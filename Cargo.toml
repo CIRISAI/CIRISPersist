@@ -1053,7 +1053,8 @@ harness = false
 [[bench]]
 name = "queue"
 harness = false
-required-features = ["sqlite"]
+# v62.0.0 (slice D): the persister rides `queue`.
+required-features = ["sqlite", "queue"]
 
 # v1.10.x bench-coverage cut — benches for the v1.7.x–v1.10.1 surface
 # that shipped with zero coverage. SQLite in-memory backed where a DB

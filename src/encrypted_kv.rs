@@ -1001,7 +1001,9 @@ fn software_mls_state_key(master_key_b64: Option<&str>) -> Result<Zeroizing<Vec<
         )));
     }
     let key = Zeroizing::new(
-        ciris_verify_core::derive_symmetric_key(
+        // v62.0.0: persist's byte-identical copy (Verify 23 moved its own to
+        // the `host` tier; I1859 pins them equal).
+        crate::verify::named_key::derive_symmetric_key(
             &SoftwareRootAsSeed(raw),
             SOFTWARE_ROOT_KEY_ID,
             MLS_STATE_CONTEXT,
@@ -1391,7 +1393,8 @@ mod tests {
                 "test one-seed".into()
             }
         }
-        ciris_verify_core::derive_symmetric_key(&OneSeed(root.to_vec()), "seed", context).unwrap()
+        crate::verify::named_key::derive_symmetric_key(&OneSeed(root.to_vec()), "seed", context)
+            .unwrap()
     }
 
     fn no_hardware_consulted(_: bool) -> HardwareRootResult {

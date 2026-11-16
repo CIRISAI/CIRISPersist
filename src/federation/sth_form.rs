@@ -1,28 +1,21 @@
-//! v62.0.0 (slice D, CIRISVerify 23 composite cut) — **the signature FORM of
-//! a transparency head or witness cosignature, read by form and signed by
-//! ceremony state.**
+//! v62.0.0 (slice D, CIRISVerify 23 composite cut; CC rc20 "nothing carries,
+//! clean mesh") — **a transparency head's or witness cosignature's
+//! signature: the composite, and only the composite.**
 //!
-//! CIRISVerify 23.0.0 changed [`SignedTreeHead::signature`] and
-//! [`WitnessSignature::signature`] from a bound-hybrid
-//! [`HybridSignature`](ciris_crypto::HybridSignature) to raw bytes, and its own
-//! readers expect the CC 2.6.1.7 composite ML-DSA-65-Ed25519 (3373 bytes). CC
-//! rc20 keeps the EARLIER form valid: a head or cosignature signed under it
-//! still verifies (CC 8.11, the bound-hybrid form at CC 8.11.12), and a node
-//! WRITES the earlier form until it holds the edition-2 ceremony row (CC
-//! ruling D4). So persist carries both forms in the one byte field:
+//! CIRISVerify 23 changed [`SignedTreeHead::signature`] and
+//! [`WitnessSignature::signature`] to raw bytes: the CC 2.6.1.7 composite
+//! ML-DSA-65-Ed25519 (3373 bytes, `mldsaSig || ed25519Sig`). A v62 node starts
+//! at its edition-2 genesis and reads ONLY edition-2 objects (rc20 0c9e17c):
 //!
-//! - **earlier form** — the bound-hybrid `HybridSignature` as its JSON bytes,
-//!   exactly the bytes persist's `signature_blob` columns already hold (v61
-//!   and earlier). A v61 row reads back unchanged;
-//! - **composite form** — the 3373-byte `mldsaSig || ed25519Sig`.
-//!
-//! [`classify`] decides the form from the bytes alone (never from a date or a
-//! build flag); every verifier dispatches on it. [`sign_sth`] picks the form
-//! to WRITE from the node's [`CeremonyState`]: earlier before the ceremony row
-//! is held, composite after. The composite branch needs the keyring's FIPS 204
-//! context-sign (CIRISVerify 23.1.3, `PqcSigner::sign_with_context`); a
-//! signer without it refuses by name
-//! ([`LocalSignerError::CompositeUnavailable`](crate::signing::LocalSignerError)).
+//! - every head and cosignature it WRITES is a composite ([`sign_sth`]);
+//! - a head or cosignature arriving in the EARLIER (bound-hybrid
+//!   `HybridSignature`) form is refused at the door by name
+//!   ([`SthFormRefusal::EarlierForm`], `sth_signature_earlier_form`), never
+//!   verified;
+//! - an earlier-form head this node's own store holds from before the
+//!   upgrade is refused by name on read, never served
+//!   (`TODO(archive-ruling)`: the operator ruling on the pre-v62 store, kept
+//!   as an archive and never read, is open).
 //!
 //! The three logs ride this one module: the audit log (`audit::merkle_store`,
 //! persist-signed), the trust-grant receipts (the same tree), and the
@@ -31,162 +24,87 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_crypto::composite::{CompositePublicKey, SIGNATURE_LEN};
-use ciris_crypto::HybridSignature;
 use ciris_verify_core::transparency::{SignedTreeHead, WitnessSignature};
 
-/// The two signature forms a head or cosignature may carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignatureForm {
-    /// CC 8.11.12: the bound-hybrid `HybridSignature`, as JSON bytes.
-    Earlier,
-    /// CC 2.6.1.7: the 3373-byte composite.
-    Composite,
-}
+/// The stable token of an earlier-form refusal.
+pub const STH_SIGNATURE_EARLIER_FORM: &str = "sth_signature_earlier_form";
+/// The stable token of a refusal of bytes in no form at all.
+pub const STH_SIGNATURE_UNRECOGNIZED: &str = "sth_signature_unrecognized";
 
-/// A classified signature.
-#[derive(Debug, Clone)]
-pub enum FormedSignature<'a> {
-    /// The earlier form, parsed.
-    Earlier(Box<HybridSignature>),
-    /// The composite form, as given.
-    Composite(&'a [u8]),
-}
-
-/// The bytes are neither form: a refusal, never absence.
+/// Why signature bytes are not a composite.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "signature_form_unrecognized: {len} bytes are neither an earlier-form (CC 8.11.12) \
-     bound-hybrid signature nor a {SIGNATURE_LEN}-byte composite (CC 2.6.1.7)"
-)]
-pub struct UnrecognizedForm {
-    /// The length of the bytes that classified as neither.
-    pub len: usize,
+pub enum SthFormRefusal {
+    /// The earlier (CC 8.11.12 bound-hybrid) form: a pre-v62 object. A v62
+    /// node reads only edition-2 objects (CC rc20, "nothing carries").
+    #[error(
+        "sth_signature_earlier_form: a bound-hybrid (pre-edition-2) signature; a v62 node \
+         reads only CC 2.6.1.7 composites (nothing carries into the edition)"
+    )]
+    EarlierForm,
+    /// Not a composite and not the earlier form either.
+    #[error("sth_signature_unrecognized: {len} bytes are not a {SIGNATURE_LEN}-byte composite")]
+    Unrecognized {
+        /// The length of the bytes refused.
+        len: usize,
+    },
 }
 
-/// Classify signature bytes by FORM. A composite is binary of exactly
-/// [`SIGNATURE_LEN`] bytes; the earlier form is a JSON object that parses as a
-/// `HybridSignature`. The two cannot collide: JSON text of that length that
-/// parsed would be the earlier form, and composite bytes are not JSON.
-///
-/// # Errors
-/// [`UnrecognizedForm`] when the bytes are neither.
-pub fn classify(sig: &[u8]) -> Result<FormedSignature<'_>, UnrecognizedForm> {
-    if sig.first() == Some(&b'{') {
-        if let Ok(h) = serde_json::from_slice::<HybridSignature>(sig) {
-            return Ok(FormedSignature::Earlier(Box::new(h)));
-        }
-    }
-    if sig.len() == SIGNATURE_LEN {
-        return Ok(FormedSignature::Composite(sig));
-    }
-    Err(UnrecognizedForm { len: sig.len() })
-}
-
-/// The form of `sig`, if it has one.
-#[must_use]
-pub fn form_of(sig: &[u8]) -> Option<SignatureForm> {
-    match classify(sig) {
-        Ok(FormedSignature::Earlier(_)) => Some(SignatureForm::Earlier),
-        Ok(FormedSignature::Composite(_)) => Some(SignatureForm::Composite),
-        Err(_) => None,
-    }
-}
-
-/// The earlier-form bytes of a bound-hybrid signature: its JSON, the encoding
-/// persist's `signature_blob` columns have always held.
-///
-/// # Errors
-/// A serde fault (never expected for a `HybridSignature`).
-pub fn earlier_form_bytes(sig: &HybridSignature) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(sig)
-}
-
-/// The `merkle_sth_log.signer_key_id` column for a head signature: for the
-/// earlier form, the hex of the Ed25519 key the signature carries (what every
-/// pre-v62 row holds); a composite carries no key, so the column is empty
-/// (the verifier pins the signer; the column was never an authority).
-#[must_use]
-pub fn signer_column(sig: &[u8]) -> String {
-    match classify(sig) {
-        Ok(FormedSignature::Earlier(h)) => hex::encode(&h.classical.public_key),
-        _ => String::new(),
-    }
-}
-
-/// Does this node hold the edition-2 ceremony row (CC ruling D4)?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CeremonyState {
-    /// No ceremony row is held: write the earlier form.
-    NotHeld,
-    /// The ceremony row is held: write the composite.
-    Held,
-}
-
-impl CeremonyState {
-    /// The form a node in this state writes.
+impl SthFormRefusal {
+    /// The stable token.
     #[must_use]
-    pub fn writes(self) -> SignatureForm {
+    pub fn token(&self) -> &'static str {
         match self {
-            Self::NotHeld => SignatureForm::Earlier,
-            Self::Held => SignatureForm::Composite,
+            Self::EarlierForm => STH_SIGNATURE_EARLIER_FORM,
+            Self::Unrecognized { .. } => STH_SIGNATURE_UNRECOGNIZED,
         }
     }
 }
 
-/// The node's ceremony state. **No edition-2 ceremony row exists yet**: its
-/// kind is defined by the edition-2 ceremony set CIRISVerify ships in 23.x
-/// (genesis bundle and revocation snapshot payloads, trust root on edition 2,
-/// the cutover proof), and persist's edition-2 slice admits it. Until that
-/// row kind exists no node can hold it, so every node is
-/// [`CeremonyState::NotHeld`] and writes the earlier form, as CC D4 rules.
-/// The one place the answer is read; the ceremony slice replaces this body
-/// with the directory read.
-#[must_use]
-pub fn ceremony_state() -> CeremonyState {
-    CeremonyState::NotHeld
+/// The composite in `sig`, or the named refusal. The earlier form is the
+/// `HybridSignature` JSON object every pre-v62 `signature_blob` holds; it is
+/// recognised only to be refused by name.
+///
+/// # Errors
+/// [`SthFormRefusal`].
+pub fn classify(sig: &[u8]) -> Result<&[u8], SthFormRefusal> {
+    if sig.len() == SIGNATURE_LEN {
+        return Ok(sig);
+    }
+    if sig.first() == Some(&b'{')
+        && serde_json::from_slice::<ciris_crypto::HybridSignature>(sig).is_ok()
+    {
+        return Err(SthFormRefusal::EarlierForm);
+    }
+    Err(SthFormRefusal::Unrecognized { len: sig.len() })
 }
 
-/// Sign transparency-head (or cosignature) `bytes` in the form `ceremony`
-/// writes. Earlier form: `LocalSigner::sign_hybrid`, as JSON bytes. Composite:
-/// `LocalSigner::sign_composite`.
+/// Sign transparency-head (or cosignature) `bytes`: the composite, through
+/// [`LocalSigner::sign_composite`](crate::signing::LocalSigner::sign_composite)
+/// (the keyring's FIPS 204 context-sign plus `composite::assemble_composite`).
 ///
 /// # Errors
 /// The signer's error; [`LocalSignerError::CompositeUnavailable`](crate::signing::LocalSignerError::CompositeUnavailable)
-/// from a signer without a context-sign.
+/// from a PQC signer without context-sign.
 pub async fn sign_sth(
     signer: &crate::signing::LocalSigner,
     bytes: &[u8],
-    ceremony: CeremonyState,
 ) -> Result<Vec<u8>, crate::signing::LocalSignerError> {
-    match ceremony.writes() {
-        SignatureForm::Earlier => {
-            let sig = signer.sign_hybrid(bytes).await?;
-            earlier_form_bytes(&sig).map_err(|e| {
-                crate::signing::LocalSignerError::PqcSign(format!("earlier-form encode: {e}"))
-            })
-        }
-        SignatureForm::Composite => signer.sign_composite(bytes).await,
-    }
+    signer.sign_composite(bytes).await
 }
 
 /// Why a signature did not verify.
 #[derive(Debug, thiserror::Error)]
 pub enum FormVerifyError {
-    /// The bytes are neither form.
+    /// Not a composite (earlier form or unrecognized), refused by name.
     #[error(transparent)]
-    Unrecognized(#[from] UnrecognizedForm),
-    /// The pinned keys cannot verify this form (no ML-DSA-65 key, a key that
-    /// does not decode).
+    Form(#[from] SthFormRefusal),
+    /// The pinned keys cannot form a composite key (no ML-DSA-65 key, a key
+    /// that does not decode).
     #[error("signature_key_unusable: {0}")]
     Key(String),
-    /// The signature does not verify.
-    #[error("signature_invalid ({form:?}): {detail}")]
-    Invalid {
-        /// The form that was checked.
-        form: SignatureForm,
-        /// What failed.
-        detail: String,
-    },
+    /// The composite does not verify.
+    #[error("signature_invalid: {0}")]
+    Invalid(String),
 }
 
 /// The pinned keys a signature verifies under: a federation key's two halves.
@@ -194,8 +112,7 @@ pub enum FormVerifyError {
 pub struct PinnedKeys {
     /// Ed25519, 32 bytes, base64.
     pub ed25519_base64: String,
-    /// ML-DSA-65, 1952 bytes, base64. `None` verifies neither form (both
-    /// forms need the PQC half under Strict).
+    /// ML-DSA-65, 1952 bytes, base64. `None` verifies nothing.
     pub ml_dsa_65_base64: Option<String>,
 }
 
@@ -209,11 +126,11 @@ impl PinnedKeys {
         }
     }
 
-    /// The two halves, decoded: `(ed25519, ml_dsa_65)`.
+    /// The 1984-byte composite key `mldsaPK || ed25519PK`.
     ///
     /// # Errors
-    /// [`FormVerifyError::Key`] when a half is missing or not base64.
-    pub fn decoded(&self) -> Result<(Vec<u8>, Vec<u8>), FormVerifyError> {
+    /// [`FormVerifyError::Key`] when a half is missing or does not decode.
+    pub fn composite(&self) -> Result<CompositePublicKey, FormVerifyError> {
         let key = |m: String| FormVerifyError::Key(m);
         let pqc = self
             .ml_dsa_65_base64
@@ -225,87 +142,45 @@ impl PinnedKeys {
         let ed = B64
             .decode(&self.ed25519_base64)
             .map_err(|e| key(format!("Ed25519 key base64: {e}")))?;
-        Ok((ed, pqc))
-    }
-
-    /// The 1984-byte composite key `mldsaPK || ed25519PK`.
-    ///
-    /// # Errors
-    /// [`FormVerifyError::Key`] when a half is missing or does not decode.
-    pub fn composite(&self) -> Result<CompositePublicKey, FormVerifyError> {
-        let (ed, pqc) = self.decoded()?;
-        CompositePublicKey::from_halves(&pqc, &ed).map_err(|e| FormVerifyError::Key(format!("{e}")))
+        CompositePublicKey::from_halves(&pqc, &ed).map_err(|e| key(format!("{e}")))
     }
 }
 
 /// Verify `sig`, a signature over `sth`'s signing bytes (the operator's own,
 /// or a witness cosignature: both cover [`SignedTreeHead::signing_bytes_of`]),
-/// under `pinned`, dispatched by FORM:
-///
-/// - earlier (CC 8.11.12): CIRISVerify's `earlier_form::EarlierSignedTreeHead`
-///   over the same head fields, whose `verify` requires the keys the
-///   signature carries to BE the pinned ones and then the bound hybrid;
-/// - composite (CC 2.6.1.7): under the pinned composite key.
-///
-/// Keys come from the caller's pinned state, never from the signature.
+/// under the PINNED composite key. The earlier form is refused by name.
 ///
 /// # Errors
-/// [`FormVerifyError`] naming the form and the failure.
+/// [`FormVerifyError`].
 pub fn verify_sth_signature(
     sth: &SignedTreeHead,
     sig: &[u8],
     pinned: &PinnedKeys,
-) -> Result<SignatureForm, FormVerifyError> {
-    match classify(sig)? {
-        FormedSignature::Earlier(h) => {
-            let (ed, pqc) = pinned.decoded()?;
-            let earlier = ciris_verify_core::earlier_form::EarlierSignedTreeHead {
-                log_id: sth.log_id.clone(),
-                tree_size: sth.tree_size,
-                root_hash: sth.root_hash,
-                timestamp: sth.timestamp,
-                signature: *h,
-                witness_signatures: Vec::new(),
-            };
-            if earlier.verify(&ed, &pqc) {
-                Ok(SignatureForm::Earlier)
-            } else {
-                Err(FormVerifyError::Invalid {
-                    form: SignatureForm::Earlier,
-                    detail: "the bound-hybrid signature does not verify under the pinned keys \
-                             (CC 8.11.12)"
-                        .into(),
-                })
-            }
-        }
-        FormedSignature::Composite(c) => {
-            pinned
-                .composite()?
-                .verify(&sth.signing_bytes_of(), c)
-                .map_err(|e| FormVerifyError::Invalid {
-                    form: SignatureForm::Composite,
-                    detail: e.to_string(),
-                })?;
-            Ok(SignatureForm::Composite)
-        }
-    }
+) -> Result<(), FormVerifyError> {
+    let c = classify(sig)?;
+    pinned
+        .composite()?
+        .verify(&sth.signing_bytes_of(), c)
+        .map_err(|e| FormVerifyError::Invalid(e.to_string()))
 }
 
 /// Resolve `key_id` in `directory` and [`verify_sth_signature`].
 ///
 /// # Errors
-/// [`FormVerifyError::Key`] for an unknown key; otherwise as
-/// [`verify_sth_signature`]. A directory fault is a `Key` refusal (fail
-/// closed).
+/// [`FormVerifyError::Key`] for an unknown key or a directory fault (fail
+/// closed); otherwise as [`verify_sth_signature`].
 pub async fn verify_sth_signature_via_directory<F>(
     directory: &F,
     sth: &SignedTreeHead,
     key_id: &str,
     sig: &[u8],
-) -> Result<SignatureForm, FormVerifyError>
+) -> Result<(), FormVerifyError>
 where
     F: super::FederationDirectory + ?Sized,
 {
+    // The form first: an earlier-form object is refused by name before any
+    // key is looked up.
+    classify(sig)?;
     let rec = directory
         .lookup_public_key(key_id)
         .await
@@ -315,8 +190,8 @@ where
 }
 
 /// A witness this verifier trusts, with its pinned keys (the persist
-/// counterpart of Verify's `TrustedWitness`, which pins only a composite key
-/// and so cannot count an earlier-form cosignature).
+/// counterpart of Verify's `TrustedWitness`, resolved from `federation_keys`
+/// halves).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedWitness {
     /// The witness id (matches `WitnessSignature::witness_id`).
@@ -326,15 +201,16 @@ pub struct PinnedWitness {
 }
 
 /// Count the DISTINCT trusted witnesses that validly cosigned `sth`, each
-/// cosignature verified by its form under the witness's PINNED keys
-/// (CEG 0.2 §10.3.1, Verify's `count_valid_witnesses` rules):
+/// cosignature verified under the witness's PINNED composite key (CEG 0.2
+/// §10.3.1, Verify's `count_valid_witnesses` rules):
 ///
 /// 1. a repeated `witness_id` counts once;
 /// 2. an untrusted witness, or one whose pinned key does not decode, does not
 ///    count;
 /// 3. the cosignature's consistency proof must chain to `(tree_size,
 ///    root_hash)`;
-/// 4. the signature verifies over `signing_bytes_of()` under the pinned keys.
+/// 4. the composite verifies over `signing_bytes_of()` under the pinned key
+///    (an earlier-form cosignature never counts).
 #[must_use]
 pub fn count_valid_witnesses(sth: &SignedTreeHead, trusted: &[PinnedWitness]) -> usize {
     let mut counted: Vec<&str> = Vec::new();
@@ -365,118 +241,121 @@ pub fn witness_quorum_met(sth: &SignedTreeHead, trusted: &[PinnedWitness], quoru
     count_valid_witnesses(sth, trusted) >= quorum
 }
 
-/// Rewrite a JSON value of a [`SignedTreeHead`] (or a list of
-/// [`WitnessSignature`]s) so an EARLIER-form signature, carried as the v22
-/// `HybridSignature` object, becomes the base64 of its JSON bytes, the shape
-/// Verify 23's serde reads. Composite signatures (already base64 strings) are
-/// left alone. Walks `signature` on the head and on each witness.
-pub fn normalize_signature_json(value: &mut serde_json::Value) {
-    fn fix(sig: &mut serde_json::Value) {
-        if sig.is_object() {
-            if let Ok(bytes) = serde_json::to_vec(sig) {
-                *sig = serde_json::Value::String(B64.encode(bytes));
-            }
-        }
-    }
-    match value {
-        serde_json::Value::Array(ws) => {
-            for w in ws {
-                if let Some(sig) = w.get_mut("signature") {
-                    fix(sig);
-                }
-            }
-        }
-        serde_json::Value::Object(o) => {
-            if let Some(sig) = o.get_mut("signature") {
-                fix(sig);
-            }
-            if let Some(ws) = o.get_mut("witness_signatures") {
-                normalize_signature_json(ws);
-            }
-        }
-        _ => {}
-    }
+/// Why a head's JSON was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum SthJsonError {
+    /// A signature in the wrong form.
+    #[error(transparent)]
+    Form(#[from] SthFormRefusal),
+    /// Not a head.
+    #[error("sth json: {0}")]
+    Json(serde_json::Error),
 }
 
-/// Parse a [`SignedTreeHead`] from JSON in either form (see
-/// [`normalize_signature_json`]).
+fn carries_an_object_signature(value: &serde_json::Value) -> bool {
+    value
+        .get("signature")
+        .is_some_and(serde_json::Value::is_object)
+}
+
+/// Parse a [`SignedTreeHead`] from JSON. A head carrying its signature (or a
+/// witness's) as the v22 `HybridSignature` OBJECT is the earlier form and is
+/// refused by name rather than as a serde type error.
 ///
 /// # Errors
-/// The serde error.
-pub fn sth_from_json(mut value: serde_json::Value) -> Result<SignedTreeHead, serde_json::Error> {
-    normalize_signature_json(&mut value);
-    serde_json::from_value(value)
+/// [`SthJsonError`].
+pub fn sth_from_json(value: serde_json::Value) -> Result<SignedTreeHead, SthJsonError> {
+    let earlier = carries_an_object_signature(&value)
+        || value
+            .get("witness_signatures")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ws| ws.iter().any(carries_an_object_signature));
+    if earlier {
+        return Err(SthJsonError::Form(SthFormRefusal::EarlierForm));
+    }
+    let sth: SignedTreeHead = serde_json::from_value(value).map_err(SthJsonError::Json)?;
+    classify(&sth.signature)?;
+    for ws in &sth.witness_signatures {
+        classify(&ws.signature)?;
+    }
+    Ok(sth)
 }
 
-/// Parse a stored witness list in either form.
+/// Parse a stored witness list. A pre-v62 row (each signature the
+/// `HybridSignature` object) is the earlier form: refused by name.
+/// `TODO(archive-ruling)`: the pre-v62 store is to be kept as an archive and
+/// never read (operator ruling open); until then its rows refuse here.
 ///
 /// # Errors
-/// The serde error.
-pub fn witnesses_from_json(raw: &str) -> Result<Vec<WitnessSignature>, serde_json::Error> {
-    let mut value: serde_json::Value = serde_json::from_str(raw)?;
-    normalize_signature_json(&mut value);
-    serde_json::from_value(value)
+/// [`SthJsonError`].
+pub fn witnesses_from_json(raw: &str) -> Result<Vec<WitnessSignature>, SthJsonError> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(SthJsonError::Json)?;
+    if value
+        .as_array()
+        .is_some_and(|ws| ws.iter().any(carries_an_object_signature))
+    {
+        return Err(SthJsonError::Form(SthFormRefusal::EarlierForm));
+    }
+    let ws: Vec<WitnessSignature> = serde_json::from_value(value).map_err(SthJsonError::Json)?;
+    for w in &ws {
+        classify(&w.signature)?;
+    }
+    Ok(ws)
 }
 
-/// Test support: earlier-form cosignatures and heads from a bound-hybrid
-/// test signer (the producer side of the CC 8.11.12 form, which Verify 23
-/// does not ship and production never writes after the ceremony row).
+/// The `merkle_sth_log.signer_key_id` column for a head: a composite carries
+/// no key of its own, so the column is empty (the verifier pins the signer;
+/// the column was never an authority).
+#[must_use]
+pub fn signer_column(_sig: &[u8]) -> String {
+    String::new()
+}
+
+/// Test support: composite test keys, and the earlier form persist refuses.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod test_support {
-    use ciris_crypto::{Ed25519Signer, HybridSigner, MlDsa65Signer};
-    use ciris_verify_core::transparency::{
-        SignedTreeHead, TransparencyError, WitnessConsistencyProof, WitnessSignature,
-    };
+    use ciris_crypto::composite::CompositeSigningKey;
 
-    /// The earlier-form signature `sth` carries, parsed (panics on a
-    /// composite: test-only).
+    /// A composite key from the seeds a bound-hybrid test signer uses
+    /// (`MlDsa65Signer::from_seed(mldsa)`, `Ed25519Signer::from_seed(ed)`):
+    /// the same two public keys, so a key record registered from that signer
+    /// verifies it.
     #[must_use]
-    pub fn earlier_of(sig: &[u8]) -> ciris_crypto::HybridSignature {
-        serde_json::from_slice(sig).expect("an earlier-form signature")
+    pub fn composite(mldsa_seed: [u8; 32], ed_seed: [u8; 32]) -> CompositeSigningKey {
+        CompositeSigningKey::from_seeds(&mldsa_seed, &ed_seed)
     }
 
-    /// `sth` with its earlier-form signature edited by `f` and re-encoded.
-    #[must_use]
-    pub fn edit_earlier(
-        sth: &SignedTreeHead,
-        f: impl FnOnce(&mut ciris_crypto::HybridSignature),
-    ) -> SignedTreeHead {
-        let mut h = earlier_of(&sth.signature);
-        f(&mut h);
-        let mut out = sth.clone();
-        out.signature = super::earlier_form_bytes(&h).expect("earlier-form encode");
-        out
+    /// A composite cosignature over `sth` (Verify's `cosign`: the
+    /// consistency proof is checked first).
+    ///
+    /// # Errors
+    /// The consistency proof's refusal or the signer's.
+    pub fn cosign(
+        sth: &ciris_verify_core::transparency::SignedTreeHead,
+        witness_id: impl Into<String>,
+        signer: &CompositeSigningKey,
+        consistency_proof: ciris_verify_core::transparency::WitnessConsistencyProof,
+    ) -> Result<
+        ciris_verify_core::transparency::WitnessSignature,
+        ciris_verify_core::transparency::TransparencyError,
+    > {
+        sth.cosign(witness_id, signer, consistency_proof)
     }
 
-    /// The bound-hybrid test signer the stores' tests use.
-    pub type EarlierSigner = HybridSigner<Ed25519Signer, MlDsa65Signer>;
-
-    /// An earlier-form signature over `bytes`, as the stored bytes.
+    /// An earlier-form (v61, bound-hybrid JSON) signature over `bytes`, as
+    /// the stored bytes a pre-v62 row holds: what the v62 door refuses by
+    /// name.
     ///
     /// # Panics
     /// On a signer fault (test-only).
     #[must_use]
-    pub fn earlier_sign(signer: &EarlierSigner, bytes: &[u8]) -> Vec<u8> {
-        super::earlier_form_bytes(&signer.sign(bytes).expect("bound-hybrid sign"))
-            .expect("earlier-form encode")
-    }
-
-    /// An earlier-form witness cosignature over `sth`, after checking the
-    /// consistency proof as Verify's `cosign` does.
-    ///
-    /// # Errors
-    /// The consistency proof's refusal.
-    pub fn earlier_cosign(
-        sth: &SignedTreeHead,
-        witness_id: impl Into<String>,
-        signer: &EarlierSigner,
-        consistency_proof: WitnessConsistencyProof,
-    ) -> Result<WitnessSignature, TransparencyError> {
-        consistency_proof.verify(sth.tree_size, &sth.root_hash)?;
-        Ok(WitnessSignature {
-            witness_id: witness_id.into(),
-            signature: earlier_sign(signer, &sth.signing_bytes_of()),
-            consistency_proof,
-        })
+    pub fn earlier_bytes(mldsa_seed: [u8; 32], ed_seed: [u8; 32], bytes: &[u8]) -> Vec<u8> {
+        let ed = ciris_crypto::Ed25519Signer::from_seed(&ed_seed).expect("ed25519 seed");
+        let ml = ciris_crypto::MlDsa65Signer::from_seed(&mldsa_seed).expect("ml-dsa seed");
+        let h = ciris_crypto::HybridSigner::new(ed, ml)
+            .expect("hybrid signer")
+            .sign(bytes)
+            .expect("bound-hybrid sign");
+        serde_json::to_vec(&h).expect("earlier-form encode")
     }
 }

@@ -5038,19 +5038,14 @@ impl PyEngine {
     fn build_storage_budget_v1_py(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
-            // v62.0.0 — the form the node's ceremony state writes (CC D4):
-            // the earlier bound-hybrid pair before the edition-2 ceremony row,
-            // the composite (`signature_composite_base64`) after.
+            // v62.0.0 — the composite (`signature_composite_base64`), the
+            // only form a v62 node writes or reads.
             let signer = require_qshape_signer(self.local_signer.as_ref())?;
             let payload = payload_json.to_owned();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
-                    crate::fountain::storage_contention::sign_storage_budget_wire(
-                        &signer,
-                        &payload,
-                        crate::federation::sth_form::ceremony_state(),
-                    )
+                    crate::fountain::storage_contention::sign_storage_budget_wire(&signer, &payload)
                     .await
                 })
             })
@@ -5065,19 +5060,14 @@ impl PyEngine {
     fn build_corpus_want_v1_py(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
-            // v62.0.0 — the form the node's ceremony state writes (CC D4):
-            // the earlier bound-hybrid pair before the edition-2 ceremony row,
-            // the composite (`signature_composite_base64`) after.
+            // v62.0.0 — the composite (`signature_composite_base64`), the
+            // only form a v62 node writes or reads.
             let signer = require_qshape_signer(self.local_signer.as_ref())?;
             let payload = payload_json.to_owned();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(async move {
-                    crate::fountain::storage_contention::sign_corpus_want_wire(
-                        &signer,
-                        &payload,
-                        crate::federation::sth_form::ceremony_state(),
-                    )
+                    crate::fountain::storage_contention::sign_corpus_want_wire(&signer, &payload)
                     .await
                 })
             })
@@ -5113,7 +5103,8 @@ impl PyEngine {
                     e @ (E::MalformedJson(_)
                     | E::MalformedBase64(_)
                     | E::RevisionRollback { .. }
-                    | E::Signer(_)),
+                    | E::Signer(_)
+                    | E::EarlierForm),
                 ) => Err(storage_contention_err_to_py(e)),
             }
         })
@@ -5144,7 +5135,8 @@ impl PyEngine {
                     e @ (E::MalformedJson(_)
                     | E::MalformedBase64(_)
                     | E::RevisionRollback { .. }
-                    | E::Signer(_)),
+                    | E::Signer(_)
+                    | E::EarlierForm),
                 ) => Err(storage_contention_err_to_py(e)),
             }
         })
@@ -10135,13 +10127,13 @@ impl PyEngine {
     ) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
-            // v62.0.0 — either signature form (an earlier-form head carries
-            // the v22 HybridSignature object; a composite, base64).
-            let sth: ciris_verify_core::transparency::SignedTreeHead = serde_json::from_str::<
-                serde_json::Value,
-            >(sth_json)
-            .and_then(crate::federation::sth_form::sth_from_json)
-            .map_err(|e| PyValueError::new_err(format!("put_stream_sth: sth_json parse: {e}")))?;
+            // v62.0.0 — the composite only; an earlier-form head (the v22
+            // HybridSignature object) is refused by name.
+            let value: serde_json::Value = serde_json::from_str(sth_json)
+                .map_err(|e| PyValueError::new_err(format!("put_stream_sth: sth_json parse: {e}")))?;
+            let sth: ciris_verify_core::transparency::SignedTreeHead =
+                crate::federation::sth_form::sth_from_json(value)
+                    .map_err(|e| PyValueError::new_err(format!("put_stream_sth: sth_json: {e}")))?;
             let runtime = self.runtime.clone();
             let producer_key_id = producer_key_id.to_string();
             py.detach(move || match &self.backend {
@@ -10749,12 +10741,11 @@ impl PyEngine {
     /// deterministic event_id). Returns JSON
     /// `{"admitted": true, "verdict": <"consistent"|"divergent"|{"equivocation": [...]}>}`.
     ///
-    /// v62.0.0 (CIRISVerify 23) — **one `signature` argument, in either
-    /// form**: a base64 string is the CC 2.6.1.7 composite (3373 bytes); a
-    /// JSON object `{"ed25519": <b64>, "ml_dsa_65": <b64>}` is the earlier
-    /// bound-hybrid form (CC 8.11.12), which still verifies. The pubkeys are
-    /// keyword arguments. The pre-v62 call shape (two signature halves as
-    /// positional arguments) raises `TypeError` naming the change.
+    /// v62.0.0 (CIRISVerify 23) — **one `signature` argument**: the base64
+    /// CC 2.6.1.7 composite (3373 bytes). The earlier bound-hybrid pair (a
+    /// JSON object) is refused, `ValueError("sig19_earlier_form…")`. The
+    /// pubkeys are keyword arguments. The pre-v62 call shape (two signature
+    /// halves as positional arguments) raises `TypeError` naming the change.
     #[pyo3(signature = (witness_json, signature, *legacy_positional,
                         ed25519_pubkey_b64=None, mldsa65_pubkey_b64=None, leaves_b64_json=None))]
     #[allow(clippy::too_many_arguments)]
@@ -32673,8 +32664,8 @@ fn storage_contention_err_to_py(
 const PUT_WHOLENESS_WITNESS_LEGACY_SHAPE: &str = concat!(
     "put_wholeness_witness_json(witness_json, signature, *, ed25519_pubkey_b64, ",
     "mldsa65_pubkey_b64, leaves_b64_json=None): since ciris-persist 62.0.0 the ",
-    "signature is ONE argument, a base64 CC 2.6.1.7 composite or the earlier form as ",
-    "the JSON object {\"ed25519\": <b64>, \"ml_dsa_65\": <b64>}, and the pubkeys are ",
+    "signature is ONE argument, the base64 CC 2.6.1.7 composite (an earlier-form ",
+    "bound-hybrid pair is refused: sig19_earlier_form), and the pubkeys are ",
     "keywords; the pre-62 positional shape (sig_ed25519_b64, sig_mldsa65_b64, ",
     "ed25519_pubkey_b64, mldsa65_pubkey_b64) is gone"
 );

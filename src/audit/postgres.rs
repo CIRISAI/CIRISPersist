@@ -77,13 +77,12 @@ async fn merkle_hook_pg(
         .await
         .map_err(|e| Error::Merkle(format!("append: {e}")))?;
 
-    // 2. Sign the STH in the form the node's ceremony state writes
-    //    (v62.0.0, CC D4): earlier (bound-hybrid) before the edition-2
-    //    ceremony row, composite after.
+    // 2. Sign the STH: the composite (v62.0.0, CC 2.6.1.7), the only form
+    //    a v62 node writes.
     let timestamp = crate::host::clock::now();
     let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
     let signature =
-        super::sth_form::sign_sth(&signer, &signing_bytes, super::sth_form::ceremony_state())
+        super::sth_form::sign_sth(&signer, &signing_bytes)
             .await
             .map_err(|e| Error::Merkle(format!("sign_sth: {e}")))?;
 

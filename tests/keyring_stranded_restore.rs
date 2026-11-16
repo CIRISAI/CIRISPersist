@@ -21,6 +21,10 @@
 //! first seal lands in the plugin tier instead; the test then says so and
 //! stops, because the stranded-software home cannot be built there.
 
+// v62.0.0 (slice D): the sealed / file-backed keyring is the keyring's
+// `fs` tier, which persist turns on under `host`.
+#![cfg(feature = "host")]
+
 use ciris_keyring::{HardwareSigner as _, SealedEd25519Signer};
 
 const ALIAS: &str = "node-identity";

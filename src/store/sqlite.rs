@@ -49997,7 +49997,7 @@ mod tests {
     async fn register_hybrid_producer(
         backend: &SqliteBackend,
         key_id: &str,
-    ) -> Box<ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer>>
+    ) -> Box<ciris_crypto::composite::CompositeSigningKey>
     {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -50019,7 +50019,7 @@ mod tests {
         // over (#88 zeroize/layout). Only the 8-byte Box crosses the await.
         // (KeyRecord is also built inline rather than via `fed_key`, which
         // would derive its own multi-KiB ML-DSA pubkeys on this frame.)
-        let signer = Box::new(ciris_crypto::HybridSigner::new(ed, mldsa).unwrap());
+        let signer = Box::new(crate::federation::sth_form::test_support::composite([0x32; 32], [0x31; 32]));
         let record = crate::federation::KeyRecord {
             key_id: key_id.into(),
             pubkey_ed25519_base64: ed_pub_b64,
@@ -50062,7 +50062,7 @@ mod tests {
         backend: &SqliteBackend,
         key_id: &str,
         register: bool,
-    ) -> Box<ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer>>
+    ) -> Box<ciris_crypto::composite::CompositeSigningKey>
     {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -50076,7 +50076,7 @@ mod tests {
             use ciris_crypto::PqcSigner as _;
             B64.encode(mldsa.public_key().unwrap())
         };
-        let signer = Box::new(ciris_crypto::HybridSigner::new(ed, mldsa).unwrap());
+        let signer = Box::new(crate::federation::sth_form::test_support::composite([0x42; 32], [0x41; 32]));
         if register {
             let record = crate::federation::KeyRecord {
                 key_id: key_id.into(),
@@ -50134,7 +50134,7 @@ mod tests {
         // (1) An UNREGISTERED witness — nothing to verify against.
         let stranger = hybrid_witness_signer(&backend, "witness-unregistered", false).await;
         let mut sth = base.clone();
-        let cosig = crate::federation::sth_form::test_support::earlier_cosign(
+        let cosig = crate::federation::sth_form::test_support::cosign(
             &sth,
             "witness-unregistered",
             &stranger,
@@ -50159,7 +50159,7 @@ mod tests {
         let witness = hybrid_witness_signer(&backend, "witness-registered", true).await;
         let other = sign_stream_sth(&signer, stream, &hashes, 1);
         let wrong_bytes = other.clone();
-        let cosig = crate::federation::sth_form::test_support::earlier_cosign(
+        let cosig = crate::federation::sth_form::test_support::cosign(
             &wrong_bytes,
             "witness-registered",
             &witness,
@@ -50175,7 +50175,7 @@ mod tests {
 
         // (3) The genuine cosignature is admitted and round-trips.
         let mut sth = base.clone();
-        let cosig = crate::federation::sth_form::test_support::earlier_cosign(
+        let cosig = crate::federation::sth_form::test_support::cosign(
             &sth,
             "witness-registered",
             &witness,
@@ -50198,10 +50198,7 @@ mod tests {
     /// Produce a producer-signed STH over a stream's recomputed root for
     /// `tree_size` leaves, signed by `signer`.
     fn sign_stream_sth(
-        signer: &ciris_crypto::HybridSigner<
-            ciris_crypto::Ed25519Signer,
-            ciris_crypto::MlDsa65Signer,
-        >,
+        signer: &ciris_crypto::composite::CompositeSigningKey,
         stream_id: &str,
         chunk_hashes: &[[u8; 32]],
         tree_size: u64,
@@ -50220,7 +50217,7 @@ mod tests {
             &log_id, tree_size, &root_hash, timestamp,
         );
         let signature =
-            crate::federation::sth_form::test_support::earlier_sign(signer, &signing_bytes);
+            signer.sign(&signing_bytes).unwrap();
         ciris_verify_core::transparency::SignedTreeHead {
             log_id,
             tree_size,
@@ -50321,7 +50318,7 @@ mod tests {
             sth.timestamp,
         );
         sth.signature =
-            crate::federation::sth_form::test_support::earlier_sign(&signer, &signing_bytes);
+            signer.sign(&signing_bytes).unwrap();
         let err = backend
             .put_stream_sth(sth, "producer-key")
             .await
@@ -50340,13 +50337,10 @@ mod tests {
         // Forge the signature bytes (root still matches persist's chunks,
         // so the gate passes the root check then rejects on the sig).
         {
-            // v62.0.0: tamper the earlier form's Ed25519 half and re-encode.
-            let mut h: ciris_crypto::HybridSignature =
-                serde_json::from_slice(&sth.signature).unwrap();
-            for b in &mut h.classical.signature {
+            // v62.0.0: tamper the composite's Ed25519 half.
+            for b in &mut sth.signature[3309..] {
                 *b ^= 0xFF;
             }
-            sth.signature = crate::federation::sth_form::earlier_form_bytes(&h).unwrap();
         }
         let err = backend
             .put_stream_sth(sth, "producer-key")
@@ -50373,7 +50367,7 @@ mod tests {
             sth.timestamp,
         );
         sth.signature =
-            crate::federation::sth_form::test_support::earlier_sign(&signer, &signing_bytes);
+            signer.sign(&signing_bytes).unwrap();
         let err = backend
             .put_stream_sth(sth, "producer-key")
             .await

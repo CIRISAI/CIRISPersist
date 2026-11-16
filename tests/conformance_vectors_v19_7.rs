@@ -18,12 +18,10 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
 use ciris_verify_core::substrate::aggregation::descend_order;
 use ciris_verify_core::substrate::{
     member_commitment, verify_aggregation_meta, AggregationMetaV1, AggregationMetaVerification,
 };
-use ed25519_dalek::{Signer as _, SigningKey};
 
 const VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/substrate_v19_7");
 
@@ -193,9 +191,9 @@ fn descend_order_vector_reproduced() {
 }
 
 /// A valid-vector `verify_aggregation_meta` round-trip ACCEPTS, and a
-/// PQC-missing (classical-only) one is REJECTED — the store-path gate as
-/// persist integrates it. Built from the canonical_bytes vector + a fresh
-/// bound-hybrid signature over the reproduced §19.7.1 preimage.
+/// tampered one is REJECTED — the store-path gate as persist integrates it.
+/// Built from the canonical_bytes vector + a fresh composite over the
+/// reproduced §19.7.1 preimage.
 #[tokio::test]
 async fn verify_aggregation_meta_admit_and_reject() {
     let v = load("aggregation_meta/canonical_bytes.json");
@@ -224,43 +222,11 @@ async fn verify_aggregation_meta_admit_and_reject() {
         noise_floor_descriptor: v["noise_floor_descriptor"].as_str().unwrap().to_owned(),
     };
 
-    let ed_sk = SigningKey::from_bytes(&[0x33; 32]);
-    let mldsa = MlDsa65SoftwareSigner::from_seed_bytes(&[0x44; 32], "conf-mldsa").unwrap();
-    let ed_pub = ed_sk.verifying_key().to_bytes();
-    let mldsa_pub = mldsa.public_key().await.unwrap();
-
+    // v62.0.0 (CIRISVerify 23, CC rc20): the forward composite (CC 2.6.1.7)
+    // over the reproduced §19.7.1 preimage verifies through
+    // `verify_aggregation_meta`; a tampered one does not. (A v62 node reads
+    // no earlier-form tier at all.)
     let preimage = meta.signing_preimage();
-    let ed_sig = ed_sk.sign(&preimage).to_bytes();
-    let mut bound = preimage.clone();
-    bound.extend_from_slice(&ed_sig);
-    let pqc_sig = mldsa.sign(&bound).await.unwrap();
-
-    // v62.0.0 (CIRISVerify 23): the EARLIER form (CC 8.11.12) verifies
-    // through Verify's `earlier_form::verify_bound_hybrid`, the forward
-    // composite (CC 2.6.1.7) through `verify_aggregation_meta`.
-    assert!(
-        ciris_verify_core::earlier_form::verify_bound_hybrid(
-            &preimage,
-            &ed_sig,
-            Some(&pqc_sig),
-            &ed_pub,
-            &mldsa_pub
-        )
-        .is_ok(),
-        "valid earlier-form bound-hybrid meta verifies"
-    );
-    let garbage_pqc = vec![0u8; pqc_sig.len()];
-    assert!(
-        ciris_verify_core::earlier_form::verify_bound_hybrid(
-            &preimage,
-            &ed_sig,
-            Some(&garbage_pqc),
-            &ed_pub,
-            &mldsa_pub
-        )
-        .is_err(),
-        "an invalid ML-DSA-65 half is rejected (no classical-only acceptance)"
-    );
     let composite =
         ciris_crypto::composite::CompositeSigningKey::from_seeds(&[0x44; 32], &[0x33; 32]);
     let csig = composite.sign(&preimage).unwrap();
@@ -276,10 +242,6 @@ async fn verify_aggregation_meta_admit_and_reject() {
         AggregationMetaVerification::Failed,
         "a tampered composite is rejected"
     );
-
-    // Sanity: b64-encoding the sigs (persist's FFI transport) preserves them.
-    assert_eq!(
-        BASE64.decode(BASE64.encode(ed_sig)).unwrap(),
-        ed_sig.to_vec()
-    );
+    // Sanity: b64-encoding the signature (persist's FFI transport) preserves it.
+    assert_eq!(BASE64.decode(BASE64.encode(&csig)).unwrap(), csig);
 }

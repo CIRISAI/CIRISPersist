@@ -299,7 +299,7 @@ pub(crate) fn derive_with_storage_typed(
     // Zeroizing until it leaves (v50, #920 review): a length refusal below
     // must not drop an unscrubbed master.
     let mut master = Zeroizing::new(
-        ciris_verify_core::derive_symmetric_key(storage, SECRETS_SEED_KEY_ID, context).map_err(
+        crate::verify::named_key::derive_symmetric_key(storage, SECRETS_SEED_KEY_ID, context).map_err(
             |e| {
                 HardwareDeriveError::Unreachable(format!("verify derive_symmetric_key failed: {e}"))
             },

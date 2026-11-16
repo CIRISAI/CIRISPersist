@@ -21811,6 +21811,8 @@ mod tests {
     ///   makes it gate-able for a trust-anchor store, not a rule about what
     ///   this substrate admits. "Normative" without "on whose authority" is
     ///   the same ambiguity one level up.
+    // v62.0.0 (slice D): `device_attestation` is Verify's `host` tier.
+    #[cfg(feature = "host")]
     #[test]
     fn only_a_ratified_authority_persist_reads_may_bind_a_gate() {
         use ciris_verify_core::device_attestation::{AndroidSecurityLevel, AppAttestEnvironment};

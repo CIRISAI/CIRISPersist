@@ -115,7 +115,7 @@ fn i1850_verify_v23_vectors_are_pinned_by_sha256() {
 /// the Rust code).
 #[test]
 fn i1851_the_substrate_composite_vectors_verify_through_persists_sig19() {
-    use crate::verify::sig19::{verify_sig19, Sig19, SignatureForm};
+    use crate::verify::sig19::{verify_sig19, Sig19};
     let v = vector("substrate_composite/composite_signatures_v1.json");
     let pk = hex::decode(v["composite_public_key_hex"].as_str().unwrap()).unwrap();
     assert_eq!(pk.len(), ciris_crypto::composite::PUBLIC_KEY_LEN);
@@ -126,14 +126,14 @@ fn i1851_the_substrate_composite_vectors_verify_through_persists_sig19() {
         let preimage = hex::decode(case["preimage_hex"].as_str().unwrap()).unwrap();
         let sig = hex::decode(case["signature_hex"].as_str().unwrap()).unwrap();
         assert_eq!(
-            verify_sig19(&preimage, &Sig19::Composite(sig), ed_pk, mldsa_pk),
-            Ok(SignatureForm::Composite),
+            verify_sig19(&preimage, &Sig19(sig), ed_pk, mldsa_pk),
+            Ok(()),
             "I1851 {id}: the vector's composite verifies"
         );
         for (name, bad) in case["refusals"].as_object().unwrap() {
             let bad = hex::decode(bad.as_str().unwrap()).unwrap();
             assert!(
-                verify_sig19(&preimage, &Sig19::Composite(bad), ed_pk, mldsa_pk).is_err(),
+                verify_sig19(&preimage, &Sig19(bad), ed_pk, mldsa_pk).is_err(),
                 "I1851 {id}/{name}: a refusal must not verify"
             );
             refusals += 1;

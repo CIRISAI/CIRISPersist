@@ -1,28 +1,29 @@
-//! v62.0.0 (slice D) — **the CIRISVerify 23 composite cut, witnessed.**
+//! v62.0.0 (slice D) — **the CIRISVerify 23 composite cut, witnessed (CC
+//! rc20 "nothing carries": a v62 node writes and reads only composites).**
 //! I1853–I1855, I1857.
 //!
 //! - **I1853** witness counting ([`sth_form::count_valid_witnesses`]): a
-//!   cosignature counts under its witness's PINNED keys; a repeated
+//!   cosignature counts under its witness's PINNED composite key; a repeated
 //!   `witness_id` counts once; an untrusted witness, or one whose pinned key
 //!   does not decode, does not count; a consistency proof that does not chain
-//!   to the head does not count; a signature over other bytes does not
-//!   count; both forms count in one head. Run over a head from each of the
-//!   three logs (audit, trust-grant receipt, stream).
-//! - **I1854** heads are read by FORM and written by ceremony state (CC D4):
-//!   before the ceremony row the earlier (bound-hybrid) form, which verifies
-//!   by CC 8.11.12; after it the composite, which is the bytes Verify's own
-//!   `CompositeSigningKey` produces for the same keys; bytes of neither form
-//!   are refused; a signer whose PQC half has no context-sign refuses by
-//!   name; a node holds no ceremony row today.
+//!   to the head does not count; a signature over other bytes, or under
+//!   another key, does not count; an earlier-form (bound-hybrid) cosignature
+//!   never counts. Run over a head from each of the three logs (audit,
+//!   trust-grant receipt, stream).
+//! - **I1854** heads are written as the composite (byte-equal to Verify's
+//!   own `CompositeSigningKey` for the same keys) and verify under the pinned
+//!   key; an earlier-form head is refused by name
+//!   (`sth_signature_earlier_form`), never verified; bytes in no form are
+//!   refused; a signer whose PQC half has no context-sign refuses by name.
 //! - **I1855** the stream door (`put_stream_sth`, sqlite and postgres)
-//!   verifies a composite producer and composite witnesses under the
-//!   producer's / witness's registered keys, refuses a duplicate, unknown or
-//!   forged witness, still admits an earlier-form head, and serves what it
-//!   stored.
-//! - **I1857** §19 objects verify by form ([`crate::verify::sig19`]): a
-//!   wholeness witness and a storage-contention wire signed by the node's
-//!   signer in either form admit; a tampered composite, an earlier form
-//!   without its ML-DSA-65 half, and a wire carrying both forms are refused.
+//!   verifies a composite producer and composite witnesses under their
+//!   registered keys, refuses a duplicate, unknown or forged witness, refuses
+//!   an earlier-form head and an earlier-form witness by name, and serves
+//!   what it stored.
+//! - **I1857** §19 objects: a wholeness witness and a storage-contention wire
+//!   the node's signer writes (the composite) admit; a tampered composite is
+//!   refused; the earlier bound-hybrid pair is refused by name
+//!   (`sig19_earlier_form`, `storage_contention_earlier_form`).
 
 use std::sync::Arc;
 
@@ -32,8 +33,7 @@ use ciris_crypto::composite::{CompositeSigningKey, MLDSA65_PK_LEN};
 use ciris_verify_core::transparency::{SignedTreeHead, WitnessConsistencyProof, WitnessSignature};
 
 use super::sth_form::{
-    self, count_valid_witnesses, witness_quorum_met, CeremonyState, PinnedKeys, PinnedWitness,
-    SignatureForm,
+    self, count_valid_witnesses, witness_quorum_met, PinnedKeys, PinnedWitness,
 };
 
 /// A composite test key from seeds `[n; 32]` (ML-DSA) and `[n + 1; 32]`
@@ -50,19 +50,10 @@ fn pinned_of(c: &CompositeSigningKey) -> PinnedKeys {
     }
 }
 
-/// An earlier-form (bound-hybrid) test signer and its pinned keys.
-fn earlier(n: u8) -> (Box<sth_form::test_support::EarlierSigner>, PinnedKeys) {
-    use ciris_crypto::{ClassicalSigner as _, PqcSigner as _};
-    let ed = ciris_crypto::Ed25519Signer::from_seed(&[n; 32]).unwrap();
-    let ml = ciris_crypto::MlDsa65Signer::from_seed(&[n.wrapping_add(1); 32]).unwrap();
-    let keys = PinnedKeys {
-        ed25519_base64: B64.encode(ed.public_key().unwrap()),
-        ml_dsa_65_base64: Some(B64.encode(ml.public_key().unwrap())),
-    };
-    (
-        Box::new(ciris_crypto::HybridSigner::new(ed, ml).unwrap()),
-        keys,
-    )
+/// The pinned keys of the bound-hybrid test signer over seeds
+/// `([n + 1; 32], [n; 32])` (ML-DSA, Ed25519): a v61 witness.
+fn earlier_keys(n: u8) -> PinnedKeys {
+    pinned_of(&CompositeSigningKey::from_seeds(&[n.wrapping_add(1); 32], &[n; 32]))
 }
 
 fn head(
@@ -93,7 +84,7 @@ fn witness(id: &str, keys: PinnedKeys) -> PinnedWitness {
 /// The I1853 body over one log's head: every counting rule, against `sth`.
 fn i1853_counting_rules(sth: &SignedTreeHead, log: &str) {
     let (w1, w2, w3) = (composite(0x11), composite(0x21), composite(0x31));
-    let (e1, e1_keys) = earlier(0x41);
+    let e1_keys = earlier_keys(0x41);
     let trusted = vec![
         witness("w1", pinned_of(&w1)),
         witness("w2", pinned_of(&w2)),
@@ -196,23 +187,25 @@ fn i1853_counting_rules(sth: &SignedTreeHead, log: &str) {
         "I1853 {log}: a signature over other bytes"
     );
 
-    // The earlier form counts under its pinned hybrid keys, beside composites.
-    h.witness_signatures
-        .push(sth_form::test_support::earlier_cosign(&h, "e1", &e1, genesis.clone()).unwrap());
+    // An earlier-form (bound-hybrid) cosignature by a trusted witness, over
+    // the right bytes, never counts: a v62 node reads only composites.
+    h.witness_signatures.push(WitnessSignature {
+        witness_id: "e1".into(),
+        signature: sth_form::test_support::earlier_bytes(
+            [0x42; 32],
+            [0x41; 32],
+            &h.signing_bytes_of(),
+        ),
+        consistency_proof: genesis.clone(),
+    });
     assert_eq!(
         count_valid_witnesses(&h, &trusted),
-        3,
-        "I1853 {log}: mixed forms"
+        2,
+        "I1853 {log}: an earlier-form cosignature"
     );
-    assert!(witness_quorum_met(&h, &trusted, 3), "I1853 {log}: quorum 3");
-    assert!(
-        !witness_quorum_met(&h, &trusted, 4),
-        "I1853 {log}: quorum 4"
-    );
-    assert!(
-        witness_quorum_met(&h, &[], 0),
-        "I1853 {log}: a zero quorum is met"
-    );
+    assert!(witness_quorum_met(&h, &trusted, 2), "I1853 {log}: quorum 2");
+    assert!(!witness_quorum_met(&h, &trusted, 3), "I1853 {log}: quorum 3");
+    assert!(witness_quorum_met(&h, &[], 0), "I1853 {log}: a zero quorum is met");
 }
 
 /// I1853 over the AUDIT log's head (a tenant tree in `merkle_sth_log`),
@@ -314,48 +307,51 @@ fn local_signer(n: u8) -> crate::signing::LocalSigner {
     )
 }
 
-/// I1854 — the write form follows the ceremony state; the read follows the
-/// bytes.
+/// I1854 — heads are written as the composite and read only as one.
 #[tokio::test]
-async fn i1854_heads_are_written_by_ceremony_state_and_read_by_form() {
+async fn i1854_heads_are_composites_and_the_earlier_form_is_refused_by_name() {
     let signer = local_signer(0x61);
     let keys = pinned_of(&composite(0x61));
     let probe = head("tenant:i1854", 2, [0x22; 32], &composite(0x61));
     let bytes = probe.signing_bytes_of();
 
-    // No ceremony row is held by any node today.
-    assert_eq!(sth_form::ceremony_state(), CeremonyState::NotHeld);
-
-    // Before the ceremony row: the earlier form, verifying by CC 8.11.12.
-    let earlier = sth_form::sign_sth(&signer, &bytes, CeremonyState::NotHeld)
-        .await
-        .unwrap();
-    assert_eq!(sth_form::form_of(&earlier), Some(SignatureForm::Earlier));
-    assert_eq!(
-        sth_form::verify_sth_signature(&probe, &earlier, &keys).unwrap(),
-        SignatureForm::Earlier
-    );
-
-    // After it: the composite, byte-equal to Verify's own key for the same
+    // Written: the composite, byte-equal to Verify's own key for the same
     // seeds (both halves are deterministic), verifying under the pinned key.
-    let forward = sth_form::sign_sth(&signer, &bytes, CeremonyState::Held)
-        .await
-        .unwrap();
-    assert_eq!(sth_form::form_of(&forward), Some(SignatureForm::Composite));
+    let forward = sth_form::sign_sth(&signer, &bytes).await.unwrap();
     assert_eq!(forward, composite(0x61).sign(&bytes).unwrap());
+    sth_form::verify_sth_signature(&probe, &forward, &keys).unwrap();
+    // ... and not under another key.
+    assert!(sth_form::verify_sth_signature(&probe, &forward, &pinned_of(&composite(0x71))).is_err());
+
+    // The earlier form (a v61 head, the signer's own keys, the right bytes)
+    // is refused by name, never verified.
+    let earlier = sth_form::test_support::earlier_bytes([0x61; 32], [0x62; 32], &bytes);
     assert_eq!(
-        sth_form::verify_sth_signature(&probe, &forward, &keys).unwrap(),
-        SignatureForm::Composite
+        sth_form::classify(&earlier),
+        Err(sth_form::SthFormRefusal::EarlierForm)
     );
+    let err = sth_form::verify_sth_signature(&probe, &earlier, &keys).unwrap_err();
+    assert!(
+        err.to_string().contains(sth_form::STH_SIGNATURE_EARLIER_FORM),
+        "I1854: {err}"
+    );
+    // A head whose JSON carries the v22 signature OBJECT is refused by name.
+    let mut v = serde_json::to_value(&probe).unwrap();
+    v["signature"] = serde_json::from_slice(&earlier).unwrap();
+    assert!(matches!(
+        sth_form::sth_from_json(v),
+        Err(sth_form::SthJsonError::Form(sth_form::SthFormRefusal::EarlierForm))
+    ));
 
-    // Each form under the WRONG keys is refused, by its own rule.
-    let other = pinned_of(&composite(0x71));
-    assert!(sth_form::verify_sth_signature(&probe, &earlier, &other).is_err());
-    assert!(sth_form::verify_sth_signature(&probe, &forward, &other).is_err());
-
-    // Bytes of neither form are refused, never absent.
+    // Bytes in no form are refused, never absent.
     for junk in [&b""[..], b"{\"not\":\"a signature\"}", &[7u8; 100]] {
-        assert!(sth_form::classify(junk).is_err(), "I1854: {junk:?}");
+        assert!(
+            matches!(
+                sth_form::classify(junk),
+                Err(sth_form::SthFormRefusal::Unrecognized { .. })
+            ),
+            "I1854: {junk:?}"
+        );
         assert!(sth_form::verify_sth_signature(&probe, junk, &keys).is_err());
     }
 }
@@ -392,8 +388,8 @@ impl ciris_keyring::PqcSigner for NoContextSign {
     }
 }
 
-/// I1854 — a signer that cannot context-sign refuses the composite by name,
-/// and never falls back to the earlier form on its own.
+/// I1854 — a signer that cannot context-sign refuses the composite by name;
+/// there is no other form to fall back to.
 #[tokio::test]
 async fn i1854_a_signer_without_context_sign_refuses_the_composite_by_name() {
     let signer = crate::signing::LocalSigner::from_parts(
@@ -402,9 +398,7 @@ async fn i1854_a_signer_without_context_sign_refuses_the_composite_by_name() {
         Some(Arc::new(NoContextSign)),
         Some("stub".into()),
     );
-    let err = sth_form::sign_sth(&signer, b"bytes", CeremonyState::Held)
-        .await
-        .unwrap_err();
+    let err = sth_form::sign_sth(&signer, b"bytes").await.unwrap_err();
     assert!(
         matches!(err, crate::signing::LocalSignerError::CompositeUnavailable),
         "I1854: {err:?}"
@@ -412,17 +406,18 @@ async fn i1854_a_signer_without_context_sign_refuses_the_composite_by_name() {
     assert!(err.to_string().contains("composite_signing_unavailable"));
 }
 
-/// I1857 — §19 objects verify by form, both forms written by the node's
-/// signer (the forward builders), and the refusals hold.
+/// I1857 — §19 objects: the node's signer writes the composite (the forward
+/// builders), it admits, a tampered one does not, and the earlier pair is
+/// refused by name.
 #[tokio::test]
-async fn i1857_sig19_objects_verify_by_form() {
+async fn i1857_sig19_objects_are_composites_and_the_earlier_pair_is_refused() {
     use crate::verify::sig19::{sign_sig19, verify_sig19, Sig19, Sig19Error};
     let signer = local_signer(0x81);
     let keys = pinned_of(&composite(0x81));
     let ed_pub = B64.decode(&keys.ed25519_base64).unwrap();
     let ml_pub = B64.decode(keys.ml_dsa_65_base64.as_ref().unwrap()).unwrap();
 
-    // A wholeness witness, in each form, through the admission gate.
+    // A wholeness witness through the admission gate.
     let leaves = vec![crate::witness::WitnessLeaf {
         claim_namespace: "scores:medical".into(),
         cohort_scope: "community".into(),
@@ -430,61 +425,32 @@ async fn i1857_sig19_objects_verify_by_form() {
         leaf_bytes: b"leaf".to_vec(),
     }];
     let w = crate::witness::build_local_witness("peer-i1857", 1, 1000, &leaves);
-    for ceremony in [CeremonyState::NotHeld, CeremonyState::Held] {
-        let sig = crate::witness::sign_wholeness_witness(&signer, &w, ceremony)
-            .await
-            .unwrap();
-        assert_eq!(sig.form(), ceremony.writes());
-        crate::witness::admit_witness(
-            &w,
-            &sig,
-            "i1857-pqc",
-            &keys.ed25519_base64,
-            keys.ml_dsa_65_base64.as_deref(),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("I1857: a {ceremony:?} witness admits: {e}"));
-    }
-    // A tampered composite and an earlier form without its PQC half: refused.
-    let Sig19::Composite(mut c) = sign_sig19(&signer, &w.canonical_preimage(), CeremonyState::Held)
-        .await
-        .unwrap()
-    else {
-        panic!("I1857: Held writes the composite")
-    };
-    c[100] ^= 1;
-    assert_eq!(
-        verify_sig19(
-            &w.canonical_preimage(),
-            &Sig19::Composite(c),
-            &ed_pub,
-            &ml_pub
-        ),
-        Err(Sig19Error::CompositeInvalid)
-    );
-    let Sig19::Earlier { ed25519, .. } =
-        sign_sig19(&signer, &w.canonical_preimage(), CeremonyState::NotHeld)
-            .await
-            .unwrap()
-    else {
-        panic!("I1857: NotHeld writes the earlier form")
-    };
-    let no_pqc = Sig19::Earlier {
-        ed25519,
-        mldsa65: None,
-    };
-    assert!(crate::witness::admit_witness(
+    let sig = crate::witness::sign_wholeness_witness(&signer, &w).await.unwrap();
+    assert_eq!(sig.0, composite(0x81).sign(&w.canonical_preimage()).unwrap());
+    crate::witness::admit_witness(
         &w,
-        &no_pqc,
+        &sig,
         "i1857-pqc",
         &keys.ed25519_base64,
         keys.ml_dsa_65_base64.as_deref(),
-        None
+        None,
     )
-    .is_err());
+    .unwrap_or_else(|e| panic!("I1857: the composite witness admits: {e}"));
+    // A tampered composite is refused.
+    let mut bad = sign_sig19(&signer, &w.canonical_preimage()).await.unwrap();
+    bad.0[100] ^= 1;
+    assert_eq!(
+        verify_sig19(&w.canonical_preimage(), &bad, &ed_pub, &ml_pub),
+        Err(Sig19Error::CompositeInvalid)
+    );
+    // The earlier pair, on the one-argument wire, is refused by name.
+    assert_eq!(
+        Sig19::from_wire(r#"{"ed25519":"AAAA","ml_dsa_65":"AAAA"}"#),
+        Err(Sig19Error::EarlierForm)
+    );
 
-    // A storage-contention wire in each form verifies; both forms at once is
-    // refused.
+    // A storage-contention wire the node signs verifies; the earlier pair
+    // on it is refused by name.
     use crate::fountain::storage_contention as sc;
     let payload = serde_json::json!({
         "node_id": "node-i1857",
@@ -495,28 +461,18 @@ async fn i1857_sig19_objects_verify_by_form() {
         "want": ["cid-a", "cid-b"],
     })
     .to_string();
-    let mut wires = Vec::new();
-    for ceremony in [CeremonyState::NotHeld, CeremonyState::Held] {
-        let wire = sc::sign_corpus_want_wire(&signer, &payload, ceremony)
-            .await
-            .unwrap();
-        sc::verify_corpus_want_wire(
-            &wire,
-            &keys.ed25519_base64,
-            keys.ml_dsa_65_base64.as_ref().unwrap(),
-        )
-        .unwrap_or_else(|e| panic!("I1857: a {ceremony:?} corpus-want verifies: {e}"));
-        wires.push(serde_json::from_str::<serde_json::Value>(&wire).unwrap());
-    }
-    let mut both = wires[1].clone();
-    both["signature_ed25519_base64"] = wires[0]["signature_ed25519_base64"].clone();
-    both["signature_ml_dsa_65_base64"] = wires[0]["signature_ml_dsa_65_base64"].clone();
-    assert!(sc::verify_corpus_want_wire(
-        &both.to_string(),
-        &keys.ed25519_base64,
-        keys.ml_dsa_65_base64.as_ref().unwrap()
-    )
-    .is_err());
+    let wire = sc::sign_corpus_want_wire(&signer, &payload).await.unwrap();
+    let ml_b64 = keys.ml_dsa_65_base64.as_ref().unwrap();
+    sc::verify_corpus_want_wire(&wire, &keys.ed25519_base64, ml_b64)
+        .unwrap_or_else(|e| panic!("I1857: the composite corpus-want verifies: {e}"));
+    let mut earlier: serde_json::Value = serde_json::from_str(&wire).unwrap();
+    earlier["signature_ed25519_base64"] = serde_json::json!("AAAA");
+    earlier["signature_ml_dsa_65_base64"] = serde_json::json!("AAAA");
+    earlier["signature_composite_base64"] = serde_json::json!("");
+    assert!(matches!(
+        sc::verify_corpus_want_wire(&earlier.to_string(), &keys.ed25519_base64, ml_b64),
+        Err(sc::StorageContentionError::EarlierForm)
+    ));
 }
 
 /// The I1855 body: the stream door on one backend.
@@ -524,6 +480,7 @@ async fn i1857_sig19_objects_verify_by_form() {
 pub(crate) mod bodies {
     use super::*;
     use crate::federation::{BlobBody, BlobStorage, FederationDirectory, SignedKeyRecord};
+    use ciris_verify_core::transparency::WitnessSignature;
 
     async fn register<B: FederationDirectory>(backend: &B, key_id: &str, keys: &PinnedKeys) {
         let record = crate::federation::KeyRecord {
@@ -559,7 +516,7 @@ pub(crate) mod bodies {
 
     /// I1855 on `backend` (a migrated, empty store). `tag` keeps postgres
     /// rows self-isolating.
-    pub(crate) async fn i1855_the_stream_door_verifies_by_form<B>(backend: &B, tag: &str)
+    pub(crate) async fn i1855_the_stream_door_reads_only_composites<B>(backend: &B, tag: &str)
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
@@ -641,10 +598,11 @@ pub(crate) mod bodies {
             "I1855 {tag}: the served witness counts"
         );
 
-        // An earlier-form head (a v61 producer) at the next size still admits.
-        let (old, old_keys) = earlier(0xA1);
+        // An earlier-form head (a v61 producer, its own registered keys, the
+        // right root) is refused by name, and so is an earlier-form witness
+        // on a composite head.
         let old_id = format!("i1855-earlier-{tag}");
-        register(backend, &old_id, &old_keys).await;
+        register(backend, &old_id, &earlier_keys(0xA1)).await;
         let root3 = {
             use ciris_verify_core::transparency::{InMemoryTransparencyStore, TransparencyStore};
             let s: InMemoryTransparencyStore<super::super::stream_sth::StreamChunkLeaf> =
@@ -656,34 +614,47 @@ pub(crate) mod bodies {
             s.root().unwrap()
         };
         let mut v61 = head(&log_id, 3, root3, &producer);
-        v61.signature = sth_form::test_support::earlier_sign(&old, &v61.signing_bytes_of());
-        backend
-            .put_stream_sth(v61.clone(), &old_id)
-            .await
-            .unwrap_or_else(|e| panic!("I1855 {tag}: an earlier-form head admits: {e}"));
-        let served = backend.latest_stream_sth(&stream).await.unwrap().unwrap();
-        assert_eq!(
-            sth_form::form_of(&served.signature),
-            Some(SignatureForm::Earlier)
+        v61.signature =
+            sth_form::test_support::earlier_bytes([0xA2; 32], [0xA1; 32], &v61.signing_bytes_of());
+        let err = backend.put_stream_sth(v61, &old_id).await.unwrap_err();
+        assert!(
+            err.to_string().contains(sth_form::STH_SIGNATURE_EARLIER_FORM),
+            "I1855 {tag}: {err}"
         );
-        assert_eq!(served.signature, v61.signature);
+        let mut mixed = head(&log_id, 3, root3, &producer);
+        mixed.witness_signatures = vec![WitnessSignature {
+            witness_id: old_id.clone(),
+            signature: sth_form::test_support::earlier_bytes(
+                [0xA2; 32],
+                [0xA1; 32],
+                &mixed.signing_bytes_of(),
+            ),
+            consistency_proof: genesis.clone(),
+        }];
+        let err = backend.put_stream_sth(mixed, &producer_id).await.unwrap_err();
+        assert!(
+            err.to_string().contains(sth_form::STH_SIGNATURE_EARLIER_FORM),
+            "I1855 {tag}: an earlier-form witness: {err}"
+        );
+        let served = backend.latest_stream_sth(&stream).await.unwrap().unwrap();
+        assert_eq!(served.tree_size, 2, "I1855 {tag}: nothing refused was stored");
     }
 }
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn i1855_the_stream_door_verifies_by_form_sqlite() {
+async fn i1855_the_stream_door_reads_only_composites_sqlite() {
     use crate::store::Backend as _;
     let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
         .await
         .unwrap();
     backend.run_migrations().await.unwrap();
-    bodies::i1855_the_stream_door_verifies_by_form(&backend, "sqlite").await;
+    bodies::i1855_the_stream_door_reads_only_composites(&backend, "sqlite").await;
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
-async fn i1855_the_stream_door_verifies_by_form_postgres() {
+async fn i1855_the_stream_door_reads_only_composites_postgres() {
     use crate::store::Backend as _;
     let Some(dsn) = crate::test_pg::empty_dsn() else {
         eprintln!("I1855: CIRIS_PERSIST_TEST_PG_URL unset; skipped");
@@ -693,5 +664,5 @@ async fn i1855_the_stream_door_verifies_by_form_postgres() {
         .await
         .unwrap();
     backend.run_migrations().await.unwrap();
-    bodies::i1855_the_stream_door_verifies_by_form(&backend, "postgres").await;
+    bodies::i1855_the_stream_door_reads_only_composites(&backend, "postgres").await;
 }

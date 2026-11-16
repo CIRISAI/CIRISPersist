@@ -353,8 +353,9 @@ async fn i1567_assert<G, E, R>(
     E: std::future::Future<Output = ()>,
     R: std::future::Future<Output = ()>,
 {
-    use crate::audit::merkle_store::{verify_audit_sth, AUDIT_STH_NOT_HYBRID};
-    let (ed_pk, pqc_pk) = pins;
+    // The pins verify the genuine head in I1565; here the head is checked for
+    // its form only (it is injected without its `signed_at`).
+    let _ = pins;
 
     heads.genuine.await;
     let proof = super::build_audit_chain_proof(dispatch, trace_id)
@@ -366,39 +367,25 @@ async fn i1567_assert<G, E, R>(
     // verifies a genuine head stored through the door.
     let head = proof_head(&proof, who);
     assert_eq!(head.tree_size, 1, "I1567 {who}: the genuine head");
-    assert!(
-        !crate::federation::sth_form::test_support::earlier_of(&head.signature)
-            .pqc
-            .signature
-            .is_empty(),
-        "I1567 {who}: the genuine head carries its ML-DSA-65 half"
+    assert_eq!(
+        crate::federation::sth_form::classify(&head.signature).map(<[u8]>::len),
+        Ok(ciris_crypto::composite::SIGNATURE_LEN),
+        "I1567 {who}: the genuine head is a composite"
     );
 
+    // v62.0.0 (CC rc20, nothing carries): a stored earlier-form head (the row
+    // a v61 node left) is refused by name, never served.
+    // TODO(archive-ruling): the pre-v62 store's fate is an open ruling.
     heads.emptied.await;
-    let proof = super::build_audit_chain_proof(dispatch, trace_id)
-        .await
-        .unwrap_or_else(|e| {
-            panic!("I1567 {who}: a stored head without its half is served as itself: {e}")
-        });
-    assert_eq!(proof.entries.len(), 1, "I1567 {who}: the chain");
-    let head = proof_head(&proof, who);
-    assert_eq!(
-        head.tree_size, 2,
-        "I1567 {who}: the newest stored head is served, not the genuine one below it"
-    );
-    assert!(
-        crate::federation::sth_form::test_support::earlier_of(&head.signature)
-            .pqc
-            .signature
-            .is_empty(),
-        "I1567 {who}: served as itself, its half still empty"
-    );
-    match verify_audit_sth(&head, ed_pk, pqc_pk) {
+    match super::build_audit_chain_proof(dispatch, trace_id).await {
         Err(e) => assert!(
-            e.to_string().contains(AUDIT_STH_NOT_HYBRID),
-            "I1567 {who}: verify refuses the served head with the token: {e}"
+            e.contains(crate::federation::sth_form::STH_SIGNATURE_EARLIER_FORM),
+            "I1567 {who}: the earlier-form head is refused by name: {e}"
         ),
-        Ok(()) => panic!("I1567 {who}: a head without its ML-DSA-65 half must not verify"),
+        Ok(p) => panic!(
+            "I1567 {who}: an earlier-form head must not be served as head_signature={:?}",
+            p.head_signature
+        ),
     }
 
     heads.removed.await;

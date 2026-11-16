@@ -15,7 +15,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use super::clock::{self, FixedClock};
 use super::rt::{self, TaskError, TokioExecutor};
 #[cfg(feature = "sqlite")]
-use super::{HostSeams, Lifecycle, LifecycleEvent};
+use super::HostSeams;
+#[cfg(all(feature = "sqlite", feature = "queue"))]
+use super::{Lifecycle, LifecycleEvent};
 
 /// An instant every store keeps exactly: whole milliseconds, so the
 /// substrate truncations (ms for a signed `valid_from`, µs for a stamp) are
@@ -278,7 +280,8 @@ fn i1793_dispatch_runs_where_the_profile_says() {
 /// (a waiter that arrives later resolves at once). Background / foreground
 /// move the state and never resolve it. A persister the host shuts down
 /// through the lifecycle drains and exits.
-#[cfg(feature = "sqlite")]
+// v62.0.0 (slice D): the persister rides `queue`.
+#[cfg(all(feature = "sqlite", feature = "queue"))]
 #[tokio::test]
 async fn i1797_lifecycle_shutdown_is_the_hosts_event() {
     let lc = Lifecycle::new();
@@ -338,7 +341,7 @@ async fn i1797_lifecycle_shutdown_is_the_hosts_event() {
         .expect("I1797: the persister exits cleanly");
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", feature = "queue"))]
 fn test_signer_arc() -> (Arc<dyn ciris_keyring::HardwareSigner>, String) {
     use ciris_keyring::Ed25519SoftwareSigner;
     let key_id = "i1797-scrub-key".to_owned();
@@ -393,7 +396,7 @@ fn i1798_single_thread_teardown_drops_inline() {
 /// bridged each entry through a scoped OS thread and `block_on`). A journal
 /// entry the pipeline refuses halts the replay with the entry kept, as the
 /// synchronous `Journal::replay` always did.
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", feature = "queue"))]
 #[test]
 fn i1799_journal_replay_awaits_in_place() {
     let dir = tempfile::tempdir().unwrap();

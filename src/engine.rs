@@ -15438,15 +15438,23 @@ mod tests {
     /// test-stack rule).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     struct QShapeId {
-        ed: ciris_crypto::Ed25519Signer,
-        pqc: ciris_crypto::MlDsa65Signer,
+        /// v62.0.0: the composite (CC 2.6.1.7) a §Q wire carries.
+        key: ciris_crypto::composite::CompositeSigningKey,
     }
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn qshape_id() -> QShapeId {
+        let seed = |u: uuid::Uuid| {
+            let mut s = [0u8; 32];
+            s[..16].copy_from_slice(u.as_bytes());
+            s[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            s
+        };
         QShapeId {
-            ed: ciris_crypto::Ed25519Signer::random().unwrap(),
-            pqc: ciris_crypto::MlDsa65Signer::new().unwrap(),
+            key: ciris_crypto::composite::CompositeSigningKey::from_seeds(
+                &seed(uuid::Uuid::new_v4()),
+                &seed(uuid::Uuid::new_v4()),
+            ),
         }
     }
 
@@ -15454,14 +15462,12 @@ mod tests {
     fn qshape_pubs(id: &QShapeId) -> (String, String) {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
-        use ciris_crypto::{ClassicalSigner, PqcSigner};
-        (
-            B64.encode(id.ed.public_key().unwrap()),
-            B64.encode(id.pqc.public_key().unwrap()),
-        )
+        let pk = id.key.public_key().as_bytes();
+        let (ml, ed) = pk.split_at(ciris_crypto::composite::MLDSA65_PK_LEN);
+        (B64.encode(ed), B64.encode(ml))
     }
 
-    /// Build + bound-hybrid sign a `StorageBudgetV1` wire: one `community`
+    /// Build + composite-sign a `StorageBudgetV1` wire: one `community`
     /// scope with `budget_bytes = 100_000` and the given
     /// `pin_reserve_bytes`, pinning `pinned_class` (MUST be pre-sorted).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -15477,7 +15483,6 @@ mod tests {
         };
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
-        use ciris_crypto::{ClassicalSigner, PqcSigner};
         let payload = serde_json::json!({
             "node_id": node_id,
             "epoch_id": "e1",
@@ -15491,11 +15496,8 @@ mod tests {
         })
         .to_string();
         let preimage = storage_budget_preimage(&payload).expect("valid §Q payload");
-        let ed_sig = id.ed.sign(&preimage).unwrap();
-        let mut bound = preimage.clone();
-        bound.extend_from_slice(&ed_sig);
-        let pqc_sig = id.pqc.sign(&bound).unwrap();
-        assemble_storage_budget_wire(&payload, B64.encode(&ed_sig), B64.encode(&pqc_sig))
+        let sig = id.key.sign(&preimage).unwrap();
+        assemble_storage_budget_wire(&payload, B64.encode(&sig))
             .expect("assemble signed budget wire")
     }
 

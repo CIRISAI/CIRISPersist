@@ -250,18 +250,17 @@ pub struct AggregationMetaVerifyInputsV1 {
     pub member_commitment_hex: String,
     /// What survives below the floor (codec-specific, canonical).
     pub noise_floor_descriptor: String,
-    /// EARLIER form (CC 8.11.12): Ed25519 signature over the §19.7.1
-    /// preimage — base64. Empty when the tier carries the composite.
-    #[serde(default)]
-    pub sig_ed25519_b64: String,
-    /// EARLIER form: ML-DSA-65 signature over `preimage ‖ ed25519_sig` —
-    /// base64. The PQC-mandatory half: empty/absent ⇒ rejected at the gate.
-    #[serde(default)]
-    pub sig_ml_dsa_65_b64: String,
-    /// v62.0.0 (CIRISVerify 23) — the CC 2.6.1.7 composite over the same
-    /// preimage, base64 (3373 bytes). A tier carries this OR the earlier
-    /// pair, never both (both is refused as ambiguous).
+    /// The EARLIER form's (CC 8.11.12) Ed25519 half. v62.0.0: present only to
+    /// refuse a pre-edition-2 tier by name (`aggregation_meta_earlier_form`);
+    /// a v62 tier leaves it empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sig_ed25519_b64: String,
+    /// The EARLIER form's ML-DSA-65 half (refused by name, as above).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sig_ml_dsa_65_b64: String,
+    /// v62.0.0 (CIRISVerify 23) — the CC 2.6.1.7 composite over the §19.7.1
+    /// preimage, base64 (3373 bytes). Required.
+    #[serde(default)]
     pub sig_composite_b64: String,
 }
 
@@ -310,6 +309,11 @@ pub enum AggregationMetaError {
     /// signed preimage). §10.1.5.1.1: rejected BEFORE persistence.
     #[error("aggregation_meta §19.7.1 bound-hybrid verify failed (PQC-mandatory)")]
     HybridRequired,
+    /// v62.0.0 — the tier carries the EARLIER (bound-hybrid) signature
+    /// pair, a pre-edition-2 object: a v62 node reads only CC 2.6.1.7
+    /// composites (CC rc20, nothing carries).
+    #[error("aggregation_meta_earlier_form: a bound-hybrid tier signature (pre-edition-2)")]
+    EarlierForm,
     /// The composite manifest envelope did not carry the aggregator's
     /// `pubkey_ed25519` / `pubkey_ml_dsa_65` needed to verify the meta.
     #[error("aggregation_meta verify: composite manifest envelope missing aggregator {0}")]
@@ -354,6 +358,7 @@ impl AggregationMetaError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::HybridRequired => "aggregation_meta_hybrid_required",
+            Self::EarlierForm => "aggregation_meta_earlier_form",
             Self::MissingAggregatorPubkey(_) => "aggregation_meta_missing_pubkey",
             Self::MalformedInput(_) => "aggregation_meta_invalid",
             Self::MemberCommitmentMismatch => "aggregation_meta_member_commitment",
@@ -511,42 +516,25 @@ impl AggregationMetaV1 {
         // v62.0.0 — by FORM: the composite (CC 2.6.1.7) through Verify's
         // `verify_aggregation_meta`; the earlier bound-hybrid pair (CC
         // 8.11.12) over the same §19.7.1 preimage.
-        let verified = if v.sig_composite_b64.is_empty() {
-            // An empty PQC sig is the hard-cut classical-only signal — reject
-            // before even decoding (mirrors the #225 fountain hard cut).
-            if v.sig_ml_dsa_65_b64.is_empty() {
-                return Err(AggregationMetaError::HybridRequired);
-            }
-            let sig = crate::verify::sig19::Sig19::earlier_b64(
-                &v.sig_ed25519_b64,
-                Some(&v.sig_ml_dsa_65_b64),
-            )
-            .map_err(|_| AggregationMetaError::MalformedInput("earlier-form signature base64"))?;
-            crate::verify::sig19::verify_sig19(
-                &verify_meta.signing_preimage(),
-                &sig,
-                &ed_pub,
-                &mldsa_pub,
-            )
-            .is_ok()
-        } else {
-            if !v.sig_ed25519_b64.is_empty() || !v.sig_ml_dsa_65_b64.is_empty() {
-                return Err(AggregationMetaError::MalformedInput(
-                    "a tier carries the composite or the earlier pair, not both",
-                ));
-            }
-            let sig = BASE64
-                .decode(&v.sig_composite_b64)
-                .map_err(|_| AggregationMetaError::MalformedInput("sig_composite base64"))?;
-            matches!(
-                verify_aggregation_meta(
-                    &verify_meta,
-                    &sig,
-                    &crate::verify::sig19::composite_pubkey(&ed_pub, &mldsa_pub),
-                ),
-                AggregationMetaVerification::Verified
-            )
-        };
+        // v62.0.0 — the composite only (CC 2.6.1.7); the earlier pair is
+        // refused by name before any signature math.
+        let sig = crate::verify::sig19::Sig19::from_wire_fields(
+            &v.sig_ed25519_b64,
+            &v.sig_ml_dsa_65_b64,
+            &v.sig_composite_b64,
+        )
+        .map_err(|e| match e {
+            crate::verify::sig19::Sig19Error::EarlierForm => AggregationMetaError::EarlierForm,
+            _ => AggregationMetaError::MalformedInput("sig_composite"),
+        })?;
+        let verified = matches!(
+            verify_aggregation_meta(
+                &verify_meta,
+                &sig.0,
+                &crate::verify::sig19::composite_pubkey(&ed_pub, &mldsa_pub),
+            ),
+            AggregationMetaVerification::Verified
+        );
         if !verified {
             return Err(AggregationMetaError::HybridRequired);
         }

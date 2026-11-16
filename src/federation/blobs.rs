@@ -5450,9 +5450,9 @@ pub(crate) async fn verify_stream_sth_signature<F>(
 where
     F: crate::federation::FederationDirectory,
 {
-    // v62.0.0 (slice D) — by FORM: an earlier-form (CC 8.11.12) head verifies
-    // hybrid-Strict, a composite (CC 2.6.1.7) under the producer's composite
-    // key; both against the producer's PINNED federation_keys row.
+    // v62.0.0 (slice D) — the composite (CC 2.6.1.7) under the producer's
+    // PINNED composite key (its federation_keys row); an earlier-form head is
+    // refused by name (`sth_signature_earlier_form`).
     crate::federation::sth_form::verify_sth_signature_via_directory(
         directory,
         sth,
@@ -5460,7 +5460,6 @@ where
         &sth.signature,
     )
     .await
-    .map(|_form| ())
     .map_err(|e| {
         BlobError::InvalidArgument(format!(
             "put_stream_sth: producer signature verification failed for \
@@ -5547,7 +5546,6 @@ where
             &ws.signature,
         )
         .await
-        .map(|_form| ())
         .map_err(|e| {
             BlobError::InvalidArgument(format!(
                 "put_stream_sth: witness cosignature verification failed for \

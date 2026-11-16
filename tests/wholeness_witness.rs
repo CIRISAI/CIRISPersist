@@ -20,8 +20,6 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
-use ed25519_dalek::{Signer as _, SigningKey};
 
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::store::Backend;
@@ -32,40 +30,30 @@ use ciris_persist::witness::{
 };
 use ciris_verify_core::substrate::WholenessWitness;
 
-/// Producer identity (Ed25519 + ML-DSA-65) with b64 pubkeys.
+/// Producer identity: a CC 2.6.1.7 composite (ML-DSA-65 + Ed25519) with its
+/// two b64 pubkeys. v62.0.0: §19 objects are composites only.
 struct Producer {
-    ed: SigningKey,
+    key: ciris_crypto::composite::CompositeSigningKey,
     ed_pub_b64: String,
-    mldsa: MlDsa65SoftwareSigner,
 }
 
 impl Producer {
     fn new(seed: u8) -> Self {
-        let ed = SigningKey::from_bytes(&[seed; 32]);
-        let ed_pub_b64 = BASE64.encode(ed.verifying_key().to_bytes());
-        let mldsa =
-            MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], "witness-mldsa").unwrap();
-        Self {
-            ed,
-            ed_pub_b64,
-            mldsa,
-        }
+        let key =
+            ciris_crypto::composite::CompositeSigningKey::from_seeds(&[seed ^ 0x55; 32], &[seed; 32]);
+        let ed_pub_b64 = BASE64.encode(
+            &key.public_key().as_bytes()[ciris_crypto::composite::MLDSA65_PK_LEN..],
+        );
+        Self { key, ed_pub_b64 }
     }
 
     async fn mldsa_pub_b64(&self) -> String {
-        BASE64.encode(self.mldsa.public_key().await.unwrap())
+        BASE64.encode(&self.key.public_key().as_bytes()[..ciris_crypto::composite::MLDSA65_PK_LEN])
     }
 
-    /// Bound-hybrid sign a witness's §19.1 canonical preimage:
-    /// Ed25519 over preimage, ML-DSA-65 over (preimage ‖ ed_sig).
-    /// Returns (ed_sig_b64, pqc_sig_b64).
-    async fn sign(&self, witness: &WholenessWitness) -> (String, String) {
-        let preimage = witness.canonical_preimage();
-        let ed_sig = self.ed.sign(&preimage).to_bytes();
-        let mut bound = preimage.clone();
-        bound.extend_from_slice(&ed_sig);
-        let pqc_sig = self.mldsa.sign(&bound).await.unwrap();
-        (BASE64.encode(ed_sig), BASE64.encode(&pqc_sig))
+    /// The composite over a witness's §19.1 canonical preimage.
+    async fn sign(&self, witness: &WholenessWitness) -> Sig19 {
+        Sig19(self.key.sign(&witness.canonical_preimage()).unwrap())
     }
 }
 
@@ -93,11 +81,11 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
         },
     ];
     let witness = build_local_witness(&peer, 1, 1000, &leaves);
-    let (ed_sig, pqc_sig) = producer.sign(&witness).await;
+    let ed_sig = producer.sign(&witness).await;
     backend
         .put_wholeness_witness(
             &witness,
-            &Sig19::earlier_b64(&ed_sig, Some(&pqc_sig)).unwrap(),
+            &ed_sig,
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -118,17 +106,23 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
         .iter()
         .all(|n| !n.contains("self") && !n.contains("anonymous")));
 
-    // ── (b) classical-only witness (no ML-DSA-65) → REJECTED, ZERO rows. ──
+    // ── (b) no ML-DSA-65 pubkey pinned → REJECTED, ZERO rows (the §19.0
+    //    hard cut); and the earlier bound-hybrid pair is refused at the wire
+    //    by name (v62.0.0, CC rc20: a v62 node reads only composites). ──
+    assert_eq!(
+        Sig19::from_wire_fields("AAAA", "AAAA", ""),
+        Err(ciris_persist::verify::sig19::Sig19Error::EarlierForm)
+    );
     let peer_classical = format!("peer-classical-{suffix}");
     let w2 = build_local_witness(&peer_classical, 1, 1000, &leaves);
-    let (ed_sig2, _pqc2) = producer.sign(&w2).await;
+    let ed_sig2 = producer.sign(&w2).await;
     let err = backend
         .put_wholeness_witness(
             &w2,
-            &Sig19::earlier_b64(&ed_sig2, None).unwrap(), // classical-only → §19.0 hard cut
+            &ed_sig2,
             "witness-mldsa",
             &producer.ed_pub_b64,
-            Some(&pqc_pub),
+            None, // no PQC key → §19.0 hard cut
             None,
         )
         .await
@@ -186,11 +180,11 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
         "(c) namespaces exclude self/anonymous"
     );
     // And it admits + stores (the disclosed-leaves recompute path).
-    let (ed3, pqc3) = producer.sign(&w_ww2).await;
+    let ed3 = producer.sign(&w_ww2).await;
     backend
         .put_wholeness_witness(
             &w_ww2,
-            &Sig19::earlier_b64(&ed3, Some(&pqc3)).unwrap(),
+            &ed3,
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -203,11 +197,11 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
     let peer_ar = format!("peer-ar-{suffix}");
     // Accept epoch 5.
     let w5 = build_local_witness(&peer_ar, 5, 5000, &leaves);
-    let (e5, p5) = producer.sign(&w5).await;
+    let e5 = producer.sign(&w5).await;
     backend
         .put_wholeness_witness(
             &w5,
-            &Sig19::earlier_b64(&e5, Some(&p5)).unwrap(),
+            &e5,
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -258,12 +252,12 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
     //        compare verdict over the peer is Consistent. ──
     let peer = format!("proj-consistent-{suffix}");
     let w = build_local_witness(&peer, 1, 1000, &leaves);
-    let (ed, pqc) = producer.sign(&w).await;
+    let ed = producer.sign(&w).await;
     for _ in 0..2 {
         backend
             .put_wholeness_witness(
                 &w,
-                &Sig19::earlier_b64(&ed, Some(&pqc)).unwrap(),
+                &ed,
                 "witness-mldsa",
                 &producer.ed_pub_b64,
                 Some(&pqc_pub),
@@ -291,13 +285,12 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
     // ── (b) tampered Ed25519 half → rejected BEFORE persist, zero rows. ──
     let peer_tamper = format!("proj-tamper-{suffix}");
     let wt = build_local_witness(&peer_tamper, 1, 1000, &leaves);
-    let (ed_t, pqc_t) = producer.sign(&wt).await;
-    let mut ed_bytes = BASE64.decode(&ed_t).unwrap();
-    ed_bytes[0] ^= 0x01; // flip one bit → classical half no longer verifies
+    let mut sig_t = producer.sign(&wt).await;
+    sig_t.0[3309] ^= 0x01; // flip one bit in the Ed25519 half → the composite no longer verifies
     let err = backend
         .put_wholeness_witness(
             &wt,
-            &Sig19::earlier_b64(&BASE64.encode(&ed_bytes), Some(&pqc_t)).unwrap(),
+            &sig_t,
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -330,11 +323,11 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
     let wb = build_local_witness(&peer_eq, 7, 7001, &leaves_b);
     assert_ne!(wa.merkle_root, wb.merkle_root);
     for w in [&wa, &wb] {
-        let (ed, pqc) = producer.sign(w).await;
+        let ed = producer.sign(w).await;
         backend
             .put_wholeness_witness(
                 w,
-                &Sig19::earlier_b64(&ed, Some(&pqc)).unwrap(),
+                &ed,
                 "witness-mldsa",
                 &producer.ed_pub_b64,
                 Some(&pqc_pub),
@@ -405,11 +398,11 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
         observed_at_unix_ms: 1000,
         witness_version: 1,
     };
-    let (ed_s, pqc_s) = producer.sign(&w_self).await;
+    let ed_s = producer.sign(&w_self).await;
     let err = backend
         .put_wholeness_witness(
             &w_self,
-            &Sig19::earlier_b64(&ed_s, Some(&pqc_s)).unwrap(),
+            &ed_s,
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -569,11 +562,11 @@ async fn equivocation_emits_hard_case_and_retains_both() {
     assert_ne!(wa.merkle_root, wb.merkle_root);
 
     for w in [&wa, &wb] {
-        let (ed, pqc) = producer.sign(w).await;
+        let ed = producer.sign(w).await;
         backend
             .put_wholeness_witness(
                 w,
-                &Sig19::earlier_b64(&ed, Some(&pqc)).unwrap(),
+                &ed,
                 "witness-mldsa",
                 &producer.ed_pub_b64,
                 Some(&pqc_pub),

@@ -18,7 +18,7 @@ use ciris_verify_core::substrate::{
     self, compute_merkle_root, verify_witness, HolonomicError, WholenessWitness,
 };
 
-use crate::verify::sig19::{Sig19, Sig19Error};
+use crate::verify::sig19::Sig19;
 
 use super::types::{encode_root_hex, StoredWitness, WitnessLeaf, WITNESS_VERSION_V1};
 
@@ -114,42 +114,6 @@ fn map_substrate_error(err: HolonomicError) -> WitnessAdmitError {
     }
 }
 
-/// v62.0.0 — the earlier form's (CC 8.11.12) refusals onto the gate's shape.
-fn map_sig19_error(err: Sig19Error) -> WitnessAdmitError {
-    match err {
-        Sig19Error::HybridRequired => WitnessAdmitError::HybridRequired,
-        Sig19Error::EarlierInvalid => {
-            WitnessAdmitError::HybridVerify("earlier-form signature invalid".to_owned())
-        }
-        Sig19Error::Malformed(m) => WitnessAdmitError::MalformedSignature(m),
-        other => WitnessAdmitError::HybridVerify(other.to_string()),
-    }
-}
-
-/// The WW-2 namespace guard and the disclosed-leaf recompute, as Verify's
-/// `verify_witness` runs them around its signature check: for the EARLIER
-/// form, whose signature Verify 23.1.0 cannot check.
-fn earlier_form_structure(
-    witness: &WholenessWitness,
-    disclosed_leaves: Option<&[Vec<u8>]>,
-) -> Result<(), WitnessAdmitError> {
-    const FORBIDDEN: [&str; 2] = ["self", "anonymous"];
-    if witness.claim_namespaces.is_empty()
-        || witness.claim_namespaces.iter().any(|ns| {
-            let lower = ns.to_ascii_lowercase();
-            FORBIDDEN.iter().any(|m| lower.contains(m))
-        })
-    {
-        return Err(WitnessAdmitError::NamespaceInvalid);
-    }
-    if let Some(leaves) = disclosed_leaves {
-        if compute_merkle_root(leaves).map_err(map_substrate_error)? != witness.merkle_root {
-            return Err(WitnessAdmitError::RootMismatch);
-        }
-    }
-    Ok(())
-}
-
 /// WW-2 leaf filter (persist's responsibility, §19.1). Drop anonymous-tier
 /// and `cohort_scope: self` leaves (and any leaf whose namespace itself
 /// names self/anonymous), returning the surviving raw leaf-bytes set the
@@ -217,13 +181,10 @@ pub fn build_local_witness(
 /// Run the §19.1 verify-before-persist gate for a candidate witness, and
 /// on `Ok` return the [`StoredWitness`] the backend may insert.
 ///
-/// `signature` is the producer's signature in either FORM (v62.0.0): the
-/// CC 2.6.1.7 composite, verified by Verify's `verify_witness` under the
-/// composite key of the pinned pair; or the earlier bound-hybrid pair (CC
-/// 8.11.12), verified here under the same WW-2 namespace guard and leaf
-/// recompute. An earlier form with no ML-DSA-65 half, or a missing ML-DSA-65
-/// pubkey, is the §19.0 hard cut ([`WitnessAdmitError::HybridRequired`]),
-/// deterministic, before any signature math.
+/// `signature` is the producer's CC 2.6.1.7 composite (v62.0.0), verified by
+/// Verify's `verify_witness` under the composite key of the pinned pair. A
+/// missing ML-DSA-65 pubkey is the §19.0 hard cut
+/// ([`WitnessAdmitError::HybridRequired`]), before any signature math.
 ///
 /// `disclosed_leaves`, when `Some`, are re-hashed and the resulting root
 /// must equal the witness's `merkle_root`.
@@ -245,12 +206,10 @@ pub fn admit_witness(
         });
     }
 
-    // (1) §19.0 PQC-mandatory hard cut, before any key or signature math.
-    if let Sig19::Earlier { mldsa65, .. } = signature {
-        if mldsa65.as_deref().is_none_or(<[u8]>::is_empty) {
-            return Err(WitnessAdmitError::HybridRequired);
-        }
-    }
+    // (1) §19.0 PQC-mandatory: the ML-DSA-65 key must be pinned, before
+    //     any signature math. (An earlier-form, bound-hybrid signature never
+    //     reaches here: `Sig19` is the composite, and the wire parsers refuse
+    //     the earlier pair by name, `sig19_earlier_form`.)
     let pqc_pubkey_b64 = match ml_dsa_65_pubkey_b64 {
         Some(s) if !s.is_empty() => s,
         _ => return Err(WitnessAdmitError::HybridRequired),
@@ -262,34 +221,19 @@ pub fn admit_witness(
         .decode(pqc_pubkey_b64)
         .map_err(|e| WitnessAdmitError::MalformedKey(format!("ml_dsa_65 pubkey: {e}")))?;
 
-    // (2) The §19.1 gate, by form.
+    // (2) The §19.1 gate: the composite over the canonical preimage + the
+    //     WW-2 namespace guard + (when disclosed) the leaf/root recompute.
+    //     verify_witness owns all three — persist does not re-roll them.
     let preimage = witness.canonical_preimage();
-    match signature {
-        Sig19::Composite(sig) => verify_witness(
-            witness,
-            &preimage,
-            sig,
-            &crate::verify::sig19::composite_pubkey(&ed_pubkey, &pqc_pubkey),
-            disclosed_leaves,
-        )
-        .map_err(map_substrate_error)?,
-        Sig19::Earlier { .. } => {
-            earlier_form_structure(witness, None)?;
-            crate::verify::sig19::verify_sig19(&preimage, signature, &ed_pubkey, &pqc_pubkey)
-                .map_err(map_sig19_error)?;
-            earlier_form_structure(witness, disclosed_leaves)?;
-        }
-    }
-    let (sig_stored, pqc_sig_stored) = match signature {
-        Sig19::Composite(sig) => (BASE64.encode(sig), String::new()),
-        Sig19::Earlier { ed25519, mldsa65 } => (
-            BASE64.encode(ed25519),
-            mldsa65
-                .as_deref()
-                .map(|m| BASE64.encode(m))
-                .unwrap_or_default(),
-        ),
-    };
+    verify_witness(
+        witness,
+        &preimage,
+        &signature.0,
+        &crate::verify::sig19::composite_pubkey(&ed_pubkey, &pqc_pubkey),
+        disclosed_leaves,
+    )
+    .map_err(map_substrate_error)?;
+    let (sig_stored, pqc_sig_stored) = (BASE64.encode(&signature.0), String::new());
 
     // Admitted. Build the corpus row (no in-band `verified` flag, F-5).
     Ok(StoredWitness {
@@ -306,18 +250,16 @@ pub fn admit_witness(
     })
 }
 
-/// v62.0.0 — sign a witness with the node's signer, in the form its ceremony
-/// state writes (CC D4: earlier before the edition-2 ceremony row, composite
-/// after), over the §19.1 canonical preimage [`admit_witness`] checks.
+/// v62.0.0 — sign a witness with the node's signer: the composite, over the
+/// §19.1 canonical preimage [`admit_witness`] checks.
 ///
 /// # Errors
 /// The signer's error.
 pub async fn sign_wholeness_witness(
     signer: &crate::signing::LocalSigner,
     witness: &WholenessWitness,
-    ceremony: crate::federation::sth_form::CeremonyState,
 ) -> Result<Sig19, crate::signing::LocalSignerError> {
-    crate::verify::sig19::sign_sig19(signer, &witness.canonical_preimage(), ceremony).await
+    crate::verify::sig19::sign_sig19(signer, &witness.canonical_preimage()).await
 }
 
 /// Re-export so callers do not have to reach into verify-core for the
@@ -367,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn classical_only_is_hard_cut_rejected() {
+    fn the_earlier_form_and_a_missing_pqc_key_are_refused() {
         let w = build_local_witness(
             "p",
             1,
@@ -379,12 +321,17 @@ mod tests {
                 leaf_bytes: b"x".to_vec(),
             }],
         );
-        // Empty PQC sig → hard cut, no signature math.
-        let sig = Sig19::earlier_b64("AA==", Some("")).unwrap();
-        let err = admit_witness(&w, &sig, "k", "AA==", Some("AA=="), None).unwrap_err();
-        assert_eq!(err.kind(), "witness_admit_hybrid_required");
-        // Absent PQC pubkey → hard cut.
-        let sig = Sig19::earlier_b64("AA==", Some("AA==")).unwrap();
+        // An earlier-form (bound-hybrid) pair is refused at the wire, by name.
+        assert_eq!(
+            Sig19::from_wire(r#"{"ed25519":"AA==","ml_dsa_65":"AA=="}"#),
+            Err(crate::verify::sig19::Sig19Error::EarlierForm)
+        );
+        assert_eq!(
+            Sig19::from_wire_fields("AA==", "", ""),
+            Err(crate::verify::sig19::Sig19Error::EarlierForm)
+        );
+        // Absent PQC pubkey → hard cut, before any signature math.
+        let sig = Sig19(vec![0u8; 3373]);
         let err = admit_witness(&w, &sig, "k", "AA==", None, None).unwrap_err();
         assert_eq!(err.kind(), "witness_admit_hybrid_required");
     }
