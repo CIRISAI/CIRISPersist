@@ -2054,7 +2054,7 @@ pub mod lifecycle_support {
         // (Unit-test builds only: the rooted fixture is test code; a
         // `test-anchor` simulation build keeps the v61 shape and gets the
         // stricter non-infrastructure path.)
-        #[cfg(test)]
+        #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
         if policy_blob
             .as_ref()
             .and_then(|b| b.get("cohort_subkind"))

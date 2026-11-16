@@ -20,6 +20,7 @@
 //!   does not verify is inert; the forward form ({node}, `infra:serve`, the
 //!   co-scrub) resolves; one anchor scrub is no conferral; a forged forward
 //!   co-scrub confers nothing.
+//! - **I1887** — the key-record store path's conflicts are typed.
 //! - **I1880** (CC 2.4 / 2.6.1.9) — a licensure row short of its quorum
 //!   authority waits (`affiliation_licence_invariants::i1214`).
 //! - **I1881–I1885** (CC 3.2 / 4.4.3.4 / 6.1.8 N1 / 5.4.6) — the infrastructure
@@ -558,6 +559,53 @@ pub(crate) mod bodies {
         assert!(!conformant(c).await, "I1884: not labelled infrastructure");
     }
 
+    /// **I1887** (CIRISPersist#1274 item 8) — the key-record store path's
+    /// conflicts are TYPED: the same key registered again with another record
+    /// is `same_key_different_record`, and other pubkeys under the key id are
+    /// `pubkey_change`. Until v62 both were one untyped `Conflict`.
+    pub(crate) async fn i1887_key_record_conflicts_are_typed(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::register::KeyRecordConflictReason as R;
+        let k = format!("i1887-k-{tag}");
+        d.put_public_key(SignedKeyRecord {
+            record: ts::replicated_key_record(&k, it::USER, &k, &k, "n1"),
+        })
+        .await
+        .expect("I1887: the first record");
+        let mut same_key = ts::replicated_key_record(&k, it::USER, &k, &k, "n1");
+        same_key.identity_ref = format!("elsewhere-{tag}");
+        match d.put_public_key(SignedKeyRecord { record: same_key }).await {
+            Err(Error::KeyRecordConflict {
+                reason: R::SameKeyDifferentRecord,
+                ..
+            }) => {}
+            other => panic!("I1887: the same key, another record: {other:?}"),
+        }
+        let mut swapped = ts::replicated_key_record(&k, it::USER, &k, &k, "n1");
+        swapped.pubkey_ed25519_base64 = ts::hybrid_pubkeys(&format!("other-{tag}")).0;
+        let err = d
+            .put_public_key(SignedKeyRecord { record: swapped })
+            .await
+            .expect_err("I1887: a pubkey swap is refused");
+        assert!(
+            matches!(
+                err,
+                Error::KeyRecordConflict {
+                    reason: R::PubkeyChange,
+                    ..
+                }
+            ),
+            "I1887: other pubkeys under the key id: {err:?}"
+        );
+        assert_eq!(err.kind(), "federation_key_record_conflict_pubkey_change");
+        assert!(
+            err.is_duplicate_key(),
+            "I1887: still a conflict to its callers"
+        );
+    }
+
     /// **I1871** — a `substrate_persist` key is asserted by a store under its
     /// own key: a self-signed registration is admitted with no co-scrub, and
     /// it carries no conferral (it is not canonical, and the privileged-type
@@ -728,6 +776,7 @@ mod runners {
                 }
                 case!(i1870_the_identity_set_rule_holds_on_every_door);
                 case!(i1871_substrate_persist_confers_nothing);
+                case!(i1887_key_record_conflicts_are_typed);
                 case!(i1883_a_self_declared_community_gets_nothing);
                 case!(i1884_conformance_is_the_record);
                 #[tokio::test]

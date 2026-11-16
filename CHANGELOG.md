@@ -57,6 +57,40 @@ These rules come from CC 1.0-rc20 (branch `rc20`, `140fed4a`; not yet tagged). P
 - An infrastructure community is authorized only as a conformant record rooted in this node's trust set. A community that relied on a self-claimed `substrate_persist` key gets the strict path: steward bindings, the DEK cascade, and no Commons audience.
 - A `user`+`agent` or `accord_holder`+`node`/`agent` key is refused everywhere, the replicated insert included. Server's aggregate counts none such [#1274].
 
+### Tested (slice E1)
+
+- I1870–I1887 on sqlite and postgres (`federation/rc20_rules_invariants.rs`, `accord_lineage_vector.rs`, `affiliation_licence_invariants.rs` I1880 in I1214, `self_at_login.rs` `run_xwing_matrix`, `tests/xwing_rebind_1274.rs`):
+  - I1870: the identity set rule, both doors, every pair.
+  - I1871: `substrate_persist` confers nothing, and a self-claimed one opens no carve-out.
+  - I1872/I1873: the X-Wing members and the per-half reuse refusals.
+  - I1874/I1875: the committed v61 re-bind probe, and THE RULE (a seat-alone key is not live).
+  - I1877: the v2 vector, which persist produces byte for byte and which walks to its own commitments.
+  - I1878/I1879: a v61 canonical resolves by its co-scrub, a label is inert, and the forward form resolves.
+  - I1880: licensure short of quorum waits, the full set lands, and `founder_only` is unchanged.
+  - I1881–I1885: the infrastructure predicate.
+  - I1886: the recovery refusals, including the material test.
+  - I1887: typed key-record conflicts.
+- Updated, each with its CC citation:
+  - `clause_a_replicated_insert_admits_a_fused_key` became `…_refuses_…`, plus I1186 (CC 3.4.7.1 / 2.4.1.1).
+  - The set shape of the HW-gate parity (CC 3.4.7.1).
+  - I1214's lone-member leg (CC 2.4).
+  - The moderator decision table's infrastructure leg (CC 3.4.7.1 / 3.2).
+  - The infrastructure fixtures that self-claimed `substrate_persist`, which now stand up a rooted trust-root room (`canonical_community_invariants::bodies::rooted_infrastructure_room`).
+  - The `set_identity_type` canonical seam users, which now hold a real conferral (`steward_purge_invariants::bodies::confer_canonical`).
+  - The `Conflict` assertions on the key-record store path.
+- Hand mutations, each run red, then restored (I1870 ×2, I1871, I1873 ×2, I1878, I1879, I1880 ×2, I1881, I1882, I1883, I1884 ×2, I1875, I1877, I1886 ×3, I1887):
+  - the person half of the identity rule;
+  - the replicated door's check;
+  - `substrate_persist` back in the authority set;
+  - the forward-form presentation;
+  - the co-scrub on read;
+  - the X-Wing x25519 half, and the hop-vs-transit halves;
+  - the licensure wait and its quorum threshold;
+  - founder personhood, the quorum form, the rooted-here leg, and the node and agent legs of the exemption;
+  - the recovery's current-key, recovery-key-by-id and material checks, and the spent-commitment walk;
+  - the pubkey-swap reason. It first survived and gained I1887.
+- Lib lane `--features postgres,server,pyo3,sqlite`, four partitions: 4939 passed. Integration (`test-anchor`, sqlite+pg): `xwing_rebind_1274` and `test_ceremony_1106`, 7 passed. The pyo3 lane (`--lib --features postgres,pyo3,server`): 2886 passed. The five no-backend axes (`cirisaudit secrets cirisnode cirisgraph telemetry`, `--all-targets`, `RUSTFLAGS=-D warnings`) and `cargo test --features server --no-run` are clean. All-features clippy `-D warnings` is clean, and so are `pyi_surface.py check`, `evidence_tsv.py check` and `evidence_pointers.py check`.
+
 ### Deferred to E2 (edition-2)
 
 - Licensure: collecting the signatures (a `cosign:pending` hold for attestation rows). Under the kernel model a counted row that waits is held and concluded by the fold, so this belongs to the kernel slice. Reading the roster at the head the row names needs the edition-2 `refs.head`.
