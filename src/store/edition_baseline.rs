@@ -96,7 +96,7 @@ pub(crate) mod catalog {
             .replace('\t', "\\t")
     }
 
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[cfg(feature = "sqlite")]
     fn is_addition(table: &str) -> bool {
         super::EDITION_TWO_ADDITIONS.contains(&table)
     }

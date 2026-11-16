@@ -60,6 +60,17 @@ CC 1.0-rc20, "nothing carries, clean mesh": a v62 node reads nothing from an ear
 - I1952: from disk, each dialect begins at `V300__edition2_baseline` and has nothing below it.
 - I1953–I1959: SQLite and PostgreSQL witnesses for the fresh open (baseline only), the deletion (counts, record, nothing carries, a second open deletes nothing), the hold guard (each plane), the dry run, the foreign store and schema (host objects untouched, cascade rolled back, foreign table refused, schema without history refused), the single-process refusal, and the history classification.
 - `scripts/sqlite_portability_witness.sh` now applies the baseline on bookworm's SQLite 3.40.1.
+- Mutations, each red on its witness and reverted:
+  - the hold guard disabled reds I1955 (SQLite and PostgreSQL);
+  - the foreign-relation check disabled reds I1957(c);
+  - the dry run deleting reds I1956 (SQLite and PostgreSQL);
+  - the cascade-fingerprint rollback disabled reds I1957(b).
+- Gates:
+  - `cargo nextest run --lib --features postgres,server,pyo3,sqlite` (4 partitions, 4,930 tests) is green after re-pointing #840's divergence witnesses at V300 and dropping the V141 row from the #1238 allow-list;
+  - the pyo3 lane (`--features postgres,pyo3,server`, `-D warnings`; 2,893 tests) is green;
+  - the five `axis-*-none` checks pass under `-D warnings`;
+  - all-features clippy passes (pre-commit);
+  - `cargo deny`, `wasm_node_gate.sh`, `pyi_surface.py`, the AST gates and the evidence and mutants-scope gates pass.
 
 ### Changed (v62 slice E1: CC rc20 rules on today's wire, CIRISPersist#1274)
 

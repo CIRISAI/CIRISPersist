@@ -227,6 +227,7 @@ pub(crate) mod bodies {
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
+    #[cfg(feature = "sqlite")]
     use crate::federation::FederationDirectory;
 
     macro_rules! runners {
