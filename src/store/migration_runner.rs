@@ -138,6 +138,7 @@ impl Report {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl MigrationError {
     /// The postgres SQLSTATE of a failed apply, when the server sent one.
     pub(crate) fn sqlstate(&self) -> Option<&str> {
@@ -228,9 +229,11 @@ pub(crate) fn applied_query(table: &str) -> String {
 /// The history row insert: refinery's column order, bound.
 pub(crate) fn insert_query(table: &str, dialect: Dialect) -> String {
     match dialect {
+        #[cfg(feature = "sqlite")]
         Dialect::Sqlite => format!(
             "INSERT INTO {table} (version, name, applied_on, checksum) VALUES (?1, ?2, ?3, ?4)"
         ),
+        #[cfg(feature = "postgres")]
         Dialect::Postgres => format!(
             "INSERT INTO {table} (version, name, applied_on, checksum) VALUES ($1, $2, $3, $4)"
         ),
@@ -240,7 +243,9 @@ pub(crate) fn insert_query(table: &str, dialect: Dialect) -> String {
 /// Which bind syntax [`insert_query`] speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Dialect {
+    #[cfg(feature = "sqlite")]
     Sqlite,
+    #[cfg(feature = "postgres")]
     Postgres,
 }
 

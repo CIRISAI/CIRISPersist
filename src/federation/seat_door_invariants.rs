@@ -654,7 +654,10 @@ async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
             );
         }};
     }
+    // The `return` keeps postgres off a sqlite engine; with no postgres arm
+    // compiled it is the last statement (a sqlite-only clippy red).
     #[cfg(feature = "sqlite")]
+    #[cfg_attr(not(feature = "postgres"), allow(clippy::needless_return))]
     if let Some(b) = engine.sqlite_backend() {
         body!(b.as_ref());
         return;
