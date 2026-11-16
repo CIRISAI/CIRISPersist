@@ -87,6 +87,17 @@ mod embedded {
     refinery::embed_migrations!("migrations/sqlite/lens");
 }
 
+/// v62.0.0 (WASM_NODE FSD §6.2, P7) — the `SingleProcess` writer's pragma
+/// block. Order is load-bearing: `locking_mode = EXCLUSIVE` is the first
+/// statement on the connection. The rest is the native block's set.
+pub(crate) const SQLITE_SINGLE_PROCESS_PRAGMAS: &str = "PRAGMA locking_mode = EXCLUSIVE;\n\
+     PRAGMA journal_mode = WAL;\n\
+     PRAGMA synchronous = NORMAL;\n\
+     PRAGMA foreign_keys = ON;\n\
+     PRAGMA busy_timeout = 30000;\n\
+     PRAGMA wal_autocheckpoint = 1000;\n\
+     PRAGMA journal_size_limit = 67108864;";
+
 /// SQLite-backed [`Backend`] impl.
 ///
 /// Construct via [`SqliteBackend::open`] for a file-backed database
@@ -1099,9 +1110,7 @@ impl SqliteBackend {
         // instead of running on a default nobody asked for.
         let tuning = crate::store::sqlite_conn_model::tuning_from_env()
             .map_err(|e| Error::Backend(format!("sqlite open: {e}")))?;
-        let writer =
-            Connection::open(&path).map_err(|e| Error::Backend(format!("sqlite open: {e}")))?;
-        let writer = Self::apply_connection_settings(writer)?;
+        let writer = Self::open_writer(&path, crate::store::HostStoreProfile::Native)?;
         let in_memory = path == ":memory:"
             || path.is_empty()
             || (path.starts_with("file:") && path.contains("mode=memory"));
@@ -1122,6 +1131,39 @@ impl SqliteBackend {
         Ok(Self::from_handles(Arc::new(Mutex::new(writer)), pool))
     }
 
+    /// v62.0.0 (WASM_NODE FSD §6.2, P7) — open with the profile the HOST
+    /// declares ([`crate::store::HostStoreProfile`]). `Native` is
+    /// [`Self::open`], unchanged. `SingleProcess` opens the writer alone:
+    /// `PRAGMA locking_mode = EXCLUSIVE` first, then WAL, zero readers, no
+    /// mmap / cache tuning and no environment knob read.
+    pub async fn open_on_host(
+        path: impl Into<String>,
+        host: crate::store::HostStoreProfile,
+    ) -> Result<Self, Error> {
+        match host {
+            crate::store::HostStoreProfile::Native => Self::open(path).await,
+            crate::store::HostStoreProfile::SingleProcess => {
+                let writer = Self::open_writer(&path.into(), host)?;
+                Ok(Self::from_handles(
+                    Arc::new(Mutex::new(writer)),
+                    crate::store::sqlite_conn_model::ReadPool::empty(),
+                ))
+            }
+        }
+    }
+
+    /// The writer connection: open the file, then the profile's pragma
+    /// block, with nothing prepared in between (under `SingleProcess` the
+    /// block's first statement must be the connection's first).
+    fn open_writer(path: &str, host: crate::store::HostStoreProfile) -> Result<Connection, Error> {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut writer =
+            Connection::open(path).map_err(|e| Error::Backend(format!("sqlite open: {e}")))?;
+        #[cfg(test)]
+        crate::store::sqlite_conn_model::profile_witness::on_writer_open(&mut writer);
+        Self::apply_host_connection_settings(writer, host)
+    }
+
     /// Open an in-memory SQLite database (for tests + sovereign-mode
     /// dev scratch). No readers (FSD §4): a private `:memory:` database is
     /// invisible to a second connection, so reads fall back to the writer.
@@ -1140,6 +1182,28 @@ impl SqliteBackend {
     /// connections get their own, smaller block in
     /// [`crate::store::sqlite_conn_model::ReadPool::open`].
     pub(crate) fn apply_connection_settings(conn: Connection) -> Result<Connection, Error> {
+        Self::apply_host_connection_settings(conn, crate::store::HostStoreProfile::Native)
+    }
+
+    /// v62.0.0 (WASM_NODE FSD §6.2, P7) — the writer's pragma block for the
+    /// host's profile. `Native` is the block below, unchanged. `SingleProcess`
+    /// puts `locking_mode = EXCLUSIVE` FIRST: with no shared memory (OPFS
+    /// sahpool has no `xShmMap`), WAL works only on the heap wal-index an
+    /// exclusive lock allows, any prepare on a WAL-format file before it
+    /// fails with "unable to open database file", and without it
+    /// `journal_mode = WAL` silently stays `delete` (FSD §6.2, measured).
+    pub(crate) fn apply_host_connection_settings(
+        conn: Connection,
+        host: crate::store::HostStoreProfile,
+    ) -> Result<Connection, Error> {
+        if host == crate::store::HostStoreProfile::SingleProcess {
+            return (move || -> Result<Connection, rusqlite::Error> {
+                conn.execute_batch(SQLITE_SINGLE_PROCESS_PRAGMAS)?;
+                crate::federation::key_digest::register_sqlite_fn(&conn)?;
+                Ok(conn)
+            })()
+            .map_err(|e| Error::Backend(format!("sqlite pragmas: {e}")));
+        }
         (move || -> Result<Connection, rusqlite::Error> {
             // Foreign keys are off by default in SQLite for backwards
             // compat — turn them on so any future FK constraints we

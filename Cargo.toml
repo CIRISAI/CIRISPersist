@@ -931,6 +931,11 @@ metrics-util = { version = "0.19", default-features = false, features = ["debugg
 # refuses a bare `#[serial]` or an unlisted key. Under nextest (a process per
 # test) the locks are inert; they hold under `cargo test`.
 serial_test = "3"
+# v62.0.0 (WASM_NODE FSD §6.2, P7) — the authorizer hook, so I1815 watches
+# the writer from its first PREPARE (`locking_mode = EXCLUSIVE` must precede
+# every prepare, `select sqlite_version()` included). Test builds only; the
+# shipped rusqlite feature set is unchanged.
+rusqlite = { version = "0.41", features = ["hooks"] }
 # v0.1.7 — bench harness. criterion writes JSON to target/criterion/
 # which github-action-benchmark consumes for the gh-pages trend
 # chart. Pinning to 0.5.x; 0.6 changes the JSON shape and would

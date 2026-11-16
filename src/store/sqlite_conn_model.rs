@@ -2488,3 +2488,216 @@ mod tuning_1246_tests {
         );
     }
 }
+
+/// v62.0.0 (WASM_NODE FSD §6.2, P7) — a test-only hook at the one point
+/// between `Connection::open` and the writer's pragma block, so a witness
+/// can watch the connection from its first prepare.
+#[cfg(test)]
+pub(crate) mod profile_witness {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn(&mut rusqlite::Connection)>;
+
+    thread_local! {
+        static ON_WRITER_OPEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Called by `SqliteBackend::open_writer` right after `Connection::open`.
+    pub(crate) fn on_writer_open(conn: &mut rusqlite::Connection) {
+        ON_WRITER_OPEN.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(conn);
+            }
+        });
+    }
+
+    /// Arm the hook for writers opened on this thread.
+    pub(crate) fn arm(f: impl Fn(&mut rusqlite::Connection) + 'static) {
+        ON_WRITER_OPEN.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    /// Disarm it.
+    pub(crate) fn disarm() {
+        ON_WRITER_OPEN.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// v62.0.0 (WASM_NODE FSD §6.2, P7): I1815–I1817. The host profile.
+#[cfg(test)]
+mod host_profile_tests {
+    use crate::store::sqlite::SqliteBackend;
+    use crate::store::HostStoreProfile;
+    use std::sync::{Arc, Mutex};
+
+    /// Every action the writer's authorizer saw, in order, from the
+    /// connection's first prepare: `Pragma(name, value)` or the action's
+    /// debug form.
+    fn watch_writer_open() -> Arc<Mutex<Vec<String>>> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let l = log.clone();
+        super::profile_witness::arm(move |conn: &mut rusqlite::Connection| {
+            let l = l.clone();
+            conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                let entry = match ctx.action {
+                    rusqlite::hooks::AuthAction::Pragma {
+                        pragma_name,
+                        pragma_value,
+                    } => format!(
+                        "Pragma({}, {})",
+                        pragma_name.to_ascii_lowercase(),
+                        pragma_value.unwrap_or("").to_ascii_lowercase()
+                    ),
+                    other => format!("{other:?}"),
+                };
+                l.lock().unwrap().push(entry);
+                rusqlite::hooks::Authorization::Allow
+            }))
+            .expect("the authorizer installs");
+        });
+        log
+    }
+
+    fn pragma(b: &SqliteBackend, name: &str) -> String {
+        let sql = format!("PRAGMA {name}");
+        b.conn_handle()
+            .lock()
+            .query_row(&sql, [], |r| r.get::<_, rusqlite::types::Value>(0))
+            .map(|v| match v {
+                rusqlite::types::Value::Text(t) => t,
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                other => format!("{other:?}"),
+            })
+            .unwrap()
+    }
+
+    fn stop_watching(b: &SqliteBackend) {
+        super::profile_witness::disarm();
+        b.conn_handle()
+            .lock()
+            .authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .expect("the authorizer clears");
+    }
+
+    /// **I1815 — under `SingleProcess`, `locking_mode = EXCLUSIVE` is the
+    /// connection's first statement.** The writer's authorizer is armed
+    /// between `Connection::open` and anything else, and runs at PREPARE
+    /// time, so "first" covers every prepare, `select sqlite_version()`
+    /// included: the first action it sees is `PRAGMA locking_mode =
+    /// EXCLUSIVE`, then WAL; the open leaves the store exclusive, in WAL,
+    /// with no reader pool and no mmap.
+    #[tokio::test]
+    async fn i1815_single_process_locking_mode_is_the_first_statement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i1815.db").to_string_lossy().to_string();
+        let log = watch_writer_open();
+        let b = SqliteBackend::open_on_host(path, HostStoreProfile::SingleProcess)
+            .await
+            .unwrap();
+        let seen = log.lock().unwrap().clone();
+        stop_watching(&b);
+        eprintln!("I1815 writer actions at open: {seen:?}");
+        assert_eq!(
+            seen.first().map(String::as_str),
+            Some("Pragma(locking_mode, exclusive)"),
+            "I1815: the first prepare on the connection is locking_mode = EXCLUSIVE: {seen:?}"
+        );
+        assert_eq!(
+            seen.get(1).map(String::as_str),
+            Some("Pragma(journal_mode, wal)"),
+            "I1815: then WAL: {seen:?}"
+        );
+        assert_eq!(pragma(&b, "locking_mode"), "exclusive");
+        assert_eq!(pragma(&b, "journal_mode"), "wal");
+        assert_eq!(pragma(&b, "mmap_size"), "0", "I1815: no mmap tuning");
+        assert_eq!(b.read_pool_handle().size(), 0, "I1815: no reader pool");
+    }
+
+    /// **I1816 — the native open is unchanged.** Its first statement is
+    /// `foreign_keys`, `locking_mode` is never set (normal), the reader
+    /// pool is the default count, and the tuning ran (mmap on).
+    #[tokio::test]
+    async fn i1816_the_native_open_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i1816.db").to_string_lossy().to_string();
+        let log = watch_writer_open();
+        let b = SqliteBackend::open_on_host(path, HostStoreProfile::Native)
+            .await
+            .unwrap();
+        let seen = log.lock().unwrap().clone();
+        stop_watching(&b);
+        eprintln!("I1816 writer actions at open: {seen:?}");
+        let pragmas: Vec<&str> = seen
+            .iter()
+            .filter_map(|s| s.strip_prefix("Pragma("))
+            .map(|s| s.split(',').next().unwrap())
+            .collect();
+        assert_eq!(
+            &pragmas[..6],
+            &[
+                "foreign_keys",
+                "journal_mode",
+                "synchronous",
+                "busy_timeout",
+                "wal_autocheckpoint",
+                "journal_size_limit"
+            ],
+            "I1816: the native block, in its order: {seen:?}"
+        );
+        assert!(
+            !pragmas.contains(&"locking_mode"),
+            "I1816: native never sets locking_mode: {seen:?}"
+        );
+        assert_eq!(pragma(&b, "locking_mode"), "normal");
+        assert_eq!(pragma(&b, "journal_mode"), "wal");
+        assert_eq!(
+            b.read_pool_handle().size(),
+            super::default_reader_count(),
+            "I1816: the default reader pool"
+        );
+    }
+
+    /// **I1817 — the Engine honours `SingleProcess` end to end.** An Engine
+    /// built on a file DSN with the host profile boots (migrations, the
+    /// genesis seed, the open legs) on the writer alone: zero readers, the
+    /// writer exclusive and in WAL, no mmap. The same DSN under `Native`
+    /// gets the default pool (the audit found the Engine's path ended at
+    /// `SqliteBackend::open` and 2 readers whatever the host was).
+    #[tokio::test]
+    async fn i1817_the_engine_open_honours_single_process_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        for (host, readers, lock) in [
+            (HostStoreProfile::SingleProcess, 0, "exclusive"),
+            (
+                HostStoreProfile::Native,
+                super::default_reader_count(),
+                "normal",
+            ),
+        ] {
+            let dsn = format!(
+                "sqlite:///{}",
+                dir.path().join(format!("{host:?}.db")).display()
+            );
+            let signer = crate::federation::tier_ingest::test_support::local_signer("i1817");
+            let engine = crate::Engine::with_signer_on_host(signer, &dsn, host)
+                .await
+                .unwrap_or_else(|e| panic!("I1817 {host:?}: the engine boots: {e}"));
+            let b = engine.sqlite_backend().expect("sqlite").clone();
+            assert_eq!(
+                b.read_pool_handle().size(),
+                readers,
+                "I1817 {host:?}: readers"
+            );
+            assert_eq!(
+                pragma(&b, "locking_mode"),
+                lock,
+                "I1817 {host:?}: locking_mode"
+            );
+            assert_eq!(pragma(&b, "journal_mode"), "wal", "I1817 {host:?}: WAL");
+            if host == HostStoreProfile::SingleProcess {
+                assert_eq!(pragma(&b, "mmap_size"), "0", "I1817: no mmap tuning");
+            }
+        }
+    }
+}

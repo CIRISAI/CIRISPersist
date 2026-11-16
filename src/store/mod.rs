@@ -103,6 +103,27 @@ pub(crate) mod test_hooks;
 mod tree_read;
 pub mod types;
 
+/// v62.0.0 (WASM_NODE FSD §6.2, the readiness audit's P7) — what the HOST
+/// says about itself when it opens the store: a capability answer, never a
+/// compile target (no `cfg(target_*)` decides it). Postgres ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum HostStoreProfile {
+    /// A native host: other processes may open the file. Today's open,
+    /// unchanged: WAL, the reader pool (`available_parallelism().clamp(2,
+    /// 8)` or `CIRIS_PERSIST_SQLITE_READERS`), mmap and page-cache tuning
+    /// from the environment and the cgroup limit.
+    #[default]
+    Native,
+    /// One process on one thread holds the store (a browser Dedicated
+    /// Worker over OPFS `opfs-sahpool`, a UEFI image). `PRAGMA
+    /// locking_mode = EXCLUSIVE` is the connection's FIRST statement (no
+    /// shared memory: WAL needs the heap wal-index, and any prepare on a WAL
+    /// file before it fails), then WAL; no reader pool (its `Condvar` would
+    /// block the one thread); no mmap, cgroup or environment tuning.
+    SingleProcess,
+}
+
 pub use backend::{Backend, InsertReport, PublicKeySample};
 pub use decompose::{
     decompose, dedup_key, trace_dedup_shard_key, trace_dedup_shard_key_parts, Decomposed,
