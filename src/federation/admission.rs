@@ -12647,9 +12647,15 @@ pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
     }
     // the key plane: is each granter a `user` key
     let mut users = std::collections::BTreeSet::new();
+    // only the granters of an owner binding to this node: the key plane is
+    // asked about no one the seat could not name
     let granters: std::collections::BTreeSet<&str> = rows
         .iter()
-        .filter(|r| r.attestation_type == attestation_type::DELEGATES_TO)
+        .filter(|r| {
+            r.attestation_type == attestation_type::DELEGATES_TO
+                && r.attested_key_id == node
+                && is_owner_binding_envelope(&r.attestation_envelope)
+        })
         .map(|r| r.attesting_key_id.as_str())
         .collect();
     for g in granters {

@@ -99,8 +99,22 @@ pub fn consensus(
     b: &crate::federation::consensus::Ballot<'_>,
     persist: &crate::federation::consensus::Verdict,
 ) {
-    use super::consensus::{admits, NoCell};
+    use super::consensus::{admits, admits_by_rows, NoCell};
     let kernel = admits(b);
+    // I1844 — the count over the resolved head is the kernel's seat rule
+    // walked over the ballot's row graph, on every call
+    let by_rows = admits_by_rows(b);
+    assert_eq!(
+        kernel.as_ref().map(|a| a.value),
+        by_rows.as_ref().map(|a| a.value),
+        "I1844: the adapter's count and the kernel's seat rule over the ballot's rows disagree \
+         for {:?} ({:?}, subject {:?}, {} signers, {} seats)",
+        b.protocol,
+        b.direction,
+        b.subject,
+        b.signers.len(),
+        b.roster.len()
+    );
     let k_admits = kernel.as_ref().is_ok_and(|a| a.value);
     let p_admits = persist.admits();
     let class = if p_admits == k_admits {

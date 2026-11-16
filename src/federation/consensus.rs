@@ -321,10 +321,13 @@ fn unevaluable(reason: impl Into<String>) -> Verdict {
 ///   record." A fractional weight or `threshold_fraction` is
 ///   [`Verdict::Unevaluable`].
 pub fn evaluate(b: &Ballot<'_>) -> Verdict {
-    use crate::kernel::consensus::{admits, NoCell};
-    let v = match admits(b) {
-        Ok(a) if a.value => Verdict::Admit,
-        Ok(_) => explain_refusal(b),
+    use crate::kernel::consensus::{admits_over, NoCell};
+    // the eligible persons, resolved once for the kernel's count and, on a
+    // refusal, the arm's account of it
+    let elig = eligible(b);
+    let v = match admits_over(b, &elig) {
+        Ok(true) => Verdict::Admit,
+        Ok(false) => explain_refusal(b, &elig),
         Err(NoCell::ReverseQuorum) => unevaluable(format!(
             "{:?}: reverse_quorum is not a membership rule; it admits no one (CC 3.2)",
             b.protocol
@@ -345,15 +348,15 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
 /// A ballot the kernel refused, as the arm that counts it accounts for it:
 /// what was needed, what was counted, who else may sign
 /// (CIRISPersist#1250). The kernel decided; this only explains.
-fn explain_refusal(b: &Ballot<'_>) -> Verdict {
-    match evaluate_reference(b) {
+fn explain_refusal<'a>(b: &Ballot<'a>, elig: &[&'a Seat]) -> Verdict {
+    match evaluate_reference_over(b, elig) {
         v @ (Verdict::Insufficient { .. } | Verdict::Unevaluable { .. }) => v,
         Verdict::Admit => {
             // The arm's own count would admit what the kernel refuses: a key
             // the change names is no voice of its count (CC 2.7.5), or a
             // removal's member is not among the counted. Report the count
             // without the change's subject.
-            let elig = eligible(b);
+            let elig = elig.to_vec();
             let got = counted(b, &elig);
             let have = got.iter().filter(|s| !is_subject(b, s)).count();
             short(
@@ -373,8 +376,14 @@ fn explain_refusal(b: &Ballot<'_>) -> Verdict {
 /// The evaluator as persist wrote it before the kernel. Production reads it
 /// only to explain a refusal ([`explain_refusal`]); the `reverse_quorum:` and
 /// `custom:` arms are the differential's reference (test builds only).
+#[cfg(test)]
 fn evaluate_reference(b: &Ballot<'_>) -> Verdict {
-    let elig = eligible(b);
+    evaluate_reference_over(b, &eligible(b))
+}
+
+/// [`evaluate_reference`] over the eligible seats the caller resolved.
+fn evaluate_reference_over<'a>(b: &Ballot<'a>, elig: &[&'a Seat]) -> Verdict {
+    let elig = elig.to_vec();
     let got = counted(b, &elig);
     let n = elig.len();
     if b.protocol == cp::OPEN_SELF_ADMIT {
