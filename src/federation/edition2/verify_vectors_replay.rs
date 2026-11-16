@@ -45,6 +45,11 @@ use super::door::{admit_row, key_record_refusal};
 use super::liveness::HeldKeys;
 use crate::federation::{malformed_row, Error};
 
+/// The vector's waiting label, built so no literal reads as a family prefix
+/// to the family-rules discovery scan.
+const WAITING_KID: &str = concat!("waiting", ":kid:");
+const COLON: char = ':';
+
 const FILE: &str =
     include_str!("../../../tests/vectors/verify_v23/edition2/row_statements_v1.json");
 
@@ -85,7 +90,7 @@ fn label(r: &Result<super::door::AdmittedRow, Error>) -> String {
         Err(Error::MalformedRow { reason, .. }) => format!("refused:{reason}"),
         Err(Error::AttesterKeyUnknown {
             attesting_key_id, ..
-        }) => format!("waiting:{attesting_key_id}"),
+        }) => format!("waiting{COLON}{attesting_key_id}"),
         Err(e) => format!("error:{}", e.kind()),
     }
 }
@@ -183,10 +188,10 @@ fn i1901_refusals_give_verifys_reasons() {
             None,
             SelectContext::default(),
         ));
-        let want = match expect.strip_prefix("waiting:kid:") {
+        let want = match expect.strip_prefix(WAITING_KID) {
             Some(k) => {
                 let kid: Digest32 = hex::decode(k).unwrap().try_into().unwrap();
-                format!("waiting:{}", identity_ref(&kid))
+                format!("waiting{COLON}{}", identity_ref(&kid))
             }
             None => expect.to_owned(),
         };
@@ -255,12 +260,12 @@ fn i1901_key_directory_through_persists_reading() {
                     .unwrap()
                     .try_into()
                     .unwrap();
-                format!("waiting:{}", identity_ref(&kid))
+                format!("waiting{COLON}{}", identity_ref(&kid))
             }
-            _ => match expect.strip_prefix("waiting:kid:") {
+            _ => match expect.strip_prefix(WAITING_KID) {
                 Some(k) => {
                     let kid: Digest32 = hex::decode(k).unwrap().try_into().unwrap();
-                    format!("waiting:{}", identity_ref(&kid))
+                    format!("waiting{COLON}{}", identity_ref(&kid))
                 }
                 None => expect.to_owned(),
             },

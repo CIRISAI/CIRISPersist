@@ -1291,7 +1291,13 @@ mod run_1908 {
         super::bodies::i1908_verify_refusals_v2(&b, |digests| {
             let pool = pool.clone();
             async move {
-                let c = pool.get().await.unwrap();
+                let c = crate::store::postgres::checkout_bounded(
+                    &pool,
+                    std::time::Duration::from_secs(30),
+                    None,
+                )
+                .await
+                .unwrap();
                 for d in digests {
                     let n = c
                         .execute(

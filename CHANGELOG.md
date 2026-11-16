@@ -7,6 +7,104 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
 ## [62.0.0] - UNRELEASED
 
+### Changed (v62 slice E2a: the edition-2 wire, CIRISPersist#1274)
+
+The ruling (CC rc20 `0c9e17c`, "nothing carries, clean mesh"): the edition starts from a fresh `ceg-genesis-bundle/2`. A v62 node reads only edition-2 objects. No key carries over, and everything is signed anew. This slice builds the edition-2 door and its readers beside the JSON doors. The JSON doors close at the JSON cut (`TODO(json-cut)`), together with E2b's baseline and the ceremony.
+
+- **The edition-2 door** (`federation::edition2::door::admit_row`; CC 2.6.1, 2.6.1.8, 2.6.1.12). One `COSE_Sign1` statement is judged in this order:
+  - **form.** Bytes that are not a tag-18 statement are refused `earlier_form_object`. That covers a JSON object of the earlier form and bytes in no form.
+  - **edition-1 row-refs.** A `[1, …]` row-ref anywhere in `refs` is refused `row_ref_edition_1`, whatever keys are held. Verify's reader admits both editions; persist refuses the earlier one (CC 2.6.1.3).
+  - **Verify's verdict.** Verify 23.1.3's `verify_row_in_family_with` runs under CC's vendored family model (`edition2_statement_invalid` / `edition2_family_invalid`, with Verify's reason). Waiting is the retryable `federation_attester_key_unknown`.
+  - **the row id, computed here.** SHA-256 over `CDE(["CEG-row/2", type, family, sub, author, payload])`. An offered id that differs is refused `row_id_mismatch`, so a row is never stored under a given id. An object at a row door is `edition2_not_a_row`.
+  - **the key record's end rule.** `key_record_out_of_window`, or the typed `IdentitySetMixesPersonAndMachine`. `identity_type` must be a sorted CBOR array.
+- **Row ids and names for the kernel** (`edition2::names`). `RowId` has no constructor from a peer string. `names_of(payload)` returns the `refs` row ids, edition 2 only. A row cannot name itself, since the id hashes the payload that holds the names. This closes the kernel name-cycle for edition-2 rows: slice C's adapter builds `KRow` from these.
+- **Key liveness** (`edition2::liveness::HeldKeys`, a `KeyDirectory`; CC 2.4.1.1):
+  - Only an edition-2 `key:record` makes a key live, over `[asserted_at, valid_until]`. Renewals reach the greatest end, and a renewal signed after the end revives the key.
+  - An uncovered instant is retryable, never Invalid.
+  - The three revokers: the key itself always. The owner and the seating roster go through `RevokerStanding`; the default admits none. `revoked_after` bounds the revocation.
+  - An earlier-form record files nothing.
+  - TODO(key_end): this becomes slice C's kernel conclusion.
+- **One rule set, two codecs** (`edition2::ingest`, `Engine::put_edition2_statement`):
+  - An edition-2 row is mapped onto persist's `Attestation` and meets the SAME gates as the JSON door:
+    - `attestation_id` = `persist_row_hash` = the row id;
+    - the envelope is the payload's projection: instants as RFC 3339, fixed-scale numbers as reals, bytes as hex, the `row` mirror from the statement, and the statement itself under `ceg_statement`.
+  - Tier 2 reads the signer's identity set from its live edition-2 record.
+  - Tier 3 re-verifies the carried statement and refuses a row that is not its projection (`typed_diverges_from_envelope`, `row_id_mismatch`).
+  - `check_attested_subject_admission` knows an edition-2 subject by its record.
+  - `key:record` / `key:revocation` are kept in the edition-2 store. A further voice of a held row joins its fold.
+  - Replication and tier ingest deliver statements through this one entry.
+- **The statement store** (`edition2::store`, E2b's `ceg_statements` / `ceg_row_names` shape). New `FederationDirectory` methods, implemented on sqlite and postgres: `edition2_statements_about`, `put_edition2_statement`, `edition2_voices`, `edition2_objects`, `put_edition2_object`.
+- **Genesis bundle/2, generic parts** (`edition2::genesis`; CC 2.6.1.11, 5.3.4, the settled bundle/2 rule):
+  - A counted object. Voices over other bytes are other objects.
+  - The object id is computed here. A pin roots only its object (`genesis_bundle_not_pinned`).
+  - `version` 1 if and only if there is no prev. `iat` is required and equals ⌊asserted_at/1000⌋ (`genesis_bundle_malformed`).
+  - Every holder signs the first bundle. A later one needs a strict majority of its predecessor's holders plus every added holder (`genesis_bundle_count_unmet`, which concludes nothing).
+  - A seat's X-Wing pair comes from its binding: both keys, 1216 bytes each, no shared half, no v1 pair (`genesis_bundle_seat_binding`).
+  - `put_genesis_bundle` refuses `genesis_bundle_reader_unavailable` at placement and stores nothing. Placement is Verify's bundle verdict (TODO(verify-bundle-reader)).
+  - `bundles_in_force` follows `refs.prev`, never instants; a fork gives two tips.
+  - The provisional draft `docs/GENESIS_BUNDLE_V2_DRAFT.md` is superseded by CC's proposal.
+- **Canonical by ruling C**: an edition-2 key (an identity-ref) is canonical exactly when it is in `serve_nodes` of every bundle in force (`is_canonical`, `is_canonical_effective`). The earlier store's co-scrub conferral is read only for earlier-form key ids (TODO(json-cut)).
+- **cosign `event_row_id`** (CC 3.1.3, 2.6.1.9): `cosign::event_row_id` and `cosign::edition2_voices` fold an edition-2 event's voices by `(event_row_id, attesting_key_id)`. `quorum_key` stays the earlier form's name (TODO(json-cut)).
+- **Licensure at the named head** (CC 2.7.4): an edition-2 `licensure:*` row from a quorum community is counted over the roster version whose row id is its `refs.head`, with its own voices. A head not held counts nothing yet. The earlier form keeps the signed-instant read (TODO(json-cut)).
+- **The purge selection digest, forward form** (CC 2.4.1.1, 3.3.2; the store's open encoding): SHA-256 over the CDE of a CBOR array of `"plane:id"` text strings. It is a set: unique, sorted by each element's deterministic encoding, so shorter strings sort first. It is carried as a 32-byte bstr (`selection_digest_bytes`), with hex in persist's columns. The JCS form is gone.
+- **Accord recovery, cross-checked with Verify's `accord_recovery_refusals_v2.json`** (CC 4.2.6):
+  - A spent recovery key is named `accord_recovery_key_spent` before its material is compared with the commitment in force (it was `accord_recovery_key_mismatch` for a re-listed spent commitment).
+  - A charter the lineage adopts and this node does not hold at all is `accord_recovery_lineage_incomplete`, never "no charter". A held, withdrawn charter still names nothing.
+- **Verify's row statements re-pinned at 23.1.3** (`tests/vectors/verify_v23/edition2/row_statements_v1.json`, 17 key records, 27 vendored-family cases).
+- **The fixture codec switch** (`edition2::fixture_switch`): `emit_edition2` / `with_edition2`, and `FLIP`, the 37 typed-row builder entry points the JSON cut flips. I1912 re-derives the list from disk.
+
+### Adoption notes (CIRISServer, CIRISEdge) for slice E2a
+
+- Hand an edition-2 statement to `Engine::put_edition2_statement(bytes, offered_row_id)`. Refusals are `federation_malformed_row` (Python `ValueError`) with these reasons:
+  - `earlier_form_object`;
+  - `row_ref_edition_1`;
+  - `edition2_statement_invalid`, with Verify's reason in the message;
+  - `edition2_family_invalid`;
+  - `row_id_mismatch`;
+  - `edition2_not_a_row`;
+  - `key_record_out_of_window`.
+
+  A statement waiting on a key is `federation_attester_key_unknown`: retry after the key's record arrives.
+- The id of an edition-2 row is its row id, as lowercase hex in `attestation_id` / `persist_row_hash`. Never send or expect another id.
+- Server: the bundle route serves `ceg-genesis-bundle/2` voices. Persist's genesis door refuses `genesis_bundle_reader_unavailable` until Verify ships its bundle reader. Canonical standing for an edition-2 key is membership in `serve_nodes` of the bundle in force.
+- A purge notice signs the forward selection digest (32 bytes). A notice carrying the JCS-form digest no longer matches (`purge_selection_digest_mismatch`).
+- A recovery under a spent commitment that a later charter re-lists now reads `accord_recovery_key_spent`.
+- No pyo3 surface is added in this slice.
+
+### Tested (slice E2a)
+
+- Witnesses on sqlite and postgres where a store is involved (`federation/edition2/*_invariants.rs`, `purge_digest_v2_invariants.rs`, `accord_lineage_vector.rs` I1908):
+  - I1900: the forward purge digest equals the known answers of an independent stdlib encoder (`tests/vectors/purge_selection/`). Order is length-first, and the JCS form differs.
+  - I1901: Verify 23.1.3's row statements replayed through the door. Three divergences are documented and sent to Verify:
+    - `names_earlier_form` is refused by persist (CC 2.6.1.3);
+    - `after_valid_until` is retryable at persist (CC 2.4.1.1);
+    - `second_voice` and `counted_with_refs` pass only under the vector's test family model.
+  - I1902: earlier-form and no-form bytes are refused by name.
+  - I1903: edition-1 row-refs are refused under every `refs` member, held or not.
+  - I1904: the row id equals an independent CBOR recompute; an offered id is never used; names come from refs.
+  - I1905: liveness, the end rule and the three revokers.
+  - I1906: the statement store.
+  - I1907: the genesis generic rules and ruling C.
+  - I1908: Verify's `accord_recovery_refusals_v2`. Its rows are of the earlier form and are replayed on the earlier-form store; both `expect_persist` tokens are asserted.
+  - I1909: one rule set, two codecs; forged and renamed mappings are refused.
+  - I1911: the genesis door, the bundle in force and canonical by C.
+  - I1912: the flip list.
+- Hand mutations. Each run went red, then the code was restored:
+  - the offered-id check (I1904);
+  - the edition-1 refusal (I1903);
+  - the CDE sort of the selection (I1900 ×2);
+  - the earlier-form refusal (I1902, I1907);
+  - the stranger-revoker check (I1905);
+  - the coverage lower bound (I1905);
+  - the fresh genesis's every-holder count (I1907 ×2);
+  - `verify_carried`'s envelope comparison (I1909: a forged mapping was inserted).
+- Gate tables updated for the new code:
+  - `store::parity::CALL_CLASSES` (`carried_identity_type` Gate, `put_row` Plumbing);
+  - `SQLITE_CONN_CLASSES` (the five edition-2 store fns);
+  - the sqlite write uses `write_tx` (BEGIN IMMEDIATE, #1238);
+  - test checkouts use the bounded checkout (#1166).
+  - I661 now pins the forward digest preimage.
+
 ### Changed (v62 slice E1: CC rc20 rules on today's wire, CIRISPersist#1274)
 
 These rules come from CC 1.0-rc20 (branch `rc20`, `140fed4a`; not yet tagged). Persist adopts them on today's JSON wire and Verify pin. The edition-2 encodings are slice E2.

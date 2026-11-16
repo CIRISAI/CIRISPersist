@@ -196,6 +196,7 @@ async fn i1906_i1909_sqlite() {
     {
         let c = b.conn_handle();
         let c = c.lock();
+        // TODO(baseline-merge): the E2b baseline creates these tables.
         c.execute_batch(super::store::SQLITE_DDL).unwrap();
         // TODO(baseline-merge): remove. The E2b baseline drops the earlier store's signer FK to
         // `federation_keys`; an edition-2 signer lives in `ceg_statements`.
@@ -235,7 +236,8 @@ async fn i1906_i1909_postgres() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
-    let c = b.pool().get().await.unwrap();
+    let c = b.checkout().await.unwrap();
+    // TODO(baseline-merge): the E2b baseline creates these tables.
     c.batch_execute(super::store::POSTGRES_DDL).await.unwrap();
     // TODO(baseline-merge): remove. The E2b baseline drops the earlier store's signer FKs to
     // `federation_keys`; an edition-2 signer lives in `ceg_statements`.

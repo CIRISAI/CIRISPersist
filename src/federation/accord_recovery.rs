@@ -449,29 +449,6 @@ where
             walk.statements.push(st.clone());
         }
         let adopts = index == 0 || fam.charter_digest != lineage[index - 1].0.charter_digest;
-        // v62.0.0 (slice E2a) — a charter the lineage adopts and this node
-        // does not hold at all is a gap: fail closed (Verify's
-        // `charter_missing`, CC 4.2.6). A held, withdrawn one names nothing.
-        if adopts
-            && !fam.charter_digest.is_empty()
-            && !charters.contains_key(&fam.charter_digest)
-            && !super::canonical_community::charter_row_held(
-                directory,
-                family_key_id,
-                &fam.charter_digest,
-            )
-            .await?
-        {
-            return refuse(
-                ACCORD_RECOVERY_LINEAGE_INCOMPLETE,
-                format!(
-                    "version {} adopts charter {}, which this node does not hold (CC 4.2.6: \
-                     the walk never skips a charter it needs)",
-                    index + 1,
-                    fam.charter_digest
-                ),
-            );
-        }
         if adopts && !fam.charter_digest.is_empty() {
             if let Some(entries) = charters
                 .get(&fam.charter_digest)

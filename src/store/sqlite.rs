@@ -3315,8 +3315,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<bool, crate::federation::Error> {
         let row = row.clone();
         self.write(move |conn| {
-            let tx = conn
-                .transaction()
+            let tx = crate::store::sqlite_conn_model::write_tx(conn)
                 .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
             let new = crate::federation::edition2::store::put_row_sqlite(&tx, &row)?;
             tx.commit()
