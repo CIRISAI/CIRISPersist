@@ -504,6 +504,18 @@ where
         .await?
         .is_none()
     {
+        // v62.0.0 (slice E2a) — a head charter this node does not hold at all
+        // is a gap in the lineage: fail closed, never read as "no charter"
+        // (Verify's `charter_missing`). A held, withdrawn one names nothing.
+        if !super::canonical_community::charter_row_held(directory, &charter_key, digest).await? {
+            return refuse(
+                ACCORD_RECOVERY_LINEAGE_INCOMPLETE,
+                format!(
+                    "the accord's head names charter {digest}, which this node does not hold \
+                     (CC 4.2.6: a charter row the walk needs and is not given fails closed)"
+                ),
+            );
+        }
         return Ok(None);
     }
     let Some(fam) = directory.lookup_family(family_key_id).await? else {
@@ -664,26 +676,13 @@ where
         .map_err(|e| Error::CharterInvalid {
             detail: format!("accord_recovery_key_mismatch: {e}"),
         })?;
-    if presented != in_force {
-        return refuse(
-            "accord_recovery_key_mismatch",
-            format!(
-                "the stored keys of {recovery_key_id} do not reproduce {old}'s recovery \
-                 commitment (an id that matches with other keys is not the committed key)"
-            ),
-        );
-    }
     // v62.0.0 (CC rc20 4.2.6) — the lineage, walked in link order.
     let walk = walk_commitments(directory, &held.family_key_id).await?;
-    // "The next commitment MUST differ from the one the recovery spends", and
-    // "a spent commitment never returns": neither the one in force nor one a
-    // recovery already spent.
-    if next_commitment == in_force || walk.is_spent(next_commitment) {
-        return refuse(
-            "accord_recovery_next_commitment_not_fresh",
-            "the new key's recovery commitment repeats the one it spends or one already spent",
-        );
-    }
+    // v62.0.0 (slice E2a; Verify's accord_recovery_refusals_v2
+    // `spent_commitment_relisted`) — a spent recovery key is named spent
+    // BEFORE its material is compared with the commitment in force: a spent
+    // commitment a later charter re-lists names none (CC 4.2.6), so the
+    // mismatch below would hide the more specific refusal.
     // Over the WHOLE lineage: a recovery key that rotated a seat is spent
     // under every charter since (#984 row 3 bounds the exception, not this),
     // by id or by the commitment its material reproduces.
@@ -695,6 +694,24 @@ where
         return refuse(
             "accord_recovery_key_spent",
             format!("{recovery_key_id} already rotated a seat"),
+        );
+    }
+    if presented != in_force {
+        return refuse(
+            "accord_recovery_key_mismatch",
+            format!(
+                "the stored keys of {recovery_key_id} do not reproduce {old}'s recovery \
+                 commitment (an id that matches with other keys is not the committed key)"
+            ),
+        );
+    }
+    // "The next commitment MUST differ from the one the recovery spends", and
+    // "a spent commitment never returns": neither the one in force nor one a
+    // recovery already spent.
+    if next_commitment == in_force || walk.is_spent(next_commitment) {
+        return refuse(
+            "accord_recovery_next_commitment_not_fresh",
+            "the new key's recovery commitment repeats the one it spends or one already spent",
         );
     }
     // v62.0.0 (CC rc20 4.2.6) — "A recovery key is spent by the recovery it

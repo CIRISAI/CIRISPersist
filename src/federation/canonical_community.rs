@@ -1972,6 +1972,38 @@ pub async fn live_charter_rows<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    live_or_held_charter_rows(directory, family, true).await
+}
+
+/// v62.0.0 (slice E2a; CC 4.2.6; Verify's `accord_recovery_refusals_v2`
+/// `charter_missing`) — **is a charter row carrying `digest` HELD here at
+/// all**, live or withdrawn? A charter the lineage adopts and this node does
+/// not hold is a gap, and the commitment walk fails closed across it
+/// (`accord_recovery_lineage_incomplete`). A held, withdrawn charter names
+/// nothing (#984 row 5).
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn charter_row_held<F>(directory: &F, family: &str, digest: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(!digest.is_empty()
+        && live_or_held_charter_rows(directory, family, false)
+            .await?
+            .iter()
+            .any(|a| a.persist_row_hash == digest))
+}
+
+async fn live_or_held_charter_rows<F>(
+    directory: &F,
+    family: &str,
+    live_only: bool,
+) -> Result<Vec<super::Attestation>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let is_charter = |a: &super::Attestation| {
         a.attestation_type == super::types::attestation_type::DELEGATES_TO
             && a.attested_key_id == family
@@ -1992,6 +2024,9 @@ where
             .pages();
     while let Some(page) = pages.next(directory).await? {
         charters.extend(page);
+    }
+    if !live_only {
+        return Ok(charters.into_iter().filter(|a| is_charter(a)).collect());
     }
     let rows =
         super::trust_root::with_slice_composers(directory, charters, Some(family), None).await?;

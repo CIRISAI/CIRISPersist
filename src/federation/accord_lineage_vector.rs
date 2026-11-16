@@ -713,7 +713,7 @@ pub(crate) mod bodies {
     /// - "A spent commitment never returns": a next commitment equal to a spent
     ///   one is `accord_recovery_next_commitment_not_fresh`; the spent
     ///   commitment v4 re-lists is not in force (a recovery under its key is
-    ///   `accord_recovery_key_mismatch`);
+    ///   `accord_recovery_key_spent`);
     /// - the control: a well-formed recovery verifies.
     pub(crate) async fn i1886_recovery_refusals(d: &dyn FederationDirectory) -> Family {
         let accord = accord_family_key_id();
@@ -761,11 +761,13 @@ pub(crate) mod bodies {
         )
         .await;
         // The spent commitment v4 re-lists is not in force: its key does not
-        // recover a2.
+        // recover a2, and is named spent (v62 slice E2a: the spent check runs
+        // before the in-force comparison, as Verify's
+        // `spent_commitment_relisted` case expects of persist).
         refused_with(
             d,
             &recovery_by_hand(&held, RECOVERED, fresh, RECOVERY_KEY, &fresh_next),
-            "accord_recovery_key_mismatch",
+            "accord_recovery_key_spent",
             "the re-listed spent commitment's key",
         )
         .await;
@@ -781,6 +783,138 @@ pub(crate) mod bodies {
             "I1886: a well-formed recovery verifies"
         );
         held
+    }
+
+    /// The vector Verify authored over persist's v2 lineage (CIRISVerify
+    /// branch `feat/accord-refusals-v2`, commit `a74bb48e`), pinned by sha256.
+    pub(crate) const REFUSALS_V2: &str = include_str!(
+        "../../tests/vectors/verify_v23/accord_lineage/accord_recovery_refusals_v2.json"
+    );
+    /// Its pinned digest.
+    pub(crate) const REFUSALS_V2_SHA256: &str =
+        "4502e5a951b566a6424189e8332590bc3f8748afaad6472723e806996c2d9aaf";
+
+    /// The recovery a v2 case offers, as the signed version persist's door
+    /// receives: the case's offered family, its statement as the supersede
+    /// proof's change envelope, its recovery signature, signed by the new key.
+    fn case_version(
+        c: &serde_json::Value,
+        held: &Family,
+    ) -> crate::federation::types::SignedFamily {
+        let family: Family = serde_json::from_value(c["offered_family"].clone()).unwrap();
+        let sig: ciris_verify_core::threshold::ThresholdSignature =
+            serde_json::from_value(c["recovery_signatures"][0].clone()).unwrap();
+        crate::federation::types::SignedFamily {
+            family,
+            authority_key_id: c["statement"]["new_holder_key_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            scrub_signature_classical: "c2ln".to_owned(),
+            scrub_signature_pqc: Some("c2ln".to_owned()),
+            supersede_proof: Some(crate::federation::types::GroupSupersedeProof {
+                prior_persist_row_hash: held.persist_row_hash.clone(),
+                change_envelope: c["statement"].clone(),
+                quorum_signatures: vec![sig],
+            }),
+            cosignatures: Vec::new(),
+        }
+    }
+
+    /// The token of a recovery verdict, or `accepted`.
+    async fn verdict(
+        d: &dyn FederationDirectory,
+        sf: &crate::federation::types::SignedFamily,
+    ) -> String {
+        match crate::federation::accord_recovery::verify_accord_recovery(d, sf).await {
+            Ok(Some(_)) => "accepted".to_owned(),
+            Ok(None) => "not_a_recovery".to_owned(),
+            Err(crate::federation::Error::CharterInvalid { detail }) => {
+                detail.split(':').next().unwrap_or_default().to_owned()
+            }
+            Err(e) => format!("error:{}", e.kind()),
+        }
+    }
+
+    /// **I1908** (CC rc20 4.2.6) — Verify's `accord_recovery_refusals_v2.json`
+    /// replayed through persist's recovery door. The file's rows are of the
+    /// EARLIER form (JSON records, bound-hybrid signatures over JCS), built
+    /// on persist's own `accord_lineage_v2.json`: persist replays them on its
+    /// earlier-form store, the one the rule runs on until the clean-mesh cut,
+    /// and asserts `expect_persist` byte for byte.
+    ///
+    /// - `spent_commitment_relisted`: `accord_recovery_key_spent`, with
+    ///   every charter row held.
+    /// - `charter_missing`: with every charter row held the recovery is
+    ///   accepted. With v4's charter row withheld it is
+    ///   `accord_recovery_lineage_incomplete`, failing closed and never
+    ///   skipping the gap.
+    ///
+    /// `withhold` removes the charter rows the case withholds from the
+    /// backend's store (a test-only delete), after the accepted leg.
+    pub(crate) async fn i1908_verify_refusals_v2<W, Fut>(d: &dyn FederationDirectory, withhold: W)
+    where
+        W: Fn(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use sha2::Digest as _;
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(REFUSALS_V2.as_bytes())),
+            REFUSALS_V2_SHA256,
+            "I1908: the pinned file"
+        );
+        let v: serde_json::Value = serde_json::from_str(REFUSALS_V2).unwrap();
+        assert_eq!(v["vector"], "ciris.accord_recovery_refusals.v2");
+        let _ = generate_v2(d).await;
+        let held = held(d).await;
+        // The keys the cases add, by the same seed rule as persist's signers.
+        let rk = format!("{RECOVERED}-recovery");
+        ts::register_hybrid_key_as(d, &rk, &rk, identity_type::NODE).await;
+        ops::register_accord_holder_as(
+            d,
+            &ops::Identity::new("vec-holder-a3"),
+            identity_type::ACCORD_HOLDER,
+        )
+        .await
+        .unwrap();
+        for added in v["added_keys"].as_array().unwrap() {
+            let id = added["key_id"].as_str().unwrap();
+            let (ed, _) = ts::hybrid_pubkeys(id);
+            assert_eq!(
+                ed,
+                added["ed25519_public_key_base64"].as_str().unwrap(),
+                "I1908: Verify's {id} is persist's seed rule"
+            );
+        }
+        let cases = v["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 2, "I1908: the case count");
+        let by_id = |id: &str| cases.iter().find(|c| c["id"] == id).unwrap().clone();
+        let relisted = by_id("spent_commitment_relisted");
+        assert_eq!(
+            verdict(d, &case_version(&relisted, &held)).await,
+            relisted["expect_persist"].as_str().unwrap(),
+            "I1908 spent_commitment_relisted"
+        );
+        let missing = by_id("charter_missing");
+        assert_eq!(missing["with_every_charter"], "accepted");
+        assert_eq!(
+            verdict(d, &case_version(&missing, &held)).await,
+            "accepted",
+            "I1908 charter_missing, every charter held"
+        );
+        let withheld: Vec<String> = missing["withheld_charter_digests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(withheld.len(), 1);
+        withhold(withheld).await;
+        assert_eq!(
+            verdict(d, &case_version(&missing, &held)).await,
+            missing["expect_persist"].as_str().unwrap(),
+            "I1908 charter_missing, v4's charter withheld"
+        );
     }
 
     /// I1886 (part 2) — after the runner seeded `twin`, an `accord_holder`
@@ -1108,6 +1242,76 @@ mod run_postgres {
             super::VECTOR_V2,
             "I1877: postgres produces the checked-in v2 vector"
         );
+    }
+}
+
+/// I1908 on both backends: the withheld charter row is deleted from the
+/// store by a test-only statement.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod run_1908 {
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1908_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let conn = b.conn_handle();
+        super::bodies::i1908_verify_refusals_v2(&b, |digests| {
+            let conn = conn.clone();
+            async move {
+                let c = conn.lock();
+                for d in digests {
+                    let n = c
+                        .execute(
+                            "DELETE FROM federation_attestations WHERE persist_row_hash = ?1",
+                            [&d],
+                        )
+                        .unwrap();
+                    assert_eq!(n, 1, "I1908: withheld {d}");
+                }
+            }
+        })
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1908_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let pool = b.pool().clone();
+        super::bodies::i1908_verify_refusals_v2(&b, |digests| {
+            let pool = pool.clone();
+            async move {
+                let c = crate::store::postgres::checkout_bounded(
+                    &pool,
+                    std::time::Duration::from_secs(30),
+                    None,
+                )
+                .await
+                .unwrap();
+                for d in digests {
+                    let n = c
+                        .execute(
+                            "DELETE FROM cirislens.federation_attestations WHERE \
+                             persist_row_hash = $1",
+                            &[&d],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(n, 1, "I1908: withheld {d}");
+                }
+            }
+        })
+        .await;
     }
 }
 

@@ -427,6 +427,12 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v62.0.0 (slice E2a) — the edition-2 statement store.
+    ("edition2_statements_about", ConnClass::Read),
+    ("edition2_objects", ConnClass::Read),
+    ("edition2_voices", ConnClass::Read),
+    ("put_edition2_object", ConnClass::Write),
+    ("put_edition2_statement", ConnClass::Write),
     // v61 (CIRISPersist#934, S4b) — the group supersede executor.
     ("store_planned_supersede", ConnClass::Write),
     // v61 (CIRISPersist#934, S4b) — the family executor.

@@ -9416,6 +9416,67 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         self
     }
 
+    async fn edition2_statements_about(
+        &self,
+        family: &str,
+        sub: &str,
+    ) -> Result<Vec<Vec<u8>>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::store::statements_about_postgres(&client, family, sub).await
+    }
+
+    async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::store::objects_of_postgres(&client, typ).await
+    }
+
+    async fn put_edition2_object(
+        &self,
+        object: &crate::federation::edition2::store::HeldObject,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::store::put_object_postgres(&client, object).await
+    }
+
+    async fn edition2_voices(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<Vec<Vec<u8>>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::store::voices_of_postgres(&client, row_id).await
+    }
+
+    async fn put_edition2_statement(
+        &self,
+        row: &crate::federation::edition2::door::AdmittedRow,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
+        let new = crate::federation::edition2::store::put_row_postgres(&tx, row).await?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
+        Ok(new)
+    }
+
     // v61.4.0 (CIRISPersist#1244) — the directory capsule reaches the
     // blackhole and edge-detection surfaces through these, so those calls
     // run inside persist's `.so`.

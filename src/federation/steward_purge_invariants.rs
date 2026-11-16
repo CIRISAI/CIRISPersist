@@ -5106,14 +5106,16 @@ mod run {
             crate::federation::steward_purge::STEWARD_PURGE_BASIS,
             "steward_purge"
         );
-        // The digest is SHA-256 over the JCS array of sorted, unique ids.
+        // v62.0.0 (slice E2a) — the digest is SHA-256 over the CDE array of the
+        // CDE-sorted, unique ids (the forward form; I1900 holds the vectors):
+        // `0x82`, then each id as a 7-byte text string (`0x67` ‖ utf-8).
         let d =
             crate::federation::steward_purge::selection_digest(&["trace:b", "trace:a", "trace:a"]);
         use sha2::Digest as _;
         assert_eq!(
             d,
-            hex::encode(sha2::Sha256::digest(br#"["trace:a","trace:b"]"#)),
-            "I661: the digest preimage is the JCS array"
+            hex::encode(sha2::Sha256::digest(b"\x82\x67trace:a\x67trace:b")),
+            "I661: the digest preimage is the CDE array"
         );
     }
 }

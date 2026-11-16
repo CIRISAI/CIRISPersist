@@ -9976,6 +9976,38 @@ impl Engine {
         })
     }
 
+    /// v62.0.0 (slice E2a, CIRISPersist#1274; CC 2.6.1, 2.6.1.12) — **the
+    /// edition-2 statement door**, local or replicated: one `COSE_Sign1`
+    /// statement as received. It runs the edition-2 door, which:
+    /// - refuses an earlier-form object or bytes in no form
+    ///   (`earlier_form_object`) and an edition-1 `row-ref`
+    ///   (`row_ref_edition_1`);
+    /// - runs Verify's verdict;
+    /// - computes the row id, refusing an `offered_row_id` that differs
+    ///   (`row_id_mismatch`);
+    /// - applies the key record's end rule.
+    ///
+    /// A key-plane row (`key:record`, `key:revocation`) is then held in the
+    /// edition-2 store. Any other row is mapped onto persist's typed row and
+    /// meets the SAME attestation gates as the JSON door, stored under its
+    /// row id. A further voice of a held row joins its fold. Replication and
+    /// tier ingest deliver edition-2 statements here.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_edition2_statement(
+        &self,
+        statement: &[u8],
+        offered_row_id: Option<[u8; 32]>,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, crate::federation::Error>
+    {
+        crate::federation::edition2::ingest::put_statement(
+            self.federation_directory().as_ref(),
+            statement,
+            offered_row_id.as_ref(),
+            crate::federation::edition2::ingest::INGEST_TIER,
+        )
+        .await
+    }
+
     /// v36.0.0 (CIRISPersist#624) — the **typed, pre-write replicated
     /// ATTESTATION-plane apply**: the Key plane's
     /// [`apply_replicated_key_record`](Self::apply_replicated_key_record)

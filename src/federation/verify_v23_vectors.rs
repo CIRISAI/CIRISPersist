@@ -3,11 +3,11 @@
 //!
 //! Verify 23.0.0 published independent vectors that persist and CIRISKernel
 //! pin. Persist keeps byte-identical copies of four, taken from the
-//! `v23.0.0` tag, under `tests/vectors/verify_v23/`:
+//! `v23.0.0` tag (the row statements at Verify `23.1.3`), under `tests/vectors/verify_v23/`:
 //!
 //! | file | Verify path at v23.0.0 |
 //! |---|---|
-//! | `edition2/row_statements_v1.json` | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/row_statements_v1.json` (re-pinned at **Verify 23.1.3**, slice E2a) | `src/ciris-verify-core/tests/vectors/edition2/` |
 //! | `composite/mldsa65_ed25519_draft_kats.json` | `src/ciris-crypto/tests/vectors/composite/` |
 //! | `accord_lineage/accord_recovery_refusals_v1.json` | `src/ciris-verify-core/tests/vectors/accord_lineage/` |
 //! | `substrate_composite/composite_signatures_v1.json` | `src/ciris-verify-core/tests/vectors/substrate_composite/` |
@@ -22,15 +22,16 @@
 //!   every refusal is refused.
 //!
 //! To re-pin from a later tag: copy the file, update its digest here, and
-//! say why in the CHANGELOG (`edition2/row_statements_v1.json` already
-//! differs at Verify's 23.1.3 tag).
+//! say why in the CHANGELOG. `edition2/row_statements_v1.json` is the
+//! Verify 23.1.3 copy (slice E2a: 17 key records, 27 vendored-family cases), the
+//! file persist's door replays (`edition2::verify_vectors_replay`, I1901).
 
 /// `(path under tests/vectors/verify_v23/, bytes, pinned SHA-256)`.
 const PINNED: &[(&str, &[u8], &str)] = &[
     (
         "edition2/row_statements_v1.json",
         include_bytes!("../../tests/vectors/verify_v23/edition2/row_statements_v1.json"),
-        "288addfa43969097d3f78d54385a82a09254271c51161ee67d0effab3abc2e52",
+        "b0603a5dd757e5b36a840735a1ec5379c1ec6bc450260f41e9846b7cd05a8166",
     ),
     (
         "composite/mldsa65_ed25519_draft_kats.json",
@@ -71,14 +72,14 @@ fn len_of(v: &serde_json::Value, key: &str) -> usize {
     v[key].as_array().map_or(0, Vec::len)
 }
 
-/// I1850 — the four files are the bytes taken at Verify's v23.0.0 tag.
+/// I1850 — the four files are the bytes taken at Verify's tags (v23.0.0; row statements Verify 23.1.3).
 #[test]
 fn i1850_verify_v23_vectors_are_pinned_by_sha256() {
     for (path, bytes, pinned) in PINNED {
         assert_eq!(
             sha256_hex(bytes),
             *pinned,
-            "I1850: tests/vectors/verify_v23/{path} is not the pinned v23.0.0 copy"
+            "I1850: tests/vectors/verify_v23/{path} is not the pinned copy"
         );
     }
     let rows = vector("edition2/row_statements_v1.json");
@@ -87,9 +88,9 @@ fn i1850_verify_v23_vectors_are_pinned_by_sha256() {
         ("refusals", 40),
         ("earlier_form", 5),
         ("family", 9),
-        ("family_vendored", 8),
+        ("family_vendored", 27),
         ("key_directory", 5),
-        ("key_records", 13),
+        ("key_records", 17),
         ("objects", 6),
         ("references", 11),
     ] {

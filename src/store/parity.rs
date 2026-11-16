@@ -128,6 +128,13 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v62.0.0 (slice E2a) — the edition-2 attestation path: the carried
+    // statement's re-verify and signer identity set refuses a row that is
+    // not its statement's projection (Gate); `put_row` writes an admitted
+    // statement into `ceg_statements` and fails only on the substrate's own
+    // terms (Plumbing: the edition-2 door judged the statement before it).
+    ("carried_identity_type", Class::Gate),
+    ("put_row", Class::Plumbing),
     // v61 (CIRISPersist#934, S4b) — the group supersede, and the verdict its
     // executor asks of the held head inside its transaction.
     ("supersede_group_row_planned", Class::Plan),
