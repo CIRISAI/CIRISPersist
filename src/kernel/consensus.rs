@@ -224,35 +224,63 @@ pub fn ballot_rows(b: &Ballot<'_>, arm: &Arm) -> Vec<KRow> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let gid = RowId::of_label(&["ballot/group", b.protocol, b.subkind.unwrap_or("")]);
-    let mut rows = Vec::with_capacity(3);
-    let (g_signer, g_rest) = match members.split_first() {
-        Some((s, rest)) => (s.clone(), rest.to_vec()),
-        None => (NO_VOICE.to_owned(), Vec::new()),
-    };
-    rows.push(KRow::new(gid, Vec::new(), g_signer).with_seat(SeatFields {
-        to: members.clone(),
-        scope: Some(SEAT_MEMBER.into()),
-        obj: Some(Obj::Row(gid)),
-        conf: Some(Conf::Own),
-        cosigners: g_rest,
-        ..SeatFields::of(SeatKind::Offer)
-    }));
-    let mut head = gid;
-    if let Some((f_signer, f_rest)) = founders.split_first() {
-        let fid = RowId::of_label(&["ballot/founders", b.protocol]);
-        rows.push(
-            KRow::new(fid, vec![gid], f_signer.clone()).with_seat(SeatFields {
-                to: founders.clone(),
-                scope: Some(SEAT_FOUNDER.into()),
-                obj: Some(Obj::Row(gid)),
-                conf: Some(Conf::Own),
-                cosigners: f_rest.to_vec(),
-                ..SeatFields::of(SeatKind::Offer)
-            }),
-        );
-        head = fid;
+    // the ballot's graph is the adapter's alone: synthetic ids, no digests
+    let gid = RowId::synthetic(0, 0);
+    let mut next: u32 = 0;
+    let mut rows = Vec::with_capacity(members.len() + founders.len() + 3);
+    // `G` founds the group and seats its own signer; every other seat is its
+    // own offer over `G` by `G`'s key, the seated person's signature on it
+    // the acceptance. One offer per seat keeps each row's signer set small:
+    // the kernel's seat walk reads an offer's signers once per key it seats
+    // (`seat::signers` per `accepted` call), so one offer seating every
+    // member is quadratic in the roster.
+    let g_signer = members
+        .first()
+        .cloned()
+        .unwrap_or_else(|| NO_VOICE.to_owned());
+    rows.push(
+        KRow::new(gid, Vec::new(), g_signer.clone()).with_seat(SeatFields {
+            to: vec![g_signer.clone()],
+            scope: Some(SEAT_MEMBER.into()),
+            obj: Some(Obj::Row(gid)),
+            conf: Some(Conf::Own),
+            ..SeatFields::of(SeatKind::Offer)
+        }),
+    );
+    let mut seat_of: std::collections::BTreeMap<&str, RowId> = std::collections::BTreeMap::new();
+    seat_of.insert(g_signer.as_str(), gid);
+    let mut version_names = vec![gid];
+    for (scope, keys) in [(SEAT_MEMBER, &members), (SEAT_FOUNDER, &founders)] {
+        for k in keys.iter() {
+            if scope == SEAT_MEMBER && *k == g_signer {
+                continue;
+            }
+            next += 1;
+            let id = RowId::synthetic(1, next);
+            if scope == SEAT_MEMBER {
+                seat_of.insert(k.as_str(), id);
+            }
+            version_names.push(id);
+            rows.push(
+                KRow::new(id, vec![gid], g_signer.clone()).with_seat(SeatFields {
+                    to: vec![k.clone()],
+                    scope: Some(scope.into()),
+                    obj: Some(Obj::Row(gid)),
+                    conf: Some(Conf::Own),
+                    cosigners: if *k == g_signer {
+                        Vec::new()
+                    } else {
+                        vec![k.clone()]
+                    },
+                    ..SeatFields::of(SeatKind::Offer)
+                }),
+            );
+        }
     }
+    // `V`: the roster version, the head the counted row names (it names
+    // every seat, so every seat is in the head's past)
+    let head = RowId::synthetic(2, 0);
+    rows.push(KRow::new(head, version_names, g_signer.clone()));
     // the voices: each verified signer's person, once
     let voices: Vec<String> = b
         .signers
@@ -267,28 +295,19 @@ pub fn ballot_rows(b: &Ballot<'_>, arm: &Arm) -> Vec<KRow> {
         None => (NO_VOICE.to_owned(), Vec::new()),
     };
     let to: Vec<String> = b.subject.map(|s| vec![person(s)]).unwrap_or_default();
-    let mut label = vec![
-        "ballot/counted",
-        b.protocol,
-        if b.direction == Direction::Add {
-            "add"
-        } else {
-            "remove"
-        },
-    ];
-    label.extend(b.subject);
-    let sorted: Vec<&str> = voices.iter().map(String::as_str).collect();
-    label.extend(sorted.iter().copied());
-    let cid = RowId::of_label(&label);
+    let cid = RowId::synthetic(3, 0);
     // a removal its subject alone signs is the member's own leaving: CC
     // 3.3.4's `membership:resignation`, a withdrawal by the member of the
     // offer that seats it, which ends its seat alone (DIFFERENCES.md 5a)
     if b.direction == Direction::Remove && to.len() == 1 && voices == to && members.contains(&to[0])
     {
-        rows.push(KRow::new(cid, vec![head], c_signer).with_seat(SeatFields {
-            target: Some(gid),
-            ..SeatFields::of(SeatKind::Withdraw)
-        }));
+        let target = seat_of.get(to[0].as_str()).copied().unwrap_or(gid);
+        rows.push(
+            KRow::new(cid, vec![head, target], c_signer).with_seat(SeatFields {
+                target: Some(target),
+                ..SeatFields::of(SeatKind::Withdraw)
+            }),
+        );
         return rows;
     }
     rows.push(KRow::new(cid, vec![head], c_signer).with_seat(SeatFields {
@@ -317,7 +336,7 @@ pub fn admits(b: &Ballot<'_>) -> Result<Answer<bool>, NoCell> {
     let arm = arm_of(b)?;
     let rows = ballot_rows(b, &arm);
     let law = seat_law();
-    let c = layers::conclude(rows.iter(), |p| seat_rule(p, law, &NoCut, &|_| false), None);
+    let c = layers::conclude(rows.iter(), |p| seat_rule(p, law, &NoCut, &|_| true), None);
     let counted = rows.last().expect("the counted row is last").id;
     Ok(Answer {
         value: c.concluded_id(&counted),

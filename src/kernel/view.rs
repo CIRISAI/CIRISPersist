@@ -59,6 +59,19 @@ impl RowId {
         Self::of_label(&["persist_row_hash", persist_row_hash])
     }
 
+    /// An id for a row of a graph the adapter builds alone (a ballot's
+    /// founding version, seats, head and counted act): no digest, only a
+    /// tag and an index, unique within that graph. Never mixed with stored
+    /// rows' ids.
+    #[must_use]
+    pub fn synthetic(tag: u8, i: u32) -> Self {
+        let mut out = [0u8; 32];
+        out[0] = 0xff;
+        out[1] = tag;
+        out[28..].copy_from_slice(&i.to_be_bytes());
+        RowId(out)
+    }
+
     /// A synthetic id for a row the adapter presents but persist does not
     /// store as one row (a group's founding version read from its record, a
     /// ballot's counted act). Domain-separated from [`Self::of_hash`]'s
