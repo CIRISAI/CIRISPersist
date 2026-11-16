@@ -37,6 +37,10 @@
 //!   PyO3 wraps, integration tests covering the chain-break / replay
 //!   / cross-tenant rejection paths.
 
+/// v62.0.0 (slice A) — I1794–I1795: the Merkle stores on one thread, with
+/// no `block_on`, stamped by the installed clock.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod host_seams_invariants;
 /// v61.1.0 (CIRISPersist#1233) — I1564–I1566: the audit gate is the
 /// hybrid-signed head.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]

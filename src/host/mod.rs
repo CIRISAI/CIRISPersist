@@ -17,6 +17,10 @@ pub mod clock;
 pub mod lifecycle;
 pub mod rt;
 
+/// I1790–I1793, I1797–I1799: the seams carry what a host gives the node.
+#[cfg(test)]
+mod seams_invariants;
+
 use std::sync::Arc;
 
 pub use clock::{Clock, FixedClock, Instant, SystemClock};

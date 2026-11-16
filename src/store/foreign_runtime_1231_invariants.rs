@@ -46,15 +46,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "CapturedRuntime",
         "held only as `Arc<dyn PersistRuntimeTimer>` persist's .so built (#1231)",
     ),
+    // v62.0.0 (P8): `PgMerkleStore` and `SqliteMerkleStore` hold no runtime
+    // type any more (async end to end / synchronous), so they left this list.
     (
-        "src/audit/merkle_store.rs",
-        "PgMerkleStore",
-        "built per call from the running copy's own `Handle::current()` and dropped in that call",
-    ),
-    (
-        "src/audit/merkle_store.rs",
-        "SqliteMerkleStore",
-        "built per call from the running copy's own `Handle::current()` and dropped in that call",
+        "src/audit/hybrid_head_1233_invariants.rs",
+        "PgSync",
+        "test-only: the I1564/I1565 bridge from the sync witnesses to the async PG store, \
+         built from the test's own `Handle::current()` and dropped in that test",
     ),
     (
         "src/ffi/pyo3.rs",

@@ -59,6 +59,10 @@ pub(crate) mod postgres_runtime_connect;
 /// `postgres`.
 #[cfg(test)]
 mod foreign_runtime_1231_invariants;
+/// v62.0.0 (slice A) — I1796, from disk: node code reaches time, the executor
+/// and shutdown only through `src/host/`.
+#[cfg(test)]
+mod host_seams_gate;
 #[cfg(all(test, feature = "postgres"))]
 mod one_connection_pool_invariants;
 /// v61 (CIRISPersist#1166) — from disk: every Postgres checkout is the
