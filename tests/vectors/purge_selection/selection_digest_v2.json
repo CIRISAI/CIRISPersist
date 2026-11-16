@@ -1,0 +1,70 @@
+{
+  "vector": "ciris.purge_selection_digest.v2",
+  "rule": "SHA-256 over CDE(array of tstr 'plane:id'); set sorted by each element's deterministic encoding (length first), unique; carried as bstr .size 32, hex in persist's columns",
+  "cases": [
+    {
+      "id": "empty",
+      "record_ids": [],
+      "preimage_hex": "80",
+      "digest_hex": "76be8b528d0075f7aae98d6fa57a6d3c83ae480a8469e668d7b0af968995ac71"
+    },
+    {
+      "id": "one",
+      "record_ids": [
+        "attestation:a1"
+      ],
+      "preimage_hex": "816e6174746573746174696f6e3a6131",
+      "digest_hex": "db73b0eb478e964d3d0de0a58346ced9f06802bd4bec0a2d0f3942cd791bc27f"
+    },
+    {
+      "id": "length_first",
+      "record_ids": [
+        "attestation:zz",
+        "trace:t",
+        "blob:abababababababababababababababababababababababababababababababab"
+      ],
+      "preimage_hex": "836774726163653a746e6174746573746174696f6e3a7a7a7845626c6f623a61626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162",
+      "digest_hex": "3eb67fe574dee4691cbf2c649788e15f67203356583d9e32f9fd7ae10f68ae5b"
+    },
+    {
+      "id": "duplicates_dropped",
+      "record_ids": [
+        "trace:t",
+        "trace:t",
+        "attestation:a"
+      ],
+      "preimage_hex": "826774726163653a746d6174746573746174696f6e3a61",
+      "digest_hex": "f8442b4d71bc96dee887d61b2b46e8e693294ebbe6ce1ebec7dc835b5b5fdcc3"
+    },
+    {
+      "id": "utf8_order_differs",
+      "record_ids": [
+        "trace:bb",
+        "attestation:a",
+        "trace:a"
+      ],
+      "preimage_hex": "836774726163653a616874726163653a62626d6174746573746174696f6e3a61",
+      "digest_hex": "22d4c249644ab5ef55c108a47c6ac54886e17b40ad031ff268a99dc2c62ab479"
+    },
+    {
+      "id": "long_23_24_boundary",
+      "record_ids": [
+        "attestation:xxxxxxxxxxx",
+        "attestation:xxxxxxxxxxxx",
+        "attestation:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ],
+      "preimage_hex": "83776174746573746174696f6e3a787878787878787878787878186174746573746174696f6e3a7878787878787878787878787901006174746573746174696f6e3a78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878",
+      "digest_hex": "80815ae1df74880bc8cc62c055cc4314a2603b6cd7e7c5741d5205964ffae7a8"
+    },
+    {
+      "id": "non_ascii",
+      "record_ids": [
+        "attestation:é",
+        "attestation:z",
+        "attestation:守"
+      ],
+      "preimage_hex": "836d6174746573746174696f6e3a7a6e6174746573746174696f6e3ac3a96f6174746573746174696f6e3ae5ae88",
+      "digest_hex": "8e54c8088cbb0bd1e25d39c8709d9b3000e50921f907979f752fd880c4dcb9ab"
+    }
+  ]
+}

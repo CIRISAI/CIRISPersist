@@ -169,6 +169,16 @@ pub async fn verify_row_hybrid_signature<F>(directory: &F, row: &Attestation) ->
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (slice E2a, CIRISPersist#1274; CC 2.6.1.7) — a row carrying an
+    // edition-2 statement is proven by that statement's composite signature,
+    // re-verified here against the edition-2 key plane, and the row must be
+    // exactly the statement's projection.
+    if super::edition2::ingest::verify_carried(directory, row)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
     // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row's signature is
     // its signed object's own, over the object's own bytes; the row is a pure
     // function of that object. The family's rule, not the generic one

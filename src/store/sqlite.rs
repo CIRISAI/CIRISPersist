@@ -3273,6 +3273,59 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         self
     }
 
+    async fn edition2_statements_about(
+        &self,
+        family: &str,
+        sub: &str,
+    ) -> Result<Vec<Vec<u8>>, crate::federation::Error> {
+        let (family, sub) = (family.to_owned(), sub.to_owned());
+        self.read(move |conn| {
+            crate::federation::edition2::store::statements_about_sqlite(conn, &family, &sub)
+        })
+        .await
+    }
+
+    async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, crate::federation::Error> {
+        let typ = typ.to_owned();
+        self.read(move |conn| crate::federation::edition2::store::objects_of_sqlite(conn, &typ))
+            .await
+    }
+
+    async fn put_edition2_object(
+        &self,
+        object: &crate::federation::edition2::store::HeldObject,
+    ) -> Result<bool, crate::federation::Error> {
+        let object = object.clone();
+        self.write(move |conn| crate::federation::edition2::store::put_object_sqlite(conn, &object))
+            .await
+    }
+
+    async fn edition2_voices(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<Vec<Vec<u8>>, crate::federation::Error> {
+        let row_id = *row_id;
+        self.read(move |conn| crate::federation::edition2::store::voices_of_sqlite(conn, &row_id))
+            .await
+    }
+
+    async fn put_edition2_statement(
+        &self,
+        row: &crate::federation::edition2::door::AdmittedRow,
+    ) -> Result<bool, crate::federation::Error> {
+        let row = row.clone();
+        self.write(move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
+            let new = crate::federation::edition2::store::put_row_sqlite(&tx, &row)?;
+            tx.commit()
+                .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
+            Ok(new)
+        })
+        .await
+    }
+
     // v61.4.0 (CIRISPersist#1244) — the directory capsule reaches the
     // blackhole and edge-detection surfaces through these, so those calls
     // run inside persist's `.so`.

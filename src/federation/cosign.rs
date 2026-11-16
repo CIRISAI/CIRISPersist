@@ -45,6 +45,14 @@
 //! or kept different randomised ML-DSA bytes, name it alike (CC 2.6.1.8,
 //! built so v62 changes the encoding and not the mechanism).
 //!
+//! **The edition-2 name (v62.0.0 slice E2a).** An edition-2 counted act is
+//! several statements over one payload, found by the row id (CC 2.6.1.9).
+//! Its pending hold IS its row, named by the event's edition-2 row id:
+//! [`event_row_id`], and the fold [`edition2_voices`] keys on
+//! `(event_row_id, attesting_key_id)`, CC 3.1.3's token, by person. There
+//! the token is spelled as CC spells it. The `quorum_key` below is the
+//! earlier form's name and goes with the earlier store (`TODO(json-cut)`).
+//!
 //! **The name, at CC rc20 (v62.0.0, CIRISPersist#1274).** CC rc20's
 //! `cosign:{state}` fold keys on `event_row_id,attesting_key_id` (CC 8.x,
 //! citing CC 3.1.3): the edition-2 name of the act, the event's row id of
@@ -1459,6 +1467,45 @@ where
     ids.sort();
     ids.dedup();
     Ok(ids)
+}
+
+/// v62.0.0 (slice E2a; CC 3.1.3 `cosign:{state}`, CC 2.6.1.9) — **the
+/// edition-2 name of a counted act**: the event's row id, the same for every
+/// voice (signatures are outside it, CC 2.6.1.3). The pending hold of an
+/// edition-2 event is named by this, never by a quorum key.
+#[must_use]
+pub fn event_row_id(event: &super::edition2::door::AdmittedRow) -> super::edition2::names::RowId {
+    event.row_id
+}
+
+/// v62.0.0 (slice E2a; CC 3.1.3, CC 4.5.13) — **the fold of a held edition-2
+/// event's voices**, keyed `(event_row_id, attesting_key_id)`: the distinct
+/// signers (`iss`, by person) whose statement over the event verifies under
+/// the edition-2 key plane and names exactly `event_row_id`. A voice that
+/// does not verify, or waits, is not counted.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn edition2_voices<D>(
+    dir: &D,
+    event_row_id: &super::edition2::names::RowId,
+) -> Result<std::collections::BTreeSet<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut voices = std::collections::BTreeSet::new();
+    for st in dir.edition2_voices(event_row_id).await? {
+        let keys = super::edition2::ingest::held_keys_for(dir, &st).await?;
+        if let Ok(row) = super::edition2::door::admit_row(
+            &st,
+            &keys,
+            Some(&event_row_id.0),
+            ciris_verify_core::edition2::family::SelectContext::default(),
+        ) {
+            voices.insert(row.iss);
+        }
+    }
+    Ok(voices)
 }
 
 /// Test-only: suppress [`after_admission`] on this thread, so a witness of

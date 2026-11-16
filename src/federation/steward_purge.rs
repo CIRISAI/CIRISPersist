@@ -12,8 +12,8 @@
 //!    trust root's `community_key_id`, cosigned by distinct SEATS of the held
 //!    root and counted under that root's own `consensus_protocol`
 //!    ([`trust_root_cosigners_over`](super::canonical_community::trust_root_cosigners_over)),
-//!    with `content_sha256` = the **selection digest**: SHA-256 over the JCS
-//!    array of sorted, unique `"plane:id"` strings naming every purged
+//!    with `content_sha256` = the **selection digest**: SHA-256 over the CDE
+//!    array of CDE-sorted, unique `"plane:id"` strings naming every purged
 //!    record, derived included — a record is named by its plane identifier
 //!    (`attestation_id`, `trace_id`, bytes by their sha256), never by content
 //!    ([`selection_digest`]). An OPTIONAL `selection_counts` `{table: count}`
@@ -637,22 +637,49 @@ pub fn parse_record_id(record_id: &str) -> Result<PurgeRecord, Error> {
     })
 }
 
-/// **The selection digest** (CIRISConstitution#165 §1): SHA-256 over the JCS
-/// serialization of the record ids as a sorted, de-duplicated JSON array of
-/// strings, lowercase hex. The notice names exactly this; the ledger re-derives
-/// it.
+/// **The selection digest, forward form** (CC 2.4.1.1, CC 3.3.2; the store's
+/// open encoding of CC 2.6.1.12, persist's answer on CIRISPersist#1274):
+/// SHA-256 over the deterministic encoding (CDE, CC 2.6.1.2) of a CBOR array
+/// (major type 4) of text strings, each `"{plane}:{id}"`. The array is a SET
+/// under CC 2.6.1.2: unique, and sorted by the bytewise order of each
+/// element's deterministic encoding. A text string's encoding begins with
+/// its length, so a SHORTER string sorts first ([`selection_preimage`]).
+///
+/// The earlier form (`hex(SHA-256(JCS(array)))` sorted on UTF-8) is gone with
+/// the earlier mesh (CC 2.6.1.12): a digest of that form never matches.
+///
+/// The edition-2 payload carries the digest as a 32-byte byte string
+/// ([`selection_digest_bytes`]); persist's columns and HTTP members carry
+/// it as lowercase hex (CC 2.6.3), which is what this returns.
 #[must_use]
 pub fn selection_digest<S: AsRef<str>>(record_ids: &[S]) -> String {
-    let sorted: BTreeSet<&str> = record_ids.iter().map(AsRef::as_ref).collect();
-    let array = serde_json::Value::Array(
-        sorted
-            .into_iter()
-            .map(|s| serde_json::Value::String(s.to_owned()))
-            .collect(),
-    );
-    let bytes = ciris_verify_core::jcs::canonicalize(&array)
-        .expect("a JSON array of strings always canonicalizes");
-    hex::encode(sha2::Sha256::digest(bytes))
+    hex::encode(selection_digest_bytes(record_ids))
+}
+
+/// The selection digest as the 32 bytes an edition-2 payload carries
+/// (`hash-digest`, a bstr of 32), never hex.
+#[must_use]
+pub fn selection_digest_bytes<S: AsRef<str>>(record_ids: &[S]) -> [u8; 32] {
+    sha2::Sha256::digest(selection_preimage(record_ids)).into()
+}
+
+/// The CDE bytes the selection digest is taken over: the de-duplicated
+/// `"plane:id"` strings as a CBOR array, each element placed by the bytewise
+/// order of its own deterministic encoding (length first).
+#[must_use]
+pub fn selection_preimage<S: AsRef<str>>(record_ids: &[S]) -> Vec<u8> {
+    use ciris_verify_core::cde::{encode, Value};
+    let mut elements: Vec<Vec<u8>> = record_ids
+        .iter()
+        .map(|s| encode(&Value::Text(s.as_ref().to_owned())))
+        .collect();
+    elements.sort_unstable();
+    elements.dedup();
+    let items: Vec<Value> = elements
+        .iter()
+        .map(|e| ciris_verify_core::cde::decode(e).expect("a text string we just encoded"))
+        .collect();
+    encode(&Value::Array(items))
 }
 
 // ── selections ─────────────────────────────────────────────────────────────

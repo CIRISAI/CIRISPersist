@@ -956,14 +956,26 @@ where
     // (`AttestationStore::attesting_identity_type`); a missing key is
     // refused HERE, typed, rather than left to the FK violation the SQL
     // backends would raise at the INSERT.
-    let attesting_identity_type = dir
-        .attesting_identity_type(&row.attesting_key_id)
-        .await?
-        // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart from a
-        // bad signature (retryable once the Key row lands).
-        .ok_or_else(|| {
-            crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation")
-        })?;
+    // v62.0.0 (slice E2a, CIRISPersist#1274) — a row carrying an edition-2
+    // statement reads its signer's identity set from the signer's live
+    // edition-2 `key:record`, never from the earlier store's
+    // `federation_keys` (CC 2.6.1.12). The same gates follow.
+    let attesting_identity_type = match crate::federation::edition2::ingest::carried_identity_type(
+        dir.as_dyn_directory(),
+        &row,
+    )
+    .await?
+    {
+        Some(t) => t,
+        None => dir
+            .attesting_identity_type(&row.attesting_key_id)
+            .await?
+            // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart from a
+            // bad signature (retryable once the Key row lands).
+            .ok_or_else(|| {
+                crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation")
+            })?,
+    };
     // AV-76 D2 — the lookup above is a hard DATA dependency of the
     // dimension policy here (`attesting_identity_type`); the pair moves
     // as a unit and its internal order is fixed. The default policy
@@ -1426,7 +1438,18 @@ where
     // v60.0.0 (CIRISPersist#988 item 4) — the goal declaration this row
     // touches, refolded by the executor after the insert.
     let projected_goal = super::goal_projection::goal_to_refold(dir, &row).await?;
-    row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+    // v62.0.0 (slice E2a) — a row carrying an edition-2 statement is stored
+    // under the row id this node computed (CC 2.6.1.3), checked equal to its
+    // `attestation_id` by the crypto tier's `verify_carried`.
+    row.persist_row_hash = if row
+        .attestation_envelope
+        .get(crate::federation::edition2::ingest::STATEMENT_MEMBER)
+        .is_some()
+    {
+        row.attestation_id.clone()
+    } else {
+        crate::federation::types::compute_persist_row_hash(&row)?
+    };
     // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation tier
     // only, the E5 invariant). v31.0.0 (CIRISPersist#646) — only the
     // LOCATOR is derived here; the hash comes from the stored row, after

@@ -812,6 +812,8 @@ pub mod schema_resolver;
 pub mod scores;
 pub mod scores_read_audit;
 pub mod steward_purge;
+// v62.0.0 (slice E2a, CIRISPersist#1274, CC rc20) — the edition-2 wire.
+pub mod edition2;
 pub mod two_path;
 // v60.0.0 (S6v; CC 4.5.13) — the two-path policy table as runtime data, and
 // the corridor at admission.
@@ -893,6 +895,8 @@ mod vote_by_person_invariants;
 pub(crate) mod doors_takedown_invariants;
 // v61.4.0 (CIRISPersist#1260; CC 4.5.3) — I1746/I1747: a room moderator
 // takes down content placed in the room by a `supersedes` widening.
+#[cfg(test)]
+mod purge_digest_v2_invariants;
 #[cfg(test)]
 mod room_takedown_invariants;
 #[cfg(test)]
@@ -3613,6 +3617,67 @@ pub trait FederationDirectory: Send + Sync {
     /// `self`.
     fn edge_detection_surface(&self) -> Option<&dyn crate::derived::EdgeDetectionSink> {
         None
+    }
+
+    // ── The edition-2 statement store (v62 slice E2a) ─────────────────
+
+    /// v62.0.0 (slice E2a, CC 2.6.1) — the held edition-2 statements of
+    /// `family` whose CWT `sub` is `sub`, as received: the key plane reads a
+    /// key's `key:record`s and `key:revocation`s through this
+    /// ([`edition2::ingest`]). Empty by default (a directory with no
+    /// edition-2 store holds none); the sqlite and postgres backends read
+    /// `ceg_statements`.
+    async fn edition2_statements_about(
+        &self,
+        family: &str,
+        sub: &str,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let _ = (family, sub);
+        Ok(Vec::new())
+    }
+
+    /// v62.0.0 (slice E2a, CC 2.6.1.9) — every held voice of one edition-2
+    /// row id: the statements over one payload that a counted row's fold
+    /// counts (`cosign:{state}` keys on `event_row_id`). Empty by default.
+    async fn edition2_voices(
+        &self,
+        row_id: &edition2::names::RowId,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let _ = row_id;
+        Ok(Vec::new())
+    }
+
+    /// v62.0.0 (slice E2a, CC 2.6.1.11) — every held voice of signed objects
+    /// of `typ` (`ceg-genesis-bundle/2`), as received. Empty by default.
+    async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, Error> {
+        let _ = typ;
+        Ok(Vec::new())
+    }
+
+    /// v62.0.0 (slice E2a) — store a verified object voice. A directory with
+    /// no edition-2 store refuses.
+    async fn put_edition2_object(
+        &self,
+        object: &edition2::store::HeldObject,
+    ) -> Result<bool, Error> {
+        let _ = object;
+        Err(Error::Backend(
+            "this directory holds no edition-2 statement store".to_owned(),
+        ))
+    }
+
+    /// v62.0.0 (slice E2a) — store an admitted edition-2 statement and its
+    /// names (`ceg_statements`, `ceg_row_names`), idempotently on the
+    /// statement id. Returns whether it was new. A directory with no
+    /// edition-2 store refuses.
+    async fn put_edition2_statement(
+        &self,
+        row: &edition2::door::AdmittedRow,
+    ) -> Result<bool, Error> {
+        let _ = row;
+        Err(Error::Backend(
+            "this directory holds no edition-2 statement store".to_owned(),
+        ))
     }
 
     // ── Public keys ────────────────────────────────────────────────
@@ -13491,6 +13556,60 @@ pub mod malformed_row {
     /// equal another key on the same row: "`onion_hop_x25519_reuse` for the
     /// second".
     pub const ONION_HOP_X25519_REUSE: &str = "onion_hop_x25519_reuse";
+    /// v62.0.0 (slice E2a; CC 2.6.1.12, rc20 `0c9e17c`) — an object of the
+    /// earlier form (CC 8.11: a JSON object signed over its JCS image), or bytes
+    /// in no form, offered at an edition-2 door. "A node of this form reads and
+    /// writes this form only. It refuses an object of the earlier form."
+    pub const EDITION2_EARLIER_FORM_OBJECT: &str = "earlier_form_object";
+    /// v62.0.0 (slice E2a; CC 2.6.1.3) — a `row-ref` of edition 1
+    /// (`[1, [-16, name]]`, an earlier-form name) inside an edition-2 row's
+    /// `refs`: "no row of this form names an object of the earlier form".
+    pub const EDITION2_ROW_REF_EDITION_1: &str = "row_ref_edition_1";
+    /// v62.0.0 (slice E2a; CC 2.6.1.8) — the statement is Invalid under
+    /// CIRISVerify's edition-2 reader (a structural fault, or a bad signature
+    /// under a held key). The message carries Verify's reason.
+    pub const EDITION2_STATEMENT_INVALID: &str = "edition2_statement_invalid";
+    /// v62.0.0 (slice E2a; CC 2.6.1.3, CC 3.1) — a valid statement breaks its
+    /// family's rules (the author column, an `iss` in no role, a missing
+    /// dimension, an unregistered or undetermined family).
+    pub const EDITION2_FAMILY_INVALID: &str = "edition2_family_invalid";
+    /// v62.0.0 (slice E2a; CC 2.6.1.3) — a row offered under an id that is not
+    /// the row id this node computes from its bytes. A row is never stored
+    /// under a given id.
+    pub const EDITION2_ROW_ID_MISMATCH: &str = "row_id_mismatch";
+    /// v62.0.0 (slice E2a; CC 2.6.1.11) — a signed object that is not a row
+    /// (`ceg-genesis-bundle/2`, `ceg-revocation-snapshot/2`,
+    /// `ceg-boot-manifest/2`) offered at a row door, or a row at an object door.
+    pub const EDITION2_NOT_A_ROW: &str = "edition2_not_a_row";
+    /// v62.0.0 (slice E2a; CC 2.4.1.1, CC 2.6.1.7) — an edition-2 `key:record`
+    /// that breaks the end rule: `valid_until` on a person's record, none on a
+    /// node's or agent's, or outside `[asserted_at, asserted_at +
+    /// key_record_max_secs]`. CC's own token.
+    pub const KEY_RECORD_OUT_OF_WINDOW: &str = "key_record_out_of_window";
+    /// v62.0.0 (slice E2a; CC 2.6.1.11, the settled bundle/2 rule) — the
+    /// bundle's own fault, with a reason in the message: `version_prev_mismatch`
+    /// (`version` 1 if and only if no prev; prev's plus one), `iat_mismatch`
+    /// (each statement's `iat` is ⌊asserted_at / 1000⌋, and required),
+    /// `holders_seats_overlap`, `members_missing`.
+    pub const GENESIS_BUNDLE_MALFORMED: &str = "genesis_bundle_malformed";
+    /// v62.0.0 (slice E2a; CC 5.3.4) — the count is not met: the fresh genesis
+    /// needs every holder, a later bundle a strict majority of its
+    /// predecessor's holders and every holder it adds or re-commits. The
+    /// bundle concludes nothing yet; it is held, never a final refusal.
+    pub const GENESIS_BUNDLE_COUNT_UNMET: &str = "genesis_bundle_count_unmet";
+    /// v62.0.0 (slice E2a; CC 5.3.4) — the bundle's object id is not this
+    /// reader's pin: it roots nothing here (another reader may pin it).
+    pub const GENESIS_BUNDLE_NOT_PINNED: &str = "genesis_bundle_not_pinned";
+    /// v62.0.0 (slice E2a; CC 3.3.6.2) — a seat's binding is not the seat's
+    /// own, or does not carry both X-Wing keys (`transit_xwing_pubkey`,
+    /// `onion_hop_xwing_pubkey`, 1216 bytes each) with distinct halves, or
+    /// carries the v1 `transit_kex_pubkeys` pair.
+    pub const GENESIS_BUNDLE_SEAT_BINDING: &str = "genesis_bundle_seat_binding";
+    /// v62.0.0 (slice E2a) — the genesis door's placement waits on
+    /// CIRISVerify's bundle reader (its verdict yields the placement: the
+    /// holders, each seat with its two X-Wing keys). Until it ships, the door
+    /// refuses by this name and stores nothing. Not a fault of the bundle.
+    pub const GENESIS_BUNDLE_READER_UNAVAILABLE: &str = "genesis_bundle_reader_unavailable";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -13520,6 +13639,18 @@ pub mod malformed_row {
         TRANSIT_XWING_X25519_REUSE,
         ONION_HOP_ML_KEM_768_REUSE,
         ONION_HOP_X25519_REUSE,
+        EDITION2_EARLIER_FORM_OBJECT,
+        EDITION2_ROW_REF_EDITION_1,
+        EDITION2_STATEMENT_INVALID,
+        EDITION2_FAMILY_INVALID,
+        EDITION2_ROW_ID_MISMATCH,
+        EDITION2_NOT_A_ROW,
+        KEY_RECORD_OUT_OF_WINDOW,
+        GENESIS_BUNDLE_MALFORMED,
+        GENESIS_BUNDLE_COUNT_UNMET,
+        GENESIS_BUNDLE_NOT_PINNED,
+        GENESIS_BUNDLE_SEAT_BINDING,
+        GENESIS_BUNDLE_READER_UNAVAILABLE,
     ];
 }
 

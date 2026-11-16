@@ -4691,6 +4691,87 @@ async fn community_quorum_cosigned_at(
     .admits())
 }
 
+/// v62.0.0 (slice E2a; CC 2.6.1.9) — the head an edition-2 row names in
+/// `refs.head`, read from the statement it carries. `None` for an
+/// earlier-form row, or one that names no head.
+fn edition2_named_head(row: &super::Attestation) -> Option<super::edition2::names::RowId> {
+    let hex = row
+        .attestation_envelope
+        .get(super::edition2::ingest::STATEMENT_MEMBER)?
+        .as_str()?;
+    let bytes = hex::decode(hex).ok()?;
+    let (_, payload) = super::edition2::liveness::statement_parts(&bytes)?;
+    let names = super::edition2::names::names_of(&payload).ok()?;
+    super::edition2::names::single(&names, "head")
+}
+
+/// v62.0.0 (slice E2a; CC 2.7.4 "the roster head the row names", CC 2.6.1.9)
+/// — **an edition-2 licensure row counted at the head it names.** The head is
+/// a version of the authority community's roster record, the version whose
+/// `persist_row_hash` (an edition-2 row id) is `head` (CC 3.2 T6: the signed
+/// roster record at a version is the head). Its members are the roster. The
+/// voices are the row's own statements, folded by person under its row id
+/// ([`super::cosign::edition2_voices`]). A head this node does not hold
+/// counts nothing yet: the row waits, retryable, as one short of its quorum.
+async fn community_quorum_at_head(
+    directory: &dyn super::FederationDirectory,
+    c: &super::Community,
+    row: &super::Attestation,
+    head: &super::edition2::names::RowId,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error> {
+    let versions = directory
+        .list_group_versions(super::cohort::Cohort::Community, &c.community_key_id)
+        .await?;
+    let at_head = versions.into_iter().find_map(|v| {
+        let snap = v.snapshot.get("community").unwrap_or(&v.snapshot).clone();
+        serde_json::from_value::<super::Community>(snap)
+            .ok()
+            .filter(|cv| cv.persist_row_hash == head.hex())
+    });
+    let Some(version) = at_head else {
+        return Ok(false);
+    };
+    let Ok(row_id) = <[u8; 32]>::try_from(
+        hex::decode(&row.attestation_id)
+            .unwrap_or_default()
+            .as_slice(),
+    ) else {
+        return Ok(false);
+    };
+    let voices =
+        super::cosign::edition2_voices(directory, &super::edition2::names::RowId(row_id)).await?;
+    let signers: std::collections::BTreeSet<String> = version
+        .members
+        .iter()
+        .filter(|m| voices.contains(&m.key_id))
+        .map(|m| m.key_id.clone())
+        .collect();
+    if signers.is_empty() {
+        return Ok(false);
+    }
+    let mut seats = Vec::with_capacity(version.members.len());
+    for m in &version.members {
+        seats.push(super::consensus::Seat {
+            node_bearing: super::is_node_bearing_key_at(directory, &m.key_id, t).await?,
+            key_id: m.key_id.clone(),
+            role: m.role.clone(),
+        });
+    }
+    Ok(super::consensus::evaluate(&super::consensus::Ballot {
+        protocol: &version.consensus_protocol,
+        subkind: super::community_subkind(&version),
+        policy_blob: version.policy_blob.as_ref(),
+        roster: &seats,
+        signers: &signers,
+        direction: super::consensus::Direction::Add,
+        subject: None,
+        persons: super::key_person::PersonsAt::each_key(),
+        high_water: None,
+    })
+    .admits())
+}
+
 /// v60.0.0 (CIRISPersist#1036 item 1) — **the `license` walk rooted at a
 /// community's quorum**, read through `lens` (its `as_of` is the instant).
 ///
@@ -4941,9 +5022,15 @@ pub async fn licensure_issuance_at(
             let roots = licence_roots_at(directory, authority, t).await?;
             let stands = match &roots {
                 LicenceRoots::Seats(r) => r.contains(&row.attesting_key_id),
-                LicenceRoots::Quorum(c) => {
-                    community_quorum_cosigned_at(directory, c, row, t).await?
-                }
+                // v62.0.0 (slice E2a; CC 2.7.4, CC 2.6.1.9) — an edition-2
+                // row is counted over the roster at the head it NAMES
+                // (`refs.head`), never at its signed instant.
+                LicenceRoots::Quorum(c) => match edition2_named_head(row) {
+                    Some(head) => community_quorum_at_head(directory, c, row, &head, t).await?,
+                    // TODO(json-cut): the earlier form names no head; its
+                    // count reads the roster at the signed instant.
+                    None => community_quorum_cosigned_at(directory, c, row, t).await?,
+                },
             };
             if stands {
                 return Ok(LicensureIssuance::Authority);
@@ -13019,6 +13106,20 @@ where
     {
         return Ok(());
     }
+    // v62.0.0 (slice E2a) — an edition-2 subject (an identity-ref) is a key
+    // this node knows when it holds an edition-2 `key:record` of it; the
+    // earlier store's `federation_keys` never holds one (CC 2.6.1.12).
+    if ciris_verify_core::edition2::is_identity_ref(attested_key_id)
+        && !directory
+            .edition2_statements_about(
+                ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY,
+                attested_key_id,
+            )
+            .await?
+            .is_empty()
+    {
+        return Ok(());
+    }
     match directory.lookup_family(attested_key_id).await {
         Ok(Some(_)) => return Ok(()),
         Ok(None) => {}
@@ -15375,6 +15476,16 @@ pub async fn is_canonical_over_roster(
     key_id: &str,
     roster_key_ids: &[String],
 ) -> Result<bool, Error> {
+    // v62.0.0 (slice E2a, ruling C) — an edition-2 key (an identity-ref) is
+    // canonical exactly when it is in `serve_nodes` of the bundle in force.
+    // No record of it presents a conferral: Verify's `check_key_record` is
+    // its door, and `canonical` is no identity type.
+    if ciris_verify_core::edition2::is_identity_ref(key_id) {
+        return super::edition2::genesis::is_canonical_by_bundle(directory, key_id).await;
+    }
+    // TODO(json-cut): the earlier store's co-scrub conferral (both its forms)
+    // is read only for earlier-form key ids, until the JSON doors close and
+    // the baked JSON genesis is replaced.
     let Some(record) = directory.lookup_public_key(key_id).await? else {
         return Ok(false);
     };
