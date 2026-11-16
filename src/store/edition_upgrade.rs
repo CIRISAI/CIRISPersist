@@ -35,6 +35,10 @@
 //! migration advisory lock, so the Engine, the PyO3 `Engine(...)` and a
 //! consumer opening a backend directly all upgrade the same way.
 
+// With no backend compiled the flow has no store to act on: the pure pieces
+// (classification, the guard's verdict) stay for the witnesses.
+#![cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
+
 use std::collections::BTreeMap;
 
 use super::Error;

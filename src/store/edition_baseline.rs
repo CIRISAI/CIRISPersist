@@ -21,9 +21,11 @@
 
 /// The version of the edition-2 baseline. An edition-1 history holds versions
 /// 1..=216 only; nothing of edition 2 is numbered below this.
+#[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
 pub(crate) const EDITION_TWO_BASELINE: i32 = 300;
 
 /// The highest version edition 1 ever shipped (V216, v62-int).
+#[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
 pub(crate) const EDITION_ONE_HEAD: i32 = 216;
 
 /// The tables the baseline adds to edition 1's schema. Each later edition-2
@@ -79,6 +81,7 @@ pub(crate) mod catalog {
     //! The normalized catalogs the I1950 witness compares.
 
     /// Where the frozen edition-1 catalogs live.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn fixture_path(dialect: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/edition1_schema")
@@ -86,12 +89,14 @@ pub(crate) mod catalog {
     }
 
     /// One line per catalog fact, newlines escaped.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn esc(s: &str) -> String {
         s.replace('\\', "\\\\")
             .replace('\n', "\\n")
             .replace('\t', "\\t")
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn is_addition(table: &str) -> bool {
         super::EDITION_TWO_ADDITIONS.contains(&table)
     }
@@ -315,14 +320,17 @@ pub(crate) mod catalog {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use super::catalog;
 
     /// The frozen edition-1 catalog; on SQLite with
     /// [`super::KEYS_EDITION_TWO_SQLITE`] applied to `federation_keys`' DDL
     /// (SQLite rewrites the stored text), executed on a scratch connection.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn fixture(dialect: &str) -> Vec<String> {
         let text = std::fs::read_to_string(catalog::fixture_path(dialect))
             .expect("the frozen edition-1 catalog");
+        #[cfg_attr(not(feature = "sqlite"), allow(unused_mut))]
         let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
         #[cfg(feature = "sqlite")]
         if dialect == "sqlite" {
@@ -350,12 +358,14 @@ mod tests {
         lines
     }
 
+    #[cfg(feature = "sqlite")]
     fn esc(s: &str) -> String {
         s.replace('\\', "\\\\")
             .replace('\n', "\\n")
             .replace('\t', "\\t")
     }
 
+    #[cfg(feature = "sqlite")]
     fn unesc(s: &str) -> String {
         let mut out = String::new();
         let mut it = s.chars();
@@ -390,6 +400,7 @@ mod tests {
         assert_eq!(pg.matches(super::KEYS_EDITION_TWO_POSTGRES).count(), 1);
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn diff(want: &[String], got: &[String]) -> String {
         let (w, g): (std::collections::BTreeSet<_>, std::collections::BTreeSet<_>) =
             (want.iter().collect(), got.iter().collect());

@@ -11,6 +11,13 @@
 //! V216, so the store under test is the store a v61 node leaves behind.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// The shared imports and seed serve the backend witnesses; without a backend
+// only the classification test is left.
+#![cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+#![cfg_attr(
+    not(any(feature = "sqlite", feature = "postgres")),
+    allow(unused_imports)
+)]
 
 use super::edition_upgrade::{
     delete_earlier_store, EarlierStoreRefusal, StoreFinding, StoreTarget, UpgradeMode,

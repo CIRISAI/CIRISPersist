@@ -27648,17 +27648,17 @@ pub(crate) mod chunk_floor_cost {
 mod accord_tests {
     use super::*;
 
-    /// #840 — the repair is not a general escape hatch: a row that diverged
-    /// for ANY other reason still aborts the boot. A repair that matched on
-    /// version alone would swallow a real schema divergence.
+    /// #840 (I43) — a shipped migration's bytes are its contract: a history
+    /// row that diverged from the shipped file (here the edition-2 baseline,
+    /// V300) aborts the boot with refinery's divergence refusal.
     #[tokio::test]
-    async fn a_divergence_that_is_not_840_still_refuses_to_boot() {
+    async fn a_divergent_baseline_row_refuses_to_boot() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let touched = backend
             .write(move |conn| {
                 conn.execute(
-                    "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = 70",
+                    "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = 300",
                     rusqlite::params!["1234567890123456789"],
                 )
                 .unwrap()

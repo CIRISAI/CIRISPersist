@@ -50443,10 +50443,10 @@ mod tests {
         );
     }
 
-    /// #840 — on postgres too, a divergence that is not #840's still refuses
-    /// to boot. The repair is not a general escape hatch.
+    /// #840 (I43) — on postgres too, a history row that diverged from the
+    /// shipped baseline (V300) refuses to boot.
     #[tokio::test]
-    async fn a_divergence_that_is_not_840_still_refuses_to_boot_postgres() {
+    async fn a_divergent_baseline_row_refuses_to_boot_postgres() {
         let Some(dsn) = crate::test_pg::empty_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -50456,7 +50456,7 @@ mod tests {
         let client = backend.dedicated_connect().await.expect("client");
         let touched = client
             .execute(
-                "UPDATE ciris_persist_schema_history SET checksum = $1 WHERE version = 70",
+                "UPDATE ciris_persist_schema_history SET checksum = $1 WHERE version = 300",
                 &[&"1234567890123456789"],
             )
             .await
