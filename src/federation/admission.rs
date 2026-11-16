@@ -12631,6 +12631,13 @@ pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
     while let Some(page) = pages.next(directory).await? {
         edges.extend(page);
     }
+    // no owner binding to the node: no seat, nothing more to read
+    if !edges
+        .iter()
+        .any(|r| is_owner_binding_envelope(&r.attestation_envelope))
+    {
+        return Ok(std::collections::BTreeSet::new());
+    }
     let edge_ids: Vec<String> = edges.iter().map(|e| e.attestation_id.clone()).collect();
     let mut rows = edges;
     rows.extend(
@@ -12645,38 +12652,24 @@ pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
     while let Some(page) = pages.next(directory).await? {
         retractions.extend(page);
     }
-    // the key plane: is each granter a `user` key
+    let now = chrono::Utc::now();
+    // the key plane is asked only about the keys the seat names: each
+    // binding seats its own granter, independently of every other, so
+    // filtering the holders by the `user` fact equals presenting only the
+    // `user` granters' bindings
+    let view = crate::kernel::owner::owner_rows(node, &rows, &retractions, now, &|_| true, cosign);
+    let mut held = crate::kernel::owner::owner_holders(&view, node).value;
     let mut users = std::collections::BTreeSet::new();
-    // only the granters of an owner binding to this node: the key plane is
-    // asked about no one the seat could not name
-    let granters: std::collections::BTreeSet<&str> = rows
-        .iter()
-        .filter(|r| {
-            r.attestation_type == attestation_type::DELEGATES_TO
-                && r.attested_key_id == node
-                && is_owner_binding_envelope(&r.attestation_envelope)
-        })
-        .map(|r| r.attesting_key_id.as_str())
-        .collect();
-    for g in granters {
+    for g in &held {
         if directory
             .lookup_public_key(g)
             .await?
             .is_some_and(|k| identity_type::set_contains(&k.identity_type, identity_type::USER))
         {
-            users.insert(g.to_owned());
+            users.insert(g.clone());
         }
     }
-    let now = chrono::Utc::now();
-    let view = crate::kernel::owner::owner_rows(
-        node,
-        &rows,
-        &retractions,
-        now,
-        &|k| users.contains(k),
-        cosign,
-    );
-    let held = crate::kernel::owner::owner_holders(&view, node).value;
+    held.retain(|k| users.contains(k));
     let mut selves = std::collections::BTreeSet::new();
     for key in held {
         let at = rows
@@ -12692,6 +12685,37 @@ pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
         selves.insert(super::self_roster::self_of_at(directory, &key, at).await?);
     }
     Ok(selves)
+}
+
+/// v62.0.0 (slice C) — **bench hook**: [`owner_of`] as persist answered it
+/// before the kernel (its own owner fold), for a same-binary A/B against the
+/// kernel's seat (`benches/kernel_paths.rs`, group `ab_switched`). Test-anchor
+/// builds only; no production path calls it.
+#[cfg(feature = "test-anchor")]
+#[doc(hidden)]
+pub async fn owner_of_pre_kernel<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    node: &str,
+) -> Result<Option<String>, Error> {
+    let owners = live_owner_binding_granters(directory, node).await?;
+    match owners.len() {
+        0 => Ok(None),
+        1 => Ok(owners.into_iter().next()),
+        _ => Err(Error::AmbiguousNodeOwner {
+            node_key_id: node.to_owned(),
+            owners: owners.into_iter().collect(),
+        }),
+    }
+}
+
+/// Profiling aid (test builds): the former owner fold, timed against the
+/// kernel's.
+#[cfg(test)]
+pub(crate) async fn owner_of_reference_for_profile<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    node: &str,
+) {
+    let _ = live_owner_binding_granters(directory, node).await;
 }
 
 /// The owner fold as persist wrote it before the kernel. v62.0.0: the

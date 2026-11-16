@@ -384,8 +384,8 @@ pub fn admits_by_rows(b: &Ballot<'_>) -> Result<Answer<bool>, NoCell> {
 /// scope's members, the voices (each verified signer's person), and the
 /// person the change names, who is no voice of its own count (CC 2.7.5). A
 /// removal its subject alone signs is the member's own leaving (CC 3.3.4).
-/// The four count cells use the kernel's `seat::met`; `unanimous`,
-/// `open:self_admit` and `weighted` read as the seat rule reads them.
+/// The count is the kernel's `seat::group_count`, the seat rule's own
+/// `Conf::Group` arm over members and voices already read.
 #[must_use]
 pub fn count(b: &Ballot<'_>, arm: &Arm) -> bool {
     count_over(b, arm, &eligible_seats(b))
@@ -397,81 +397,57 @@ fn count_over<'a>(
     arm: &Arm,
     elig: &[&'a crate::federation::consensus::Seat],
 ) -> bool {
-    use ciris_kernel::seat::{met, Policy};
     let infra = b.subkind == Some("infrastructure");
     let person = |k: &'a str| -> &'a str { b.persons.seat_person(k) };
-    // one seat per person already (`eligible_seats`): sorted vectors, not sets
-    let sorted = |mut v: Vec<&'a str>| {
-        v.sort_unstable();
-        v.dedup();
-        v
-    };
-    let members = sorted(elig.iter().map(|s| person(s.key_id.as_str())).collect());
-    let founders;
-    let mem: &[&str] = if arm.counted == SEAT_FOUNDER {
-        founders = sorted(
-            elig.iter()
-                .filter(|s| {
-                    infra
-                        || s.role.as_deref()
-                            == Some(crate::federation::consensus::MEMBER_ROLE_FOUNDER)
-                })
-                .map(|s| person(s.key_id.as_str()))
-                .collect(),
-        );
+    let members: BTreeSet<&str> = elig.iter().map(|s| person(s.key_id.as_str())).collect();
+    let founders: BTreeSet<&str>;
+    let mem: &BTreeSet<&str> = if arm.counted == SEAT_FOUNDER {
+        founders = elig
+            .iter()
+            .filter(|s| {
+                infra
+                    || s.role.as_deref() == Some(crate::federation::consensus::MEMBER_ROLE_FOUNDER)
+            })
+            .map(|s| person(s.key_id.as_str()))
+            .collect();
         &founders
     } else {
         &members
     };
-    let seated = |k: &str| mem.binary_search(&k).is_ok();
-    let v = sorted(
-        b.signers
-            .iter()
-            .filter_map(|k| b.persons.voice(k))
-            .collect(),
-    );
-    let voiced = |k: &str| v.binary_search(&k).is_ok();
-    let to: Option<&str> = b.subject.map(person);
-    let named = |k: &str| to == Some(k);
-    if b.direction == Direction::Remove {
-        if let Some(t) = to {
-            if v.len() == 1 && v[0] == t && members.binary_search(&t).is_ok() {
-                return true; // the member's own leaving
-            }
-        }
+    let voices: BTreeSet<&str> = b
+        .signers
+        .iter()
+        .filter_map(|k| b.persons.voice(k))
+        .collect();
+    let to: Vec<&str> = b.subject.map(person).into_iter().collect();
+    // a removal its subject alone signs is the member's own leaving (CC
+    // 3.3.4): a withdrawal of the seat, not a count
+    if b.direction == Direction::Remove
+        && to.len() == 1
+        && voices.len() == 1
+        && voices.contains(to[0])
+        && members.contains(to[0])
+    {
+        return true;
     }
-    let is_offer = b.direction == Direction::Add;
-    let pol = seat_law().policy.get(arm.word).copied();
-    // the yes voices: signers' persons seated in the counted scope, the
-    // person the change names not among them (CC 2.7.5)
-    let yes = || v.iter().copied().filter(|k| seated(k) && !named(k));
-    match pol {
-        Some(Policy::SelfAdmit) => match to {
-            Some(t) if is_offer && !seated(t) => voiced(t),
-            _ => yes().count() >= 2,
+    // the seat rule's `Conf::Group` arm itself, over the head the ballot
+    // resolved (`seat::group_count`: the very code that arm runs, no graph)
+    ciris_kernel::seat::group_count(
+        &ciris_kernel::seat::GroupCount {
+            policy: seat_law().policy.get(arm.word).copied(),
+            offer: b.direction == Direction::Add,
+            to: &to,
+            members: mem,
+            voices: &voices,
+            need: arm.need,
         },
-        Some(Policy::Weighted) => {
-            let sum: u64 = yes()
-                .map(|k| {
-                    arm.weights
-                        .iter()
-                        .find(|(w, _)| w == k)
-                        .map_or(0, |(_, x)| *x)
-                })
-                .sum();
-            arm.need.is_some_and(|t| t > 0 && sum >= t as u64)
-        }
-        Some(Policy::Unanimous) => {
-            let others = mem.iter().filter(|k| !named(k)).count();
-            let y = yes().count();
-            if is_offer {
-                !mem.is_empty() && y == others && to.is_none_or(|t| !seated(t) || voiced(t))
-            } else {
-                y == others && 2 * y > mem.len()
-            }
-        }
-        _ => met(pol, yes().count(), mem.len(), arm.need),
-    }
+        |k: &&str| {
+            arm.weights
+                .iter()
+                .find(|(w, _)| w == k)
+                .map_or(0, |(_, x)| *x)
+        },
+    )
 }
 
 #[cfg(test)]

@@ -89,11 +89,15 @@ pub fn edge_rows(rows: &[&Attestation], edge: &dyn Fn(&Attestation) -> bool) -> 
         .collect()
 }
 
+/// The composer kind a view carries (`seat.policy` holds the row's type).
+fn kind(r: &KRow) -> &str {
+    r.seat.policy.as_deref().unwrap_or("")
+}
+
 /// **The kernel's edge leg**: the live acceptance edges, and whether the
 /// user's one-hop walk reaches the root over them.
 #[must_use]
 pub fn edge_leg(rows: &[KRow], user: &str, root: &str) -> Answer<bool> {
-    let kind = |r: &KRow| r.seat.policy.clone().unwrap_or_default();
     let c = layers::conclude(
         rows.iter(),
         |p| {
@@ -114,13 +118,13 @@ pub fn edge_leg(rows: &[KRow], user: &str, root: &str) -> Answer<bool> {
         .cs()
         .iter()
         .copied()
-        .filter(|&i| rank(&kind(c.g.row(i))) > 0)
+        .filter(|&i| rank(kind(c.g.row(i))) > 0)
         .collect();
     let winners = fold_default(
         &c,
         &composers,
         |r: &KRow| r.seat.target,
-        |r: &KRow| rank(&kind(r)),
+        |r: &KRow| rank(kind(r)),
         |r: &KRow| r.at,
     );
     let ended: BTreeSet<(String, RowId)> = winners.keys().cloned().collect();

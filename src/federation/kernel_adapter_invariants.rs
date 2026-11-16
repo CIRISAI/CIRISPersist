@@ -16,6 +16,8 @@
 //!   the user's acceptance edge makes `edge_exists`, and the user's own
 //!   `withdraws` of it (the CC 3.5.1 fold default: one signer's chain) ends
 //!   it.
+//! - **I1845** — a member's leaving in the counted row's past is not counted
+//!   (a `unanimous` widening after a removal needs only those remaining).
 //! - **I1843** — a fork of a held head (two versions naming one head): persist
 //!   refuses it; the kernel holds it as a tip (CC 2.7.8). Witnessed, not
 //!   switched.
@@ -214,6 +216,96 @@ pub(crate) mod bodies {
             "I1843: the kernel holds v3 as a tip beside v2 (CC 2.7.8)"
         );
     }
+
+    /// **I1845** — the count reads the members at the change, less those whose
+    /// own leaving is in its past (`seat::seat_rule`'s `left_in_past`; the
+    /// kernel review's counterexample). A `unanimous` family of ann, ben and
+    /// cat; cat leaves (removed by ann and ben, every other member); then a
+    /// widening of dan signed by ann and ben is admitted. A count over the
+    /// roster of the version before cat left would read 2 of 3 and refuse.
+    pub(crate) async fn i1845_a_leaving_in_the_rows_past_is_not_counted(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+        use crate::federation::types::{
+            Family, FamilyMember, FamilyMembershipRevocation, FamilyMembershipWidening,
+        };
+        let at = |t: &str| -> chrono::DateTime<chrono::Utc> { t.parse().expect("instant") };
+        let [ann, ben, cat, dan] = ["ann", "ben", "cat", "dan"].map(|n| format!("i1845-{n}-{s}"));
+        for k in [&ann, &ben, &cat, &dan] {
+            ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+        }
+        let fam = format!("i1845-fam-{s}");
+        let founded = at("2026-01-01T00:00:00Z");
+        d.put_family(ts::sign_family(
+            &ann,
+            Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                family_key_id: fam.clone(),
+                family_name: "household".into(),
+                members: [&ann, &ben, &cat]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| FamilyMember {
+                        key_id: (*k).clone(),
+                        joined_at: founded,
+                        role: (i == 0).then(|| "founder".to_owned()),
+                    })
+                    .collect(),
+                founded_at: founded,
+                consensus_protocol: "unanimous".to_owned(),
+                consensus_protocol_entrenched: false,
+                dissolved_at: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("I1845: the family");
+        let mut r = ts::sign_family_membership_revocation(
+            &ann,
+            FamilyMembershipRevocation {
+                family_key_id: fam.clone(),
+                removed_identity_key_id: cat.clone(),
+                removed_at: at("2026-02-01T00:00:00Z"),
+                effective_at: at("2026-02-01T00:00:00Z"),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_family_membership_revocation(&mut r, &ben);
+        d.put_family_membership_revocation(r)
+            .await
+            .expect("I1845: cat leaves (every other member signs)");
+        let mut w = ts::sign_family_membership_widening(
+            &ann,
+            FamilyMembershipWidening {
+                family_key_id: fam.clone(),
+                member_key_id: dan.clone(),
+                joined_at: at("2026-03-01T00:00:00Z"),
+                effective_at: at("2026-03-01T00:00:00Z"),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_family_membership_widening(&mut w, &ben);
+        d.put_family_membership_widening_consented(w)
+            .await
+            .expect("I1845: ann and ben are every member at the change: unanimous");
+        let active: Vec<String> = d
+            .active_family_members(&fam)
+            .await
+            .expect("roster")
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(
+            active.contains(&dan) && !active.contains(&cat),
+            "I1845: {active:?}"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -270,7 +362,136 @@ mod runners {
         crate::federation::kernel_adapter_invariants::bodies::i1843_a_fork_of_the_held_head_is_a_tip_to_the_kernel
     );
     on_sqlite_and_postgres!(
+        i1845,
+        crate::federation::kernel_adapter_invariants::bodies::i1845_a_leaving_in_the_rows_past_is_not_counted
+    );
+    on_sqlite_and_postgres!(
         i1842,
         crate::federation::kernel_adapter_invariants::bodies::i1842_the_edge_leg_is_the_kernels_one_hop_walk
     );
+}
+
+/// Phase timing of the owner seat's adapter (a profiling aid, ignored).
+#[cfg(all(test, feature = "sqlite"))]
+mod profile {
+    use crate::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::{attestation_type, identity_type};
+    use crate::federation::{FederationDirectory, SignedAttestation};
+    use std::time::Instant;
+
+    #[tokio::test]
+    #[ignore = "profiling aid"]
+    async fn owner_phases() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let d: &dyn FederationDirectory = &b;
+        let (owner, node) = ("prof-owner".to_owned(), "prof-node".to_owned());
+        ts::register_hybrid_key_as(d, &owner, &owner, identity_type::USER).await;
+        ts::register_hybrid_key_as(d, &node, &node, identity_type::NODE).await;
+        d.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation("prof-b", &owner, &node),
+        })
+        .await
+        .unwrap();
+        let n = 300u32;
+        let t = Instant::now();
+        for _ in 0..n {
+            crate::federation::admission::owner_of_reference_for_profile(d, &node).await;
+        }
+        eprintln!("legacy owner_of: {:?}", t.elapsed() / n);
+        let t = Instant::now();
+        for _ in 0..n {
+            crate::federation::admission::owner_of(d, &node)
+                .await
+                .unwrap();
+        }
+        eprintln!("kernel owner_of (with differential): {:?}", t.elapsed() / n);
+        let t = Instant::now();
+        for _ in 0..n {
+            crate::federation::admission::kernel_owner_selves(
+                d,
+                &node,
+                crate::kernel::owner::Cosign::Required,
+            )
+            .await
+            .unwrap();
+        }
+        eprintln!("kernel_owner_selves: {:?}", t.elapsed() / n);
+        let t = Instant::now();
+        for _ in 0..n {
+            crate::federation::admission::owner_of_reference_for_profile(d, &node).await;
+        }
+        eprintln!("legacy again: {:?}", t.elapsed() / n);
+        let mut acc = [std::time::Duration::ZERO; 6];
+        for _ in 0..n {
+            let t0 = Instant::now();
+            let mut edges = Vec::new();
+            let mut pages = AttestationQuery::to(&node, FOLD_PAGE)
+                .types(&[attestation_type::DELEGATES_TO])
+                .pages();
+            while let Some(page) = pages.next(d).await.unwrap() {
+                edges.extend(page);
+            }
+            let t1 = Instant::now();
+            let ids: Vec<String> = edges.iter().map(|e| e.attestation_id.clone()).collect();
+            let mut rows = edges;
+            rows.extend(
+                d.list_composers_referencing_any(&ids, Some(&node), None)
+                    .await
+                    .unwrap(),
+            );
+            let t2 = Instant::now();
+            let mut retr = Vec::new();
+            let mut pages = AttestationQuery::to(&node, FOLD_PAGE)
+                .types(&[attestation_type::WITHDRAWS, attestation_type::RECANTS])
+                .pages();
+            while let Some(page) = pages.next(d).await.unwrap() {
+                retr.extend(page);
+            }
+            let t3 = Instant::now();
+            let view = crate::kernel::owner::owner_rows(
+                &node,
+                &rows,
+                &retr,
+                chrono::Utc::now(),
+                &|_| true,
+                crate::kernel::owner::Cosign::Required,
+            );
+            let held = crate::kernel::owner::owner_holders(&view, &node).value;
+            let t4 = Instant::now();
+            for g in &held {
+                d.lookup_public_key(g).await.unwrap();
+            }
+            let t5 = Instant::now();
+            for g in &held {
+                crate::federation::self_roster::self_of_at(d, g, chrono::Utc::now())
+                    .await
+                    .unwrap();
+            }
+            let t6 = Instant::now();
+            for (i, (a, b)) in [(t0, t1), (t1, t2), (t2, t3), (t3, t4), (t4, t5), (t5, t6)]
+                .iter()
+                .enumerate()
+            {
+                acc[i] += *b - *a;
+            }
+        }
+        for (name, a) in [
+            "edges",
+            "composers",
+            "retractions",
+            "kernel",
+            "lookup",
+            "self_of_at",
+        ]
+        .iter()
+        .zip(acc)
+        {
+            eprintln!("{name}: {:?}", a / n);
+        }
+    }
 }

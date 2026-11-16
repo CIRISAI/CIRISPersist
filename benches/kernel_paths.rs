@@ -50,8 +50,9 @@ use ciris_persist::federation::accord_recovery::{
 };
 use ciris_persist::federation::accord_test_support as ops;
 use ciris_persist::federation::admission::{
-    check_delegation_cycle_admission, owner_of, reachable_under_scope, steward_bindings_of,
-    truncate_to_substrate_resolution, DelegationTermBounds, DELEGATION_SCOPE_MODERATE,
+    check_delegation_cycle_admission, owner_of, owner_of_pre_kernel, reachable_under_scope,
+    steward_bindings_of, truncate_to_substrate_resolution, DelegationTermBounds,
+    DELEGATION_SCOPE_MODERATE,
 };
 use ciris_persist::federation::canonical_community::{accord_family_key_id, NEXT_PERSIST_ROW_HASH};
 use ciris_persist::federation::cohort::Cohort;
@@ -59,8 +60,8 @@ use ciris_persist::federation::deletion_window::run_deletion_window_watch;
 use ciris_persist::federation::tier_ingest::test_support as ts;
 use ciris_persist::federation::trust_root::{
     recovery_commitment, test_accord_recovery_commitments, test_committed_key,
-    test_pre_rotation_commitment, trust_root_valid, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
-    TRUST_CHARTER_DIMENSION,
+    test_pre_rotation_commitment, trust_edge_leg_ab, trust_root_valid, INFRA_ATTEST_SCOPE,
+    INFRA_SERVE_SCOPE, TRUST_CHARTER_DIMENSION,
 };
 use ciris_persist::federation::types::{
     attestation_type, compute_persist_row_hash, delegation_scope as ds, identity_type,
@@ -387,6 +388,109 @@ fn bench_owner_of(c: &mut Criterion) {
                     )
                 });
             });
+        }
+    }
+    group.finish();
+}
+
+// ─── 2b. same-binary A/B of the switched paths (v62.0.0, slice C) ─────────
+
+/// The persist path before the kernel and the kernel's, over the SAME store,
+/// in one binary, run back to back: `owner_of` against
+/// `owner_of_pre_kernel`, and the trust edge leg against persist's former
+/// fold. Each pair's answers are asserted identical before timing.
+fn bench_ab_switched(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("ab_switched");
+    group.sample_size(40);
+    let ocell: OnceCell<OwnerFixture> = OnceCell::new();
+    let ofx = || ocell.get_or_init(|| rt.block_on(owner_fixture(1_000)));
+    for case in ["one_owner", "cosigned", "withdrawn", "no_owner"] {
+        let node_of = |f: &OwnerFixture| -> String {
+            match case {
+                "one_owner" => f.bound_node.clone(),
+                "cosigned" => "own-cosigned".into(),
+                "withdrawn" => "own-withdrawn".into(),
+                _ => "own-unbound".into(),
+            }
+        };
+        {
+            let f = ofx();
+            let node = node_of(f);
+            let new = rt
+                .block_on(owner_of(&f.store.backend, &node))
+                .expect("owner_of");
+            let old = rt
+                .block_on(owner_of_pre_kernel(&f.store.backend, &node))
+                .expect("owner_of_pre_kernel");
+            assert_eq!(new, old, "{case}: the two answers are identical");
+        }
+        for (path, kernel) in [
+            ("owner_of_kernel", true),
+            ("owner_of_pre", false),
+            ("owner_of_kernel_again", true),
+            ("owner_of_pre_again", false),
+        ] {
+            group.bench_function(BenchmarkId::new(path, case), |b| {
+                let f = ofx();
+                let node = node_of(f);
+                b.iter(|| {
+                    if kernel {
+                        black_box(
+                            rt.block_on(owner_of(&f.store.backend, black_box(&node)))
+                                .unwrap(),
+                        )
+                    } else {
+                        black_box(
+                            rt.block_on(owner_of_pre_kernel(&f.store.backend, black_box(&node)))
+                                .unwrap(),
+                        )
+                    }
+                });
+            });
+        }
+    }
+    for extra in [0usize, 16, 128] {
+        let cell: OnceCell<TrustFixture> = OnceCell::new();
+        let fx = || cell.get_or_init(|| rt.block_on(trust_fixture(extra)));
+        for (case, root) in [
+            ("valid_root", "tr-root"),
+            ("uncharted_root", "tr-other-root-0000"),
+        ] {
+            if extra == 0 && case == "uncharted_root" {
+                continue;
+            }
+            {
+                let f = fx();
+                let a = rt
+                    .block_on(trust_edge_leg_ab(&f.store.backend, "tr-user", root, false))
+                    .expect("pre");
+                let k = rt
+                    .block_on(trust_edge_leg_ab(&f.store.backend, "tr-user", root, true))
+                    .expect("kernel");
+                assert_eq!(a, k, "{case}/{extra}: the two edge legs agree");
+            }
+            for (path, kernel) in [
+                ("edge_leg_kernel", true),
+                ("edge_leg_pre", false),
+                ("edge_leg_kernel_again", true),
+                ("edge_leg_pre_again", false),
+            ] {
+                group.bench_function(BenchmarkId::new(format!("{path}/{case}"), extra), |b| {
+                    let f = fx();
+                    b.iter(|| {
+                        black_box(
+                            rt.block_on(trust_edge_leg_ab(
+                                &f.store.backend,
+                                "tr-user",
+                                black_box(root),
+                                kernel,
+                            ))
+                            .unwrap(),
+                        )
+                    });
+                });
+            }
         }
     }
     group.finish();
@@ -1243,6 +1347,7 @@ fn peak_rss(spec: &str) {
 criterion_group!(
     benches,
     bench_owner_of,
+    bench_ab_switched,
     bench_trust_root,
     bench_delegation_walk,
     bench_held_head,
@@ -1251,11 +1356,12 @@ criterion_group!(
     bench_fold_recompute
 );
 
+/// One named fixture check of [`smoke`].
+type SmokeCheck<'a> = (&'a str, Box<dyn Fn() + 'a>);
+
 /// `KERNEL_PATHS_SMOKE=1`: build every fixture at its smallest size and
 /// ask each path once, reporting every failure instead of stopping at the
 /// first (a fixture check, not a measurement).
-/// One named fixture check of [`smoke`].
-type SmokeCheck<'a> = (&'a str, Box<dyn Fn() + 'a>);
 
 fn smoke() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
