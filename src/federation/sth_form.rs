@@ -20,7 +20,7 @@
 //! build flag); every verifier dispatches on it. [`sign_sth`] picks the form
 //! to WRITE from the node's [`CeremonyState`]: earlier before the ceremony row
 //! is held, composite after. The composite branch needs the keyring's FIPS 204
-//! context-sign (CIRISVerify 23.1.2, `PqcSigner::sign_with_context`); a
+//! context-sign (CIRISVerify 23.1.3, `PqcSigner::sign_with_context`); a
 //! signer without it refuses by name
 //! ([`LocalSignerError::CompositeUnavailable`](crate::signing::LocalSignerError)).
 //!

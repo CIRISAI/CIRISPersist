@@ -13,7 +13,7 @@
 //!
 //! - [`Sig19::Composite`]: Verify's own composite verifier;
 //! - [`Sig19::Earlier`]: Verify's `earlier_form::verify_bound_hybrid`
-//!   (CIRISVerify 23.1.2, verify-only), over the SAME preimage
+//!   (CIRISVerify 23.1.3, verify-only), over the SAME preimage
 //!   (`canonical_preimage()` / `signing_preimage()`, unchanged by the cut).
 //!
 //! The structural checks each Verify function makes besides the signature
