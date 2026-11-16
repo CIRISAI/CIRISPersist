@@ -41,6 +41,12 @@
 //! - **I2007 (idempotence, re-derivation).** Re-putting a record or a
 //!   revocation leaves the projected rows byte-identical; a renewal
 //!   re-projects (`valid_until`, `mutated_at`).
+//! - **I2007b.** A key id held by an earlier-form row is never overwritten
+//!   by a projection: `Conflict`, and the row is unchanged.
+//! - **I2009 (the read models are not earlier-form rows).** On a fresh
+//!   open of the same store, the key-plane rehome mints no `key:record:v1` /
+//!   revocation row for a projection and its report counts none, and the
+//!   key and revocation projection-rebuild gates find no divergence.
 //! - **I2008 (the serve listing).** `edition2_statements_since` serves every
 //!   held statement once, as received, in admission order, paging by its
 //!   cursor; positions strictly increase.
@@ -603,6 +609,57 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
         "I2001: none held"
     );
 
+    // ── I2007b: an earlier-form row is never overwritten ──
+    let squat = key(74);
+    let json_squat = crate::federation::tier_ingest::test_support::replicated_key_record(
+        "j0-squat", "agent", "j0-squat", "j0-squat", "j0",
+    );
+    let squat_id = iref(&squat);
+    raw.exec(&format!(
+        "INSERT INTO {q}federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, \
+         identity_ref, valid_from, registration_envelope, original_content_hash, \
+         scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, \
+         admitted_at) VALUES ({id}, {pk}, 'hybrid', 'agent', {id}, {t}, '{{}}', {h}, 'x', {id}, \
+         {t}, 'x', {t})",
+        id = sq(&squat_id),
+        pk = sq(&json_squat.pubkey_ed25519_base64),
+        t = sq("2026-01-01T00:00:00+00:00"),
+        h = if q.is_empty() {
+            "X'00'"
+        } else {
+            "'\\x00'::bytea"
+        },
+    ))
+    .await
+    .unwrap();
+    let squat_row = raw
+        .rows("federation_keys", &format!("key_id = {}", sq(&squat_id)))
+        .await;
+    let e = put_statement(
+        d,
+        &key_record(&squat, &["user"], 0, None),
+        None,
+        INGEST_TIER,
+    )
+    .await
+    .expect_err("I2007b: refused");
+    assert!(
+        matches!(e, Error::Conflict(_)),
+        "I2007b: Conflict, got {e:?}"
+    );
+    assert_eq!(
+        raw.rows("federation_keys", &format!("key_id = {}", sq(&squat_id)))
+            .await,
+        squat_row,
+        "I2007b: the earlier-form row is unchanged"
+    );
+    raw.exec(&format!(
+        "DELETE FROM {q}federation_keys WHERE key_id = {}",
+        sq(&squat_id)
+    ))
+    .await
+    .unwrap();
+
     // ── I2008: the serve listing ──
     let mut served = Vec::new();
     let mut cursor = None;
@@ -641,6 +698,52 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
             .unwrap(),
         vec![],
         "I2008: nothing after the last"
+    );
+}
+
+/// I2009 on a fresh open of the store `body` filled: the rehome and the two
+/// rebuild gates leave the read models alone.
+pub(crate) async fn read_models_are_not_earlier_form_rows(
+    report: crate::federation::key_plane::KeyPlaneRehomeReport,
+    keys: crate::federation::silo_projection::ProjectionRebuild,
+    revocations: crate::federation::silo_projection::ProjectionRebuild,
+    raw: &Raw<'_>,
+) {
+    assert_eq!(
+        report.keys_without_row, 0,
+        "I2009: no projection counted: {report:?}"
+    );
+    assert_eq!(report.revocations_without_row, 0, "I2009: {report:?}");
+    assert_eq!(keys.divergence(), None, "I2009: the key rebuild gate");
+    assert_eq!(
+        revocations.divergence(),
+        None,
+        "I2009: the revocation rebuild gate"
+    );
+    assert_eq!(
+        raw.rows("federation_keys", "edition = 2 AND attestation_id IS NULL")
+            .await
+            .len(),
+        4,
+        "I2009: every projection is still rowless"
+    );
+    assert!(
+        raw.rows(
+            "federation_keys",
+            "edition = 2 AND attestation_id IS NOT NULL"
+        )
+        .await
+        .is_empty(),
+        "I2009: no key:record:v1 row minted for a projection"
+    );
+    assert!(
+        raw.rows(
+            "federation_revocations",
+            "attestation_id IS NOT NULL AND revoked_key_id LIKE 'urn:%'"
+        )
+        .await
+        .is_empty(),
+        "I2009: no revocation row minted for a projection"
     );
 }
 
@@ -727,9 +830,11 @@ async fn cross_form(
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn i2000_to_i2008_sqlite() {
+async fn i2000_to_i2009_sqlite() {
     use crate::store::Backend as _;
-    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("j0.db").to_string_lossy().into_owned();
+    let b = crate::store::sqlite::SqliteBackend::open(path.clone())
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
@@ -758,11 +863,29 @@ async fn i2000_to_i2008_sqlite() {
         }
     }
     Box::pin(body(&b, &Raw::Sqlite(&b))).await;
+    drop(b);
+    // I2009: a fresh open of the same file.
+    let b = crate::store::sqlite::SqliteBackend::open(path)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    use crate::federation::attestation_admit::AttestationStore as _;
+    use crate::federation::silo_projection::SiloProjection;
+    let report = b.rehome_key_plane_at_open().await.unwrap();
+    let keys = b
+        .projection_rebuild(SiloProjection::FederationKeys)
+        .await
+        .unwrap();
+    let revs = b
+        .projection_rebuild(SiloProjection::FederationRevocations)
+        .await
+        .unwrap();
+    read_models_are_not_earlier_form_rows(report, keys, revs, &Raw::Sqlite(&b)).await;
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-async fn i2000_to_i2008_postgres() {
+async fn i2000_to_i2009_postgres() {
     use crate::store::Backend as _;
     let Some(dsn) = crate::test_pg::empty_dsn() else {
         return;
@@ -772,4 +895,21 @@ async fn i2000_to_i2008_postgres() {
         .unwrap();
     b.run_migrations().await.unwrap();
     Box::pin(body(&b, &Raw::Pg(&b))).await;
+    // I2009: a fresh open of the same database.
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    use crate::federation::attestation_admit::AttestationStore as _;
+    use crate::federation::silo_projection::SiloProjection;
+    let report = b.rehome_key_plane_at_open().await.unwrap();
+    let keys = b
+        .projection_rebuild(SiloProjection::FederationKeys)
+        .await
+        .unwrap();
+    let revs = b
+        .projection_rebuild(SiloProjection::FederationRevocations)
+        .await
+        .unwrap();
+    read_models_are_not_earlier_form_rows(report, keys, revs, &Raw::Pg(&b)).await;
 }

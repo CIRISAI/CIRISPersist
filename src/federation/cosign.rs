@@ -562,12 +562,6 @@ where
                 .event
                 .plane_signing_envelope()
                 .ok_or_else(|| malformed(row, "a record carries no cosignature"))?;
-            super::edition2::projection::refuse_edition2_signer(
-                dir,
-                "cosign",
-                &[c.authority_key_id.as_str()],
-            )
-            .await?;
             super::tier_ingest::verify_envelope_hybrid_signature(
                 dir,
                 &c.authority_key_id,

@@ -818,12 +818,6 @@ where
                     ),
                 )
             })?;
-            super::edition2::projection::refuse_edition2_signer(
-                directory,
-                "key_record",
-                &[record.key_id.as_str(), record.scrub_key_id.as_str()],
-            )
-            .await?;
             let held_signer = held_signer_of(directory, &record).await?;
             check_canonical_plane_row(row, &plan_key_record_row(&record, &held_signer)?)?;
             Ok(true)
