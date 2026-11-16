@@ -403,3 +403,5 @@ sqlite	214	cosign_hold	1720451589950938537
 postgres	214	cosign_hold	846735043445654734
 sqlite	215	cosign_alias_held_index	8942902581568388975
 postgres	215	cosign_alias_held_index	10412532197534795789
+sqlite	216	attestation_dimension_asserted_seek	11991581832445919656
+postgres	216	attestation_dimension_asserted_seek	14663403053046678011

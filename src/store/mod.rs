@@ -8,6 +8,10 @@
 //! Phase 1; later phases fill in surfaces, never restructure the
 //! contract.
 
+/// v62.0.0 (FSD §6.4, P10): I1813–I1814. The attestation page in its order,
+/// postgres (the sqlite twins sit in `sqlite.rs`'s tests).
+#[cfg(all(test, feature = "postgres"))]
+mod attestation_page_order_pg_invariants;
 pub mod backend;
 /// v61 (CIRISPersist#934, S4a) — the `Backend` trait's gated doors (the two
 /// trace erasures, the two fountain writes), decided once, with the
@@ -23,8 +27,8 @@ pub mod decompose;
 pub(crate) mod fountain_read;
 // v3.12.x (CIRISPersist#156) — always-compiled migration-timing
 // diagnostic. Sibling to the `debug-tools`-gated panic hook in
-// `crate::debug`. Gated on `postgres` OR `sqlite` since the type
-// references `refinery::Report`.
+// `crate::debug`. Gated on `postgres` OR `sqlite`, the two backends that
+// migrate.
 /// v31.2.0 (CIRISPersist#670) — **the schema-parity gate.** The sibling of
 /// [`parity`], for the half a Rust scan cannot see: it replays
 /// `migrations/{postgres,sqlite}/lens/V*.sql` and compares the table, column,
@@ -34,6 +38,10 @@ pub(crate) mod fountain_read;
 pub(crate) mod crypto_cardinality;
 /// #840 (I43/I44) — the migration-immutability gate and V070's repair.
 mod migration_immutability;
+/// v62.0.0 (WASM_UEFI_READINESS P6) — persist applies its own migrations:
+/// refinery's decisions, rows and checksums, with the instant the caller's.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod migration_runner;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub mod migration_timing;
 /// v31.2.0 (CIRISPersist#670) — **the backend-parity gate.**
@@ -102,6 +110,27 @@ pub(crate) mod test_hooks;
 #[cfg(test)]
 mod tree_read;
 pub mod types;
+
+/// v62.0.0 (WASM_NODE FSD §6.2, the readiness audit's P7) — what the HOST
+/// says about itself when it opens the store: a capability answer, never a
+/// compile target (no `cfg(target_*)` decides it). Postgres ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum HostStoreProfile {
+    /// A native host: other processes may open the file. Today's open,
+    /// unchanged: WAL, the reader pool (`available_parallelism().clamp(2,
+    /// 8)` or `CIRIS_PERSIST_SQLITE_READERS`), mmap and page-cache tuning
+    /// from the environment and the cgroup limit.
+    #[default]
+    Native,
+    /// One process on one thread holds the store (a browser Dedicated
+    /// Worker over OPFS `opfs-sahpool`, a UEFI image). `PRAGMA
+    /// locking_mode = EXCLUSIVE` is the connection's FIRST statement (no
+    /// shared memory: WAL needs the heap wal-index, and any prepare on a WAL
+    /// file before it fails), then WAL; no reader pool (its `Condvar` would
+    /// block the one thread); no mmap, cgroup or environment tuning.
+    SingleProcess,
+}
 
 pub use backend::{Backend, InsertReport, PublicKeySample};
 pub use decompose::{

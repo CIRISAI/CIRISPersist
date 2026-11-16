@@ -48,6 +48,8 @@
 pub mod sqlite_open;
 pub mod types;
 // v54.0.0 (#996) — I577: the status counts equal the rows, on every backend.
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 mod counts_invariants;
 
 #[cfg(feature = "sqlite")]

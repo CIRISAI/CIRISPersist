@@ -482,7 +482,23 @@ impl Engine {
     /// same `Backend::run_migrations` path the PyO3 surface uses), so
     /// the returned Engine is ready to read/write immediately.
     pub async fn with_signer(signer: Arc<LocalSigner>, dsn: &str) -> Result<Self, EngineError> {
-        let backend = build_backend(dsn, true).await?;
+        Self::with_signer_on_host(signer, dsn, crate::store::HostStoreProfile::Native).await
+    }
+
+    /// v62.0.0 (WASM_NODE FSD §6.2, P7) — [`Self::with_signer`] on a host
+    /// that declares what it is. `HostStoreProfile::SingleProcess` (a browser
+    /// worker over OPFS, a UEFI image) opens a SQLite store with
+    /// `locking_mode = EXCLUSIVE` first, WAL, and **no reader pool**, end to
+    /// end through the migrations, the genesis seed and the open legs; no
+    /// environment knob or cgroup limit is read. `Native` is `with_signer`.
+    /// Postgres ignores the profile. The host's capability answer decides,
+    /// never a compile target.
+    pub async fn with_signer_on_host(
+        signer: Arc<LocalSigner>,
+        dsn: &str,
+        host: crate::store::HostStoreProfile,
+    ) -> Result<Self, EngineError> {
+        let backend = build_backend(dsn, true, host).await?;
         // v2.12.0 (#112): preserve the original `LocalSigner` Arc so
         // `Engine::sign_hybrid` can reach `LocalSigner::sign_hybrid`.
         let local_signer = Some(signer.clone());
@@ -573,7 +589,7 @@ impl Engine {
         signer: Arc<LocalSigner>,
         dsn: &str,
     ) -> Result<Self, EngineError> {
-        let backend = build_backend(dsn, false).await?;
+        let backend = build_backend(dsn, false, crate::store::HostStoreProfile::Native).await?;
         let local_signer = Some(signer.clone());
         let signer: Arc<dyn HardwareSigner> = Arc::new(LocalSignerHardwareAdapter::new(signer));
         let engine = Engine {
@@ -654,7 +670,7 @@ impl Engine {
         signer: Arc<dyn HardwareSigner>,
         dsn: &str,
     ) -> Result<Self, EngineError> {
-        let backend = build_backend(dsn, true).await?;
+        let backend = build_backend(dsn, true, crate::store::HostStoreProfile::Native).await?;
         let engine = Engine {
             backend,
             signer,
@@ -724,7 +740,7 @@ impl Engine {
             )
             .await?,
         );
-        let backend = build_backend(dsn, true).await?;
+        let backend = build_backend(dsn, true, crate::store::HostStoreProfile::Native).await?;
         let engine = Engine {
             backend,
             // `signer` is the hardware classical itself — same shape as
@@ -11089,6 +11105,9 @@ async fn build_backend(
         allow(unused_variables)
     )]
     seed_genesis: bool,
+    // Read only by the sqlite arm; postgres has no host profile.
+    #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
+    host: crate::store::HostStoreProfile,
 ) -> Result<BackendDispatch, EngineError> {
     if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
         #[cfg(feature = "postgres")]
@@ -11155,7 +11174,7 @@ async fn build_backend(
                     .strip_prefix("sqlite:///")
                     .or_else(|| dsn.strip_prefix("sqlite://"))
                     .unwrap_or(dsn);
-                SqliteBackend::open(path)
+                SqliteBackend::open_on_host(path, host)
                     .await
                     .map_err(EngineError::Store)?
             };

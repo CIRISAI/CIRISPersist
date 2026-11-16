@@ -122,6 +122,8 @@ pub mod blackhole;
 #[cfg(test)]
 mod blob_surface_gates;
 pub mod blobs;
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(any(test, feature = "test-anchor"))]
 pub mod bootstrap_admission;
 #[cfg(test)]
 mod bounded_planes_invariants;
@@ -155,11 +157,15 @@ pub mod consent_peer_set;
 /// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — `custody:ack:v1`: which of
 /// a cohort's own devices hold a blob, folded at read time.
 pub mod custody_ack;
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 mod custody_ack_invariants;
 /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3, CIRISConstitution#141) — the ONE
 /// holding claim: `custody:ack:v1` `here` at the content's scope, its
 /// emission and the holder directory read.
 pub mod holding_claim;
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 mod holding_claim_invariants;
 /// v51.0.0 (CIRISPersist#938/#937) — the lineage-head cosign object and predicates.
 pub mod lineage_witness;
@@ -391,11 +397,15 @@ pub mod room_roster_authority_invariants;
 pub mod room_roster_invariants;
 /// v47.0.0 (CIRISPersist#897, #796, #797) — one scope, one question, every
 /// gate: I145 / I147 (`FSD/SCOPE_CLASSIFIER.md` §5).
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(any(test, feature = "test-anchor"))]
 pub mod scope_classifier_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod sealed_dag_adopt_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 pub(crate) mod silo_projection_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod stream_key_invariants;
@@ -477,12 +487,18 @@ pub mod occurrence_revocation_carrier;
 mod occurrence_revocation_carrier_invariants;
 pub mod transport_rebind;
 // v58.0.0 (CIRISPersist#991) — I975–I980.
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 pub(crate) mod key_plane_invariants;
 // v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — I1144–I1147:
 // the framed key plane is retired; a v57 store migrates onto the rows.
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 mod key_plane_retired_invariants;
 // v60.0.0 (CIRISPersist#934 step 3) — I1183–I1191: the key-record write
 // doors on one plan, every backend storing its verdict.
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 mod key_record_plan_invariants;
 // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — I1153: a key id names its own key.
 #[cfg(test)]
@@ -518,6 +534,8 @@ pub mod claim_signing_invariants;
     any(test, feature = "test-anchor"),
     any(feature = "postgres", feature = "sqlite")
 ))]
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 pub mod key_rebind_invariants;
 // v61 (CC 2.6.2) — the open-time pass over non-canonical signed instants.
 pub mod instant_form;
@@ -537,12 +555,16 @@ pub mod self_registration_restart_invariants;
     any(test, feature = "test-anchor"),
     any(feature = "postgres", feature = "sqlite")
 ))]
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 pub mod attester_key_unknown_invariants;
 // v54.1.0 (#1044) — the invalid-replace witnesses drive the key plan.
 #[cfg(all(
     any(test, feature = "test-anchor"),
     any(feature = "postgres", feature = "sqlite")
 ))]
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 pub mod invalid_replace_invariants;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
@@ -597,6 +619,8 @@ pub mod read;
 pub mod envelope;
 /// v31.0.0 (CIRISPersist#645) — the byte-exactness witness for the V122
 /// signature-covered envelope columns.
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(test)]
 pub mod envelope_bytes;
 // v21.6.0 (CIRISPersist#519 item 2a-iii) — the signed `fresh_as_of`
 // freshness floor: SignedTouchClaim's storage + monotonic-max merge
@@ -903,6 +927,8 @@ pub mod stream_seal;
 // gate + storage live in the backends.
 pub mod stream_receipt;
 pub mod stream_sth;
+// v62.0.0 (P13) — every item inside is test-gated; so is the module.
+#[cfg(any(test, feature = "test-anchor"))]
 pub mod substrate_machine;
 // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — the PQC-mandatory
 // federation-tier ingest gate: hybrid-verify a federation-tier

@@ -28,7 +28,7 @@ default = []
 test-anchor = ["ciris-verify-core/test-anchor"]
 
 # Phase 1 features.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:refinery", "refinery/tokio-postgres"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:siphasher"]
 server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
 # pyo3 implies postgres — the lens FastAPI integration shape (FSD §3.5)
 # needs the Postgres backend to be available. This is the published-wheel
@@ -68,12 +68,9 @@ _pyffi   = ["dep:pyo3"]
 extension-module = ["pyo3?/extension-module"]
 
 # v0.1.21 — SQLite backend Phase 1 parity (sovereign-mode + Pi-class
-# deployments per FSD §7 #7). Opens `dep:rusqlite` plus the rusqlite
-# feature on refinery for embedded migrations. Refinery is also
-# imported by the postgres feature; cargo unifies them when both are
-# on (refinery built with both `tokio-postgres` and `rusqlite`
-# features).
-sqlite         = ["dep:rusqlite", "dep:refinery", "refinery/rusqlite"]
+# deployments per FSD §7 #7). Opens `dep:rusqlite`; persist's own
+# migration runner applies the embedded migrations (v62.0.0, P6).
+sqlite         = ["dep:rusqlite", "dep:siphasher"]
 
 # Phase 2 features (declared now; impls land later — MISSION.md §2 / FSD §4).
 c-abi          = []
@@ -675,14 +672,12 @@ jsonschema    = { version = "0.46", default-features = false }
 tokio-postgres    = { version = "0.7.18", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"], optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 postgres-types    = { version = "0.2.14", optional = true }
-# CIRISPersist#339 — `default-features = false` drops refinery's default
-# `toml` feature (config-file loading, which we never use — migrations are
-# compile-time `embed_migrations!`) AND the previously-hardcoded
-# `tokio-postgres` backend. Each backend feature now opts into its own
-# refinery backend: `sqlite` → `refinery/rusqlite`, `postgres` →
-# `refinery/tokio-postgres`. This keeps `tokio-postgres` (and its build
-# weight) out of a sqlite-only (`pyo3-sqlite`) tree.
-refinery          = { version = "0.10", default-features = false, optional = true }
+# v62.0.0 (WASM_UEFI_READINESS P6) — refinery's checksum (SipHash-1-3),
+# for persist's own migration runner (`store::migration_runner`). refinery
+# itself is a dev-dependency now: its runner stamped `applied_on` with
+# `OffsetDateTime::now_utc()`, which panics on wasm32-unknown-unknown. Already
+# in the graph at 1.0.3 (refinery-core's own).
+siphasher         = { version = "1", optional = true }
 
 # v0.1.3 — TLS for tokio-postgres connection pool (THREAT_MODEL.md AV-18).
 tokio-postgres-rustls = { version = "0.13", optional = true }
@@ -931,6 +926,16 @@ metrics-util = { version = "0.19", default-features = false, features = ["debugg
 # refuses a bare `#[serial]` or an unlisted key. Under nextest (a process per
 # test) the locks are inert; they hold under `cargo test`.
 serial_test = "3"
+# v62.0.0 (WASM_NODE FSD §6.2, P7) — the authorizer hook, so I1815 watches
+# the writer from its first PREPARE (`locking_mode = EXCLUSIVE` must precede
+# every prepare, `select sqlite_version()` included). Test builds only; the
+# shipped rusqlite feature set is unchanged.
+rusqlite = { version = "0.41", features = ["hooks"] }
+# v62.0.0 (P6) — the oracle persist's migration runner is held to (I1818–
+# I1822): refinery's embedded list, checksums, history rows and refusals,
+# and `time`'s RFC 3339 form of `applied_on`. Test builds only.
+refinery = { version = "0.10", default-features = false, features = ["rusqlite", "tokio-postgres"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 # v0.1.7 — bench harness. criterion writes JSON to target/criterion/
 # which github-action-benchmark consumes for the gh-pages trend
 # chart. Pinning to 0.5.x; 0.6 changes the JSON shape and would
@@ -1025,6 +1030,14 @@ required-features = ["sqlite"]
 # tests/scores_shape_witness.rs; this bench charts the magnitudes.
 [[bench]]
 name = "scores_read"
+harness = false
+required-features = ["sqlite"]
+
+# v62.0.0 (WASM_NODE FSD §6.4, P10) — the 1000-row attestation page at
+# 1k / 16k / 100k rows: the door (V216 seek; the two-phase read) against
+# the v61.4.1 statement shape (sort every match, then LIMIT).
+[[bench]]
+name = "attestation_read"
 harness = false
 required-features = ["sqlite"]
 

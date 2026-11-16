@@ -98,6 +98,14 @@ const ALLOWED: &[Allowed] = &[
     },
     Allowed {
         file: "src/store/sqlite.rs",
+        item: "sqlite_read_attestations_two_phase",
+        form: Form::Unchecked,
+        reason: "READ-ONLY: the attestation page's two phases (v62.0.0, P10) inside the \
+                 read door; the rowids and their rows are one snapshot. It never writes, so \
+                 it never upgrades.",
+    },
+    Allowed {
+        file: "src/store/sqlite.rs",
         item:
             "v141_rebuild_backfills_admitted_at_and_preserves_every_index_trigger_and_referrer_828",
         form: Form::BeginLiteral,

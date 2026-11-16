@@ -48,10 +48,6 @@ use super::types::{TraceEventRow, TraceLlmCallRow};
 use super::Error;
 use crate::schema::ReasoningEventType;
 
-mod embedded {
-    refinery::embed_migrations!("migrations/postgres/lens");
-}
-
 /// v50.0.0 (CIRISPersist#925 review M5) — the key-record store step, with the
 /// door it was reached through: `put_public_key` is the local mint
 /// ([`KeyDoor::LocalMint`](crate::federation::register::KeyDoor::LocalMint));
@@ -4974,8 +4970,8 @@ mod attestation_id_is_text_622 {
 #[cfg(test)]
 pub(crate) fn embedded_migration_fingerprint() -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for m in embedded::migrations::runner().get_migrations() {
-        for b in format!("{}:{}:{}", m.version(), m.name(), m.checksum()).bytes() {
+    for m in crate::store::migration_runner::postgres_migrations() {
+        for b in format!("{}:{}:{}", m.version, m.name, m.checksum).bytes() {
             h ^= b as u64;
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -4989,11 +4985,10 @@ pub(crate) fn embedded_migration_fingerprint() -> u64 {
 /// hardcoded number that drifts each release.
 ///
 /// Returns the same count refinery walks at runtime —
-/// `embedded::migrations::runner().get_migrations().len()` — and is
-/// stable as long as the `embed_migrations!` macro stays sourced
-/// from the same directory.
+/// `migration_runner::postgres_migrations().len()` — and is stable as long
+/// as build.rs embeds the same directory.
 pub fn embedded_lens_migration_count() -> usize {
-    embedded::migrations::runner().get_migrations().len()
+    crate::store::migration_runner::postgres_migrations().len()
 }
 
 /// Postgres advisory-lock namespace for the migration phase.
@@ -6218,17 +6213,15 @@ impl PostgresBackend {
                 sqlstate: None,
                 detail: format!("postgres V070 checksum repair (#840): {e}"),
             })?;
-        let mut runner =
-            embedded::migrations::runner().set_target(refinery::Target::Version(version as _));
-        runner
-            .set_migration_table_name("ciris_persist_schema_history")
-            .run_async(&mut client)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::Migration {
-                sqlstate: None,
-                detail: format!("postgres migrations through V{version}: {e}"),
-            })
+        crate::store::migration_runner::run_postgres(
+            &mut client,
+            &crate::store::migration_runner::postgres_migrations(),
+            Some(i32::try_from(version).unwrap_or(i32::MAX)),
+            &crate::host::clock::now,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| runner_error(&format!("postgres migrations through V{version}"), e))
     }
 
     /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
@@ -7207,7 +7200,7 @@ impl PostgresBackend {
 /// [`PostgresBackend::dedicated_connect`]); also the genesis scratch's admin
 /// connection (CIRISPersist#1002).
 #[cfg(not(feature = "tls"))]
-async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
+pub(crate) async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
     let (client, connection) =
         tokio_postgres::connect(dsn, NoTls)
             .await
@@ -7225,7 +7218,7 @@ async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error
 }
 
 #[cfg(feature = "tls")]
-async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
+pub(crate) async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
     use rustls::ClientConfig;
     use tokio_postgres_rustls::MakeRustlsConnect;
     ensure_rustls_provider();
@@ -7478,6 +7471,17 @@ fn extract_sqlstate(err: &(dyn std::error::Error + 'static)) -> Option<String> {
 /// Format a migration-phase error with the SQLSTATE prepended
 /// (when available) so the Display string is greppable in lens
 /// logs without separate field-extraction.
+/// v62.0.0 (P6) — a [`crate::store::migration_runner::MigrationError`] as
+/// [`Error::Migration`], in [`migration_error`]'s `stage: [code] detail` form.
+fn runner_error(stage: &str, err: crate::store::migration_runner::MigrationError) -> Error {
+    let sqlstate = err.sqlstate().map(str::to_owned);
+    let detail = match &sqlstate {
+        Some(code) => format!("{stage}: [{code}] {err}"),
+        None => format!("{stage}: {err}"),
+    };
+    Error::Migration { sqlstate, detail }
+}
+
 fn migration_error<E>(stage: &str, err: E) -> Error
 where
     E: std::error::Error + 'static,
@@ -8151,17 +8155,22 @@ impl Backend for PostgresBackend {
         // detection both stay at their strict defaults (no integrity
         // weakening). Runtime is 100% TimescaleDB-free; the only residue is
         // dormant guarded DDL in the two immutable shipped migrations.
-        let report_result = embedded::migrations::runner()
-            .set_migration_table_name("ciris_persist_schema_history")
-            .run_async(&mut lock_client)
-            .await;
+        // v62.0.0 (P6) — persist's runner, refinery's decisions and rows;
+        // the instant is the caller's (the Clock seam wires it).
+        let report_result = crate::store::migration_runner::run_postgres(
+            &mut lock_client,
+            &crate::store::migration_runner::postgres_migrations(),
+            None,
+            &crate::host::clock::now,
+        )
+        .await;
         let elapsed = migration_started.elapsed();
         let migration_result = match report_result {
             Ok(report) => {
-                let applied = report.applied_migrations();
+                let applied = report.versions();
                 let applied_versions = applied
                     .iter()
-                    .map(|m| m.version().to_string())
+                    .map(i32::to_string)
                     .collect::<Vec<_>>()
                     .join(",");
                 crate::store::migration_timing::append(
@@ -8174,7 +8183,7 @@ impl Backend for PostgresBackend {
                 );
                 Ok(())
             }
-            Err(e) => Err(migration_error("migrations", e)),
+            Err(e) => Err(runner_error("migrations", e)),
         };
 
         // Best-effort explicit unlock — graceful path. The drop below
@@ -22602,13 +22611,21 @@ const PG_ATTESTATION_COLUMNS: &str = "attestation_id::text, attesting_key_id, at
 /// v61 — `list_attestations_by_dimension_citing`'s statement (`$1` the
 /// attester, `$2` the dimension, `$3` the cited blob), spelled once so the
 /// plan witness reads the statement the door runs.
+///
+/// v62.0.0 — the order is `asserted_at + interval '0'`: the same values in
+/// the same order, which no index yields. V216's `(attesting_key_id,
+/// dimension, asserted_at DESC, …)` does yield `asserted_at DESC` under the
+/// first two equalities, and with stale statistics postgres took it to skip
+/// the sort, walking the device's whole custody slice (the sort-avoidance
+/// heuristic sqlite's twin pins against with INDEXED BY). The cited rows are
+/// few, so the sort is of a handful.
 pub(crate) fn pg_by_dimension_citing_sql() -> String {
     format!(
         "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
          WHERE attesting_key_id = $1 AND dimension COLLATE \"C\" = $2 \
            AND (attestation_envelope::jsonb->'evidence_refs'->>0) = $3 \
            AND tier = 'federation' \
-         ORDER BY asserted_at DESC"
+         ORDER BY (asserted_at + interval '0') DESC"
     )
 }
 
@@ -22758,7 +22775,12 @@ pub(crate) fn pg_list_attestations_sql(
             filter.attesting_key_id.as_ref(),
             &filter.attesting_key_ids,
         );
-        if !keys.is_empty() {
+        // v62.0.0 (FSD §6.4, P10) — one key binds as equality, so the
+        // planner sees one (key, dimension) slice and V216's page order.
+        if let [one] = keys.as_slice() {
+            params.push(Box::new(one.clone()));
+            where_parts.push(format!("attesting_key_id = ${}", params.len()));
+        } else if !keys.is_empty() {
             params.push(Box::new(keys));
             where_parts.push(format!("attesting_key_id = ANY(${})", params.len()));
         }
@@ -22769,7 +22791,10 @@ pub(crate) fn pg_list_attestations_sql(
             filter.attested_key_id.as_ref(),
             &filter.attested_key_ids,
         );
-        if !keys.is_empty() {
+        if let [one] = keys.as_slice() {
+            params.push(Box::new(one.clone()));
+            where_parts.push(format!("attested_key_id = ${}", params.len()));
+        } else if !keys.is_empty() {
             params.push(Box::new(keys));
             where_parts.push(format!("attested_key_id = ANY(${})", params.len()));
         }

@@ -271,6 +271,8 @@ jobs:
           run_bench engine_cold_start
           run_bench read_engine_analytics
           run_bench scores_read
+          # v62.0.0 (FSD §6.4, P10) — the 1000-row attestation page, before/after.
+          run_bench attestation_read
           run_bench secrets_crypto
           run_bench occurrence_registry
           run_bench storage_floor
