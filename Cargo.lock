@@ -834,8 +834,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-kernel"
-version = "0.1.0"
-source = "git+https://github.com/CIRISAI/CIRISKernel?rev=07ced1f2d2f6f672aa240b122657fa20b76d910c#07ced1f2d2f6f672aa240b122657fa20b76d910c"
+version = "0.2.0"
+source = "git+https://github.com/CIRISAI/CIRISKernel?tag=kernel-v0.2.0#78b2f677df7722a41c643c728530394469d7f354"
 
 [[package]]
 name = "ciris-keyring"

@@ -297,6 +297,20 @@ mod tests {
             holders(&[binding("b", "O", "N", true)], &[], Cosign::Required),
             one("O")
         );
+        // the answer names the rows it rests on: the binding that seats O
+        let view = owner_rows(
+            "N",
+            &[binding("b", "O", "N", true)],
+            &[],
+            chrono::Utc::now(),
+            &|_| true,
+            Cosign::Required,
+        );
+        assert_eq!(
+            owner_holders(&view, "N").rows,
+            vec![RowId::of_hash("prh-b")],
+            "I1834: the rows read are the seat's offer"
+        );
         assert!(holders(&[binding("b", "O", "N", false)], &[], Cosign::Required).is_empty());
         assert_eq!(
             holders(&[binding("b", "O", "N", false)], &[], Cosign::Assumed),
@@ -356,5 +370,58 @@ mod tests {
         let mut late = b;
         late.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
         assert!(holders(&[late], &[], Cosign::Required).is_empty());
+    }
+
+    /// CANARY for the adapter's own-withdrawal filter in [`owner_rows`]
+    /// (`.filter(|r| r.attesting_key_id != node)`, CC 3.2: a node cannot
+    /// outrun its owner). The kernel's `Conf::Own` seat ends on the
+    /// conferrer's own withdrawal, and the node is the presented signer of
+    /// a cosigned binding, so without the filter the node's own `withdraws`
+    /// ends the seat. This test hands the kernel that withdrawal DIRECTLY,
+    /// bypassing the filter, and asserts the kernel STILL ends the seat.
+    ///
+    /// When this FAILS, the kernel has fixed it (kernel friction item 2,
+    /// expected in v0.3): delete the filter in `owner_rows` and this canary,
+    /// and keep `i1835`'s node-retraction assertion as the witness.
+    #[test]
+    fn kernel_still_needs_own_withdrawal_filter() {
+        let now = chrono::Utc::now();
+        let b = binding("b", "O", "N", true);
+        let mut view = owner_rows(
+            "N",
+            std::slice::from_ref(&b),
+            &[],
+            now,
+            &|_| true,
+            Cosign::Required,
+        );
+        // control: the binding alone seats O
+        assert_eq!(owner_holders(&view, "N").value.len(), 1);
+        // control: through the adapter, the node's own withdrawal is filtered
+        let own = row(
+            "w",
+            attestation_type::WITHDRAWS,
+            "N",
+            "N",
+            serde_json::json!({"references_attestation_id": "b"}),
+        );
+        assert_eq!(
+            holders(&[b.clone(), own.clone()], &[], Cosign::Required).len(),
+            1,
+            "the adapter filter keeps the seat"
+        );
+        // the row the filter drops, built as the composer path builds it
+        let target = RowId::of_hash(&b.persist_row_hash);
+        let mut wd = KRow::new(RowId::of_hash(&own.persist_row_hash), vec![target], "N")
+            .at(micros(own.asserted_at));
+        wd.seat.kind = SeatKind::Withdraw;
+        wd.seat.target = Some(target);
+        wd.seat.policy = Some(attestation_type::WITHDRAWS.into());
+        view.push(wd);
+        assert!(
+            owner_holders(&view, "N").value.is_empty(),
+            "CANARY: the kernel no longer ends a Conf::Own seat on the node's own \
+             withdrawal — remove the own-withdrawal filter in owner_rows and this test"
+        );
     }
 }

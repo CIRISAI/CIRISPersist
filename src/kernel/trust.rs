@@ -204,4 +204,39 @@ mod tests {
             "I1846: the live edge stands"
         );
     }
+
+    /// I1847 — a `supersedes` is an edge only when it rotates the signer's
+    /// OWN grant (CC 3.2 T2): one naming another signer's delegation, or the
+    /// signer's own row that is no grant, concludes nothing; one naming the
+    /// signer's own delegation replaces it (the rotation is the live edge).
+    #[test]
+    fn i1847_a_rotation_concludes_only_over_the_signers_own_grant() {
+        let rows = vec![
+            row(1, attestation_type::DELEGATES_TO, "x", None, None),
+            row(2, attestation_type::SUPERSEDES, "u", Some(1), Some("root")),
+        ];
+        assert!(
+            !edge_leg(&rows, "u", "root").value,
+            "I1847: a rotation of another's grant is no edge"
+        );
+        let rows = vec![
+            row(1, "scores", "u", None, None),
+            row(2, attestation_type::SUPERSEDES, "u", Some(1), Some("root")),
+        ];
+        assert!(
+            !edge_leg(&rows, "u", "root").value,
+            "I1847: a rotation of a row that is no grant is no edge"
+        );
+        let rows = vec![
+            row(1, attestation_type::DELEGATES_TO, "u", None, Some("root")),
+            row(2, attestation_type::SUPERSEDES, "u", Some(1), Some("root")),
+        ];
+        let a = edge_leg(&rows, "u", "root");
+        assert!(a.value, "I1847: the rotation stands");
+        assert_eq!(
+            a.rows,
+            vec![RowId([2; 32])],
+            "I1847: only the rotation is live"
+        );
+    }
 }
