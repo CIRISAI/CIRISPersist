@@ -3031,8 +3031,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         object: &crate::federation::edition2::store::HeldObject,
     ) -> Result<bool, crate::federation::Error> {
         let object = object.clone();
-        self.write(move |conn| crate::federation::edition2::store::put_object_sqlite(conn, &object))
-            .await
+        self.write(move |conn| {
+            let be = |e: rusqlite::Error| {
+                crate::federation::Error::Backend(format!("ceg_statements: {e}"))
+            };
+            let tx = crate::store::sqlite_conn_model::write_tx(conn).map_err(be)?;
+            let new = crate::federation::edition2::store::put_object_sqlite(&tx, &object)?;
+            tx.commit().map_err(be)?;
+            Ok(new)
+        })
+        .await
     }
 
     async fn edition2_voices(
@@ -3056,6 +3064,59 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             tx.commit()
                 .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
             Ok(new)
+        })
+        .await
+    }
+
+    async fn upsert_edition2_key_projection(
+        &self,
+        set: &crate::federation::edition2::projection::ProjectionSet,
+    ) -> Result<(), crate::federation::Error> {
+        let set = set.clone();
+        self.write(move |conn| {
+            let be = |e: rusqlite::Error| {
+                crate::federation::Error::Backend(format!("edition-2 projection: {e}"))
+            };
+            let tx = write_tx(conn).map_err(be)?;
+            for key in &set.keys {
+                sqlite_upsert_edition2_key(&tx, key)?;
+            }
+            for rev in &set.revocations {
+                sqlite_insert_edition2_revocation(&tx, rev)?;
+            }
+            tx.commit().map_err(be)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn key_edition(&self, key_id: &str) -> Result<Option<i16>, crate::federation::Error> {
+        let key_id = key_id.to_owned();
+        self.read(move |conn| -> Result<Option<i16>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT edition FROM federation_keys WHERE key_id = ?1",
+                [&key_id],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("key_edition: {e}")))
+    }
+
+    async fn edition2_statements_since(
+        &self,
+        cursor: Option<&crate::federation::edition2::store::StatementCursor>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::edition2::store::ServedStatement>, crate::federation::Error>
+    {
+        let cursor = cursor.copied();
+        self.read(move |conn| {
+            crate::federation::edition2::store::statements_since_sqlite(
+                conn,
+                cursor.as_ref(),
+                limit,
+            )
         })
         .await
     }
@@ -14856,6 +14917,147 @@ fn parse_rfc3339(s: &str) -> chrono::DateTime<chrono::Utc> {
 const KEY_SERVE_POSITION_SQLITE: &str = "MAX(COALESCE(admitted_at, scrub_timestamp), \
      COALESCE(mutated_at, COALESCE(admitted_at, scrub_timestamp)))";
 
+/// v62.0.0 (slice J0) — upsert one edition-2 key projection
+/// (`federation::edition2::projection`) in the caller's write transaction.
+/// A key id held by an earlier-form row is refused `Conflict`; an unchanged
+/// projection writes nothing (idempotence: byte-identical, no new serve
+/// position).
+fn sqlite_upsert_edition2_key(
+    tx: &rusqlite::Connection,
+    key: &crate::federation::edition2::projection::KeyProjection,
+) -> Result<(), crate::federation::Error> {
+    use crate::federation::edition2::projection::EDITION_TWO;
+    use crate::federation::Error;
+    let be = |e: rusqlite::Error| Error::Backend(format!("edition-2 key projection: {e}"));
+    let held: Option<i64> = tx
+        .query_row(
+            "SELECT edition FROM federation_keys WHERE key_id = ?1",
+            [&key.key_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(be)?;
+    if held.is_some_and(|e| e != i64::from(EDITION_TWO)) {
+        return Err(Error::Conflict(format!(
+            "federation_keys {} is held by an earlier-form row; an edition-2 key's projection \
+             never overwrites it",
+            key.key_id
+        )));
+    }
+    let envelope = serde_json::to_string(&key.registration_envelope)
+        .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
+    let evidence = serde_json::to_string(&key.attestation_evidence)
+        .map_err(|e| Error::Backend(format!("evidence serialize: {e}")))?;
+    let hash = hex::decode(&key.original_content_hash)
+        .map_err(|e| Error::Backend(format!("original_content_hash hex: {e}")))?;
+    let position = sqlite_next_key_serve_position(tx).map_err(be)?.to_rfc3339();
+    let params = rusqlite::params![
+        key.key_id,
+        key.pubkey_ed25519_base64,
+        key.pubkey_ml_dsa_65_base64,
+        key.identity_type,
+        key.valid_from.to_rfc3339(),
+        key.valid_until.map(|t| t.to_rfc3339()),
+        envelope,
+        hash,
+        key.scrub_signature_classical,
+        key.scrub_key_id,
+        key.scrub_timestamp.to_rfc3339(),
+        key.persist_row_hash,
+        evidence,
+        &key.record_row_id[..],
+        &key.kid[..],
+        position,
+    ];
+    if held.is_none() {
+        tx.execute(
+            "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, \
+                algorithm, identity_type, identity_ref, valid_from, valid_until, \
+                registration_envelope, original_content_hash, scrub_signature_classical, \
+                scrub_key_id, scrub_timestamp, persist_row_hash, attestation_evidence, \
+                consent_role, edition, record_row_id, kid, admitted_at) \
+             VALUES (?1, ?2, ?3, 'hybrid', ?4, ?1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                'unregistered', 2, ?14, ?15, ?16)",
+            params,
+        )
+        .map_err(be)?;
+    } else {
+        tx.execute(
+            "UPDATE federation_keys SET pubkey_ed25519_base64 = ?2, \
+                pubkey_ml_dsa_65_base64 = ?3, identity_type = ?4, valid_from = ?5, \
+                valid_until = ?6, registration_envelope = ?7, original_content_hash = ?8, \
+                scrub_signature_classical = ?9, scrub_key_id = ?10, scrub_timestamp = ?11, \
+                persist_row_hash = ?12, attestation_evidence = ?13, record_row_id = ?14, \
+                kid = ?15, mutated_at = ?16 \
+             WHERE key_id = ?1 AND edition = 2 AND ( \
+                pubkey_ed25519_base64 IS NOT ?2 OR pubkey_ml_dsa_65_base64 IS NOT ?3 OR \
+                identity_type IS NOT ?4 OR valid_from IS NOT ?5 OR valid_until IS NOT ?6 OR \
+                registration_envelope IS NOT ?7 OR original_content_hash IS NOT ?8 OR \
+                scrub_signature_classical IS NOT ?9 OR scrub_key_id IS NOT ?10 OR \
+                scrub_timestamp IS NOT ?11 OR persist_row_hash IS NOT ?12 OR \
+                attestation_evidence IS NOT ?13 OR record_row_id IS NOT ?14 OR kid IS NOT ?15)",
+            params,
+        )
+        .map_err(be)?;
+    }
+    Ok(())
+}
+
+/// v62.0.0 (slice J0) — insert one honoured edition-2 revocation's projection
+/// once (`ON CONFLICT DO NOTHING` on its row id), in the caller's write
+/// transaction, at THIS node's next revocation admission position.
+fn sqlite_insert_edition2_revocation(
+    tx: &rusqlite::Connection,
+    rev: &crate::federation::edition2::projection::RevocationProjection,
+) -> Result<(), crate::federation::Error> {
+    use crate::federation::Error;
+    let be = |e: rusqlite::Error| Error::Backend(format!("edition-2 revocation projection: {e}"));
+    let envelope = serde_json::to_string(&rev.revocation_envelope)
+        .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
+    let hash = hex::decode(&rev.original_content_hash)
+        .map_err(|e| Error::Backend(format!("original_content_hash hex: {e}")))?;
+    let last: Option<String> = tx
+        .query_row(
+            "SELECT MAX(admitted_at) FROM federation_revocations",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(be)?
+        .flatten();
+    let admitted_at = crate::federation::types::monotonic_admission_instant(
+        crate::host::clock::now(),
+        last.as_deref().map(parse_rfc3339),
+    );
+    tx.execute(
+        "INSERT INTO federation_revocations (revocation_id, revoked_key_id, revoking_key_id, \
+            reason, revoked_at, effective_at, revocation_envelope, original_content_hash, \
+            scrub_signature_classical, scrub_key_id, scrub_timestamp, revoked_after, \
+            persist_row_hash, admitted_at, revoked_key_sha256_ed25519_raw) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+         ON CONFLICT (revocation_id) DO NOTHING",
+        rusqlite::params![
+            rev.revocation_id,
+            rev.revoked_key_id,
+            rev.revoking_key_id,
+            rev.reason,
+            rev.revoked_at.to_rfc3339(),
+            rev.effective_at.to_rfc3339(),
+            envelope,
+            hash,
+            rev.scrub_signature_classical,
+            rev.scrub_key_id,
+            rev.scrub_timestamp.to_rfc3339(),
+            rev.revoked_after.map(|t| t.to_rfc3339()),
+            rev.persist_row_hash,
+            admitted_at.to_rfc3339(),
+            rev.revoked_key_sha256_ed25519_raw,
+        ],
+    )
+    .map_err(be)?;
+    Ok(())
+}
+
 /// v36.0.0 (CIRISPersist#707) — allocate the next `federation_keys` serve
 /// position, strictly above every position already handed out, on a
 /// connection the CALLER already holds (doors allocate inside the same lock
@@ -18067,8 +18269,13 @@ fn sqlite_revocation_projection_rebuild(
     conn: &rusqlite::Connection,
 ) -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
     let live: Vec<(crate::federation::Revocation, Option<String>)> = {
-        let mut stmt =
-            conn.prepare("SELECT * FROM federation_revocations ORDER BY revocation_id")?;
+        let mut stmt = conn.prepare(
+            // v62.0.0 (slice J0) — an edition-2 revocation's projection has no
+            // earlier-form row.
+            "SELECT * FROM federation_revocations WHERE NOT EXISTS (SELECT 1 FROM \
+             federation_keys k WHERE k.key_id = federation_revocations.revoking_key_id AND \
+             k.edition = 2) ORDER BY revocation_id",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 sqlite_row_to_revocation(r)?,
@@ -18138,7 +18345,11 @@ fn sqlite_key_projection_rebuild(
     conn: &rusqlite::Connection,
 ) -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
     let live: Vec<(crate::federation::KeyRecord, Option<String>)> = {
-        let mut stmt = conn.prepare("SELECT * FROM federation_keys ORDER BY key_id")?;
+        let mut stmt = conn.prepare(
+            // v62.0.0 (slice J0) — an edition-2 projection is a read model of
+            // `ceg_statements`, never a `key:record:v1` row's projection.
+            "SELECT * FROM federation_keys WHERE edition = 1 ORDER BY key_id",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 sqlite_row_to_key_record(r)?,
@@ -23300,10 +23511,12 @@ impl SqliteBackend {
                 .unwrap_or(0);
                 Ok::<_, rusqlite::Error>(crate::federation::key_plane::KeyPlaneRehomeReport {
                     keys_without_row: n(
-                        "SELECT COUNT(*) FROM federation_keys WHERE attestation_id IS NULL",
+                        "SELECT COUNT(*) FROM federation_keys WHERE attestation_id IS NULL AND edition = 1",
                     )?,
                     revocations_without_row: n(
-                        "SELECT COUNT(*) FROM federation_revocations WHERE attestation_id IS NULL",
+                        "SELECT COUNT(*) FROM federation_revocations WHERE attestation_id IS NULL AND \
+                         NOT EXISTS (SELECT 1 FROM federation_keys k WHERE k.key_id = \
+                         federation_revocations.revoking_key_id AND k.edition = 2)",
                     )?,
                     occurrences_without_row: n(
                         "SELECT COUNT(*) FROM federation_identity_occurrences \
@@ -23374,9 +23587,16 @@ impl SqliteBackend {
                     rows.collect::<Result<Vec<_>, _>>()?
                 };
                 Ok((
-                    ids("SELECT key_id FROM federation_keys WHERE attestation_id IS NULL")?,
+                    // v62.0.0 (slice J0) — edition-2 projections are read models: never
+                    // re-homed as `key:record:v1` / revocation rows.
+                    ids(
+                        "SELECT key_id FROM federation_keys WHERE attestation_id IS NULL \
+                          AND edition = 1",
+                    )?,
                     ids("SELECT revocation_id FROM federation_revocations \
-                          WHERE attestation_id IS NULL")?,
+                          WHERE attestation_id IS NULL AND NOT EXISTS (SELECT 1 FROM \
+                          federation_keys k WHERE k.key_id = \
+                          federation_revocations.revoking_key_id AND k.edition = 2)")?,
                     pairs,
                 ))
             })

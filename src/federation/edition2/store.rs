@@ -1,7 +1,7 @@
 //! The edition-2 statement store: the shape the E2b baseline creates.
 //!
 //! The tables are E2b's, created in the edition-2 schema baseline
-//! (`cirislens.` on postgres). This slice writes and reads against these
+//! (`cirislens.` on postgres). This module writes and reads against these
 //! column names, which stay stable:
 //!
 //! - `ceg_statements`. One row per voice, keyed by `statement_id`, with an
@@ -14,66 +14,14 @@
 //!   from its signed `refs`. There is no FK, because a named row may not be
 //!   held yet.
 //!
-//! [`SQLITE_DDL`] / [`POSTGRES_DDL`] are the shape, written here so this
-//! slice's tests can stand it up before the baseline merges. I1906 checks
-//! the columns against what the baseline creates, once it holds the tables.
+//! The tables are created by `V300__edition2_baseline` on both dialects
+//! (`store::edition_baseline::EDITION_TWO_ADDITIONS`); nothing here creates
+//! them. I1906 checks the columns against what the baseline creates.
 
 use super::door::AdmittedRow;
 
-/// The tables' shape on sqlite (test fixture until the E2b baseline).
-pub const SQLITE_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS ceg_statements (\
-  statement_id BLOB PRIMARY KEY CHECK (length(statement_id) = 32),\
-  row_id BLOB NOT NULL CHECK (length(row_id) = 32),\
-  typ TEXT NOT NULL,\
-  row_type TEXT,\
-  family TEXT,\
-  kid BLOB NOT NULL CHECK (length(kid) = 32),\
-  iss TEXT NOT NULL,\
-  sub TEXT,\
-  author TEXT,\
-  asserted_at_ms INTEGER,\
-  bytes BLOB NOT NULL,\
-  CHECK ((typ = 'ceg-row/2') = (row_type IS NOT NULL AND family IS NOT NULL AND sub IS NOT \
-  NULL AND asserted_at_ms IS NOT NULL))\
-);\
-CREATE INDEX IF NOT EXISTS ceg_statements_row_id ON ceg_statements (row_id);\
-CREATE TABLE IF NOT EXISTS ceg_row_names (\
-  row_id BLOB NOT NULL CHECK (length(row_id) = 32),\
-  named_row_id BLOB NOT NULL CHECK (length(named_row_id) = 32),\
-  role TEXT NOT NULL,\
-  PRIMARY KEY (row_id, named_row_id, role)\
-);\
-CREATE INDEX IF NOT EXISTS ceg_row_names_named ON ceg_row_names (named_row_id, role, row_id);";
-
-/// The tables' shape on postgres (test fixture until the E2b baseline).
-pub const POSTGRES_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS cirislens.ceg_statements (\
-  statement_id BYTEA PRIMARY KEY CHECK (octet_length(statement_id) = 32),\
-  row_id BYTEA NOT NULL CHECK (octet_length(row_id) = 32),\
-  typ TEXT NOT NULL,\
-  row_type TEXT,\
-  family TEXT,\
-  kid BYTEA NOT NULL CHECK (octet_length(kid) = 32),\
-  iss TEXT NOT NULL,\
-  sub TEXT,\
-  author TEXT,\
-  asserted_at_ms BIGINT,\
-  bytes BYTEA NOT NULL,\
-  CHECK ((typ = 'ceg-row/2') = (row_type IS NOT NULL AND family IS NOT NULL AND sub IS NOT \
-  NULL AND asserted_at_ms IS NOT NULL))\
-);\
-CREATE INDEX IF NOT EXISTS ceg_statements_row_id ON cirislens.ceg_statements (row_id);\
-CREATE TABLE IF NOT EXISTS cirislens.ceg_row_names (\
-  row_id BYTEA NOT NULL CHECK (octet_length(row_id) = 32),\
-  named_row_id BYTEA NOT NULL CHECK (octet_length(named_row_id) = 32),\
-  role TEXT NOT NULL,\
-  PRIMARY KEY (row_id, named_row_id, role)\
-);\
-CREATE INDEX IF NOT EXISTS ceg_row_names_named ON cirislens.ceg_row_names (named_row_id, role, row_id);";
-
-/// The `ceg_statements` columns, in [`SQLITE_DDL`]'s order.
-pub const STATEMENT_COLUMNS: [&str; 11] = [
+/// The `ceg_statements` columns, in the baseline's order.
+pub const STATEMENT_COLUMNS: [&str; 12] = [
     "statement_id",
     "row_id",
     "typ",
@@ -85,6 +33,7 @@ pub const STATEMENT_COLUMNS: [&str; 11] = [
     "author",
     "asserted_at_ms",
     "bytes",
+    "admitted_us",
 ];
 
 /// The `ceg_row_names` columns.
@@ -92,6 +41,43 @@ pub const NAME_COLUMNS: [&str; 3] = ["row_id", "named_row_id", "role"];
 
 /// The `typ` of a row statement.
 pub const ROW_TYP: &str = ciris_verify_core::edition2::ROW_TYP;
+
+/// THIS node's next admission position (POSIX µs): the host clock, or one
+/// past the last position handed out when the clock is not ahead of it
+/// (`monotonic_admission_instant`'s rule at µs). A backward clock step never
+/// stamps a statement below one already served.
+#[must_use]
+pub fn next_admitted_us(now: chrono::DateTime<chrono::Utc>, last: Option<i64>) -> i64 {
+    let now = now.timestamp_micros();
+    match last {
+        Some(l) if l >= now => l.saturating_add(1),
+        _ => now,
+    }
+}
+
+/// Where a reader of [`FederationDirectory::edition2_statements_since`]
+/// resumes: the last served statement's admission position and id.
+///
+/// [`FederationDirectory::edition2_statements_since`]: crate::federation::FederationDirectory::edition2_statements_since
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StatementCursor {
+    /// The admission position, POSIX µs.
+    pub admitted_us: i64,
+    /// The statement id.
+    pub statement_id: [u8; 32],
+}
+
+/// One held statement, served as received (CC 2.6.1.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedStatement {
+    /// Its position: pass the last one served back as the cursor.
+    pub cursor: StatementCursor,
+    /// The statement's bytes as received.
+    pub bytes: Vec<u8>,
+}
+
+/// The most statements one page serves.
+pub const MAX_PAGE: u32 = 1000;
 
 /// `asserted_at_ms` as the BIGINT the columns hold. An instant above
 /// `i64::MAX` ms is refused at the door rather than wrapped.
@@ -108,6 +94,30 @@ pub fn asserted_at_column(row: &AdmittedRow) -> Result<i64, crate::federation::E
     })
 }
 
+/// sqlite: the next admission position, read in the caller's write
+/// transaction (BEGIN IMMEDIATE serialises it).
+#[cfg(feature = "sqlite")]
+fn next_admitted_us_sqlite(tx: &rusqlite::Connection) -> Result<i64, rusqlite::Error> {
+    let last: Option<i64> =
+        tx.query_row("SELECT MAX(admitted_us) FROM ceg_statements", [], |r| {
+            r.get(0)
+        })?;
+    Ok(next_admitted_us(crate::host::clock::now(), last))
+}
+
+/// postgres: the next admission position, read in the caller's transaction.
+#[cfg(feature = "postgres")]
+async fn next_admitted_us_postgres<C>(client: &C) -> Result<i64, tokio_postgres::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    let last: Option<i64> = client
+        .query_one("SELECT MAX(admitted_us) FROM cirislens.ceg_statements", &[])
+        .await?
+        .try_get(0)?;
+    Ok(next_admitted_us(crate::host::clock::now(), last))
+}
+
 /// sqlite: store an admitted row's statement and its names, idempotently, in
 /// the caller's transaction. Returns whether the statement was new.
 ///
@@ -120,11 +130,12 @@ pub fn put_row_sqlite(
 ) -> Result<bool, crate::federation::Error> {
     let at = asserted_at_column(row)?;
     let be = |e: rusqlite::Error| crate::federation::Error::Backend(format!("ceg_statements: {e}"));
+    let admitted = next_admitted_us_sqlite(tx).map_err(be)?;
     let n = tx
         .execute(
             "INSERT OR IGNORE INTO ceg_statements (statement_id, row_id, typ, row_type, family, \
-             kid, iss, sub, author, asserted_at_ms, bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
-             ?8, ?9, ?10, ?11)",
+             kid, iss, sub, author, asserted_at_ms, bytes, admitted_us) VALUES (?1, ?2, ?3, ?4, \
+             ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 &row.statement_id[..],
                 &row.row_id.0[..],
@@ -137,6 +148,7 @@ pub fn put_row_sqlite(
                 row.author,
                 at,
                 row.bytes,
+                admitted,
             ],
         )
         .map_err(be)?;
@@ -221,11 +233,12 @@ where
     let be = |e: tokio_postgres::Error| {
         crate::federation::Error::Backend(format!("ceg_statements: {e}"))
     };
+    let admitted = next_admitted_us_postgres(client).await.map_err(be)?;
     let n = client
         .execute(
             "INSERT INTO cirislens.ceg_statements (statement_id, row_id, typ, row_type, family, \
-             kid, iss, sub, author, asserted_at_ms, bytes) VALUES ($1, $2, $3, $4, $5, $6, $7, \
-             $8, $9, $10, $11) ON CONFLICT (statement_id) DO NOTHING",
+             kid, iss, sub, author, asserted_at_ms, bytes, admitted_us) VALUES ($1, $2, $3, $4, \
+             $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (statement_id) DO NOTHING",
             &[
                 &&row.statement_id[..],
                 &&row.row_id.0[..],
@@ -238,6 +251,7 @@ where
                 &row.author,
                 &at,
                 &row.bytes,
+                &admitted,
             ],
         )
         .await
@@ -372,7 +386,8 @@ pub struct HeldObject {
     pub bytes: Vec<u8>,
 }
 
-/// sqlite: store an object voice, idempotently. Returns whether it was new.
+/// sqlite: store an object voice, idempotently, in the caller's write
+/// transaction. Returns whether it was new.
 ///
 /// # Errors
 /// sqlite errors.
@@ -381,20 +396,23 @@ pub fn put_object_sqlite(
     conn: &rusqlite::Connection,
     o: &HeldObject,
 ) -> Result<bool, crate::federation::Error> {
+    let be = |e: rusqlite::Error| crate::federation::Error::Backend(format!("ceg_statements: {e}"));
+    let admitted = next_admitted_us_sqlite(conn).map_err(be)?;
     let n = conn
         .execute(
-            "INSERT OR IGNORE INTO ceg_statements (statement_id, row_id, typ, kid, iss, bytes) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR IGNORE INTO ceg_statements (statement_id, row_id, typ, kid, iss, bytes, \
+             admitted_us) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 &o.statement_id[..],
                 &o.object_id.0[..],
                 o.typ,
                 &o.kid[..],
                 o.iss,
-                o.bytes
+                o.bytes,
+                admitted,
             ],
         )
-        .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
+        .map_err(be)?;
     Ok(n == 1)
 }
 
@@ -417,7 +435,8 @@ pub fn objects_of_sqlite(
     rows.collect::<Result<Vec<_>, _>>().map_err(be)
 }
 
-/// postgres: store an object voice, idempotently. Returns whether it was new.
+/// postgres: store an object voice, idempotently, in the caller's
+/// transaction. Returns whether it was new.
 ///
 /// # Errors
 /// postgres errors.
@@ -429,10 +448,15 @@ pub async fn put_object_postgres<C>(
 where
     C: deadpool_postgres::GenericClient + Sync,
 {
+    let be = |e: tokio_postgres::Error| {
+        crate::federation::Error::Backend(format!("ceg_statements: {e}"))
+    };
+    let admitted = next_admitted_us_postgres(client).await.map_err(be)?;
     let n = client
         .execute(
-            "INSERT INTO cirislens.ceg_statements (statement_id, row_id, typ, kid, iss, bytes) \
-             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (statement_id) DO NOTHING",
+            "INSERT INTO cirislens.ceg_statements (statement_id, row_id, typ, kid, iss, bytes, \
+             admitted_us) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (statement_id) DO \
+             NOTHING",
             &[
                 &&o.statement_id[..],
                 &&o.object_id.0[..],
@@ -440,10 +464,11 @@ where
                 &&o.kid[..],
                 &o.iss,
                 &o.bytes,
+                &admitted,
             ],
         )
         .await
-        .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
+        .map_err(be)?;
     Ok(n == 1)
 }
 
@@ -467,4 +492,100 @@ where
         .await
         .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
     Ok(rows.iter().map(|r| r.get::<_, Vec<u8>>(0)).collect())
+}
+
+fn served(
+    admitted_us: i64,
+    id: &[u8],
+    bytes: Vec<u8>,
+) -> Result<ServedStatement, crate::federation::Error> {
+    let statement_id = <[u8; 32]>::try_from(id).map_err(|_| {
+        crate::federation::Error::Backend("ceg_statements: statement_id length".into())
+    })?;
+    Ok(ServedStatement {
+        cursor: StatementCursor {
+            admitted_us,
+            statement_id,
+        },
+        bytes,
+    })
+}
+
+/// sqlite: the held statements after `cursor` (from the first with none), in
+/// admission order, at most `limit` (clamped to [`MAX_PAGE`]).
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn statements_since_sqlite(
+    conn: &rusqlite::Connection,
+    cursor: Option<&StatementCursor>,
+    limit: u32,
+) -> Result<Vec<ServedStatement>, crate::federation::Error> {
+    let be = |e: rusqlite::Error| crate::federation::Error::Backend(format!("ceg_statements: {e}"));
+    let limit = i64::from(limit.min(MAX_PAGE));
+    let (at, id) = cursor.map_or((i64::MIN, Vec::new()), |c| {
+        (c.admitted_us, c.statement_id.to_vec())
+    });
+    let mut st = conn
+        .prepare(
+            "SELECT admitted_us, statement_id, bytes FROM ceg_statements \
+             WHERE admitted_us > ?1 OR (admitted_us = ?1 AND statement_id > ?2) \
+             ORDER BY admitted_us, statement_id LIMIT ?3",
+        )
+        .map_err(be)?;
+    let rows = st
+        .query_map(rusqlite::params![at, id, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(be)?;
+    rows.map(|r| {
+        let (a, id, bytes) = r.map_err(be)?;
+        served(a, &id, bytes)
+    })
+    .collect()
+}
+
+/// postgres: the held statements after `cursor` (from the first with none),
+/// in admission order, at most `limit` (clamped to [`MAX_PAGE`]).
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn statements_since_postgres<C>(
+    client: &C,
+    cursor: Option<&StatementCursor>,
+    limit: u32,
+) -> Result<Vec<ServedStatement>, crate::federation::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    let be = |e: tokio_postgres::Error| {
+        crate::federation::Error::Backend(format!("ceg_statements: {e}"))
+    };
+    let limit = i64::from(limit.min(MAX_PAGE));
+    let (at, id) = cursor.map_or((i64::MIN, Vec::new()), |c| {
+        (c.admitted_us, c.statement_id.to_vec())
+    });
+    let rows = client
+        .query(
+            "SELECT admitted_us, statement_id, bytes FROM cirislens.ceg_statements \
+             WHERE admitted_us > $1 OR (admitted_us = $1 AND statement_id > $2) \
+             ORDER BY admitted_us, statement_id LIMIT $3",
+            &[&at, &id, &limit],
+        )
+        .await
+        .map_err(be)?;
+    rows.iter()
+        .map(|r| {
+            let a: i64 = r.try_get(0).map_err(be)?;
+            let id: Vec<u8> = r.try_get(1).map_err(be)?;
+            let bytes: Vec<u8> = r.try_get(2).map_err(be)?;
+            served(a, &id, bytes)
+        })
+        .collect()
 }

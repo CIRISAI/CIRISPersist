@@ -186,6 +186,31 @@ impl HeldKeys {
         }
     }
 
+    /// The same records with no revocation held: the reading of whether a
+    /// statement was signed by a key with a valid record, apart from
+    /// whether that key was revoked since. The projection
+    /// ([`super::projection`]) maps a held record or revocation through it,
+    /// and an already-held key-plane statement is re-read through it
+    /// ([`super::ingest::put_statement`]): a revoke-all revocation does not
+    /// make its own bytes, or the record it ends, unreadable.
+    #[must_use]
+    pub fn without_revocations(&self) -> HeldKeys {
+        HeldKeys {
+            records: self.records.clone(),
+            revocations: Vec::new(),
+            standing: Arc::clone(&self.standing),
+        }
+    }
+
+    /// Is this exact statement held, as a record or a revocation?
+    #[must_use]
+    pub fn holds(&self, statement: &[u8]) -> bool {
+        self.records
+            .values()
+            .any(|v| v.iter().any(|s| s.as_slice() == statement))
+            || self.revocations.iter().any(|s| s.as_slice() == statement)
+    }
+
     /// The kids of the keys a statement's records are held for.
     pub fn kids(&self) -> impl Iterator<Item = &Digest32> {
         self.records.keys()
@@ -198,13 +223,45 @@ impl HeldKeys {
     }
 
     fn resolve(&self, kid: &Digest32, at: u64, depth: usize, with_revocations: bool) -> Liveness {
+        let valid = match self.judged(kid, depth) {
+            Ok(valid) => valid,
+            Err(other) => return other,
+        };
+        if with_revocations && self.revoked(kid, at, depth) {
+            return Liveness::Revoked;
+        }
+        // Renewals all count: the instant is covered by any one of them.
+        valid
+            .into_iter()
+            .map(|v| v.record)
+            .filter(|r| r.asserted_at <= at && r.valid_until.is_none_or(|u| at <= u))
+            .max_by_key(|r| r.valid_until.unwrap_or(u64::MAX))
+            .map_or(Liveness::NotCovered, |r| Liveness::Live(Box::new(r)))
+    }
+
+    /// The held records of `kid` that verify and keep the end rule, each with
+    /// its statement, at any instant: the input [`Self::liveness`] reads.
+    /// `Err` carries the reading when none does ([`Liveness::NotHeld`],
+    /// [`Liveness::Invalid`], [`Liveness::Waiting`]).
+    ///
+    /// v62.0.0 (slice J0) — the edition-2 key projection
+    /// ([`super::projection`]) reads THIS, so the read model and the gates
+    /// share one fold.
+    ///
+    /// # Errors
+    /// The reading when no held record of `kid` is valid.
+    pub fn valid_records(&self, kid: &Digest32) -> Result<Vec<ValidRecord>, Liveness> {
+        self.judged(kid, 0)
+    }
+
+    fn judged(&self, kid: &Digest32, depth: usize) -> Result<Vec<ValidRecord>, Liveness> {
         if depth > MAX_DEPTH {
-            return Liveness::Invalid;
+            return Err(Liveness::Invalid);
         }
         let Some(statements) = self.records.get(kid) else {
-            return Liveness::NotHeld;
+            return Err(Liveness::NotHeld);
         };
-        let mut valid: Vec<KeyRecord> = Vec::new();
+        let mut valid: Vec<ValidRecord> = Vec::new();
         let mut waiting: Vec<MissingKey> = Vec::new();
         for st in statements {
             let own_key = statement_parts(st)
@@ -222,7 +279,11 @@ impl HeldKeys {
                         continue;
                     }
                     match check_key_record(&row.payload) {
-                        Ok(rec) if rec.kid == *kid => valid.push(rec),
+                        Ok(rec) if rec.kid == *kid => valid.push(ValidRecord {
+                            record: rec,
+                            row_id: row.row_id,
+                            statement: st.clone(),
+                        }),
                         _ => {}
                     }
                 }
@@ -231,56 +292,97 @@ impl HeldKeys {
             }
         }
         if valid.is_empty() {
-            return if waiting.is_empty() {
+            return Err(if waiting.is_empty() {
                 Liveness::Invalid
             } else {
                 Liveness::Waiting(waiting)
-            };
+            });
         }
-        if with_revocations && self.revoked(kid, at, depth) {
-            return Liveness::Revoked;
-        }
-        // Renewals all count: the instant is covered by any one of them.
-        valid
-            .into_iter()
-            .filter(|r| r.asserted_at <= at && r.valid_until.is_none_or(|u| at <= u))
-            .max_by_key(|r| r.valid_until.unwrap_or(u64::MAX))
-            .map_or(Liveness::NotCovered, |r| Liveness::Live(Box::new(r)))
+        Ok(valid)
     }
 
     /// Has a revocation by one of the three revokers taken effect for `kid`
     /// by `at`?
     fn revoked(&self, kid: &Digest32, at: u64, depth: usize) -> bool {
-        let subject = identity_ref(kid);
-        self.revocations.iter().any(|st| {
-            // A revocation's signer is resolved over records only, so a key
-            // revoking itself does not recurse into its own revocation.
-            let records_only = RecordsOnly {
-                held: self,
-                depth: depth + 1,
-            };
-            let Verdict::Valid(row) = verify_row_statement(st, &records_only) else {
-                return false;
-            };
-            if row.family != KEY_REVOCATION_FAMILY || row.sub != subject {
-                return false;
-            }
-            let by_itself = row.kid == *kid;
-            if !by_itself && !self.standing.may_revoke(&row.iss, &subject) {
-                return false;
-            }
-            match row
-                .payload
-                .get_text("revoked_after")
-                .and_then(Value::as_u64)
-            {
+        self.honoured_at(kid, depth)
+            .iter()
+            .any(|r| match r.revoked_after {
                 // Absent: revoke-all.
                 None => true,
                 // Statements signed before the bound still stand.
                 Some(bound) => at >= bound,
-            }
-        })
+            })
     }
+
+    /// The held `key:revocation`s of `kid` this reading honours: valid, about
+    /// `kid`, and by one of the three revokers (the key itself, or a revoker
+    /// [`RevokerStanding`] admits). Whether one has taken effect at an
+    /// instant is its `revoked_after`.
+    ///
+    /// v62.0.0 (slice J0) — the revocation read model
+    /// ([`super::projection`]) projects exactly these, and
+    /// [`Self::liveness`] reads exactly these: one fold.
+    #[must_use]
+    pub fn honoured_revocations(&self, kid: &Digest32) -> Vec<HonouredRevocation> {
+        self.honoured_at(kid, 0)
+    }
+
+    fn honoured_at(&self, kid: &Digest32, depth: usize) -> Vec<HonouredRevocation> {
+        let subject = identity_ref(kid);
+        self.revocations
+            .iter()
+            .filter_map(|st| {
+                // A revocation's signer is resolved over records only, so a key
+                // revoking itself does not recurse into its own revocation.
+                let records_only = RecordsOnly {
+                    held: self,
+                    depth: depth + 1,
+                };
+                let Verdict::Valid(row) = verify_row_statement(st, &records_only) else {
+                    return None;
+                };
+                if row.family != KEY_REVOCATION_FAMILY || row.sub != subject {
+                    return None;
+                }
+                let by_itself = row.kid == *kid;
+                if !by_itself && !self.standing.may_revoke(&row.iss, &subject) {
+                    return None;
+                }
+                let revoked_after = row
+                    .payload
+                    .get_text("revoked_after")
+                    .and_then(Value::as_u64);
+                Some(HonouredRevocation {
+                    statement: st.clone(),
+                    row: *row,
+                    revoked_after,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A held key record that verifies and keeps the end rule
+/// ([`HeldKeys::valid_records`]).
+#[derive(Clone, Debug)]
+pub struct ValidRecord {
+    /// The record's reading.
+    pub record: KeyRecord,
+    /// The record row's id.
+    pub row_id: Digest32,
+    /// The statement as held.
+    pub statement: Vec<u8>,
+}
+
+/// A `key:revocation` the reading honours ([`HeldKeys::honoured_revocations`]).
+#[derive(Clone, Debug)]
+pub struct HonouredRevocation {
+    /// The statement as held.
+    pub statement: Vec<u8>,
+    /// Verify's reading of it.
+    pub row: ciris_verify_core::edition2::VerifiedRow,
+    /// Its `revoked_after` bound, POSIX ms; `None` revokes the key outright.
+    pub revoked_after: Option<u64>,
 }
 
 /// The view a key record's own statement is verified through: its own key

@@ -4,6 +4,9 @@
 # Rows are appended when a migration is ADDED. A row is never edited.
 # v62.0.0 (slice E2b): edition 1 (V001..V216) is retired — a v62 node deletes an
 # edition-1 store — and its rows with it. Edition 2 begins at the V300 baseline.
+# v62.0.0 (slice J0): V300 is unshipped; its two rows are re-pinned once, for
+# `ceg_statements.admitted_us` (the statement serve cursor). From the v62 tag
+# on, V300's bytes are its contract.
 # dialect	version	name	checksum
-sqlite	300	edition2_baseline	7064104315438208845
-postgres	300	edition2_baseline	14803970834383000701
+sqlite	300	edition2_baseline	9702721270110924315
+postgres	300	edition2_baseline	6554108512570118968

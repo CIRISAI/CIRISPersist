@@ -868,6 +868,8 @@ pub(crate) async fn verify_proposal_row<D>(dir: &D, row: &Attestation) -> Result
 where
     D: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (slice J0; CC 2.6.1.12) — the cross-form refusal.
+    super::edition2::projection::refuse_edition2_row_signer(dir, "self_roster", row).await?;
     if !is_proposal_row(row) {
         return Ok(false);
     }

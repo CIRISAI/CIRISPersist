@@ -433,6 +433,11 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("edition2_voices", ConnClass::Read),
     ("put_edition2_object", ConnClass::Write),
     ("put_edition2_statement", ConnClass::Write),
+    // v62.0.0 (slice J0) — the edition-2 read models, the cross-form
+    // refusal's edition read, and the statement serve listing.
+    ("upsert_edition2_key_projection", ConnClass::Write),
+    ("key_edition", ConnClass::Read),
+    ("edition2_statements_since", ConnClass::Read),
     // v61 (CIRISPersist#934, S4b) — the group supersede executor.
     ("store_planned_supersede", ConnClass::Write),
     // v61 (CIRISPersist#934, S4b) — the family executor.

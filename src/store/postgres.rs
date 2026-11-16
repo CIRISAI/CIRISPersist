@@ -214,11 +214,14 @@ impl PostgresBackend {
         };
         let report = crate::federation::key_plane::KeyPlaneRehomeReport {
             keys_without_row: n(
-                "SELECT COUNT(*) FROM cirislens.federation_keys WHERE attestation_id IS NULL",
+                "SELECT COUNT(*) FROM cirislens.federation_keys WHERE attestation_id IS NULL \
+                 AND edition = 1",
             )
             .await?,
             revocations_without_row: n("SELECT COUNT(*) FROM cirislens.federation_revocations \
-                 WHERE attestation_id IS NULL")
+                 WHERE attestation_id IS NULL AND NOT EXISTS (SELECT 1 FROM \
+                 cirislens.federation_keys k WHERE k.key_id = \
+                 cirislens.federation_revocations.revoking_key_id AND k.edition = 2)")
             .await?,
             occurrences_without_row: n(
                 "SELECT COUNT(*) FROM cirislens.federation_identity_occurrences \
@@ -286,7 +289,10 @@ impl PostgresBackend {
         }
         let keys: Vec<String> = tx
             .query(
-                "SELECT key_id FROM cirislens.federation_keys WHERE attestation_id IS NULL",
+                // v62.0.0 (slice J0) — edition-2 projections are read models:
+                // never re-homed as `key:record:v1` / revocation rows.
+                "SELECT key_id FROM cirislens.federation_keys WHERE attestation_id IS NULL \
+                 AND edition = 1",
                 &[],
             )
             .await
@@ -300,7 +306,9 @@ impl PostgresBackend {
         let revocations: Vec<String> = tx
             .query(
                 "SELECT revocation_id FROM cirislens.federation_revocations \
-                  WHERE attestation_id IS NULL",
+                  WHERE attestation_id IS NULL AND NOT EXISTS (SELECT 1 FROM \
+                  cirislens.federation_keys k WHERE k.key_id = \
+                  cirislens.federation_revocations.revoking_key_id AND k.edition = 2)",
                 &[],
             )
             .await
@@ -9440,11 +9448,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         object: &crate::federation::edition2::store::HeldObject,
     ) -> Result<bool, crate::federation::Error> {
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(crate::store::Error::into_federation)?;
-        crate::federation::edition2::store::put_object_postgres(&client, object).await
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
+        let new = crate::federation::edition2::store::put_object_postgres(&tx, object).await?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
+        Ok(new)
     }
 
     async fn edition2_voices(
@@ -9475,6 +9491,61 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
         Ok(new)
+    }
+
+    async fn upsert_edition2_key_projection(
+        &self,
+        set: &crate::federation::edition2::projection::ProjectionSet,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("edition-2 projection tx: {e}")))?;
+        for key in &set.keys {
+            let position = self.next_key_serve_position(&tx).await?;
+            pg_upsert_edition2_key(&tx, key, position).await?;
+        }
+        for rev in &set.revocations {
+            pg_insert_edition2_revocation(&tx, rev).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("edition-2 projection commit: {e}")))?;
+        Ok(())
+    }
+
+    async fn key_edition(&self, key_id: &str) -> Result<Option<i16>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        client
+            .query_opt(
+                "SELECT edition FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("key_edition: {e}")))?
+            .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
+            .transpose()
+    }
+
+    async fn edition2_statements_since(
+        &self,
+        cursor: Option<&crate::federation::edition2::store::StatementCursor>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::edition2::store::ServedStatement>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::store::statements_since_postgres(&client, cursor, limit).await
     }
 
     // v61.4.0 (CIRISPersist#1244) — the directory capsule reaches the
@@ -23639,6 +23710,157 @@ fn pg_key_columns(
     })
 }
 
+/// v62.0.0 (slice J0) — upsert one edition-2 key projection
+/// (`federation::edition2::projection`) in the caller's transaction. A key id
+/// held by an earlier-form row is refused `Conflict`; an unchanged
+/// projection writes nothing (idempotence: byte-identical, no new serve
+/// position).
+async fn pg_upsert_edition2_key<C>(
+    tx: &C,
+    key: &crate::federation::edition2::projection::KeyProjection,
+    position: chrono::DateTime<chrono::Utc>,
+) -> Result<(), crate::federation::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    use crate::federation::edition2::projection::EDITION_TWO;
+    use crate::federation::Error;
+    let be = |e: tokio_postgres::Error| Error::Backend(format!("edition-2 key projection: {e}"));
+    let held: Option<i16> = tx
+        .query_opt(
+            "SELECT edition FROM cirislens.federation_keys WHERE key_id = $1 FOR UPDATE",
+            &[&key.key_id],
+        )
+        .await
+        .map_err(be)?
+        .map(|r| r.safe_get_with(0, Error::Backend))
+        .transpose()?;
+    if held.is_some_and(|e| e != EDITION_TWO) {
+        return Err(Error::Conflict(format!(
+            "federation_keys {} is held by an earlier-form row; an edition-2 key's projection \
+             never overwrites it",
+            key.key_id
+        )));
+    }
+    let envelope = pg_envelope_text(&key.registration_envelope, "registration_envelope")?;
+    let hash = hex::decode(&key.original_content_hash)
+        .map_err(|e| Error::Backend(format!("original_content_hash hex: {e}")))?;
+    let record_row_id = key.record_row_id.to_vec();
+    let kid = key.kid.to_vec();
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 16] = [
+        &key.key_id,
+        &key.pubkey_ed25519_base64,
+        &key.pubkey_ml_dsa_65_base64,
+        &key.identity_type,
+        &key.valid_from,
+        &key.valid_until,
+        &envelope,
+        &hash,
+        &key.scrub_signature_classical,
+        &key.scrub_key_id,
+        &key.scrub_timestamp,
+        &key.persist_row_hash,
+        &key.attestation_evidence,
+        &record_row_id,
+        &kid,
+        &position,
+    ];
+    if held.is_none() {
+        tx.execute(
+            "INSERT INTO cirislens.federation_keys (key_id, pubkey_ed25519_base64, \
+                pubkey_ml_dsa_65_base64, algorithm, identity_type, identity_ref, valid_from, \
+                valid_until, registration_envelope, original_content_hash, \
+                scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, \
+                attestation_evidence, consent_role, edition, record_row_id, kid, admitted_at) \
+             VALUES ($1, $2, $3, 'hybrid', $4, $1, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
+                'unregistered', 2, $14, $15, $16)",
+            &params,
+        )
+        .await
+        .map_err(be)?;
+    } else {
+        tx.execute(
+            "UPDATE cirislens.federation_keys SET pubkey_ed25519_base64 = $2, \
+                pubkey_ml_dsa_65_base64 = $3, identity_type = $4, valid_from = $5, \
+                valid_until = $6, registration_envelope = $7, original_content_hash = $8, \
+                scrub_signature_classical = $9, scrub_key_id = $10, scrub_timestamp = $11, \
+                persist_row_hash = $12, attestation_evidence = $13, record_row_id = $14, \
+                kid = $15, mutated_at = $16 \
+             WHERE key_id = $1 AND edition = 2 AND ( \
+                pubkey_ed25519_base64 IS DISTINCT FROM $2 OR \
+                pubkey_ml_dsa_65_base64 IS DISTINCT FROM $3 OR identity_type IS DISTINCT FROM $4 \
+                OR valid_from IS DISTINCT FROM $5 OR valid_until IS DISTINCT FROM $6 OR \
+                registration_envelope IS DISTINCT FROM $7 OR \
+                original_content_hash IS DISTINCT FROM $8 OR \
+                scrub_signature_classical IS DISTINCT FROM $9 OR \
+                scrub_key_id IS DISTINCT FROM $10 OR scrub_timestamp IS DISTINCT FROM $11 OR \
+                persist_row_hash IS DISTINCT FROM $12 OR \
+                attestation_evidence IS DISTINCT FROM $13 OR \
+                record_row_id IS DISTINCT FROM $14 OR kid IS DISTINCT FROM $15)",
+            &params,
+        )
+        .await
+        .map_err(be)?;
+    }
+    Ok(())
+}
+
+/// v62.0.0 (slice J0) — insert one honoured edition-2 revocation's projection
+/// once (`ON CONFLICT DO NOTHING` on its row id), in the caller's
+/// transaction, at THIS node's next revocation admission position.
+async fn pg_insert_edition2_revocation<C>(
+    tx: &C,
+    rev: &crate::federation::edition2::projection::RevocationProjection,
+) -> Result<(), crate::federation::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    use crate::federation::Error;
+    let be =
+        |e: tokio_postgres::Error| Error::Backend(format!("edition-2 revocation projection: {e}"));
+    let envelope = pg_envelope_text(&rev.revocation_envelope, "revocation_envelope")?;
+    let hash = hex::decode(&rev.original_content_hash)
+        .map_err(|e| Error::Backend(format!("original_content_hash hex: {e}")))?;
+    let last: Option<chrono::DateTime<chrono::Utc>> = tx
+        .query_one(
+            "SELECT MAX(admitted_at) FROM cirislens.federation_revocations",
+            &[],
+        )
+        .await
+        .map_err(be)?
+        .safe_get_with(0, Error::Backend)?;
+    let admitted_at =
+        crate::federation::types::monotonic_admission_instant(crate::host::clock::now(), last);
+    tx.execute(
+        "INSERT INTO cirislens.federation_revocations (revocation_id, revoked_key_id, \
+            revoking_key_id, reason, revoked_at, effective_at, revocation_envelope, \
+            original_content_hash, scrub_signature_classical, scrub_key_id, scrub_timestamp, \
+            revoked_after, persist_row_hash, admitted_at, revoked_key_sha256_ed25519_raw) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+         ON CONFLICT (revocation_id) DO NOTHING",
+        &[
+            &rev.revocation_id,
+            &rev.revoked_key_id,
+            &rev.revoking_key_id,
+            &rev.reason,
+            &rev.revoked_at,
+            &rev.effective_at,
+            &envelope,
+            &hash,
+            &rev.scrub_signature_classical,
+            &rev.scrub_key_id,
+            &rev.scrub_timestamp,
+            &rev.revoked_after,
+            &rev.persist_row_hash,
+            &admitted_at,
+            &rev.revoked_key_sha256_ed25519_raw,
+        ],
+    )
+    .await
+    .map_err(be)?;
+    Ok(())
+}
+
 /// v58.0.0 (CIRISPersist#991) — the live `federation_keys` projection and
 /// every `key:record:v1` row, for the rebuild gate.
 async fn pg_key_projection_rebuild<C>(
@@ -23651,7 +23873,9 @@ where
     let mut live = Vec::new();
     for r in client
         .query(
-            "SELECT * FROM cirislens.federation_keys ORDER BY key_id",
+            // v62.0.0 (slice J0) — an edition-2 projection is a read model of
+            // `ceg_statements`, never a `key:record:v1` row's projection.
+            "SELECT * FROM cirislens.federation_keys WHERE edition = 1 ORDER BY key_id",
             &[],
         )
         .await
@@ -23703,7 +23927,12 @@ where
     let mut live = Vec::new();
     for r in client
         .query(
-            "SELECT * FROM cirislens.federation_revocations ORDER BY revocation_id",
+            // v62.0.0 (slice J0) — an edition-2 revocation's projection has no
+            // earlier-form row.
+            "SELECT * FROM cirislens.federation_revocations WHERE NOT EXISTS (SELECT 1 FROM \
+             cirislens.federation_keys k WHERE k.key_id = \
+             cirislens.federation_revocations.revoking_key_id AND k.edition = 2) \
+             ORDER BY revocation_id",
             &[],
         )
         .await

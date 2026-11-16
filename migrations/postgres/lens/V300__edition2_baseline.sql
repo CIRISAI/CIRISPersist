@@ -3507,10 +3507,15 @@ CREATE TABLE cirislens.ceg_statements (
     author          text,
     asserted_at_ms  bigint,
     bytes           bytea NOT NULL,
+    -- Slice J0: THIS node's admission position, POSIX microseconds, after
+    -- the last one handed out. The serve cursor is the pair
+    -- (admitted_us, statement_id) (edition2_statements_since).
+    admitted_us     bigint NOT NULL,
     CHECK ((typ = 'ceg-row/2') = (row_type IS NOT NULL AND family IS NOT NULL
         AND sub IS NOT NULL AND asserted_at_ms IS NOT NULL))
 );
 CREATE INDEX ceg_statements_row_id ON cirislens.ceg_statements (row_id);
+CREATE INDEX ceg_statements_admitted ON cirislens.ceg_statements (admitted_us, statement_id);
 
 -- Slice E2a: the rows a statement names, by refs member path (`head`,
 -- `further_heads`, `prev`, `target`, `trusted_through`, `also:ack`,

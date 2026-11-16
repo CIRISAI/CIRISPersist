@@ -317,6 +317,13 @@ pub async fn verify_carrier_row<D>(dir: &D, row: &Attestation) -> Result<bool, E
 where
     D: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (slice J0; CC 2.6.1.12) — the cross-form refusal.
+    super::edition2::projection::refuse_edition2_row_signer(
+        dir,
+        "occurrence_revocation_carrier",
+        row,
+    )
+    .await?;
     if !is_carrier_row(row) {
         return Ok(false);
     }

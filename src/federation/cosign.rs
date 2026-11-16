@@ -544,6 +544,8 @@ pub(crate) async fn verify_row<D>(dir: &D, row: &Attestation) -> Result<bool, Er
 where
     D: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (slice J0; CC 2.6.1.12) — the cross-form refusal.
+    super::edition2::projection::refuse_edition2_row_signer(dir, "cosign", row).await?;
     let Some(read) = read_row(row)? else {
         return Ok(false);
     };
@@ -560,6 +562,12 @@ where
                 .event
                 .plane_signing_envelope()
                 .ok_or_else(|| malformed(row, "a record carries no cosignature"))?;
+            super::edition2::projection::refuse_edition2_signer(
+                dir,
+                "cosign",
+                &[c.authority_key_id.as_str()],
+            )
+            .await?;
             super::tier_ingest::verify_envelope_hybrid_signature(
                 dir,
                 &c.authority_key_id,

@@ -3680,6 +3680,57 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
+    /// v62.0.0 (slice J0) — write an edition-2 key's read models
+    /// ([`edition2::projection`]), in one transaction: each key upserted
+    /// into `federation_keys` (`edition = 2`, `record_row_id`, `kid`; a row
+    /// left unchanged when the projection is), then each revocation inserted
+    /// into `federation_revocations` once. Storage only: the set is derived
+    /// by [`edition2::projection::project_key`] from the held key plane. A
+    /// directory with no edition-2 store refuses.
+    ///
+    /// # Errors
+    /// [`Error::Conflict`] when a key id is held by an earlier-form row
+    /// (`edition = 1`); storage failures.
+    async fn upsert_edition2_key_projection(
+        &self,
+        set: &edition2::projection::ProjectionSet,
+    ) -> Result<(), Error> {
+        let _ = set;
+        Err(Error::Backend(
+            "this directory holds no edition-2 statement store".to_owned(),
+        ))
+    }
+
+    /// v62.0.0 (slice J0) — the edition of the held `federation_keys` row of
+    /// `key_id` (1 or 2), `None` when none is held: what the cross-form
+    /// refusal reads ([`edition2::projection::refuse_edition2_signer`]).
+    ///
+    /// Provided: read off the row [`Self::lookup_public_key`] returns
+    /// ([`edition2::projection::edition_of_key_record`]), so a proxy that
+    /// forwards the lookup answers too. The sqlite and postgres backends read
+    /// the `edition` column; I2001 witnesses the two agree.
+    async fn key_edition(&self, key_id: &str) -> Result<Option<i16>, Error> {
+        Ok(self
+            .lookup_public_key(key_id)
+            .await?
+            .as_ref()
+            .map(edition2::projection::edition_of_key_record))
+    }
+
+    /// v62.0.0 (slice J0) — the held edition-2 statements after `cursor`
+    /// (from the first with `None`), in THIS node's admission order, at most
+    /// `limit` (clamped to [`edition2::store::MAX_PAGE`]); each as received
+    /// (CC 2.6.1.2), with the cursor to resume after it. For serving
+    /// statements to peers. Empty by default (no edition-2 store).
+    async fn edition2_statements_since(
+        &self,
+        cursor: Option<&edition2::store::StatementCursor>,
+        limit: u32,
+    ) -> Result<Vec<edition2::store::ServedStatement>, Error> {
+        let _ = (cursor, limit);
+        Ok(Vec::new())
+    }
+
     // ── Public keys ────────────────────────────────────────────────
 
     /// Insert a new pubkey row. Idempotent on `key_id` collision with
@@ -13610,6 +13661,13 @@ pub mod malformed_row {
     /// holders, each seat with its two X-Wing keys). Until it ships, the door
     /// refuses by this name and stores nothing. Not a fault of the bundle.
     pub const GENESIS_BUNDLE_READER_UNAVAILABLE: &str = "genesis_bundle_reader_unavailable";
+    /// v62.0.0 (slice J0; CC 2.6.1.12) — an earlier-form verification (a
+    /// JSON row, a JSON key registration, a plane object signed over its JCS
+    /// image) whose signer is an edition-2 key: its `federation_keys` row is
+    /// the edition-2 projection (`edition = 2`), a read model that gives an
+    /// earlier-form signature no standing
+    /// (`federation::edition2::projection`).
+    pub const EARLIER_FORM_SIGNER_IS_EDITION2: &str = "earlier_form_signer_is_edition2";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -13651,6 +13709,7 @@ pub mod malformed_row {
         GENESIS_BUNDLE_NOT_PINNED,
         GENESIS_BUNDLE_SEAT_BINDING,
         GENESIS_BUNDLE_READER_UNAVAILABLE,
+        EARLIER_FORM_SIGNER_IS_EDITION2,
     ];
 }
 

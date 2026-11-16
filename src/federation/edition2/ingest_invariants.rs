@@ -67,13 +67,6 @@ fn reason(e: &Error) -> String {
     }
 }
 
-/// TODO(baseline-merge): remove. The signer FKs the E2b baseline does not carry (postgres).
-pub(crate) const EDITION2_SIGNER_FKS_DROPPED_PG: &str = "\
-    ALTER TABLE cirislens.federation_attestations \
-      DROP CONSTRAINT IF EXISTS federation_attestations_attesting_key_id_fkey; \
-    ALTER TABLE cirislens.federation_attestations \
-      DROP CONSTRAINT IF EXISTS federation_attestations_scrub_key_id_fkey;";
-
 pub(crate) async fn body(d: &dyn FederationDirectory) {
     let k = key(60);
     let record = key_record(&k, &["user"], 0, None);
@@ -193,15 +186,6 @@ async fn i1906_i1909_sqlite() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
-    {
-        let c = b.conn_handle();
-        let c = c.lock();
-        // TODO(baseline-merge): the E2b baseline creates these tables.
-        c.execute_batch(super::store::SQLITE_DDL).unwrap();
-        // TODO(baseline-merge): remove. The E2b baseline drops the earlier store's signer FK to
-        // `federation_keys`; an edition-2 signer lives in `ceg_statements`.
-        c.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-    }
     Box::pin(body(&b)).await;
     // The names landed.
     let k = key(60);
@@ -237,13 +221,6 @@ async fn i1906_i1909_postgres() {
         .unwrap();
     b.run_migrations().await.unwrap();
     let c = b.checkout().await.unwrap();
-    // TODO(baseline-merge): the E2b baseline creates these tables.
-    c.batch_execute(super::store::POSTGRES_DDL).await.unwrap();
-    // TODO(baseline-merge): remove. The E2b baseline drops the earlier store's signer FKs to
-    // `federation_keys`; an edition-2 signer lives in `ceg_statements`.
-    c.batch_execute(EDITION2_SIGNER_FKS_DROPPED_PG)
-        .await
-        .unwrap();
     Box::pin(body(&b)).await;
     let naming =
         super::store::rows_naming_postgres(&c, &super::names::RowId([0x31; 32]), "also:cites")

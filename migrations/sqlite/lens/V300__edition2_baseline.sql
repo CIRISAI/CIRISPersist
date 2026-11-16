@@ -2776,10 +2776,15 @@ CREATE TABLE ceg_statements (
     author          TEXT,
     asserted_at_ms  INTEGER CHECK (asserted_at_ms IS NULL OR typeof(asserted_at_ms) = 'integer'),
     bytes           BLOB    NOT NULL,
+    -- Slice J0: THIS node's admission position, POSIX microseconds, strictly
+    -- after the last one handed out. The serve cursor is the pair
+    -- (admitted_us, statement_id) (edition2_statements_since).
+    admitted_us     INTEGER NOT NULL CHECK (typeof(admitted_us) = 'integer'),
     CHECK ((typ = 'ceg-row/2') = (row_type IS NOT NULL AND family IS NOT NULL
         AND sub IS NOT NULL AND asserted_at_ms IS NOT NULL))
 );
 CREATE INDEX ceg_statements_row_id ON ceg_statements (row_id);
+CREATE INDEX ceg_statements_admitted ON ceg_statements (admitted_us, statement_id);
 
 -- Slice E2a: the rows a statement names, by refs member path (`head`,
 -- `further_heads`, `prev`, `target`, `trusted_through`, `also:ack`,

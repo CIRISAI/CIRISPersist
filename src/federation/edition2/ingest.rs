@@ -22,9 +22,13 @@
 //!   row id this node computed. A row is never stored under a given id.
 //!
 //! A key's own rows (`key:record`, `key:revocation`) are the edition-2 key
-//! plane. They are kept in `ceg_statements` alone, and the key plane reads
-//! them from there ([`held_keys_for`]). `federation_keys` is the earlier
-//! store, and an edition-2 key is never written to it.
+//! plane. They are kept in `ceg_statements`, and every edition-2 gate reads
+//! them from there ([`held_keys_for`]). v62.0.0 (slice J0): each is then
+//! PROJECTED into the earlier store as a read model
+//! ([`super::projection`]): the key into `federation_keys` (`edition = 2`),
+//! its honoured revocations into `federation_revocations`. The projection is
+//! what the attestation signer FKs and the earlier-form readers
+//! (`revocations_for`, `lookup_public_key`) see; no edition-2 gate reads it.
 //!
 //! [`put_statement`] is the one entry for a statement, local or replicated:
 //! the Engine's `put_edition2_statement`, replication and tier ingest all
@@ -71,7 +75,7 @@ pub fn statement_kid(bytes: &[u8]) -> Option<Digest32> {
 
 /// The edition-2 key plane a statement's signer resolves through: every
 /// held `key:record` and `key:revocation` about its kid, and about the kid
-/// of each key that signed one of those records, to [`MAX_KEY_HOPS`].
+/// of each key that signed one of those, to [`MAX_KEY_HOPS`].
 ///
 /// # Errors
 /// Directory read failures.
@@ -79,12 +83,26 @@ pub async fn held_keys_for<F>(dir: &F, statement: &[u8]) -> Result<HeldKeys, Err
 where
     F: FederationDirectory + ?Sized,
 {
+    match statement_kid(statement) {
+        Some(kid) => held_keys_for_kid(dir, &kid).await,
+        None => Ok(HeldKeys::new()),
+    }
+}
+
+/// The edition-2 key plane of one key: every held `key:record` and
+/// `key:revocation` about `kid`, and about the kid of each key that signed
+/// one of those (a revoker's own records, so its revocation can be read), to
+/// [`MAX_KEY_HOPS`].
+///
+/// # Errors
+/// Directory read failures.
+pub async fn held_keys_for_kid<F>(dir: &F, first: &Digest32) -> Result<HeldKeys, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let mut held = HeldKeys::new();
-    let Some(first) = statement_kid(statement) else {
-        return Ok(held);
-    };
     let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::from([first]);
+    let mut queue = VecDeque::from([*first]);
     while let Some(kid) = queue.pop_front() {
         if !seen.insert(kid) || seen.len() > MAX_KEY_HOPS {
             continue;
@@ -105,10 +123,30 @@ where
             .edition2_statements_about(KEY_REVOCATION_FAMILY, &subject)
             .await?
         {
+            if let Some(signer) = statement_kid(&st) {
+                if signer != kid {
+                    queue.push_back(signer);
+                }
+            }
             held.insert_revocation(st);
         }
     }
     Ok(held)
+}
+
+/// The kid an identity-ref names (RFC 9679 §5.7: the base64url thumbprint
+/// after the prefix). `None` for text that is not an identity-ref.
+#[must_use]
+pub fn kid_of_identity_ref(s: &str) -> Option<Digest32> {
+    use base64::Engine as _;
+    if !ciris_verify_core::edition2::is_identity_ref(s) {
+        return None;
+    }
+    let t = s.strip_prefix(ciris_verify_core::edition2::IDENTITY_REF_PREFIX)?;
+    let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(t)
+        .ok()?;
+    <[u8; 32]>::try_from(b.as_slice()).ok()
 }
 
 /// A CBOR payload value as the JSON the earlier-form gates read: text as a
@@ -428,13 +466,39 @@ where
 {
     super::door::require_statement_form(bytes)?;
     let mut keys = held_keys_for(dir, bytes).await?;
+    // v62.0.0 (slice J0) — a key-plane statement already held was judged when
+    // it arrived. Its re-put is read over the records alone, so a revoke-all
+    // revocation does not make its own bytes unreadable on the way back in
+    // (idempotence); it then re-projects.
+    let already_held = keys.holds(bytes);
     // A key record is signed by its own key (CC 2.4.1.1: "Each key's own
     // holder signs its record"): offered, it is its own key source. It gives
     // liveness only through its own verification.
     keys.insert_record(bytes.to_vec());
-    let admitted = admit_row(bytes, &keys, offered_id, SelectContext::default())?;
+    let admitted = if already_held {
+        admit_row(
+            bytes,
+            &keys.without_revocations(),
+            offered_id,
+            SelectContext::default(),
+        )?
+    } else {
+        admit_row(bytes, &keys, offered_id, SelectContext::default())?
+    };
     if admitted.family == KEY_RECORD_FAMILY || admitted.family == KEY_REVOCATION_FAMILY {
         let new = dir.put_edition2_statement(&admitted).await?;
+        // v62.0.0 (slice J0) — the read models: the key this statement is
+        // about, projected into `federation_keys` and its honoured
+        // revocations into `federation_revocations`, re-derived from the
+        // held key plane every time (`projection::project_key`).
+        let about = if admitted.family == KEY_RECORD_FAMILY {
+            super::liveness::recorded_kid(bytes)
+        } else {
+            kid_of_identity_ref(&admitted.sub)
+        };
+        if let Some(kid) = about {
+            super::projection::project_key(dir, &kid).await?;
+        }
         return Ok(StatementOutcome::KeyPlane {
             row_id: admitted.row_id,
             new,

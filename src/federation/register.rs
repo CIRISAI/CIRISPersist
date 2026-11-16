@@ -1541,6 +1541,15 @@ pub async fn verify_key_registration<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (slice J0; CC 2.6.1.12) — an earlier-form registration of, or
+    // by, an edition-2 key is refused by name: its projected row gives an
+    // earlier-form signature no standing.
+    super::edition2::projection::refuse_edition2_signer(
+        directory,
+        "key_registration",
+        &[record.key_id.as_str(), record.scrub_key_id.as_str()],
+    )
+    .await?;
     let canonical = registration_canonical_bytes(record)?;
 
     // Resolve the signer's (scrub_key_id's) public keys. Self-attested
@@ -1695,6 +1704,14 @@ pub fn verify_record_signed_by(
     ed25519_pubkey_b64: &str,
     ml_dsa_65_pubkey_b64: Option<&str>,
 ) -> Result<(), Error> {
+    // v62.0.0 (slice J0; CC 2.6.1.12) — a record that IS an edition-2
+    // projection (a read model of a `key:record` statement) is never checked
+    // as an earlier-form registration: refused by name, first, before the
+    // hybrid-pending checks would refuse it under another name. Pure: the
+    // proof-of-possession door reads no directory. (`verify_key_registration`,
+    // this file's other way into `verify_registration_signature`, refuses an
+    // edition-2 key or signer through the directory first.)
+    super::edition2::projection::refuse_edition2_projection("key_registration", record)?;
     let Some(ml_dsa_65_pubkey_b64) = ml_dsa_65_pubkey_b64 else {
         return Err(Error::SignatureInvalid(format!(
             "key:record:v1 {}: the signer {} carries no ML-DSA-65 key (hybrid-pending); a plane \

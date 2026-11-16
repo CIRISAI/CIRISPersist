@@ -1084,6 +1084,8 @@ pub(crate) async fn verify_plane_row<F>(directory: &F, row: &Attestation) -> Res
 where
     F: super::FederationDirectory + ?Sized,
 {
+    // v62.0.0 (slice J0; CC 2.6.1.12) — the cross-form refusal.
+    super::edition2::projection::refuse_edition2_row_signer(directory, "group_plane", row).await?;
     let Some(signed) = canonical_object_of_row(row)? else {
         return Ok(false);
     };

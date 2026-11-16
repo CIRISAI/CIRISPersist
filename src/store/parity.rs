@@ -135,6 +135,18 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // terms (Plumbing: the edition-2 door judged the statement before it).
     ("carried_identity_type", Class::Gate),
     ("put_row", Class::Plumbing),
+    // v62.0.0 (slice J0) — the edition-2 object voice and the key plane's read
+    // models. Plumbing: the edition-2 door judged the statement, and
+    // `edition2::projection::project_key` derived the set from the held key
+    // plane, before any of these runs. The one refusal inside the upsert
+    // (`Conflict`, a key id held by an earlier-form row) is the substrate
+    // refusing to overwrite a row it holds, not a question about the caller's
+    // input, and it fails closed (nothing is written).
+    ("put_object", Class::Plumbing),
+    ("sqlite_upsert_edition2_key", Class::Plumbing),
+    ("pg_upsert_edition2_key", Class::Plumbing),
+    ("sqlite_insert_edition2_revocation", Class::Plumbing),
+    ("pg_insert_edition2_revocation", Class::Plumbing),
     // v61 (CIRISPersist#934, S4b) — the group supersede, and the verdict its
     // executor asks of the held head inside its transaction.
     ("supersede_group_row_planned", Class::Plan),

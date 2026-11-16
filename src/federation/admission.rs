@@ -2410,6 +2410,9 @@ where
             &row.subject_key_ids,
         );
     if ceremony_disposition == LocalTierDisposition::TransitRevocation || bare_transit {
+        // v62.0.0 (slice J0; CC 2.6.1.12) — the cross-form refusal.
+        super::edition2::projection::refuse_edition2_row_signer(directory, "consent_record", row)
+            .await?;
         crate::federation::verify_row_hybrid_signature(directory, row).await
     } else {
         Ok(())
@@ -2479,6 +2482,15 @@ where
             ))
         }
     };
+    // v62.0.0 (slice J0; CC 2.6.1.12) — the cross-form refusal: a local row's
+    // earlier-form signature never verifies under an edition-2 key's
+    // projected row.
+    super::edition2::projection::refuse_edition2_signer(
+        directory,
+        "local_attestation",
+        &[input.attesting_key_id.as_str()],
+    )
+    .await?;
     let sig_pqc = input.scrub_signature_pqc.as_deref();
     let hash = crate::federation::verify_envelope_hybrid_signature(
         directory,

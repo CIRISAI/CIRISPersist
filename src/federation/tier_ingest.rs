@@ -179,6 +179,11 @@ where
     {
         return Ok(());
     }
+    // v62.0.0 (slice J0; CC 2.6.1.12) — every arm below is an earlier-form
+    // verification. A row whose attester or scrubber is an edition-2 key (its
+    // `federation_keys` row is the edition-2 projection, a read model) is
+    // refused by name, before any arm reads that row's pubkeys.
+    super::edition2::projection::refuse_edition2_row_signer(directory, "attestation", row).await?;
     // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row's signature is
     // its signed object's own, over the object's own bytes; the row is a pure
     // function of that object. The family's rule, not the generic one

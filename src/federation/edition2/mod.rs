@@ -15,6 +15,8 @@
 //! | the genesis bundle's generic parts (object verify, object id, version / prev, every holder) | [`genesis`] |
 //! | the statement store's shape (the E2b baseline's `ceg_statements`, `ceg_row_names`) | [`store`] |
 //! | one rule set, two codecs: the statement mapped onto persist's typed row and its gates | [`ingest`] |
+//! | the read models: an edition-2 key and its honoured revocations projected into `federation_keys` / `federation_revocations`; the cross-form refusal | [`projection`] |
+//! | producing: an edition-2 row or object signed with persist's own composite signer | [`produce`] |
 //!
 //! **The rule this module keeps (CC 2.6.1.12).** A node of this form reads and
 //! writes this form only. An object of the earlier form (CC 8.11, a JSON object
@@ -31,8 +33,12 @@ pub mod genesis;
 pub mod ingest;
 pub mod liveness;
 pub mod names;
+pub mod produce;
+pub mod projection;
 pub mod store;
 
+#[cfg(test)]
+pub(crate) mod codec;
 #[cfg(test)]
 mod door_invariants;
 #[cfg(test)]
@@ -43,6 +49,10 @@ mod genesis_store_invariants;
 mod ingest_invariants;
 #[cfg(test)]
 mod liveness_invariants;
+#[cfg(test)]
+mod produce_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod projection_invariants;
 #[cfg(test)]
 mod verify_vectors_replay;
 

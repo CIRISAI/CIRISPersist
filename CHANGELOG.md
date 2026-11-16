@@ -7,6 +7,49 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
 ## [62.0.0] - UNRELEASED
 
+### Changed (v62 slice J0: E2a and E2b reconciled; the edition-2 key plane's read models, CIRISPersist#1274)
+
+Slices E2b (the V300 baseline) and E2a (the edition-2 door) are merged. The signer FKs on `federation_attestations` stay, so an edition-2 row inserts only once its signer has a `federation_keys` row. That row is now the edition-2 key's **projection**, a read model.
+
+- **The key projection** (`federation::edition2::projection`; CC 2.4.1.1, 2.6.1.12). After every `key:record` or `key:revocation` that `put_statement` keeps, `project_key` re-derives the key's row from the held key plane (`ingest::held_keys_for_kid`, then `HeldKeys::valid_records`) and upserts it into `federation_keys`:
+  - `key_id` = `identity_ref` = the identity-ref;
+  - the composite split into `pubkey_ml_dsa_65_base64` (1952 B) and `pubkey_ed25519_base64` (32 B);
+  - `identity_type` = the record's set, comma-joined;
+  - `valid_from` = the earliest valid record's `asserted_at`, `valid_until` = the greatest end (none if any record states none);
+  - `registration_envelope` = the record mapped as a row is (`attestation_of`: the payload projection plus `ceg_statement`), with its `original_content_hash`;
+  - `scrub_signature_classical` = the composite (base64), `scrub_key_id` = the record's `iss`, `persist_row_hash` = the record's row id;
+  - `attestation_evidence` = `{hardware_class, pq_custody, chain}` from the payload, chain as hex DER, leaf first (always an object);
+  - `edition = 2`, `record_row_id`, `kid`.
+
+  The record projected is the one with the greatest end. An unchanged projection writes nothing, so re-putting is byte-identical; a change sets `mutated_at`. A key id held by an earlier-form row is refused `Conflict`, never overwritten. New `FederationDirectory::upsert_edition2_key_projection`, implemented on sqlite (`write_tx`) and postgres; a directory with no edition-2 store refuses.
+- **The revocation read model.** The same projection writes each `key:revocation` that `HeldKeys` honours (`HeldKeys::honoured_revocations`: by the key itself, or by a revoker `RevokerStanding` admits) into `federation_revocations`, once (`ON CONFLICT DO NOTHING`): `revoked_key_id` = the identity-ref, `revoked_key_sha256_ed25519_raw` from the Ed25519 half, `effective_at` = `revoked_after` (or `asserted_at` when it states none), `revoked_after` kept. `revocations_for` / `revocations_for_subject` and every reader over them see it. A revoker other than the key itself has its own key row projected first (the FK target). `project_key` honours the key alone (`SelfOnly`, what the gates read); `project_key_with` takes a standing.
+- **One fold.** `HeldKeys::liveness` now reads `valid_records` and `honoured_revocations`, the same functions the projection reads. No edition-2 gate reads the projection: the door, tier 2's identity set (`carried_identity_type`) and tier 3 read `HeldKeys`.
+- **A held key-plane statement re-put is read over the records alone** (`HeldKeys::without_revocations`), so a revoke-all revocation no longer makes its own bytes, or the record it ends, refuse on the way back in (idempotence). It re-projects.
+- **`held_keys_for` also loads each revoker's records**, so a revocation by another key can be read.
+- **The cross-form refusal `earlier_form_signer_is_edition2`** (a new `malformed_row` reason, appended to `ALL`; Python `ValueError`). An earlier-form verification whose signer is an edition-2 key is refused by name. `FederationDirectory::key_edition` reads the signer's `edition` column (provided: read off the row `lookup_public_key` returns, so a proxy answers too); text that is not an identity-ref costs no read. The choke points:
+  - `tier_ingest::verify_row_hybrid_signature`, after the carried arm (a row carrying its statement passes);
+  - `register::verify_key_registration` (the record's key and its signer);
+  - `register::verify_record_signed_by`, so `verify_proof_of_possession` (pure: a record that IS a projection);
+  - `key_plane::verify_plane_row` (the row's signers and the record's), `group_plane::verify_plane_row`, `self_roster::verify_proposal_row`, `cosign::verify_row` (and a cosignature's authority), `occurrence_revocation_carrier::verify_carrier_row`;
+  - `admission::verify_consent_record_transit_ingest` and `admission::verify_caller_signed_local_row`.
+- **The earlier store's own sweeps skip the read models.** The open-time key-plane rehome and its report, and the key / revocation projection-rebuild gates, read `edition = 1` keys and revocations not signed by an edition-2 key. Before this, they would have minted a `key:record:v1` row for a projection.
+- **The statement serve listing** (`FederationDirectory::edition2_statements_since(cursor, limit)`, sqlite and postgres; default empty). It returns held statements as received, in this node's admission order, after the cursor `(admitted_us, statement_id)`, at most `limit` (clamped to 1000). `ceg_statements` gains `admitted_us` (POSIX µs, after the last one handed out) and the index `ceg_statements_admitted`. **V300 is edited in place** (unshipped): the two baseline checksums in `evidence/migration_checksums.tsv` are re-pinned.
+- **The producer primitive** (`edition2::produce`): `sign_row(signer, sub, row_type, family, payload)` and `sign_object(signer, typ, payload, iat)` sign with persist's own `LocalSigner::sign_composite`, building Verify's header and `Sig_structure`. Also `signer_identity`, `composite_public_key`, `row_protected`, `object_protected`, `assemble`. `ProduceError` is `edition2_payload_invalid` or the signer's error.
+- **The test codec** (`edition2::codec`, test-only): `statement_of(&Attestation, family, key)` / `statement_of_with(…, bytes_members)` / `row_of(statement, key, tier)`, and `key_for(id)` / `kid(id)` / `rid(row)`. `key_for` is the composite `tier_ingest::test_support::local_signer(id)` signs with.
+- **Removed:** E2a's `TODO(baseline-merge)` emulation (`edition2::store::{SQLITE_DDL, POSTGRES_DDL}`, the `foreign_keys = OFF` and dropped-FK test setup). The tables come from V300.
+
+### Adoption notes (CIRISServer, CIRISEdge) for slice J0
+
+- An edition-2 key now has a `federation_keys` row (`edition = 2`), keyed by its identity-ref. `lookup_public_key` and `revocations_for` answer for it. Its signature column is the composite, and its ML-DSA-65 scrub is NULL. Do not verify an earlier-form signature against it: persist refuses that `earlier_form_signer_is_edition2`.
+- A revocation of an edition-2 key appears in `federation_revocations` once the key itself (or a revoker the host's `RevokerStanding` admits) revokes it.
+- `edition2_statements_since` is the serving cursor for statements. It is not yet on the PyO3 surface.
+
+### Tested (slice J0)
+
+- E2b's I1950–I1959 (and I1951's runner and I1822 companions) and E2a's I1900–I1912 are green after each merge on sqlite and postgres. I1906/I1909 run on the V300 baseline with the FKs on.
+- I2000–I2008 (`edition2/projection_invariants.rs`, sqlite and postgres): projection equals reading; the edition read two ways; the signer FK; the cross-form refusal at every choke point with an earlier-form control; four revocation reader classes; revocation authority; one fold; idempotence and re-derivation; the serve listing.
+- I2010–I2012 (`edition2/produce_invariants.rs`): `sign_row` equals Verify's minter byte for byte and is admitted; the codec round-trips; `sign_object` equals the genesis reader's voice and is Valid.
+
 ### BREAKING — upgrading to v62 DELETES the node's earlier (v61) store (slice E2b: the clean install)
 
 CC 1.0-rc20, "nothing carries, clean mesh": a v62 node reads nothing from an earlier store. Eric's ruling on that store: "No just delete it, we can not store old data indefinitely and no holds exist." A node's storage layout is its own (CC 2.7.9), so edition 2 starts from a fresh schema baseline, and **the first v62 open of a v61 store deletes that store** and creates an empty edition-2 one. There is no archive and no held copy. Server, Edge and Agent each lose the node's v61 rows on upgrade: keys, attestations, communities, blobs, traces, ledgers, secrets, everything persist held.

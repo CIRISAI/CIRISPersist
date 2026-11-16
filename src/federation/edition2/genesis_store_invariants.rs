@@ -184,11 +184,6 @@ async fn i1911_sqlite() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
-    b.conn_handle()
-        .lock()
-        // TODO(baseline-merge): the E2b baseline creates these tables.
-        .execute_batch(super::store::SQLITE_DDL)
-        .unwrap();
     Box::pin(body(&b)).await;
 }
 
@@ -203,13 +198,6 @@ async fn i1911_postgres() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
-    b.checkout()
-        .await
-        .unwrap()
-        // TODO(baseline-merge): the E2b baseline creates these tables.
-        .batch_execute(super::store::POSTGRES_DDL)
-        .await
-        .unwrap();
     Box::pin(body(&b)).await;
 }
 
