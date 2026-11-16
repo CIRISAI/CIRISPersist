@@ -265,3 +265,68 @@ async fn i2012_sign_object_is_the_voice_the_genesis_reader_reads() {
         Err(ProduceError::Payload(_))
     ));
 }
+
+/// **I2013 (the kernel reads an edition-2 row by its own bytes).** The
+/// adapter's view of a stored edition-2 row has the row id this node computes
+/// from the carried statement and names exactly the row ids of its signed
+/// `refs`; a peer-chosen `persist_row_hash` / `attestation_id` on the stored
+/// row changes neither. An earlier-form row keeps its `persist_row_hash` id
+/// until the JSON cut.
+#[test]
+fn i2013_the_kernel_reads_an_edition2_rows_own_id_and_refs() {
+    use super::door_invariants::fixture::ref2;
+    use crate::kernel::view::{attestation_view, row_id, RowId as KId};
+    let k = key_for("j0-kernel");
+    let me = kid_of("j0-kernel");
+    let payload = map(vec![
+        ("asserted_at", Value::Uint(5_000)),
+        ("author", Value::Text(me.clone())),
+        ("score", Value::Uint(750_000)),
+        ("confidence", Value::Uint(900_000)),
+        (
+            "dimension",
+            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
+        ),
+        (
+            "refs",
+            map(vec![(
+                "also",
+                map(vec![("cites", Value::Array(vec![ref2(&[0x31; 32])]))]),
+            )]),
+        ),
+    ]);
+    let st = sign_row_statement(&k, &me, &me, "scores", EVIDENCE_FAMILY, &payload, vec![]).unwrap();
+    let row = row_of(&st, &k, INGEST_TIER).unwrap();
+    let mut keys = HeldKeys::new();
+    keys.insert_record(key_record(&k, &["user"], 0, None));
+    let computed = admit_row(&st, &keys, None, SelectContext::default())
+        .unwrap()
+        .row_id;
+    let view = attestation_view(&row, &|_| None);
+    assert_eq!(view.id, KId(computed.0), "I2013: the node-computed row id");
+    assert_eq!(
+        view.names,
+        vec![KId([0x31; 32])],
+        "I2013: the refs, and only them"
+    );
+    let mut forged = row.clone();
+    forged.persist_row_hash = "ab".repeat(32);
+    forged.attestation_id = "ab".repeat(32);
+    assert_eq!(
+        row_id(&forged),
+        KId(computed.0),
+        "I2013: a stated id is never read"
+    );
+    let mut earlier = row.clone();
+    earlier
+        .attestation_envelope
+        .as_object_mut()
+        .unwrap()
+        .remove(super::ingest::STATEMENT_MEMBER);
+    earlier.persist_row_hash = "cd".repeat(32);
+    assert_eq!(
+        row_id(&earlier),
+        KId([0xcd; 32]),
+        "I2013: the earlier form, until the cut"
+    );
+}

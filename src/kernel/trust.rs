@@ -45,12 +45,7 @@ fn rank(k: &str) -> u8 {
 pub fn edge_rows(rows: &[&Attestation], edge: &dyn Fn(&Attestation) -> bool) -> Vec<KRow> {
     let id_of: BTreeMap<&str, RowId> = rows
         .iter()
-        .map(|r| {
-            (
-                r.attestation_id.as_str(),
-                RowId::of_hash(&r.persist_row_hash),
-            )
-        })
+        .map(|r| (r.attestation_id.as_str(), super::view::row_id(r)))
         .collect();
     rows.iter()
         .filter(|r| {
@@ -67,14 +62,22 @@ pub fn edge_rows(rows: &[&Attestation], edge: &dyn Fn(&Attestation) -> bool) -> 
                     )
                 })
                 .flatten();
-            let target = pointer.map(|t| {
-                id_of
-                    .get(t)
-                    .copied()
-                    .unwrap_or_else(|| RowId::of_label(&["unheld", t]))
-            });
+            // v62.0.0 (slice J0) — an edition-2 row's target is its signed
+            // `refs.target` (a node-computed row id), never a peer string.
+            let target = match super::view::row_names(r) {
+                Some(names) => names
+                    .into_iter()
+                    .find(|(role, _)| role == "target")
+                    .map(|(_, id)| id),
+                None => pointer.map(|t| {
+                    id_of
+                        .get(t)
+                        .copied()
+                        .unwrap_or_else(|| RowId::of_label(&["unheld", t]))
+                }),
+            };
             let mut k = KRow::new(
-                RowId::of_hash(&r.persist_row_hash),
+                super::view::row_id(r),
                 target.into_iter().collect(),
                 r.attesting_key_id.clone(),
             )

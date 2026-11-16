@@ -392,6 +392,43 @@ pub fn micros(t: chrono::DateTime<chrono::Utc>) -> Micros {
     t.timestamp_micros()
 }
 
+/// v62.0.0 (slice J0) — the carried edition-2 statement of a stored row, if
+/// it carries one (`ceg_statement`, lowercase hex).
+fn carried_statement(a: &crate::federation::types::Attestation) -> Option<Vec<u8>> {
+    a.attestation_envelope
+        .get(crate::federation::edition2::ingest::STATEMENT_MEMBER)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|h| hex::decode(h).ok())
+}
+
+/// v62.0.0 (slice J0) — **a stored row's id.** A row that carries an
+/// edition-2 statement is named by the row id THIS node computes from the
+/// statement's bytes (CC 2.6.1.3; `edition2::names::RowId::of_statement`),
+/// never by a column a peer could have supplied. An earlier-form row is named
+/// by its `persist_row_hash` (computed by persist at admission) until the JSON
+/// cut.
+#[must_use]
+pub fn row_id(a: &crate::federation::types::Attestation) -> RowId {
+    carried_statement(a)
+        .and_then(|s| crate::federation::edition2::names::RowId::of_statement(&s))
+        .map_or_else(|| RowId::of_hash(&a.persist_row_hash), |id| RowId(id.0))
+}
+
+/// v62.0.0 (slice J0) — **what an edition-2 row names**: the row ids of its
+/// signed `refs` (edition 2 only), each with its role. `None` for a row that
+/// carries no statement (the earlier form names by `references_attestation_id`).
+#[must_use]
+pub fn row_names(a: &crate::federation::types::Attestation) -> Option<Vec<(String, RowId)>> {
+    let s = carried_statement(a)?;
+    let (_, names) = crate::federation::edition2::names::of_statement_names(&s)?;
+    Some(
+        names
+            .into_iter()
+            .map(|n| (n.role, RowId(n.row.0)))
+            .collect(),
+    )
+}
+
 /// The view of a stored attestation: its id, the digests its signed bytes
 /// name, its signer and its instant. The seat and window readings are the
 /// caller's (they depend on the family the row is read as).
@@ -406,6 +443,15 @@ pub fn attestation_view(
     id_of: &dyn Fn(&str) -> Option<RowId>,
 ) -> KRow {
     let mut names = Vec::new();
+    // v62.0.0 (slice J0) — an edition-2 row names what its signed refs name.
+    if let Some(e2) = row_names(a) {
+        return KRow::new(
+            row_id(a),
+            e2.into_iter().map(|(_, id)| id).collect(),
+            a.attesting_key_id.clone(),
+        )
+        .at(micros(a.asserted_at));
+    }
     // only a structural composer's pointer names a row (CC 4.5.1.1)
     let composer = crate::federation::precedence::is_structural_composer(&a.attestation_type);
     if let Some(r) = composer
@@ -418,12 +464,7 @@ pub fn attestation_view(
     {
         names.push(id_of(r).unwrap_or_else(|| RowId::of_label(&["unheld", r])));
     }
-    KRow::new(
-        RowId::of_hash(&a.persist_row_hash),
-        names,
-        a.attesting_key_id.clone(),
-    )
-    .at(micros(a.asserted_at))
+    KRow::new(row_id(a), names, a.attesting_key_id.clone()).at(micros(a.asserted_at))
 }
 
 #[cfg(test)]

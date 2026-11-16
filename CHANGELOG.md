@@ -7,9 +7,9 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
 ## [62.0.0] - UNRELEASED
 
-### Changed (v62 slice J0: E2a and E2b reconciled; the edition-2 key plane's read models, CIRISPersist#1274)
+### Changed (v62 slice J0: E2a, E2b and C reconciled; the edition-2 key plane's read models, CIRISPersist#1274)
 
-Slices E2b (the V300 baseline) and E2a (the edition-2 door) are merged. The signer FKs on `federation_attestations` stay, so an edition-2 row inserts only once its signer has a `federation_keys` row. That row is now the edition-2 key's **projection**, a read model.
+Slices E2b (the V300 baseline), E2a (the edition-2 door) and C (the kernel adapter) are merged. The signer FKs on `federation_attestations` stay, so an edition-2 row inserts only once its signer has a `federation_keys` row. That row is now the edition-2 key's **projection**, a read model.
 
 - **The key projection** (`federation::edition2::projection`; CC 2.4.1.1, 2.6.1.12). After every `key:record` or `key:revocation` that `put_statement` keeps, `project_key` re-derives the key's row from the held key plane (`ingest::held_keys_for_kid`, then `HeldKeys::valid_records`) and upserts it into `federation_keys`:
   - `key_id` = `identity_ref` = the identity-ref;
@@ -37,6 +37,7 @@ Slices E2b (the V300 baseline) and E2a (the edition-2 door) are merged. The sign
 - **The statement serve listing** (`FederationDirectory::edition2_statements_since(cursor, limit)`, sqlite and postgres; default empty). It returns held statements as received, in this node's admission order, after the cursor `(admitted_us, statement_id)`, at most `limit` (clamped to 1000). `ceg_statements` gains `admitted_us` (POSIX µs, after the last one handed out) and the index `ceg_statements_admitted`. **V300 is edited in place** (unshipped): the two baseline checksums in `evidence/migration_checksums.tsv` are re-pinned.
 - **The producer primitive** (`edition2::produce`): `sign_row(signer, sub, row_type, family, payload)` and `sign_object(signer, typ, payload, iat)` sign with persist's own `LocalSigner::sign_composite`, building Verify's header and `Sig_structure`. Also `signer_identity`, `composite_public_key`, `row_protected`, `object_protected`, `assemble`. `ProduceError` is `edition2_payload_invalid` or the signer's error.
 - **The test codec** (`edition2::codec`, test-only): `statement_of(&Attestation, family, key)` / `statement_of_with(…, bytes_members)` / `row_of(statement, key, tier)`, and `key_for(id)` / `kid(id)` / `rid(row)`. `key_for` is the composite `tier_ingest::test_support::local_signer(id)` signs with.
+- **The kernel adapter reads an edition-2 row by its own bytes** (slice C meets E2a). `kernel::view::row_id(row)`: a row that carries its statement is named by the row id this node computes from it (`edition2::names::RowId::of_statement`), never by `persist_row_hash` / `attestation_id`; `kernel::view::row_names(row)`: its names are the row ids of its signed `refs` (`edition2::names::of_statement_names`). `attestation_view`, the trust edge leg (`refs.target`), the owner seat and `trust_root`'s edge read use them. An earlier-form row keeps C's path (`persist_row_hash`, `references_attestation_id` resolved through held rows) until the JSON cut.
 - **Removed:** E2a's `TODO(baseline-merge)` emulation (`edition2::store::{SQLITE_DDL, POSTGRES_DDL}`, the `foreign_keys = OFF` and dropped-FK test setup). The tables come from V300.
 
 ### Adoption notes (CIRISServer, CIRISEdge) for slice J0
@@ -49,7 +50,8 @@ Slices E2b (the V300 baseline) and E2a (the edition-2 door) are merged. The sign
 
 - E2b's I1950–I1959 (and I1951's runner and I1822 companions) and E2a's I1900–I1912 are green after each merge on sqlite and postgres. I1906/I1909 run on the V300 baseline with the FKs on.
 - I2000–I2008 (`edition2/projection_invariants.rs`, sqlite and postgres): projection equals reading; the edition read two ways; the signer FK; the cross-form refusal at every choke point with an earlier-form control; four revocation reader classes; revocation authority; one fold; idempotence and re-derivation; the serve listing.
-- I2010–I2012 (`edition2/produce_invariants.rs`): `sign_row` equals Verify's minter byte for byte and is admitted; the codec round-trips; `sign_object` equals the genesis reader's voice and is Valid.
+- I2010–I2013 (`edition2/produce_invariants.rs`): `sign_row` equals Verify's minter byte for byte and is admitted; the codec round-trips; `sign_object` equals the genesis reader's voice and is Valid; the kernel adapter names an edition-2 row by its computed id and its refs, whatever its stored columns say.
+- Slice C's I1830–I1847 and the canary `kernel_still_needs_own_withdrawal_filter` are green after the merge (sqlite and postgres).
 
 ### BREAKING — upgrading to v62 DELETES the node's earlier (v61) store (slice E2b: the clean install)
 

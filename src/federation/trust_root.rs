@@ -1672,7 +1672,7 @@ where
         edge.rows.iter().copied().collect();
     let live_edges: Vec<&Attestation> = by_user
         .iter()
-        .filter(|a| read.contains(&crate::kernel::view::RowId::of_hash(&a.persist_row_hash)))
+        .filter(|a| read.contains(&crate::kernel::view::row_id(a)))
         .collect();
     let edge_exists = edge.value;
     // v62.0.0 (slice C, I1838) — the differential witness: persist's own

@@ -123,12 +123,7 @@ pub fn owner_rows(
         .collect();
     let id_of: BTreeMap<&str, RowId> = bindings
         .iter()
-        .map(|b| {
-            (
-                b.attestation_id.as_str(),
-                RowId::of_hash(&b.persist_row_hash),
-            )
-        })
+        .map(|b| (b.attestation_id.as_str(), super::view::row_id(b)))
         .collect();
     let mut out: Vec<KRow> = Vec::with_capacity(bindings.len());
     for b in &bindings {
@@ -167,7 +162,7 @@ pub fn owner_rows(
             )?;
             let target = *id_of.get(t)?;
             let mut k = KRow::new(
-                RowId::of_hash(&r.persist_row_hash),
+                super::view::row_id(r),
                 vec![target],
                 r.attesting_key_id.clone(),
             )

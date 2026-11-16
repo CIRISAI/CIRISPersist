@@ -15,6 +15,8 @@
 //!
 //! For slice C's adapter: build `KRow::new(RowId(id.0), names, signer)` from
 //! [`RowId`] and [`names_of`]'s ids. Never from a string a peer sent.
+//! v62.0.0 (slice J0): `kernel::view::row_id` and `kernel::view::row_names`
+//! do so for a row that carries its statement ([`of_statement_names`]).
 
 use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::{self, Digest32};
@@ -43,6 +45,21 @@ impl RowId {
         payload: &[u8],
     ) -> Self {
         RowId(edition2::row_id(row_type, family, sub, author, payload))
+    }
+
+    /// v62.0.0 (slice J0) — the row id of a held row statement, computed from
+    /// its own bytes: the header's row type and family, the CWT `sub`, the
+    /// payload's `author`, and the payload as signed. `None` for bytes that
+    /// are not a row statement. Nothing a peer states about the row is read.
+    #[must_use]
+    pub fn of_statement(statement: &[u8]) -> Option<Self> {
+        let (protected, payload) = super::liveness::statement_parts(statement)?;
+        let row_type = protected.get_int(-70001)?.as_text()?;
+        let family = protected.get_int(-70002)?.as_text()?;
+        let sub = protected.get_int(15)?.get_int(2)?.as_text()?;
+        let author = payload.get_text("author").and_then(Value::as_text);
+        let raw = super::door::raw_payload(statement)?;
+        Some(Self::of_row(row_type, family, sub, author, &raw))
     }
 
     /// The object id of a signed object that is not a row (CC 2.6.1.11).
@@ -179,4 +196,14 @@ pub fn single(names: &[Name], role: &str) -> Option<RowId> {
     let mut it = names.iter().filter(|n| n.role == role);
     let first = it.next()?;
     it.next().is_none().then_some(first.row)
+}
+
+/// v62.0.0 (slice J0) — a held row statement's node-computed id and the names
+/// its signed `refs` carry, for the kernel adapter. `None` for bytes that are
+/// not a row statement, or whose `refs` do not read.
+#[must_use]
+pub fn of_statement_names(statement: &[u8]) -> Option<(RowId, Vec<Name>)> {
+    let id = RowId::of_statement(statement)?;
+    let (_, payload) = super::liveness::statement_parts(statement)?;
+    Some((id, names_of(&payload).ok()?))
 }
