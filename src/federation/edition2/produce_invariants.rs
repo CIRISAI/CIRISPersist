@@ -54,7 +54,7 @@ fn score_payload(author: &str, at: u64) -> Value {
     ])
 }
 
-const EVIDENCE_FAMILY: &str = "evidence:.suite:.kind:.cell:.prefix";
+const EVIDENCE_ROWS: &str = "evidence:.suite:.kind:.cell:.prefix";
 
 #[tokio::test]
 async fn i2010_sign_row_is_verifys_minter_and_the_door_admits_it() {
@@ -67,11 +67,11 @@ async fn i2010_sign_row_is_verifys_minter_and_the_door_admits_it() {
         "I2010: the signer signs as its composite's identity-ref"
     );
     let payload = score_payload(&iss, 5_000);
-    let ours = sign_row(&signer, &iss, "scores", EVIDENCE_FAMILY, &payload)
+    let ours = sign_row(&signer, &iss, "scores", EVIDENCE_ROWS, &payload)
         .await
         .unwrap();
     let verifys =
-        sign_row_statement(&k, &iss, &iss, "scores", EVIDENCE_FAMILY, &payload, vec![]).unwrap();
+        sign_row_statement(&k, &iss, &iss, "scores", EVIDENCE_ROWS, &payload, vec![]).unwrap();
     assert_eq!(ours, verifys, "I2010: byte for byte");
     let mut keys = HeldKeys::new();
     keys.insert_record(key_record(&k, &["user"], 0, None));
@@ -94,7 +94,7 @@ async fn i2010_sign_row_is_verifys_minter_and_the_door_admits_it() {
     // A payload with no instant, and a signer with no PQC half, refuse.
     let none = map(vec![("author", Value::Text(iss.clone()))]);
     assert!(matches!(
-        sign_row(&signer, &iss, "scores", EVIDENCE_FAMILY, &none).await,
+        sign_row(&signer, &iss, "scores", EVIDENCE_ROWS, &none).await,
         Err(ProduceError::Payload(_))
     ));
     let classical_only = crate::signing::LocalSigner::from_parts(
@@ -104,7 +104,7 @@ async fn i2010_sign_row_is_verifys_minter_and_the_door_admits_it() {
         None,
     );
     assert!(matches!(
-        sign_row(&classical_only, &iss, "scores", EVIDENCE_FAMILY, &payload).await,
+        sign_row(&classical_only, &iss, "scores", EVIDENCE_ROWS, &payload).await,
         Err(ProduceError::Signer(
             crate::signing::LocalSignerError::PqcNotConfigured
         ))
@@ -122,7 +122,7 @@ async fn i2010_the_test_key_ids_name_the_test_signers() {
     );
     let payload = score_payload(&iss, 7_000);
     assert_eq!(
-        sign_row(&signer, &iss, "scores", EVIDENCE_FAMILY, &payload)
+        sign_row(&signer, &iss, "scores", EVIDENCE_ROWS, &payload)
             .await
             .unwrap(),
         sign_row_statement(
@@ -130,7 +130,7 @@ async fn i2010_the_test_key_ids_name_the_test_signers() {
             &iss,
             &iss,
             "scores",
-            EVIDENCE_FAMILY,
+            EVIDENCE_ROWS,
             &payload,
             vec![]
         )
@@ -152,12 +152,12 @@ fn i2011_the_codec_round_trips() {
                 &me,
                 &me,
                 "scores",
-                EVIDENCE_FAMILY,
+                EVIDENCE_ROWS,
                 &score_payload(&me, 5_000),
                 vec![],
             )
             .unwrap(),
-            EVIDENCE_FAMILY,
+            EVIDENCE_ROWS,
         ),
         (
             sign_row_statement(
@@ -206,7 +206,7 @@ fn i2011_the_codec_round_trips() {
             "persist_row_hash": "",
         }))
         .unwrap();
-    let st = statement_of(&literal, EVIDENCE_FAMILY, &k);
+    let st = statement_of(&literal, EVIDENCE_ROWS, &k);
     let row = row_of(&st, &k, INGEST_TIER).unwrap();
     let strip = |a: &crate::federation::types::Attestation| {
         let mut e = a.attestation_envelope.clone();
@@ -228,11 +228,7 @@ fn i2011_the_codec_round_trips() {
         row.attesting_key_id, me,
         "I2011: the signer signs as itself"
     );
-    assert_eq!(
-        statement_of(&row, EVIDENCE_FAMILY, &k),
-        st,
-        "I2011: and back"
-    );
+    assert_eq!(statement_of(&row, EVIDENCE_ROWS, &k), st, "I2011: and back");
 }
 
 #[tokio::test]
@@ -295,7 +291,7 @@ fn i2013_the_kernel_reads_an_edition2_rows_own_id_and_refs() {
             )]),
         ),
     ]);
-    let st = sign_row_statement(&k, &me, &me, "scores", EVIDENCE_FAMILY, &payload, vec![]).unwrap();
+    let st = sign_row_statement(&k, &me, &me, "scores", EVIDENCE_ROWS, &payload, vec![]).unwrap();
     let row = row_of(&st, &k, INGEST_TIER).unwrap();
     let mut keys = HeldKeys::new();
     keys.insert_record(key_record(&k, &["user"], 0, None));

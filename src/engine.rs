@@ -4518,7 +4518,7 @@ impl Engine {
                 scrub_signature_classical: B64.encode(&co.classical.signature),
                 scrub_signature_pqc: Some(B64.encode(&co.pqc.signature)),
                 cosigned_at: Some(crate::federation::admission::render_signed_instant(
-                    chrono::Utc::now(),
+                    crate::host::clock::now(),
                 )),
             });
         self.federation_directory()

@@ -12863,7 +12863,7 @@ pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
     while let Some(page) = pages.next(directory).await? {
         retractions.extend(page);
     }
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     // the key plane is asked only about the keys the seat names: each
     // binding seats its own granter, independently of every other, so
     // filtering the holders by the `user` fact equals presenting only the
@@ -12920,8 +12920,9 @@ pub async fn owner_of_pre_kernel<F: super::FederationDirectory + ?Sized>(
 }
 
 /// Profiling aid (test builds): the former owner fold, timed against the
-/// kernel's.
-#[cfg(test)]
+/// kernel's. Gated as its one caller is (`kernel_adapter_invariants::profile`,
+/// sqlite), so the pyo3 lane (`postgres,pyo3,server`, `-D warnings`) builds.
+#[cfg(all(test, feature = "sqlite"))]
 pub(crate) async fn owner_of_reference_for_profile<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,
