@@ -43,8 +43,8 @@ pub mod compare;
 pub mod types;
 
 pub use admit::{
-    admit_witness, build_local_witness, filter_witness_leaves, surviving_namespaces,
-    WitnessAdmitError,
+    admit_witness, build_local_witness, filter_witness_leaves, sign_wholeness_witness,
+    surviving_namespaces, WitnessAdmitError,
 };
 pub use compare::{
     accept_if_monotonic, classify, classify_stored, equivocation_hard_case, verdict_json,

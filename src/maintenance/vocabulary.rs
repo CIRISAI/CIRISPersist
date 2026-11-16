@@ -195,7 +195,7 @@ impl VocabularyTightening {
             citation: "CC 5.1 (class rule CC 3.3.2) / CIRISVerify#234".to_string(),
             family,
             field_path: field_path.into(),
-            non_conformant: ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED
+            non_conformant: crate::federation::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED
                 .to_string(),
             conformant: ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2.to_string(),
         }
@@ -943,7 +943,7 @@ mod tests {
         );
         assert_eq!(
             t.non_conformant,
-            ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED
+            crate::federation::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED
         );
         assert!(!t.conformant.contains('-'), "CC 5.1 ratified snake_case");
         assert!(t.non_conformant.contains('-'));

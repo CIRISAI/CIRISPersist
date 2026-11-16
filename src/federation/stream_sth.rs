@@ -227,10 +227,12 @@ pub async fn produce_stream_sth(
         .map_err(|e| BlobError::Backend(format!("stream-sth root: {e}")))?;
     let log_id = log_id_for_stream(stream_id);
     let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
-    let signature = local
-        .sign_hybrid(&signing_bytes)
-        .await
-        .map_err(|e| BlobError::Backend(format!("produce_stream_sth: signer: {e}")))?;
+    // v62.0.0 (slice D) — the form follows the node's ceremony state (CC D4):
+    // the earlier (bound-hybrid) form before the ceremony row, composite after.
+    let signature =
+        super::sth_form::sign_sth(local, &signing_bytes, super::sth_form::ceremony_state())
+            .await
+            .map_err(|e| BlobError::Backend(format!("produce_stream_sth: signer: {e}")))?;
     Ok(SignedTreeHead {
         log_id,
         tree_size,
@@ -296,25 +298,10 @@ pub fn recompute_and_assert_root(
     Ok(())
 }
 
-/// v4.1 (Cut C1b) — extract the base64 Ed25519 + optional ML-DSA-65
-/// signature components from a stored/parsed [`SignedTreeHead`]'s
-/// [`HybridSignature`](ciris_crypto::HybridSignature), for handing to
-/// [`verify_hybrid_via_directory`](crate::verify::verify_hybrid_via_directory).
-///
-/// The directory path resolves the producer's PINNED public keys from
-/// `federation_keys` (it does NOT trust the pubkeys embedded in the
-/// signature), so a forged STH carrying its own keypair cannot
-/// self-certify. ML-DSA-65 is returned `None` only for a
-/// classical-only signature mode (the hybrid-pending window); a normal
-/// hybrid STH returns `Some`.
-#[must_use]
-pub fn signature_b64_parts(sth: &SignedTreeHead) -> (String, Option<String>) {
-    hybrid_signature_b64_parts(&sth.signature)
-}
-
-/// v31.0.0 (CIRISPersist#657) — the body of [`signature_b64_parts`], lifted so
-/// the WITNESS cosignatures go through the identical projection the PRODUCER
-/// signature does.
+/// v31.0.0 (CIRISPersist#657) — the base64 halves of a bound-hybrid
+/// signature, one projection for the producer, the witnesses and the
+/// receipts. v62.0.0: reached through [`super::sth_form::verify_sth_signature`] for
+/// an EARLIER-form (CC 8.11.12) head or cosignature.
 ///
 /// A [`WitnessSignature`] carries the same
 /// [`HybridSignature`](ciris_crypto::HybridSignature) shape over the same
@@ -393,19 +380,23 @@ pub fn consistency_proof(
 // witness list).
 // ────────────────────────────────────────────────────────────────────
 
-/// JSON-serialize the producer's `HybridSignature` for the
-/// `signature_blob` column. JSON-as-bytes so PG (BYTEA) and SQLite
-/// (BLOB) share the exact same encoding. Mirrors
-/// `merkle_store::serialize_signature`.
-pub fn serialize_signature(sig: &ciris_crypto::HybridSignature) -> Result<Vec<u8>, BlobError> {
-    serde_json::to_vec(sig)
-        .map_err(|e| BlobError::Backend(format!("stream-sth signature serialize: {e}")))
+/// The producer's signature bytes for the `signature_blob` column. v62.0.0
+/// (slice D): the column holds the signature in its FORM
+/// ([`super::sth_form`]): the earlier form is the bound-hybrid JSON bytes
+/// (what every pre-v62 row already holds), the composite its 3373 bytes. The
+/// bytes are stored as given, after checking they are one of the two forms.
+pub fn serialize_signature(sig: &[u8]) -> Result<Vec<u8>, BlobError> {
+    super::sth_form::classify(sig)
+        .map_err(|e| BlobError::InvalidArgument(format!("stream-sth signature: {e}")))?;
+    Ok(sig.to_vec())
 }
 
-/// Inverse of [`serialize_signature`].
-pub fn deserialize_signature(bytes: &[u8]) -> Result<ciris_crypto::HybridSignature, BlobError> {
-    serde_json::from_slice(bytes)
-        .map_err(|e| BlobError::Backend(format!("stream-sth signature deserialize: {e}")))
+/// Inverse of [`serialize_signature`]: a stored blob in neither form is a
+/// refusal, never a silently absent signature.
+pub fn deserialize_signature(bytes: &[u8]) -> Result<Vec<u8>, BlobError> {
+    super::sth_form::classify(bytes)
+        .map_err(|e| BlobError::Backend(format!("stream-sth signature deserialize: {e}")))?;
+    Ok(bytes.to_vec())
 }
 
 /// JSON-serialize the witness cosignatures for the `witness_signatures`
@@ -430,7 +421,9 @@ pub fn serialize_witness_signatures(witnesses: &[WitnessSignature]) -> Result<St
 
 /// Inverse of [`serialize_witness_signatures`].
 pub fn deserialize_witness_signatures(raw: &str) -> Result<Vec<WitnessSignature>, BlobError> {
-    serde_json::from_str(raw)
+    // v62.0.0 — a pre-v62 row carries each signature as the HybridSignature
+    // object; `witnesses_from_json` reads both forms.
+    super::sth_form::witnesses_from_json(raw)
         .map_err(|e| BlobError::Backend(format!("stream-sth witness sigs deserialize: {e}")))
 }
 
@@ -487,7 +480,7 @@ mod tests {
             tree_size: 3,
             root_hash: root,
             timestamp: chrono::Utc::now(),
-            signature: dummy_sig(),
+            signature: dummy_sig_bytes(),
             witness_signatures: Vec::new(),
         };
         recompute_and_assert_root(&sth, &hashes).unwrap();
@@ -501,7 +494,7 @@ mod tests {
             tree_size: 3,
             root_hash: [0xFF; 32], // wrong root
             timestamp: chrono::Utc::now(),
-            signature: dummy_sig(),
+            signature: dummy_sig_bytes(),
             witness_signatures: Vec::new(),
         };
         assert!(recompute_and_assert_root(&sth, &hashes).is_err());
@@ -516,7 +509,7 @@ mod tests {
             tree_size: 5, // more than the 2 chunks held
             root_hash: store.root().unwrap(),
             timestamp: chrono::Utc::now(),
-            signature: dummy_sig(),
+            signature: dummy_sig_bytes(),
             witness_signatures: Vec::new(),
         };
         assert!(recompute_and_assert_root(&sth, &hashes).is_err());
@@ -543,13 +536,28 @@ mod tests {
 
     #[test]
     fn signature_round_trips_through_columns() {
-        let sig = dummy_sig();
-        let blob = serialize_signature(&sig).unwrap();
-        let back = deserialize_signature(&blob).unwrap();
-        assert_eq!(back.classical.signature, sig.classical.signature);
+        // v62.0.0 — both forms round-trip unchanged; bytes of neither form
+        // are refused both ways.
+        let earlier = dummy_sig_bytes();
+        assert_eq!(
+            deserialize_signature(&serialize_signature(&earlier).unwrap()).unwrap(),
+            earlier
+        );
+        let composite = vec![7u8; ciris_crypto::composite::SIGNATURE_LEN];
+        assert_eq!(
+            deserialize_signature(&serialize_signature(&composite).unwrap()).unwrap(),
+            composite
+        );
+        assert!(serialize_signature(&[1, 2, 3]).is_err());
+        assert!(deserialize_signature(&[1, 2, 3]).is_err());
         let raw = serialize_witness_signatures(&[]).unwrap();
         assert_eq!(raw, "[]");
         assert!(deserialize_witness_signatures(&raw).unwrap().is_empty());
+    }
+
+    /// An earlier-form (bound-hybrid JSON) signature's bytes.
+    fn dummy_sig_bytes() -> Vec<u8> {
+        crate::federation::sth_form::earlier_form_bytes(&dummy_sig()).unwrap()
     }
 
     fn dummy_sig() -> ciris_crypto::HybridSignature {

@@ -56,7 +56,11 @@ pub(crate) mod bodies {
         let timestamp = crate::audit::verify::truncate_to_micros(chrono::Utc::now());
         let root_hash = [0x5Au8; 32];
         let bytes = SignedTreeHead::signing_bytes(log_id, tree_size, &root_hash, timestamp);
-        let signature = signer.sign_hybrid(&bytes).await.expect("sign_hybrid");
+        // v62.0.0: the earlier (bound-hybrid) form, as the stored bytes.
+        let signature = crate::federation::sth_form::earlier_form_bytes(
+            &signer.sign_hybrid(&bytes).await.expect("sign_hybrid"),
+        )
+        .expect("earlier-form encode");
         let ed_pk = B64.encode(signer.ed25519_public_key_bytes());
         let pqc_pk = signer
             .pqc_public_key_b64()
@@ -76,34 +80,46 @@ pub(crate) mod bodies {
 
     /// Every way a head can decode yet lack its ML-DSA-65 half.
     pub(crate) fn without_the_pqc_half(h: &SignedTreeHead) -> Vec<(&'static str, SignedTreeHead)> {
-        let mut out = Vec::new();
-        let mut v = h.clone();
-        v.signature.pqc.signature = Vec::new();
-        out.push(("ML-DSA-65 signature emptied", v));
-        let mut v = h.clone();
-        v.signature.pqc.public_key = Vec::new();
-        out.push(("ML-DSA-65 public key emptied", v));
-        let mut v = h.clone();
-        v.signature.pqc.signature = Vec::new();
-        v.signature.pqc.public_key = Vec::new();
-        out.push(("both ML-DSA-65 fields emptied", v));
-        let mut v = h.clone();
-        v.signature.pqc.signature.pop();
-        out.push(("ML-DSA-65 signature one byte short", v));
-        let mut v = h.clone();
-        v.signature.mode = SignatureMode::ClassicalOnly;
-        out.push(("mode ClassicalOnly", v));
-        let mut v = h.clone();
-        v.signature.pqc.algorithm = PqcAlgorithm::MlDsa44;
-        out.push(("PQC algorithm ML-DSA-44", v));
-        out
+        use crate::federation::sth_form::test_support::edit_earlier;
+        vec![
+            (
+                "ML-DSA-65 signature emptied",
+                edit_earlier(h, |s| s.pqc.signature = Vec::new()),
+            ),
+            (
+                "ML-DSA-65 public key emptied",
+                edit_earlier(h, |s| s.pqc.public_key = Vec::new()),
+            ),
+            (
+                "both ML-DSA-65 fields emptied",
+                edit_earlier(h, |s| {
+                    s.pqc.signature = Vec::new();
+                    s.pqc.public_key = Vec::new();
+                }),
+            ),
+            (
+                "ML-DSA-65 signature one byte short",
+                edit_earlier(h, |s| {
+                    s.pqc.signature.pop();
+                }),
+            ),
+            (
+                "mode ClassicalOnly",
+                edit_earlier(h, |s| s.mode = SignatureMode::ClassicalOnly),
+            ),
+            (
+                "PQC algorithm ML-DSA-44",
+                edit_earlier(h, |s| s.pqc.algorithm = PqcAlgorithm::MlDsa44),
+            ),
+        ]
     }
 
     /// The JSON `signature_blob` of `h` with the `pqc` member REMOVED — the
     /// shape `HybridSignature` cannot represent, reachable only as stored
     /// bytes.
     pub(crate) fn blob_with_the_pqc_half_removed(h: &SignedTreeHead) -> Vec<u8> {
-        let mut v = serde_json::to_value(&h.signature).expect("signature serializes");
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&h.signature).expect("an earlier-form signature");
         let removed = v
             .as_object_mut()
             .expect("HybridSignature serializes as an object")
@@ -118,7 +134,7 @@ pub(crate) mod bodies {
 
     /// The JSON `signature_blob` of `h` with the ML-DSA-65 half EMPTIED.
     pub(crate) fn blob_with_the_pqc_half_emptied(h: &SignedTreeHead) -> Vec<u8> {
-        let mut sig = h.signature.clone();
+        let mut sig = crate::federation::sth_form::test_support::earlier_of(&h.signature);
         sig.pqc.signature = Vec::new();
         sig.pqc.public_key = Vec::new();
         serde_json::to_vec(&sig).expect("blob")
@@ -199,7 +215,12 @@ pub(crate) mod bodies {
             .expect("I1564: a head is present");
         assert_eq!(served.tree_size, genuine.tree_size, "I1564 {who}");
         assert_eq!(
-            served.signature.pqc.signature, genuine.signature.pqc.signature,
+            crate::federation::sth_form::test_support::earlier_of(&served.signature)
+                .pqc
+                .signature,
+            crate::federation::sth_form::test_support::earlier_of(&genuine.signature)
+                .pqc
+                .signature,
             "I1564 {who}: the ML-DSA-65 half round-trips"
         );
     }
@@ -258,8 +279,9 @@ pub(crate) mod bodies {
             served.tree_size, 2,
             "I1565 {who}: the newest stored head is served, not the genuine one below it"
         );
+        let held = crate::federation::sth_form::test_support::earlier_of(&served.signature);
         assert!(
-            served.signature.pqc.signature.is_empty() && served.signature.pqc.public_key.is_empty(),
+            held.pqc.signature.is_empty() && held.pqc.public_key.is_empty(),
             "I1565 {who}: the stored head is served as itself, its half still empty"
         );
     }
@@ -313,8 +335,9 @@ pub(crate) mod bodies {
             );
         }
 
-        let mut forged = genuine.clone();
-        forged.signature.pqc.signature[0] ^= 0xFF;
+        let forged = crate::federation::sth_form::test_support::edit_earlier(&genuine, |s| {
+            s.pqc.signature[0] ^= 0xFF;
+        });
         let err = verify_audit_sth(&forged, &ed_pk, &pqc_pk)
             .expect_err("I1566: a corrupted ML-DSA-65 half must not verify");
         assert!(

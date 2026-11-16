@@ -6313,7 +6313,10 @@ pub mod invariants {
         let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
             &log_id, tree_size, &root_hash, timestamp,
         );
-        let signature = signer.sign(&signing_bytes).unwrap();
+        // v62.0.0: the earlier (bound-hybrid) form, as the stored bytes.
+        let signature =
+            crate::federation::sth_form::earlier_form_bytes(&signer.sign(&signing_bytes).unwrap())
+                .unwrap();
         ciris_verify_core::transparency::SignedTreeHead {
             log_id,
             tree_size,

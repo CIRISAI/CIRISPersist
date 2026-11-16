@@ -983,7 +983,7 @@ pub fn unwrap_dek_v2_json(
         .get("algorithm")
         .and_then(|x| x.as_str())
         .ok_or_else(|| AtRestError::Decode("v2 envelope: missing algorithm".into()))?;
-    if !key_grant_algorithm_v2_accepts(algorithm, false) {
+    if !key_grant_algorithm_v2_accepts(algorithm) {
         return Err(AtRestError::Crypto(format!(
             "v2 envelope: algorithm {algorithm:?} is not the v2 hybrid wrap identifier"
         )));
@@ -4020,7 +4020,7 @@ mod tests {
         // is belongs to verify, and CC 5.1 is where it is ratified.
         assert!(json.contains(ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2));
         assert!(
-            !json.contains(ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED),
+            !json.contains(crate::federation::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED),
             "the non-conformant hyphenated alias must never be EMITTED: {json}"
         );
 

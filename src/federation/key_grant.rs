@@ -106,6 +106,14 @@
 //! index entries the retired sets left. The legacy set rows stay where they
 //! are, unserved.
 
+/// v62.0.0 (slice D) — the CC 1.0-rc2 HYPHENATED spelling of the v2 hybrid
+/// wrap algorithm. CIRISVerify 23.0.0 deleted its constant along with the
+/// `accept_legacy_hyphenated` switch (`key_grant_algorithm_v2_accepts` takes
+/// only the snake_case id). Persist still names the spelling: to refuse it by
+/// name at the wheel door, and as the `non_conformant` value its vocabulary
+/// tightening retires (CC 5.1). Nothing accepts it.
+pub const KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED: &str = "x25519-mlkem768-aes256-gcm-hkdf-sha256";
+
 use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
 use crate::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
 use crate::federation::self_collective::speaks_for;

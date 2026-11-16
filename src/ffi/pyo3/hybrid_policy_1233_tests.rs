@@ -367,7 +367,10 @@ async fn i1567_assert<G, E, R>(
     let head = proof_head(&proof, who);
     assert_eq!(head.tree_size, 1, "I1567 {who}: the genuine head");
     assert!(
-        !head.signature.pqc.signature.is_empty(),
+        !crate::federation::sth_form::test_support::earlier_of(&head.signature)
+            .pqc
+            .signature
+            .is_empty(),
         "I1567 {who}: the genuine head carries its ML-DSA-65 half"
     );
 
@@ -384,7 +387,10 @@ async fn i1567_assert<G, E, R>(
         "I1567 {who}: the newest stored head is served, not the genuine one below it"
     );
     assert!(
-        head.signature.pqc.signature.is_empty(),
+        crate::federation::sth_form::test_support::earlier_of(&head.signature)
+            .pqc
+            .signature
+            .is_empty(),
         "I1567 {who}: served as itself, its half still empty"
     );
     match verify_audit_sth(&head, ed_pk, pqc_pk) {

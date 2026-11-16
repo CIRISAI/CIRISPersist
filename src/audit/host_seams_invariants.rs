@@ -188,7 +188,10 @@ mod postgres {
             tree_size: 3,
             root_hash: root,
             timestamp: at,
-            signature: signer.sign_hybrid(&bytes).await.unwrap(),
+            signature: crate::federation::sth_form::earlier_form_bytes(
+                &signer.sign_hybrid(&bytes).await.unwrap(),
+            )
+            .unwrap(),
             witness_signatures: Vec::new(),
         };
         store.store_sth(&sth).await.unwrap();

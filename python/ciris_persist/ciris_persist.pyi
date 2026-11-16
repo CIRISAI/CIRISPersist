@@ -2015,7 +2015,7 @@ class Engine:
     def put_stream_sth(self, sth_json: str, producer_key_id: str) -> None:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C1b) — store a producer-signed Signed Tree Head for a stream's transparency log (CEG §10.5.1)."""
 
-    def put_wholeness_witness_json(self, witness_json: str, sig_ed25519_b64: str, sig_mldsa65_b64: str, ed25519_pubkey_b64: str, mldsa65_pubkey_b64: str, leaves_b64_json: str | None = None) -> str:
+    def put_wholeness_witness_json(self, witness_json: str, signature: str, *legacy_positional: object, ed25519_pubkey_b64: str | None = None, mldsa65_pubkey_b64: str | None = None, leaves_b64_json: str | None = None) -> str:
         """(derived) testimonial — v16 (CIRISPersist#431, N3 + N4) — admit a WholenessWitness to the corpus, PQC-verified-BEFORE-persist: the full hybrid gate over the §19.1 canonica..."""
 
     def rebuild_signed_wire_index(self) -> int:

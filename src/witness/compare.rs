@@ -226,7 +226,7 @@ mod tests {
             peer_id: peer.into(),
             epoch_id: epoch,
             claim_namespaces: ns.iter().map(|s| s.to_string()).collect(),
-            merkle_root: compute_merkle_root(&[leaf.to_vec()]),
+            merkle_root: compute_merkle_root(&[leaf.to_vec()]).unwrap(),
             leaf_count: 1,
             observed_at_unix_ms: 0,
             witness_version: 1,

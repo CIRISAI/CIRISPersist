@@ -51,6 +51,10 @@ pub mod merkle_store;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod service;
+/// v62.0.0 (slice D) — the head's signature form (earlier before the
+/// edition-2 ceremony row, composite after; read by form). Shared with the
+/// stream logs, so it lives in `federation`.
+pub use crate::federation::sth_form;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod types;

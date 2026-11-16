@@ -86,7 +86,7 @@ async fn signed_verify_inputs_v3(
         .iter()
         .map(|id| (id.clone(), 1_000_000u64))
         .collect();
-    let mass_root = ciris_persist::fountain::aggregation::mass_commitment(&masses);
+    let mass_root = ciris_persist::fountain::aggregation::mass_commitment(&masses).unwrap();
     let meta = ciris_verify_core::substrate::AggregationMetaV1 {
         version,
         content_id: "content-root-agg".to_owned(),
@@ -131,6 +131,8 @@ async fn signed_verify_inputs_v3(
         } else {
             BASE64.encode(&pqc_sig)
         },
+        // The earlier (CC 8.11.12) form: no composite.
+        sig_composite_b64: String::new(),
     };
     (inputs, commitment_hex)
 }
@@ -1013,7 +1015,10 @@ async fn i1152_member_commitment_unique<B: Backend>(backend: &B, suffix: &str) {
     };
     malformed(member_commitment(&padded_ids).expect_err("I1152: the builder refuses padding"));
     let root = member_commitment(&ids).expect("I1152: a distinct list builds");
-    assert_eq!(root, ciris_verify_core::substrate::member_commitment(&ids));
+    assert_eq!(
+        root,
+        ciris_verify_core::substrate::member_commitment(&ids).unwrap()
+    );
 
     // The fold over the distinct list.
     let fold_cid = format!("i1152-fold-{suffix}");

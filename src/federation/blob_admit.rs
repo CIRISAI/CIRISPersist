@@ -618,7 +618,9 @@ pub(crate) async fn put_delivery_receipt_planned<D: BlobFloorStore>(
         receipt: &receipt,
         k_i64,
         epoch_i64,
-        signature_blob: super::stream_sth::serialize_signature(&receipt.signature)?,
+        signature_blob: super::sth_form::earlier_form_bytes(&receipt.signature).map_err(|e| {
+            BlobError::Backend(format!("delivery receipt signature serialize: {e}"))
+        })?,
         received_at: crate::host::clock::now(),
     };
     match dir.store_delivery_receipt(planned).await? {

@@ -27,7 +27,6 @@
 //! different master and orphans every encrypted secret — it is a
 //! stable wire constant.
 
-use ciris_keyring::create_platform_storage;
 use zeroize::Zeroizing;
 
 use super::crypto;
@@ -68,6 +67,31 @@ fn secrets_storage_dir() -> Result<std::path::PathBuf, SecretsError> {
                 .into(),
         )),
     }
+}
+
+/// v62.0.0 (slice D, P2) — the platform keyring's secure storage: a NATIVE
+/// host's (the keyring's `fs` tier, persist feature `host`). A node build has
+/// no platform keyring; its hardware seal is the host's, so it reports "not
+/// hardware-backed" and every caller keeps the software master, as on a
+/// no-TPM host.
+#[cfg(feature = "host")]
+fn create_platform_storage(
+    alias: &str,
+    dir: std::path::PathBuf,
+) -> Result<Box<dyn ciris_keyring::SecureBlobStorage>, String> {
+    ciris_keyring::create_platform_storage(alias, dir).map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "host"))]
+fn create_platform_storage(
+    _alias: &str,
+    _dir: std::path::PathBuf,
+) -> Result<Box<dyn ciris_keyring::SecureBlobStorage>, String> {
+    Err(
+        "this build has no platform keyring (persist feature `host`); a node's hardware \
+         seal is its host's"
+            .into(),
+    )
 }
 
 /// Derive the hardware-rooted secrets master key.

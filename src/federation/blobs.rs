@@ -5450,20 +5450,17 @@ pub(crate) async fn verify_stream_sth_signature<F>(
 where
     F: crate::federation::FederationDirectory,
 {
-    let (ed25519_sig_b64, ml_dsa_65_sig_b64) =
-        crate::federation::stream_sth::signature_b64_parts(sth);
-    let signing_bytes = sth.signing_bytes_of();
-    crate::verify::verify_hybrid_via_directory(
+    // v62.0.0 (slice D) — by FORM: an earlier-form (CC 8.11.12) head verifies
+    // hybrid-Strict, a composite (CC 2.6.1.7) under the producer's composite
+    // key; both against the producer's PINNED federation_keys row.
+    crate::federation::sth_form::verify_sth_signature_via_directory(
         directory,
-        &signing_bytes,
+        sth,
         producer_key_id,
-        &ed25519_sig_b64,
-        ml_dsa_65_sig_b64.as_deref(),
-        crate::verify::HybridPolicy::Strict,
-        None,
+        &sth.signature,
     )
     .await
-    .map(|_outcome| ())
+    .map(|_form| ())
     .map_err(|e| {
         BlobError::InvalidArgument(format!(
             "put_stream_sth: producer signature verification failed for \
@@ -5524,7 +5521,6 @@ where
     if sth.witness_signatures.is_empty() {
         return Ok(());
     }
-    let signing_bytes = sth.signing_bytes_of();
     let mut seen: Vec<&str> = Vec::with_capacity(sth.witness_signatures.len());
     for ws in &sth.witness_signatures {
         if seen.contains(&ws.witness_id.as_str()) {
@@ -5544,19 +5540,14 @@ where
                     witness_id = ws.witness_id
                 ))
             })?;
-        let (ed25519_sig_b64, ml_dsa_65_sig_b64) =
-            crate::federation::stream_sth::hybrid_signature_b64_parts(&ws.signature);
-        crate::verify::verify_hybrid_via_directory(
+        crate::federation::sth_form::verify_sth_signature_via_directory(
             directory,
-            &signing_bytes,
+            sth,
             &ws.witness_id,
-            &ed25519_sig_b64,
-            ml_dsa_65_sig_b64.as_deref(),
-            crate::verify::HybridPolicy::Strict,
-            None,
+            &ws.signature,
         )
         .await
-        .map(|_outcome| ())
+        .map(|_form| ())
         .map_err(|e| {
             BlobError::InvalidArgument(format!(
                 "put_stream_sth: witness cosignature verification failed for \

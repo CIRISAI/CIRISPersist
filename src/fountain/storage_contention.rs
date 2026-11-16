@@ -91,6 +91,9 @@ pub enum StorageContentionError {
         /// The refused candidate revision.
         candidate: u64,
     },
+    /// v62.0.0 — the node's signer failed (for a composite: no context-sign).
+    #[error("storage-contention: signer ({0})")]
+    Signer(String),
 }
 
 impl StorageContentionError {
@@ -103,6 +106,7 @@ impl StorageContentionError {
             Self::MalformedBase64(_) => "storage_contention_malformed_base64",
             Self::SignatureFailed => "storage_contention_signature_failed",
             Self::RevisionRollback { .. } => "storage_contention_revision_rollback",
+            Self::Signer(_) => "storage_contention_signer",
         }
     }
 }
@@ -147,10 +151,19 @@ pub struct StorageBudgetWire {
     pub scopes: Vec<ScopeBudgetWire>,
     /// Pinned `subject_kind`s.
     pub pinned_class: Vec<String>,
-    /// Ed25519 signature over the CC 6.1.3 preimage, base64 standard.
+    /// EARLIER form (CC 8.11.12): Ed25519 signature over the CC 6.1.3
+    /// preimage, base64 standard. Empty when the wire carries the composite.
+    #[serde(default)]
     pub signature_ed25519_base64: String,
-    /// ML-DSA-65 signature over `preimage ‖ ed25519_sig`, base64 standard.
+    /// EARLIER form: ML-DSA-65 signature over `preimage ‖ ed25519_sig`,
+    /// base64 standard.
+    #[serde(default)]
     pub signature_ml_dsa_65_base64: String,
+    /// v62.0.0 (CIRISVerify 23) — the CC 2.6.1.7 composite over the same
+    /// preimage, base64 standard (3373 bytes). The wire carries this OR the
+    /// earlier pair, never both.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature_composite_base64: String,
 }
 
 impl From<&ScopeBudgetWire> for ScopeBudget {
@@ -295,10 +308,19 @@ pub struct CorpusWantWire {
     pub remaining_budget_bytes: u64,
     /// Content-addressed ids wanted (sorted + deduped).
     pub want: Vec<String>,
-    /// Ed25519 signature over the CC 6.1.3 preimage, base64 standard.
+    /// EARLIER form (CC 8.11.12): Ed25519 signature over the CC 6.1.3
+    /// preimage, base64 standard. Empty when the wire carries the composite.
+    #[serde(default)]
     pub signature_ed25519_base64: String,
-    /// ML-DSA-65 signature over `preimage ‖ ed25519_sig`, base64 standard.
+    /// EARLIER form: ML-DSA-65 signature over `preimage ‖ ed25519_sig`,
+    /// base64 standard.
+    #[serde(default)]
     pub signature_ml_dsa_65_base64: String,
+    /// v62.0.0 (CIRISVerify 23) — the CC 2.6.1.7 composite over the same
+    /// preimage, base64 standard (3373 bytes). The wire carries this OR the
+    /// earlier pair, never both.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature_composite_base64: String,
 }
 
 impl CorpusWantPayload {
@@ -372,6 +394,58 @@ pub fn assemble_storage_budget_wire(
     sig_ed25519_base64: String,
     sig_ml_dsa_65_base64: String,
 ) -> Result<String, StorageContentionError> {
+    assemble_storage_budget_wire_with(
+        payload_json,
+        WireSignature {
+            ed25519: sig_ed25519_base64,
+            ml_dsa_65: sig_ml_dsa_65_base64,
+            composite: String::new(),
+        },
+    )
+}
+
+/// v62.0.0 — assemble the wire from a payload and a base64 CC 2.6.1.7
+/// composite signature over its preimage (the forward form).
+///
+/// # Errors
+/// [`StorageContentionError`] on parse / validation failure.
+pub fn assemble_storage_budget_wire_composite(
+    payload_json: &str,
+    sig_composite_base64: String,
+) -> Result<String, StorageContentionError> {
+    assemble_storage_budget_wire_with(
+        payload_json,
+        WireSignature {
+            ed25519: String::new(),
+            ml_dsa_65: String::new(),
+            composite: sig_composite_base64,
+        },
+    )
+}
+
+/// v62.0.0 — sign a payload with the node's [`LocalSigner`](crate::signing::LocalSigner)
+/// in the form its ceremony state writes (CC D4: earlier before the
+/// edition-2 ceremony row, composite after) and assemble the wire.
+///
+/// # Errors
+/// [`StorageContentionError`] on parse / validation failure or a signer
+/// fault ([`StorageContentionError::Signer`]).
+pub async fn sign_storage_budget_wire(
+    signer: &crate::signing::LocalSigner,
+    payload_json: &str,
+    ceremony: crate::federation::sth_form::CeremonyState,
+) -> Result<String, StorageContentionError> {
+    let preimage = storage_budget_preimage(payload_json)?;
+    let sig = crate::verify::sig19::sign_sig19(signer, &preimage, ceremony)
+        .await
+        .map_err(|e| StorageContentionError::Signer(e.to_string()))?;
+    assemble_storage_budget_wire_with(payload_json, WireSignature::of(&sig))
+}
+
+fn assemble_storage_budget_wire_with(
+    payload_json: &str,
+    sig: WireSignature,
+) -> Result<String, StorageContentionError> {
     let payload: StorageBudgetPayload = serde_json::from_str(payload_json)
         .map_err(|e| StorageContentionError::MalformedJson(e.to_string()))?;
     payload
@@ -384,8 +458,9 @@ pub fn assemble_storage_budget_wire(
         revision: payload.revision,
         scopes: payload.scopes,
         pinned_class: payload.pinned_class,
-        signature_ed25519_base64: sig_ed25519_base64,
-        signature_ml_dsa_65_base64: sig_ml_dsa_65_base64,
+        signature_ed25519_base64: sig.ed25519,
+        signature_ml_dsa_65_base64: sig.ml_dsa_65,
+        signature_composite_base64: sig.composite,
     };
     serde_json::to_string(&wire).map_err(|e| StorageContentionError::MalformedJson(e.to_string()))
 }
@@ -398,6 +473,58 @@ pub fn assemble_corpus_want_wire(
     payload_json: &str,
     sig_ed25519_base64: String,
     sig_ml_dsa_65_base64: String,
+) -> Result<String, StorageContentionError> {
+    assemble_corpus_want_wire_with(
+        payload_json,
+        WireSignature {
+            ed25519: sig_ed25519_base64,
+            ml_dsa_65: sig_ml_dsa_65_base64,
+            composite: String::new(),
+        },
+    )
+}
+
+/// v62.0.0 — assemble the wire from a payload and a base64 CC 2.6.1.7
+/// composite signature over its preimage (the forward form).
+///
+/// # Errors
+/// [`StorageContentionError`] on parse / validation failure.
+pub fn assemble_corpus_want_wire_composite(
+    payload_json: &str,
+    sig_composite_base64: String,
+) -> Result<String, StorageContentionError> {
+    assemble_corpus_want_wire_with(
+        payload_json,
+        WireSignature {
+            ed25519: String::new(),
+            ml_dsa_65: String::new(),
+            composite: sig_composite_base64,
+        },
+    )
+}
+
+/// v62.0.0 — sign a payload with the node's [`LocalSigner`](crate::signing::LocalSigner)
+/// in the form its ceremony state writes (CC D4: earlier before the
+/// edition-2 ceremony row, composite after) and assemble the wire.
+///
+/// # Errors
+/// [`StorageContentionError`] on parse / validation failure or a signer
+/// fault ([`StorageContentionError::Signer`]).
+pub async fn sign_corpus_want_wire(
+    signer: &crate::signing::LocalSigner,
+    payload_json: &str,
+    ceremony: crate::federation::sth_form::CeremonyState,
+) -> Result<String, StorageContentionError> {
+    let preimage = corpus_want_preimage(payload_json)?;
+    let sig = crate::verify::sig19::sign_sig19(signer, &preimage, ceremony)
+        .await
+        .map_err(|e| StorageContentionError::Signer(e.to_string()))?;
+    assemble_corpus_want_wire_with(payload_json, WireSignature::of(&sig))
+}
+
+fn assemble_corpus_want_wire_with(
+    payload_json: &str,
+    sig: WireSignature,
 ) -> Result<String, StorageContentionError> {
     let payload: CorpusWantPayload = serde_json::from_str(payload_json)
         .map_err(|e| StorageContentionError::MalformedJson(e.to_string()))?;
@@ -412,8 +539,9 @@ pub fn assemble_corpus_want_wire(
         size_cap_bytes: payload.size_cap_bytes,
         remaining_budget_bytes: payload.remaining_budget_bytes,
         want: payload.want,
-        signature_ed25519_base64: sig_ed25519_base64,
-        signature_ml_dsa_65_base64: sig_ml_dsa_65_base64,
+        signature_ed25519_base64: sig.ed25519,
+        signature_ml_dsa_65_base64: sig.ml_dsa_65,
+        signature_composite_base64: sig.composite,
     };
     serde_json::to_string(&wire).map_err(|e| StorageContentionError::MalformedJson(e.to_string()))
 }
@@ -432,17 +560,39 @@ pub fn verify_storage_budget_wire(
     let wire: StorageBudgetWire = serde_json::from_str(wire_json)
         .map_err(|e| StorageContentionError::MalformedJson(e.to_string()))?;
     let (ed_pub, mldsa_pub) = decode_pubkeys(ed25519_pubkey_base64, ml_dsa_65_pubkey_base64)?;
-    let (sig_ed, sig_mldsa) = decode_sigs(
+    let shape = wire.to_verify();
+    // v62.0.0 — by FORM (CC 2.6.1.7 composite through Verify; the earlier
+    // bound-hybrid pair, CC 8.11.12, structure first as Verify orders it).
+    match wire_signature(
         &wire.signature_ed25519_base64,
         &wire.signature_ml_dsa_65_base64,
-    )?;
-    match verify_storage_budget_v1(&wire.to_verify(), &sig_ed, &sig_mldsa, &ed_pub, &mldsa_pub) {
-        StorageContentionVerification::HybridVerified => Ok(()),
-        StorageContentionVerification::Invalid(e) => {
-            Err(StorageContentionError::Invalid(e.to_string()))
-        }
-        StorageContentionVerification::SignatureFailed => {
-            Err(StorageContentionError::SignatureFailed)
+        &wire.signature_composite_base64,
+    )? {
+        crate::verify::sig19::Sig19::Composite(sig) => match verify_storage_budget_v1(
+            &shape,
+            &sig,
+            &crate::verify::sig19::composite_pubkey(&ed_pub, &mldsa_pub),
+        ) {
+            StorageContentionVerification::Verified => Ok(()),
+            StorageContentionVerification::Invalid(e) => {
+                Err(StorageContentionError::Invalid(e.to_string()))
+            }
+            StorageContentionVerification::SignatureFailed => {
+                Err(StorageContentionError::SignatureFailed)
+            }
+        },
+        earlier => {
+            shape
+                .validate()
+                .map_err(|e| StorageContentionError::Invalid(e.to_string()))?;
+            crate::verify::sig19::verify_sig19(
+                &shape.signing_preimage(),
+                &earlier,
+                &ed_pub,
+                &mldsa_pub,
+            )
+            .map(|_| ())
+            .map_err(|_| StorageContentionError::SignatureFailed)
         }
     }
 }
@@ -460,17 +610,39 @@ pub fn verify_corpus_want_wire(
     let wire: CorpusWantWire = serde_json::from_str(wire_json)
         .map_err(|e| StorageContentionError::MalformedJson(e.to_string()))?;
     let (ed_pub, mldsa_pub) = decode_pubkeys(ed25519_pubkey_base64, ml_dsa_65_pubkey_base64)?;
-    let (sig_ed, sig_mldsa) = decode_sigs(
+    let shape = wire.to_verify();
+    // v62.0.0 — by FORM (CC 2.6.1.7 composite through Verify; the earlier
+    // bound-hybrid pair, CC 8.11.12, structure first as Verify orders it).
+    match wire_signature(
         &wire.signature_ed25519_base64,
         &wire.signature_ml_dsa_65_base64,
-    )?;
-    match verify_corpus_want_v1(&wire.to_verify(), &sig_ed, &sig_mldsa, &ed_pub, &mldsa_pub) {
-        StorageContentionVerification::HybridVerified => Ok(()),
-        StorageContentionVerification::Invalid(e) => {
-            Err(StorageContentionError::Invalid(e.to_string()))
-        }
-        StorageContentionVerification::SignatureFailed => {
-            Err(StorageContentionError::SignatureFailed)
+        &wire.signature_composite_base64,
+    )? {
+        crate::verify::sig19::Sig19::Composite(sig) => match verify_corpus_want_v1(
+            &shape,
+            &sig,
+            &crate::verify::sig19::composite_pubkey(&ed_pub, &mldsa_pub),
+        ) {
+            StorageContentionVerification::Verified => Ok(()),
+            StorageContentionVerification::Invalid(e) => {
+                Err(StorageContentionError::Invalid(e.to_string()))
+            }
+            StorageContentionVerification::SignatureFailed => {
+                Err(StorageContentionError::SignatureFailed)
+            }
+        },
+        earlier => {
+            shape
+                .validate()
+                .map_err(|e| StorageContentionError::Invalid(e.to_string()))?;
+            crate::verify::sig19::verify_sig19(
+                &shape.signing_preimage(),
+                &earlier,
+                &ed_pub,
+                &mldsa_pub,
+            )
+            .map(|_| ())
+            .map_err(|_| StorageContentionError::SignatureFailed)
         }
     }
 }
@@ -523,14 +695,61 @@ fn decode_pubkeys(
     ))
 }
 
-fn decode_sigs(
+/// The three base64 signature fields a wire carries (one form filled).
+struct WireSignature {
+    ed25519: String,
+    ml_dsa_65: String,
+    composite: String,
+}
+
+impl WireSignature {
+    fn of(sig: &crate::verify::sig19::Sig19) -> Self {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        match sig {
+            crate::verify::sig19::Sig19::Earlier { ed25519, mldsa65 } => Self {
+                ed25519: B64.encode(ed25519),
+                ml_dsa_65: mldsa65
+                    .as_deref()
+                    .map(|m| B64.encode(m))
+                    .unwrap_or_default(),
+                composite: String::new(),
+            },
+            crate::verify::sig19::Sig19::Composite(c) => Self {
+                ed25519: String::new(),
+                ml_dsa_65: String::new(),
+                composite: B64.encode(c),
+            },
+        }
+    }
+}
+
+/// The wire's signature in its form: the composite, or the earlier pair (an
+/// empty ML-DSA-65 half kept, refused at verify). Both present is refused.
+fn wire_signature(
     ed_b64: &str,
     mldsa_b64: &str,
-) -> Result<(Vec<u8>, Vec<u8>), StorageContentionError> {
-    Ok((
-        b64_decode(ed_b64, "sig_ed25519")?,
-        b64_decode(mldsa_b64, "sig_ml_dsa_65")?,
-    ))
+    composite_b64: &str,
+) -> Result<crate::verify::sig19::Sig19, StorageContentionError> {
+    if composite_b64.is_empty() {
+        return Ok(crate::verify::sig19::Sig19::Earlier {
+            ed25519: b64_decode(ed_b64, "sig_ed25519")?,
+            mldsa65: if mldsa_b64.is_empty() {
+                None
+            } else {
+                Some(b64_decode(mldsa_b64, "sig_ml_dsa_65")?)
+            },
+        });
+    }
+    if !ed_b64.is_empty() || !mldsa_b64.is_empty() {
+        return Err(StorageContentionError::Invalid(
+            "a wire carries the composite or the earlier pair, not both".into(),
+        ));
+    }
+    Ok(crate::verify::sig19::Sig19::Composite(b64_decode(
+        composite_b64,
+        "sig_composite",
+    )?))
 }
 
 #[cfg(test)]

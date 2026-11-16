@@ -25,6 +25,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::store::Backend;
+use ciris_persist::verify::sig19::Sig19;
 use ciris_persist::witness::{
     accept_if_monotonic, build_local_witness, classify, verdict_json, WitnessLeaf,
     WitnessReconcileAction, WitnessWire, QUORUM_MERGE_SUBJECT_KINDS, WITNESS_EQUIVOCATION,
@@ -96,8 +97,7 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
     backend
         .put_wholeness_witness(
             &witness,
-            &ed_sig,
-            Some(&pqc_sig),
+            &Sig19::earlier_b64(&ed_sig, Some(&pqc_sig)).unwrap(),
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -125,8 +125,7 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
     let err = backend
         .put_wholeness_witness(
             &w2,
-            &ed_sig2,
-            None, // classical-only → §19.0 hard cut
+            &Sig19::earlier_b64(&ed_sig2, None).unwrap(), // classical-only → §19.0 hard cut
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -174,7 +173,8 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
     ];
     let w_ww2 = build_local_witness(&peer_ww2, 1, 1000, &mixed);
     // Root is over exactly the one survivor.
-    let expected_root = ciris_verify_core::substrate::compute_merkle_root(&[b"keep".to_vec()]);
+    let expected_root =
+        ciris_verify_core::substrate::compute_merkle_root(&[b"keep".to_vec()]).unwrap();
     assert_eq!(
         w_ww2.merkle_root, expected_root,
         "(c) root over survivors only"
@@ -190,8 +190,7 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
     backend
         .put_wholeness_witness(
             &w_ww2,
-            &ed3,
-            Some(&pqc3),
+            &Sig19::earlier_b64(&ed3, Some(&pqc3)).unwrap(),
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -208,8 +207,7 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
     backend
         .put_wholeness_witness(
             &w5,
-            &e5,
-            Some(&p5),
+            &Sig19::earlier_b64(&e5, Some(&p5)).unwrap(),
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -265,8 +263,7 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
         backend
             .put_wholeness_witness(
                 &w,
-                &ed,
-                Some(&pqc),
+                &Sig19::earlier_b64(&ed, Some(&pqc)).unwrap(),
                 "witness-mldsa",
                 &producer.ed_pub_b64,
                 Some(&pqc_pub),
@@ -300,8 +297,7 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
     let err = backend
         .put_wholeness_witness(
             &wt,
-            &BASE64.encode(&ed_bytes),
-            Some(&pqc_t),
+            &Sig19::earlier_b64(&BASE64.encode(&ed_bytes), Some(&pqc_t)).unwrap(),
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -338,8 +334,7 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
         backend
             .put_wholeness_witness(
                 w,
-                &ed,
-                Some(&pqc),
+                &Sig19::earlier_b64(&ed, Some(&pqc)).unwrap(),
                 "witness-mldsa",
                 &producer.ed_pub_b64,
                 Some(&pqc_pub),
@@ -405,7 +400,7 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
         peer_id: peer_self.clone(),
         epoch_id: 1,
         claim_namespaces: vec!["scores:self".into()], // WW-2 violation
-        merkle_root: ciris_verify_core::substrate::compute_merkle_root(&[b"x".to_vec()]),
+        merkle_root: ciris_verify_core::substrate::compute_merkle_root(&[b"x".to_vec()]).unwrap(),
         leaf_count: 1,
         observed_at_unix_ms: 1000,
         witness_version: 1,
@@ -414,8 +409,7 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
     let err = backend
         .put_wholeness_witness(
             &w_self,
-            &ed_s,
-            Some(&pqc_s),
+            &Sig19::earlier_b64(&ed_s, Some(&pqc_s)).unwrap(),
             "witness-mldsa",
             &producer.ed_pub_b64,
             Some(&pqc_pub),
@@ -462,13 +456,13 @@ fn root_hex_builder_and_wire_shape() {
     use sha2::{Digest as _, Sha256};
 
     // Empty leaf set → the §19.1 empty sentinel root.
-    let empty = ciris_verify_core::substrate::compute_merkle_root(&[]);
+    let empty = ciris_verify_core::substrate::compute_merkle_root(&[]).unwrap();
     let sentinel: [u8; 32] = Sha256::digest(b"WW-v1-empty").into();
     assert_eq!(empty, sentinel, "empty array → the WW-v1-empty sentinel");
 
     // Non-empty parity with the verify-core scheme + hex round-trip.
     let leaves = vec![b"l1".to_vec(), b"l2".to_vec()];
-    let root = ciris_verify_core::substrate::compute_merkle_root(&leaves);
+    let root = ciris_verify_core::substrate::compute_merkle_root(&leaves).unwrap();
     let hex = encode_root_hex(&root);
     assert_eq!(hex.len(), 64);
     assert_eq!(decode_root_hex(&hex).unwrap(), root);
@@ -579,8 +573,7 @@ async fn equivocation_emits_hard_case_and_retains_both() {
         backend
             .put_wholeness_witness(
                 w,
-                &ed,
-                Some(&pqc),
+                &Sig19::earlier_b64(&ed, Some(&pqc)).unwrap(),
                 "witness-mldsa",
                 &producer.ed_pub_b64,
                 Some(&pqc_pub),
@@ -664,7 +657,8 @@ async fn divergent_triggers_quorum_merge_revoked_not_resurrected() {
         peer_id: "peer-a".into(),
         epoch_id: 1,
         claim_namespaces: vec!["revocation".into()],
-        merkle_root: ciris_verify_core::substrate::compute_merkle_root(&[b"state-a".to_vec()]),
+        merkle_root: ciris_verify_core::substrate::compute_merkle_root(&[b"state-a".to_vec()])
+            .unwrap(),
         leaf_count: 1,
         observed_at_unix_ms: 1,
         witness_version: 1,
@@ -673,7 +667,8 @@ async fn divergent_triggers_quorum_merge_revoked_not_resurrected() {
         peer_id: "peer-b".into(),
         epoch_id: 1,
         claim_namespaces: vec!["revocation".into()],
-        merkle_root: ciris_verify_core::substrate::compute_merkle_root(&[b"state-b".to_vec()]),
+        merkle_root: ciris_verify_core::substrate::compute_merkle_root(&[b"state-b".to_vec()])
+            .unwrap(),
         leaf_count: 1,
         observed_at_unix_ms: 1,
         witness_version: 1,
