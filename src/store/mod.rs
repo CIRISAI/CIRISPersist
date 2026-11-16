@@ -36,6 +36,11 @@ pub(crate) mod fountain_read;
 #[cfg(test)]
 /// CIRISPersist#789 — the crypto-cardinality declaration gate.
 pub(crate) mod crypto_cardinality;
+#[cfg(test)]
+mod edition1_gen;
+/// v62.0.0 (slice E2b) — the edition-2 baseline: its version, its additions,
+/// and the I1950 catalog witness.
+pub(crate) mod edition_baseline;
 /// #840 (I43/I44) — the migration-immutability gate and V070's repair.
 mod migration_immutability;
 /// v62.0.0 (WASM_UEFI_READINESS P6) — persist applies its own migrations:
