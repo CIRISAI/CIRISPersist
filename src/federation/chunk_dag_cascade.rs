@@ -6261,7 +6261,9 @@ pub mod invariants {
             use ciris_crypto::PqcSigner as _;
             B64.encode(mldsa.public_key().unwrap())
         };
-        let signer = Box::new(crate::federation::sth_form::test_support::composite([0x52; 32], [0x51; 32]));
+        let signer = Box::new(crate::federation::sth_form::test_support::composite(
+            [0x52; 32], [0x51; 32],
+        ));
         let record = crate::federation::KeyRecord {
             key_id: key_id.into(),
             pubkey_ed25519_base64: ed_pub_b64,
@@ -6311,8 +6313,7 @@ pub mod invariants {
             &log_id, tree_size, &root_hash, timestamp,
         );
         // v62.0.0: the earlier (bound-hybrid) form, as the stored bytes.
-        let signature =
-            signer.sign(&signing_bytes).unwrap();
+        let signature = signer.sign(&signing_bytes).unwrap();
         ciris_verify_core::transparency::SignedTreeHead {
             log_id,
             tree_size,

@@ -39,11 +39,12 @@ struct Producer {
 
 impl Producer {
     fn new(seed: u8) -> Self {
-        let key =
-            ciris_crypto::composite::CompositeSigningKey::from_seeds(&[seed ^ 0x55; 32], &[seed; 32]);
-        let ed_pub_b64 = BASE64.encode(
-            &key.public_key().as_bytes()[ciris_crypto::composite::MLDSA65_PK_LEN..],
+        let key = ciris_crypto::composite::CompositeSigningKey::from_seeds(
+            &[seed ^ 0x55; 32],
+            &[seed; 32],
         );
+        let ed_pub_b64 =
+            BASE64.encode(&key.public_key().as_bytes()[ciris_crypto::composite::MLDSA65_PK_LEN..]);
         Self { key, ed_pub_b64 }
     }
 

@@ -229,10 +229,9 @@ pub async fn produce_stream_sth(
     let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
     // v62.0.0 (slice D) — the composite (CC 2.6.1.7), the only form a v62
     // node writes.
-    let signature =
-        super::sth_form::sign_sth(local, &signing_bytes)
-            .await
-            .map_err(|e| BlobError::Backend(format!("produce_stream_sth: signer: {e}")))?;
+    let signature = super::sth_form::sign_sth(local, &signing_bytes)
+        .await
+        .map_err(|e| BlobError::Backend(format!("produce_stream_sth: signer: {e}")))?;
     Ok(SignedTreeHead {
         log_id,
         tree_size,

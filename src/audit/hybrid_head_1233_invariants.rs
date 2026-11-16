@@ -94,11 +94,20 @@ pub(crate) mod bodies {
         let mut short = h.signature.clone();
         short.pop();
         vec![
-            ("the earlier (v61 bound-hybrid) form", with(earlier_form_signature(h))),
+            (
+                "the earlier (v61 bound-hybrid) form",
+                with(earlier_form_signature(h)),
+            ),
             ("a composite one byte short", with(short)),
-            ("the ML-DSA-65 half alone", with(h.signature[..3309].to_vec())),
+            (
+                "the ML-DSA-65 half alone",
+                with(h.signature[..3309].to_vec()),
+            ),
             ("no signature bytes", with(Vec::new())),
-            ("a JSON object that is no signature", with(b"{\"pqc\":null}".to_vec())),
+            (
+                "a JSON object that is no signature",
+                with(b"{\"pqc\":null}".to_vec()),
+            ),
         ]
     }
 
@@ -246,7 +255,9 @@ pub(crate) mod bodies {
     ) {
         match got {
             Err(e) => assert_refused_as_earlier(&e.to_string(), who),
-            other => panic!("I1565 {who}: current_sth must refuse the earlier-form head: {other:?}"),
+            other => {
+                panic!("I1565 {who}: current_sth must refuse the earlier-form head: {other:?}")
+            }
         }
     }
 

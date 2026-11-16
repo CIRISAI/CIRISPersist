@@ -670,7 +670,9 @@ mod tests {
         let mut b = [0u8; 32];
         a[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         b[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        Id(ciris_crypto::composite::CompositeSigningKey::from_seeds(&a, &b))
+        Id(ciris_crypto::composite::CompositeSigningKey::from_seeds(
+            &a, &b,
+        ))
     }
     fn pubs(id: &Id) -> (String, String) {
         let pk = id.0.public_key().as_bytes();
@@ -690,8 +692,11 @@ mod tests {
         "size_cap_bytes":4096,"remaining_budget_bytes":1800,"want":["cid-a","cid-b"]}"#;
 
     fn build_budget(id: &Id, payload: &str) -> String {
-        assemble_storage_budget_wire(payload, sign(id, &storage_budget_preimage(payload).unwrap()))
-            .unwrap()
+        assemble_storage_budget_wire(
+            payload,
+            sign(id, &storage_budget_preimage(payload).unwrap()),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -760,9 +765,11 @@ mod tests {
     fn want_build_verify_and_admits() {
         let id = id();
         let (ed_pub, pqc_pub) = pubs(&id);
-        let wire =
-            assemble_corpus_want_wire(WANT_PAYLOAD, sign(&id, &corpus_want_preimage(WANT_PAYLOAD).unwrap()))
-                .unwrap();
+        let wire = assemble_corpus_want_wire(
+            WANT_PAYLOAD,
+            sign(&id, &corpus_want_preimage(WANT_PAYLOAD).unwrap()),
+        )
+        .unwrap();
         assert!(verify_corpus_want_wire(&wire, &ed_pub, &pqc_pub).is_ok());
         assert!(corpus_want_admits(&wire, "cid-a", 4096).unwrap());
         assert!(!corpus_want_admits(&wire, "cid-a", 4097).unwrap()); // over cap

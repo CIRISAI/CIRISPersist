@@ -170,15 +170,13 @@ pub fn verify_audit_sth(
         ed25519_base64: signer_ed25519_pubkey_b64.to_owned(),
         ml_dsa_65_base64: Some(signer_ml_dsa_65_pubkey_b64.to_owned()),
     };
-    crate::federation::sth_form::verify_sth_signature(sth, &sth.signature, &pinned).map_err(
-        |e| {
-            TransparencyError::Signing(format!(
-                "{AUDIT_STH_SIGNATURE_INVALID}: {e} for the signed tree head of {} at \
+    crate::federation::sth_form::verify_sth_signature(sth, &sth.signature, &pinned).map_err(|e| {
+        TransparencyError::Signing(format!(
+            "{AUDIT_STH_SIGNATURE_INVALID}: {e} for the signed tree head of {} at \
                  tree_size {}",
-                sth.log_id, sth.tree_size
-            ))
-        },
-    )
+            sth.log_id, sth.tree_size
+        ))
+    })
 }
 
 /// The head's signature bytes for the `signature_blob` column (v62.0.0): the

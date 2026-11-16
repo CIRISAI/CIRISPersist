@@ -46035,8 +46035,7 @@ mod tests {
         let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
             &log_id, tree_size, &root_hash, timestamp,
         );
-        let signature =
-            signer.sign(&signing_bytes).unwrap();
+        let signature = signer.sign(&signing_bytes).unwrap();
         ciris_verify_core::transparency::SignedTreeHead {
             log_id,
             tree_size,

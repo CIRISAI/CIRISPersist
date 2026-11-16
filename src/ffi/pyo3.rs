@@ -5046,7 +5046,7 @@ impl PyEngine {
             py.detach(move || {
                 runtime.block_on(async move {
                     crate::fountain::storage_contention::sign_storage_budget_wire(&signer, &payload)
-                    .await
+                        .await
                 })
             })
             .map_err(storage_contention_err_to_py)
@@ -5068,7 +5068,7 @@ impl PyEngine {
             py.detach(move || {
                 runtime.block_on(async move {
                     crate::fountain::storage_contention::sign_corpus_want_wire(&signer, &payload)
-                    .await
+                        .await
                 })
             })
             .map_err(storage_contention_err_to_py)
@@ -10129,8 +10129,9 @@ impl PyEngine {
         catch_panic(|| {
             // v62.0.0 — the composite only; an earlier-form head (the v22
             // HybridSignature object) is refused by name.
-            let value: serde_json::Value = serde_json::from_str(sth_json)
-                .map_err(|e| PyValueError::new_err(format!("put_stream_sth: sth_json parse: {e}")))?;
+            let value: serde_json::Value = serde_json::from_str(sth_json).map_err(|e| {
+                PyValueError::new_err(format!("put_stream_sth: sth_json parse: {e}"))
+            })?;
             let sth: ciris_verify_core::transparency::SignedTreeHead =
                 crate::federation::sth_form::sth_from_json(value)
                     .map_err(|e| PyValueError::new_err(format!("put_stream_sth: sth_json: {e}")))?;

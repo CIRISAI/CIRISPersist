@@ -49997,8 +49997,7 @@ mod tests {
     async fn register_hybrid_producer(
         backend: &SqliteBackend,
         key_id: &str,
-    ) -> Box<ciris_crypto::composite::CompositeSigningKey>
-    {
+    ) -> Box<ciris_crypto::composite::CompositeSigningKey> {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
         let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x31; 32]).unwrap();
@@ -50019,7 +50018,9 @@ mod tests {
         // over (#88 zeroize/layout). Only the 8-byte Box crosses the await.
         // (KeyRecord is also built inline rather than via `fed_key`, which
         // would derive its own multi-KiB ML-DSA pubkeys on this frame.)
-        let signer = Box::new(crate::federation::sth_form::test_support::composite([0x32; 32], [0x31; 32]));
+        let signer = Box::new(crate::federation::sth_form::test_support::composite(
+            [0x32; 32], [0x31; 32],
+        ));
         let record = crate::federation::KeyRecord {
             key_id: key_id.into(),
             pubkey_ed25519_base64: ed_pub_b64,
@@ -50062,8 +50063,7 @@ mod tests {
         backend: &SqliteBackend,
         key_id: &str,
         register: bool,
-    ) -> Box<ciris_crypto::composite::CompositeSigningKey>
-    {
+    ) -> Box<ciris_crypto::composite::CompositeSigningKey> {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
         let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x41; 32]).unwrap();
@@ -50076,7 +50076,9 @@ mod tests {
             use ciris_crypto::PqcSigner as _;
             B64.encode(mldsa.public_key().unwrap())
         };
-        let signer = Box::new(crate::federation::sth_form::test_support::composite([0x42; 32], [0x41; 32]));
+        let signer = Box::new(crate::federation::sth_form::test_support::composite(
+            [0x42; 32], [0x41; 32],
+        ));
         if register {
             let record = crate::federation::KeyRecord {
                 key_id: key_id.into(),
@@ -50216,8 +50218,7 @@ mod tests {
         let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
             &log_id, tree_size, &root_hash, timestamp,
         );
-        let signature =
-            signer.sign(&signing_bytes).unwrap();
+        let signature = signer.sign(&signing_bytes).unwrap();
         ciris_verify_core::transparency::SignedTreeHead {
             log_id,
             tree_size,
@@ -50317,8 +50318,7 @@ mod tests {
             &sth.root_hash,
             sth.timestamp,
         );
-        sth.signature =
-            signer.sign(&signing_bytes).unwrap();
+        sth.signature = signer.sign(&signing_bytes).unwrap();
         let err = backend
             .put_stream_sth(sth, "producer-key")
             .await
@@ -50366,8 +50366,7 @@ mod tests {
             &sth.root_hash,
             sth.timestamp,
         );
-        sth.signature =
-            signer.sign(&signing_bytes).unwrap();
+        sth.signature = signer.sign(&signing_bytes).unwrap();
         let err = backend
             .put_stream_sth(sth, "producer-key")
             .await
