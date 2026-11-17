@@ -1,0 +1,996 @@
+From 1665f22bafcb95215bea8a1a935a59d1f7f62e57 Mon Sep 17 00:00:00 2001
+From: Eric Moore <mooreericnyc@gmail.com>
+Date: Sun, 15 Nov 2026 16:58:30 -0600
+Subject: [PATCH] wip(w614-lts-floor): checkpoint of the uncommitted
+ removal-floor work before v62 opens
+
+Staged work carried from the 61.4 cycle (the removal floor), committed as a
+checkpoint so nothing is lost when v62 starts. Not reviewed, not certified.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RmimP6Y1ABLko9usXN2Ssd
+---
+ CHANGELOG.md                                  |   5 +
+ src/engine.rs                                 |  18 +-
+ src/federation/admission.rs                   |  32 +++
+ src/federation/affiliation_config.rs          |  17 ++
+ .../affiliation_floor_invariants.rs           |  12 +-
+ src/federation/community_admit.rs             |   6 +
+ src/federation/consensus.rs                   |   7 +
+ src/federation/cosign_invariants.rs           | 219 ++++++++++++++++++
+ src/federation/family_admit.rs                |   2 +
+ src/federation/family_roster_invariants.rs    |  10 +-
+ src/federation/group_amendment.rs             |   8 +
+ src/federation/mod.rs                         | 130 ++++++++++-
+ .../moderation_walk_asof_invariants.rs        |   9 +-
+ src/federation/put_audience_invariants.rs     |  30 +--
+ src/federation/reverse_quorum.rs              |  34 ++-
+ .../room_roster_authority_invariants.rs       |  25 +-
+ src/federation/room_roster_invariants.rs      |  16 +-
+ src/store/backend_suite.rs                    |   6 +-
+ src/store/parity.rs                           |   2 +
+ 19 files changed, 535 insertions(+), 53 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 25e63f24..675068d5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -16,6 +16,10 @@ Room moderation for rooms larger than two: a room moderator can take down a mess
+ 
+ ### Changed
+ 
++- **One signature never removes another member, under every protocol** (CIRISPersist#1201; CC 3.1.3.2 at CIRISConstitution dfde68d, "The floor of two voices stands under every protocol ... A removal has no such second voice, so one signature never removes"; CC 4.5.13). The roster door now refuses a NEW removal of another member that carries fewer than two voices besides the member removed, whatever the `consensus_protocol` (`quorum:1/N`, `founder_only` and `reverse_quorum:` included). The refusal is the existing `roster_consensus_insufficient` with the #1250 shortfall (`have`, `need: 2`, the eligible signers); it is short by signatures, so the primary's own local door holds it for cosignatures like any other shortfall. At two members nobody is removed: resignation (the member signs their own removal) is the exit and needs no one. Voices are persons (CIRISPersist#1198), and an affiliation's designated official counts as the outside voice its countersign rule names (CC 4.4.3.2.8). Asked at the door only: a removal the fold already admitted is not unsaid. `consensus::REMOVAL_VOICE_FLOOR` (2). An admission is unchanged: the invitee's acceptance is its second voice, so `quorum:1/N` still admits on one member's signature (CC's reading A).
++- **A room's moderator removes an AI agent's key alone** (CC 4.5.13, CIRISConstitution b9d267c). A removal whose target is an `agent`-typed key (not a person's) stands on a live `moderate` holder's signature, a zero-hop steward-bound founder or a delegate, with no protocol count and no floor. The fold reads the same standing at every replay. A person is never removed by a moderator alone.
++- **`custom:` consensus protocols are refused at declaration** (CC 3.3.4, CC 4.4.3.4.2.1 at CIRISConstitution 6453665, which removes `custom:`). A new community or family, a supersede, and a replicated version that moves a stored group onto `custom:{id}` are refused `consensus_protocol_custom_removed` (`InvalidArgument`, Python `ValueError`). A group already stored under `custom:` keeps folding as data. `weighted:` stays declarable and its parsing is unchanged.
++
+ - **`quorum:M/N` below `M` counts the whole roster, and `M` latches once reached** (CIRISPersist#1201, CC 4.4.3.4.2.1). A room founded alone at `quorum:3/4` could not seat its second member: the gate asked three signatures of a room of one. While the roster is below `M` and the group's lineage has never held `M` members, the gate now needs every live member (at least one), the invitee's acceptance being the other consent; from the first act at which the roster reaches `M`, `M` binds absolutely and for good. A room that reached `M` and shrank below it is stalled, and its refusal says so (`roster_consensus_insufficient`, detail "stalled", `have`/`need` per #1250). "Ever reached `M`" is a fold over persisted roster history, never a stored flag: `authorized_roster_high_water_at` (the largest active roster the authorized fold held, the same replay as `authorized_roster_state_at`) and the directory read `community_roster_high_water_at`. No migration: the roster doors already replay the lineage, so the high water costs no extra read. One count for both readers: `consensus::quorum_need`, used by the evaluator and by the new `required_signatures_at` (`required_signatures` stays absolute). `consensus::Ballot` gains `high_water: Option<usize>`; `None`, which every caller that does not fold the lineage passes (the trust-root chain, a retraction of a roster event, a record change, the accord checks), keeps absolute `M`. `roster_event_standing` and `roster_event_verdict` take the high water. An `infrastructure` community never relaxes (CC 3.2 T7). Carrying the high water on the signed `group:roster` head is left to CIRISPersist#1253.
+ 
+ ### Fixed
+@@ -35,6 +39,7 @@ Room moderation for rooms larger than two: a room moderator can take down a mess
+ - **I1746** (two nodes; sqlite and postgres; CIRISPersist#1260): room content in CIRISEdge's row shape (a `chat:message:v1` message and a `file:v1` file, authored at `self` and `local` tier with a `community_dek` pointer and `evidence_refs`, entered into the mesh and placed by the author's `supersedes` widening). A is the author's node; B is the founder's and receives only the widenings, through `apply_replicated_attestation`. On B the founder takes the message down and its `takedown` deputy the file (`community_standards`); the same notices apply on A; both are tombstoned and withheld on both nodes. A plain member and another room's founder are refused `takedown_unauthorised` on both nodes. The `review` deputy's `reversed` ruling, placed at the room's scope, lifts the message's withholding; a plain member's is refused. A placement the author withdraws (the room-born `withdraws` delivered to B) binds no room on either node, and the founder is refused.
+ - **I1750** (two nodes; sqlite and postgres; CIRISPersist#1260, C536 (a)): a room of two, a founder and one member. The founder takes the member's placed message down on the founder's node, and the notice applies on the author's. The member takes down their own placed message on the founder's node, which holds only the placement: the content's signed subject signs the takedown (CC 4.5.5 (a); the takedown door has admitted the subject since v55, I786, and the placement now carries that standing to a member's node). The member cannot take the founder's message down.
+ - **I1747** (sqlite and postgres; CIRISPersist#1260): `attestations_binding_content_with_placements` returns the author's row and its room placement, and not a widening to `federation` scope; `attestations_binding_content` returns no `supersedes` row.
++- **I1753** (sqlite and postgres; CIRISPersist#1201): `quorum:1/3`, one member removing another is `have 1, need 2`, two members other than the target remove, the target resigns alone; a `founder_only` family of two founders, one never removes the other; a founder (the room's moderator) removes an AI agent's key alone and never a person. **I1754** (sqlite and postgres): `custom:` refused for a room and a family at put, a peer's legacy `custom:` room still applies and folds, `weighted:` declarable. Fixtures that removed a member on one signature now resign or add a second voice (I163, I165, I167, I170, I173, I177, I181, I1513, I1521, I1524, P3, E4, `cohort_surface_roundtrip`); fixtures that founded a `custom:` room now apply it as legacy data.
+ - **I1751** (sqlite and postgres; CIRISPersist#1201): a room founded alone at `quorum:3/4` seats its second member on the founder's signature, its third on both (one alone is `have 1, need 2`), and at three members `M` binds (two are `have 2, need 3`, three seat the fourth); after two resignations the room of two is stalled (`have 2, need 3`, "stalled"), and the high-water read answers 4. **I1752** (pure): `quorum_need`, `required_signatures_at` and the evaluator agree on every case, `None` and `infrastructure` included.
+ - **I1748** (sqlite and postgres; CIRISPersist#1250): at a node that does not speak for the primary, a `unanimous` room of three founders refuses one signature with `have 1, need 3` and two with `have 2, need 3`, naming the three founders; the third signature lands it. A `majority` room of four: `have 1, need 3`; a member removed from it who signs alone is told `have 0, need 2` and no eligible signers. A stranger's widening (`roster_authority_not_established`) carries no count. **I1749** (pure): each count arm's `have`, `need` and eligible keys, a no-signer ballot included; a self-signed admission, a weighted rubric and an admit carry none.
+ - **I1745** (sqlite and postgres; CIRISPersist#1195, CC 4.5.4): in a `majority` room a plain member, who may still sign for the room, is refused at the `moderation:*` act door, the takedown door and the takedown-reversal door; the founder and its `takedown`/`review` deputy pass all three. I1522 (61.0.2) covers the helpers and the community-scoped reconsideration door.
+diff --git a/src/engine.rs b/src/engine.rs
+index 8c8709ee..8a4510f7 100644
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -20536,9 +20536,11 @@ mod tests {
+                 cohort,
+                 group,
+                 &mem_b,
++                // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one
++                // signature never removes another member; mem_b resigns.
+                 crate::federation::tier_ingest::test_support::sign_revoke_spec(
+                     cohort,
+-                    &founder,
++                    &mem_b,
+                     group,
+                     &mem_b,
+                     chrono::Utc::now(),
+@@ -21237,9 +21239,17 @@ mod tests {
+                     for key in &keys {
+                         ts::register_hybrid_key_as(d, key, key, identity_type::USER).await;
+                     }
+-                    d.put_community(community(&room, &keys[..n], founders, cp))
+-                        .await
+-                        .unwrap_or_else(|e| panic!("{tag}: put_community: {e}"));
++                    // v61.4.0 (CC rc19 6453665) — a `custom:` room is a
++                    // legacy room now, delivered as data.
++                    if cp.starts_with(types::consensus_protocol::CUSTOM_PREFIX) {
++                        d.apply_replicated_community(community(&room, &keys[..n], founders, cp))
++                            .await
++                            .unwrap_or_else(|e| panic!("{tag}: legacy room: {e}"));
++                    } else {
++                        d.put_community(community(&room, &keys[..n], founders, cp))
++                            .await
++                            .unwrap_or_else(|e| panic!("{tag}: put_community: {e}"));
++                    }
+                     (room, keys)
+                 }
+             };
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index de0eddd9..ed5a7ded 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -8592,6 +8592,34 @@ pub fn check_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Err
+     }
+ }
+ 
++/// v61.4.0 (CC 3.3.4, 4.4.3.4.2.1 at CIRISConstitution 6453665, which
++/// removes `custom:`) — the refusal token for a group declaring a
++/// `custom:{id}` protocol. `Error::ConsensusProtocolMalformed` carries the
++/// protocol; this token leads its Display through
++/// [`check_consensus_protocol_not_custom`].
++pub const CONSENSUS_PROTOCOL_CUSTOM_REMOVED: &str = "consensus_protocol_custom_removed";
++
++/// v61.4.0 (CC rc19 6453665: `custom:` is removed) — **refuse a declaration of
++/// `custom:{id}`** at every door that accepts a `consensus_protocol`: a new
++/// community or family, a supersede, and a replicated version that moves a
++/// stored group onto it. A group already stored under `custom:` keeps folding
++/// as data (inert, never rewritten); its next version names another protocol.
++/// `weighted:` stays declarable.
++///
++/// # Errors
++///
++/// [`Error::InvalidArgument`] led by [`CONSENSUS_PROTOCOL_CUSTOM_REMOVED`]
++/// (Python `ValueError`).
++pub fn check_consensus_protocol_not_custom(consensus_protocol: &str) -> Result<(), Error> {
++    if consensus_protocol.starts_with(crate::federation::types::consensus_protocol::CUSTOM_PREFIX) {
++        return Err(Error::InvalidArgument(format!(
++            "{CONSENSUS_PROTOCOL_CUSTOM_REMOVED}: {consensus_protocol:?} — `custom:` protocols \
++             are removed (CC 3.3.4, CC 4.4.3.4.2.1); declare a canonical protocol"
++        )));
++    }
++    Ok(())
++}
++
+ /// v61 (CIRISPersist#1123; CC 4.4.3.2) — a FAMILY's `consensus_protocol`:
+ /// [`check_consensus_protocol_form`], and never `open:self_admit`, which is a
+ /// `public` group's protocol and a family is never public. Refused as
+@@ -16529,6 +16557,10 @@ pub async fn check_replicated_supersede_does_not_degrade(
+         if stored.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY {
+             check_founder_only_above_family(offered)?;
+         }
++        // v61.4.0 (CC rc19 6453665) — nor onto a removed `custom:` protocol.
++        if stored.consensus_protocol != offered.consensus_protocol {
++            check_consensus_protocol_not_custom(&offered.consensus_protocol)?;
++        }
+         return Ok(());
+     }
+     match check_infrastructure_community_conformance(directory, &stored, at).await {
+diff --git a/src/federation/affiliation_config.rs b/src/federation/affiliation_config.rs
+index 0251db16..5fe39c30 100644
+--- a/src/federation/affiliation_config.rs
++++ b/src/federation/affiliation_config.rs
+@@ -664,6 +664,23 @@ pub fn declared_cohort(c: &Community) -> Result<Cohort, Error> {
+     }
+ }
+ 
++/// v61.4.0 (CIRISPersist#1201; CC 4.4.3.2.8) — the designated officials'
++/// keys a group's `policy_blob` names: the outside voice an affiliation's
++/// countersign rule counts. Empty when none are named or the member does not
++/// parse (the record door refuses a malformed config).
++#[must_use]
++pub fn designated_official_keys(policy_blob: Option<&serde_json::Value>) -> BTreeSet<String> {
++    policy_blob
++        .and_then(serde_json::Value::as_object)
++        .and_then(|o| o.get(POLICY_AFFILIATION_CONFIG_FIELD))
++        .and_then(|v| serde_json::from_value::<AffiliationConfig>(v.clone()).ok())
++        .and_then(|c| c.designated_officials)
++        .unwrap_or_default()
++        .into_iter()
++        .map(|o| o.key_id)
++        .collect()
++}
++
+ /// The record's typed config, if it carries one (no validation).
+ ///
+ /// # Errors
+diff --git a/src/federation/affiliation_floor_invariants.rs b/src/federation/affiliation_floor_invariants.rs
+index cf800929..61ca900e 100644
+--- a/src/federation/affiliation_floor_invariants.rs
++++ b/src/federation/affiliation_floor_invariants.rs
+@@ -165,7 +165,17 @@ pub(crate) mod bodies {
+         .await
+         .unwrap();
+         seat(d, &pair, &f, &m, at).await;
+-        remove(d, &pair, &[&f], &m, at + Duration::minutes(5))
++        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d) — one seat's
++        // signature never removes, founder_only included: both seats do.
++        let e = remove(d, &pair, &[&f], &m, at + Duration::minutes(4))
++            .await
++            .expect_err("I1513: one of two seats never removes");
++        assert_eq!(
++            rule(&e),
++            crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
++            "{e}"
++        );
++        remove(d, &pair, &[&f, &g], &m, at + Duration::minutes(5))
+             .await
+             .expect("I1513: a body of two seats");
+     }
+diff --git a/src/federation/community_admit.rs b/src/federation/community_admit.rs
+index 1b9a9676..eb5705c6 100644
+--- a/src/federation/community_admit.rs
++++ b/src/federation/community_admit.rs
+@@ -278,6 +278,12 @@ where
+     let row = &community.community;
+     // v4.0 — the consensus_protocol canonical form.
+     super::check_consensus_protocol_form(&row.consensus_protocol)?;
++    // v61.4.0 (CC rc19 6453665) — `custom:` is removed: refused on the local
++    // door; a replicated version is refused only when it moves a stored room
++    // onto it (`check_replicated_supersede_does_not_degrade`).
++    if door != CommunityDoor::ReplicatedApply {
++        super::admission::check_consensus_protocol_not_custom(&row.consensus_protocol)?;
++    }
+     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
+     // a config rides only on an affiliation, and an affiliation's config
+     // validates against its roster.
+diff --git a/src/federation/consensus.rs b/src/federation/consensus.rs
+index 50e6f3dd..edeacb70 100644
+--- a/src/federation/consensus.rs
++++ b/src/federation/consensus.rs
+@@ -121,6 +121,13 @@ pub struct Ballot<'a> {
+ /// not among them, sign a removal.
+ pub const OPEN_SELF_ADMIT_REMOVAL_FLOOR: usize = 2;
+ 
++/// v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at CIRISConstitution dfde68d, CC
++/// 4.5.13) — the voices a removal of another member needs under EVERY
++/// protocol, the member removed not among them. The roster door asks it
++/// (`check_roster_authority_over`); a resignation and a moderator's removal of
++/// an AI agent's key are outside it.
++pub const REMOVAL_VOICE_FLOOR: usize = 2;
++
+ /// v61 S2 (CC 4.5.13, the release lead's ruling) — under `open:self_admit`
+ /// each counted voice of a removal signs within this many seconds of the
+ /// removal's asserted instant (72 hours). A roster cosignature carries no
+diff --git a/src/federation/cosign_invariants.rs b/src/federation/cosign_invariants.rs
+index d87fbc9f..6897a572 100644
+--- a/src/federation/cosign_invariants.rs
++++ b/src/federation/cosign_invariants.rs
+@@ -1509,6 +1509,223 @@ pub(crate) mod bodies {
+         );
+     }
+ 
++    /// **I1753** (CIRISPersist#1201; CC 3.1.3.2 at CIRISConstitution dfde68d,
++    /// "the floor of two voices stands under every protocol ... one signature
++    /// never removes"; CC 4.5.13 rc19 b9d267c, a moderator removes an AI
++    /// agent alone). At a node that is not the primary's (refused, not held):
++    ///
++    /// - `quorum:1/3`: one member removing another is
++    ///   `roster_consensus_insufficient` with `have 1, need 2`; the removed
++    ///   member resigns alone; two members other than the target remove;
++    /// - a `founder_only` family of two founders: one founder never removes
++    ///   the other (`have 1, need 2`);
++    /// - a room's founder (its moderator, zero-hop) removes an AI agent's key
++    ///   alone, and never a person.
++    ///
++    /// Mutation: drop the door's floor → each one-signature removal lands: red.
++    pub(crate) async fn i1753_one_signature_never_removes<D: Node>(d: &D, tag: &str) {
++        use crate::federation::membership_acceptance_invariants::bodies::found_family;
++        use crate::federation::types::{identity_type, FamilyMembershipRevocation};
++        let count = |e: &Error| match e {
++            Error::RosterAuthorityUnauthorized {
++                rule, shortfall, ..
++            } => (*rule, shortfall.as_ref().map(|s| (s.have, s.need))),
++            other => panic!("I1753: a standing refusal, got {other:?}"),
++        };
++        let removal = |cid: &str, signers: &[&str], target: &str, t: DateTime<Utc>| {
++            let mut r = ts::sign_community_membership_revocation(
++                signers[0],
++                CommunityMembershipRevocation {
++                    community_key_id: cid.to_owned(),
++                    removed_identity_key_id: target.to_owned(),
++                    removed_at: t,
++                    effective_at: t,
++                    reason: None,
++                    witness_set: Vec::new(),
++                    persist_row_hash: String::new(),
++                },
++            );
++            for c in &signers[1..] {
++                ts::cosign_community_membership_revocation(&mut r, c);
++            }
++            r
++        };
++        let t0 = ms(Utc::now() - Duration::hours(2));
++        let at_i = |i: i64| t0 + Duration::minutes(i);
++
++        // quorum:1/3, three founders.
++        let r = room(d, tag, "i1753q", "quorum:1/3", 3).await;
++        d.set_node(&format!("i1753-elsewhere-{tag}"));
++        let (a, b, c) = (&r.founders[0], &r.founders[1], &r.founders[2]);
++        let e = d
++            .put_community_membership_revocation(removal(&r.cid, &[a], c, at_i(1)))
++            .await
++            .expect_err("I1753: one signature never removes");
++        assert_eq!(
++            count(&e),
++            (ROSTER_CONSENSUS_INSUFFICIENT, Some((1, 2))),
++            "{e:?}"
++        );
++        // The target's own signature is no second voice for removing them.
++        assert!(active(d, &r.cid, c).await);
++        d.put_community_membership_revocation(removal(&r.cid, &[a, b], c, at_i(2)))
++            .await
++            .expect("I1753: two voices besides the target remove");
++        assert!(!active(d, &r.cid, c).await);
++        d.put_community_membership_revocation(removal(&r.cid, &[b], b, at_i(3)))
++            .await
++            .expect("I1753: a resignation needs no one");
++        assert!(!active(d, &r.cid, b).await);
++
++        // founder_only, a family of two.
++        let (ff, fg, fam) = (
++            format!("i1753-ff-{tag}"),
++            format!("i1753-fg-{tag}"),
++            format!("i1753-fam-{tag}"),
++        );
++        reg(d, &[&ff, &fg]).await;
++        found_family(d, &fam, "founder_only", &[&ff, &fg], &[])
++            .await
++            .expect("I1753: the family");
++        let e = d
++            .put_family_membership_revocation(ts::sign_family_membership_revocation(
++                &ff,
++                FamilyMembershipRevocation {
++                    family_key_id: fam.clone(),
++                    removed_identity_key_id: fg.clone(),
++                    removed_at: at_i(4),
++                    effective_at: at_i(4),
++                    reason: None,
++                    witness_set: Vec::new(),
++                    persist_row_hash: String::new(),
++                },
++            ))
++            .await
++            .expect_err("I1753: founder_only, one founder never removes the other");
++        assert_eq!(
++            count(&e),
++            (ROSTER_CONSENSUS_INSUFFICIENT, Some((1, 2))),
++            "{e:?}"
++        );
++
++        // The moderator and the agent.
++        let rm = room(d, tag, "i1753m", "majority", 1).await;
++        d.set_node(&format!("i1753-elsewhere-{tag}"));
++        let f = rm.founders[0].clone();
++        let person = format!("i1753-person-{tag}");
++        let agent = format!("i1753-agent-{tag}");
++        reg(d, &[&person]).await;
++        ts::register_hybrid_key_as(d, &agent, &agent, identity_type::AGENT).await;
++        // The agent is steward-bound: an occurrence of the person (CC 3.2).
++        d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
++            identity_key_id: person.clone(),
++            occurrence_key_id: agent.clone(),
++            device_class: crate::federation::types::device_class::LAPTOP.into(),
++            hardware_attestation: None,
++            asserted_at: at_i(0),
++            valid_until: None,
++            encryption_pubkeys: None,
++            transport_binding: None,
++            persist_row_hash: String::new(),
++        })
++        .await
++        .expect("I1753: the agent occurs for the person");
++        for (i, k) in [(5, &person), (6, &agent)] {
++            let w = widening_by(&rm, &f, k, at_i(i));
++            // At two members a majority is both.
++            let w = if i == 6 { cosigned(&w, &[&person]) } else { w };
++            consent(d, &w).await;
++            d.put_community_membership_widening(w)
++                .await
++                .unwrap_or_else(|e| panic!("I1753: seat {k}: {e}"));
++        }
++        let e = d
++            .put_community_membership_revocation(removal(&rm.cid, &[&f], &person, at_i(7)))
++            .await
++            .expect_err("I1753: a moderator never removes a person alone");
++        assert_eq!(count(&e).0, ROSTER_CONSENSUS_INSUFFICIENT, "{e:?}");
++        assert!(active(d, &rm.cid, &person).await);
++        d.put_community_membership_revocation(removal(&rm.cid, &[&f], &agent, at_i(8)))
++            .await
++            .expect("I1753: the moderator removes an AI agent's key alone");
++        assert!(!active(d, &rm.cid, &agent).await);
++    }
++
++    /// **I1754** (CC 3.3.4, 4.4.3.4.2.1 at CIRISConstitution 6453665:
++    /// `custom:` is removed) — a community or family declaring `custom:{id}`
++    /// is refused `consensus_protocol_custom_removed` at put; a room stored
++    /// under `custom:` (a peer's legacy version, applied as data) keeps
++    /// folding; `weighted:` stays declarable. Mutation: the check returns Ok
++    /// → the custom room founds: red.
++    pub(crate) async fn i1754_custom_protocols_are_removed<D: Node>(d: &D, tag: &str) {
++        use crate::federation::admission::CONSENSUS_PROTOCOL_CUSTOM_REMOVED;
++        use crate::federation::membership_acceptance_invariants::bodies::found_family;
++        let (f, g) = (format!("i1754-f-{tag}"), format!("i1754-g-{tag}"));
++        reg(d, &[&f, &g]).await;
++        let e = found_community(
++            d,
++            &format!("i1754-c-{tag}"),
++            "custom:council",
++            &[&f, &g],
++            &[],
++        )
++        .await
++        .expect_err("I1754: a custom: room");
++        assert!(
++            e.to_string().contains(CONSENSUS_PROTOCOL_CUSTOM_REMOVED),
++            "{e}"
++        );
++        let e = found_family(
++            d,
++            &format!("i1754-fam-{tag}"),
++            "custom:council",
++            &[&f, &g],
++            &[],
++        )
++        .await
++        .expect_err("I1754: a custom: family");
++        assert!(
++            e.to_string().contains(CONSENSUS_PROTOCOL_CUSTOM_REMOVED),
++            "{e}"
++        );
++        found_community(
++            d,
++            &format!("i1754-w-{tag}"),
++            "weighted:uniform_half",
++            &[&f, &g],
++            &[],
++        )
++        .await
++        .expect("I1754: weighted: stays declarable");
++        // A peer's legacy custom room still applies as data and folds.
++        let legacy = format!("i1754-legacy-{tag}");
++        let community = ts::sign_community(
++            &f,
++            crate::federation::types::Community {
++                prev_head_digest: String::new(),
++                charter_digest: String::new(),
++                community_key_id: legacy.clone(),
++                community_name: "legacy".into(),
++                members: [&f, &g]
++                    .iter()
++                    .map(|k| crate::federation::types::CommunityMember {
++                        key_id: (*k).clone(),
++                        joined_at: Utc::now() - Duration::days(1),
++                        role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
++                    })
++                    .collect(),
++                founded_at: Utc::now() - Duration::days(1),
++                consensus_protocol: "custom:council".into(),
++                policy_blob: None,
++                persist_row_hash: String::new(),
++            },
++        );
++        d.apply_replicated_community(community)
++            .await
++            .expect("I1754: a stored legacy custom room is data");
++        assert!(active(d, &legacy, &g).await, "I1754: the legacy room folds");
++    }
++
+     pub(crate) async fn i1744_freshness_w_on_cosign_rows<D: Node>(d: &D, tag: &str) {
+         let r = room(d, tag, "i1744", "majority", 4).await;
+         let gone = r.founders[3].clone();
+@@ -1791,6 +2008,8 @@ mod tests {
+     on_every_backend!(i1744, bodies::i1744_freshness_w_on_cosign_rows);
+     on_every_backend!(i1748, bodies::i1748_a_short_refusal_carries_the_count);
+     on_every_backend!(i1751, bodies::i1751_below_m_counts_the_roster_and_m_latches);
++    on_every_backend!(i1753, bodies::i1753_one_signature_never_removes);
++    on_every_backend!(i1754, bodies::i1754_custom_protocols_are_removed);
+ 
+     mod i1739 {
+         use super::*;
+diff --git a/src/federation/family_admit.rs b/src/federation/family_admit.rs
+index 2ade8bfa..fe373010 100644
+--- a/src/federation/family_admit.rs
++++ b/src/federation/family_admit.rs
+@@ -71,6 +71,8 @@ pub(crate) async fn put_family_local_planned<D: FamilyStore>(
+     mut row: Family,
+ ) -> Result<(), Error> {
+     super::admission::check_family_consensus_protocol_form(&row.consensus_protocol)?;
++    // v61.4.0 (CC rc19 6453665) — `custom:` is removed.
++    super::admission::check_consensus_protocol_not_custom(&row.consensus_protocol)?;
+     // v13.3.0 (CIRISPersist#386) — every member key_id must be a registered
+     // key (the dropped family_key_id FK's real invariant).
+     super::admission::validate_family_members(dir, &row).await?;
+diff --git a/src/federation/family_roster_invariants.rs b/src/federation/family_roster_invariants.rs
+index ecf0f084..e2554fc7 100644
+--- a/src/federation/family_roster_invariants.rs
++++ b/src/federation/family_roster_invariants.rs
+@@ -347,9 +347,11 @@ pub mod bodies {
+             at("2026-04-01T00:00:00Z"),
+             at("2026-05-01T00:00:00Z"),
+         );
+-        revoke_by(a, &[alice], revocation(&fam, carol, t2))
++        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature
++        // never removes another member; carol resigns.
++        revoke_by(a, &[carol], revocation(&fam, carol, t2))
+             .await
+-            .unwrap_or_else(|e| panic!("{tag} I177: the founder removes carol: {e}"));
++            .unwrap_or_else(|e| panic!("{tag} I177: carol resigns: {e}"));
+         assert!(!admitted(a, carol, &fam).await, "{tag} I177: removed");
+         widen_by(a, &[alice], widening(&fam, carol, t3, None))
+             .await
+@@ -358,7 +360,7 @@ pub mod bodies {
+             admitted(a, carol, &fam).await,
+             "{tag} I177 (#910.1): the re-added member is active again"
+         );
+-        revoke_by(a, &[alice], revocation(&fam, carol, t4))
++        revoke_by(a, &[carol], revocation(&fam, carol, t4))
+             .await
+             .unwrap_or_else(|e| panic!("{tag} I177: a re-added member can be removed again: {e}"));
+         assert!(!admitted(a, carol, &fam).await, "{tag} I177: removed again");
+@@ -373,7 +375,7 @@ pub mod bodies {
+             "{tag} I177 (#910.1): two removals of one member are two rows"
+         );
+         // The exact retry of a stored removal is still the #861 no-op.
+-        revoke_by(a, &[alice], revocation(&fam, carol, t4))
++        revoke_by(a, &[carol], revocation(&fam, carol, t4))
+             .await
+             .unwrap_or_else(|e| panic!("{tag} I177: the #861 retry is Ok: {e}"));
+         assert_eq!(
+diff --git a/src/federation/group_amendment.rs b/src/federation/group_amendment.rs
+index 2c8b0492..919e6c76 100644
+--- a/src/federation/group_amendment.rs
++++ b/src/federation/group_amendment.rs
+@@ -229,6 +229,10 @@ where
+         return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
+     }
+     super::admission::check_family_consensus_protocol_form(&f.consensus_protocol)?;
++    // v61.4.0 (CC rc19 6453665) — never moved onto a removed `custom:`.
++    if held.consensus_protocol != f.consensus_protocol {
++        super::admission::check_consensus_protocol_not_custom(&f.consensus_protocol)?;
++    }
+     super::admission::validate_family_members(dir, f).await?;
+     // v53.0.0 (CC 3.2 T6, consequence (i)) — a family version carries no
+     // signed instant, so it is judged at admission.
+@@ -681,6 +685,8 @@ where
+     F: FederationDirectory + ?Sized,
+ {
+     super::admission::check_family_consensus_protocol_form(&new.family.consensus_protocol)?;
++    // v61.4.0 (CC rc19 6453665) — `custom:` is removed.
++    super::admission::check_consensus_protocol_not_custom(&new.family.consensus_protocol)?;
+     super::verify_family_admission(dir, &new).await?;
+     // v52.0.0 (#956) — a dissolved family admits no change, on either door.
+     super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)
+@@ -746,6 +752,8 @@ where
+     F: FederationDirectory + ?Sized,
+ {
+     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
++    // v61.4.0 (CC rc19 6453665) — `custom:` is removed.
++    super::admission::check_consensus_protocol_not_custom(&new.community.consensus_protocol)?;
+     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the held record is the
+     // cohort this door addresses, the new version declares the same cohort,
+     // and an affiliation's config validates against the new roster.
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index f8d89c24..41d7a191 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -2189,6 +2189,49 @@ where
+     Ok(out)
+ }
+ 
++/// v61.4.0 (CC 4.5.13 rc19 b9d267c, "a moderator removes an agent alone") —
++/// is `key_id` an AI agent's key: `agent`-typed and not a person's (`user`)?
++/// Fixed at mint, so every replay reads the same answer.
++async fn is_ai_agent_key<F>(directory: &F, key_id: &str) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    Ok(directory.lookup_public_key(key_id).await?.is_some_and(|k| {
++        types::identity_type::set_contains(&k.identity_type, types::identity_type::AGENT)
++            && !types::identity_type::set_contains(&k.identity_type, types::identity_type::USER)
++    }))
++}
++
++/// v61.4.0 — the moderation roots among `signers` that held authority (were
++/// active, steward-bound founders) at `at`: a zero-hop moderator signing for
++/// itself. [`moderator_roots_at`] reads only roots that reach ANOTHER signer;
++/// this is the agent-removal standing alone (CC 4.5.13).
++async fn founders_signing_at<F>(
++    directory: &F,
++    roots: &std::collections::BTreeSet<String>,
++    intervals: &RootAuthorityIntervals,
++    signers: &std::collections::BTreeSet<String>,
++    at: chrono::DateTime<chrono::Utc>,
++) -> Result<std::collections::BTreeSet<String>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let mut out = std::collections::BTreeSet::new();
++    for r in roots.iter().filter(|r| signers.contains(*r)) {
++        let in_authority = intervals.get(r).is_some_and(|iv| {
++            iv.iter()
++                .any(|(start, end)| *start <= at && end.is_none_or(|e| at < e))
++        });
++        // A non-steward-bound founder roots no duty (CC 4.5.4).
++        if in_authority
++            && Box::pin(admission::is_steward_bound(directory.as_dyn_directory(), r)).await?
++        {
++            out.insert(r.clone());
++        }
++    }
++    Ok(out)
++}
++
+ fn signer_set(e: &types::RosterEventSigner) -> std::collections::BTreeSet<String> {
+     e.authority_key_id
+         .iter()
+@@ -2285,6 +2328,14 @@ where
+                 ev.effective_at,
+             ))
+             .await?;
++            // v61.4.0 (CC 4.5.13 rc19 b9d267c) — the door's agent-removal
++            // standing, read the same way at every replay.
++            if !ev.is_add && is_ai_agent_key(directory, &ev.member.key_id).await? {
++                ev.moderator_roots.extend(
++                    founders_signing_at(directory, roots, &intervals, &ev.signers, ev.effective_at)
++                        .await?,
++                );
++            }
+         }
+     }
+     if reverse_candidates.is_empty() {
+@@ -2701,22 +2752,34 @@ where
+     // admitted (an admitted row is not unsaid by a later gate), and an exact
+     // retry of a held row is not a new removal.
+     let held_retry = events.iter().any(is_this_row);
++    // v61.4.0 (CC 4.5.13 rc19 b9d267c, "a moderator removes an agent alone")
++    // — the one removal a moderator's standing reaches: an AI agent's key
++    // (agent-typed, not a person's).
++    let target_is_agent = is_revocation && is_ai_agent_key(directory, &incoming.key_id).await?;
+     let events: Vec<RosterEvent> = events.into_iter().filter(|e| !is_this_row(e)).collect();
+     let (state, _, high_water) = fold_roster(record_members, rules, &events, effective_at);
+     let moderator_roots = match moderation_roots {
+-        Some(mut roots) if !is_revocation || held_retry => {
++        Some(mut roots) if !is_revocation || held_retry || target_is_agent => {
+             if !is_revocation && incoming.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER) {
+                 roots.remove(&incoming.key_id);
+             }
+-            Box::pin(moderator_roots_at(
++            let intervals = root_authority_intervals(record_members, rules, &events, &roots);
++            let mut out = Box::pin(moderator_roots_at(
+                 directory,
+                 group_key_id,
+                 &roots,
+-                &root_authority_intervals(record_members, rules, &events, &roots),
++                &intervals,
+                 signers,
+                 effective_at,
+             ))
+-            .await?
++            .await?;
++            if target_is_agent {
++                out.extend(
++                    founders_signing_at(directory, &roots, &intervals, signers, effective_at)
++                        .await?,
++                );
++            }
++            out
+         }
+         _ => std::collections::BTreeSet::new(),
+     };
+@@ -2759,6 +2822,65 @@ where
+             shortfall,
+         } => return Err(refusal(rule, &detail, shortfall)),
+     };
++    // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at CIRISConstitution dfde68d,
++    // "The floor of two voices stands under every protocol ... A removal has
++    // no such second voice, so one signature never removes"; CC 4.5.13) — a
++    // NEW removal of another member needs two voices besides the member it
++    // removes, whatever the protocol (`quorum:1/N` and `founder_only`
++    // included). A resignation (the member signs) is the exit and needs no
++    // one; a moderator's removal of an AI agent's key stands alone. Asked
++    // here at the door only: removals the fold already admitted are not unsaid
++    // by this later gate. Short by signatures, so held like any shortfall.
++    let short = match short {
++        None if is_revocation
++            && !held_retry
++            && !e.signers.contains(&e.member.key_id)
++            && !(target_is_agent && !e.moderator_roots.is_empty()) =>
++        {
++            let persons = rules.persons.at(effective_at);
++            let target = persons.seat_person(&e.member.key_id);
++            let active_persons: std::collections::BTreeSet<&str> = state
++                .iter()
++                .filter(|(_, (active, _))| *active)
++                .map(|(k, _)| persons.seat_person(k))
++                .collect();
++            // CC 4.4.3.2.8 — an affiliation's designated official is the
++            // second voice its one-voice countersign rule names.
++            let officials = affiliation_config::designated_official_keys(rules.policy_blob);
++            let official_persons: std::collections::BTreeSet<&str> =
++                officials.iter().map(|k| persons.seat_person(k)).collect();
++            let voices: std::collections::BTreeSet<&str> = e
++                .signers
++                .iter()
++                .filter_map(|k| persons.voice(k))
++                .filter(|p| {
++                    *p != target && (active_persons.contains(p) || official_persons.contains(p))
++                })
++                .collect();
++            (voices.len() < consensus::REMOVAL_VOICE_FLOOR).then(|| {
++                let mut eligible: Vec<String> = state
++                    .iter()
++                    .filter(|(k, (active, _))| *active && persons.seat_person(k) != target)
++                    .map(|(k, _)| k.clone())
++                    .collect();
++                eligible.sort();
++                refusal(
++                    ROSTER_CONSENSUS_INSUFFICIENT,
++                    &format!(
++                        "removal floor: {} voice(s) besides the member removed; one \
++                         signature never removes (CC 3.1.3.2, CC 4.5.13)",
++                        voices.len()
++                    ),
++                    Some(consensus::ConsensusShortfall {
++                        have: voices.len(),
++                        need: consensus::REMOVAL_VOICE_FLOOR,
++                        eligible_signer_key_ids: Some(eligible),
++                    }),
++                )
++            })
++        }
++        other => other,
++    };
+     // v52.0.0 (CIRISPersist#955) — a GROWTH (a key not active before this
+     // instant) needs the member's own acceptance, under every protocol. The
+     // group's standing above is its decision; this is the member's consent.
+diff --git a/src/federation/moderation_walk_asof_invariants.rs b/src/federation/moderation_walk_asof_invariants.rs
+index 8f5509c8..6f49f6a9 100644
+--- a/src/federation/moderation_walk_asof_invariants.rs
++++ b/src/federation/moderation_walk_asof_invariants.rs
+@@ -436,9 +436,16 @@ pub mod bodies {
+             "[{tag}] I1524: hank stays after mo's refused removal"
+         );
+         tick().await;
++        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature
++        // never removes, the founder's included; at two members only the
++        // member's own resignation does.
+         dir.put_community_membership_revocation(revoke(&alice))
+             .await
+-            .unwrap_or_else(|e| panic!("[{tag}] I1524: the protocol removes: {e}"));
++            .expect_err("I1524: the founder alone removes nobody either");
++        tick().await;
++        dir.put_community_membership_revocation(revoke(&hank))
++            .await
++            .unwrap_or_else(|e| panic!("[{tag}] I1524: hank resigns: {e}"));
+         assert!(
+             !held(dir.active_community_members(&here).await.unwrap()),
+             "[{tag}] I1524: hank is gone after the protocol's removal"
+diff --git a/src/federation/put_audience_invariants.rs b/src/federation/put_audience_invariants.rs
+index 453f588d..d77cb3c2 100644
+--- a/src/federation/put_audience_invariants.rs
++++ b/src/federation/put_audience_invariants.rs
+@@ -490,21 +490,25 @@ pub(crate) mod family_events {
+             );
+         }
+         let at = Utc::now() - Duration::minutes(5);
++        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature
++        // never removes another member, founder_only included; Q cosigns.
++        let mut removal = ts::sign_family_membership_revocation(
++            &p,
++            FamilyMembershipRevocation {
++                family_key_id: fam.clone(),
++                removed_identity_key_id: r.clone(),
++                removed_at: at,
++                effective_at: at,
++                reason: None,
++                witness_set: vec![],
++                persist_row_hash: String::new(),
++            },
++        );
++        ts::cosign_family_membership_revocation(&mut removal, &q);
+         p_node
+-            .put_family_membership_revocation(ts::sign_family_membership_revocation(
+-                &p,
+-                FamilyMembershipRevocation {
+-                    family_key_id: fam.clone(),
+-                    removed_identity_key_id: r.clone(),
+-                    removed_at: at,
+-                    effective_at: at,
+-                    reason: None,
+-                    witness_set: vec![],
+-                    persist_row_hash: String::new(),
+-                },
+-            ))
++            .put_family_membership_revocation(removal)
+             .await
+-            .expect("I1521: P removes R");
++            .expect("I1521: P and Q remove R");
+         let removal = plane_row(p_node, &fam, MEMBERSHIP_REMOVAL_DIMENSION).await;
+         assert_eq!(
+             carry(r_node, &removal).await,
+diff --git a/src/federation/reverse_quorum.rs b/src/federation/reverse_quorum.rs
+index 4d59b08c..45f7bf1f 100644
+--- a/src/federation/reverse_quorum.rs
++++ b/src/federation/reverse_quorum.rs
+@@ -4443,7 +4443,9 @@ pub(crate) mod test_support {
+                 crate::federation::ReplicatedCommunityOutcome::Inserted,
+                 "({suffix}) P3: the replicated entry admits the legacy room as data"
+             );
+-            dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
++            // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one
++            // signature never removes; an overruler cosigns the removal.
++            let mut removal = ts::sign_community_membership_revocation(
+                 &human,
+                 crate::federation::types::CommunityMembershipRevocation {
+                     community_key_id: room.clone(),
+@@ -4454,9 +4456,11 @@ pub(crate) mod test_support {
+                     witness_set: vec![],
+                     persist_row_hash: String::new(),
+                 },
+-            ))
+-            .await
+-            .unwrap_or_else(|e| panic!("({suffix}) P3 {leg}: the human's removal lands: {e}"));
++            );
++            ts::cosign_community_membership_revocation(&mut removal, &overrulers[0]);
++            dir.put_community_membership_revocation(removal)
++                .await
++                .unwrap_or_else(|e| panic!("({suffix}) P3 {leg}: the human's removal lands: {e}"));
+             let row_hash = dir
+                 .list_community_membership_revocations_for(&room)
+                 .await
+@@ -4626,7 +4630,7 @@ pub(crate) mod test_support {
+                 .is_empty(),
+             "({suffix}) I181: nothing stored"
+         );
+-        dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
++        let removal = ts::sign_community_membership_revocation(
+             &bob,
+             CommunityMembershipRevocation {
+                 community_key_id: community.clone(),
+@@ -4637,9 +4641,23 @@ pub(crate) mod test_support {
+                 witness_set: vec![],
+                 persist_row_hash: String::new(),
+             },
+-        ))
+-        .await
+-        .unwrap_or_else(|e| panic!("({suffix}) I181: one member's removal lands: {e}"));
++        );
++        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d, "the floor of two
++        // voices stands under every protocol"): one member's signature never
++        // removes, reverse_quorum included; two land it, and the objection
++        // fold still undoes it.
++        dir.put_community_membership_revocation(removal.clone())
++            .await
++            .expect_err("one member's signature never removes another");
++        assert!(
++            active().await.contains(&carol),
++            "({suffix}) I181: carol stays"
++        );
++        let mut removal = removal;
++        ts::cosign_community_membership_revocation(&mut removal, &alice);
++        dir.put_community_membership_revocation(removal)
++            .await
++            .unwrap_or_else(|e| panic!("({suffix}) I181: two members' removal lands: {e}"));
+         assert!(
+             !active().await.contains(&carol),
+             "({suffix}) I181: carol is out"
+diff --git a/src/federation/room_roster_authority_invariants.rs b/src/federation/room_roster_authority_invariants.rs
+index a30b8906..9d13a7da 100644
+--- a/src/federation/room_roster_authority_invariants.rs
++++ b/src/federation/room_roster_authority_invariants.rs
+@@ -108,9 +108,12 @@ pub mod bodies {
+         // v61, as the field holds one), which a peer still delivers: the
+         // replicated door admits it as data, and every fold reads it as
+         // before. An affiliation keeps `founder_only` on the local door.
+-        let legacy = protocol == consensus_protocol::FOUNDER_ONLY
++        // v61.4.0 (CC rc19 6453665) — so is a `custom:` room: removed at
++        // declaration, still folded as data.
++        let legacy = (protocol == consensus_protocol::FOUNDER_ONLY
+             && crate::federation::affiliation_config::declared_cohort(&community.community)
+-                .is_ok_and(|c| c != crate::federation::cohort::Cohort::Affiliations);
++                .is_ok_and(|c| c != crate::federation::cohort::Cohort::Affiliations))
++            || protocol.starts_with(consensus_protocol::CUSTOM_PREFIX);
+         if legacy {
+             let outcome = d
+                 .apply_replicated_community(community)
+@@ -251,9 +254,11 @@ pub mod bodies {
+             admitted(d, &carol, &room).await,
+             "{tag} I170: a widened member is admitted (#907)"
+         );
++        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature never
++        // removes another member; the removed member resigns.
+         revoke(
+             d,
+-            &alice,
++            &carol,
+             revocation(&room, &carol, at("2026-03-02T00:00:00Z")),
+         )
+         .await
+@@ -1164,14 +1169,12 @@ pub mod bodies {
+ 
+     /// The store-half setup: a room, bob removed by alice.
+     pub async fn i173_setup(d: &dyn FederationDirectory, tag: &str) -> (String, String) {
+-        let (room, alice, bob) = make_room(d, tag, "quorum:1/1").await;
+-        revoke(
+-            d,
+-            &alice,
+-            revocation(&room, &bob, at("2026-03-01T00:00:00Z")),
+-        )
+-        .await
+-        .unwrap();
++        let (room, _alice, bob) = make_room(d, tag, "quorum:1/1").await;
++        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature never
++        // removes another member; the removed member resigns.
++        revoke(d, &bob, revocation(&room, &bob, at("2026-03-01T00:00:00Z")))
++            .await
++            .unwrap();
+         (room, bob)
+     }
+ }
+diff --git a/src/federation/room_roster_invariants.rs b/src/federation/room_roster_invariants.rs
+index f5b6db10..fcad993b 100644
+--- a/src/federation/room_roster_invariants.rs
++++ b/src/federation/room_roster_invariants.rs
+@@ -105,8 +105,10 @@ pub mod bodies {
+         )
+         .await
+         .unwrap_or_else(|e| panic!("{tag}: seal before: {e}"));
++        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature never
++        // removes another member; the removed member resigns.
+         b.put_community_membership_revocation(ts::sign_community_membership_revocation(
+-            &alice,
++            &bob,
+             revocation(&room, &bob, at("2026-02-01T00:00:00Z")),
+         ))
+         .await
+@@ -473,11 +475,13 @@ pub mod bodies {
+             let carol = format!("{tg}-carol");
+             ts::register_hybrid_key_as(*d, &carol, &carol, identity_type::USER).await;
+             let w1 = ts::sign_community_membership_widening(&alice, widening(&room, &carol, t1));
++            // v61.4.0 (CIRISPersist#1201): carol resigns (one signature
++            // never removes another member).
+             let r2 =
+-                ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
++                ts::sign_community_membership_revocation(&carol, revocation(&room, &carol, t2));
+             let w3 = ts::sign_community_membership_widening(&alice, widening(&room, &carol, t3));
+             let r4 =
+-                ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t4));
++                ts::sign_community_membership_revocation(&carol, revocation(&room, &carol, t4));
+             let events: Vec<(&str, usize)> = match i {
+                 0 => vec![("w", 1), ("r", 2), ("w", 3), ("r", 4)],
+                 1 => vec![("r", 4), ("w", 3), ("r", 2), ("w", 1)],
+@@ -708,8 +712,10 @@ pub mod bodies {
+         let t1 = at("2026-03-01T00:00:00Z");
+         let t2 = at("2026-03-02T00:00:00Z");
+         let t3 = at("2026-03-03T00:00:00Z");
++        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature never
++        // removes another member; the removed member resigns.
+         d.put_community_membership_revocation(ts::sign_community_membership_revocation(
+-            &alice,
++            &bob,
+             revocation(&room, &bob, t1),
+         ))
+         .await
+@@ -721,7 +727,7 @@ pub mod bodies {
+         .await
+         .unwrap();
+         d.put_community_membership_revocation(ts::sign_community_membership_revocation(
+-            &alice,
++            &bob,
+             revocation(&room, &bob, t3),
+         ))
+         .await
+diff --git a/src/store/backend_suite.rs b/src/store/backend_suite.rs
+index c7929675..e8d086fc 100644
+--- a/src/store/backend_suite.rs
++++ b/src/store/backend_suite.rs
+@@ -6290,11 +6290,13 @@ mod tests {
+             witness_set: vec![],
+             persist_row_hash: String::new(),
+         };
+-        // Honest: signed by e4-fmr-authority — admits.
++        // Honest — admits. v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at
++        // dfde68d): one signature never removes another member, so the
++        // honest revocation is the member's own resignation.
+         backend
+             .put_family_membership_revocation(
+                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+-                    "e4-fmr-authority",
++                    "e4-fmr-member",
+                     rev.clone(),
+                 ),
+             )
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index a28d66dd..51d30d90 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -804,6 +804,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     // one predicate on the local and the replicated community door.
+     ("check_trust_root_at_door", Class::Gate),
+     ("check_consensus_protocol_form", Class::Gate),
++    // v61.4.0 (CC rc19 6453665) — `custom:` is removed at declaration.
++    ("check_consensus_protocol_not_custom", Class::Gate),
+     ("check_family_consensus_protocol_form", Class::Gate),
+     ("check_content_hash_hex", Class::Gate),
+     ("check_delegated_duty_scores_admission", Class::Gate),
+-- 
+2.43.0
+

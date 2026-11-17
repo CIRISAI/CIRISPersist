@@ -1,0 +1,3368 @@
+diff --git a/src/engine.rs b/src/engine.rs
+index 711e6726..0a5c4c59 100644
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -531,12 +531,6 @@ impl Engine {
+         // v61 — the open legs every open runs, the Python `Engine(...)`
+         // included ([`Self::settle_at_open`]). Never boot-fatal.
+         engine.settle_at_open().await;
+-        // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
+-        // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
+-        // `Backend` has no signer; this is the first point at which the backend
+-        // and the signing key exist together. Idempotent, resumable, and never
+-        // boot-fatal — see `federation::migration`.
+-        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
+         Ok(engine)
+     }
+ 
+@@ -618,13 +612,6 @@ impl Engine {
+         // v61 — the open legs every open runs, the Python `Engine(...)`
+         // included ([`Self::settle_at_open`]). Never boot-fatal.
+         engine.settle_at_open().await;
+-        // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
+-        // pre-genesis node usually has nothing to migrate (no identity ⇒ no
+-        // authorship), and the routine returns early in that case; but a node
+-        // that HAS an identity and no trust root still owns rows, and
+-        // withholding the migration from this constructor would make the
+-        // corpus's shape depend on which constructor the host happened to use.
+-        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
+         Ok(engine)
+     }
+ 
+@@ -6617,9 +6604,7 @@ impl Engine {
+ 
+     /// CIRISPersist#848 (`BLOB_REPLICATION.md` §16, I66) — **resolve
+     /// the V145 minter sentinel to this node's own key**, at construction,
+-    /// the first moment the backend and the signer exist together — beside
+-    /// `run_v31_migration_at_boot`, which needs the signer for the same
+-    /// reason. Runs before any read; a sentinel that survives aborts the
++    /// the first moment the backend and the signer exist together. Runs before any read; a sentinel that survives aborts the
+     /// boot. Idempotent: a no-op on every boot but the first after V145.
+     /// #848 (I66) — **resolve V145's minter sentinel before the first door
+     /// that reads or writes the community-DEK plane.** The DSN constructors
+diff --git a/src/federation/attestation_admit.rs b/src/federation/attestation_admit.rs
+index 2f52c7db..b3003986 100644
+--- a/src/federation/attestation_admit.rs
++++ b/src/federation/attestation_admit.rs
+@@ -246,12 +246,6 @@ pub(crate) trait AttestationStore:
+         planned: PlannedAttestation,
+     ) -> Result<StoredAttestation, Error>;
+ 
+-    /// Write a planned hybrid completion: the three columns, guarded on the
+-    /// row still being incomplete (a concurrent completion is a
+-    /// [`Error::Conflict`], the guard's storage outcome), the serve position
+-    /// moved with them, then the wire index re-derived from the row as stored.
+-    async fn store_pqc_completion(&self, completion: PqcCompletion) -> Result<(), Error>;
+-
+     /// Store a planned local-tier row: for an upsert, first delete every local
+     /// row of `(attester, dimension)` (and their renditions); then insert the
+     /// row if its id is free (a concurrent writer that took it makes this a
+@@ -354,78 +348,6 @@ pub(crate) trait AttestationStore:
+     ) -> Result<(), Error>;
+ }
+ 
+-/// v56.0.0 (CIRISPersist#934 step 1) — a planned hybrid completion
+-/// (`attach_attestation_pqc_signature`): the three columns the write sets.
+-pub(crate) struct PqcCompletion {
+-    /// The row being completed.
+-    pub(crate) attestation_id: String,
+-    /// The ML-DSA-65 half the caller supplied.
+-    pub(crate) scrub_signature_pqc: String,
+-    /// The completion instant: the plan's `received_at`.
+-    pub(crate) pqc_completed_at: chrono::DateTime<chrono::Utc>,
+-    /// The row hash over the completed row.
+-    pub(crate) persist_row_hash: String,
+-}
+-
+-/// v56.0.0 (CIRISPersist#934 step 1) — **the hybrid-completion decision**,
+-/// once for all three backends: the row must be held and not yet
+-/// PQC-complete; the completed row's hash covers the new signature half and
+-/// the completion instant `received_at` (the receiving node's clock at the
+-/// door). Pure: the held row is the directory's read.
+-pub(crate) fn plan_attach_attestation_pqc_signature(
+-    held: Option<Attestation>,
+-    attestation_id: &str,
+-    scrub_signature_pqc: &str,
+-    received_at: chrono::DateTime<chrono::Utc>,
+-) -> Result<PqcCompletion, Error> {
+-    let mut row = held.ok_or_else(|| {
+-        Error::InvalidArgument(format!(
+-            "federation_attestations row {attestation_id} does not exist"
+-        ))
+-    })?;
+-    if row.is_pqc_complete() {
+-        return Err(Error::Conflict(format!(
+-            "federation_attestations row {attestation_id} is already PQC-complete"
+-        )));
+-    }
+-    row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+-    row.pqc_completed_at = Some(received_at);
+-    row.persist_row_hash = String::new();
+-    let persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+-    Ok(PqcCompletion {
+-        attestation_id: attestation_id.to_owned(),
+-        scrub_signature_pqc: scrub_signature_pqc.to_owned(),
+-        pqc_completed_at: received_at,
+-        persist_row_hash,
+-    })
+-}
+-
+-/// v56.0.0 (CIRISPersist#934 step 1) — the door: every backend's
+-/// `attach_attestation_pqc_signature` is this call. The one clock read of the
+-/// door is here; the plan reads the held row through the directory, and the
+-/// executor writes what the plan decided.
+-pub(crate) async fn attach_attestation_pqc_planned<D>(
+-    dir: &D,
+-    attestation_id: &str,
+-    scrub_signature_pqc: &str,
+-) -> Result<(), Error>
+-where
+-    D: AttestationStore,
+-{
+-    let received_at = crate::host::clock::now();
+-    // The row as stored, any tier: the same point read the crossing door
+-    // plans over (`enter_mesh`).
+-    let held = dir.get_attestation(attestation_id).await?;
+-    let completion = plan_attach_attestation_pqc_signature(
+-        held,
+-        attestation_id,
+-        scrub_signature_pqc,
+-        received_at,
+-    )?;
+-    dir.store_pqc_completion(completion).await?;
+-    Ok(())
+-}
+-
+ /// The door: every backend's `put_attestation_with_origin` is this call.
+ pub(crate) async fn put_attestation_planned<D>(
+     dir: &D,
+diff --git a/src/federation/consent_sweep_plan_invariants.rs b/src/federation/consent_sweep_plan_invariants.rs
+index 9983735d..3c49febe 100644
+--- a/src/federation/consent_sweep_plan_invariants.rs
++++ b/src/federation/consent_sweep_plan_invariants.rs
+@@ -838,15 +838,7 @@ mod units {
+     /// empty or unreachable page.
+     #[test]
+     fn i1196_i1197_selection_bounds() {
+-        use crate::federation::sweep_plan::{plan_expired, plan_hybrid_pending, HybridPlane};
+-        assert!(plan_hybrid_pending(HybridPlane::Keys, 0).is_none());
+-        assert!(plan_hybrid_pending(HybridPlane::Keys, -5).is_none());
+-        assert_eq!(
+-            plan_hybrid_pending(HybridPlane::Attestations, 3)
+-                .unwrap()
+-                .limit,
+-            3
+-        );
++        use crate::federation::sweep_plan::plan_expired;
+         let now = chrono::Utc::now();
+         assert!(plan_expired(now, 0, 0).is_none());
+         assert!(plan_expired(now, 1, usize::MAX).is_none());
+diff --git a/src/federation/directory_double.rs b/src/federation/directory_double.rs
+index d4634205..500811f7 100644
+--- a/src/federation/directory_double.rs
++++ b/src/federation/directory_double.rs
+@@ -168,31 +168,6 @@ impl FederationDirectory for FaultInjectingDirectory {
+     fn as_dyn_directory(&self) -> &dyn FederationDirectory {
+         self
+     }
+-    async fn attach_attestation_pqc_signature(
+-        &self,
+-        attestation_id: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), Error> {
+-        if let Some(e) = self.faulted("attach_attestation_pqc_signature") {
+-            return Err(e);
+-        }
+-        self.inner
+-            .attach_attestation_pqc_signature(attestation_id, scrub_signature_pqc)
+-            .await
+-    }
+-    async fn attach_key_pqc_signature(
+-        &self,
+-        key_id: &str,
+-        pubkey_ml_dsa_65_base64: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), Error> {
+-        if let Some(e) = self.faulted("attach_key_pqc_signature") {
+-            return Err(e);
+-        }
+-        self.inner
+-            .attach_key_pqc_signature(key_id, pubkey_ml_dsa_65_base64, scrub_signature_pqc)
+-            .await
+-    }
+     async fn attestation_insert_local(
+         &self,
+         input: crate::federation::types::LocalAttestationInput,
+@@ -695,21 +670,6 @@ impl FederationDirectory for FaultInjectingDirectory {
+             .list_held_fountain_content(publisher_key_id)
+             .await
+     }
+-    async fn list_hybrid_pending_attestations(
+-        &self,
+-        limit: i64,
+-    ) -> Result<Vec<HybridPendingRow>, Error> {
+-        if let Some(e) = self.faulted("list_hybrid_pending_attestations") {
+-            return Err(e);
+-        }
+-        self.inner.list_hybrid_pending_attestations(limit).await
+-    }
+-    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error> {
+-        if let Some(e) = self.faulted("list_hybrid_pending_keys") {
+-            return Err(e);
+-        }
+-        self.inner.list_hybrid_pending_keys(limit).await
+-    }
+     async fn list_identity_occurrence_history_by_occurrence(
+         &self,
+         occurrence_key_id: &str,
+diff --git a/src/federation/key_plane.rs b/src/federation/key_plane.rs
+index 7e0dfb3c..d73578c9 100644
+--- a/src/federation/key_plane.rs
++++ b/src/federation/key_plane.rs
+@@ -1324,7 +1324,6 @@ impl PlannedKeyRecord {
+             | Self::Rewrite { record, .. }
+             | Self::Replace { record, .. }
+             | Self::RehydrateScrubs { record } => &record.key_id,
+-            Self::CompletePqc { key_id, .. } => key_id,
+         }
+     }
+ 
+@@ -1361,9 +1360,6 @@ impl PlannedKeyRecord {
+                 "{} key registration {kid}: row changed concurrently",
+                 kind.as_str()
+             ))),
+-            Self::CompletePqc { .. } => Some(Error::Conflict(format!(
+-                "federation_keys row {kid} was concurrently completed"
+-            ))),
+             Self::RehydrateScrubs { .. } => Some(Error::Conflict(format!(
+                 "rehydrate_dropped_key_scrubs {kid}: row changed concurrently"
+             ))),
+diff --git a/src/federation/migration.rs b/src/federation/migration.rs
+index 4558fcc9..585829bf 100644
+--- a/src/federation/migration.rs
++++ b/src/federation/migration.rs
+@@ -131,31 +131,6 @@ use super::load_bearing::{is_load_bearing, LoadBearing, ObjectRef};
+ use super::types::{attestation_tier, attestation_type, Attestation};
+ use super::{Error, FederationDirectory};
+ 
+-/// The page size the corpus walk uses. Bounded so a large corpus is streamed
+-/// rather than materialized; large enough that a normal node is one or two
+-/// pages.
+-pub const MIGRATION_PAGE_SIZE: u32 = 500;
+-
+-/// A hard cap on how many rows one run will ACT ON — re-stamp, purge or retain
+-/// — not on how many it scans.
+-///
+-/// # Why it bounds the work and not the scan
+-///
+-/// It bounded the SCAN, and that made the routine non-resumable in the one case
+-/// the budget exists for. `scan_corpus` starts from the beginning every call
+-/// and no cursor is persisted, so a corpus larger than the budget re-processed
+-/// the same leading rows forever and never reached the tail: the boot cost was
+-/// paid, the "budget exhausted" flag was set, and the far end of the table
+-/// stayed v30-shaped indefinitely.
+-///
+-/// Bounding the WORK instead makes every run make progress. The scan runs to
+-/// the end (one indexed keyset walk, no per-row I/O), the pending set is capped,
+-/// and the rows this run fixes are conformant on the next — so the next run's
+-/// pending set is a different, later slice. It converges with no cursor to
+-/// persist and no state to get wrong, which is the same reasoning that makes an
+-/// interrupted run safe.
+-pub const MIGRATION_ROW_BUDGET: usize = 200_000;
+-
+ // ─────────────────────────────────────────────────────────────────────────
+ // The fold — the FINAL state, never the interim states.
+ // ─────────────────────────────────────────────────────────────────────────
+@@ -1228,573 +1203,6 @@ pub async fn owner_roots(
+     Ok(roots)
+ }
+ 
+-/// What the migration needs from a signer, and nothing more.
+-///
+-/// A trait rather than `&Engine` so the routine is testable without an Engine
+-/// and so `engine.rs` needs no method of its own — the impl for
+-/// [`crate::Engine`] lives here, at the bottom of this module.
+-#[async_trait::async_trait]
+-pub trait MigrationSigner: Send + Sync {
+-    /// The DERIVED federation `key_id` this signer signs as (never a keystore
+-    /// alias — CIRISPersist#247). `None` when the node has no resolvable
+-    /// identity, which makes every signed row [`Authorship::Foreign`].
+-    async fn signing_key_id(&self) -> Option<String>;
+-
+-    /// Hybrid-sign `canonical`, returning `(ed25519_base64,
+-    /// ml_dsa_65_base64)`.
+-    async fn sign_canonical(&self, canonical: &[u8]) -> Result<(String, Option<String>), Error>;
+-}
+-
+-/// One row's outcome, for the report.
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+-pub struct RowOutcome {
+-    /// The row.
+-    pub attestation_id: String,
+-    /// What was decided.
+-    pub disposition: Disposition,
+-    /// Whether the decision was actually applied (a `dry_run` reports
+-    /// decisions without applying them).
+-    pub applied: bool,
+-    /// A backend failure on this row. The run CONTINUES: one unwritable row
+-    /// must not block the rest of the corpus, and the next boot retries it.
+-    #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub error: Option<String>,
+-}
+-
+-/// The report. Every count is derivable from [`Self::rows`]; they are
+-/// precomputed because a caller logging one line at boot should not have to
+-/// fold.
+-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+-pub struct MigrationOutcome {
+-    /// Rows visited.
+-    pub visited: usize,
+-    /// Rows already in v31 shape (the idempotence signal — a second run is all
+-    /// of these).
+-    pub already_conformant: usize,
+-    /// Rows re-stamped.
+-    pub restamped: usize,
+-    /// Rows purged, by reason.
+-    pub purged_retracted: usize,
+-    /// Rows purged because they are legacy, foreign and *assumed* refillable.
+-    ///
+-    /// Surfaced on its own so an operator can see how much was dumped on an
+-    /// assumption this substrate cannot verify — see
+-    /// [`PurgeReason::UnauthorableLegacy`].
+-    pub purged_unauthorable: usize,
+-    /// Rows kept in v30 shape because deleting them was unsafe.
+-    pub retained_inert: usize,
+-    /// Of [`Self::retained_inert`], how many were retained because they carry
+-    /// CO-SCRUBS this node cannot reconstruct ([`is_co_scrubbed`]).
+-    ///
+-    /// Its own counter because it is its own operator decision: these rows are
+-    /// m-of-n statements whose quorum evidence is intact but whose envelope is
+-    /// v30-shaped, so they are unfederatable until the original co-signers
+-    /// re-run the ceremony that produced them. **A silent authority reduction is
+-    /// the worst possible shape for this**, so the alternative — re-stamping
+-    /// them into 1-of-1 rows — is refused, and the count is surfaced here and in
+-    /// the boot log rather than buried in `retained_inert`.
+-    pub retained_co_scrubbed: usize,
+-    /// Per-row detail.
+-    pub rows: Vec<RowOutcome>,
+-    /// Whether the corpus walk hit [`MIGRATION_ROW_BUDGET`].
+-    pub budget_exhausted: bool,
+-    /// Rows the walk could not act on. Non-empty means the next run has work.
+-    pub errors: usize,
+-    /// The node has no derived key id, so nothing is authored by it, nothing is
+-    /// re-stampable, and — critically — nothing may be purged. The run did
+-    /// NOTHING; it is not a completed migration.
+-    pub skipped_no_identity: bool,
+-}
+-
+-impl MigrationOutcome {
+-    /// Did the run change anything? A `false` here on the SECOND run is the
+-    /// idempotence property, stated as a value rather than as a comment.
+-    #[must_use]
+-    pub const fn changed_anything(&self) -> bool {
+-        self.restamped > 0 || self.purged_retracted > 0 || self.purged_unauthorable > 0
+-    }
+-
+-    fn record(&mut self, outcome: RowOutcome, co_scrubbed: bool) {
+-        self.visited += 1;
+-        if outcome.error.is_some() {
+-            self.errors += 1;
+-        }
+-        if outcome.applied {
+-            match &outcome.disposition {
+-                Disposition::AlreadyConformant => self.already_conformant += 1,
+-                Disposition::Restamp => self.restamped += 1,
+-                Disposition::RetainInert { .. } => {
+-                    self.retained_inert += 1;
+-                    if co_scrubbed {
+-                        self.retained_co_scrubbed += 1;
+-                    }
+-                }
+-                Disposition::Purge(PurgeReason::Retracted { .. }) => self.purged_retracted += 1,
+-                Disposition::Purge(PurgeReason::UnauthorableLegacy { .. }) => {
+-                    self.purged_unauthorable += 1;
+-                }
+-            }
+-        }
+-        self.rows.push(outcome);
+-    }
+-}
+-
+-/// Knobs. Defaults are the boot behaviour.
+-#[derive(Debug, Clone, PartialEq, Eq)]
+-pub struct MigrationOptions {
+-    /// Decide but do not write. Used by an operator preview and by the witness
+-    /// that asserts a decision without paying for it.
+-    pub dry_run: bool,
+-    /// The corpus-walk row budget.
+-    pub row_budget: usize,
+-}
+-
+-impl Default for MigrationOptions {
+-    fn default() -> Self {
+-        Self {
+-            dry_run: false,
+-            row_budget: MIGRATION_ROW_BUDGET,
+-        }
+-    }
+-}
+-
+-/// What one streaming pass over the corpus keeps.
+-///
+-/// # Why it is not just `Vec<Attestation>`
+-///
+-/// This runs at EVERY boot, on a corpus that is fully migrated almost all of
+-/// the time, and it scales with the database. Materializing every envelope to
+-/// answer a question about a handful of them is the cost that made a completion
+-/// marker look necessary. Three things are retained and nothing else:
+-///
+-/// - `pending` — rows that are NOT v31-conformant. **The only rows that need a
+-///   decision at all**, because [`classify`]'s first arm returns
+-///   [`Disposition::AlreadyConformant`] for everything else.
+-/// - `composers` — every structural composer, whole. A small fraction of any
+-///   real corpus, and the fold's input.
+-/// - `authors` — `attestation_id -> attesting_key_id` for EVERY row. Two short
+-///   strings a row, and the fold needs it to apply the same-attester rule to a
+-///   target it is no longer holding.
+-///
+-/// Conformant rows are counted and dropped. On a migrated node the scan is one
+-/// indexed keyset walk plus a pure per-row shape check, with no per-row
+-/// directory reads and no closure walk (see [`run_v31_migration`]).
+-struct CorpusScan {
+-    pending: Vec<Attestation>,
+-    composers: Vec<Attestation>,
+-    authors: BTreeMap<String, RetractionTarget>,
+-    visited: usize,
+-    conformant: usize,
+-    budget_exhausted: bool,
+-}
+-
+-/// Stream the whole corpus, every tier, in one stable keyset order.
+-async fn scan_corpus(
+-    directory: &dyn FederationDirectory,
+-    row_budget: usize,
+-    now: chrono::DateTime<chrono::Utc>,
+-) -> Result<CorpusScan, Error> {
+-    let mut scan = CorpusScan {
+-        pending: Vec::new(),
+-        composers: Vec::new(),
+-        authors: BTreeMap::new(),
+-        visited: 0,
+-        conformant: 0,
+-        budget_exhausted: false,
+-    };
+-    let mut after: Option<String> = None;
+-    loop {
+-        let page = directory
+-            .list_attestations_for_migration(after.as_deref(), MIGRATION_PAGE_SIZE)
+-            .await?;
+-        if page.is_empty() {
+-            return Ok(scan);
+-        }
+-        after = page.last().map(|r| r.attestation_id.clone());
+-        for row in page {
+-            scan.authors
+-                .insert(row.attestation_id.clone(), RetractionTarget::of(&row));
+-            if super::precedence::is_structural_composer(&row.attestation_type) {
+-                scan.composers.push(row.clone());
+-            }
+-            if classify_shape(&row, now).is_conformant() {
+-                scan.conformant += 1;
+-            } else if scan.pending.len() < row_budget {
+-                scan.pending.push(row);
+-            } else {
+-                // The WORK budget, not the scan budget — see
+-                // `MIGRATION_ROW_BUDGET`. The scan continues so `visited` and
+-                // `authors` stay total (the fold needs every row's author, and
+-                // an under-populated author map can only cause UNDER-retraction
+-                // — the safe direction), but this run will not act on more.
+-                scan.budget_exhausted = true;
+-            }
+-            scan.visited += 1;
+-        }
+-    }
+-}
+-
+-/// Build the v31-shaped twin of `row`: the SAME row, with the signed instants
+-/// and the typed-column mirror stamped and the seal recomputed over exactly
+-/// those bytes.
+-///
+-/// **The identity is preserved.** `attestation_id` is not re-minted — it is one
+-/// of the seven members #643 binds, and a re-mint under a fresh id would
+-/// detach the row from every composer that references it. That is the second
+-/// resurrection vector, closed by construction rather than by a check.
+-///
+-/// Both stamps go through the ONE placement each field has
+-/// ([`stamp_signed_instants`](super::envelope::stamp_signed_instants) and
+-/// [`RowMirror::stamp_row`](super::envelope::RowMirror::stamp_row)), so this is
+-/// not a third definition of either projection.
+-async fn build_restamped(
+-    row: &Attestation,
+-    signer: &dyn MigrationSigner,
+-    authorship: &Authorship,
+-) -> Result<Attestation, Error> {
+-    use sha2::{Digest, Sha256};
+-
+-    let mut next = row.clone();
+-    super::envelope::stamp_signed_instants(&mut next)?;
+-    super::envelope::RowMirror::stamp_row(&mut next)?;
+-    // v31.0.0 (CIRISPersist#647) — CANONICALIZE BEFORE HASHING, so the STORED
+-    // bytes and the HASHED bytes are the same bytes by construction.
+-    //
+-    // The three canonicalizing doors (`put_attestation` / `put_public_key` /
+-    // `put_revocation`) call this before storing; the re-stamp writes
+-    // `attestation_envelope` through `reseal_attestation_v31`, which is not one
+-    // of them. Without this line the envelope stored is whatever `serde_json`
+-    // built while the hash covers the JCS form — and #647's invariant is that
+-    // an operator can run `sha256sum` over the stored column and get
+-    // `original_content_hash` back. The stamps above insert members through
+-    // `serde_json` (`weight` as a NUMBER, which JCS §3.2.2.3 serializes through
+-    // ECMAScript `Number::toString`), so "they probably agree" is exactly the
+-    // reasoning #644/#645 disproved one column over.
+-    //
+-    // Done here — once, on the value that is about to be both signed and stored
+-    // — rather than separately at the hash site and the store site, because two
+-    // spellings of one projection is the defect this release keeps finding.
+-    super::canonical_at_rest::canonicalize_in_place(&mut next.attestation_envelope)?;
+-
+-    match authorship {
+-        Authorship::UnsealedLocal => {
+-            // The deferred empty-sentinel seal is preserved verbatim: a local
+-            // row has no signature and no content hash, and inventing one here
+-            // would make the row look federation-sealed to the V066 trigger's
+-            // twin invariant.
+-            next.original_content_hash = String::new();
+-            next.scrub_signature_classical = String::new();
+-            next.scrub_signature_pqc = None;
+-        }
+-        Authorship::OwnKey => {
+-            let canonical =
+-                crate::verify::canonical::ceg_produce_canonicalize(&next.attestation_envelope)
+-                    .map_err(|e| Error::Backend(format!("v31 migration canonicalize: {e}")))?;
+-            let (ed, pqc) = signer.sign_canonical(&canonical).await?;
+-            next.original_content_hash = hex::encode(Sha256::digest(&canonical));
+-            next.scrub_signature_classical = ed;
+-            next.scrub_signature_pqc = pqc;
+-            next.scrub_key_id = signer.signing_key_id().await.ok_or_else(|| {
+-                Error::Backend(
+-                    "v31 migration: re-sealing a row this node authored requires a derived \
+-                     signing key id, and none resolved"
+-                        .to_owned(),
+-                )
+-            })?;
+-            next.scrub_timestamp =
+-                super::admission::truncate_to_substrate_resolution(crate::host::clock::now());
+-            // DEFENCE IN DEPTH. `classify` already refuses to re-stamp a
+-            // co-scrubbed row, so reaching here with one is a routing bug — and
+-            // the failure mode is silent AUTHORITY LOSS, which is exactly the
+-            // kind that must not be recoverable by accident. See
+-            // [`is_co_scrubbed`] for the full account.
+-            if !next.additional_scrubs.is_empty() {
+-                return Err(Error::InvalidArgument(format!(
+-                    "v31 migration refuses to re-stamp attestation {}: it carries {} co-scrub(s) \
+-                     over the OLD envelope bytes, and this node holds only its own key. \
+-                     Re-signing would drop them and silently turn an m-of-n into a 1-of-1 \
+-                     (CIRISPersist#650)",
+-                    next.attestation_id,
+-                    next.additional_scrubs.len(),
+-                )));
+-            }
+-        }
+-        Authorship::Foreign { .. } => {
+-            return Err(Error::InvalidArgument(format!(
+-                "v31 migration refuses to re-stamp attestation {}: its bytes were signed by {} \
+-                 and rewriting them would leave a stored hash and signature covering an envelope \
+-                 that no longer exists (CIRISPersist#650)",
+-                row.attestation_id, row.attesting_key_id,
+-            )));
+-        }
+-    }
+-    Ok(next)
+-}
+-
+-/// v31.0.0 (CIRISPersist#650) — **run the migration.**
+-///
+-/// See the module doc for the algorithm, the fail-secure polarity, and why it
+-/// is safe to interrupt and safe to repeat.
+-pub async fn run_v31_migration(
+-    directory: &dyn FederationDirectory,
+-    signer: &dyn MigrationSigner,
+-    options: &MigrationOptions,
+-) -> Result<MigrationOutcome, Error> {
+-    let now = crate::host::clock::now();
+-    let self_key_id = signer.signing_key_id().await;
+-
+-    // v31.0.0 (CIRISPersist#650) — **NO IDENTITY, NO MIGRATION.** This was true
+-    // of `run_v31_migration_at_boot`, which bails early, and the doc claimed it
+-    // of the ROUTINE — but `run_v31_migration` is `pub`, and without a key id
+-    // `classify_authorship` returns `Foreign` for every signed row, so arm 7
+-    // would mass-purge the node's OWN federation corpus. A property asserted of
+-    // a function has to hold in that function.
+-    if self_key_id.is_none() {
+-        return Ok(MigrationOutcome {
+-            skipped_no_identity: true,
+-            ..MigrationOutcome::default()
+-        });
+-    }
+-
+-    let scan = scan_corpus(directory, options.row_budget, now).await?;
+-
+-    // THE STEADY-STATE SHORT-CIRCUIT. Nothing is legacy => every arm of
+-    // `classify` returns `AlreadyConformant`, so the fold and the recursive
+-    // walk cannot change a single answer. Skipping them is what keeps a
+-    // fully-migrated node's boot to one indexed keyset scan — and it is a
+-    // CONSEQUENCE of the arm order, not an optimization bolted beside it: it is
+-    // sound exactly because arm 1 leads. If any arm could act on a conformant
+-    // row (as the retraction arm once could), this would silently skip it.
+-    if scan.pending.is_empty() {
+-        return Ok(MigrationOutcome {
+-            visited: scan.visited,
+-            already_conformant: scan.conformant,
+-            budget_exhausted: scan.budget_exhausted,
+-            ..MigrationOutcome::default()
+-        });
+-    }
+-
+-    let fold = fold_retractions_from(&scan.composers, &scan.authors);
+-
+-    // NO CLOSURE WALK, and no per-row `is_load_bearing`. Both existed to feed
+-    // the removed `ProvablyInert` arm, and both were the wrong second opinion:
+-    // the walk consults the SAME predicate it was being used to corroborate.
+-    // Removing the arm removes the reads, which is also what makes a
+-    // legacy-bearing boot cost one scan plus one write per row rather than a
+-    // graph traversal. See `classify`.
+-
+-    let mut outcome = MigrationOutcome {
+-        budget_exhausted: scan.budget_exhausted,
+-        // Conformant rows never reach the loop below; they are counted here so
+-        // `visited` still means "every row the scan saw".
+-        visited: scan.conformant,
+-        already_conformant: scan.conformant,
+-        ..MigrationOutcome::default()
+-    };
+-
+-    for row in &scan.pending {
+-        let shape = classify_shape(row, now);
+-        let authorship = classify_authorship(row, self_key_id.as_deref());
+-        // Consulted ONLY where it can RETAIN — a foreign federation row that
+-        // arm 7 would otherwise purge. Never where it could license a delete;
+-        // that was the removed arm's defect. Also keeps the boot sweep from
+-        // paying two directory reads per row for a verdict no other arm reads.
+-        let positively_load_bearing = if !shape.is_conformant()
+-            && !authorship.can_reauthor()
+-            && row.tier == attestation_tier::FEDERATION
+-            && is_exclusion_bearing(row).is_none()
+-            && !fold.is_retracted(&row.attestation_id)
+-        {
+-            matches!(
+-                is_load_bearing(
+-                    directory,
+-                    ObjectRef::Attestation {
+-                        attestation_id: row.attestation_id.clone(),
+-                    },
+-                )
+-                .await?,
+-                LoadBearing::Yes { .. }
+-            )
+-        } else {
+-            false
+-        };
+-        let disposition = classify(row, &shape, &fold, &authorship, positively_load_bearing);
+-
+-        if options.dry_run {
+-            outcome.record(
+-                RowOutcome {
+-                    attestation_id: row.attestation_id.clone(),
+-                    disposition,
+-                    applied: false,
+-                    error: None,
+-                },
+-                is_co_scrubbed(row),
+-            );
+-            continue;
+-        }
+-
+-        let applied = match &disposition {
+-            Disposition::AlreadyConformant | Disposition::RetainInert { .. } => Ok(()),
+-            Disposition::Restamp => match build_restamped(row, signer, &authorship).await {
+-                Ok(next) => directory.reseal_attestation_v31(&next).await.map(|_| ()),
+-                Err(e) => Err(e),
+-            },
+-            Disposition::Purge(_) => directory
+-                .purge_attestation_v31(&row.attestation_id)
+-                .await
+-                .map(|_| ()),
+-        };
+-        match applied {
+-            Ok(()) => outcome.record(
+-                RowOutcome {
+-                    attestation_id: row.attestation_id.clone(),
+-                    disposition,
+-                    applied: true,
+-                    error: None,
+-                },
+-                is_co_scrubbed(row),
+-            ),
+-            // One unwritable row does not stop the sweep. The routine is
+-            // resumable by construction, so the honest response is to report
+-            // it and let the next boot retry.
+-            Err(e) => outcome.record(
+-                RowOutcome {
+-                    attestation_id: row.attestation_id.clone(),
+-                    disposition,
+-                    applied: false,
+-                    error: Some(e.to_string()),
+-                },
+-                is_co_scrubbed(row),
+-            ),
+-        }
+-    }
+-
+-    // A purge leaves the V111 signed wire index pointing at rows that are gone.
+-    // `rebuild_signed_wire_index` is the sanctioned repair for exactly this and
+-    // is already implemented on all three backends — reused rather than
+-    // hand-rolling three index deletes.
+-    if !options.dry_run && (outcome.purged_retracted + outcome.purged_unauthorable) > 0 {
+-        match directory.rebuild_signed_wire_index().await {
+-            Ok(_) | Err(Error::Unsupported { .. }) => {}
+-            Err(e) => return Err(e),
+-        }
+-    }
+-
+-    // v59.0.0 (sealed-transport floor) — the v31.1.0 backfill of the framed
+-    // `Revocation` wire-index kind is gone with the kind: a key-level
+-    // revocation is indexed as its `key:revocation:v1` row.
+-
+-    Ok(outcome)
+-}
+-
+-// ─────────────────────────────────────────────────────────────────────────
+-// The boot hook.
+-// ─────────────────────────────────────────────────────────────────────────
+-
+-#[async_trait::async_trait]
+-impl MigrationSigner for crate::Engine {
+-    async fn signing_key_id(&self) -> Option<String> {
+-        self.local_derived_key_id().await.ok()
+-    }
+-
+-    async fn sign_canonical(&self, canonical: &[u8]) -> Result<(String, Option<String>), Error> {
+-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+-        let sig = self
+-            .sign_hybrid(canonical)
+-            .await
+-            .map_err(|e| Error::Backend(format!("v31 migration sign_hybrid: {e}")))?;
+-        Ok((
+-            B64.encode(&sig.classical.signature),
+-            Some(B64.encode(&sig.pqc.signature)),
+-        ))
+-    }
+-}
+-
+-/// v31.0.0 (CIRISPersist#650) — **the boot hook.** Called from every `Engine`
+-/// constructor that opens a real backend, immediately after the node's identity
+-/// is known to the backend and before the Engine is handed to the caller.
+-///
+-/// # Why here and not in `Backend::run_migrations`
+-///
+-/// `run_migrations` is where the idempotent data-repair sweeps live
+-/// (`backfill_trace_dedup_shard_keys` is the precedent), and structurally that
+-/// is the better slot. It cannot be used: **a re-stamp is a re-SIGN**, and
+-/// `Backend` has no signer. The Engine constructor is the first point at which
+-/// the backend and the signing key exist together, which is exactly what this
+-/// routine needs and exactly why it lives one layer up.
+-///
+-/// # Why it never fails a boot
+-///
+-/// A node that cannot migrate is still a node that must start — refusing to
+-/// boot would turn a partially-migratable corpus into an unreachable one, and
+-/// the routine is resumable, so the next boot retries. Failures are returned in
+-/// the [`MigrationOutcome`] and, for a hard error, swallowed with a `tracing`
+-/// warning. **A pre-genesis node** (no derived key id) migrates nothing: with
+-/// no identity there is no owner claim, no authorship, and therefore nothing it
+-/// may re-stamp or purge.
+-///
+-/// # The default-feature twin
+-///
+-/// Gated on `any(postgres, sqlite)` because
+-/// [`Engine::federation_directory`](crate::Engine::federation_directory) is —
+-/// with neither backend feature on, `BackendDispatch` has no variants and there
+-/// is no storage to migrate at all. The `not(...)` twin below keeps the CALL
+-/// SITE in `engine.rs` feature-blind, because a constructor that runs the
+-/// migration under one feature set and silently does not under another is the
+-/// shape a previous cut shipped a break in.
+-#[cfg(any(feature = "postgres", feature = "sqlite"))]
+-pub async fn run_v31_migration_at_boot(engine: &crate::Engine) -> Option<MigrationOutcome> {
+-    let directory = engine.federation_directory();
+-    // No identity ⇒ nothing is ours ⇒ nothing to do. Bail before paying for a
+-    // corpus read.
+-    MigrationSigner::signing_key_id(engine).await.as_ref()?;
+-    // Probe the enumerator once: a directory surface that cannot enumerate (the
+-    // FFI capsule) has no migration to run, and `Unsupported` is not an error.
+-    match directory.list_attestations_for_migration(None, 1).await {
+-        Ok(_) => {}
+-        Err(Error::Unsupported { .. }) => return None,
+-        Err(e) => {
+-            tracing::warn!(error = %e, "v31 migration (CIRISPersist#650) could not read the corpus; skipped");
+-            return None;
+-        }
+-    }
+-    match run_v31_migration(
+-        directory.as_ref(),
+-        engine as &dyn MigrationSigner,
+-        &MigrationOptions::default(),
+-    )
+-    .await
+-    {
+-        Ok(outcome) => {
+-            if outcome.changed_anything() || outcome.errors > 0 || outcome.retained_co_scrubbed > 0
+-            {
+-                tracing::info!(
+-                    visited = outcome.visited,
+-                    restamped = outcome.restamped,
+-                    purged_retracted = outcome.purged_retracted,
+-                    purged_unauthorable = outcome.purged_unauthorable,
+-                    retained_inert = outcome.retained_inert,
+-                    retained_co_scrubbed = outcome.retained_co_scrubbed,
+-                    errors = outcome.errors,
+-                    "v31 in-place migration (CIRISPersist#650)"
+-                );
+-            }
+-            Some(outcome)
+-        }
+-        Err(e) => {
+-            tracing::warn!(error = %e, "v31 migration (CIRISPersist#650) failed; boot continues and the next boot retries");
+-            None
+-        }
+-    }
+-}
+-
+-/// The no-backend build's twin of [`run_v31_migration_at_boot`]: there is no
+-/// storage in this configuration, so there is nothing to migrate.
+-#[cfg(not(any(feature = "postgres", feature = "sqlite")))]
+-pub async fn run_v31_migration_at_boot(engine: &crate::Engine) -> Option<MigrationOutcome> {
+-    let _ = engine;
+-    None
+-}
+ 
+ #[cfg(test)]
+ mod tests {
+@@ -2369,37 +1777,6 @@ mod tests {
+         );
+     }
+ 
+-    /// Defence in depth: even if a future edit routes a co-scrubbed row to the
+-    /// re-stamp builder, it REFUSES rather than silently dropping the set. A
+-    /// silent authority reduction is the worst possible shape for this.
+-    #[tokio::test]
+-    async fn the_restamp_builder_refuses_a_co_scrubbed_row() {
+-        struct NullSigner;
+-        #[async_trait::async_trait]
+-        impl MigrationSigner for NullSigner {
+-            async fn signing_key_id(&self) -> Option<String> {
+-                Some("me".to_owned())
+-            }
+-            async fn sign_canonical(&self, _: &[u8]) -> Result<(String, Option<String>), Error> {
+-                Ok(("ed".to_owned(), None))
+-            }
+-        }
+-        let mut r = row("d1", "me", attestation_type::SCORES, env("x:y:v1", None));
+-        r.additional_scrubs = vec![crate::federation::types::ScrubSig {
+-            cosigned_at: None,
+-            scrub_key_id: "holder-b".into(),
+-            scrub_signature_classical: "sig-b".into(),
+-            scrub_signature_pqc: None,
+-        }];
+-        let e = build_restamped(&r, &NullSigner, &Authorship::OwnKey)
+-            .await
+-            .expect_err("the builder must refuse a co-scrubbed row");
+-        assert!(
+-            e.to_string().contains("co-scrub"),
+-            "the refusal must name the reason: {e}"
+-        );
+-    }
+-
+     #[test]
+     fn a_foreign_local_row_is_never_purged() {
+         // A subject-side revocation in TRANSIT: local tier, caller-signed.
+@@ -2479,61 +1856,6 @@ pub(crate) mod test_support {
+     use super::*;
+     use crate::federation::tier_ingest::test_support as seal;
+     use crate::federation::types::attestation_type;
+-    #[cfg(feature = "sqlite")]
+-    use crate::federation::SignedAttestation;
+-
+-    /// Install a row in **v30 shape** — the one thing no production door can
+-    /// do, because both v31 gates refuse it.
+-    ///
+-    /// Implemented per backend beside the storage it reaches (the memory
+-    /// `State` vector, the sqlite connection, the postgres pool), because that
+-    /// access is private to those modules. The witness body below is shared, so
+-    /// the three backends are measured by ONE set of assertions.
+-    #[async_trait::async_trait]
+-    #[cfg(feature = "sqlite")]
+-    pub(crate) trait LegacyRowInstaller: Send + Sync {
+-        /// Strip the #598 instants and the #643 mirror from the STORED
+-        /// envelope of `attestation_id`, leaving the row exactly as a v30
+-        /// writer would have left it. The row must already exist.
+-        async fn downgrade_to_v30(&self, attestation_id: &str);
+-    }
+-
+-    /// Strip both v31 bindings from an envelope — the v30 shape, by removal.
+-    #[cfg(feature = "sqlite")]
+-    pub(crate) fn v30_envelope(envelope: &serde_json::Value) -> serde_json::Value {
+-        use crate::federation::envelope::paths;
+-        let mut out = envelope.clone();
+-        if let Some(obj) = out.as_object_mut() {
+-            obj.remove(paths::ROW);
+-            obj.remove(paths::ASSERTED_AT);
+-            obj.remove(paths::EXPIRES_AT);
+-        }
+-        out
+-    }
+-
+-    /// A deterministic [`MigrationSigner`] over the fixture keypair for
+-    /// `key_id` — the same pair [`seal::hybrid_pubkeys`] registers, so a
+-    /// re-stamped row verifies against the stored key record.
+-    pub(crate) struct FixtureSigner {
+-        pub(crate) key_id: String,
+-    }
+-
+-    #[async_trait::async_trait]
+-    impl MigrationSigner for FixtureSigner {
+-        async fn signing_key_id(&self) -> Option<String> {
+-            Some(self.key_id.clone())
+-        }
+-        async fn sign_canonical(
+-            &self,
+-            canonical: &[u8],
+-        ) -> Result<(String, Option<String>), Error> {
+-            let envelope: serde_json::Value = serde_json::from_slice(canonical)
+-                .map_err(|e| Error::Backend(format!("fixture signer parse: {e}")))?;
+-            let (_och, ed, pqc) = seal::sign_envelope(&self.key_id, &envelope);
+-            Ok((ed, pqc))
+-        }
+-    }
+-
+     fn row_with(
+         id: &str,
+         attester: &str,
+@@ -2589,618 +1911,6 @@ pub(crate) mod test_support {
+         );
+         r.weight = Some(1.0);
+         seal::seal_row_in_place(attester, &mut r);
+-        r
+-    }
+-
+-    /// The #650 witness. `dir` is the node under migration, `peer` is a SECOND
+-    /// directory used to prove that a re-stamped row is accepted by somebody
+-    /// else's put door — the CIRISPersist#649 lesson that local success is not
+-    /// acceptance.
+-    #[cfg(feature = "sqlite")]
+-    pub(crate) async fn exercise_v31_migration(
+-        dir: &dyn FederationDirectory,
+-        installer: &dyn LegacyRowInstaller,
+-        peer: &dyn FederationDirectory,
+-        suffix: &str,
+-    ) {
+-        // Invocation-unique: the postgres arm may share a long-lived database,
+-        // and every id below is a real UUID because `attestation_id` was
+-        // `uuid`-typed until V121.
+-        let run = uuid::Uuid::new_v4().simple().to_string();
+-        let me = format!("mig-node-{suffix}-{run}");
+-        let other = format!("mig-peer-{suffix}-{run}");
+-        let fresh_peer = format!("mig-fresh-peer-{suffix}-{run}");
+-        for d in [dir, peer] {
+-            seal::register_hybrid_key(d, &me).await;
+-            seal::register_hybrid_key(d, &other).await;
+-            seal::register_hybrid_key(d, &fresh_peer).await;
+-        }
+-        let new_id = || uuid::Uuid::new_v4().to_string();
+-        let (grant_id, tomb_id, live_id, deadm_id, alien_id, alien_del_id, quorum_id, newpeer_id) = (
+-            new_id(),
+-            new_id(),
+-            new_id(),
+-            new_id(),
+-            new_id(),
+-            new_id(),
+-            new_id(),
+-            new_id(),
+-        );
+-
+-        // ── The corpus ──────────────────────────────────────────────────
+-        //
+-        // 1. `grant`  — a consent:replication grant WE authored, then withdrew.
+-        //               THE RESURRECTION CASE.
+-        // 2. `tomb`   — the withdraws composer that killed it.
+-        // 3. `live`   — an ordinary live row we authored, on a family with NO
+-        //               declared load-bearing predicate. Two jobs: the control
+-        //               (the migration must re-stamp, not merely delete) and
+-        //               the `Unknown`-verdict arm.
+-        // 4. `deadm`  — a peer de-admission row: an EXCLUSION.
+-        // 5. `alien`  — a live federation row a PEER authored (unauthorable).
+-        // 6. `alien_del` — a delegation a PEER authored. Same unauthorable
+-        //               shape as `alien` in EVERY respect except that it is
+-        //               EXCLUSION-BEARING, so it is the arm that makes the
+-        //               retention rule load-bearing rather than decorative:
+-        //               `alien` is purged, `alien_del` is not, and the only
+-        //               thing separating them is `is_exclusion_bearing`.
+-        // The `payload` is what the #510 closed grammar requires of a consent
+-        // grant; the prefix content is irrelevant here (the same minimal shape
+-        // `consent_peer_set`'s own fixture uses).
+-        let grant = row_with(
+-            &grant_id,
+-            &me,
+-            serde_json::json!({
+-                "dimension": crate::federation::consent_peer_set::DIMENSION,
+-                "payload": {"grants": "replication", "attestation_prefixes": ["mig-650:"]},
+-            }),
+-            &[&other],
+-            attestation_type::SCORES,
+-        );
+-        let tomb = row_with(
+-            &tomb_id,
+-            &me,
+-            serde_json::json!({
+-                "references_attestation_id": grant_id,
+-                "withdrawal_reason": "the subject revoked it",
+-            }),
+-            &[],
+-            attestation_type::WITHDRAWS,
+-        );
+-        // 8. `newpeer` — THE REVIEWER'S CASE, and the one that had to be found
+-        //    by running the routine rather than by reading it. An UNRETRACTED
+-        //    legacy `consent:replication:v1` grant we authored, naming a peer
+-        //    that has authored no rows here yet.
+-        //
+-        //    `retained_replication` returns `LoadBearing::No` for it — nothing
+-        //    is retained under the grant — and the removed `ProvablyInert` arm
+-        //    deleted it. But a grant naming a peer with no rows is a peer you
+-        //    have JUST ADDED: deleting the grant makes that peer's rows
+-        //    inadmissible, so it can never bootstrap. Self-fulfilling, silent,
+-        //    permanent, and the operator sees a successful migration.
+-        let newpeer = row_with(
+-            &newpeer_id,
+-            &me,
+-            serde_json::json!({
+-                "dimension": crate::federation::consent_peer_set::DIMENSION,
+-                "payload": {"grants": "replication", "attestation_prefixes": ["mig-650-new:"]},
+-            }),
+-            &[&format!("mig-fresh-peer-{suffix}-{run}")],
+-            attestation_type::SCORES,
+-        );
+-        let live = scores_row(&live_id, &me, "transparency_log:inclusion:v1");
+-        let deadm = scores_row(
+-            &deadm_id,
+-            &me,
+-            crate::federation::admission::PEER_DEADMISSION_DIMENSION,
+-        );
+-        let alien = scores_row(&alien_id, &other, "transparency_log:inclusion:v1");
+-        // 7. `quorum` — a row WE authored carrying a real co-signature from
+-        //    `other`. Everything about it routes to `Restamp` except the
+-        //    co-scrub, which must win: re-stamping would re-sign our half and
+-        //    drop `other`'s, silently turning an m-of-n into a 1-of-1.
+-        let mut quorum = row_with(
+-            &quorum_id,
+-            &me,
+-            serde_json::json!({
+-                "dimension": crate::federation::reverse_quorum::DIMENSION_DISMISSAL,
+-                "dismisses": "objection-fixture",
+-            }),
+-            &[],
+-            attestation_type::SCORES,
+-        );
+-        {
+-            let (_h, ed, pqc) = seal::sign_envelope(&other, &quorum.attestation_envelope);
+-            quorum.additional_scrubs = vec![crate::federation::types::ScrubSig {
+-                cosigned_at: None,
+-                scrub_key_id: other.clone(),
+-                scrub_signature_classical: ed,
+-                scrub_signature_pqc: pqc,
+-            }];
+-        }
+-        // Targets `me`, not itself: a SELF-`delegates_to` is a root charter and
+-        // carries the whole `check_trust_charter_admission` stack, which is a
+-        // different subject.
+-        let mut alien_del = row_with(
+-            &alien_del_id,
+-            &other,
+-            serde_json::json!({
+-                "dimension": "delegation:migration_fixture:v1",
+-                "scope": ["infra:serve"],
+-            }),
+-            &[],
+-            attestation_type::DELEGATES_TO,
+-        );
+-        alien_del.attested_key_id = me.clone();
+-        seal::seal_row_in_place(&other, &mut alien_del);
+-
+-        let corpus = [
+-            &grant, &tomb, &live, &deadm, &alien, &alien_del, &quorum, &newpeer,
+-        ];
+-        for row in corpus {
+-            dir.put_attestation(SignedAttestation {
+-                attestation: row.clone(),
+-            })
+-            .await
+-            .unwrap_or_else(|e| panic!("({suffix}) seed {}: {e}", row.attestation_id));
+-        }
+-        // Now make every one of them look like a v30 row AT REST — the one
+-        // thing no production door can do, because both v31 gates refuse it.
+-        for row in corpus {
+-            installer.downgrade_to_v30(&row.attestation_id).await;
+-        }
+-
+-        // POSITIVE CONTROL: the downgraded rows really are refused, so "the
+-        // migration fixed them" is a measurement rather than a tautology.
+-        let stored_live = dir
+-            .get_attestation(&live_id)
+-            .await
+-            .expect("read")
+-            .expect("present");
+-        assert!(
+-            !classify_shape(&stored_live, chrono::Utc::now()).is_conformant(),
+-            "({suffix}) the installer did not actually produce a v30-shaped row"
+-        );
+-        peer.put_attestation(SignedAttestation {
+-            attestation: stored_live.clone(),
+-        })
+-        .await
+-        .expect_err(
+-            "({suffix}) a v30-shaped row must be REFUSED by a peer — if it is not, this whole \
+-             witness is measuring nothing",
+-        );
+-
+-        let signer = FixtureSigner { key_id: me.clone() };
+-
+-        // ── The DRY RUN reports the same decisions it would apply. ───────
+-        let preview = run_v31_migration(
+-            dir,
+-            &signer,
+-            &MigrationOptions {
+-                dry_run: true,
+-                ..MigrationOptions::default()
+-            },
+-        )
+-        .await
+-        .expect("({suffix}) dry run");
+-        let decided = |id: &str| -> Disposition {
+-            preview
+-                .rows
+-                .iter()
+-                .find(|r| r.attestation_id == id)
+-                .unwrap_or_else(|| panic!("({suffix}) {id} was not visited"))
+-                .disposition
+-                .clone()
+-        };
+-        // WITNESS: a row whose family declares NO load-bearing predicate is
+-        // KEPT and re-stamped. `classify` no longer consults the predicate at
+-        // all for a row we authored — there is no arm that could delete one on
+-        // a reachability verdict — so this is now a statement about the
+-        // OUTCOME rather than about the verdict that used to gate it.
+-        assert_eq!(
+-            decided(&live_id),
+-            Disposition::Restamp,
+-            "({suffix}) an Unknown-verdict row must be KEPT and re-stamped, never purged"
+-        );
+-        assert!(
+-            matches!(
+-                decided(&grant_id),
+-                Disposition::Purge(PurgeReason::Retracted { .. })
+-            ),
+-            "({suffix}) a withdrawn grant must be purged, not re-minted"
+-        );
+-        // Nothing was written by the preview.
+-        assert!(
+-            dir.get_attestation(&grant_id)
+-                .await
+-                .expect("read")
+-                .is_some(),
+-            "({suffix}) a dry run must not delete anything"
+-        );
+-
+-        // ── Run ─────────────────────────────────────────────────────────
+-        let outcome = run_v31_migration(dir, &signer, &MigrationOptions::default())
+-            .await
+-            .expect("({suffix}) migration runs");
+-        assert_eq!(
+-            outcome.errors, 0,
+-            "({suffix}) first run errors: {outcome:?}"
+-        );
+-
+-        // ── WITNESS 1 (THE ONE THAT MATTERS): the withdrawn row does NOT
+-        //    come back. ────────────────────────────────────────────────────
+-        assert!(
+-            dir.get_attestation(&grant_id)
+-                .await
+-                .expect("read")
+-                .is_none(),
+-            "({suffix}) a withdrawn consent grant survived the migration — this is the \
+-             resurrection case (CIRISPersist#650); outcome = {outcome:?}"
+-        );
+-
+-        // ── WITNESS 2: the TOMBSTONE survives, in v31 shape. Purging it is
+-        //    the other way the grant comes back, one round of anti-entropy
+-        //    later. ─────────────────────────────────────────────────────────
+-        let tomb_after = dir
+-            .get_attestation(&tomb_id)
+-            .await
+-            .expect("read")
+-            .expect("({suffix}) the tombstone must survive — purging it resurrects the grant");
+-        assert!(
+-            classify_shape(&tomb_after, chrono::Utc::now()).is_conformant(),
+-            "({suffix}) the tombstone was kept but not re-stamped"
+-        );
+-
+-        // ── WITNESS 3: previously-excluded keys are STILL excluded. ──────
+-        let deadm_after = dir.get_attestation(&deadm_id).await.expect("read").expect(
+-            "({suffix}) a peer de-admission row was purged — the reset would re-admit \
+-                 exactly the key it was meant to exclude (CIRISPersist#650)",
+-        );
+-        assert!(
+-            crate::federation::admission::envelope_dimension(&deadm_after.attestation_envelope)
+-                == Some(crate::federation::admission::PEER_DEADMISSION_DIMENSION),
+-            "({suffix}) the de-admission row's dimension was rewritten"
+-        );
+-
+-        // ── WITNESS 4: the live row is re-stamped, and a PEER ACCEPTS IT.
+-        //    Local success is not acceptance (#649). ─────────────────────
+-        let live_after = dir
+-            .get_attestation(&live_id)
+-            .await
+-            .expect("read")
+-            .expect("({suffix}) a live row we authored must survive");
+-        assert!(
+-            classify_shape(&live_after, chrono::Utc::now()).is_conformant(),
+-            "({suffix}) the re-stamped row still fails this substrate's own v31 gates"
+-        );
+-        assert_eq!(
+-            live_after.attestation_id, live_id,
+-            "({suffix}) the re-stamp MUST preserve the identity — a fresh id detaches the row \
+-             from every composer that references it, which is the second resurrection vector"
+-        );
+-        peer.put_attestation(SignedAttestation {
+-            attestation: live_after.clone(),
+-        })
+-        .await
+-        .unwrap_or_else(|e| {
+-            panic!(
+-                "({suffix}) a peer's put_attestation REFUSED the re-stamped row. Local success \
+-                 is not acceptance — that is the #649 lesson, and a migration whose output no \
+-                 peer takes has migrated nothing. Refusal: {e}"
+-            )
+-        });
+-
+-        // ── WITNESS 5: a peer-authored legacy row is purged, so its v31
+-        //    refill is not blocked by its own primary key… ────────────────
+-        assert!(
+-            dir.get_attestation(&alien_id)
+-                .await
+-                .expect("read")
+-                .is_none(),
+-            "({suffix}) a legacy row this node cannot re-author was retained; it blocks its own \
+-             v31 refill on the primary key"
+-        );
+-        // …and its EXCLUSION-BEARING twin — identical in author, tier, shape
+-        // and unauthorability — is NOT. This pair is what makes the retention
+-        // rule measurable: remove `is_exclusion_bearing`'s delegation arm and
+-        // this assertion is the one that reds.
+-        assert!(
+-            dir.get_attestation(&alien_del_id)
+-                .await
+-                .expect("read")
+-                .is_some(),
+-            "({suffix}) a peer-authored DELEGATION was purged. It authorizes every quarantine / \
+-             moderation / slashing act hanging off it, and its refill is order-dependent — so \
+-             deleting it re-admits exactly what the reset was meant to exclude \
+-             (CIRISPersist#650)"
+-        );
+-
+-        // ── WITNESS 5b: THE m-of-n. The co-scrubbed row is RETAINED with its
+-        //    co-signature intact, counted under its own heading, and NOT
+-        //    re-stamped into a 1-of-1. ─────────────────────────────────────
+-        let quorum_after = dir
+-            .get_attestation(&quorum_id)
+-            .await
+-            .expect("read")
+-            .expect("({suffix}) a co-scrubbed row must survive");
+-        assert_eq!(
+-            quorum_after.additional_scrubs.len(),
+-            1,
+-            "({suffix}) the co-signature was DROPPED. `Attestation::scrubs()` is what the \
+-             charter quorum, the reverse-quorum undo and the ownership-reclaim finding all \
+-             count, so this silently turned an m-of-n into a 1-of-1 — worse than a purge, \
+-             because the row still looks valid (CIRISPersist#650)"
+-        );
+-        assert_eq!(
+-            quorum_after.additional_scrubs[0].scrub_key_id, other,
+-            "({suffix}) the surviving co-scrub must be the one that was there"
+-        );
+-        assert_eq!(
+-            outcome.retained_co_scrubbed, 1,
+-            "({suffix}) a retained m-of-n row must be VISIBLE under its own counter, not \
+-             buried in retained_inert: {outcome:?}"
+-        );
+-
+-        // ── WITNESS 5c: THE NEWLY-ADDED PEER. An unretracted legacy grant
+-        //    naming a peer that holds no rows must SURVIVE — it is a peer you
+-        //    just added, and deleting its grant makes it permanently
+-        //    un-bootstrappable. ────────────────────────────────────────────
+-        let newpeer_after = dir
+-            .get_attestation(&newpeer_id)
+-            .await
+-            .expect("read")
+-            .expect(
+-                "({suffix}) an UNRETRACTED consent:replication grant naming a peer with no rows \
+-                 yet was DELETED. That peer is one you have just added and not yet synced with; \
+-                 without the grant its rows are inadmissible, so it can never bootstrap — \
+-                 silently, permanently, and with the migration reporting success \
+-                 (CIRISPersist#650)",
+-            );
+-        assert!(
+-            classify_shape(&newpeer_after, chrono::Utc::now()).is_conformant(),
+-            "({suffix}) the new-peer grant survived but was not re-stamped"
+-        );
+-
+-        // ── WITNESS 5d: #647 AT REST, over EVERY surviving row. ─────────
+-        //
+-        //    The headline promise of #647 is that an operator can run
+-        //    `sha256sum` over the stored `attestation_envelope` column and get
+-        //    `original_content_hash` back. The three ingest doors keep it by
+-        //    canonicalizing on the way in; the re-stamp writes that column
+-        //    through a FOURTH door. Asserted over the whole corpus rather than
+-        //    over one row, because "the door I remembered" is the failure mode.
+-        //    Restricted to rows the migration declared CONFORMANT: a
+-        //    `RetainInert` row is v30-shaped on purpose and its stored bytes
+-        //    were never persist's to canonicalize. The counter below keeps the
+-        //    filter from quietly emptying the loop.
+-        let mut checked_at_rest = 0usize;
+-        for id in [&tomb_id, &live_id, &deadm_id, &newpeer_id, &quorum_id] {
+-            let Some(r) = dir.get_attestation(id).await.expect("read") else {
+-                continue;
+-            };
+-            if !classify_shape(&r, chrono::Utc::now()).is_conformant() {
+-                continue;
+-            }
+-            checked_at_rest += 1;
+-            crate::federation::canonical_at_rest::check_canonical_at_rest(&r.attestation_envelope)
+-                .unwrap_or_else(|e| {
+-                    panic!(
+-                        "({suffix}) row {id} is NOT canonical at rest after migration, so \
+-                         `sha256sum` over the stored column will not equal \
+-                         `original_content_hash` — #647 broken for exactly the rows this \
+-                         release re-mints: {e}"
+-                    )
+-                });
+-            if !r.original_content_hash.is_empty() {
+-                let stored = serde_json::to_vec(&r.attestation_envelope).expect("serialize");
+-                assert_eq!(
+-                    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&stored)),
+-                    r.original_content_hash,
+-                    "({suffix}) row {id}: sha256(stored column) != original_content_hash"
+-                );
+-            }
+-        }
+-        assert!(
+-            checked_at_rest >= 4,
+-            "({suffix}) only {checked_at_rest} rows reached the at-rest assertion — the filter \
+-             emptied the loop and the check became a report"
+-        );
+-
+-        // ── WITNESS 6: IDEMPOTENCE. A second run changes nothing. ────────
+-        let second = run_v31_migration(dir, &signer, &MigrationOptions::default())
+-            .await
+-            .expect("({suffix}) second run");
+-        assert!(
+-            !second.changed_anything(),
+-            "({suffix}) the migration is not idempotent: second run {second:?}"
+-        );
+-        assert_eq!(
+-            second.errors, 0,
+-            "({suffix}) the second run reported errors: {second:?}"
+-        );
+-
+-        // ── WITNESS 7: INTERRUPTION. Put one row back into v30 shape — the
+-        //    state a crash mid-run leaves — and the next run COMPLETES it
+-        //    rather than corrupting it. ────────────────────────────────────
+-        installer.downgrade_to_v30(&live_id).await;
+-        let third = run_v31_migration(dir, &signer, &MigrationOptions::default())
+-            .await
+-            .expect("({suffix}) resumed run");
+-        assert_eq!(
+-            third.restamped, 1,
+-            "({suffix}) a half-migrated corpus must be COMPLETED by the next run: {third:?}"
+-        );
+-        assert_eq!(third.errors, 0, "({suffix}) resumed run errors: {third:?}");
+-        let live_again = dir
+-            .get_attestation(&live_id)
+-            .await
+-            .expect("read")
+-            .expect("({suffix}) still there");
+-        assert!(
+-            classify_shape(&live_again, chrono::Utc::now()).is_conformant(),
+-            "({suffix}) the resumed run did not finish the job"
+-        );
+-        // And the tombstone did not get taken along for the ride.
+-        assert!(
+-            dir.get_attestation(&tomb_id).await.expect("read").is_some(),
+-            "({suffix}) the resumed run purged the tombstone"
+-        );
+-
+-        // ── WITNESS 8: the routine's REACH is one table. The dedicated
+-        //    revocation plane has NO replication cursor, so its survival is
+-        //    the whole of the old-keys answer. ────────────────────────────
+-        assert!(
+-            dir.revocations_for(&other).await.is_ok(),
+-            "({suffix}) the revocation plane must still be readable after a migration"
+-        );
+-    }
+-
+-    /// v31.0.0 (CIRISPersist#650/#656) — **THE GAP THAT WAS, AND IS CLOSED.**
+-    ///
+-    /// A marker ("this corpus is migrated, skip the scan") is safe if and only
+-    /// if a v30-shaped row cannot appear AFTER the migration. When this witness
+-    /// was written, one could — and the witness was deliberately shaped so that
+-    /// the day the gap closed would be a day it went RED rather than a day
+-    /// nobody noticed.
+-    ///
+-    /// **That day came.** CIRISPersist#656 closed the transit door, this test
+-    /// went red on all three backends exactly as designed, and it is now
+-    /// inverted: it asserts the REFUSAL. The history is kept in place rather
+-    /// than rewritten, because the composition below is the reason the hole
+-    /// existed and is what a future reader needs in order not to reopen it.
+-    ///
+-    /// # The path
+-    ///
+-    /// The local write door stamps the #643 mirror and the #598 instants
+-    /// (`RowMirror::stamp_local_row`) — **except for a subject-side revocation
+-    /// in TRANSIT**, which is deliberately excluded, because the caller
+-    /// hybrid-signed those bytes and stamping would invalidate the signature
+-    /// and the hash derived from it. That exclusion is right.
+-    ///
+-    /// What it LEFT open is that the local door then asked
+-    /// `check_instant_binding` and **not** `check_row_column_binding` — by
+-    /// design too, since #649 chose to STAMP at this door rather than GATE at
+-    /// it, and a transit row was said to be checked "where the signature is",
+-    /// i.e. at the promote door. Both halves of that sentence were false: the
+-    /// promote door re-derived the mirror FROM the row's columns before
+-    /// comparing it, so it validated the mirror against the very columns a
+-    /// relay had rewritten, and then signed the result.
+-    ///
+-    /// Composed, a caller could land a row whose signed envelope carried
+-    /// `asserted_at` and no `row` mirror, resting at `tier = local`, v30-shaped,
+-    /// at any time. Neither decision was wrong alone; only the composition was.
+-    /// That is why it survived every review of either half.
+-    ///
+-    /// #656 fixed it at the same helper that made the stamping decision:
+-    /// `stamp_local_row` now CHECKS when it does not stamp. The receiving half
+-    /// cannot be forgotten at a door that remembered the minting half.
+-    ///
+-    /// # What that means for the marker
+-    ///
+-    /// With every door gated, "no v30-shaped row can appear after the
+-    /// migration" is now a property of the substrate rather than a hope, so a
+-    /// completion marker is no longer a cache that can go stale — it is a record
+-    /// of an irreversible transition. Implementing one is therefore sound, and
+-    /// this test is the standing proof of its premise: if a future change
+-    /// reopens ANY door, this goes red again and the marker must come out with
+-    /// it.
+-    ///
+-    /// The steady-state cost it would save was measured on an idle box: ~50 µs
+-    /// per row, linear — 486 ms at 10k rows, 5.2 s at 100k, ~50 s at 1M, paid on
+-    /// every boot forever.
+-    pub(crate) async fn exercise_a_v30_row_cannot_land_after_migration(
+-        dir: &dyn FederationDirectory,
+-        suffix: &str,
+-    ) {
+-        use crate::federation::types::{cohort_scope, LocalAttestationInput};
+-
+-        let run = uuid::Uuid::new_v4().simple().to_string();
+-        // THREE distinct keys, and the split matters: the SUBJECT signs the
+-        // revocation, the NODE runs the migration. A subject-side revocation is
+-        // by definition authored by someone other than the node it transits, so
+-        // conflating them would test the one case where re-stamping is
+-        // legitimate (we hold the key) and miss the real one.
+-        let node = format!("mig-node-{suffix}-{run}");
+-        let subject = format!("mig-subj-{suffix}-{run}");
+-        let target = format!("mig-tgt-{suffix}-{run}");
+-        for k in [&node, &subject, &target] {
+-            seal::register_hybrid_key(dir, k).await;
+-        }
+-
+-        let signer = FixtureSigner {
+-            key_id: node.clone(),
+-        };
+-        // Start from a migrated corpus: whatever is here is dealt with first,
+-        // so anything non-conformant afterwards arrived through a door.
+-        run_v31_migration(dir, &signer, &MigrationOptions::default())
+-            .await
+-            .expect("({suffix}) baseline migration");
+-        let baseline = run_v31_migration(dir, &signer, &MigrationOptions::default())
+-            .await
+-            .expect("({suffix}) baseline is stable");
+-        assert!(
+-            !baseline.changed_anything(),
+-            "({suffix}) precondition: the corpus must be fully migrated before the probe"
+-        );
+-
+-        // A subject-side consent revocation in TRANSIT. The envelope carries a
+-        // signed `asserted_at` (so `check_instant_binding` is satisfied) and NO
+-        // `row` mirror — which no gate on this path asks for.
+-        let envelope = serde_json::json!({
+-            "id": "marker-probe",
+-            "dimension": "consent:state:revoked:v1",
+-            "score": 1.0,
+-            "confidence": 0.9,
+-            crate::federation::envelope::paths::ASSERTED_AT:
+-                crate::federation::admission::render_signed_instant(chrono::Utc::now()),
+-        });
+-        let (_hash, sig_classical, sig_pqc) = seal::sign_envelope(&subject, &envelope);
+-        let err = dir
+-            .attestation_insert_local(LocalAttestationInput {
+-                attestation_id: None,
+-                attesting_key_id: subject.clone(),
+-                attested_key_id: Some(target.clone()),
+-                attestation_type: attestation_type::SCORES.to_owned(),
+-                weight: None,
+-                expires_at: None,
+-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+-                    envelope,
+-                )
+-                .expect("envelope"),
+-                subject_key_ids: vec![subject.clone()],
+-                cohort_scope: cohort_scope::SELF.to_owned(),
+-                scrub_signature_classical: Some(sig_classical),
+-                scrub_signature_pqc: sig_pqc,
+-            })
+-            .await
+-            .expect_err(
+-                "({suffix}) THE GAP IS OPEN AGAIN. A transit revocation carrying no `row` mirror \
+-                 was ADMITTED at the local door. That is CIRISPersist#656's seventh site \
+-                 reopened: the seven typed columns of this row are now bound by no door \
+-                 anywhere, and the promote door will stamp whatever a relay put in them into \
+-                 bytes THIS NODE signs. It also invalidates the completion-marker premise — \
+-                 read this test's doc before changing it",
+-            );
+-
+-        // The refusal must be the BINDING gate, not an incidental failure. A
+-        // row refused for the wrong reason would let the real hole reopen
+-        // behind a passing test — the mistake four genesis witnesses made this
+-        // same release by pinning one issue number.
+-        let msg = err.to_string();
+-        assert!(
+-            msg.contains("CIRISPersist#643"),
+-            "({suffix}) the refusal must name the row-column binding gate: {msg}"
+-        );
+-
+-        // And NOTHING landed: the corpus is still fully migrated, which is the
+-        // marker's premise stated as a property rather than as a hope.
+-        let after = run_v31_migration(dir, &signer, &MigrationOptions::default())
+-            .await
+-            .expect("({suffix}) post-probe migration");
+-        assert!(
+-            !after.changed_anything(),
+-            "({suffix}) a refused transit row left work behind: {after:?}"
+-        );
+     }
+ 
+     /// The MUTATION witness: a fold that keeps the INTERIM states (nothing is
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index f69000eb..425e36c3 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -9196,39 +9196,6 @@ pub trait FederationDirectory: Send + Sync {
+     // The two signature-only siblings below attach no key material, so their
+     // signature really is verified at the consumer's policy layer on read.
+ 
+-    /// Attach the PQC components to a hybrid-pending federation_keys row.
+-    /// Updates pubkey_ml_dsa_65_base64 + scrub_signature_pqc + pqc_completed_at.
+-    /// Errors if the row is already PQC-complete.
+-    ///
+-    /// v31.0.0 (CIRISPersist#657) — REFUSES unless the row's already-signed
+-    /// `registration_envelope` binds the ML-DSA-65 pubkey being attached and
+-    /// the post-attach row hybrid-Strict-verifies. See
+-    /// [`admission::check_key_pqc_attachment`](crate::federation::admission::check_key_pqc_attachment)
+-    /// for why a row that bound `pubkey_ml_dsa_65_base64: null` may not attach
+-    /// one afterwards.
+-    async fn attach_key_pqc_signature(
+-        &self,
+-        key_id: &str,
+-        pubkey_ml_dsa_65_base64: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), Error>;
+-
+-    /// Attach the PQC signature to a hybrid-pending
+-    /// `federation_attestations` row. Attestations don't have their
+-    /// own pubkey — they reference the existing
+-    /// `federation_keys.scrub_key_id`'s pubkey for verification.
+-    ///
+-    /// v31.0.0 (CIRISPersist#657) — implementations MUST re-index
+-    /// `signed_wire_index` after the UPDATE. Three serialized columns move, so
+-    /// the wire content hash moves with them; this is the #547/#640 stale-index
+-    /// class, which was fixed at [`Self::attach_key_pqc_signature`] and not
+-    /// here.
+-    async fn attach_attestation_pqc_signature(
+-        &self,
+-        attestation_id: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), Error>;
+-
+     /// v4.6 (CIRISPersist#171 phase 2) — fetch a single attestation row
+     /// by id (any tier). `None` if absent. Used by `Engine::attestation_
+     /// promote` to load the `local` row's envelope before signing.
+@@ -9348,34 +9315,6 @@ pub trait FederationDirectory: Send + Sync {
+         )))
+     }
+ 
+-    // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
+-    //
+-    // Per V004's schema header §"Phase transitions":
+-    //   "Pre-flip rows that are still pending get walked through the
+-    //    upgrade pipeline."
+-    // These three methods feed that pipeline. Persist's PyO3
+-    // `Engine.run_pqc_sweep()` walks each batch and drives cold-path
+-    // PQC fill-in for rows authored before the writer was configured
+-    // with a PQC local signer (or where the per-write cold-path failed
+-    // transiently). Idempotent at the consumer level —
+-    // `attach_*_pqc_signature` already guards against double-fill via
+-    // `WHERE pqc_completed_at IS NULL`.
+-
+-    /// Return up to `limit` `federation_keys` rows where
+-    /// `pqc_completed_at IS NULL`, ordered oldest first by
+-    /// `valid_from`. Returns `(key_id, registration_envelope,
+-    /// scrub_signature_classical)` triples sufficient to reconstruct
+-    /// the cold-path bound-signature input.
+-    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error>;
+-
+-    /// Return up to `limit` `federation_attestations` rows where
+-    /// `pqc_completed_at IS NULL`, ordered oldest first by
+-    /// `asserted_at`.
+-    async fn list_hybrid_pending_attestations(
+-        &self,
+-        limit: i64,
+-    ) -> Result<Vec<HybridPendingRow>, Error>;
+-
+     // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
+     //
+     // Persist absorbs NodeCore's `crate::trust` module surface at
+diff --git a/src/federation/sweep_plan.rs b/src/federation/sweep_plan.rs
+index 28b21042..0e6f4f0a 100644
+--- a/src/federation/sweep_plan.rs
++++ b/src/federation/sweep_plan.rs
+@@ -50,99 +50,6 @@ use super::Error;
+ 
+ // ── the PQC sweep's selection ─────────────────────────────────────────
+ 
+-/// Which table the PQC sweep walks.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-pub(crate) enum HybridPlane {
+-    /// `federation_keys`, oldest `valid_from` first.
+-    Keys,
+-    /// `federation_attestations`, oldest `asserted_at` first.
+-    Attestations,
+-}
+-
+-/// **The PQC sweep's selection**: the rows whose ML-DSA-65 half is still
+-/// pending (`pqc_completed_at IS NULL`), oldest first by the plane's
+-/// instant, ties by id, at most `limit`.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-pub(crate) struct HybridPendingSelection {
+-    /// The table.
+-    pub(crate) plane: HybridPlane,
+-    /// The page size, at least 1.
+-    pub(crate) limit: i64,
+-}
+-
+-/// Plan a PQC-sweep page: `None` when `limit` asks for no rows (zero or
+-/// negative), so no backend reads anything. Before v60 sqlite read every
+-/// row for a negative limit and postgres refused it.
+-#[must_use]
+-pub(crate) fn plan_hybrid_pending(
+-    plane: HybridPlane,
+-    limit: i64,
+-) -> Option<HybridPendingSelection> {
+-    let limit = u64::try_from(limit)
+-        .ok()
+-        .and_then(std::num::NonZeroU64::new)?;
+-    Some(HybridPendingSelection {
+-        plane,
+-        limit: i64::try_from(limit.get()).unwrap_or(i64::MAX),
+-    })
+-}
+-
+-#[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
+-impl HybridPendingSelection {
+-    /// The one statement, for `dialect`: `id`, envelope TEXT, classical
+-    /// signature, in the selection's order, `LIMIT ?1`.
+-    #[must_use]
+-    pub(crate) fn render(&self, dialect: Dialect) -> Statement {
+-        let (table, id, envelope, instant) = match self.plane {
+-            HybridPlane::Keys => (
+-                "federation_keys",
+-                "key_id",
+-                "registration_envelope",
+-                "valid_from",
+-            ),
+-            HybridPlane::Attestations => (
+-                "federation_attestations",
+-                "attestation_id",
+-                "attestation_envelope",
+-                "asserted_at",
+-            ),
+-        };
+-        let (schema, id_expr, id_order, ph) = match dialect {
+-            Dialect::Sqlite => ("", id.to_owned(), id.to_owned(), "?1"),
+-            Dialect::Postgres => (
+-                "cirislens.",
+-                format!("{id}::text"),
+-                format!("{id}::text COLLATE \"C\""),
+-                "$1",
+-            ),
+-        };
+-        Statement {
+-            sql: format!(
+-                "SELECT {id_expr} AS row_id, {envelope} AS envelope, scrub_signature_classical \
+-                 FROM {schema}{table} WHERE pqc_completed_at IS NULL \
+-                 ORDER BY {instant} ASC, {id_order} ASC LIMIT {ph}"
+-            ),
+-            binds: vec![Bind::Int(self.limit)],
+-        }
+-    }
+-}
+-
+-/// The PQC sweep's page (`list_hybrid_pending_keys` /
+-/// `list_hybrid_pending_attestations`): the plan, then the executor.
+-pub(crate) async fn list_hybrid_pending_planned<D>(
+-    dir: &D,
+-    plane: HybridPlane,
+-    limit: i64,
+-) -> Result<Vec<HybridPendingRow>, Error>
+-where
+-    D: SweepStore + ?Sized,
+-{
+-    match plan_hybrid_pending(plane, limit) {
+-        Some(selection) => dir.read_hybrid_pending(selection).await,
+-        None => Ok(Vec::new()),
+-    }
+-}
+-
+ // ── the reaper's selection ────────────────────────────────────────────
+ 
+ /// The types the reaper never OFFERS (PR #769 review round 2): the purge
+@@ -283,12 +190,6 @@ where
+ /// Storage only.
+ #[async_trait::async_trait]
+ pub(crate) trait SweepStore: Send + Sync {
+-    /// Run the PQC-sweep page: [`HybridPendingSelection::render`] on SQL,
+-    /// [`HybridPendingSelection::cut`] on memory.
+-    async fn read_hybrid_pending(
+-        &self,
+-        selection: HybridPendingSelection,
+-    ) -> Result<Vec<HybridPendingRow>, Error>;
+ 
+     /// Run the reaper page: [`ExpiredSelection::render`] on SQL,
+     /// [`ExpiredSelection::cut`] on memory.
+diff --git a/src/ffi/directory_capsule.rs b/src/ffi/directory_capsule.rs
+index 72155034..aac0e075 100644
+--- a/src/ffi/directory_capsule.rs
++++ b/src/ffi/directory_capsule.rs
+@@ -5488,25 +5488,6 @@ impl FederationDirectory for OpsDirectory {
+             method: "list_group_versions",
+         })
+     }
+-    async fn attach_key_pqc_signature(
+-        &self,
+-        key_id: &str,
+-        pubkey_ml_dsa_65_base64: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), Error> {
+-        Err(Error::Unsupported {
+-            method: "attach_key_pqc_signature",
+-        })
+-    }
+-    async fn attach_attestation_pqc_signature(
+-        &self,
+-        attestation_id: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), Error> {
+-        Err(Error::Unsupported {
+-            method: "attach_attestation_pqc_signature",
+-        })
+-    }
+     async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error> {
+         // v61.4.0 (CIRISPersist#1244 round 2, the rooting view).
+         match self
+@@ -5532,19 +5513,6 @@ impl FederationDirectory for OpsDirectory {
+             method: "enter_mesh",
+         })
+     }
+-    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error> {
+-        Err(Error::Unsupported {
+-            method: "list_hybrid_pending_keys",
+-        })
+-    }
+-    async fn list_hybrid_pending_attestations(
+-        &self,
+-        limit: i64,
+-    ) -> Result<Vec<HybridPendingRow>, Error> {
+-        Err(Error::Unsupported {
+-            method: "list_hybrid_pending_attestations",
+-        })
+-    }
+     async fn put_accord_proposal(
+         &self,
+         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
+diff --git a/src/ffi/pyo3.rs b/src/ffi/pyo3.rs
+index e06cf9fe..167baac7 100644
+--- a/src/ffi/pyo3.rs
++++ b/src/ffi/pyo3.rs
+@@ -1723,7 +1723,6 @@ impl PyEngine {
+                         local_pqc_key_id=None, local_pqc_key_path=None,
+                         identity_dir=None, keystore_alias=None,
+                         create_identity_if_missing=false,
+-                        pqc_sweep_on_init=true,
+                         replication_sweeper_enabled=true,
+                         cache_mode=None, max_cache_bytes=None,
+                         cache_ttl_seconds=None, disk_pressure=None))]
+@@ -1742,7 +1741,6 @@ impl PyEngine {
+         identity_dir: Option<String>,
+         keystore_alias: Option<String>,
+         create_identity_if_missing: bool,
+-        pqc_sweep_on_init: bool,
+         replication_sweeper_enabled: bool,
+         // v6.8.0 (CIRISPersist#148) — operator cache-size knob. Mode
+         // label ("proxy"|"cache"|"server") + human-readable byte cap
+@@ -1809,15 +1807,6 @@ impl PyEngine {
+         // Anything else → ValueError. Other arms compile to the right
+         // arm of [`BackendDispatch`]; method bodies still hard-code
+         // the Postgres path (follow-up agent ports them).
+-        //
+-        // `pg_backend_for_sweep` captures the Arc<PostgresBackend> for
+-        // the v0.3.2 cold-path PQC sweep that fires further down — that
+-        // primitive is Postgres-only today; on the SQLite arm we
+-        // simply skip the sweep (it's a Postgres-table migration
+-        // artifact that doesn't exist on the SQLite schema).
+-        #[cfg(feature = "postgres")]
+-        #[allow(unused_variables)] // borrowed only when local_signer + sweep are wired
+-        let pg_backend_for_sweep: Option<Arc<PostgresBackend>>;
+         let backend: BackendDispatch =
+             if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+                 #[cfg(feature = "postgres")]
+@@ -1856,7 +1845,6 @@ impl PyEngine {
+                         Ok::<_, PyErr>(Arc::new(pg))
+                     })
+                     })?;
+-                    pg_backend_for_sweep = Some(pg.clone());
+                     BackendDispatch::Postgres(pg)
+                 }
+                 // v11.8.0 (CIRISPersist#328) — sqlite-only build: no postgres
+@@ -1929,10 +1917,6 @@ impl PyEngine {
+                         Ok::<_, PyErr>(Arc::new(sq))
+                     })
+                     })?;
+-                    #[cfg(feature = "postgres")]
+-                    {
+-                        pg_backend_for_sweep = None;
+-                    }
+                     BackendDispatch::Sqlite(sq)
+                 }
+                 #[cfg(not(feature = "sqlite"))]
+@@ -2467,43 +2451,6 @@ impl PyEngine {
+             py.detach(|| runtime.block_on(open_engine.settle_at_open()));
+         }
+ 
+-        // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when a local
+-        // PQC key is configured. Drains hybrid-pending rows authored
+-        // before the per-write cold-path was wired (or rows where the
+-        // per-write spawn failed transiently). Spawned as a background
+-        // task on the runtime so Engine::new returns immediately;
+-        // sweep result is logged at tracing::info when complete.
+-        //
+-        // v1.0.0-scaffold (CIRISPersist#193): the sweep primitive is
+-        // Postgres-only today (operates on cirisgraph_keys /
+-        // federation_attestations / federation_revocations PG tables).
+-        // On the SQLite arm `pg_backend_for_sweep` is `None` and the
+-        // sweep is silently skipped — same observable shape as
+-        // `pqc_sweep_on_init=false`.
+-        // Sqlite-only build: the sweep is postgres-only, so the flag is
+-        // consumed to a no-op rather than warned as unused.
+-        #[cfg(not(feature = "postgres"))]
+-        let _ = pqc_sweep_on_init;
+-        #[cfg(feature = "postgres")]
+-        if pqc_sweep_on_init {
+-            if let (Some(pqc_signer), Some(backend_for_sweep)) = (
+-                local_signer.as_ref().and_then(|s| s.pqc_signer()),
+-                pg_backend_for_sweep.as_ref().cloned(),
+-            ) {
+-                runtime.spawn(async move {
+-                    let summary = run_pqc_sweep_inner(&backend_for_sweep, &*pqc_signer, 1000).await;
+-                    tracing::info!(
+-                        scanned = summary.total_scanned,
+-                        signed = summary.total_signed,
+-                        failed = summary.total_failed,
+-                        keys_signed = summary.keys.signed,
+-                        attestations_signed = summary.attestations.signed,
+-                        "ciris-persist v0.3.2: cold-path PQC sweep on init complete"
+-                    );
+-                });
+-            }
+-        }
+-
+         // v1.5.0 Phase H — wire Engine.local_signer → backend's
+         // Merkle-hook signer. The Phase C audit-service hook reads
+         // this on every committed entry; without it `record_entry`
+@@ -6164,25 +6111,6 @@ impl PyEngine {
+                     PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
+                 })?;
+ 
+-            // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10). Capture
+-            // the inputs the auto-fire task needs BEFORE backend consumes
+-            // the record. Cold-path skips when no local PQC key is
+-            // configured; row stays hybrid-pending and consumers can fill
+-            // via the attach_*_pqc_signature escape hatch on their own
+-            // schedule.
+-            let cold_path_inputs =
+-                self.local_signer
+-                    .as_ref()
+-                    .and_then(|s| s.pqc_signer())
+-                    .map(|signer| {
+-                        (
+-                            signer,
+-                            record.record.key_id.clone(),
+-                            record.record.registration_envelope.clone(),
+-                            record.record.scrub_signature_classical.clone(),
+-                        )
+-                    });
+-
+             py.detach(move || match &self.backend {
+                 #[cfg(feature = "postgres")]
+                 BackendDispatch::Postgres(pg) => {
+@@ -6202,46 +6130,6 @@ impl PyEngine {
+                             .await
+                             .map_err(federation_err_to_py)?;
+ 
+-                        // Cold-path fire-and-forget. We're already inside
+-                        // tokio::Runtime::block_on, so tokio::spawn here
+-                        // schedules the task without waiting. The synchronous
+-                        // Python call returns as soon as the put commits;
+-                        // PQC catches up within seconds.
+-                        if let Some((signer, key_id, envelope, classical_sig_b64)) =
+-                            cold_path_inputs
+-                        {
+-                            let backend = backend.clone();
+-                            tokio::spawn(async move {
+-                                match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64)
+-                                    .await
+-                                {
+-                                    Ok((pubkey_b64, pqc_sig_b64)) => {
+-                                        if let Err(e) = backend
+-                                            .attach_key_pqc_signature(
+-                                                &key_id,
+-                                                &pubkey_b64,
+-                                                &pqc_sig_b64,
+-                                            )
+-                                            .await
+-                                        {
+-                                            tracing::warn!(
+-                                                key_id = key_id.as_str(),
+-                                                error = %e,
+-                                                "cold-path PQC attach_key_pqc_signature failed; \
+-                                                 row stays hybrid-pending"
+-                                            );
+-                                        }
+-                                    }
+-                                    Err(e) => {
+-                                        tracing::warn!(
+-                                            key_id = key_id.as_str(),
+-                                            error = %e,
+-                                            "cold-path PQC sign failed; row stays hybrid-pending"
+-                                        );
+-                                    }
+-                                }
+-                            });
+-                        }
+                         Ok(())
+                     })
+                 }
+@@ -6263,45 +6151,6 @@ impl PyEngine {
+                             .await
+                             .map_err(federation_err_to_py)?;
+ 
+-                        // Cold-path fire-and-forget; same shape as the
+-                        // Postgres arm — tokio::spawn inside the tokio
+-                        // runtime returns immediately, PQC attach
+-                        // catches up out-of-band.
+-                        if let Some((signer, key_id, envelope, classical_sig_b64)) =
+-                            cold_path_inputs
+-                        {
+-                            let backend = backend.clone();
+-                            tokio::spawn(async move {
+-                                match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64)
+-                                    .await
+-                                {
+-                                    Ok((pubkey_b64, pqc_sig_b64)) => {
+-                                        if let Err(e) = backend
+-                                            .attach_key_pqc_signature(
+-                                                &key_id,
+-                                                &pubkey_b64,
+-                                                &pqc_sig_b64,
+-                                            )
+-                                            .await
+-                                        {
+-                                            tracing::warn!(
+-                                                key_id = key_id.as_str(),
+-                                                error = %e,
+-                                                "cold-path PQC attach_key_pqc_signature failed; \
+-                                                 row stays hybrid-pending"
+-                                            );
+-                                        }
+-                                    }
+-                                    Err(e) => {
+-                                        tracing::warn!(
+-                                            key_id = key_id.as_str(),
+-                                            error = %e,
+-                                            "cold-path PQC sign failed; row stays hybrid-pending"
+-                                        );
+-                                    }
+-                                }
+-                            });
+-                        }
+                         Ok(())
+                     })
+                 }
+@@ -7711,20 +7560,6 @@ impl PyEngine {
+                     PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
+                 })?;
+ 
+-            // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
+-            let cold_path_inputs =
+-                self.local_signer
+-                    .as_ref()
+-                    .and_then(|s| s.pqc_signer())
+-                    .map(|signer| {
+-                        (
+-                            signer,
+-                            att.attestation.attestation_id.clone(),
+-                            att.attestation.attestation_envelope.clone(),
+-                            att.attestation.scrub_signature_classical.clone(),
+-                        )
+-                    });
+-
+             py.detach(|| match &self.backend {
+                 #[cfg(feature = "postgres")]
+                 BackendDispatch::Postgres(pg) => {
+@@ -7735,45 +7570,6 @@ impl PyEngine {
+                             .put_attestation(att)
+                             .await
+                             .map_err(federation_err_to_py)?;
+-                        if let Some((signer, attestation_id, envelope, classical_sig_b64)) =
+-                            cold_path_inputs
+-                        {
+-                            let backend = backend.clone();
+-                            tokio::spawn(async move {
+-                                match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64)
+-                                    .await
+-                                {
+-                                    Ok((_pubkey_b64, pqc_sig_b64)) => {
+-                                        // Attestations don't carry their own pubkey
+-                                        // (they reference scrub_key_id's federation_keys
+-                                        // pubkey for verification); only the PQC
+-                                        // signature attaches.
+-                                        if let Err(e) = backend
+-                                            .attach_attestation_pqc_signature(
+-                                                &attestation_id,
+-                                                &pqc_sig_b64,
+-                                            )
+-                                            .await
+-                                        {
+-                                            tracing::warn!(
+-                                                attestation_id = attestation_id.as_str(),
+-                                                error = %e,
+-                                                "cold-path PQC \
+-                                                 attach_attestation_pqc_signature failed; \
+-                                                 row stays hybrid-pending"
+-                                            );
+-                                        }
+-                                    }
+-                                    Err(e) => {
+-                                        tracing::warn!(
+-                                            attestation_id = attestation_id.as_str(),
+-                                            error = %e,
+-                                            "cold-path PQC sign failed; row stays hybrid-pending"
+-                                        );
+-                                    }
+-                                }
+-                            });
+-                        }
+                         Ok(())
+                     })
+                 }
+@@ -7786,41 +7582,6 @@ impl PyEngine {
+                             .put_attestation(att)
+                             .await
+                             .map_err(federation_err_to_py)?;
+-                        if let Some((signer, attestation_id, envelope, classical_sig_b64)) =
+-                            cold_path_inputs
+-                        {
+-                            let backend = backend.clone();
+-                            tokio::spawn(async move {
+-                                match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64)
+-                                    .await
+-                                {
+-                                    Ok((_pubkey_b64, pqc_sig_b64)) => {
+-                                        if let Err(e) = backend
+-                                            .attach_attestation_pqc_signature(
+-                                                &attestation_id,
+-                                                &pqc_sig_b64,
+-                                            )
+-                                            .await
+-                                        {
+-                                            tracing::warn!(
+-                                                attestation_id = attestation_id.as_str(),
+-                                                error = %e,
+-                                                "cold-path PQC \
+-                                                 attach_attestation_pqc_signature failed; \
+-                                                 row stays hybrid-pending"
+-                                            );
+-                                        }
+-                                    }
+-                                    Err(e) => {
+-                                        tracing::warn!(
+-                                            attestation_id = attestation_id.as_str(),
+-                                            error = %e,
+-                                            "cold-path PQC sign failed; row stays hybrid-pending"
+-                                        );
+-                                    }
+-                                }
+-                            });
+-                        }
+                         Ok(())
+                     })
+                 }
+@@ -8561,25 +8322,9 @@ impl PyEngine {
+                 serde_json::from_str(signed_revocation_json).map_err(|e| {
+                     PyValueError::new_err(format!("SignedRevocation JSON decode: {e}"))
+                 })?;
+-            let signer = self.local_signer.as_ref().and_then(|s| s.pqc_signer());
+             py.detach(|| {
+                 runtime.block_on(async move {
+                     use crate::federation::FederationDirectory;
+-                    if rev.revocation.scrub_signature_pqc.is_none() {
+-                        if let Some(signer) = signer {
+-                            let (_pubkey, pqc) = cold_path_pqc_sign(
+-                                &*signer,
+-                                &rev.revocation.revocation_envelope,
+-                                &rev.revocation.scrub_signature_classical,
+-                            )
+-                            .await
+-                            .map_err(|e| {
+-                                PyRuntimeError::new_err(format!("revocation PQC sign: {e}"))
+-                            })?;
+-                            rev.revocation.scrub_signature_pqc = Some(pqc);
+-                            rev.revocation.pqc_completed_at = Some(rev.revocation.scrub_timestamp);
+-                        }
+-                    }
+                     match &self.backend {
+                         #[cfg(feature = "postgres")]
+                         BackendDispatch::Postgres(pg) => {
+@@ -9117,90 +8862,6 @@ impl PyEngine {
+         })
+     }
+ 
+-    /// Federation directory: attach the cold-path PQC signature to a
+-    /// hybrid-pending federation_keys row. See docs/FEDERATION_DIRECTORY.md
+-    /// §"Trust contract" for the writer contract — this is step 4
+-    /// (called once the cold-path ML-DSA-65 sign completes).
+-    fn attach_key_pqc_signature(
+-        &self,
+-        py: Python<'_>,
+-        key_id: &str,
+-        pubkey_ml_dsa_65_base64: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> PyResult<()> {
+-        self.ensure_usable()?;
+-        catch_panic(|| {
+-            let runtime = self.runtime.clone();
+-            let key_id = key_id.to_owned();
+-            let mldsa_pk = pubkey_ml_dsa_65_base64.to_owned();
+-            let pqc_sig = scrub_signature_pqc.to_owned();
+-            py.detach(|| match &self.backend {
+-                #[cfg(feature = "postgres")]
+-                BackendDispatch::Postgres(pg) => {
+-                    let backend = pg.clone();
+-                    runtime.block_on(async move {
+-                        use crate::federation::FederationDirectory;
+-                        backend
+-                            .attach_key_pqc_signature(&key_id, &mldsa_pk, &pqc_sig)
+-                            .await
+-                            .map_err(federation_err_to_py)
+-                    })
+-                }
+-                #[cfg(feature = "sqlite")]
+-                BackendDispatch::Sqlite(sq) => {
+-                    let backend = sq.clone();
+-                    runtime.block_on(async move {
+-                        use crate::federation::FederationDirectory;
+-                        backend
+-                            .attach_key_pqc_signature(&key_id, &mldsa_pk, &pqc_sig)
+-                            .await
+-                            .map_err(federation_err_to_py)
+-                    })
+-                }
+-            })
+-        })
+-    }
+-
+-    /// Federation directory: attach PQC signature to a hybrid-pending
+-    /// federation_attestations row.
+-    fn attach_attestation_pqc_signature(
+-        &self,
+-        py: Python<'_>,
+-        attestation_id: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> PyResult<()> {
+-        self.ensure_usable()?;
+-        catch_panic(|| {
+-            let runtime = self.runtime.clone();
+-            let attestation_id = attestation_id.to_owned();
+-            let pqc_sig = scrub_signature_pqc.to_owned();
+-            py.detach(|| match &self.backend {
+-                #[cfg(feature = "postgres")]
+-                BackendDispatch::Postgres(pg) => {
+-                    let backend = pg.clone();
+-                    runtime.block_on(async move {
+-                        use crate::federation::FederationDirectory;
+-                        backend
+-                            .attach_attestation_pqc_signature(&attestation_id, &pqc_sig)
+-                            .await
+-                            .map_err(federation_err_to_py)
+-                    })
+-                }
+-                #[cfg(feature = "sqlite")]
+-                BackendDispatch::Sqlite(sq) => {
+-                    let backend = sq.clone();
+-                    runtime.block_on(async move {
+-                        use crate::federation::FederationDirectory;
+-                        backend
+-                            .attach_attestation_pqc_signature(&attestation_id, &pqc_sig)
+-                            .await
+-                            .map_err(federation_err_to_py)
+-                    })
+-                }
+-            })
+-        })
+-    }
+-
+     // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────
+     //
+     // Mirrors the six new FederationDirectory methods that unblock
+@@ -16376,108 +16037,6 @@ impl PyEngine {
+         })
+     }
+ 
+-    /// v0.3.2 (CIRISPersist#11) — Walk hybrid-pending federation rows
+-    /// across `federation_keys` / `federation_attestations` /
+-    /// `federation_revocations` and drive cold-path PQC fill-in for
+-    /// each. Same canonicalization + signing path as the per-write
+-    /// auto-fire (`cold_path_pqc_sign`), just walked over the rows
+-    /// already in the table without per-write spawn coverage:
+-    ///
+-    /// - Rows authored before v0.3.1 wired the per-write cold-path
+-    /// - Rows authored before the local PQC key was configured on the
+-    ///   writer
+-    /// - Rows where the per-write `tokio::spawn` cold-path failed
+-    ///   transiently (sign error, attach network blip, process restart
+-    ///   between hot-path commit and cold-path attach)
+-    ///
+-    /// Per the writer contract in V004 schema header §"Phase
+-    /// transitions":
+-    ///
+-    /// > Pre-flip rows that are still pending get walked through the
+-    /// > upgrade pipeline.
+-    ///
+-    /// This method is that pipeline.
+-    ///
+-    /// Returns a dict shaped:
+-    ///
+-    /// ```text
+-    /// {
+-    ///   "scanned": int,        # total rows examined across the three tables
+-    ///   "signed":  int,        # rows successfully hybrid-completed by this call
+-    ///   "failed":  int,        # rows where sign or attach errored (still pending)
+-    ///   "by_table": {
+-    ///     "federation_keys":          {"scanned": ..., "signed": ..., "failed": ...},
+-    ///     "federation_attestations":  {...},
+-    ///     "federation_revocations":   {...},
+-    ///   }
+-    /// }
+-    /// ```
+-    ///
+-    /// Idempotent: `attach_*_pqc_signature` already guards against
+-    /// double-fill via `WHERE pqc_completed_at IS NULL`. Multi-worker
+-    /// concurrent sweeps waste signs on losers but do not produce
+-    /// incorrect rows; the silent-skip path on `Conflict` is not
+-    /// counted as failed.
+-    ///
+-    /// `batch_size` (default 1000) caps each table's scan in one call.
+-    /// Re-invoke until `scanned == 0` to drain larger backlogs
+-    /// incrementally.
+-    ///
+-    /// Raises `ValueError` if no local PQC key is configured (same
+-    /// shape as `local_pqc_sign`).
+-    #[pyo3(signature = (batch_size=1000))]
+-    fn run_pqc_sweep<'py>(&self, py: Python<'py>, batch_size: i64) -> PyResult<Bound<'py, PyDict>> {
+-        self.ensure_usable()?;
+-        catch_panic(|| {
+-            let signer = self
+-                .local_signer
+-                .as_ref()
+-                .and_then(|s| s.pqc_signer())
+-                .ok_or_else(|| {
+-                    PyValueError::new_err(
+-                        "no local PQC key configured (pass local_pqc_key_id and \
+-                 local_pqc_key_path to the Engine constructor)",
+-                    )
+-                })?;
+-            let runtime = self.runtime.clone();
+-
+-            let summary = py.detach(move || match &self.backend {
+-                #[cfg(feature = "postgres")]
+-                BackendDispatch::Postgres(pg) => {
+-                    let backend = pg.clone();
+-                    runtime.block_on(async move {
+-                        run_pqc_sweep_inner(&backend, &*signer, batch_size).await
+-                    })
+-                }
+-                #[cfg(feature = "sqlite")]
+-                BackendDispatch::Sqlite(sq) => {
+-                    let backend = sq.clone();
+-                    runtime.block_on(async move {
+-                        run_pqc_sweep_inner(&backend, &*signer, batch_size).await
+-                    })
+-                }
+-            });
+-
+-            let dict = PyDict::new(py);
+-            dict.set_item("scanned", summary.total_scanned)?;
+-            dict.set_item("signed", summary.total_signed)?;
+-            dict.set_item("failed", summary.total_failed)?;
+-            let by_table = PyDict::new(py);
+-            for (name, counts) in [
+-                ("federation_keys", &summary.keys),
+-                ("federation_attestations", &summary.attestations),
+-            ] {
+-                let d = PyDict::new(py);
+-                d.set_item("scanned", counts.scanned)?;
+-                d.set_item("signed", counts.signed)?;
+-                d.set_item("failed", counts.failed)?;
+-                by_table.set_item(name, d)?;
+-            }
+-            dict.set_item("by_table", by_table)?;
+-            Ok(dict)
+-        })
+-    }
+-
+     /// v0.3.6 (CIRISPersist#15, CIRISLens#8 ASK 1) — GDPR Article 17
+     /// / DSAR primitive. Per-key scope: deletion is scoped to
+     /// `(agent_id_hash, signing_key_id)`.
+@@ -34641,229 +34200,6 @@ fn encode_blob_body_json(body: &crate::federation::BlobBody) -> PyResult<String>
+         .map_err(|e| PyRuntimeError::new_err(format!("BlobBody JSON encode: {e}")))
+ }
+ 
+-/// v0.3.1 — Cold-path PQC sign helper for the auto-fire flow after
+-/// federation writes (CIRISPersist#10). Computes the bound-signature
+-/// input (canonical_envelope_bytes || classical_sig_bytes), invokes
+-/// the local ML-DSA-65 signer, and returns base64-encoded
+-/// (pubkey, signature) ready for `attach_*_pqc_signature`.
+-///
+-/// Per the writer contract in `migrations/postgres/lens/V004__federation_directory.sql`:
+-/// "kick off IMMEDIATELY after Ed25519 sign, not delayed/batched/scheduled,
+-/// just off the synchronous request path." This helper runs on the
+-/// tokio task spawned by put_public_key / put_attestation /
+-/// put_revocation; the synchronous Python call has already returned.
+-async fn cold_path_pqc_sign(
+-    signer: &dyn PqcSigner,
+-    envelope: &serde_json::Value,
+-    classical_sig_b64: &str,
+-) -> Result<(String, String), String> {
+-    use base64::engine::general_purpose::STANDARD as B64;
+-    use base64::Engine as _;
+-
+-    // v37.0.0 (CIRISPersist#735) — THE PRODUCE GATE, not a hand-built
+-    // canonicalizer. The stored PQC half is rebuilt by every Rust verifier
+-    // with `ceg_produce_canonicalize` (the accord quorum in
+-    // `src/federation/admission.rs`, the holder cross-check in
+-    // `src/federation/blobs.rs`, `register::verify_key_registration`).
+-    // Minting it over `PythonJsonDumpsCanonicalizer` agreed byte-for-byte on
+-    // ASCII-only input and diverged permanently on everything else — a PQC
+-    // half no gate could ever rebuild, on a row nothing re-mints (the sweep
+-    // only sees `pqc_completed_at IS NULL`, and `attach_*_pqc_signature`
+-    // refuses an already-complete row).
+-    let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope)
+-        .map_err(|e| format!("canonicalize: {e}"))?;
+-    let classical_sig = B64
+-        .decode(classical_sig_b64)
+-        .map_err(|e| format!("classical_sig base64 decode: {e}"))?;
+-
+-    // Bound signature: PQC covers (data || classical_sig). Same shape
+-    // as CIRISVerify's HybridSignature spec — prevents stripping
+-    // attacks where an attacker who breaks Ed25519 could otherwise
+-    // replace the PQC signature with their own.
+-    let mut input = Vec::with_capacity(canonical.len() + classical_sig.len());
+-    input.extend_from_slice(&canonical);
+-    input.extend_from_slice(&classical_sig);
+-
+-    let pqc_sig = signer
+-        .sign(&input)
+-        .await
+-        .map_err(|e| format!("sign: {e}"))?;
+-    let pubkey = signer
+-        .public_key()
+-        .await
+-        .map_err(|e| format!("public_key: {e}"))?;
+-    Ok((B64.encode(&pubkey), B64.encode(&pqc_sig)))
+-}
+-
+-/// v0.3.2 (CIRISPersist#11) — counts for one table's slice of a sweep.
+-struct SweepCounts {
+-    scanned: i64,
+-    signed: i64,
+-    failed: i64,
+-}
+-
+-/// v0.3.2 (CIRISPersist#11) — aggregate sweep result across the three
+-/// federation tables. Returned by `run_pqc_sweep_inner` and surfaced
+-/// to Python as a dict by `Engine.run_pqc_sweep`.
+-struct SweepSummary {
+-    total_scanned: i64,
+-    total_signed: i64,
+-    total_failed: i64,
+-    keys: SweepCounts,
+-    attestations: SweepCounts,
+-}
+-
+-/// v0.3.2 (CIRISPersist#11) — Drive a single-batch sweep across the
+-/// three federation tables. Reused by both `Engine.run_pqc_sweep`
+-/// (synchronous from Python) and the constructor's `pqc_sweep_on_init`
+-/// auto-fire (background tokio task at end of `Engine::new`).
+-///
+-/// v1.5.1 — generic over [`crate::federation::FederationDirectory`] so
+-/// the same sweep primitive drives both PG and SQLite backends. The
+-/// trait already exposes `list_hybrid_pending_*` + `attach_*_pqc_signature`
+-/// on every concrete backend; this function just wires them together.
+-async fn run_pqc_sweep_inner<B>(
+-    backend: &Arc<B>,
+-    signer: &dyn PqcSigner,
+-    batch_size: i64,
+-) -> SweepSummary
+-where
+-    B: crate::federation::FederationDirectory + Send + Sync + 'static,
+-{
+-    let keys = sweep_keys(backend, signer, batch_size).await;
+-    let attestations = sweep_attestations(backend, signer, batch_size).await;
+-    // v58.0.0 (CIRISPersist#991) — no revocation sweep: a revocation is a
+-    // `key:revocation:v1` row and is refused unless hybrid at its door.
+-    let total_scanned = keys.scanned + attestations.scanned;
+-    let total_signed = keys.signed + attestations.signed;
+-    let total_failed = keys.failed + attestations.failed;
+-    SweepSummary {
+-        total_scanned,
+-        total_signed,
+-        total_failed,
+-        keys,
+-        attestations,
+-    }
+-}
+-
+-async fn sweep_keys<B>(backend: &Arc<B>, signer: &dyn PqcSigner, batch_size: i64) -> SweepCounts
+-where
+-    B: crate::federation::FederationDirectory + Send + Sync + 'static,
+-{
+-    let rows = match backend.list_hybrid_pending_keys(batch_size).await {
+-        Ok(rows) => rows,
+-        Err(e) => {
+-            tracing::warn!(error = %e, "sweep_keys: list_hybrid_pending_keys failed");
+-            return SweepCounts {
+-                scanned: 0,
+-                signed: 0,
+-                failed: 0,
+-            };
+-        }
+-    };
+-    let scanned = rows.len() as i64;
+-    let mut signed = 0i64;
+-    let mut failed = 0i64;
+-    for row in rows {
+-        match cold_path_pqc_sign(signer, &row.envelope, &row.classical_sig_b64).await {
+-            Ok((pubkey_b64, pqc_sig_b64)) => match backend
+-                .attach_key_pqc_signature(&row.id, &pubkey_b64, &pqc_sig_b64)
+-                .await
+-            {
+-                Ok(()) => signed += 1,
+-                Err(crate::federation::Error::Conflict(_)) => {
+-                    tracing::debug!(
+-                        key_id = row.id.as_str(),
+-                        "sweep: row hybrid-completed by another worker"
+-                    );
+-                }
+-                Err(e) => {
+-                    tracing::warn!(
+-                        key_id = row.id.as_str(),
+-                        error = %e,
+-                        "sweep: attach_key_pqc_signature failed"
+-                    );
+-                    failed += 1;
+-                }
+-            },
+-            Err(e) => {
+-                tracing::warn!(
+-                    key_id = row.id.as_str(),
+-                    error = %e,
+-                    "sweep: cold_path_pqc_sign failed"
+-                );
+-                failed += 1;
+-            }
+-        }
+-    }
+-    SweepCounts {
+-        scanned,
+-        signed,
+-        failed,
+-    }
+-}
+-
+-async fn sweep_attestations<B>(
+-    backend: &Arc<B>,
+-    signer: &dyn PqcSigner,
+-    batch_size: i64,
+-) -> SweepCounts
+-where
+-    B: crate::federation::FederationDirectory + Send + Sync + 'static,
+-{
+-    let rows = match backend.list_hybrid_pending_attestations(batch_size).await {
+-        Ok(rows) => rows,
+-        Err(e) => {
+-            tracing::warn!(error = %e, "sweep_attestations: list failed");
+-            return SweepCounts {
+-                scanned: 0,
+-                signed: 0,
+-                failed: 0,
+-            };
+-        }
+-    };
+-    let scanned = rows.len() as i64;
+-    let mut signed = 0i64;
+-    let mut failed = 0i64;
+-    for row in rows {
+-        match cold_path_pqc_sign(signer, &row.envelope, &row.classical_sig_b64).await {
+-            Ok((_pubkey_b64, pqc_sig_b64)) => match backend
+-                .attach_attestation_pqc_signature(&row.id, &pqc_sig_b64)
+-                .await
+-            {
+-                Ok(()) => signed += 1,
+-                Err(crate::federation::Error::Conflict(_)) => {
+-                    tracing::debug!(
+-                        attestation_id = row.id.as_str(),
+-                        "sweep: row hybrid-completed by another worker"
+-                    );
+-                }
+-                Err(e) => {
+-                    tracing::warn!(
+-                        attestation_id = row.id.as_str(),
+-                        error = %e,
+-                        "sweep: attach_attestation_pqc_signature failed"
+-                    );
+-                    failed += 1;
+-                }
+-            },
+-            Err(e) => {
+-                tracing::warn!(
+-                    attestation_id = row.id.as_str(),
+-                    error = %e,
+-                    "sweep: cold_path_pqc_sign failed"
+-                );
+-                failed += 1;
+-            }
+-        }
+-    }
+-    SweepCounts {
+-        scanned,
+-        signed,
+-        failed,
+-    }
+-}
+-
+ /// Scrubber bridge: wraps a Python callable in the [`Scrubber`]
+ /// trait. The callable receives the JSON-equivalent envelope dict and returns
+ /// its treatment.
+@@ -38870,139 +38206,6 @@ mod canonicalizer_parity_735 {
+         }
+     }
+ 
+-    /// **CIRISPersist#735 — `cold_path_pqc_sign` mints a PQC half the gates
+-    /// can rebuild.**
+-    ///
+-    /// Mint through the FFI cold path exactly as `put_public_key` /
+-    /// `put_attestation` / `put_revocation` auto-fire do (six call sites) and
+-    /// as the backfill sweep does (three more), then verify with
+-    /// [`crate::verify::hybrid::verify_hybrid`] over
+-    /// `ceg_produce_canonicalize(envelope)` — the bytes
+-    /// `register::verify_key_registration`, the accord-family quorum in
+-    /// `admission.rs` and `blobs.rs`'s holder cross-check all reconstruct.
+-    ///
+-    /// `verify_hybrid` binds the PQC leg over `(canonical || classical_sig)`
+-    /// internally, which is the same bound-signature shape `cold_path_pqc_sign`
+-    /// assembles — so this test compares the two constructions end to end and
+-    /// not merely two calls to one helper.
+-    ///
+-    /// Against the unfixed code (`PythonJsonDumpsCanonicalizer` inside
+-    /// `cold_path_pqc_sign`) this FAILS on the non-ASCII envelope: the stored
+-    /// PQC half is over bytes no verifier will ever rebuild, and because
+-    /// nothing re-mints an already-attached half, that row is permanently
+-    /// PQC-dark.
+-    #[tokio::test]
+-    async fn cold_path_pqc_sign_mints_the_bytes_the_gates_rebuild() {
+-        use ciris_keyring::PqcSigner as _;
+-        let envelope = divergent_envelope();
+-
+-        // The gate's reconstruction — the ONLY bytes any Rust verifier builds.
+-        let gate_bytes = ceg_produce_canonicalize(&envelope).expect("gate canonicalize");
+-
+-        // Classical half, signed over the gate bytes (what a correct producer
+-        // does; `register::verify_key_registration` re-checks exactly this).
+-        let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
+-        let ed_sig = {
+-            use ed25519_dalek::Signer as _;
+-            ed_sk.sign(&gate_bytes).to_bytes()
+-        };
+-        let classical_sig_b64 = B64.encode(ed_sig);
+-
+-        // Mint the PQC half through the FFI cold path under test.
+-        let signer = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+-            &[0x35; 32],
+-            "cold-path-735-mldsa",
+-        )
+-        .expect("deterministic ml-dsa seed");
+-        let (pqc_pubkey_b64, pqc_sig_b64) =
+-            super::cold_path_pqc_sign(&signer, &envelope, &classical_sig_b64)
+-                .await
+-                .expect("cold path pqc sign");
+-
+-        // The pubkey the helper returns is the signer's own — a sanity leg so
+-        // a helper that returned some OTHER key's bytes cannot pass.
+-        let expected_pk = signer.public_key().await.expect("ml-dsa pubkey");
+-        assert_eq!(
+-            pqc_pubkey_b64,
+-            B64.encode(&expected_pk),
+-            "the cold path must publish the key it signed with"
+-        );
+-
+-        let outcome = crate::verify::hybrid::verify_hybrid(
+-            &gate_bytes,
+-            &classical_sig_b64,
+-            Some(&pqc_sig_b64),
+-            &B64.encode(ed_sk.verifying_key().to_bytes()),
+-            Some(&pqc_pubkey_b64),
+-            crate::verify::hybrid::HybridPolicy::Strict,
+-            None,
+-        )
+-        .expect(
+-            "a PQC half minted by the FFI cold path MUST verify against the bytes \
+-             every Rust gate rebuilds — CIRISPersist#735",
+-        );
+-        assert_eq!(
+-            outcome,
+-            crate::verify::hybrid::VerifyOutcome::HybridVerified,
+-            "Strict policy must reach a full hybrid verify, not a fallback"
+-        );
+-    }
+-
+-    /// **CIRISPersist#735 — the mint side really is the gate, byte-for-byte.**
+-    ///
+-    /// The round-trip above proves the signature verifies; this proves WHY,
+-    /// which is the property that survives a future refactor: the preimage
+-    /// `cold_path_pqc_sign` signs is `ceg_produce_canonicalize(envelope) ||
+-    /// classical_sig`, not `PythonJsonDumpsCanonicalizer(envelope) ||
+-    /// classical_sig`. Verified by signing both candidate preimages with the
+-    /// same deterministic signer and asserting which one the cold path
+-    /// reproduces — a right-outcome-through-the-wrong-mechanism pass is
+-    /// therefore not available to it.
+-    #[tokio::test]
+-    async fn cold_path_pqc_sign_preimage_is_the_produce_gate_not_v1() {
+-        use ciris_keyring::PqcSigner as _;
+-        let envelope = divergent_envelope();
+-        let classical_sig_b64 = B64.encode([0x11u8; 64]);
+-        let classical_sig = B64.decode(&classical_sig_b64).expect("fixture decodes");
+-
+-        let signer = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+-            &[0x36; 32],
+-            "cold-path-735-preimage",
+-        )
+-        .expect("deterministic ml-dsa seed");
+-
+-        let (_pk, actual_sig_b64) =
+-            super::cold_path_pqc_sign(&signer, &envelope, &classical_sig_b64)
+-                .await
+-                .expect("cold path pqc sign");
+-
+-        let mut jcs_preimage = ceg_produce_canonicalize(&envelope).expect("jcs");
+-        jcs_preimage.extend_from_slice(&classical_sig);
+-        let mut v1_preimage = PythonJsonDumpsCanonicalizer
+-            .canonicalize_value(&envelope)
+-            .expect("v1");
+-        v1_preimage.extend_from_slice(&classical_sig);
+-        assert_ne!(
+-            jcs_preimage, v1_preimage,
+-            "the fixture must diverge or this test cannot fail"
+-        );
+-
+-        let jcs_sig = signer.sign(&jcs_preimage).await.expect("sign jcs preimage");
+-        let v1_sig = signer.sign(&v1_preimage).await.expect("sign v1 preimage");
+-        assert_eq!(
+-            actual_sig_b64,
+-            B64.encode(&jcs_sig),
+-            "cold_path_pqc_sign must sign ceg_produce_canonicalize(envelope) || \
+-             classical_sig — CIRISPersist#735"
+-        );
+-        assert_ne!(
+-            actual_sig_b64,
+-            B64.encode(&v1_sig),
+-            "cold_path_pqc_sign must NOT sign PythonJsonDumpsCanonicalizer(envelope) \
+-             || classical_sig — that is the #735 defect"
+-        );
+-    }
+-
+     /// **CIRISPersist#735 — the FFI verify side rebuilds the gate's bytes.**
+     ///
+     /// `canonicalize_envelope_value` feeds `verify_signed_key_record`,
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index 3953c735..45340435 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -653,7 +653,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     // and which I951's local-door rows exercise.
+     ("map", Class::Plumbing),
+     ("plan_attach_attestation_pqc_signature", Class::Gate),
+-    ("store_pqc_completion", Class::Plumbing),
+     // v55.0.0 (CIRISPersist#952) — Gate: the finalize refuses a chunk not held whole.
+     ("check_held_dag_chunk", Class::Gate),
+     // v46.3.0 (#884) — `minter_of_blob`'s community arm IS the #876 read
+diff --git a/src/store/postgres.rs b/src/store/postgres.rs
+index b19630be..72ef52af 100644
+--- a/src/store/postgres.rs
++++ b/src/store/postgres.rs
+@@ -692,35 +692,6 @@ impl crate::federation::group_plane::GroupPlaneStore for PostgresBackend {
+ /// Storage only: the selections are `federation::sweep_plan`'s.
+ #[async_trait::async_trait]
+ impl crate::federation::sweep_plan::SweepStore for PostgresBackend {
+-    async fn read_hybrid_pending(
+-        &self,
+-        selection: crate::federation::sweep_plan::HybridPendingSelection,
+-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+-        let client = self
+-            .get_client()
+-            .await
+-            .map_err(crate::store::Error::into_federation)?;
+-        let rows = pg_query_statement(
+-            &**client,
+-            selection.render(crate::federation::attestation_query::Dialect::Postgres),
+-        )
+-        .await
+-        .map_err(|e| crate::federation::Error::Backend(format!("read_hybrid_pending: {e}")))?;
+-        rows.into_iter()
+-            .map(|row| {
+-                let mk_err = crate::federation::Error::Backend;
+-                Ok(crate::federation::HybridPendingRow {
+-                    id: row.safe_get_with("row_id", mk_err)?,
+-                    // v31.0.0 (#644) — TEXT since V122.
+-                    envelope: pg_envelope_value(
+-                        &row.safe_get_with::<String, _, _, _>("envelope", mk_err)?,
+-                        "envelope",
+-                    )?,
+-                    classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
+-                })
+-            })
+-            .collect()
+-    }
+ 
+     async fn read_expired_attestation_ids(
+         &self,
+@@ -4247,7 +4218,6 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
+             | P::Rewrite { record, .. }
+             | P::Replace { record, .. }
+             | P::RehydrateScrubs { record } => Some(pg_key_columns(record)?),
+-            P::CompletePqc { .. } => None,
+         };
+         self.rehome_legacy_key_plane().await?;
+         let mut client = self
+@@ -4439,32 +4409,6 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
+                     .map_err(|e| failed("replace", e))?
+                 }
+             }
+-            (
+-                P::CompletePqc {
+-                    key_id,
+-                    pubkey_ml_dsa_65_base64,
+-                    scrub_signature_pqc,
+-                    completed_at,
+-                    persist_row_hash,
+-                },
+-                _,
+-            ) => tx
+-                .execute(
+-                    "UPDATE cirislens.federation_keys \
+-                     SET pubkey_ml_dsa_65_base64 = $1, scrub_signature_pqc = $2, \
+-                         pqc_completed_at = $3, persist_row_hash = $4, mutated_at = $6 \
+-                     WHERE key_id = $5 AND pqc_completed_at IS NULL",
+-                    &[
+-                        pubkey_ml_dsa_65_base64,
+-                        scrub_signature_pqc,
+-                        completed_at,
+-                        persist_row_hash,
+-                        key_id,
+-                        &position,
+-                    ],
+-                )
+-                .await
+-                .map_err(|e| failed("complete pqc", e))?,
+             (P::RehydrateScrubs { record: r }, Some(c)) => tx
+                 .execute(
+                     "UPDATE cirislens.federation_keys SET additional_scrubs = $3, mutated_at = $4 \
+@@ -14399,41 +14343,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+         Ok(triples.len() as u64)
+     }
+ 
+-    async fn attach_key_pqc_signature(
+-        &self,
+-        key_id: &str,
+-        pubkey_ml_dsa_65_base64: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), crate::federation::Error> {
+-        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
+-        crate::federation::key_plane::key_record_write_planned(
+-            self,
+-            crate::federation::key_plane::KeyRecordWrite::AttachPqc {
+-                key_id,
+-                pubkey_ml_dsa_65_base64,
+-                scrub_signature_pqc,
+-            },
+-        )
+-        .await?;
+-        Ok(())
+-    }
+-
+-    /// v56.0.0 (CIRISPersist#934 step 1) — the decision is
+-    /// [`plan_attach_attestation_pqc_signature`](crate::federation::attestation_admit::plan_attach_attestation_pqc_signature),
+-    /// shared by all three backends; this backend stores it.
+-    async fn attach_attestation_pqc_signature(
+-        &self,
+-        attestation_id: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), crate::federation::Error> {
+-        crate::federation::attestation_admit::attach_attestation_pqc_planned(
+-            self,
+-            attestation_id,
+-            scrub_signature_pqc,
+-        )
+-        .await
+-    }
+-
+     async fn get_attestation(
+         &self,
+         attestation_id: &str,
+@@ -14812,34 +14721,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+             .collect()
+     }
+ 
+-    async fn list_hybrid_pending_keys(
+-        &self,
+-        limit: i64,
+-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+-        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
+-        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
+-            self,
+-            crate::federation::sweep_plan::HybridPlane::Keys,
+-            limit,
+-        )
+-        .await?;
+-        Ok(rows)
+-    }
+-
+-    async fn list_hybrid_pending_attestations(
+-        &self,
+-        limit: i64,
+-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+-        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
+-        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
+-            self,
+-            crate::federation::sweep_plan::HybridPlane::Attestations,
+-            limit,
+-        )
+-        .await?;
+-        Ok(rows)
+-    }
+-
+     // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
+ 
+     async fn grant_trust(
+@@ -21267,62 +21148,6 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend
+             .map_err(|e| crate::federation::Error::Backend(format!("withdraws depth repair: {e}")))
+     }
+ 
+-    async fn store_pqc_completion(
+-        &self,
+-        completion: crate::federation::attestation_admit::PqcCompletion,
+-    ) -> Result<(), crate::federation::Error> {
+-        let client = self
+-            .get_client()
+-            .await
+-            .map_err(crate::store::Error::into_federation)?;
+-        // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
+-        // THREE served columns; the serve position moves with them.
+-        let admitted_at = self
+-            .next_plane_position(&client, "federation_attestations")
+-            .await?;
+-        let n = client
+-            .execute(
+-                "UPDATE cirislens.federation_attestations \
+-                 SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3, \
+-                     admitted_at = $5 \
+-                 WHERE attestation_id = $4 AND pqc_completed_at IS NULL",
+-                &[
+-                    &completion.scrub_signature_pqc,
+-                    &completion.pqc_completed_at,
+-                    &completion.persist_row_hash,
+-                    &completion.attestation_id,
+-                    &admitted_at,
+-                ],
+-            )
+-            .await
+-            .map_err(|e| {
+-                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
+-            })?;
+-        if n == 0 {
+-            return Err(crate::federation::Error::Conflict(format!(
+-                "federation_attestations row {} was concurrently completed",
+-                completion.attestation_id
+-            )));
+-        }
+-        // v59.1.2 — the re-index checks out its own client (the boot PQC
+-        // sweep reaches this door).
+-        drop(client);
+-        // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. The
+-        // hybrid-completion write moves three serialized columns, so it moves
+-        // the wire content hash. Postgres rounds `pqc_completed_at` to
+-        // microseconds, which is exactly why the shared helper re-reads the row
+-        // rather than hashing the in-memory value.
+-        self.index_stored_record(
+-            "Attestation",
+-            &crate::federation::wire_index::record_key(&[(
+-                "attestation_id",
+-                &completion.attestation_id,
+-            )]),
+-        )
+-        .await?;
+-        Ok(())
+-    }
+-
+     async fn store_planned_local_attestation(
+         &self,
+         planned: crate::federation::attestation_admit::PlannedLocalAttestation,
+@@ -31673,37 +31498,6 @@ mod tests {
+         .await;
+     }
+ 
+-    /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
+-    /// the STORED envelope. No production door can do this (both v31 gates
+-    /// refuse the shape), so the seam reaches the pool directly.
+-    #[cfg(feature = "sqlite")]
+-    #[async_trait::async_trait]
+-    impl crate::federation::migration::test_support::LegacyRowInstaller for PostgresBackend {
+-        async fn downgrade_to_v30(&self, attestation_id: &str) {
+-            let row = crate::federation::FederationDirectory::get_attestation(self, attestation_id)
+-                .await
+-                .expect("read")
+-                .expect("downgrade_to_v30: row must exist");
+-            // v31.0.0 (#644) — attestation_envelope is TEXT since V122.
+-            let envelope = pg_envelope_text(
+-                &crate::federation::migration::test_support::v30_envelope(
+-                    &row.attestation_envelope,
+-                ),
+-                "attestation_envelope",
+-            )
+-            .expect("serialize");
+-            let client = self.get_client().await.expect("client");
+-            client
+-                .execute(
+-                    "UPDATE cirislens.federation_attestations SET attestation_envelope = $2 \
+-                     WHERE attestation_id = $1",
+-                    &[&attestation_id, &envelope],
+-                )
+-                .await
+-                .expect("downgrade_to_v30 update");
+-        }
+-    }
+-
+     /// v31.0.0 (CIRISPersist#650) — the recursive load-bearing walk over a
+     /// CYCLIC graph, postgres arm. Shared exercise body with memory + sqlite.
+     #[tokio::test]
+@@ -31722,48 +31516,6 @@ mod tests {
+         .await;
+     }
+ 
+-    /// v31.0.0 (CIRISPersist#650) — THE PINNED GAP: a v30-shaped row can STILL
+-    /// land after the migration, through the transit-revocation door. Postgres
+-    /// arm; shared body with memory + sqlite.
+-    #[tokio::test]
+-    #[serial_test::serial(postgres)]
+-    async fn a_v30_row_cannot_land_after_migration_postgres_650() {
+-        let Some(dsn) = pg_dsn() else {
+-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+-            return;
+-        };
+-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+-        backend.run_migrations().await.expect("migrations run");
+-        let tag = format!("pg650g{}", uuid_like());
+-        crate::federation::migration::test_support::exercise_a_v30_row_cannot_land_after_migration(
+-            &backend, &tag,
+-        )
+-        .await;
+-    }
+-
+-    /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration, postgres arm.
+-    /// Shared exercise body with sqlite; the peer is an in-memory SQLite
+-    /// (one postgres database per test process, so a second postgres corpus is
+-    /// not available — and the receiving stack is backend-symmetric by
+-    /// construction, with its own parity witnesses).
+-    #[tokio::test]
+-    #[serial_test::serial(postgres)]
+-    #[cfg(feature = "sqlite")]
+-    async fn v31_migration_postgres_650() {
+-        let Some(dsn) = pg_dsn() else {
+-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+-            return;
+-        };
+-        let origin = PostgresBackend::connect(&dsn).await.expect("connect");
+-        origin.run_migrations().await.expect("migrations run");
+-        let peer = crate::store::test_backend::test_backend();
+-        let tag = format!("pg650{}", uuid_like());
+-        crate::federation::migration::test_support::exercise_v31_migration(
+-            &origin, &origin, &peer, &tag,
+-        )
+-        .await;
+-    }
+-
+     /// #592 B9 / AV-84 — a targeted-cohort placement is a producer
+     /// self-declaration, on postgres. Shared exercise body; the tag is unique
+     /// per run because this database persists across tests.
+diff --git a/src/store/sqlite.rs b/src/store/sqlite.rs
+index b1600e00..2774c2d0 100644
+--- a/src/store/sqlite.rs
++++ b/src/store/sqlite.rs
+@@ -7664,41 +7664,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+         Ok(count)
+     }
+ 
+-    async fn attach_key_pqc_signature(
+-        &self,
+-        key_id: &str,
+-        pubkey_ml_dsa_65_base64: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), crate::federation::Error> {
+-        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
+-        crate::federation::key_plane::key_record_write_planned(
+-            self,
+-            crate::federation::key_plane::KeyRecordWrite::AttachPqc {
+-                key_id,
+-                pubkey_ml_dsa_65_base64,
+-                scrub_signature_pqc,
+-            },
+-        )
+-        .await?;
+-        Ok(())
+-    }
+-
+-    /// v56.0.0 (CIRISPersist#934 step 1) — the decision is
+-    /// [`plan_attach_attestation_pqc_signature`](crate::federation::attestation_admit::plan_attach_attestation_pqc_signature),
+-    /// shared by all three backends; this backend stores it.
+-    async fn attach_attestation_pqc_signature(
+-        &self,
+-        attestation_id: &str,
+-        scrub_signature_pqc: &str,
+-    ) -> Result<(), crate::federation::Error> {
+-        crate::federation::attestation_admit::attach_attestation_pqc_planned(
+-            self,
+-            attestation_id,
+-            scrub_signature_pqc,
+-        )
+-        .await
+-    }
+-
+     async fn get_attestation(
+         &self,
+         attestation_id: &str,
+@@ -8058,34 +8023,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+         .await
+     }
+ 
+-    async fn list_hybrid_pending_keys(
+-        &self,
+-        limit: i64,
+-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+-        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
+-        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
+-            self,
+-            crate::federation::sweep_plan::HybridPlane::Keys,
+-            limit,
+-        )
+-        .await?;
+-        Ok(rows)
+-    }
+-
+-    async fn list_hybrid_pending_attestations(
+-        &self,
+-        limit: i64,
+-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+-        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
+-        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
+-            self,
+-            crate::federation::sweep_plan::HybridPlane::Attestations,
+-            limit,
+-        )
+-        .await?;
+-        Ok(rows)
+-    }
+-
+     // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
+ 
+     async fn grant_trust(
+@@ -15453,59 +15390,6 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
+         .map_err(|e| crate::federation::Error::Backend(format!("withdraws depth repair: {e}")))
+     }
+ 
+-    async fn store_pqc_completion(
+-        &self,
+-        completion: crate::federation::attestation_admit::PqcCompletion,
+-    ) -> Result<(), crate::federation::Error> {
+-        let attestation_id = completion.attestation_id.clone();
+-        let n = self
+-            .write(move |conn| -> Result<usize, rusqlite::Error> {
+-                // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
+-                // THREE served columns; the serve position moves with them.
+-                let admitted_at =
+-                    sqlite_next_plane_position(conn, "federation_attestations", POS_ATTESTATION)?;
+-                conn.execute(
+-                    "UPDATE federation_attestations \
+-                 SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3, \
+-                     admitted_at = ?5 \
+-                 WHERE attestation_id = ?4 AND pqc_completed_at IS NULL",
+-                    rusqlite::params![
+-                        completion.scrub_signature_pqc,
+-                        completion.pqc_completed_at.to_rfc3339(),
+-                        completion.persist_row_hash,
+-                        completion.attestation_id,
+-                        admitted_at.to_rfc3339()
+-                    ],
+-                )
+-            })
+-            .await
+-            .map_err(|e| {
+-                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
+-            })?;
+-        if n == 0 {
+-            return Err(crate::federation::Error::Conflict(
+-                "federation_attestations row was concurrently completed".to_string(),
+-            ));
+-        }
+-        // v31.0.0 (CIRISPersist#657) — the hybrid-completion write moves THREE
+-        // serialized columns of the attestation (`scrub_signature_pqc`,
+-        // `pqc_completed_at`, `persist_row_hash`), so it moves the wire content
+-        // hash exactly as the key-plane twin above does. #547 fixed the key
+-        // site and #640 made that remedy shared; this site was never redirected
+-        // through it, so a federation-tier attestation that completed its PQC
+-        // leg kept serving the PRE-completion hash out of `signed_wire_index` —
+-        // the point-read advertises one digest and the read surface returns
+-        // another. Indexed from the row AS STORED (the shared helper re-reads),
+-        // which is what makes the index agree with the read surface on a
+-        // backend that rounds `pqc_completed_at`.
+-        self.index_stored_record(
+-            "Attestation",
+-            &crate::federation::wire_index::record_key(&[("attestation_id", &attestation_id)]),
+-        )
+-        .await?;
+-        Ok(())
+-    }
+-
+     async fn store_planned_local_attestation(
+         &self,
+         planned: crate::federation::attestation_admit::PlannedLocalAttestation,
+@@ -23902,40 +23786,6 @@ fn sqlite_binds(binds: Vec<crate::federation::attestation_query::Bind>) -> Vec<S
+ /// Storage only: the selections are `federation::sweep_plan`'s.
+ #[async_trait::async_trait]
+ impl crate::federation::sweep_plan::SweepStore for SqliteBackend {
+-    async fn read_hybrid_pending(
+-        &self,
+-        selection: crate::federation::sweep_plan::HybridPendingSelection,
+-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+-        let stmt = selection.render(crate::federation::attestation_query::Dialect::Sqlite);
+-        let binds = sqlite_binds(stmt.binds);
+-        let sql = stmt.sql;
+-        let rows = self
+-            .read(
+-                move |conn| -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+-                    let mut stmt = conn.prepare(&sql)?;
+-                    let rows = stmt.query_map(params_from_iter(binds.iter()), |r| {
+-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+-                    })?;
+-                    rows.collect()
+-                },
+-            )
+-            .await
+-            .map_err(|e| crate::federation::Error::Backend(format!("read_hybrid_pending: {e}")))?;
+-        rows.into_iter()
+-            .map(|(id, envelope_text, classical_sig_b64)| {
+-                let envelope = serde_json::from_str(&envelope_text).map_err(|e| {
+-                    crate::federation::Error::Backend(format!(
+-                        "hybrid-pending envelope decode: {e}"
+-                    ))
+-                })?;
+-                Ok(crate::federation::HybridPendingRow {
+-                    id,
+-                    envelope,
+-                    classical_sig_b64,
+-                })
+-            })
+-            .collect()
+-    }
+ 
+     async fn read_expired_attestation_ids(
+         &self,
+@@ -27375,7 +27225,6 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
+             | P::Rewrite { record, .. }
+             | P::Replace { record, .. }
+             | P::RehydrateScrubs { record } => Some(sqlite_key_columns(record)?),
+-            P::CompletePqc { .. } => None,
+         };
+         self.rehome_legacy_key_plane().await?;
+         let kid = key_id.clone();
+@@ -27554,29 +27403,6 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
+                         )?
+                     }
+                 }
+-                (
+-                    P::CompletePqc {
+-                        key_id,
+-                        pubkey_ml_dsa_65_base64,
+-                        scrub_signature_pqc,
+-                        completed_at,
+-                        persist_row_hash,
+-                    },
+-                    _,
+-                ) => tx.execute(
+-                    "UPDATE federation_keys \
+-                     SET pubkey_ml_dsa_65_base64 = ?1, scrub_signature_pqc = ?2, \
+-                         pqc_completed_at = ?3, persist_row_hash = ?4, mutated_at = ?6 \
+-                     WHERE key_id = ?5 AND pqc_completed_at IS NULL",
+-                    rusqlite::params![
+-                        pubkey_ml_dsa_65_base64,
+-                        scrub_signature_pqc,
+-                        completed_at.to_rfc3339(),
+-                        persist_row_hash,
+-                        key_id,
+-                        position,
+-                    ],
+-                )?,
+                 (P::RehydrateScrubs { record: r }, Some(c)) => tx.execute(
+                     "UPDATE federation_keys SET additional_scrubs = ?3, mutated_at = ?4 \
+                      WHERE key_id = ?1 AND persist_row_hash = ?2 AND additional_scrubs = '[]'",
+@@ -52001,35 +51827,6 @@ mod tests {
+         .await;
+     }
+ 
+-    /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
+-    /// the STORED envelope. No production door can do this (both v31 gates
+-    /// refuse the shape), so the seam reaches the connection directly.
+-    #[async_trait::async_trait]
+-    impl crate::federation::migration::test_support::LegacyRowInstaller for SqliteBackend {
+-        async fn downgrade_to_v30(&self, attestation_id: &str) {
+-            let row = crate::federation::FederationDirectory::get_attestation(self, attestation_id)
+-                .await
+-                .expect("read")
+-                .expect("downgrade_to_v30: row must exist");
+-            let envelope =
+-                serde_json::to_string(&crate::federation::migration::test_support::v30_envelope(
+-                    &row.attestation_envelope,
+-                ))
+-                .expect("serialize");
+-            let conn = self.conn.clone();
+-            let id = attestation_id.to_owned();
+-            (move || -> Result<usize, rusqlite::Error> {
+-                let conn = conn.lock();
+-                conn.execute(
+-                    "UPDATE federation_attestations SET attestation_envelope = ?2 \
+-                     WHERE attestation_id = ?1",
+-                    rusqlite::params![id, envelope],
+-                )
+-            })()
+-            .expect("downgrade_to_v30 update");
+-        }
+-    }
+-
+     impl SqliteBackend {
+         pub(crate) fn rewrite_dimension_for_test(&self, attestation_id: &str, dimension: &str) {
+             let conn = self.conn.lock();
+@@ -52064,34 +51861,6 @@ mod tests {
+         .await;
+     }
+ 
+-    /// v31.0.0 (CIRISPersist#650) — THE PINNED GAP: a v30-shaped row can STILL
+-    /// land after the migration, through the transit-revocation door. Sqlite
+-    /// arm; shared body with memory + postgres.
+-    #[tokio::test]
+-    async fn a_v30_row_cannot_land_after_migration_sqlite_650() {
+-        let backend = SqliteBackend::open_in_memory().await.unwrap();
+-        backend.run_migrations().await.unwrap();
+-        crate::federation::migration::test_support::exercise_a_v30_row_cannot_land_after_migration(
+-            &backend, "sq650g",
+-        )
+-        .await;
+-    }
+-
+-    /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration, sqlite arm.
+-    /// Shared exercise body with memory + postgres; two independent in-memory
+-    /// databases are two genuinely separate corpora.
+-    #[tokio::test]
+-    async fn v31_migration_sqlite_650() {
+-        let origin = SqliteBackend::open_in_memory().await.unwrap();
+-        origin.run_migrations().await.unwrap();
+-        let peer = SqliteBackend::open_in_memory().await.unwrap();
+-        peer.run_migrations().await.unwrap();
+-        crate::federation::migration::test_support::exercise_v31_migration(
+-            &origin, &origin, &peer, "sq650",
+-        )
+-        .await;
+-    }
+-
+     /// #592 B9 / AV-84 — a targeted-cohort placement is a producer
+     /// self-declaration, on sqlite. Shared exercise body with memory +
+     /// postgres.
+diff --git a/src/store/sqlite_conn_model.rs b/src/store/sqlite_conn_model.rs
+index 492125ff..2f5f2e63 100644
+--- a/src/store/sqlite_conn_model.rs
++++ b/src/store/sqlite_conn_model.rs
+@@ -670,7 +670,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+     ("list_group_versions", ConnClass::Read),
+     ("list_hard_case_events", ConnClass::Read),
+     ("list_held_fountain_content", ConnClass::Read),
+-    ("read_hybrid_pending", ConnClass::Read),
+     ("list_identity_occurrence_revocations_for", ConnClass::Read),
+     ("list_identity_occurrences_for", ConnClass::Read),
+     ("list_installed_storage_budgets", ConnClass::Read),
+@@ -942,7 +941,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+     ("list_open_self_roster_proposals", ConnClass::Read),
+     ("list_settled_self_roster_proposals", ConnClass::Read),
+     ("settle_self_roster_proposal", ConnClass::Write),
+-    ("store_pqc_completion", ConnClass::Write),
+     ("store_planned_attestation", ConnClass::Write),
+     ("store_planned_reseal", ConnClass::Write),
+     // v57.0.0 (CIRISPersist#988 items 2, 3) — the hard_case and detection

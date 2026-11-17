@@ -1,0 +1,450 @@
+diff --git a/src/federation/accord_admit.rs b/src/federation/accord_admit.rs
+index a705e5e8..e4588049 100644
+--- a/src/federation/accord_admit.rs
++++ b/src/federation/accord_admit.rs
+@@ -90,6 +90,7 @@ pub(crate) async fn put_accord_proposal_planned<D: AccordStore>(
+     proposal: AccordProposal,
+     authority_signature: Option<serde_json::Value>,
+ ) -> Result<(), Error> {
++    super::edition2::door::refuse_earlier_form("accord_quorum")?;
+     let received_at = crate::host::clock::now();
+     let last = dir.last_accord_proposal_created_at().await?;
+     let created_at = super::types::monotonic_admission_instant(received_at, last);
+@@ -108,6 +109,7 @@ pub(crate) async fn put_accord_participation_planned<D: AccordStore>(
+     participation: AccordParticipation,
+     standing_roster: &[ThresholdMember],
+ ) -> Result<(), Error> {
++    super::edition2::door::refuse_earlier_form("accord_quorum")?;
+     // The proposal MUST exist: verify-before-mutation needs it to verify the
+     // participation's binding.
+     let stored = dir
+@@ -145,6 +147,7 @@ pub(crate) async fn put_accord_decision_planned<D: AccordStore>(
+     dir: &D,
+     decision: AccordDecision,
+ ) -> Result<(), Error> {
++    super::edition2::door::refuse_earlier_form("accord_quorum")?;
+     let received_at = crate::host::clock::now();
+     let prep = accord_quorum::prepare_decision(&decision, received_at)?;
+     let digest = prep.proposal_digest.clone();
+diff --git a/src/federation/accord_carriage.rs b/src/federation/accord_carriage.rs
+index 33208b8f..b31ad127 100644
+--- a/src/federation/accord_carriage.rs
++++ b/src/federation/accord_carriage.rs
+@@ -271,6 +271,7 @@ pub async fn admit_replicated_accord_evidence(
+     directory: &dyn FederationDirectory,
+     evidence: &AccordQuorumEvidence,
+ ) -> Result<AccordEvidenceAdmission, Error> {
++    super::edition2::door::refuse_earlier_form("accord_evidence")?;
+     admit_replicated_accord_evidence_over_roster(
+         directory,
+         evidence,
+diff --git a/src/federation/attestation_admit.rs b/src/federation/attestation_admit.rs
+index 2f52c7db..18ffa974 100644
+--- a/src/federation/attestation_admit.rs
++++ b/src/federation/attestation_admit.rs
+@@ -435,6 +435,7 @@ pub(crate) async fn put_attestation_planned<D>(
+ where
+     D: AttestationStore,
+ {
++    super::edition2::door::refuse_earlier_form_row("attestation", &attestation.attestation)?;
+     // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row goes to its
+     // family's door: proof of possession, not resolve-the-attester; the
+     // object's own signature, not one over the row's envelope.
+diff --git a/src/federation/attestation_apply.rs b/src/federation/attestation_apply.rs
+index b7307f0e..1da97522 100644
+--- a/src/federation/attestation_apply.rs
++++ b/src/federation/attestation_apply.rs
+@@ -422,6 +422,7 @@ pub(crate) async fn apply_planned<D>(
+ where
+     D: super::FederationDirectory + ?Sized,
+ {
++    super::edition2::door::refuse_earlier_form_row("attestation", &attestation.attestation)?;
+     use super::precedence;
+     use ReplicatedAttestationOutcome as Outcome;
+     use ReplicatedAttestationPlan as Plan;
+diff --git a/src/federation/blob_admit.rs b/src/federation/blob_admit.rs
+index 8261c44c..4f6deb4a 100644
+--- a/src/federation/blob_admit.rs
++++ b/src/federation/blob_admit.rs
+@@ -607,6 +607,8 @@ pub(crate) async fn put_delivery_receipt_planned<D: BlobFloorStore>(
+     dir: &D,
+     receipt: super::stream_receipt::DeliveryReceipt,
+ ) -> Result<(), BlobError> {
++    super::edition2::door::refuse_earlier_form("delivery_receipt")
++        .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
+     // Step 1: the subscriber's hybrid signature. Necessary, NOT sufficient.
+     super::stream_receipt::verify_receipt_signature(dir, &receipt).await?;
+     let k_i64 = i64::try_from(receipt.k)
+diff --git a/src/federation/community_admit.rs b/src/federation/community_admit.rs
+index 95651498..f6098f49 100644
+--- a/src/federation/community_admit.rs
++++ b/src/federation/community_admit.rs
+@@ -155,6 +155,7 @@ pub(crate) async fn put_community_planned<D>(
+ where
+     D: CommunityStore,
+ {
++    super::edition2::door::refuse_earlier_form("community")?;
+     // Test-only (PR #921 review, F3): a rival write that won the race lands
+     // here, after any read the caller made and before this write's own gates
+     // and reads.
+@@ -219,6 +220,7 @@ pub(crate) async fn apply_replicated_community_planned<D>(
+ where
+     D: CommunityStore,
+ {
++    super::edition2::door::refuse_earlier_form("community")?;
+     // v61 (CIRISPersist#1148) — the put-time audience precondition, as on the
+     // attestation plane: a record this node may not receive is refused by
+     // name before any door runs.
+@@ -320,6 +322,7 @@ pub(crate) async fn put_community_membership_revocation_planned<D>(
+ where
+     D: CommunityStore,
+ {
++    super::edition2::door::refuse_earlier_form("community")?;
+     // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door, and
+     // the row's signed instant.
+     let instants = PlanInstants {
+@@ -526,6 +529,7 @@ pub(crate) async fn put_community_membership_widening_planned<D>(
+ where
+     D: CommunityStore,
+ {
++    super::edition2::door::refuse_earlier_form("community")?;
+     // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door, and
+     // the row's signed instant.
+     let instants = PlanInstants {
+diff --git a/src/federation/consent_admit.rs b/src/federation/consent_admit.rs
+index e31b85c7..b0c383b4 100644
+--- a/src/federation/consent_admit.rs
++++ b/src/federation/consent_admit.rs
+@@ -255,6 +255,7 @@ pub(crate) async fn grant_trust_planned<D>(dir: &D, signed: SignedTrustGrant) ->
+ where
+     D: ConsentStore + FederationDirectory,
+ {
++    super::edition2::door::refuse_earlier_form("trust_grant")?;
+     let row = plan_grant_trust(dir, signed, crate::host::clock::now()).await?;
+     let key = row.key.clone();
+     if dir.store_planned_trust_grant(row).await? {
+@@ -277,6 +278,7 @@ pub(crate) async fn revoke_trust_planned<D>(
+ where
+     D: ConsentStore + FederationDirectory,
+ {
++    super::edition2::door::refuse_earlier_form("trust_grant")?;
+     if revocation.key.is_empty() {
+         return Err(Error::InvalidArgument("key must be non-empty".into()));
+     }
+diff --git a/src/federation/edition2/door.rs b/src/federation/edition2/door.rs
+index 47a51814..e6b036cd 100644
+--- a/src/federation/edition2/door.rs
++++ b/src/federation/edition2/door.rs
+@@ -347,3 +347,79 @@ pub fn raw_payload(bytes: &[u8]) -> Option<Vec<u8>> {
+     };
+     inner.as_array()?.get(2)?.as_bytes().map(<[u8]>::to_vec)
+ }
++
++/// v62.0.0 (JSON-cut slice A; CC 2.6.1.12, rc20 "nothing carries, clean
++/// mesh") — **THE switch that shuts the earlier-form doors.** While it is
++/// `false` every JSON door admits as before; slice F flips it to `true`, in
++/// this one place, and every door wired to [`refuse_earlier_form`] refuses
++/// an earlier-form object by name ([`token::EARLIER_FORM_OBJECT`]).
++pub const EARLIER_FORM_DOORS_SHUT: bool = false;
++
++#[cfg(test)]
++tokio::task_local! {
++    /// A test forces the switch on for the future it scopes
++    /// ([`with_earlier_form_doors_shut`]), so a witness can assert each
++    /// door's refusal before F flips [`EARLIER_FORM_DOORS_SHUT`].
++    static FORCE_SHUT: bool;
++}
++
++/// Is the earlier form shut at this node's doors?
++#[must_use]
++pub fn earlier_form_doors_shut() -> bool {
++    #[cfg(test)]
++    if FORCE_SHUT.try_with(|f| *f).unwrap_or(false) {
++        return true;
++    }
++    EARLIER_FORM_DOORS_SHUT
++}
++
++/// Test only: run `fut` with the switch forced on.
++#[cfg(test)]
++pub(crate) async fn with_earlier_form_doors_shut<T>(
++    fut: impl std::future::Future<Output = T>,
++) -> T {
++    FORCE_SHUT.scope(true, fut).await
++}
++
++/// **The one shared refusal every earlier-form door calls** (v62.0.0,
++/// JSON-cut slice A). `plane` names the door. It is inert until
++/// [`EARLIER_FORM_DOORS_SHUT`] is `true`; then it refuses
++/// [`token::EARLIER_FORM_OBJECT`] (`federation_malformed_row`, Python
++/// `ValueError`), before any parse or verify of the object.
++///
++/// # Errors
++/// [`token::EARLIER_FORM_OBJECT`] once the doors are shut.
++pub fn refuse_earlier_form(plane: &'static str) -> Result<(), Error> {
++    if earlier_form_doors_shut() {
++        return Err(Error::malformed_row(
++            plane,
++            token::EARLIER_FORM_OBJECT,
++            format!(
++                "an object of the earlier form (a JSON object signed over its JCS image, CC 8.11) \
++                 at the `{plane}` door: a node of this form reads this form only; offer the \
++                 edition-2 statement (CC 2.6.1.12)"
++            ),
++        ));
++    }
++    Ok(())
++}
++
++/// [`refuse_earlier_form`] for a row at the attestation plane: a row that
++/// carries its edition-2 statement (`ceg_statement`) is the edition-2 door's
++/// mapping, never an earlier-form object, and passes.
++///
++/// # Errors
++/// As [`refuse_earlier_form`].
++pub fn refuse_earlier_form_row(
++    plane: &'static str,
++    row: &crate::federation::types::Attestation,
++) -> Result<(), Error> {
++    if row
++        .attestation_envelope
++        .get(super::ingest::STATEMENT_MEMBER)
++        .is_some()
++    {
++        return Ok(());
++    }
++    refuse_earlier_form(plane)
++}
+diff --git a/src/federation/edition2/ingest.rs b/src/federation/edition2/ingest.rs
+index 71b20739..50d280f6 100644
+--- a/src/federation/edition2/ingest.rs
++++ b/src/federation/edition2/ingest.rs
+@@ -526,3 +526,80 @@ where
+ 
+ /// The tier replication and tier ingest deliver at.
+ pub const INGEST_TIER: &str = attestation_tier::FEDERATION;
++
++/// v62.0.0 (JSON-cut slice A) — what [`apply_replicated_statement`] did with
++/// one statement a peer offered. A `Refused` is a policy outcome that
++/// ADVANCES the replication cursor (the lost-race `StoreConflict`, fail
++/// closed, safe to re-offer); a waiting statement is never an outcome: it is
++/// the retryable `federation_attester_key_unknown` error, and the cursor
++/// stays where it is.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum ReplicatedStatementOutcome {
++    /// The statement was new here and is kept ([`StatementOutcome`] says
++    /// where).
++    Admitted(StatementOutcome),
++    /// This node already held the statement byte for byte: nothing changed.
++    Unchanged(StatementOutcome),
++    /// The statement was not kept and the store is untouched.
++    Refused {
++        /// Which branch refused.
++        reason: crate::federation::attestation_apply::AttestationRefusalReason,
++    },
++}
++
++impl ReplicatedStatementOutcome {
++    /// Does this outcome advance the sender's cursor? Every outcome does;
++    /// only an `Err` (a statement waiting on a key, a backend failure) holds
++    /// it. Spelled out for the replication loop.
++    #[must_use]
++    pub const fn advances_cursor(&self) -> bool {
++        true
++    }
++}
++
++/// v62.0.0 (JSON-cut slice A) — **the replicated statement door**: one
++/// edition-2 statement as a peer delivered it, under the id the peer offered
++/// it as (`offered_id`), at tier `federation` ([`INGEST_TIER`]), through
++/// [`put_statement`] and so through every gate the local door runs.
++///
++/// - an id the bytes do not name is `row_id_mismatch` (terminal);
++/// - a statement whose signer's key record is not held waits:
++///   `federation_attester_key_unknown`, retryable, and the cursor must NOT
++///   advance past it;
++/// - a key conflict the plan did not see (a duplicate key in the store, a
++///   key-record conflict) is `Refused { StoreConflict }`: fail closed, the
++///   held rows untouched, safe to re-offer;
++/// - every other gate refusal keeps its typed [`Error`].
++///
++/// # Errors
++/// As above.
++pub async fn apply_replicated_statement<F>(
++    dir: &F,
++    bytes: &[u8],
++    offered_id: &Digest32,
++) -> Result<ReplicatedStatementOutcome, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    use crate::federation::attestation_apply::AttestationRefusalReason;
++    match put_statement(dir, bytes, Some(offered_id), INGEST_TIER).await {
++        Ok(out) => {
++            let new = match &out {
++                StatementOutcome::KeyPlane { new, .. }
++                | StatementOutcome::Voice { new, .. }
++                | StatementOutcome::Row { new, .. } => *new,
++            };
++            Ok(if new {
++                ReplicatedStatementOutcome::Admitted(out)
++            } else {
++                ReplicatedStatementOutcome::Unchanged(out)
++            })
++        }
++        Err(Error::Conflict(_) | Error::KeyRecordConflict { .. }) => {
++            Ok(ReplicatedStatementOutcome::Refused {
++                reason: AttestationRefusalReason::StoreConflict,
++            })
++        }
++        Err(e) => Err(e),
++    }
++}
+diff --git a/src/federation/evidence_admit.rs b/src/federation/evidence_admit.rs
+index f38d3070..ddc4b82e 100644
+--- a/src/federation/evidence_admit.rs
++++ b/src/federation/evidence_admit.rs
+@@ -121,6 +121,7 @@ pub(crate) async fn put_location_proof_planned<D: EvidenceStore>(
+     dir: &D,
+     proof: SignedLocationProof,
+ ) -> Result<(), Error> {
++    super::edition2::door::refuse_earlier_form("location_proof")?;
+     // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+     // before any verification.
+     if super::replication_policy::settle_if_held(
+@@ -213,6 +214,7 @@ pub(crate) async fn put_touch_claim_planned<D: EvidenceStore>(
+     dir: &D,
+     claim: &SignedTouchClaim,
+ ) -> Result<TouchApplyOutcome, Error> {
++    super::edition2::door::refuse_earlier_form("touch_claim")?;
+     // v21.6.0 (#519 item 2a-iii) — verify-before-mutation: the full hybrid
+     // admission gate, THEN the future-skew guard, THEN the monotonic-max
+     // merge.
+diff --git a/src/federation/family_admit.rs b/src/federation/family_admit.rs
+index 2ade8bfa..50800c19 100644
+--- a/src/federation/family_admit.rs
++++ b/src/federation/family_admit.rs
+@@ -83,6 +83,7 @@ pub(crate) async fn put_family_planned<D: FamilyStore>(
+     dir: &D,
+     family: SignedFamily,
+ ) -> Result<(), Error> {
++    super::edition2::door::refuse_earlier_form("family")?;
+     // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any other
+     // admission step.
+     super::verify_family_admission(dir, &family).await?;
+@@ -127,6 +128,7 @@ pub(crate) async fn put_family_membership_revocation_planned<D: FamilyStore>(
+     dir: &D,
+     mut revocation: SignedFamilyMembershipRevocation,
+ ) -> Result<(), Error> {
++    super::edition2::door::refuse_earlier_form("family")?;
+     // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship first.
+     super::verify_family_membership_revocation_admission(dir, &revocation).await?;
+     let offered = GroupSigned::FamilyRevocation(revocation.clone());
+@@ -185,6 +187,7 @@ pub(crate) async fn put_family_membership_widening_planned<D: FamilyStore>(
+     dir: &D,
+     mut widening: SignedFamilyMembershipWidening,
+ ) -> Result<(), Error> {
++    super::edition2::door::refuse_earlier_form("family")?;
+     super::verify_family_membership_widening_admission(dir, &widening).await?;
+     let offered = GroupSigned::FamilyWidening(widening.clone());
+     let row = &widening.family_membership_widening;
+diff --git a/src/federation/key_grant.rs b/src/federation/key_grant.rs
+index 5e7cd53f..50954043 100644
+--- a/src/federation/key_grant.rs
++++ b/src/federation/key_grant.rs
+@@ -2764,6 +2764,7 @@ pub async fn admit_replicated_key_grant<B>(
+ where
+     B: BlobStorage + FederationDirectory + Sync,
+ {
++    super::edition2::door::refuse_earlier_form("key_grant")?;
+     use crate::federation::attestation_apply::AttestationRefusalReason;
+ 
+     let row = signed.attestation;
+diff --git a/src/federation/key_plane.rs b/src/federation/key_plane.rs
+index 7e0dfb3c..17798829 100644
+--- a/src/federation/key_plane.rs
++++ b/src/federation/key_plane.rs
+@@ -1142,6 +1142,7 @@ pub(crate) async fn put_revocation_planned<D>(
+ where
+     D: KeyPlaneStore,
+ {
++    super::edition2::door::refuse_earlier_form("revocation")?;
+     // A byte-identical re-offer of a held revocation settles before any verify
+     // (the #672 rule): the whole record, not its id — a relay's re-pasted
+     // column under a held id must still meet the binding gate.
+@@ -1828,6 +1829,7 @@ pub(crate) async fn key_record_write_planned<D>(
+ where
+     D: KeyPlaneStore,
+ {
++    super::edition2::door::refuse_earlier_form("key_record")?;
+     match plan_key_record_write(dir, write, crate::host::clock::now()).await? {
+         KeyRecordPlan::Settled => Ok(KeyRecordWritten::Settled),
+         KeyRecordPlan::Write(planned) => {
+@@ -1875,6 +1877,7 @@ pub(crate) async fn apply_replicated_key_record_planned<D>(
+ where
+     D: KeyPlaneStore,
+ {
++    super::edition2::door::refuse_earlier_form("key_record")?;
+     use super::register::{KeyRefusalReason, ReplicatedKeyOutcome as O, ReplicatedKeyPlan as P};
+     const RACED: O = O::Refused {
+         reason: KeyRefusalReason::StoreConflict,
+diff --git a/src/federation/lineage_witness.rs b/src/federation/lineage_witness.rs
+index 24cf11c7..5270f22c 100644
+--- a/src/federation/lineage_witness.rs
++++ b/src/federation/lineage_witness.rs
+@@ -166,6 +166,7 @@ pub async fn admit_lineage_head_cosign<F>(
+ where
+     F: crate::federation::FederationDirectory + ?Sized,
+ {
++    super::edition2::door::refuse_earlier_form("lineage_head_cosign")?;
+     let refused = |reason: LineageCosignRefusal| Ok(LineageCosignOutcome::Refused { reason });
+     // 0. shape
+     let hex64 = |s: &str| {
+diff --git a/src/federation/occurrence_admit.rs b/src/federation/occurrence_admit.rs
+index 85ce6c4e..d26302ce 100644
+--- a/src/federation/occurrence_admit.rs
++++ b/src/federation/occurrence_admit.rs
+@@ -125,6 +125,7 @@ pub(crate) async fn put_identity_occurrence_planned<D: OccurrenceStore>(
+     dir: &D,
+     occurrence: SignedIdentityOccurrence,
+ ) -> Result<(), Error> {
++    super::edition2::door::refuse_earlier_form("identity_occurrence")?;
+     // v14.0.0 (CIRISPersist#418) — the hybrid signature over the exact
+     // producer envelope, the signer's authority and §5.6.8.8.2 C4 key
+     // separation, BEFORE any write. One gate for HTTP and the wire.
+diff --git a/src/federation/register.rs b/src/federation/register.rs
+index d9cd2760..523322ab 100644
+--- a/src/federation/register.rs
++++ b/src/federation/register.rs
+@@ -551,6 +551,7 @@ pub(crate) async fn plan_replicated_key_apply(
+     directory: &dyn FederationDirectory,
+     record: &KeyRecord,
+ ) -> Result<ReplicatedKeyPlan, Error> {
++    super::edition2::door::refuse_earlier_form("key_record")?;
+     let Some(existing) = directory.lookup_public_key(&record.key_id).await? else {
+         return Ok(ReplicatedKeyPlan::Insert);
+     };
+diff --git a/src/federation/steward_purge.rs b/src/federation/steward_purge.rs
+index 6378f76e..e7977fa3 100644
+--- a/src/federation/steward_purge.rs
++++ b/src/federation/steward_purge.rs
+@@ -2638,6 +2638,7 @@ pub async fn apply_replicated_purge<F>(
+ where
+     F: FederationDirectory + ?Sized,
+ {
++    super::edition2::door::refuse_earlier_form("purge")?;
+     let now = purge_clock();
+     let (terms, _signers) = authorise_at(directory, &bundle.notice, now).await?;
+     let mut records = Vec::with_capacity(bundle.record_ids.len());
+diff --git a/src/federation/transport_admit.rs b/src/federation/transport_admit.rs
+index f063e01f..ba4b5466 100644
+--- a/src/federation/transport_admit.rs
++++ b/src/federation/transport_admit.rs
+@@ -164,6 +164,7 @@ pub(crate) async fn put_signed_transport_destination_planned<D: TransportStore>(
+     dir: &D,
+     signed: &SignedTransportDestination,
+ ) -> Result<Outcome, Error> {
++    super::edition2::door::refuse_earlier_form("transport_destination")?;
+     // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+     // before any verification.
+     if super::replication_policy::settle_if_held(
