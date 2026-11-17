@@ -160,7 +160,7 @@ The slice branches:
 - `v62-seams`, `v62-native`, `v62-kernel`, `v62-verify`, `v62-rules`, `v62-wire`, `v62-baseline`, `v62-j0`.
 
 Other branches:
-- `bench-pre-kernel`: the pre-kernel benches and `BENCHMARKS-pre-kernel.md`;
-- `wasm-uefi-probe`: `WASM_UEFI_READINESS.md`;
+- `bench-pre-kernel`: the pre-kernel benches (also ported onto this branch by slice C) and `BENCHMARKS-pre-kernel.md` (copied to `FSD/v62_docs/`);
+- `wasm-uefi-probe`: `WASM_UEFI_READINESS.md` (copied to `FSD/v62_docs/`);
 - `vec-accord-lineage`;
 - `w614-lts-floor`.
