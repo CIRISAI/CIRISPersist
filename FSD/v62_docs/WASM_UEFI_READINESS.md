@@ -49,7 +49,7 @@ is countable and small:
 ## 1. A finding about the v59 probe that the FSD does not state
 
 The probe sources survive at
-`/tmp/claude-1000/-home-emoore-CIRISServer/3d2b33f9-…/scratchpad/wasm855-logs/` (read only) [read]:
+`<local scratch>` (read only) [read]:
 
 - **The Engine probe** (`sql-probes/engine-probe/`) ran the real `ciris_persist::Engine` in a Worker. **It used
   `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `getrandom` 0.2 `js`, 0.3 and 0.4 `wasm_js`, `uuid/js`,
@@ -234,7 +234,7 @@ v61. Close the FSD's open item.
 
 ## 9. Verify 23: what persist must pass it, and where
 
-Local checkout `/home/emoore/CIRISVerify` on `release/23.0.0` (`f7471bf`), read only [read].
+Local checkout `<checkout CIRISVerify>` on `release/23.0.0` (`f7471bf`), read only [read].
 
 **The shape.** Verify 23 has no host-value interface. Its pure tier takes **values as parameters**:
 
@@ -291,7 +291,7 @@ The payload probe already defined `__getrandom_v03_custom` over `ciris.random` (
 whether wasm-bindgen still contributes any import when `wasm_js` is on but unused. Removing the feature at its source (jsonschema
 `default-features=false` still enables `wasm_js` on `referencing`) is the clean fix, as an upstream ask or a feature patch.
 
-**CIRISOssicle** (`/home/emoore/CIRISOssicle`, `1bc2f09`) [read]:
+**CIRISOssicle** (`<checkout CIRISOssicle>`, `1bc2f09`) [read]:
 
 - It is a Python + CuPy (CUDA) GPU timing "strain gauge" (`src/strain_gauge.py:505` `generate_trng`, `src/trng_generate.py`).
 - Its TRNG output is raw timing LSBs ("lower 4 bits, 6/6 NIST"), with no conditioner and no DRBG.

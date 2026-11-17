@@ -122,30 +122,72 @@ Both shutdown slices were stopped at spin-down. Neither compiles yet, so the pre
 
 The 61.4 removal-floor work-in-progress (commits after v61.4.0 on `w614-lts-floor`). It is unreviewed and was never merged; re-target it to the kernel model before using it.
 
-## Remaining to the v62 tag
+## Remaining to the v62 tag: plan, order and checkpoints
 
-1. Finish JSON-cut A and B (the patches above).
-2. **C: genesis bundle/2 and boot.**
-   - the producer and reader on Verify's `edition2::genesis` reader;
-   - `test_ceremony_v2`; boot pre-genesis;
-   - canonical = `serve_nodes` (ruling C);
-   - the Verify 23.3.0 bump;
-   - vendor CC rc20.
-3. **D: PyO3, capsule and HTTP surfaces.**
-4. **E: the fixture flip,** about 3,270 tests, using `statement_of` / `kid()` / `rid()`.
-5. **F:** flip `EARLIER_FORM_DOORS_SHUT`, delete the dead earlier-form code (`TODO(json-cut)` sites) and the baked JSON genesis, and add a from-disk gate.
-6. **Kernel second pass:**
-   - fork-as-tip in `held_head_verdict`;
-   - delete the 21 breaker gates and the single-owner gate;
-   - windows and sweeps;
-   - key_end liveness (`TODO(key_end)`).
-7. **Release gates:**
-   - full certify;
-   - the wheel pytest;
-   - the wasm gate;
-   - the kernel benches against `pre-kernel` (baseline doc on branch `bench-pre-kernel`);
-   - the adoption notes;
-   - then `scripts/release.sh 62.0.0 --hold`.
+Durations are effort estimates for one agent working on a cold build, not dates. Two cargo builds at a time is the machine limit that set the parallelism.
+
+```mermaid
+gantt
+    title v62 remaining work (dependency order)
+    dateFormat  X
+    axisFormat  %s
+    section JSON cut
+    A finish: inbound doors + payloads + halt + dedup   :a, 0, 3d
+    B finish: PQC delete + producers + serving        :b, 0, 3d
+    C genesis bundle/2 + boot + Verify 23.3.0 + rc20   :c, after b, 3d
+    D PyO3 / capsule / HTTP surfaces                   :d, after a, 2d
+    CP1 merge A+B+C+D into release/62                  :milestone, cp1, after c d, 0d
+    E fixture flip (~3,270 tests, 2 agents by file)    :e, after cp1, 5d
+    F shut doors + delete dead code + from-disk gate   :f, after e, 1d
+    CP2 edition-2 only, full suite green               :milestone, cp2, after f, 0d
+    section Kernel pass 2
+    K2 forks-as-tips, 21 breakers, windows, key_end    :k2, after cp1, 3d
+    section Release
+    R1 rc20 evidence re-stamp + adoption notes         :r1, after cp2 k2, 1d
+    R2 certify + wheel pytest + wasm gate + benches    :r2, after r1, 1d
+    CP3 release.sh 62.0.0 --hold                       :milestone, cp3, after r2, 0d
+```
+
+### Checkpoints (the exit criteria an agent must show before moving on)
+
+| ID | Step | Depends on | Exit criteria |
+|---|---|---|---|
+| A | Finish `v62-cut-a.staged.patch` | release/62 | The patch applies and compiles; `edition2::payloads` exists with `docs/EDITION2_PAYLOADS.md`; every family's door lands in its typed table on sqlite+pg; `composer_family_mismatch`, `accord_invocation_replayed` and the halt (unknown kid waits, `iss_not_holder` refused) are witnessed and mutation-tested; the switch is still OFF; the full lib lane is green. |
+| B | Finish `v62-cut-b.staged.patch` | release/62 | The PQC cold path is fully deleted (pyi and FFI rows gone); every MESH producer emits through `sign_row`; a two-node witness shows each produced row admitted by `put_statement` on a second node; `register_self_federation_key` returns an identity-ref; serving goes through `edition2_statements_since`; the full lib lane is green. |
+| C | Genesis bundle/2 and boot | B (shares `engine.rs`) | Verify pinned at 23.3.0 (all crates together); CC rc20 vendored (`evidence/cc_impl.tsv` re-stamped; span_sha256); `put_genesis_bundle` uses Verify's `read_genesis_bundles` / `follow_to_head`; `test_ceremony_v2`; a fresh node boots pre-genesis; canonical = `serve_nodes`; Verify's `genesis_bundles_v2.json` replays; bundle/1 and the JSON seeds deleted; `adopt_scrub_upgrade` removed. |
+| D | Host surfaces | A | PyO3 gets `put_edition2_statement`, `apply_replicated_statement`, `bundles_in_force_json` and `edition2_statements_since`; earlier-form PyO3 doors raise `ValueError(federation_malformed_row: earlier_form_object)` behind the switch; capsule ops appended (append-only gate); pyi check green; a Python round-trip witness. |
+| **CP1** | Merge A–D into release/62 | A, B, C, D | Each slice's witnesses rerun after its merge; the full lib lane, the pyo3 lane, the five axes, all-features clippy, deny and the wasm gate all green; `accord_lineage_v2.json` sha256 unchanged. |
+| E | Fixture flip | CP1 | The 37 builders emit edition 2 by default; literal sites rewritten with `statement_of`, `kid()` and `rid()`; earlier-form behaviour tests deleted; at most 2 agents, partitioned by file (`federation/*_invariants` A–M, N–Z, `store/`, `ffi/`, `tests/`). |
+| F | Shut the doors | E | `EARLIER_FORM_DOORS_SHUT = true`; every earlier-form door refuses by name (witnessed); `TODO(json-cut)` sites and the baked JSON genesis deleted; a from-disk gate stops any write door from reopening the earlier form. |
+| **CP2** | Edition-2 only | F | The full suite is green with the switch ON and no earlier-form producer left. |
+| K2 | Kernel pass 2 | CP1 | `held_head_verdict` holds forks as tips; the 21 breaker gates and the single-owner gate deleted; windows and sweeps replaced; key_end liveness through the kernel; the differential shows no unnamed class; the canary `kernel_still_needs_own_withdrawal_filter` still passes, or the filter is removed if a kernel tag fixed it. |
+| R1 | Evidence and notes | CP2, K2 | Register rows re-filed at CC 8.11; `CLM-identity-set` etc. pointers current; the CHANGELOG adoption notes for Edge, Server, Agent and Bridge are complete. |
+| R2 | Release gates | R1 | `scripts/certify.sh` full, every leg; the wheel pytest; the wasm gate; the benches against `pre-kernel` (restore from `FSD/v62_docs/criterion-pre-kernel/`, or re-record on the same machine) at or below 1.0× within noise; PR CI green. |
+| **CP3** | Cut | R2 | `scripts/release.sh 62.0.0 --hold`; then ship; then `scripts/release_finish.sh`. |
+
+### Known blockers outside persist
+
+- **Verify v23.3.0:** the halt reader fix, the rc20 re-vendor and the derived act. Blocks C's pin bump, and the un-ignoring of A's halt-v2 and location_proof witnesses.
+- **CC next edition:** the location_proof / trust:blessing family cards and the text for the readings marked *next edition* in `FSD/v62_docs/RULINGS.md`. Not blocking: persist builds to the readings.
+
+## How a resuming agent works
+
+- **Read first:**
+  - `FSD/v62_docs/RULINGS.md`, for every decision;
+  - `FSD/v62_docs/JSON_CUT_PLAN.md`, the inventory and per-slice brief;
+  - `FSD/v62_docs/CC_FAMILYMAP_ANSWER.md`;
+  - `FSD/v62_docs/VERIFY_GENESIS_READER_API.md`;
+  - the CHANGELOG `## [62.0.0]`.
+  `FSD/v62_docs/PROJECTION_BRIEF.md` is already built (J0); keep it for reference.
+- **Resume a WIP slice:** cut a branch from `release/62` and `git apply --index FSD/v62_wip/<patch>`.
+- **The repository's rules:**
+  - every cargo / nextest / mutants / deny command and every `git commit` goes through `scripts/cargo_guard.sh`;
+  - postgres tests run via `scripts/pg_test_db.sh -- <cmd>`;
+  - test every backend (sqlite AND postgres);
+  - never `git commit --no-verify`, `--amend`, `reset`, `stash` or force;
+  - shipped migrations are immutable (V300 is not shipped yet);
+  - `#![deny(unsafe_code)]`.
+- **Invariant numbers already used:** I1790–I1859, I1870–I1912, I1950–I1959, I2000–I2013. Cut A planned I2100+, cut B I2200+. Start new slices at I2300.
 
 ## Owed to other teams at the pin
 
