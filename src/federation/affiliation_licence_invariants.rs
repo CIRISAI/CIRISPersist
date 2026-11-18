@@ -53,13 +53,15 @@ pub mod bodies {
         LicensureChainBreak, DELEGATION_SCOPE_LICENSE, LICENCE_AUDIENCE_REFUSED,
         LICENCE_RE_EMITS_MEMBER, OWNER_BINDING_AFFILIATION_REFUSED,
     };
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::licensure::{status_set_for, LicensureStatus};
+    use crate::federation::licensure_chain_invariants::bodies::key_id;
     use crate::federation::licensure_chain_invariants::bodies::{
         base, edge, keys, licence, must_put, must_refuse_as, officer, put,
     };
     use crate::federation::room_roster_authority_invariants::bodies::make_group;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{attestation_type, consensus_protocol, identity_type, ScrubSig};
+    use crate::federation::types::{attestation_type, consensus_protocol, identity_type};
     use crate::federation::{Attestation, Error, FederationDirectory};
     use chrono::{Duration, Utc};
     use std::collections::BTreeSet;
@@ -126,19 +128,13 @@ pub mod bodies {
         row
     }
 
-    /// `row` cosigned by each of `cosigners` over its (final) envelope bytes:
-    /// the `additional_scrubs[]` carrier (CC 2.4 cosigned rows).
-    pub(crate) fn cosigned(mut row: Attestation, cosigners: &[&str]) -> Attestation {
-        for c in cosigners {
-            let (_, classical, pqc) = ts::sign_envelope(c, &row.attestation_envelope);
-            row.additional_scrubs.push(ScrubSig {
-                scrub_key_id: (*c).to_owned(),
-                scrub_signature_classical: classical,
-                scrub_signature_pqc: pqc,
-                cosigned_at: None,
-            });
-        }
-        row.persist_row_hash = String::new();
+    /// `row` cosigned by each of `cosigners`. v62.0.0 (CC 2.4.1.3,
+    /// CLM-licence-authority-quorum): a cosignature is one more edition-2
+    /// voice over the row's payload and row id, offered after the row by
+    /// `licensure_chain_invariants::bodies::put` (`note_cosigners`); a
+    /// counted row short of its protocol is held `Pending`.
+    pub(crate) fn cosigned(row: Attestation, cosigners: &[&str]) -> Attestation {
+        crate::federation::licensure_chain_invariants::bodies::note_cosigners(&row, cosigners);
         row
     }
 
@@ -313,7 +309,7 @@ pub mod bodies {
     pub async fn i1211_revision_never_goes_backwards(d: &dyn FederationDirectory, tag: &str) {
         let (board, holder) = keys(d, tag).await;
         let stranger = format!("{tag}-stranger");
-        crate::federation::admission::steward_liveness_test_support::register(
+        crate::federation::licensure_chain_invariants::bodies::reg(
             d,
             &stranger,
             &[identity_type::USER],
@@ -403,7 +399,7 @@ pub mod bodies {
         // foreign-authority skip weakened (the board's row under
         // `licensure:{board}2` would count as the board's own).
         let board2 = format!("{board}2");
-        crate::federation::admission::steward_liveness_test_support::register(
+        crate::federation::licensure_chain_invariants::bodies::reg(
             d,
             &board2,
             &[identity_type::USER],
@@ -520,7 +516,7 @@ pub mod bodies {
         let holder = format!("{tag}-holder");
         let stranger = format!("{tag}-stranger");
         for key in [&holder, &stranger] {
-            crate::federation::admission::steward_liveness_test_support::register(
+            crate::federation::licensure_chain_invariants::bodies::reg(
                 d,
                 key,
                 &[identity_type::USER],
@@ -544,14 +540,22 @@ pub mod bodies {
         // asserted the row was admitted as testimony. CC 2.4: "a row short of
         // its protocol by signatures alone is not refused; it waits".
         // Kills: a lone member standing for a quorum protocol.
+        // v62.0.0 (CC 2.4.1.3): a counted licence short of its protocol is
+        // HELD (`Pending`): its voices are kept, no typed row lands.
         let short = |row: &Attestation| {
             let row = row.clone();
             async move {
-                match d
-                    .put_attestation(crate::federation::SignedAttestation { attestation: row })
-                    .await
-                {
-                    Err(Error::LicensureShortOfAuthorityQuorum { signers, .. }) => signers,
+                match crate::federation::licensure_chain_invariants::bodies::offer(d, &row).await {
+                    Ok((held, Some(StatementOutcome::Pending { .. }))) => {
+                        assert!(
+                            d.get_attestation(&held.attestation_id)
+                                .await
+                                .unwrap()
+                                .is_none(),
+                            "[{tag}] I1880: a held row writes no typed row"
+                        );
+                        1usize
+                    }
                     other => panic!("[{tag}] I1880: short of the quorum must wait, got {other:?}"),
                 }
             }
@@ -571,9 +575,16 @@ pub mod bodies {
         );
         // A stranger's cosignature counts for nothing. Kills: counting
         // scrubs outside the roster.
-        assert_eq!(
-            short(&cosigned(lic("suspended", 25), &[&stranger])).await,
-            1,
+        // v62.0.0: the stranger's voice is not counted (a non-member of the
+        // roster at the named head); held or refused, no typed row lands.
+        let stray = cosigned(lic("suspended", 25), &[&stranger]);
+        let stray_id =
+            match crate::federation::licensure_chain_invariants::bodies::offer(d, &stray).await {
+                Ok((offered, _)) => offered.attestation_id,
+                Err(_) => stray.attestation_id.clone(),
+            };
+        assert!(
+            d.get_attestation(&stray_id).await.unwrap().is_none(),
             "[{tag}] I1880: a non-member's cosignature does not make a quorum"
         );
         // Two of three cosign: the affiliation's licence. Kills: dropping the
@@ -585,31 +596,38 @@ pub mod bodies {
         )
         .await;
         assert!(
-            crate::federation::admission::row_was_issued_under_authority(d, &quorum, &aff)
+            crate::federation::admission::row_was_issued_under_authority(d, &quorum, &key_id(&aff))
                 .await
                 .unwrap(),
             "[{tag}] I1214: a quorum-cosigned licence is the affiliation's"
         );
         assert_eq!(
-            status_set_for(d, &holder, &aff, Utc::now()).await.unwrap(),
+            status_set_for(d, &key_id(&holder), &key_id(&aff), Utc::now())
+                .await
+                .unwrap(),
             BTreeSet::from([LicensureStatus::Issued]),
             "[{tag}] I1214: the lone `revoked` binds nobody; the quorum's `issued` stands"
         );
-        let listed: BTreeSet<String> = crate::federation::admission::licences_issued_under(d, &aff)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.attestation_id)
-            .collect();
+        let listed: BTreeSet<String> =
+            crate::federation::admission::licences_issued_under(d, &key_id(&aff))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.attestation_id)
+                .collect();
         assert_eq!(
             listed,
             BTreeSet::from([quorum.attestation_id.clone()]),
             "[{tag}] I1214: the list-by-authority holds the cosigned licence only"
         );
         assert!(
-            !crate::federation::admission::emitter_resolves_to_authority(d, &k[0], &aff)
-                .await
-                .unwrap(),
+            !crate::federation::admission::emitter_resolves_to_authority(
+                d,
+                &key_id(&k[0]),
+                &key_id(&aff)
+            )
+            .await
+            .unwrap(),
             "[{tag}] I1214: no single member resolves to a quorum authority"
         );
         // I1880 — a `founder_only` authority is unchanged: a non-founder
@@ -637,9 +655,13 @@ pub mod bodies {
         )
         .await;
         assert!(
-            !crate::federation::admission::row_was_issued_under_authority(d, &testimony, &fo)
-                .await
-                .unwrap(),
+            !crate::federation::admission::row_was_issued_under_authority(
+                d,
+                &testimony,
+                &key_id(&fo)
+            )
+            .await
+            .unwrap(),
             "[{tag}] I1880: under founder_only a non-founder's row stays testimony"
         );
     }
@@ -657,7 +679,7 @@ pub mod bodies {
         )
         .await;
         let holder = format!("{tag}-holder");
-        crate::federation::admission::steward_liveness_test_support::register(
+        crate::federation::licensure_chain_invariants::bodies::reg(
             d,
             &holder,
             &[identity_type::USER],
@@ -678,9 +700,39 @@ pub mod bodies {
                 &extra,
             )
         };
-        // (1) A lone member's appointment: nothing.
+        // v62.0.0 (CC 4.4.3.12, V1b): an officer appointment naming the
+        // affiliation is a COUNTED `self:delegates_to` over the roster head it
+        // names (`offer` restates it); it lands at the affiliation's protocol,
+        // and the SEAT stands only with the officer's own
+        // `membership:acceptance` naming it (`seat`).
+        let seat = |officer: String, appointment: Attestation| {
+            let aff = aff.clone();
+            async move {
+                let mut answered = appointment.clone();
+                answered.cohort_scope = "community".to_owned();
+                answered.attestation_envelope["community_key_id"] = serde_json::json!(aff.clone());
+                let acceptance =
+                    crate::federation::membership_acceptance::test_support::acceptance_row(
+                        &officer,
+                        &answered,
+                        now - Duration::hours(5),
+                    );
+                crate::federation::edition2::fixture_switch::put_signed(d, &acceptance)
+                    .await
+                    .expect("the officer accepts the seat");
+            }
+        };
+        // (1) A lone member's appointment: held (Pending), it roots nothing.
         let o1 = officer(d, tag, "o1").await;
-        let lone = must_put(d, &appoint(&o1, false, true, 6), "I1215 lone appointment").await;
+        let lone = match crate::federation::licensure_chain_invariants::bodies::offer(
+            d,
+            &appoint(&o1, false, true, 6),
+        )
+        .await
+        {
+            Ok((held, Some(StatementOutcome::Pending { .. }))) => held,
+            other => panic!("[{tag}] I1215(1): a lone member's appointment is held, got {other:?}"),
+        };
         must_refuse_as(
             d,
             &classed(licence(
@@ -704,6 +756,7 @@ pub mod bodies {
             "I1215 quorum appointment",
         )
         .await;
+        seat(o2.clone(), root.clone()).await;
         let early = must_put(
             d,
             &classed(licence(
@@ -718,20 +771,21 @@ pub mod bodies {
         )
         .await;
         assert!(
-            crate::federation::admission::emitter_resolves_to_authority(d, &o2, &aff)
-                .await
-                .unwrap(),
+            crate::federation::admission::emitter_resolves_to_authority(
+                d,
+                &key_id(&o2),
+                &key_id(&aff)
+            )
+            .await
+            .unwrap(),
             "[{tag}] I1215(2): the quorum's officer resolves to the authority"
         );
         // (3) Cosigned but naming no community: not a root. Kills: dropping
         // the community check on the root edge.
         let o3 = officer(d, tag, "o3").await;
-        let unnamed = must_put(
-            d,
-            &cosigned(appoint(&o3, false, false, 6), &[&k[1]]),
-            "I1215 cosigned, unnamed",
-        )
-        .await;
+        // v62.0.0: an edge naming no affiliation is an authored edge (no
+        // second-signer role), so it goes alone.
+        let unnamed = must_put(d, &appoint(&o3, false, false, 6), "I1215 unnamed").await;
         must_refuse_as(
             d,
             &classed(licence(
@@ -783,7 +837,7 @@ pub mod bodies {
             "I1215 quorum appointment with sub_delegation",
         )
         .await;
-        let _ = deputising;
+        seat(o5.clone(), deputising.clone()).await;
         let onward = must_put(
             d,
             &edge(
@@ -814,11 +868,15 @@ pub mod bodies {
         // sub_delegation) does not. Kills: the onward reach not reported.
         use crate::federation::admission::emitter_resolves_to_authority as resolves;
         assert!(
-            resolves(d, &o6, &aff).await.expect("resolves"),
+            resolves(d, &key_id(&o6), &key_id(&aff))
+                .await
+                .expect("resolves"),
             "[{tag}] I1215(4): o6 resolves through the quorum's onward chain"
         );
         assert!(
-            !resolves(d, &o4, &aff).await.expect("resolves"),
+            !resolves(d, &key_id(&o4), &key_id(&aff))
+                .await
+                .expect("resolves"),
             "[{tag}] I1215(4): o4 does not"
         );
         // (5) A lone member's withdraws does not retract a cosigned root
@@ -832,6 +890,7 @@ pub mod bodies {
             "I1215 a second quorum appointment",
         )
         .await;
+        seat(o7.clone(), root_b.clone()).await;
         let mut w_lone = edge(&k[0], &o7, &[], now - Duration::minutes(50), &[]);
         w_lone.attestation_type = attestation_type::WITHDRAWS.to_owned();
         let w_lone = with(
@@ -839,7 +898,8 @@ pub mod bodies {
             "references_attestation_id",
             serde_json::json!(root_b.attestation_id),
         );
-        must_put(d, &w_lone, "I1215 a lone member withdraws the root").await;
+        // v62.0.0: held or refused, a lone retraction lands nothing.
+        let _ = crate::federation::licensure_chain_invariants::bodies::offer(d, &w_lone).await;
         must_put(
             d,
             &classed(licence(
@@ -863,6 +923,9 @@ pub mod bodies {
             "references_attestation_id",
             serde_json::json!(root.attestation_id),
         );
+        // v62.0.0: the quorum's retraction names the affiliation, so it is
+        // counted at its protocol like the appointment.
+        let w_q = with(w_q, "community_id", names.clone());
         must_put(
             d,
             &cosigned(w_q, &[&k[1]]),
@@ -884,7 +947,7 @@ pub mod bodies {
         )
         .await;
         assert!(
-            crate::federation::admission::row_was_issued_under_authority(d, &early, &aff)
+            crate::federation::admission::row_was_issued_under_authority(d, &early, &key_id(&aff))
                 .await
                 .unwrap(),
             "[{tag}] I1215(6): a licence issued before the withdrawal stays the affiliation's"
@@ -908,7 +971,7 @@ pub mod bodies {
         )
         .await;
         let holder = format!("{tag}-holder");
-        crate::federation::admission::steward_liveness_test_support::register(
+        crate::federation::licensure_chain_invariants::bodies::reg(
             d,
             &holder,
             &[identity_type::USER],
@@ -1003,7 +1066,7 @@ pub mod bodies {
         let holder = format!("{tag}-holder");
         let reader = format!("{tag}-reader");
         for key in [&holder, &reader] {
-            crate::federation::admission::steward_liveness_test_support::register(
+            crate::federation::licensure_chain_invariants::bodies::reg(
                 d,
                 key,
                 &[identity_type::USER],
@@ -1172,7 +1235,7 @@ pub mod bodies {
     pub async fn i1218_licence_contest_path(d: &dyn FederationDirectory, tag: &str) {
         let (board, holder) = keys(d, tag).await;
         let stranger = format!("{tag}-stranger");
-        crate::federation::admission::steward_liveness_test_support::register(
+        crate::federation::licensure_chain_invariants::bodies::reg(
             d,
             &stranger,
             &[identity_type::USER],
@@ -1328,7 +1391,7 @@ pub mod bodies {
                 env["community_id"] = serde_json::json!(c);
             }
             let mut row = crate::federation::admission::steward_liveness_test_support::signed_row(
-                steward,
+                &crate::federation::edition2::fixture_switch::seed_of(steward),
                 node,
                 attestation_type::DELEGATES_TO,
                 env,
@@ -1349,11 +1412,29 @@ pub mod bodies {
             ),
             other => panic!("[{tag}] {what}: expected {reason}, got {other:?}"),
         };
-        // Signed by one member only. Kills: dropping the cosign check.
-        refused(
+        // v62.0.0 (CC ruling (a), V1b): an owner binding naming an affiliation
+        // is COUNTED: the owner's statement, the bound key's, and the members'
+        // voices at the affiliation's protocol over the `refs.head` it names.
+        // Short of that it is HELD (`Pending`, no typed row).
+        let held = |r: Result<Attestation, Error>, what: &str| match r {
+            Err(Error::InvalidArgument(m))
+                if m.starts_with(
+                    crate::federation::licensure_chain_invariants::bodies::PENDING,
+                ) => {}
+            other => panic!("[{tag}] {what}: expected a held (Pending) binding, got {other:?}"),
+        };
+        // Signed by one member only (plus the bound key): held. Kills:
+        // dropping the cosign check.
+        held(
             put(d, &binding(&k[0], &node("n1"), Some(&aff))).await,
-            obr::NOT_COSIGNED_UNDER_PROTOCOL,
             "I1219 an organisation's binding signed by one member",
+        );
+        assert_eq!(
+            crate::federation::admission::affiliation_of_binding(d, &key_id(&node("n1")))
+                .await
+                .unwrap(),
+            None,
+            "[{tag}] I1219: a held binding names no affiliation on the bond"
         );
         // Cosigned under the protocol: admitted, and the fold names it.
         must_put(
@@ -1363,7 +1444,7 @@ pub mod bodies {
         )
         .await;
         assert_eq!(
-            crate::federation::admission::affiliation_of_binding(d, &node("n2"))
+            crate::federation::admission::affiliation_of_binding(d, &key_id(&node("n2")))
                 .await
                 .unwrap(),
             Some(aff.clone()),
@@ -1377,7 +1458,7 @@ pub mod bodies {
         )
         .await;
         assert_eq!(
-            crate::federation::admission::affiliation_of_binding(d, &node("n3"))
+            crate::federation::admission::affiliation_of_binding(d, &key_id(&node("n3")))
                 .await
                 .unwrap(),
             None,
@@ -1394,9 +1475,10 @@ pub mod bodies {
             obr::NOT_AN_AFFILIATION,
             "I1219 a binding naming a plain community",
         );
-        refused(
+        // An affiliation this node does not hold yet: the binding WAITS
+        // (edition 2 holds it Pending; no longer `affiliation_not_held`).
+        held(
             put(d, &binding(&k[0], &node("n5"), Some("no-such-org"))).await,
-            obr::AFFILIATION_NOT_HELD,
             "I1219 a binding naming an unknown community",
         );
         // Signed beyond W, cosigned by a quorum that still holds at receipt:
@@ -1408,24 +1490,25 @@ pub mod bodies {
         stale.asserted_at = base() - Duration::days(4);
         stale.scrub_timestamp = stale.asserted_at;
         ts::reseal(&mut stale);
-        must_put(
+        let stale_row = must_put(
             d,
             &cosigned(stale, &[&k[1]]),
             "I1219 a binding signed four days ago, its quorum still standing",
         )
         .await;
-        // A bare retraction against the node ends the binding only when its
-        // GRANTER signs it. Kills: the bare-retraction match inverted.
+        // A retraction of the binding ends it only when its GRANTER signs it.
+        // Kills: the retraction match inverted. v62.0.0: a withdraws names
+        // its target (`refs.target`); a target-less "bare" withdraws is
+        // refused by Verify's reader, so the retraction names the binding.
         let bare = |by: &str| {
-            let id = uuid::Uuid::new_v4().to_string();
-            let mut row =
-                ts::bare_attestation(&id, by, &node("n6"), &serde_json::json!({ "id": id }));
-            row.attestation_type = attestation_type::WITHDRAWS.to_owned();
-            ts::seal_row_in_place(by, &mut row);
-            row
+            crate::federation::edition2::fixture_switch::composer_of(
+                attestation_type::WITHDRAWS,
+                &stale_row,
+                by,
+            )
         };
         let on_bond = || async {
-            crate::federation::admission::affiliation_of_binding(d, &node("n6"))
+            crate::federation::admission::affiliation_of_binding(d, &key_id(&node("n6")))
                 .await
                 .unwrap()
         };
@@ -1434,7 +1517,8 @@ pub mod bodies {
             Some(aff.clone()),
             "[{tag}] I1219: n6 on the bond"
         );
-        must_put(d, &bare(&k[2]), "I1219 another key's bare retraction").await;
+        // Another key's withdraws: held or refused, it does not end the binding.
+        let _ = crate::federation::licensure_chain_invariants::bodies::offer(d, &bare(&k[2])).await;
         assert_eq!(
             on_bond().await,
             Some(aff.clone()),
@@ -1451,7 +1535,7 @@ pub mod bodies {
         // In force up to, not at, the retraction's instant (half-open).
         // Kills: the end bound read inclusively.
         let in_force = |t| async move {
-            crate::federation::admission::owner_bindings_in_force_at(d, &node("n6"), t)
+            crate::federation::admission::owner_bindings_in_force_at(d, &key_id(&node("n6")), t)
                 .await
                 .unwrap()
                 .len()
@@ -1475,7 +1559,7 @@ pub mod bodies {
         // owner-binding: the fold does not read it. Kills: the owner-binding
         // filter weakened from AND to OR.
         let mut general = crate::federation::admission::steward_liveness_test_support::signed_row(
-            &pk[0],
+            &crate::federation::edition2::fixture_switch::seed_of(&pk[0]),
             &node("n3"),
             attestation_type::DELEGATES_TO,
             serde_json::json!({ "scope": [ds::INFRA_SERVE], "community_id": plain }),
@@ -1485,7 +1569,7 @@ pub mod bodies {
         ts::reseal(&mut general);
         must_put(d, &general, "I1219 a general delegation naming a community").await;
         assert_eq!(
-            crate::federation::admission::affiliation_of_binding(d, &node("n3"))
+            crate::federation::admission::affiliation_of_binding(d, &key_id(&node("n3")))
                 .await
                 .unwrap(),
             None,
@@ -1516,7 +1600,7 @@ pub mod bodies {
         )
         .await;
         assert_eq!(
-            crate::federation::admission::affiliation_of_binding(d, &node("n2"))
+            crate::federation::admission::affiliation_of_binding(d, &key_id(&node("n2")))
                 .await
                 .unwrap(),
             Some(aff.clone()),
@@ -1562,7 +1646,7 @@ pub mod bodies {
             )
         };
         let put_row = |r: Attestation| async move {
-            d.put_attestation(crate::federation::SignedAttestation { attestation: r })
+            crate::federation::edition2::fixture_switch::put_signed(d, &r)
                 .await
                 .map(|_| ())
         };

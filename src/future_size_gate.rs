@@ -48,11 +48,14 @@ mod tests {
         let m = crate::store::test_backend::test_backend();
         let d: &dyn FederationDirectory = &m;
         let now = chrono::Utc::now();
+        // v62.0.0 (JSON cut, E7) — the flipped builder signs an edition-2
+        // statement, so the row names a dimension Verify's matcher registers
+        // (a row with none has no family). Only the futures' sizes are read.
         let row = crate::federation::tier_ingest::test_support::bare_attestation(
             "i578",
             "a",
             "b",
-            &serde_json::json!({}),
+            &serde_json::json!({ "dimension": "evidence:safety_battery:capture:a:b:v1" }),
         );
         let sizes = [
             (

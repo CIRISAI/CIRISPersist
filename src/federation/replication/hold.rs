@@ -564,6 +564,28 @@ where
     .await
     .map_err(|e| BlobError::Backend(format!("would_hold: audience walk: {e} ({})", e.kind())))?;
     if !party {
+        // v62.0.0 (wave GC4; CC 2.7.3, 2.7.5) — party-to is read from OTHER
+        // rows (the cohort's roster, the author's owner/family rows): it is a
+        // fold condition, not a verdict on the content. The BYTES are still
+        // not stored here (the operator rule: never store what we are not
+        // party to), but inside a fold attempt the row that carries them is
+        // HELD (`not_in_audience`) — not refused — reading the cohort, the
+        // author and this node's key, and re-folds when a membership lands.
+        {
+            use crate::federation::edition2::fold;
+            if let Some(c) = provenance.community_key_id.as_deref() {
+                fold::reads(fold::Dep::key(c));
+            }
+            fold::reads(fold::Dep::key(&provenance.author_key_id));
+            fold::reads(fold::Dep::key(ctx.our_key_id));
+            fold::hold_detail(
+                fold::reason::NOT_IN_AUDIENCE,
+                format!(
+                    "not party to {:?} content of {:?}",
+                    provenance.cohort_scope, provenance.community_key_id
+                ),
+            );
+        }
         return Err(BlobError::NotPartyTo {
             cohort_scope: provenance.cohort_scope.clone(),
             community_key_id: provenance.community_key_id.clone(),

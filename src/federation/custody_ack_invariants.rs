@@ -43,16 +43,12 @@
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::custody_ack::{
-        custody_ack_envelope, device_custody_of, CustodyState, CustodyVerdict,
-        CUSTODY_ACK_DIMENSION,
-    };
-    use crate::federation::envelope::EnvelopeCore;
+    use crate::federation::custody_ack::{device_custody_of, CustodyState, CustodyVerdict};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::attestation_type as at;
     use crate::federation::types::cohort_scope as cs;
     use crate::federation::types::identity_type as it;
-    use crate::federation::{EmitAttestationInput, Error, FederationDirectory};
+    use crate::federation::{Error, FederationDirectory};
     use chrono::{DateTime, Duration, Utc};
 
     /// A fixed, millisecond-aligned base instant in the recent past, so every
@@ -67,27 +63,11 @@ pub(crate) mod bodies {
         sha2::Sha256::digest(tag.as_bytes()).into()
     }
 
-    /// Emit `env` (an object) as a `scores` row signed by `signer`, about
-    /// `attested` (`None` = the signer), placed at `scope`, stamped at `at`.
-    async fn emit(
-        d: &dyn FederationDirectory,
-        signer: &str,
-        attested: Option<&str>,
-        mut env: serde_json::Value,
-        scope: &str,
-        at: DateTime<Utc>,
-    ) -> Result<String, Error> {
-        env["asserted_at"] =
-            serde_json::json!(crate::federation::admission::render_signed_instant(at));
-        let core: EnvelopeCore = serde_json::from_value(env).expect("envelope");
-        let mut input = EmitAttestationInput::with_envelope(at::SCORES, core, scope);
-        input.attested_key_id = attested.map(str::to_owned);
-        crate::federation::attestation_emit::emit_with_local_signer(d, &signer_of(signer), input)
-            .await
-            .map(|e| e.attestation_id)
-    }
-
     /// [`report`], returning the door's answer instead of insisting on it.
+    ///
+    /// v62.0.0 (T2) — a device's own report is an edition-2 `custody:{kind}`
+    /// statement (`typed::custody_payload`, signed by the device's key, about
+    /// itself) through the statement door; its id is the row id.
     pub(crate) async fn try_report(
         d: &dyn FederationDirectory,
         device: &str,
@@ -96,8 +76,46 @@ pub(crate) mod bodies {
         at: DateTime<Utc>,
     ) -> Result<String, Error> {
         let size = (state == CustodyState::Here).then_some(4096);
-        let env = custody_ack_envelope(sha, state, size, cs::SELF, None).expect("envelope");
-        emit(d, device, None, env, cs::SELF, at).await
+        custody(d, device, None, sha, state, size, cs::SELF, None, at).await
+    }
+
+    /// A custody report signed by `signer` (a kid `put_key` minted) about
+    /// `about` (`None` = the signer), placed at `scope` (`target`: the
+    /// community / family it names), stamped at `at`: an edition-2
+    /// `custody:{kind}` statement through the statement door. Its row id.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn custody(
+        d: &dyn FederationDirectory,
+        signer: &str,
+        about: Option<&str>,
+        sha: &[u8; 32],
+        state: CustodyState,
+        size: Option<u64>,
+        scope: &str,
+        target: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<String, Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::edition2::typed;
+        let device = e2::kid_or_keep(about.unwrap_or(signer));
+        let at_ms = u64::try_from(at.timestamp_millis()).expect("after the epoch");
+        let target = target.map(e2::kid_or_keep);
+        let payload =
+            typed::custody_payload(&device, sha, state, size, scope, target.as_deref(), at_ms)?;
+        let st = e2::typed_statement(
+            &e2::seed_of(signer),
+            None,
+            &device,
+            typed::CUSTODY_PREFIX,
+            &payload,
+        );
+        match Box::pin(e2::put_statement(d, &st)).await? {
+            StatementOutcome::Row { row_id, .. } | StatementOutcome::Voice { row_id, .. } => {
+                Ok(row_id.hex())
+            }
+            other => panic!("a custody report lands as a row: {other:?}"),
+        }
     }
 
     pub(crate) async fn report(
@@ -107,9 +125,7 @@ pub(crate) mod bodies {
         state: CustodyState,
         at: DateTime<Utc>,
     ) -> String {
-        let size = (state == CustodyState::Here).then_some(4096);
-        let env = custody_ack_envelope(sha, state, size, cs::SELF, None).expect("envelope");
-        emit(d, device, None, env, cs::SELF, at)
+        try_report(d, device, sha, state, at)
             .await
             .expect("a device's own report is admitted")
     }
@@ -124,8 +140,17 @@ pub(crate) mod bodies {
         // is no one's device), so a report it places at `self` would be
         // refused `custody_ack_outside_cohort`. The device is its owner's
         // personal laptop here, which is what these witnesses are about.
-        let owner = format!("{k}-owner");
-        ts::register_hybrid_key_as(d, &owner, &owner, it::USER).await;
+        // v62.0.0 — the owner seed derives from the device's SEED (a kid
+        // never seeds a signer, E0 v1.4).
+        let owner = crate::federation::edition2::fixture_switch::put_key(
+            d,
+            &format!(
+                "{}-owner",
+                crate::federation::edition2::fixture_switch::seed_of(&k)
+            ),
+            &[it::USER],
+        )
+        .await;
         d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
             identity_key_id: owner.clone(),
             occurrence_key_id: k.clone(),
@@ -159,28 +184,9 @@ pub(crate) mod bodies {
         let alias = format!("{role}-dev-{head}")
             .replace('_', "-")
             .to_lowercase();
-        let k = ts::local_signer(&alias).derived_key_id();
-        assert_eq!(
-            &k.as_bytes()[..32],
-            &alias.as_bytes()[..32],
-            "seed-sharing derived id"
-        );
-        ts::register_hybrid_key_as(d, &k, &alias, identity_type).await;
-        ALIASES.with(|m| m.borrow_mut().insert(k.clone(), alias));
-        k
-    }
-
-    thread_local! {
-        /// derived key → the alias whose seed signs for it.
-        static ALIASES: std::cell::RefCell<std::collections::HashMap<String, String>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-
-    fn signer_of(key: &str) -> std::sync::Arc<crate::signing::LocalSigner> {
-        let alias = ALIASES
-            .with(|m| m.borrow().get(key).cloned())
-            .expect("a registered device");
-        ts::local_signer(&alias)
+        // v62.0.0 — the device's edition-2 key; its LocalSigner
+        // (`ts::local_signer(alias)`) signs as this kid.
+        crate::federation::edition2::fixture_switch::put_key(d, &alias, &[identity_type]).await
     }
 
     async fn verdict(
@@ -193,16 +199,6 @@ pub(crate) mod bodies {
         device_custody_of(d, dev, &hex::encode(sha), receipt, now)
             .await
             .expect("fold")
-    }
-
-    fn refused(r: Result<String, Error>, token: &str, what: &str) {
-        match r {
-            Err(e) => assert!(
-                e.to_string().contains(token),
-                "{what}: refused, but not by `{token}`: {e}"
-            ),
-            Ok(id) => panic!("{what}: ADMITTED as {id}, expected `{token}`"),
-        }
     }
 
     /// **I400** — a live `here`.
@@ -378,12 +374,23 @@ pub(crate) mod bodies {
     ) {
         let dev = device(d, tag).await;
         let other = device(d, &format!("{tag}--x")).await;
-        let env =
-            custody_ack_envelope(&blob(tag), CustodyState::Here, Some(1), cs::SELF, None).unwrap();
-        refused(
-            emit(d, &other, Some(&dev), env, cs::SELF, base()).await,
-            "custody_ack_not_self_report",
-            "I405 another key reporting the device's custody",
+        // v62.0.0 — refused at the custody door (the statement's author
+        // is not the device it reports about), whatever the token.
+        let r = custody(
+            d,
+            &other,
+            Some(&dev),
+            &blob(tag),
+            CustodyState::Here,
+            Some(1),
+            cs::SELF,
+            None,
+            base(),
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "I405 another key reporting the device's custody: {r:?}"
         );
         assert_eq!(
             verdict(d, &dev, &blob(tag), None, base()).await.state,
@@ -403,21 +410,28 @@ pub(crate) mod bodies {
         let community = format!("cust-comm-{tag}");
         ts::seed_two_member_community(d, &community, &a, &b).await;
         let sha = blob(tag);
-        let env = |state| {
-            custody_ack_envelope(&sha, state, Some(9), cs::COMMUNITY, Some(&community)).unwrap()
+        let at_room = |by: &str| {
+            let by = by.to_owned();
+            let community = community.clone();
+            async move {
+                custody(
+                    d,
+                    &by,
+                    None,
+                    &sha,
+                    CustodyState::Here,
+                    Some(9),
+                    cs::COMMUNITY,
+                    Some(&community),
+                    base(),
+                )
+                .await
+            }
         };
-        emit(d, &a, None, env(CustodyState::Here), cs::COMMUNITY, base())
+        at_room(&a)
             .await
             .expect("I406 a member's report at its community is admitted");
-        let r = emit(
-            d,
-            &outsider,
-            None,
-            env(CustodyState::Here),
-            cs::COMMUNITY,
-            base(),
-        )
-        .await;
+        let r = at_room(&outsider).await;
         assert!(
             r.is_err(),
             "I406 an outsider's report at the community is refused: {r:?}"
@@ -431,92 +445,62 @@ pub(crate) mod bodies {
         );
     }
 
-    /// **I407** — malformed is a refusal; a future instant is refused.
+    /// **I407** — a scope outside the closed placement set is refused; a
+    /// future instant is refused. v62.0.0: the malformed-ENVELOPE legs (here
+    /// without size, none with size, an unknown or missing state, a bad or
+    /// doubled digest) are deleted: a custody statement's payload is the
+    /// closed `custody:{kind}` map, refused `edition2_payload_invalid` by the
+    /// statement door (P1d's payload witnesses), and these shapes cannot be
+    /// written through `typed::custody_payload` at all.
     pub(crate) async fn i407_malformed_is_a_refusal(d: &dyn FederationDirectory, tag: &str) {
         let dev = device(d, tag).await;
-        let hex_sha = hex::encode(blob(tag));
-        let row = |extra: serde_json::Value| {
-            let mut env = serde_json::json!({
-                "dimension": CUSTODY_ACK_DIMENSION,
-                "evidence_refs": [hex_sha],
-                "score": 1.0,
-                "confidence": 1.0,
-            });
-            for (k, v) in extra.as_object().unwrap() {
-                env[k] = v.clone();
-            }
-            env
-        };
+        let sha = blob(tag);
         let t = base();
-        for (what, env) in [
-            (
-                "here without size",
-                row(serde_json::json!({"custody_state": "here"})),
-            ),
-            (
-                "none with size",
-                row(serde_json::json!({"custody_state": "none", "size": 3})),
-            ),
-            (
-                "an unknown state",
-                row(serde_json::json!({"custody_state": "maybe", "size": 3})),
-            ),
-            ("no state", row(serde_json::json!({}))),
-            (
-                "a digest that is not 64 lowercase hex",
-                row(serde_json::json!({"custody_state": "none", "evidence_refs": ["AB"]})),
-            ),
-            (
-                "two blobs in one report",
-                row(
-                    serde_json::json!({"custody_state": "none", "evidence_refs": [hex_sha, hex_sha]}),
-                ),
-            ),
-        ] {
-            refused(
-                emit(d, &dev, None, env, cs::SELF, t).await,
-                "custody_ack_malformed",
-                &format!("I407 {what}"),
-            );
-        }
         // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — `federation` is the
-        // commons claim's placement now (the holder directory); a scope
-        // outside the closed placement set is still malformed.
-        emit(
+        // commons claim's placement (the holder directory); a scope outside
+        // the closed placement set is malformed.
+        custody(
             d,
             &dev,
             None,
-            row(serde_json::json!({"custody_state": "none"})),
+            &sha,
+            CustodyState::None,
+            None,
             cs::FEDERATION,
+            None,
             t,
         )
         .await
         .expect("I407 a commons placement is the holder directory's");
-        refused(
-            emit(
-                d,
-                &dev,
-                None,
-                row(serde_json::json!({"custody_state": "none"})),
-                cs::SPECIES,
-                t,
-            )
-            .await,
-            "custody_ack_malformed",
-            "I407 a commons scope other than federation",
-        );
-        // The signer's instant may run at most 300 s ahead of the receiving
-        // node's clock (the universal instant gate's bound): a future-dated
-        // `here` cannot stay live.
-        // A literal, not the constant: a witness that computed its instant
-        // from the bound would move with any mutation of the bound.
-        let future = Utc::now() + Duration::seconds(300 + 60);
-        let r = emit(
+        let r = custody(
             d,
             &dev,
             None,
-            row(serde_json::json!({"custody_state": "here", "size": 1})),
+            &sha,
+            CustodyState::None,
+            None,
+            cs::SPECIES,
+            None,
+            t,
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "I407 a commons scope other than federation: {r:?}"
+        );
+        // The signer's instant may run at most 300 s ahead of the receiving
+        // node's clock: a future-dated `here` cannot stay live. A literal,
+        // not the constant.
+        let future = Utc::now() + Duration::seconds(300 + 60);
+        let r = custody(
+            d,
+            &dev,
+            None,
+            &sha,
+            CustodyState::Here,
+            Some(1),
             cs::SELF,
+            None,
             future,
         )
         .await;
@@ -525,12 +509,15 @@ pub(crate) mod bodies {
             "I407 a report dated past the skew bound is refused: {r:?}"
         );
         let near = Utc::now() + Duration::seconds(60);
-        emit(
+        custody(
             d,
             &dev,
             None,
-            row(serde_json::json!({"custody_state": "here", "size": 1})),
+            &sha,
+            CustodyState::Here,
+            Some(1),
             cs::SELF,
+            None,
             near,
         )
         .await
@@ -549,24 +536,35 @@ pub(crate) mod bodies {
         let community = format!("cust-aud-{tag}");
         ts::seed_two_member_community(d, &community, &a, &b).await;
         let sha = blob(tag);
-        let env = custody_ack_envelope(
+        custody(
+            d,
+            &a,
+            None,
             &sha,
             CustodyState::Here,
             Some(9),
             cs::COMMUNITY,
             Some(&community),
+            base(),
         )
-        .unwrap();
-        emit(d, &a, None, env, cs::COMMUNITY, base())
-            .await
-            .expect("I408 admitted");
+        .await
+        .expect("I408 admitted");
         let audience = |node: String| {
             let community = community.clone();
             let a = a.clone();
             async move {
-                is_audience(d, cs::COMMUNITY, Some(&community), &a, |_| false, &node)
-                    .await
-                    .unwrap()
+                is_audience(
+                    d,
+                    cs::COMMUNITY,
+                    Some(&crate::federation::edition2::fixture_switch::kid(
+                        &community,
+                    )),
+                    &a,
+                    |_| false,
+                    &node,
+                )
+                .await
+                .unwrap()
             }
         };
         assert!(
@@ -577,11 +575,19 @@ pub(crate) mod bodies {
         // the self leg: a CLAIMED device (since S1 an unclaimed key is in no
         // self cohort, so `a` — a bare room member — could not place one)
         let c = device(d, &format!("{tag}--c")).await;
-        let self_env =
-            custody_ack_envelope(&sha, CustodyState::None, None, cs::SELF, None).unwrap();
-        emit(d, &c, None, self_env, cs::SELF, base())
-            .await
-            .expect("I408 self admitted");
+        custody(
+            d,
+            &c,
+            None,
+            &sha,
+            CustodyState::None,
+            None,
+            cs::SELF,
+            None,
+            base(),
+        )
+        .await
+        .expect("I408 self admitted");
         assert!(
             !is_audience(d, cs::SELF, None, &c, |_| false, &outsider)
                 .await
@@ -603,22 +609,31 @@ pub(crate) mod bodies {
                 .state,
             CustodyVerdict::None
         );
-        let mut env = serde_json::json!({
-            "references_attestation_id": latest,
-            "withdrawal_reason": "custody witness",
-        });
-        env["asserted_at"] =
-            serde_json::json!(crate::federation::admission::render_signed_instant(
-                t0 + Duration::hours(1) + Duration::minutes(1)
-            ));
-        let core: EnvelopeCore = serde_json::from_value(env).unwrap();
-        crate::federation::attestation_emit::emit_with_local_signer(
-            d,
-            &signer_of(&dev),
-            EmitAttestationInput::with_envelope(at::WITHDRAWS, core, cs::SELF),
-        )
-        .await
-        .expect("I409 the device withdraws its own report");
+        // v62.0.0 — the device's `withdraws` of its own latest report:
+        // an edition-2 composer naming it by `refs.target` (its family),
+        // stamped just after it.
+        {
+            use crate::federation::edition2::fixture_switch as e2;
+            let target = d
+                .get_attestation(&latest)
+                .await
+                .unwrap()
+                .expect("I409 the latest report is held");
+            let mut w = e2::composer_of(at::WITHDRAWS, &target, &dev);
+            w.asserted_at = t0 + Duration::hours(1) + Duration::minutes(1);
+            if let Some(o) = w.attestation_envelope.as_object_mut() {
+                o.insert(
+                    "asserted_at".to_owned(),
+                    serde_json::json!(crate::federation::admission::render_signed_instant(
+                        w.asserted_at
+                    )),
+                );
+            }
+            let st = e2::statement_of_family(&w, &dev, &e2::family_of(&target));
+            e2::put_statement(d, &st)
+                .await
+                .expect("I409 the device withdraws its own report");
+        }
         assert_eq!(
             verdict(d, &dev, &sha, None, t0 + Duration::hours(2))
                 .await
@@ -826,116 +841,62 @@ mod engine_bodies {
         }
     }
 
-    /// The one-leaf log of inline blob `sha` on A, with an STH and a delivery
-    /// receipt from node B. Returns the stream id.
-    async fn receipted_stream<B>(l: &Ladder<B>, run: &str, sha: &[u8; 32]) -> String
+    /// The one-leaf log of inline blob `sha` on A, with its STH: the stream
+    /// id and the root a receipt names.
+    async fn stream_of<B>(l: &Ladder<B>, sha: &[u8; 32]) -> (String, [u8; 32])
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        use crate::federation::stream_receipt::{receipt_signing_bytes, DeliveryReceipt};
         let sid = crate::federation::stream_sth::inline_blob_stream_id(sha);
         let sth = l.engine_a.sign_stream_sth(&sid, &[*sha], 1).await.unwrap();
         l.ba.put_stream_sth(sth.clone(), &l.node_a).await.unwrap();
-        let subscriber =
-            crate::federation::tier_ingest::test_support::local_signer(&format!("em-b-{run}"));
-        assert_eq!(subscriber.derived_key_id(), l.node_b);
-        let bytes = receipt_signing_bytes(&l.node_b, &sid, 0, &sth.root_hash, 1);
-        l.ba.put_delivery_receipt(DeliveryReceipt {
-            stream_id: sid.clone(),
-            subscriber_key_id: l.node_b.clone(),
-            epoch: 0,
-            k: 1,
-            chunk_root: sth.root_hash,
-            signature: subscriber.sign_hybrid(&bytes).await.unwrap(),
-        })
-        .await
-        .expect("the receipt is stored");
-        sid
+        (sid, sth.root_hash)
     }
 
-    /// Node B (the ladder's subscriber) signs `env` as a `scores` row at
-    /// `federation`, stamped `at`, into A's directory. Returns the row id.
-    async fn signed_by_b<B>(
+    /// v62.0.0 (T2) — node B's signed delivery receipt for `sid` (epoch 0,
+    /// k 1, `root`), signed at `at`: one edition-2 `delivery_receipt:{stream}`
+    /// statement, which lands both the receipt row and its signed row
+    /// (`signed_receipt_at` reads it). Its row id.
+    async fn receipt<B>(
         l: &Ladder<B>,
         run: &str,
-        mut env: serde_json::Value,
+        sid: &str,
+        root: &[u8; 32],
         at: chrono::DateTime<chrono::Utc>,
-        expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> String
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        env["asserted_at"] =
-            serde_json::json!(crate::federation::admission::render_signed_instant(at));
-        let core: crate::federation::envelope::EnvelopeCore =
-            serde_json::from_value(env).expect("envelope");
-        let mut input = crate::federation::EmitAttestationInput::with_envelope(
-            crate::federation::types::attestation_type::SCORES,
-            core,
-            crate::federation::types::cohort_scope::FEDERATION,
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        let b_seed = format!("em-b-{run}");
+        assert_eq!(
+            e2::kid(&b_seed),
+            l.node_b,
+            "the ladder's subscriber is B's key"
         );
-        input.expires_at = expires_at;
-        let signer =
-            crate::federation::tier_ingest::test_support::local_signer(&format!("em-b-{run}"));
-        crate::federation::attestation_emit::emit_with_local_signer(
-            l.ba.as_dyn_directory(),
-            &signer,
-            input,
-        )
-        .await
-        .expect("B's row is admitted on A")
-        .attestation_id
-    }
-
-    /// B's signed `delivery_receipt:{stream}` row (CC 3.4.6) about `sha`.
-    async fn signed_receipt_row<B>(
-        l: &Ladder<B>,
-        run: &str,
-        stream: &str,
-        sha: &[u8; 32],
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> String
-    where
-        B: BlobStorage + FederationDirectory + Sync,
-    {
-        signed_receipt_row_until(l, run, stream, sha, at, None).await
-    }
-
-    async fn signed_receipt_row_until<B>(
-        l: &Ladder<B>,
-        run: &str,
-        stream: &str,
-        sha: &[u8; 32],
-        at: chrono::DateTime<chrono::Utc>,
-        expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> String
-    where
-        B: BlobStorage + FederationDirectory + Sync,
-    {
-        signed_by_b(
-            l,
-            run,
-            serde_json::json!({
-                "dimension": crate::federation::custody_ack::delivery_receipt_dimension(stream),
-                "score": 1.0,
-                "confidence": 1.0,
-                "evidence_refs": [hex::encode(sha)],
-            }),
-            at,
-            expires_at,
-        )
-        .await
+        let at_ms = u64::try_from(at.timestamp_millis()).expect("after the epoch");
+        let st = e2::delivery_receipt_statement(&b_seed, sid, 0, 1, root, at_ms);
+        match e2::put_statement(l.ba.as_dyn_directory(), &st)
+            .await
+            .expect("B's receipt is stored")
+        {
+            StatementOutcome::Row { row_id, .. } => row_id.hex(),
+            other => panic!("a receipt lands as a row: {other:?}"),
+        }
     }
 
     /// **I1407** (v60.1.0, CIRISPersist#1006; CC 3.1.3.3, CC 3.4.6) — **`received`
     /// is ordered by the instant the SUBSCRIBER signed**, never by this node's
-    /// storage stamp. A `ciris-delivery-receipt/v1` receipt stored after the
-    /// device's later signed `none` (the receiver's clock ahead) no longer
-    /// outranks it: the device reads `none`, and a stored receipt with no
-    /// signed instant is not custody evidence. The device's own
-    /// `delivery_receipt:{stream}` row orders: one signed before the `none`
-    /// keeps `none`; one signed after reads `received` at its signed instant;
-    /// withdrawn by the device it no longer counts, nor once it has expired.
+    /// storage stamp. The device's own receipt orders: one signed before its
+    /// signed `none` keeps `none`; one signed after reads `received` at its
+    /// signed instant; withdrawn by the device it no longer counts.
+    ///
+    /// v62.0.0 (wave 5, E6) — every receipt is an edition-2
+    /// `delivery_receipt:{stream}` statement, so the earlier legs are gone:
+    /// the v1 receipt stored with NO signed instant (there is no unsigned
+    /// receipt now) and the receipt row's `expires_at` (the T2 payload has no
+    /// end). B's `none` is its edition-2 custody statement.
     pub(crate) async fn i1407_received_is_ordered_by_the_signed_instant<B>(
         dsn_a: &str,
         dsn_b: &str,
@@ -944,15 +905,15 @@ mod engine_bodies {
     ) where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
-        use crate::federation::custody_ack::{custody_ack_envelope, signed_receipt_at};
+        use crate::federation::custody_ack::signed_receipt_at;
+        use crate::federation::edition2::fixture_switch as e2;
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let e = &l.engine_a;
-        let author = format!("i1407-author-{run}");
-        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-            l.ba.as_ref(),
-            &author,
-            &author,
-            crate::federation::types::identity_type::USER,
+        let dir = l.ba.as_dyn_directory();
+        let author = e2::put_key(
+            dir,
+            &format!("i1407-author-{run}"),
+            &[crate::federation::types::identity_type::USER],
         )
         .await;
         let bytes = format!("i1407 {run}").into_bytes();
@@ -971,23 +932,21 @@ mod engine_bodies {
             chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis()).unwrap()
         };
         let t_none = ms(chrono::Utc::now() - chrono::Duration::seconds(60));
-        signed_by_b(
-            &l,
-            run,
-            custody_ack_envelope(
-                &x,
-                CustodyState::None,
-                None,
-                crate::federation::types::cohort_scope::FEDERATION,
-                None,
-            )
-            .unwrap(),
-            t_none,
+        let b_seed = format!("em-b-{run}");
+        super::bodies::custody(
+            dir,
+            &b_seed,
             None,
+            &x,
+            CustodyState::None,
+            None,
+            crate::federation::types::cohort_scope::FEDERATION,
+            None,
+            t_none,
         )
-        .await;
-        // The v1 receipt is stored NOW, a minute after B's signed `none`.
-        let sid = receipted_stream(&l, run, &x).await;
+        .await
+        .expect("B's signed none is admitted on A");
+        let (sid, root) = stream_of(&l, &x).await;
         let b_state = |v: &crate::federation::custody_ack::CustodyView| {
             v.devices
                 .iter()
@@ -995,17 +954,10 @@ mod engine_bodies {
                 .unwrap_or_else(|| panic!("I1407 the subscriber is listed: {v:?}"))
                 .clone()
         };
-        let v = e.custody_view(&x, &l.node_a, Some(&sid)).await.unwrap();
-        let b = b_state(&v);
-        assert_eq!(
-            b.state,
-            CustodyVerdict::None,
-            "I1407 a stored receipt never outranks the device's later signed `none`: {b:?}"
-        );
-        assert_eq!(b.received_at, None, "I1407 no signed receipt instant");
 
         // Signed before the `none`: still `none`.
-        signed_receipt_row(&l, run, &sid, &x, t_none - chrono::Duration::seconds(30)).await;
+        let t_before = ms(t_none - chrono::Duration::seconds(30));
+        receipt(&l, run, &sid, &root, t_before).await;
         let b = b_state(&e.custody_view(&x, &l.node_a, Some(&sid)).await.unwrap());
         assert_eq!(
             b.state,
@@ -1014,8 +966,8 @@ mod engine_bodies {
         );
 
         // Signed after the `none`: `received`, at the signed instant.
-        let t_after = t_none + chrono::Duration::seconds(30);
-        let later = signed_receipt_row(&l, run, &sid, &x, t_after).await;
+        let t_after = ms(t_none + chrono::Duration::seconds(30));
+        let later = receipt(&l, run, &sid, &root, t_after).await;
         let b = b_state(&e.custody_view(&x, &l.node_a, Some(&sid)).await.unwrap());
         assert_eq!(
             b.state,
@@ -1023,66 +975,24 @@ mod engine_bodies {
             "I1407 a later receipt: {b:?}"
         );
         assert_eq!(b.received_at, Some(t_after), "I1407 the signed instant");
-
-        // An expired receipt row does not count at a reader's later clock.
-        let t_exp = t_none + chrono::Duration::seconds(45);
-        let expiring = signed_receipt_row_until(
-            &l,
-            run,
-            &sid,
-            &x,
-            t_exp,
-            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-        )
-        .await;
-        let dir = l.ba.as_dyn_directory();
         assert_eq!(
             signed_receipt_at(dir, &l.node_b, &sid, chrono::Utc::now())
                 .await
                 .unwrap(),
-            Some(ms(t_exp)),
-            "I1407 a live row counts"
-        );
-        assert_eq!(
-            signed_receipt_at(
-                dir,
-                &l.node_b,
-                &sid,
-                chrono::Utc::now() + chrono::Duration::days(1)
-            )
-            .await
-            .unwrap(),
             Some(t_after),
-            "I1407 an expired row does not"
-        );
-        // At the instant it expires it no longer counts (live means strictly
-        // before `expires_at`), read back at the substrate's own resolution.
-        let expires_at = dir
-            .get_attestation(&expiring)
-            .await
-            .unwrap()
-            .unwrap()
-            .expires_at
-            .expect("the row's expiry");
-        assert_eq!(
-            signed_receipt_at(dir, &l.node_b, &sid, expires_at)
-                .await
-                .unwrap(),
-            Some(t_after),
-            "I1407 a row is not live at its own expiry instant"
+            "I1407 the latest signed receipt"
         );
 
         // Withdrawn by the device: no longer counts.
         let prior = dir.get_attestation(&later).await.unwrap().unwrap();
-        crate::federation::blobs::emit_withdraws_attestation_helper(
+        let w = e2::composer_of(
+            crate::federation::types::attestation_type::WITHDRAWS,
             &prior,
-            "",
-            &crate::federation::tier_ingest::test_support::local_signer(&format!("em-b-{run}")),
-            dir,
-            chrono::Utc::now(),
-        )
-        .await
-        .expect("B withdraws its receipt row");
+            &b_seed,
+        );
+        e2::put_signed(dir, &w)
+            .await
+            .expect("B withdraws its receipt row");
         assert_eq!(
             signed_receipt_at(
                 dir,
@@ -1092,7 +1002,7 @@ mod engine_bodies {
             )
             .await
             .unwrap(),
-            Some(ms(t_none - chrono::Duration::seconds(30))),
+            Some(t_before),
             "I1407 a withdrawn row does not count"
         );
     }
@@ -1123,7 +1033,15 @@ mod engine_bodies {
             .await
             .unwrap()
             .at_rest_sha256;
-        let s_y = receipted_stream(&l, run, &y).await;
+        let (s_y, root_y) = stream_of(&l, &y).await;
+        receipt(
+            &l,
+            run,
+            &s_y,
+            &root_y,
+            chrono::Utc::now() - chrono::Duration::seconds(10),
+        )
+        .await;
         let r = e.custody_view(&x, &l.node_a, Some(&s_y)).await;
         assert!(
             matches!(&r, Err(BlobError::InvalidArgument(m)) if m.contains("not the blob's stream")),
@@ -1131,12 +1049,12 @@ mod engine_bodies {
         );
         // Control: X's own log, receipted, folds node B as `received` (v60.1.0,
         // CIRISPersist#1006: by the instant B SIGNED on its receipt row).
-        let s_x = receipted_stream(&l, run, &x).await;
-        signed_receipt_row(
+        let (s_x, root_x) = stream_of(&l, &x).await;
+        receipt(
             &l,
             run,
             &s_x,
-            &x,
+            &root_x,
             chrono::Utc::now() - chrono::Duration::seconds(5),
         )
         .await;
@@ -1162,32 +1080,34 @@ mod engine_bodies {
     /// on A: the one room shape that resolves to the PLAINTEXT tier.
     async fn infra_room<B>(l: &Ladder<B>, run: &str, tag: &str) -> String
     where
-        B: BlobStorage + FederationDirectory + Sync,
+        B: BlobStorage
+            + FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + crate::federation::canonical_community_invariants::bodies::SetNodeKey
+            + Sync,
     {
         infra_room_of(l, run, tag, &l.alice).await
     }
 
     /// [`infra_room`] with `founder` seated (v62: as a member of a rooted
     /// infrastructure room, whose founders are the trust root's stewards).
+    /// v62.0.0 (wave 5, E6) — E5's `rooted_infrastructure_room_e2` (T1
+    /// voices, W1's shared rooted root); the room is its returned kid.
     async fn infra_room_of<B>(l: &Ladder<B>, run: &str, tag: &str, founder: &str) -> String
     where
-        B: BlobStorage + FederationDirectory + Sync,
+        B: BlobStorage
+            + FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + crate::federation::canonical_community_invariants::bodies::SetNodeKey
+            + Sync,
     {
-        // v62.0.0 (CC rc20 3.4.7.1 / 3.2, #1274) — the carve-out needs a
-        // conformant infrastructure record rooted in this node's trust set;
-        // a self-claimed `substrate_persist` room key no longer opens it.
-        // `founder` reads the room as a member (human founders are the
-        // accord-conferred stewards the trust root seats).
-        let room = format!("em-infra-{tag}-{run}");
-        let ba = l.ba.as_ref();
-        crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room(
-            ba as &dyn FederationDirectory,
-            &room,
+        crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room_e2(
+            l.ba.as_ref(),
+            &format!("em-infra-{tag}-{run}"),
             &[founder],
             &format!("{tag}-{run}"),
         )
-        .await;
-        room
+        .await
     }
 
     /// **I525** (v53.1.3, Codex on #985, #986) — **the row-target arm reads
@@ -1202,7 +1122,12 @@ mod engine_bodies {
         run: &str,
         pick: Pick<B>,
     ) where
-        B: BlobStorage + FederationDirectory + Sync + 'static,
+        B: BlobStorage
+            + FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + crate::federation::canonical_community_invariants::bodies::SetNodeKey
+            + Sync
+            + 'static,
     {
         use crate::federation::replication_audience_invariants::bodies as ra;
         use crate::federation::types::cohort_scope::AFFILIATIONS;
@@ -1298,7 +1223,12 @@ mod engine_bodies {
         run: &str,
         pick: Pick<B>,
     ) where
-        B: BlobStorage + FederationDirectory + Sync + 'static,
+        B: BlobStorage
+            + FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + crate::federation::canonical_community_invariants::bodies::SetNodeKey
+            + Sync
+            + 'static,
     {
         use crate::federation::durability::DeficitAudience;
         let l = ladder(dsn_a, dsn_b, run, pick).await;
@@ -1347,7 +1277,12 @@ mod engine_bodies {
         run: &str,
         pick: Pick<B>,
     ) where
-        B: BlobStorage + FederationDirectory + Sync + 'static,
+        B: BlobStorage
+            + FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + crate::federation::canonical_community_invariants::bodies::SetNodeKey
+            + Sync
+            + 'static,
     {
         use crate::federation::durability::{content_audience, ContentAudience, DeficitAudience};
         use crate::federation::replication_audience_invariants::bodies as ra;
@@ -1463,7 +1398,12 @@ mod engine_bodies {
         run: &str,
         pick: Pick<B>,
     ) where
-        B: BlobStorage + FederationDirectory + Sync + 'static,
+        B: BlobStorage
+            + FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + crate::federation::canonical_community_invariants::bodies::SetNodeKey
+            + Sync
+            + 'static,
     {
         use crate::federation::durability::{content_audience, ContentAudience, DeficitAudience};
         use crate::federation::tier_ingest::test_support as ts;
@@ -1524,7 +1464,9 @@ mod engine_bodies {
                 core,
                 crate::federation::types::cohort_scope::FEDERATION,
             );
-            input.attested_key_id = Some(other_root);
+            input.attested_key_id = Some(crate::federation::edition2::fixture_switch::kid(
+                &other_root,
+            ));
             e.emit_attestation_self(input)
                 .await
                 .expect("I605: node A's trust edge to another root");
@@ -1608,7 +1550,9 @@ mod engine_bodies {
                     n.contains(has) && !n.contains(lacks),
                     "I607 premise: {owner}'s self room reaches {has} and not {lacks}: {n:?}"
                 ),
-                other => panic!("I607 premise: {owner}'s self room resolves to nodes: {other:?}"),
+                other => {
+                    panic!("I607 premise: {owner}'s self room resolves to nodes: {other:?}")
+                }
             }
         }
         let associations = vec![
@@ -1881,7 +1825,7 @@ mod runners {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i514_sqlite() {
-        super::engine_bodies::i514_the_custody_door_knows_its_node(
+        Box::pin(super::engine_bodies::i514_the_custody_door_knows_its_node(
             "sqlite::memory:",
             "sqlite::memory:",
             &suffix(),
@@ -1891,7 +1835,7 @@ mod runners {
                 >,
             crate::engine::BackendDispatch::Sqlite,
             |b| b.forget_node_key_id(),
-        )
+        ))
         .await;
     }
 
@@ -1963,7 +1907,7 @@ mod runners {
         let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
             return;
         };
-        super::engine_bodies::i514_the_custody_door_knows_its_node(
+        Box::pin(super::engine_bodies::i514_the_custody_door_knows_its_node(
             &a,
             &b,
             &suffix(),
@@ -1973,14 +1917,14 @@ mod runners {
                 >,
             crate::engine::BackendDispatch::Postgres,
             |b| b.forget_node_key_id(),
-        )
+        ))
         .await;
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i400e_the_engine_door_sqlite() {
-        super::engine_bodies::i400e_the_engine_door(
+        Box::pin(super::engine_bodies::i400e_the_engine_door(
             "sqlite::memory:",
             "sqlite::memory:",
             &suffix(),
@@ -1988,7 +1932,7 @@ mod runners {
                 as crate::federation::epoch_minter_invariants::bodies::Pick<
                     crate::store::sqlite::SqliteBackend,
                 >,
-        )
+        ))
         .await;
     }
 
@@ -1998,7 +1942,7 @@ mod runners {
         let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
             return;
         };
-        super::engine_bodies::i400e_the_engine_door(
+        Box::pin(super::engine_bodies::i400e_the_engine_door(
             &a,
             &b,
             &suffix(),
@@ -2006,7 +1950,7 @@ mod runners {
                 as crate::federation::epoch_minter_invariants::bodies::Pick<
                     crate::store::postgres::PostgresBackend,
                 >,
-        )
+        ))
         .await;
     }
 }

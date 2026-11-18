@@ -28,8 +28,8 @@
 //! - `advance_head` — L4 bookkeeping: heads move forward only. Same
 //!   `(seq, head_hash)` is idempotent (`Unchanged`); a LOWER seq is
 //!   `Stale` (normal under replication, a no-op); a DIFFERENT hash at the
-//!   CURRENT seq is `Conflict` — fork-shaped, the door never overwrites,
-//!   and the caller assembles [`standard::ForkEvidence`].
+//!   CURRENT seq is `Contested` (v62.0.0, CC 2.7 rc21 X4): both heads kept as
+//!   fork evidence, neither concludes, never first-wins.
 //! - `get_ledger` / `find_ledger_by_triple` / `list_ledgers_for_owner` —
 //!   point and index reads.
 //! - `put_checkpoint` / `latest_checkpoint` — L5: checkpoints are
@@ -101,8 +101,9 @@ pub enum Error {
     NotFound(String),
 
     /// The fail-secure refusals: a differing claim on an occupied L1
-    /// triple, a differing head at the current seq (fork-shaped), or a
-    /// differing checkpoint/range at an occupied key (immutable planes).
+    /// triple (derivation drift or a forged row: the id IS the triple), or a
+    /// differing checkpoint/range at an occupied key (immutable planes). A
+    /// differing head at the current seq is `AdvanceOutcome::Contested`.
     #[error("conflict: {0}")]
     Conflict(String),
 

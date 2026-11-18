@@ -163,12 +163,19 @@ pub fn check_location_proof_withdrawal(
                 .into(),
         ));
     }
+    // v62.0.0 (wave GC5; CC 2.7.3) — the two checks below compare the
+    // offered row with the HELD proof (another row): unmet, the withdrawal
+    // is held, concluding nothing, never refused. The `withdrawn_at` check
+    // above reads only the offered row: a door refusal.
     if offered.authority_key_id != held.authority_key_id {
-        return Err(Error::InvalidArgument(format!(
-            "location_proof_withdraw_not_the_attester: {} did not attest the held proof ({} did); \
-             only the proof's own attester ends it (CC 3.3.3)",
-            offered.authority_key_id, held.authority_key_id
-        )));
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::LOCATION_PROOF_WITHDRAW_NOT_THE_ATTESTER,
+            Error::InvalidArgument(format!(
+                "location_proof_withdraw_not_the_attester: {} did not attest the held proof ({} \
+                 did); only the proof's own attester ends it (CC 3.3.3)",
+                offered.authority_key_id, held.authority_key_id
+            )),
+        ));
     }
     let (h, o) = (&held.location_proof, &offered.location_proof);
     if h.subject_key_id != o.subject_key_id
@@ -178,10 +185,13 @@ pub fn check_location_proof_withdrawal(
         || h.valid_until != o.valid_until
         || h.attestation_evidence != o.attestation_evidence
     {
-        return Err(Error::InvalidArgument(
-            "location_proof_withdraw_mismatch: the offered row is not the held proof with \
-             `withdrawn_at` set — a withdrawal changes nothing else"
-                .into(),
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::LOCATION_PROOF_WITHDRAW_MISMATCH,
+            Error::InvalidArgument(
+                "location_proof_withdraw_mismatch: the offered row is not the held proof with \
+                 `withdrawn_at` set — a withdrawal changes nothing else"
+                    .into(),
+            ),
         ));
     }
     Ok(if h.withdrawn_at.is_some() {
@@ -229,14 +239,30 @@ where
     let Some(constraint_cell) = geographic_constraint_cell(community.policy_blob.as_ref()) else {
         return Ok(());
     };
+    // v62.0.0 (wave GC5; CC rc21 3.2, CC27 items 4 and 5) — an edition-2
+    // version (the typed door under the group vouch) is judged on the
+    // location proofs it NAMES, at its own `asserted_at`
+    // (`edition2::group`'s named-proof fold), never on the proofs this node
+    // happens to hold at `now`.
+    if super::edition2::group::vouched() {
+        return Ok(());
+    }
     for m in &community.members {
+        // v62.0.0 (wave GC5; CC 2.7.3) — each member's proofs are other rows:
+        // declared, and a member with no contained proof yet HOLDS the
+        // roster (`geographic_member_unlocated`), concluding nothing, until
+        // its proof is replicated here; never refused.
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(&m.key_id));
         let proofs = dir.list_location_proofs_for(&m.key_id).await?;
         if !member_in_geographic_constraint(&constraint_cell, &proofs, now) {
-            return Err(Error::InvalidArgument(format!(
-                "geographic community member {} has no in-force location_proof contained in the \
-                 constraint cell {constraint_cell} (CEG §8.1.13.2)",
-                m.key_id
-            )));
+            return Err(super::edition2::fold::hold(
+                super::edition2::fold::reason::GEOGRAPHIC_MEMBER_UNLOCATED,
+                Error::InvalidArgument(format!(
+                    "geographic community member {} has no in-force location_proof contained in \
+                     the constraint cell {constraint_cell} (CEG §8.1.13.2)",
+                    m.key_id
+                )),
+            ));
         }
     }
     Ok(())

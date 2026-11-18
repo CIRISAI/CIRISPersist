@@ -185,6 +185,20 @@ pub(crate) trait BlobFloorStore: BlobStorage + FederationDirectory + Sized {
     ) -> Result<usize, BlobError>;
 }
 
+/// v62.0.0 (wave GC7; CC 2.7.3) — the reason tokens of the byte doors'
+/// fold conditions, and the one marker every one of them uses: a refusal
+/// that read ANOTHER row (a held stream, a held chunk at the slot, an epoch
+/// row, a tombstone, a published STH, a held receipt, this node's own blob
+/// row) marks the running fold attempt held with `reason` and declares the
+/// stream / content it read; outside an attempt it is the refusal it was.
+/// The byte checks (cap, hash, scope, name, arity) and the epoch CAP (a
+/// resource limit) stay refusals.
+fn held_on(reason: &'static str, read: &str, err: BlobError) -> BlobError {
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(read));
+    super::edition2::fold::hold_detail(reason, err.to_string());
+    err
+}
+
 /// **The stream claim's verdict** (#837 §12.9 / I41, #954), asked by the
 /// executor inside its transaction against the row it just read: a stream
 /// belongs to its first append; an abandoned one takes nothing; one in
@@ -202,25 +216,40 @@ pub(crate) fn stream_claim_verdict(
 
 /// The held stream rows an append may not land on.
 fn refuse_held_stream(batch: &PlannedChunkBatch, held: &HeldStream) -> Result<(), BlobError> {
+    use super::edition2::fold::reason;
     let stream_id = batch.stream_id.as_str();
+    // v62.0.0 (wave GC7; CC 2.7.2/2.7.3) — "a stream belongs to its first
+    // append" reads the held stream row: each refusal is a fold condition.
     if held.abandoned {
-        return Err(blobs::stream_abandoned_refusal(stream_id));
+        return Err(held_on(
+            reason::STREAM_ABANDONED,
+            stream_id,
+            blobs::stream_abandoned_refusal(stream_id),
+        ));
     }
     if held.cohort_scope != batch.cohort_scope
         || held.community_key_id != batch.claim.community_key_id
     {
-        return Err(blobs::stream_elsewhere_refusal(
+        return Err(held_on(
+            reason::STREAM_ELSEWHERE,
             stream_id,
-            &held.cohort_scope,
-            held.community_key_id.as_deref(),
-            &batch.cohort_scope,
-            batch.claim.community_key_id.as_deref(),
+            blobs::stream_elsewhere_refusal(
+                stream_id,
+                &held.cohort_scope,
+                held.community_key_id.as_deref(),
+                &batch.cohort_scope,
+                batch.claim.community_key_id.as_deref(),
+            ),
         ));
     }
     match (&held.owner_key_id, &batch.claim.owner_key_id) {
         (None, _) => Ok(()),
         (Some(owner), Some(mine)) if owner == mine => Ok(()),
-        _ => Err(foreign_stream(batch, held)),
+        _ => Err(held_on(
+            reason::STREAM_FOREIGN,
+            stream_id,
+            foreign_stream(batch, held),
+        )),
     }
 }
 
@@ -242,29 +271,51 @@ fn item_answer(
     (seq, sha): (u64, [u8; 32]),
     got: ItemAppended,
 ) -> Result<[u8; 32], BlobError> {
+    use super::edition2::fold::reason;
+    // v62.0.0 (wave GC7; CC 2.7.3) — every arm but the epoch cap (a
+    // resource limit) read another row at the slot: held under a fold
+    // attempt.
     Err(match got {
         ItemAppended::Ok => return Ok(sha),
-        ItemAppended::SeqConflict => {
-            BlobError::InvalidArgument(format!("stream {batch_stream} seq {seq} already exists"))
-        }
+        ItemAppended::SeqConflict => held_on(
+            reason::STREAM_SEQ_HELD,
+            batch_stream,
+            BlobError::InvalidArgument(format!("stream {batch_stream} seq {seq} already exists")),
+        ),
         ItemAppended::CapReached => blobs::epoch_cap_refusal(batch_stream, epoch),
         ItemAppended::EpochMoved => {
             let b = binding.expect("EpochMoved only arises with a binding");
-            BlobError::EpochNotCurrent {
-                community_key_id: b.community_key_id.clone(),
-                epoch: b.epoch,
-            }
+            held_on(
+                reason::STREAM_EPOCH_MOVED,
+                &b.community_key_id,
+                BlobError::EpochNotCurrent {
+                    community_key_id: b.community_key_id.clone(),
+                    epoch: b.epoch,
+                },
+            )
         }
-        ItemAppended::StreamCounterMoved => blobs::stream_counter_moved_refusal(
+        ItemAppended::StreamCounterMoved => held_on(
+            reason::STREAM_EPOCH_MOVED,
             batch_stream,
-            epoch,
-            claim.stream_key.map_or(0, |k| k.counter),
+            blobs::stream_counter_moved_refusal(
+                batch_stream,
+                epoch,
+                claim.stream_key.map_or(0, |k| k.counter),
+            ),
         ),
-        ItemAppended::StreamEpochClosed => blobs::stream_epoch_closed_refusal(batch_stream, epoch),
-        ItemAppended::Purged(notice_id) => BlobError::Purged {
-            sha256_hex: hex::encode(sha),
-            notice_id,
-        },
+        ItemAppended::StreamEpochClosed => held_on(
+            reason::STREAM_EPOCH_MOVED,
+            batch_stream,
+            blobs::stream_epoch_closed_refusal(batch_stream, epoch),
+        ),
+        ItemAppended::Purged(notice_id) => held_on(
+            reason::BLOB_PURGED,
+            &hex::encode(sha),
+            BlobError::Purged {
+                sha256_hex: hex::encode(sha),
+                notice_id,
+            },
+        ),
     })
 }
 
@@ -575,7 +626,16 @@ pub(crate) async fn put_stream_sth_planned<D: BlobFloorStore>(
     // assert equality (the anti-equivocation gate; it also refuses an
     // over-claimed tree_size).
     let chunk_hashes = dir.read_stream_chunk_hashes(&stream_id).await?;
-    stream_sth::recompute_and_assert_root(&sth, &chunk_hashes)?;
+    // v62.0.0 (wave GC7; CC 2.7.3) — the root is recomputed over this node's
+    // own chunks (other rows): a disagreement holds under a fold attempt
+    // and re-folds when the stream's chunks change.
+    stream_sth::recompute_and_assert_root(&sth, &chunk_hashes).map_err(|e| {
+        held_on(
+            super::edition2::fold::reason::STH_ROOT_DISAGREES,
+            &stream_id,
+            e,
+        )
+    })?;
     // Step 5: the producer's hybrid signature, and (v31.0.0, #657) every
     // witness cosignature, verified the same way.
     blobs::verify_stream_sth_signature(dir, &sth, producer_key_id).await?;
@@ -593,11 +653,17 @@ pub(crate) async fn put_stream_sth_planned<D: BlobFloorStore>(
     // Step 6: a held (stream_id, tree_size) with a DIFFERENT root is an
     // equivocation; an identical one an idempotent re-put.
     match dir.store_stream_sth(planned).await? {
-        Some(held) if held != sth.root_hash.to_vec() => Err(BlobError::InvalidArgument(format!(
-            "put_stream_sth: equivocation — an STH at stream={stream_id} tree_size={} already \
-             exists with a different root",
-            sth.tree_size
-        ))),
+        // v62.0.0 (wave GC7) — first-seen-wins reads the held STH: a fold
+        // condition (CC 2.7.7 rule 2 makes the slot both-or-neither).
+        Some(held) if held != sth.root_hash.to_vec() => Err(held_on(
+            super::edition2::fold::reason::STH_ROOT_DISAGREES,
+            &stream_id,
+            BlobError::InvalidArgument(format!(
+                "put_stream_sth: equivocation — an STH at stream={stream_id} tree_size={} \
+                 already exists with a different root",
+                sth.tree_size
+            )),
+        )),
         _ => Ok(()),
     }
 }
@@ -649,20 +715,29 @@ async fn store_receipt_checked<D: BlobFloorStore>(
     match dir.store_delivery_receipt(planned).await? {
         // Step 2: the JOIN gate. The signature proved WHO; a root this node
         // published at tree_size >= k proves the root is REAL.
-        ReceiptWrite::Unpublished => Err(BlobError::InvalidArgument(format!(
-            "put_delivery_receipt: no published STH for stream={} matches the acknowledged \
-             chunk_root at tree_size >= {} (a subscriber cannot acknowledge an unpublished root)",
-            receipt.stream_id, receipt.k
-        ))),
+        // v62.0.0 (wave GC7; CC 2.7.3) — the publication is another row: the
+        // receipt WAITS for it (held, re-folded when the STH lands).
+        ReceiptWrite::Unpublished => Err(held_on(
+            super::edition2::fold::reason::RECEIPT_ROOT_UNPUBLISHED,
+            &receipt.stream_id,
+            BlobError::InvalidArgument(format!(
+                "put_delivery_receipt: no published STH for stream={} matches the acknowledged \
+                 chunk_root at tree_size >= {} (a subscriber cannot acknowledge an unpublished \
+                 root)",
+                receipt.stream_id, receipt.k
+            )),
+        )),
         // Step 3: a held receipt with a DIFFERENT root is a subscriber
         // equivocation; an identical one an idempotent re-put.
-        ReceiptWrite::Held(root) if root != receipt.chunk_root.to_vec() => {
-            Err(BlobError::InvalidArgument(format!(
+        ReceiptWrite::Held(root) if root != receipt.chunk_root.to_vec() => Err(held_on(
+            super::edition2::fold::reason::RECEIPT_EQUIVOCATION,
+            &receipt.stream_id,
+            BlobError::InvalidArgument(format!(
                 "put_delivery_receipt: subscriber equivocation — a receipt for stream={} \
                  subscriber={} k={} already exists with a different chunk_root",
                 receipt.stream_id, receipt.subscriber_key_id, receipt.k
-            )))
-        }
+            )),
+        )),
         ReceiptWrite::Held(_) | ReceiptWrite::Inserted => Ok(()),
     }
 }
@@ -680,9 +755,14 @@ pub(crate) async fn put_holding_claim_planned<D: BlobFloorStore>(
     if dir.store_holding_claim(sha256, prepared).await? {
         Ok(())
     } else {
-        Err(BlobError::NotHeld {
-            sha256_hex: hex::encode(sha256),
-        })
+        // v62.0.0 (wave GC7) — this node's own blob row is another row.
+        Err(held_on(
+            super::edition2::fold::reason::BLOB_NOT_HELD,
+            &hex::encode(sha256),
+            BlobError::NotHeld {
+                sha256_hex: hex::encode(sha256),
+            },
+        ))
     }
 }
 
@@ -889,7 +969,21 @@ async fn tombstone_floor<D: BlobFloorStore>(
 ) -> Result<TombstoneFloor, BlobError> {
     let mut reversed = ReversedTakedowns::default();
     for sha in shas {
-        reversed.absorb(steward_purge::refuse_tombstoned_bytes(dir, sha).await?);
+        // v62.0.0 (wave GC7; CC 2.7.3) — the tombstone / reversal / manifest
+        // rows are other rows: a purged address holds under a fold attempt
+        // (re-folded when a reversal lands).
+        reversed.absorb(
+            steward_purge::refuse_tombstoned_bytes(dir, sha)
+                .await
+                .map_err(|e| match e {
+                    e @ BlobError::Purged { .. } => held_on(
+                        super::edition2::fold::reason::BLOB_PURGED,
+                        &hex::encode(sha),
+                        e,
+                    ),
+                    e => e,
+                })?,
+        );
     }
     let floor = TombstoneFloor::new(dir.tombstone_plane_present(), reversed);
     #[cfg(test)]
@@ -985,8 +1079,16 @@ pub(crate) async fn put_blob_planned<D: BlobWriteStore>(
     } else {
         super::holding_claim::content_claim_scope(dir, sha256)
             .await?
-            .ok_or_else(|| BlobError::NotHeld {
-                sha256_hex: hex::encode(sha256),
+            .ok_or_else(|| {
+                // v62.0.0 (wave GC7) — the cascade's stored row is another
+                // row: the announcement WAITS for it.
+                held_on(
+                    super::edition2::fold::reason::BLOB_NOT_HELD,
+                    &hex::encode(sha256),
+                    BlobError::NotHeld {
+                        sha256_hex: hex::encode(sha256),
+                    },
+                )
             })?
     };
     let claim =
@@ -1009,9 +1111,13 @@ pub(crate) async fn put_blob_planned<D: BlobWriteStore>(
         return if held {
             Ok(())
         } else {
-            Err(BlobError::NotHeld {
-                sha256_hex: hex::encode(sha256),
-            })
+            Err(held_on(
+                super::edition2::fold::reason::BLOB_NOT_HELD,
+                &hex::encode(sha256),
+                BlobError::NotHeld {
+                    sha256_hex: hex::encode(sha256),
+                },
+            ))
         };
     }
     dir.store_planned_blob(PlannedBlob {
@@ -1368,22 +1474,105 @@ pub(crate) async fn seal_stream_planned<D: BlobWriteStore>(
             binding: binding.clone(),
         })
         .await?;
+    // v62.0.0 (wave GC7; CC 2.7.3) — the bytes checks above are refusals;
+    // what the transaction found reads other rows (the stream's chunks, its
+    // abandonment, the community epoch): held under a fold attempt.
+    use super::edition2::fold::reason;
     match written {
         SealWrite::Sealed => Ok(()),
-        SealWrite::Abandoned => Err(blobs::stream_abandoned_refusal(stream_id)),
+        SealWrite::Abandoned => Err(held_on(
+            reason::STREAM_ABANDONED,
+            stream_id,
+            blobs::stream_abandoned_refusal(stream_id),
+        )),
         // §12.3 — the manifest describes a stream that no longer exists:
         // refused, never truncated.
-        SealWrite::StreamMoved(count) => Err(BlobError::InvalidArgument(format!(
-            "seal_stream_with_scope: stream {stream_id} has {count} chunk(s) but the manifest \
-             was built over {expected_count}; the stream moved under the seal — list it again \
-             (BLOB_ENCRYPTION_AT_REST.md §12.3)"
-        ))),
+        SealWrite::StreamMoved(count) => Err(held_on(
+            reason::STREAM_SEQ_HELD,
+            stream_id,
+            BlobError::InvalidArgument(format!(
+                "seal_stream_with_scope: stream {stream_id} has {count} chunk(s) but the \
+                 manifest was built over {expected_count}; the stream moved under the seal — \
+                 list it again (BLOB_ENCRYPTION_AT_REST.md §12.3)"
+            )),
+        )),
         SealWrite::EpochMoved => {
             let b = binding.expect("EpochMoved only arises with a binding");
-            Err(BlobError::EpochNotCurrent {
-                community_key_id: b.community_key_id,
-                epoch: b.epoch,
-            })
+            Err(held_on(
+                reason::STREAM_EPOCH_MOVED,
+                &b.community_key_id,
+                BlobError::EpochNotCurrent {
+                    community_key_id: b.community_key_id.clone(),
+                    epoch: b.epoch,
+                },
+            ))
         }
+    }
+}
+
+/// **I3916** (wave GC7; CC 2.7.3): the chunk savepoint's answers that read
+/// another row at the slot (a held seq, a moved epoch / counter, a closed
+/// epoch, a tombstone) mark a running fold attempt held with their reason
+/// and declare the stream; the epoch CAP (a resource limit) is a refusal
+/// and marks nothing; outside an attempt every one is the refusal it was.
+#[cfg(test)]
+mod gc7_fold_marks {
+    use super::*;
+    use crate::federation::edition2::fold::{self, reason, Dep};
+    use crate::federation::edition2::names::RowId;
+
+    async fn marked(got: ItemAppended) -> Option<String> {
+        let (out, att) = fold::attempt(RowId([0x79; 32]), None, async {
+            item_answer("s1", 0, None, &StreamClaim::default(), (3, [7; 32]), got)
+        })
+        .await;
+        assert!(out.is_err(), "I3916: still an Err inside the attempt");
+        if att.held.is_some() {
+            assert!(
+                att.reads.contains(&Dep::key("s1").read_key())
+                    || att
+                        .reads
+                        .contains(&Dep::key(&hex::encode([7u8; 32])).read_key()),
+                "I3916: the slot's input is declared: {:?}",
+                att.reads
+            );
+        }
+        att.held.map(|(r, _)| r)
+    }
+
+    #[tokio::test]
+    async fn i3916_chunk_slot_answers_hold_and_the_cap_refuses() {
+        assert_eq!(
+            marked(ItemAppended::SeqConflict).await.as_deref(),
+            Some(reason::STREAM_SEQ_HELD)
+        );
+        assert_eq!(
+            marked(ItemAppended::StreamCounterMoved).await.as_deref(),
+            Some(reason::STREAM_EPOCH_MOVED)
+        );
+        assert_eq!(
+            marked(ItemAppended::StreamEpochClosed).await.as_deref(),
+            Some(reason::STREAM_EPOCH_MOVED)
+        );
+        assert_eq!(
+            marked(ItemAppended::Purged("n1".into())).await.as_deref(),
+            Some(reason::BLOB_PURGED)
+        );
+        assert_eq!(
+            marked(ItemAppended::CapReached).await,
+            None,
+            "I3916: the epoch cap is a resource limit: refused, not held"
+        );
+        // Outside an attempt: the same refusal, nothing marked.
+        assert!(!fold::in_attempt());
+        assert!(item_answer(
+            "s1",
+            0,
+            None,
+            &StreamClaim::default(),
+            (3, [7; 32]),
+            ItemAppended::SeqConflict
+        )
+        .is_err());
     }
 }

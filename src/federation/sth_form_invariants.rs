@@ -496,39 +496,29 @@ async fn i1857_sig19_objects_are_composites_and_the_earlier_pair_is_refused() {
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod bodies {
     use super::*;
-    use crate::federation::{BlobBody, BlobStorage, FederationDirectory, SignedKeyRecord};
+    use crate::federation::{BlobBody, BlobStorage, FederationDirectory};
     use ciris_verify_core::transparency::WitnessSignature;
 
-    async fn register<B: FederationDirectory>(backend: &B, key_id: &str, keys: &PinnedKeys) {
-        let record = crate::federation::KeyRecord {
-            key_id: key_id.into(),
-            pubkey_ed25519_base64: keys.ed25519_base64.clone(),
-            pubkey_ml_dsa_65_base64: keys.ml_dsa_65_base64.clone(),
-            algorithm: crate::federation::types::algorithm::HYBRID.into(),
-            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
-            identity_ref: key_id.into(),
-            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": key_id }),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "c2lnbmF0dXJl".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            attestation_evidence: Some(
-                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                ),
-            ),
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        backend
-            .put_public_key(SignedKeyRecord { record })
-            .await
-            .unwrap();
+    /// v62 (E4): the test key `seed` names goes live as an edition-2
+    /// `key:record` (self-signed, `user`: no start and no end, so the heads'
+    /// FIXED 2026-11-15 instant stays inside the key's liveness on any run
+    /// date — E0.api.md v1.6 fixed-instant rule; the door reads only the
+    /// key), put through the statement door.
+    /// Returns the key and its identity-ref, which is what the store names it
+    /// by. The earlier form's hand-built `KeyRecord` offered to
+    /// `put_public_key` is not how a key becomes live.
+    async fn register<B: FederationDirectory>(
+        backend: &B,
+        seed: &str,
+    ) -> (CompositeSigningKey, String) {
+        use crate::federation::edition2::fixture_switch as e2;
+        let id = e2::put_key(
+            backend,
+            seed,
+            &[crate::federation::types::identity_type::USER],
+        )
+        .await;
+        (e2::signing_key(seed), id)
     }
 
     /// I1855 on `backend` (a migrated, empty store). `tag` keeps postgres
@@ -537,12 +527,8 @@ pub(crate) mod bodies {
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        let producer_id = format!("i1855-producer-{tag}");
-        let witness_id = format!("i1855-witness-{tag}");
-        let producer = composite(0x91);
-        let w = composite(0x93);
-        register(backend, &producer_id, &pinned_of(&producer)).await;
-        register(backend, &witness_id, &pinned_of(&w)).await;
+        let (producer, producer_id) = register(backend, &format!("i1855-producer-{tag}")).await;
+        let (w, witness_id) = register(backend, &format!("i1855-witness-{tag}")).await;
         let stream = format!("i1855-{tag}");
         let mut shas = Vec::new();
         for (seq, body) in [&b"AAAA"[..], b"BBBB", b"CC"].iter().enumerate() {
@@ -618,8 +604,10 @@ pub(crate) mod bodies {
         // An earlier-form head (a v61 producer, its own registered keys, the
         // right root) is refused by name, and so is an earlier-form witness
         // on a composite head.
-        let old_id = format!("i1855-earlier-{tag}");
-        register(backend, &old_id, &earlier_keys(0xA1)).await;
+        // v62 (E4): the v61 producer holds a live key of its own; what it
+        // offers is the earlier-form signature, refused by name before any
+        // verify.
+        let (_, old_id) = register(backend, &format!("i1855-earlier-{tag}")).await;
         let root3 = {
             use ciris_verify_core::transparency::{InMemoryTransparencyStore, TransparencyStore};
             let s: InMemoryTransparencyStore<super::super::stream_sth::StreamChunkLeaf> =

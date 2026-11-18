@@ -407,39 +407,64 @@ pub fn statement_signature_halves(row: &Attestation) -> Option<(Vec<u8>, Vec<u8>
     })
 }
 
-/// v62.0.0 (v62 P8; CC 2.6.1.5) — **every real in `v` as a fixed-scale
-/// integer** `round(x × 10^6)`, at any depth; integers, text, booleans and
-/// null unchanged. An edition-2 payload carries no floats, and never a real
-/// as text. A real whose scaled value leaves `i64` saturates (a detection's
-/// scores are bounded far below it).
-#[must_use]
-pub fn fixed_scale_reals(v: serde_json::Value) -> serde_json::Value {
+/// v62.0.0 (v62 P8; CC ruling on body reals) — **a detection body as CBOR**:
+/// every number through P1's shared `edition2::payloads::body_number` (an
+/// integral value a plain integer, a non-integral one a normalised CBOR tag-4
+/// decimal fraction, `0.25` → `4([-2, 25])`; never a float, never text),
+/// maps in deterministic order (CC 2.6.1.3). Fixed-scale MEMBERS (`score`,
+/// `confidence`, `weight` at the payload's top level) are not a body's and
+/// stay fixed6 elsewhere.
+///
+/// # Errors
+/// `body_number_unrepresentable`.
+pub fn body_cbor(
+    v: &serde_json::Value,
+) -> Result<ciris_verify_core::cde::Value, crate::federation::Error> {
+    use ciris_verify_core::cde::Value;
     use serde_json::Value as J;
-    match v {
-        J::Number(n) if n.is_f64() => {
-            let x = n.as_f64().unwrap_or(0.0);
-            #[allow(clippy::cast_possible_truncation)]
-            let scaled = (x * 1_000_000.0).round() as i64;
-            J::from(scaled)
+    Ok(match v {
+        J::Null => Value::Null,
+        J::Bool(b) => Value::Bool(*b),
+        J::Number(n) => crate::federation::edition2::payloads::body_number(n)?,
+        J::String(t) => Value::Text(t.clone()),
+        J::Array(a) => Value::Array(a.iter().map(body_cbor).collect::<Result<_, _>>()?),
+        J::Object(o) => {
+            let mut m = o
+                .iter()
+                .map(|(k, v)| Ok((Value::Text(k.clone()), body_cbor(v)?)))
+                .collect::<Result<Vec<_>, crate::federation::Error>>()?;
+            m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+            Value::Map(m)
         }
-        J::Array(a) => J::Array(a.into_iter().map(fixed_scale_reals).collect()),
-        J::Object(o) => J::Object(
-            o.into_iter()
-                .map(|(k, v)| (k, fixed_scale_reals(v)))
-                .collect(),
-        ),
-        other => other,
-    }
+    })
+}
+
+/// v62.0.0 (v62 P8) — **the digest a detection's `evidence_refs` names its
+/// trace by** on the clean mesh: SHA-256 over `ciris:trace:v1:` ‖ the trace
+/// id, lowercase hex. An edition-2 `evidence_refs` member is a sequence of
+/// `[-16, bstr .size 32]` digests (CC 2.6.1.5), and a trace id is not one;
+/// the purge resolver keys a selected trace by this digest too
+/// (`steward_purge`), so a purge of the trace still reaches its detection
+/// row (the Art. 17 route this module's doc names).
+#[must_use]
+pub fn trace_evidence_ref(trace_id: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"ciris:trace:v1:");
+    h.update(trace_id.as_bytes());
+    hex::encode(h.finalize())
 }
 
 /// v62.0.0 (v62 P8; CC 3.4.8) — **a detection's `detection:{detector}`
-/// statement parts**: `(sub, family, payload)`. `sub` is the detector
+/// statement parts**: `(sub, family, payload)`. `subject` is the scored
+/// agent's canonical subject, stated as `subject_key_ids` (named, not
+/// empowered; the DSAR erasure's by-subject reach). `sub` is the detector
 /// (`signing_key_id`, an identity-ref); the payload is `{asserted_at: ts,
 /// dimension: detection:{detector}:v1, detection: <body>}` with `author`
 /// when the family is authored. The body is the [`DetectionProjection`]
 /// WITHOUT its two signature members (the statement's composite signature
-/// is the detector's), every real a FIXED-SCALE integer
-/// ([`fixed_scale_reals`], CC 2.6.1.5: `round(x × 10^6)`). The row id is node-computed; the
+/// is the detector's), every number as [`body_cbor`] states it (CC ruling:
+/// tag-4 decimal fractions for non-integral body reals). The row id is node-computed; the
 /// earlier [`detection_attestation_id`] is not used.
 ///
 /// # Errors
@@ -448,6 +473,7 @@ pub fn fixed_scale_reals(v: serde_json::Value) -> serde_json::Value {
 /// shape (`detection_shape_refusal`, the signatures aside).
 pub fn detection_statement_parts(
     event: &DetectionEvent,
+    subject: Option<&str>,
 ) -> Result<(String, String, ciris_verify_core::cde::Value), crate::federation::Error> {
     use ciris_verify_core::cde::Value;
     let invalid = |m: String| {
@@ -471,18 +497,33 @@ pub fn detection_statement_parts(
         o.remove("ml_dsa_65_sig");
         o.remove("erased_at");
     }
-    let body = fixed_scale_reals(body);
+
     let at = u64::try_from(event.ts.timestamp_millis())
         .map_err(|_| invalid("the detection's instant is before the epoch".into()))?;
     let text = |s: &str| Value::Text(s.to_owned());
     let mut m = vec![
         (text("asserted_at"), Value::Uint(at)),
         (text("dimension"), text(dimension.as_str())),
-        (
-            text(BODY_MEMBER),
-            crate::federation::edition2::group::cbor_of_json(&body)?,
-        ),
+        (text(BODY_MEMBER), body_cbor(&body)?),
     ];
+    // The trace is the detection's EVIDENCE: kept, as a digest, so a purge of
+    // the trace derives the detection row (`trace_evidence_ref`).
+    let trace_digest = hex::decode(trace_evidence_ref(&event.trace_id))
+        .map_err(|e| invalid(format!("the trace digest: {e}")))?;
+    m.push((
+        text("evidence_refs"),
+        Value::Array(vec![Value::Array(vec![
+            Value::int(-16),
+            Value::Bytes(trace_digest),
+        ])]),
+    ));
+    // The scored agent's canonical subject (`subject_erasure::agent_subject`)
+    // is NAMED, not empowered: a DSAR erasure by subject reaches the row
+    // through it (`attestation_subjects`), even once its trace is gone.
+    if let Some(subject) = subject {
+        crate::federation::validate_subject_key_ids(&[subject.to_owned()])?;
+        m.push((text("subject_key_ids"), Value::Array(vec![text(subject)])));
+    }
     if crate::federation::edition2::emit::family_is_authored(&family, Some(dimension.as_str())) {
         m.push((text("author"), text(event.signing_key_id.as_str())));
     }
@@ -500,8 +541,9 @@ pub fn detection_statement_parts(
 /// identity-ref.
 pub fn draft_detection(
     event: &DetectionEvent,
+    subject: Option<&str>,
 ) -> Result<crate::federation::edition2::emit::Draft, crate::federation::Error> {
-    let (sub, family, payload) = detection_statement_parts(event)?;
+    let (sub, family, payload) = detection_statement_parts(event, subject)?;
     let kid = crate::federation::edition2::ingest::kid_of_identity_ref(&sub).ok_or_else(|| {
         crate::federation::Error::InvalidArgument(format!(
             "detection: the detector {sub} is not an identity-ref"
@@ -523,13 +565,13 @@ pub fn draft_detection(
 /// `InvalidArgument` for a signer that is not the event's detector;
 /// `composite_signing_unavailable`; the purge refusal; the door's and the
 /// gates' refusals (`ReservedPrefixEmitterMismatch` without the conferral).
-pub async fn state_detection<D>(
+pub(crate) async fn state_detection<D>(
     dir: &D,
     signer: &crate::signing::LocalSigner,
     event: &DetectionEvent,
 ) -> Result<String, crate::federation::Error>
 where
-    D: crate::federation::FederationDirectory + ?Sized,
+    D: crate::federation::attestation_admit::AttestationStore,
 {
     let iss = signer.federation_id().await;
     if iss != event.signing_key_id {
@@ -539,7 +581,11 @@ where
         )));
     }
     crate::federation::steward_purge::refuse_if_tombstoned_trace(dir, &event.trace_id).await?;
-    let (sub, family, payload) = detection_statement_parts(event)?;
+    // The scored agent's subject, resolved from the trace as the earlier door
+    // resolved it (`attestation_admit::detection_subject`).
+    let subject =
+        crate::federation::attestation_admit::detection_subject(dir, Some(&event.trace_id)).await?;
+    let (sub, family, payload) = detection_statement_parts(event, subject.as_deref())?;
     let statement =
         crate::federation::edition2::produce::sign_row(signer, &sub, "scores", &family, &payload)
             .await

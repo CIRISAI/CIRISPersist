@@ -6320,26 +6320,12 @@ mod tests {
     /// op; an id with nothing recorded reads `None`.
     #[test]
     fn withdraws_admission_depth_op_forwards_the_recorded_depth() {
-        use crate::federation::tier_ingest::test_support as ts;
+        // v62.0.0 (JSON cut, E7) — a withdraws of a HELD row (an edition-2
+        // composer names a held row; the deferred arm is gone) is admitted at
+        // the node's default depth, and the op reads it back.
         let rt = test_runtime();
         let (dir, directory) = test_directory();
-        rt.block_on(ts::register_hybrid_key_as(
-            dir.as_ref(),
-            "capsule-issuer",
-            "capsule-issuer",
-            crate::federation::types::identity_type::USER,
-        ));
-        let env = serde_json::json!({
-            "references_attestation_id": "not-yet-held",
-            "withdrawal_reason": "CC 2.3",
-        });
-        let wid = uuid::Uuid::new_v4().to_string();
-        let mut w = ts::bare_attestation(&wid, "capsule-issuer", "capsule-issuer", &env);
-        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
-        w.cohort_scope = "federation".into();
-        ts::seal_row_in_place("capsule-issuer", &mut w);
-        rt.block_on(dir.put_attestation(crate::federation::SignedAttestation { attestation: w }))
-            .expect("a deferred withdraws is admitted");
+        let (wid, _) = seed_withdraws_e2(&rt, dir.as_ref(), "capsule-issuer", "depth");
         for (id, want) in [
             (
                 wid.as_str(),
@@ -6427,44 +6413,6 @@ mod tests {
         serde_json::from_slice::<DirectoryOpResult>(&bytes)
             .expect("deserialize DirectoryOpResult")
             .into_flattened()
-    }
-
-    fn sample_key_record(key_id: &str) -> KeyRecord {
-        let now = chrono::Utc::now();
-        // v22.0.0 (CIRISPersist#543) — REAL deterministic hybrid pubkeys, not
-        // the old `"AAAA"` placeholder. `validate_registration_pubkey` (#275)
-        // now runs on the memory backend too, and it demands a 32-byte
-        // Ed25519 key — as sqlite and postgres always have. The capsule
-        // round-trip is about the C-ABI seam, so it must carry a record every
-        // backend would actually admit.
-        let (ed_pk, mldsa_pk) =
-            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
-        KeyRecord {
-            key_id: key_id.into(),
-            pubkey_ed25519_base64: ed_pk,
-            pubkey_ml_dsa_65_base64: mldsa_pk,
-            algorithm: crate::federation::types::algorithm::HYBRID.into(),
-            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
-            identity_ref: key_id.into(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": key_id }),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-            attestation_evidence: Some(
-                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                ),
-            ),
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        }
     }
 
     /// v61.0.5 (CIRISPersist#1225) — **I1548: the subject read crosses the
@@ -6786,230 +6734,10 @@ mod tests {
             other => panic!("expected Revocations, got {other:?}"),
         }
 
-        // The accord evidence serve cursor (v59.0.0: the framed revocation
-        // cursor is retired).
-        match run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::ListSignedAccordQuorumEvidenceSince {
-                since: None,
-                limit: 100,
-            },
-        ) {
-            DirectoryOpResult::AccordQuorumEvidence(v) => assert!(v.is_empty()),
-            other => panic!("expected AccordQuorumEvidence, got {other:?}"),
-        }
-
-        // And the RECEIVE half. This directory has no seated accord roster, so
-        // the correct outcome is a REFUSAL that crossed the ABI as a refusal —
-        // which is exactly what distinguishes "the op ran and said no" from
-        // "the op is not routed". The refusal text is not asserted: the
-        // fail-closed roster chokepoint and the re-tally can each legitimately
-        // answer first on an empty node, and pinning one would make this a test
-        // of which gate is first rather than of whether the door exists.
-        let evidence = crate::federation::accord_carriage::AccordQuorumEvidence {
-            proposal: ciris_verify_core::accord_live_quorum::AccordProposal {
-                family_key_id: ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
-                    .to_owned(),
-                action: ciris_verify_core::accord_live_quorum::AccordAction::RosterChange,
-                nonce: "capsule-nonce".into(),
-                window_until: "2031-01-01T00:00:00Z".into(),
-                prior_family_digest: "prior".into(),
-                payload_sha256: "00".repeat(32),
-            },
-            authority_signature: None,
-            participations: Vec::new(),
-            evidence_at: chrono::Utc::now(),
-        };
-        match run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::ApplyReplicatedAccordEvidence { evidence },
-        ) {
-            // A TYPED refusal, not a flattened string. v31.1.0 (PR #667
-            // round-3): `DirectoryOpResult::Err` rebuilds as `Error::Backend`,
-            // so a bundle the receiving node declined to authorize used to
-            // reach a capsule host as `federation_backend` — indistinguishable
-            // from "our storage broke". A carrier decides retry vs quarantine
-            // on that token, so the distinction has to survive the ABI.
-            DirectoryOpResult::AccordEvidenceRefused { reason, .. } => assert!(
-                !reason.contains("Unsupported") && !reason.contains("not implemented"),
-                "the admission must RUN on the far side, not bounce: {reason}"
-            ),
-            // A node with no seated roster may also refuse at the fail-closed
-            // posture chokepoint before the re-tally is reached; that arm is a
-            // legitimate first answer and is not asserted against, only that
-            // the op ran.
-            DirectoryOpResult::Err(msg) => assert!(
-                !msg.contains("Unsupported") && !msg.contains("not implemented"),
-                "the admission must RUN on the far side, not bounce: {msg}"
-            ),
-            other => panic!("an unbacked bundle must be refused, got {other:?}"),
-        }
-    }
-
-    /// v31.1.0 (CIRISPersist#662, PR #667 round-3) — **the accord refusal KIND
-    /// survives the ABI.**
-    ///
-    /// Separate from the routing witness above because it asserts a different
-    /// thing: not that the door exists, but that what comes back through it is
-    /// still typed. The proxy reconstructs `Error::AccordEvidenceUnverified`,
-    /// so `kind()` reads `accord_evidence_unverified` on the consumer side
-    /// rather than the `federation_backend` every flattened failure collapses
-    /// to.
-    #[test]
-    fn accord_refusal_kind_survives_the_capsule_662() {
-        let refused = DirectoryOpResult::AccordEvidenceRefused {
-            proposal_digest: "digest-abc".into(),
-            reason: "insufficient accord quorum on RE-TALLY".into(),
-        };
-        // The exact reconstruction the proxy arm performs.
-        let rebuilt = match refused {
-            DirectoryOpResult::AccordEvidenceRefused {
-                proposal_digest,
-                reason,
-            } => Error::AccordEvidenceUnverified {
-                proposal_digest,
-                reason,
-            },
-            other => panic!("expected AccordEvidenceRefused, got {other:?}"),
-        };
-        assert_eq!(
-            rebuilt.kind(),
-            "accord_evidence_unverified",
-            "a carrier keys retry-vs-quarantine on this token; `federation_backend` is a \
-             different decision"
-        );
-        assert!(format!("{rebuilt}").contains("digest-abc"));
-    }
-
-    /// v36.0.0 (CIRISPersist#674) — the CARRIER-fault refusal kind survives
-    /// the ABI too, counts included. Same shape as
-    /// [`accord_refusal_kind_survives_the_capsule_662`]: the whole point of
-    /// the variant is that an operator can tell a malformed carrier from a
-    /// partition, and a kind that flattens to `federation_backend` crossing
-    /// the capsule cannot draw that line.
-    #[test]
-    fn accord_carrier_refusal_kind_survives_the_capsule_674() {
-        let refused = DirectoryOpResult::AccordEvidenceCarrierRefused {
-            proposal_digest: "digest-def".into(),
-            participations: 4,
-            roster_seats: 3,
-            reason: "a bundle cannot carry more participations than the accord roster has seats"
-                .into(),
-        };
-        // The exact reconstruction the proxy arm performs.
-        let rebuilt = match refused {
-            DirectoryOpResult::AccordEvidenceCarrierRefused {
-                proposal_digest,
-                participations,
-                roster_seats,
-                reason,
-            } => Error::AccordEvidenceCarrierMalformed {
-                proposal_digest,
-                participations,
-                roster_seats,
-                reason,
-            },
-            other => panic!("expected AccordEvidenceCarrierRefused, got {other:?}"),
-        };
-        assert_eq!(
-            rebuilt.kind(),
-            "accord_evidence_carrier_malformed",
-            "a malformed carrier and a partition want different operator responses"
-        );
-        let msg = format!("{rebuilt}");
-        assert!(
-            msg.contains("digest-def")
-                && msg.contains("4 participation(s)")
-                && msg.contains("3 declared accord seat(s)"),
-            "the counts survive the crossing: {msg}"
-        );
-    }
-
-    /// v36.0.0 (CIRISPersist#674) — the carrier refusal END TO END: proxy →
-    /// C-ABI → host dispatch → the pre-tally carrier bound → typed result →
-    /// proxy reconstruction. The two unit tests above each replicate ONE arm
-    /// by hand, so deleting the real dispatch arm (or the proxy's) would
-    /// leave them green while every capsule consumer read
-    /// `federation_backend` — the witness-measures-a-neighbouring-gate trap.
-    /// This one goes red under exactly those deletions.
-    #[test]
-    fn accord_carrier_refusal_round_trips_the_capsule_674() {
-        let rt = test_runtime();
-        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
-        let dir: Arc<dyn FederationDirectory> = backend;
-        let directory = build_persist_directory(dir.clone());
-        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
-            rt.clone(),
-        ));
-        let proxy = build_ops_directory(directory, executor).expect("abi ok");
-
-        // One resolvable accord seat, so the step-(0) posture gate passes and
-        // the refusal under test is the one that answers.
-        let seat = crate::federation::admission::accord_holder_roster_key_ids()[0].clone();
-        rt.block_on(dir.put_public_key(SignedKeyRecord {
-            record: sample_key_record(&seat),
-        }))
-        .expect("register one accord seat");
-
-        // Four participations against three declared seats — junk on purpose:
-        // the bound is decided before any signature is verified, so nothing
-        // here needs to (or could) verify.
-        let proposal = ciris_verify_core::accord_live_quorum::AccordProposal {
-            family_key_id: ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
-                .to_owned(),
-            action: ciris_verify_core::accord_live_quorum::AccordAction::RosterChange,
-            nonce: "carrier-capsule-nonce".into(),
-            window_until: "2031-01-01T00:00:00Z".into(),
-            prior_family_digest: "prior".into(),
-            payload_sha256: "00".repeat(32),
-        };
-        let digest = proposal.digest();
-        let participations: Vec<_> = (0..4)
-            .map(
-                |i| ciris_verify_core::accord_live_quorum::AccordParticipation {
-                    family_key_id: proposal.family_key_id.clone(),
-                    proposal_digest: digest.clone(),
-                    member_id: format!("ghost-{i}"),
-                    vote: ciris_verify_core::accord_live_quorum::Vote::Yes,
-                    window_until: proposal.window_until.clone(),
-                    signed_at: "2025-06-01T00:00:00Z".into(),
-                    signature: ciris_verify_core::threshold::ThresholdSignature {
-                        member_id: format!("ghost-{i}"),
-                        ed25519_signature_base64: String::new(),
-                        mldsa65_signature_base64: None,
-                    },
-                },
-            )
-            .collect();
-        let evidence = crate::federation::accord_carriage::AccordQuorumEvidence {
-            proposal,
-            authority_signature: None,
-            participations,
-            evidence_at: chrono::Utc::now(),
-        };
-
-        let err = rt
-            .block_on(proxy.apply_replicated_accord_evidence(&evidence))
-            .expect_err("an overbroad bundle must be refused through the capsule too");
-        assert_eq!(
-            err.kind(),
-            "accord_evidence_carrier_malformed",
-            "the CARRIER kind must survive the full ABI round trip: {err}"
-        );
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("4 participation(s)") && msg.contains("3 declared accord seat(s)"),
-            "and it still names the counts: {msg}"
-        );
-        // Pre-write through this door as well.
-        assert!(
-            rt.block_on(dir.get_accord_proposal(&digest))
-                .expect("direct read")
-                .is_none(),
-            "a carrier-refused bundle stores nothing, whichever door offered it"
-        );
+        // v62.0.0 (JSON cut, E7) — the accord evidence arms (the serve
+        // cursor and `ApplyReplicatedAccordEvidence`) are deleted: the
+        // accord's proposal, participation and decision are gone (RULINGS,
+        // genesis bundle/2); a roster change is a later bundle.
     }
 
     /// v32.0.0 (CIRISPersist#682) — bumped 1 → 2 because
@@ -7429,57 +7157,18 @@ mod tests {
         drop(dir);
     }
 
-    /// **I1153 at the capsule's PutPublicKey** (CIRISPersist#1103): a host's
-    /// raw registration through the capsule refuses an id that does not name
-    /// its own key, and stores nothing. (The derived id is admitted by
-    /// [`put_then_lookup_public_key_round_trips`].)
-    #[test]
-    fn i1153_capsule_put_public_key_refuses_a_mismatched_id() {
-        let rt = test_runtime();
-        let (dir, directory) = test_directory();
-        let rec = sample_key_record("i1153-capsule-bad");
-        match run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::PutPublicKey {
-                record: SignedKeyRecord { record: rec },
-            },
-        ) {
-            DirectoryOpResult::Err(e) => assert!(
-                e.contains("key_id_fingerprint_mismatch") || e.contains("does not end in"),
-                "I1153: {e}"
-            ),
-            other => panic!("I1153: a mismatched id through PutPublicKey: {other:?}"),
-        }
-        assert!(rt
-            .block_on(dir.lookup_public_key("i1153-capsule-bad"))
-            .unwrap()
-            .is_none());
-    }
-
     #[test]
     fn put_then_lookup_public_key_round_trips() {
         let rt = test_runtime();
         let (dir, directory) = test_directory();
-        // v59.0.0 (CIRISPersist#1103) — the capsule's PutPublicKey is a door:
-        // the id names its own key.
-        let key_id = crate::federation::tier_ingest::test_support::fp_key_id("primitive-abc");
-        let rec = sample_key_record(&key_id);
-
-        // PutPublicKey via the capsule → Unit.
-        let put = run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::PutPublicKey {
-                record: SignedKeyRecord {
-                    record: rec.clone(),
-                },
-            },
-        );
-        assert!(
-            matches!(put, DirectoryOpResult::Unit),
-            "put ⇒ Unit, got {put:?}"
-        );
+        // v62.0.0 (JSON cut, E7) — the key is an edition-2 `key:record` put on
+        // the backend (the capsule's JSON `PutPublicKey` door is shut); the
+        // capsule's `LookupPublicKey` is what this round-trips.
+        let key_id = rt.block_on(crate::federation::edition2::fixture_switch::put_key(
+            dir.as_ref(),
+            "primitive-abc",
+            &[crate::federation::types::identity_type::PRIMITIVE],
+        ));
 
         // LookupPublicKey via the capsule → PublicKey(Some(..)).
         let looked = run_op(
@@ -7532,10 +7221,16 @@ mod tests {
         });
         let dir: Arc<dyn FederationDirectory> = backend.clone();
         let directory = build_persist_directory(dir.clone());
-        // v59.0.0 (CIRISPersist#1103) — the id names its own key.
-        let cap_node = ts::fp_key_id("cap-node");
-        let record =
-            ts::replicated_key_record(&cap_node, identity_type::NODE, &cap_node, &cap_node, "v1");
+        // v62.0.0 (JSON cut, E7) — the record is the edition-2 key read model
+        // (E0's flipped `replicated_key_record`); its id is the identity-ref.
+        let record = ts::replicated_key_record(
+            "cap-node",
+            identity_type::NODE,
+            "cap-node",
+            "cap-node",
+            "v1",
+        );
+        let cap_node = record.key_id.clone();
         match run_op(
             &rt,
             &directory,
@@ -7570,19 +7265,12 @@ mod tests {
             ),
             other => panic!("I1146: the framed occurrence-revocation op: {other:?}"),
         }
-        // The row door still takes the key.
-        let row = crate::federation::key_plane::plan_key_record_row(&record, &None).expect("row");
-        let res = run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::ApplyReplicatedAttestation {
-                attestation: crate::federation::SignedAttestation { attestation: row },
-            },
-        );
-        assert!(
-            !matches!(res, DirectoryOpResult::Err(_)),
-            "I1146: the key:record:v1 row is admitted: {res:?}"
-        );
+        // v62.0.0 (JSON cut, E7) — a key arrives as its edition-2 `key:record`
+        // statement (the earlier `key:record:v1` attestation row is gone).
+        rt.block_on(crate::federation::edition2::fixture_switch::put_key_row(
+            dir.as_ref(),
+            &record,
+        ));
         assert!(rt
             .block_on(dir.lookup_public_key(&cap_node))
             .unwrap()
@@ -8207,14 +7895,14 @@ mod tests {
         ));
         let proxy = build_ops_directory(directory, executor).expect("abi ok");
 
-        // v59.0.0 (CIRISPersist#1103) — the capsule's PutPublicKey is a door:
-        // the id names its own key.
-        let key_id = crate::federation::tier_ingest::test_support::fp_key_id("primitive-ops");
-        let rec = sample_key_record(&key_id);
-        rt.block_on(proxy.put_public_key(SignedKeyRecord {
-            record: rec.clone(),
-        }))
-        .expect("proxy put_public_key");
+        // v62.0.0 (JSON cut, E7) — a key becomes live only as an edition-2
+        // `key:record` statement (the JSON `put_public_key` door is shut), so
+        // the key is put on the backend and the PROXY's read is what crosses.
+        let key_id = rt.block_on(crate::federation::edition2::fixture_switch::put_key(
+            dir.as_ref(),
+            "primitive-ops",
+            &[crate::federation::types::identity_type::PRIMITIVE],
+        ));
 
         let via_proxy = rt
             .block_on(proxy.lookup_public_key(&key_id))
@@ -8318,16 +8006,22 @@ mod tests {
         let proxy = build_ops_directory(directory, executor).expect("abi ok");
 
         let now = chrono::Utc::now();
-        for k in ["kex-identity", "kex-phone"] {
-            rt.block_on(dir.put_public_key(SignedKeyRecord {
-                record: sample_key_record(k),
-            }))
-            .expect("register fixture key");
-        }
+        // v62.0.0 (JSON cut, E7) — edition-2 keys; the ids below are the
+        // identity-refs `e2::put_key` returns.
+        let identity = rt.block_on(crate::federation::edition2::fixture_switch::put_key(
+            dir.as_ref(),
+            "kex-identity",
+            &[crate::federation::types::identity_type::USER],
+        ));
+        let phone = rt.block_on(crate::federation::edition2::fixture_switch::put_key(
+            dir.as_ref(),
+            "kex-phone",
+            &[crate::federation::types::identity_type::PRIMITIVE],
+        ));
         rt.block_on(
             dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
-                identity_key_id: "kex-identity".into(),
-                occurrence_key_id: "kex-phone".into(),
+                identity_key_id: identity.clone(),
+                occurrence_key_id: phone.clone(),
                 device_class: crate::federation::types::device_class::AGENT.into(),
                 hardware_attestation: None,
                 asserted_at: now - chrono::Duration::hours(1),
@@ -8348,7 +8042,7 @@ mod tests {
 
         // Pre-revocation: the proxy resolves the KEX keys (was: hard error).
         let resolved = rt
-            .block_on(proxy.resolve_encryption_keys("kex-phone"))
+            .block_on(proxy.resolve_encryption_keys(&phone))
             .expect("#329: proxy resolve must not be Unsupported");
         {
             use base64::engine::general_purpose::STANDARD as B64;
@@ -8363,18 +8057,18 @@ mod tests {
         // Revoke → the SAME proxy call fail-secure excludes the occurrence.
         rt.block_on(dir.put_identity_occurrence_revocation_local(
             crate::federation::IdentityOccurrenceRevocation {
-                identity_key_id: "kex-identity".into(),
-                occurrence_key_id: "kex-phone".into(),
+                identity_key_id: identity.clone(),
+                occurrence_key_id: phone.clone(),
                 revoked_at: now,
                 effective_at: now,
                 reason: None,
-                witness_set: vec!["kex-identity".into()],
+                witness_set: vec![identity.clone()],
                 persist_row_hash: String::new(),
             },
         ))
         .expect("seed revocation");
         let resolved = rt
-            .block_on(proxy.resolve_encryption_keys("kex-phone"))
+            .block_on(proxy.resolve_encryption_keys(&phone))
             .expect("proxy resolve after revocation");
         assert!(
             resolved.is_none(),
@@ -8383,10 +8077,10 @@ mod tests {
 
         // The raw revocation-plane read routes too, equal to a direct call.
         let via_proxy = rt
-            .block_on(proxy.list_identity_occurrence_revocations_for("kex-identity"))
+            .block_on(proxy.list_identity_occurrence_revocations_for(&identity))
             .expect("#329: raw revocations read must not be Unsupported");
         let via_direct = rt
-            .block_on(dir.list_identity_occurrence_revocations_for("kex-identity"))
+            .block_on(dir.list_identity_occurrence_revocations_for(&identity))
             .expect("direct revocations read");
         assert_eq!(via_proxy.len(), 1);
         assert_eq!(via_proxy, via_direct, "proxy == direct backend call");
@@ -8647,13 +8341,18 @@ mod tests {
         dir: Arc<dyn FederationDirectory>,
         tag: &str,
     ) {
-        use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::NODE;
-        let mine = [format!("{tag}-node-a"), format!("{tag}-node-b")];
-        rt.block_on(async {
-            for k in &mine {
-                ts::register_identity_key(dir.as_ref(), k, NODE).await;
+        // v62.0.0 (JSON cut, E7) — edition-2 keys: the ids are the
+        // identity-refs `e2::put_key` returns.
+        let mine: Vec<String> = rt.block_on(async {
+            let mut v = Vec::new();
+            for k in [format!("{tag}-node-a"), format!("{tag}-node-b")] {
+                v.push(
+                    crate::federation::edition2::fixture_switch::put_key(dir.as_ref(), &k, &[NODE])
+                        .await,
+                );
             }
+            v
         });
         let ids = |v: &[KeyRecord]| -> Vec<String> { v.iter().map(|r| r.key_id.clone()).collect() };
         let direct = rt
@@ -9554,33 +9253,60 @@ mod tests {
         );
     }
 
-    /// **I1769 — the rooting view's row reads cross the capsule:**
-    /// `list_attestations_referencing` and `get_attestation` return the stored
-    /// `withdraws` row, equal to the direct reads.
-    /// A stored `withdraws` row naming `target`; returns its id.
-    fn seed_withdraws_1244(
+    /// v62.0.0 (JSON cut, E7) — the edition-2 twin of the earlier `seed_withdraws_1244`:
+    /// `issuer` (a seed) holds a row and then withdraws it (an edition-2
+    /// composer must name a HELD row). Returns `(withdraws id, target id)`,
+    /// both node-computed.
+    fn seed_withdraws_e2(
         rt: &Arc<tokio::runtime::Runtime>,
         dir: &dyn FederationDirectory,
         issuer: &str,
-        target: &str,
-    ) -> String {
-        use crate::federation::tier_ingest::test_support as ts;
-        rt.block_on(ts::register_hybrid_key_as(
-            dir,
-            issuer,
-            issuer,
-            crate::federation::types::identity_type::USER,
-        ));
-        let env =
-            serde_json::json!({"references_attestation_id": target, "withdrawal_reason": "CC 2.3"});
-        let wid = uuid::Uuid::new_v4().to_string();
-        let mut w = ts::bare_attestation(&wid, issuer, issuer, &env);
-        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
-        w.cohort_scope = "federation".into();
-        ts::seal_row_in_place(issuer, &mut w);
-        rt.block_on(dir.put_attestation(crate::federation::SignedAttestation { attestation: w }))
-            .expect("a withdraws is admitted");
-        wid
+        label: &str,
+    ) -> (String, String) {
+        use crate::federation::edition2::fixture_switch as e2;
+        rt.block_on(async {
+            e2::put_key(
+                dir,
+                issuer,
+                &[crate::federation::types::identity_type::USER],
+            )
+            .await;
+            let now = chrono::Utc::now();
+            let target = crate::federation::Attestation {
+                attestation_id: String::new(),
+                attesting_key_id: e2::kid(issuer),
+                attested_key_id: e2::kid(issuer),
+                attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({
+                    "dimension": "evidence:safety_battery:capture:a:b:v1",
+                    "score": 1.0,
+                    "confidence": 0.9,
+                    "label": label,
+                }),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: e2::kid(issuer),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: "federation".into(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.into(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            let target = e2::put_row(dir, &target, issuer).await;
+            let w = e2::composer_of("withdraws", &target, issuer);
+            e2::put_signed(dir, &w)
+                .await
+                .expect("a withdraws is admitted");
+            (w.attestation_id.clone(), target.attestation_id.clone())
+        })
     }
 
     fn exercise_i1769(
@@ -9589,8 +9315,7 @@ mod tests {
         tag: &str,
     ) {
         let issuer = format!("{tag}-issuer-1769");
-        let target = format!("{tag}-target-1769");
-        let wid = seed_withdraws_1244(rt, dir.as_ref(), &issuer, &target);
+        let (wid, target) = seed_withdraws_e2(rt, dir.as_ref(), &issuer, "target-1769");
         let refs = rt
             .block_on(dir.list_attestations_referencing(&target))
             .expect("direct");
@@ -9696,7 +9421,8 @@ mod tests {
     ) {
         let id = format!("{tag}-ident-1771");
         // The receipt names a stored row (the ledger joins on it).
-        let prop = seed_withdraws_1244(rt, dir.as_ref(), &format!("{tag}-issuer-1771"), "t-1771");
+        let (prop, _) =
+            seed_withdraws_e2(rt, dir.as_ref(), &format!("{tag}-issuer-1771"), "t-1771");
         rt.block_on(async {
             dir.note_self_roster_proposal(&prop, &id, chrono::Utc::now())
                 .await
@@ -10011,115 +9737,117 @@ mod tests {
     }
 
     /// The trust questions the harness asks of one directory.
+    /// v62.0.0 (JSON cut, E7) — the I1774 fixture's identity-refs and ids:
+    /// this node (the asking party), W1b's rooted trust root and its subject,
+    /// E9's chartered root and its subject, the withdraws and its target.
+    struct Eq1774 {
+        node: String,
+        root: String,
+        subject_a: String,
+        root_f: String,
+        subject_f: String,
+        holder: String,
+        wid: String,
+        target: String,
+    }
+
     async fn trust_questions_1774(
         d: &dyn FederationDirectory,
-        wid: &str,
+        q: &Eq1774,
     ) -> Vec<(&'static str, String)> {
-        use crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON;
         use crate::federation::trust_root::{
             capability_roots_to_trusted_root, trust_root_valid, INFRA_SERVE_SCOPE,
         };
         vec![
             (
                 "trust_root_valid key root",
-                answer_1774(trust_root_valid(d, "eqa-user", "eqa-root").await),
+                answer_1774(trust_root_valid(d, &q.node, &q.root).await),
             ),
             (
                 "trust_root_valid self root",
-                answer_1774(trust_root_valid(d, "eqa-user", "eqa-user").await),
+                answer_1774(trust_root_valid(d, &q.node, &q.node).await),
             ),
             (
                 "trust_root_valid family-quorum root",
-                answer_1774(trust_root_valid(d, "eqf-user", "eqf-accord").await),
-            ),
-            (
-                "trust_root_valid community root",
-                answer_1774(trust_root_valid(d, "eqc-consumer", CANON).await),
+                answer_1774(trust_root_valid(d, &q.node, &q.root_f).await),
             ),
             (
                 "trust_root_valid unknown root",
-                answer_1774(trust_root_valid(d, "eqf-user", "eq-nobody").await),
+                answer_1774(trust_root_valid(d, &q.node, "eq-nobody").await),
             ),
             (
                 "capability key root",
                 answer_1774(
-                    capability_roots_to_trusted_root(
-                        d,
-                        "eqa-user",
-                        "eqa-subject",
-                        INFRA_SERVE_SCOPE,
-                    )
-                    .await,
+                    capability_roots_to_trusted_root(d, &q.node, &q.subject_a, INFRA_SERVE_SCOPE)
+                        .await,
                 ),
             ),
             (
                 "capability family root",
                 answer_1774(
-                    capability_roots_to_trusted_root(
-                        d,
-                        "eqf-user",
-                        "eqf-subject",
-                        INFRA_SERVE_SCOPE,
-                    )
-                    .await,
+                    capability_roots_to_trusted_root(d, &q.node, &q.subject_f, INFRA_SERVE_SCOPE)
+                        .await,
                 ),
             ),
             (
                 "get_active_halt",
-                answer_1774(d.get_active_halt("eqf-accord").await),
+                answer_1774(d.get_active_halt(&q.root_f).await),
             ),
             (
                 "lookup_role_withdrawal",
-                answer_1774(d.lookup_role_withdrawal("steward", "eqf-subject").await),
+                answer_1774(d.lookup_role_withdrawal("steward", &q.subject_f).await),
             ),
             (
                 "lookup_canonical_withdrawal",
-                answer_1774(d.lookup_canonical_withdrawal("eqf-subject").await),
+                answer_1774(d.lookup_canonical_withdrawal(&q.subject_f).await),
             ),
             (
                 "owner_of",
-                answer_1774(crate::federation::admission::owner_of(d, "eqf-subject").await),
+                answer_1774(crate::federation::admission::owner_of(d, &q.subject_f).await),
             ),
             (
                 "list_attestations_referencing",
-                answer_1774(d.list_attestations_referencing("eq-target").await),
+                answer_1774(d.list_attestations_referencing(&q.target).await),
             ),
-            ("get_attestation", answer_1774(d.get_attestation(wid).await)),
+            (
+                "get_attestation",
+                answer_1774(d.get_attestation(&q.wid).await),
+            ),
             (
                 "list_settled_self_roster_proposals",
-                answer_1774(d.list_settled_self_roster_proposals("eqf-user").await),
+                answer_1774(d.list_settled_self_roster_proposals(&q.node).await),
             ),
             (
                 "list_identity_occurrences_for",
-                answer_1774(d.list_identity_occurrences_for("eqf-user").await),
+                answer_1774(d.list_identity_occurrences_for(&q.node).await),
             ),
             (
                 "list_identity_occurrence_revocations_for",
-                answer_1774(d.list_identity_occurrence_revocations_for("eqf-user").await),
+                answer_1774(d.list_identity_occurrence_revocations_for(&q.node).await),
             ),
             (
                 "lookup_family",
-                answer_1774(d.lookup_family("eqf-accord").await),
+                answer_1774(d.lookup_family(&q.root_f).await),
             ),
             (
                 "list_families_for_member",
-                answer_1774(d.list_families_for_member("h0-eqf").await),
+                answer_1774(d.list_families_for_member(&q.holder).await),
             ),
             (
                 "lookup_community",
-                answer_1774(d.lookup_community(CANON).await),
+                answer_1774(d.lookup_community(&q.root).await),
             ),
             (
                 "lookup_signed_community",
-                answer_1774(d.lookup_signed_community(CANON).await),
+                answer_1774(d.lookup_signed_community(&q.root).await),
             ),
             (
                 "family_roster_signers",
-                answer_1774(d.family_roster_signers("eqf-accord").await),
+                answer_1774(d.family_roster_signers(&q.root_f).await),
             ),
             (
                 "community_roster_signers",
-                answer_1774(d.community_roster_signers(CANON).await),
+                answer_1774(d.community_roster_signers(&q.root).await),
             ),
             (
                 "hardware_attestation_policy",
@@ -10138,11 +9866,11 @@ mod tests {
         rt: &Arc<tokio::runtime::Runtime>,
         concrete: &Arc<dyn FederationDirectory>,
         proxy: &Arc<OpsDirectory>,
-        wid: &str,
+        q: &Eq1774,
         phase: &str,
     ) -> (Vec<String>, Vec<(&'static str, String)>) {
-        let want = rt.block_on(trust_questions_1774(concrete.as_ref(), wid));
-        let got = rt.block_on(trust_questions_1774(proxy.as_ref(), wid));
+        let want = rt.block_on(trust_questions_1774(concrete.as_ref(), q));
+        let got = rt.block_on(trust_questions_1774(proxy.as_ref(), q));
         let mut red = Vec::new();
         for ((q, w), (_, g)) in want.iter().zip(&got) {
             if g.starts_with("UNSUPPORTED") || w.starts_with("UNSUPPORTED") {
@@ -10168,91 +9896,104 @@ mod tests {
     /// withdrawn canonical; and with the halt lifted. Any difference, or any
     /// `Unsupported` reached, is red. It does not list the methods the walks
     /// reach: it finds them.
+    ///
+    /// v62.0.0 (JSON cut, E7) — the roots are edition 2: W1b's rooted trust
+    /// root (the community arm, `put_conferral` to its subject) and E9's
+    /// chartered root (`seed_chartered_e2_root`, `confer_e2`); the asking party
+    /// is THIS node (the runner sets its key). The `ciris-canonical` community
+    /// arm is gone (wave-3 rule 1: canonical = `serve_nodes` of the bundle in
+    /// force). The withdraws names a HELD row (`seed_withdraws_e2`).
     fn exercise_i1774(rt: &Arc<tokio::runtime::Runtime>, concrete: Arc<dyn FederationDirectory>) {
+        use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::operational::test_support as ops;
-        rt.block_on(async {
-            ops::exercise_trust_root(concrete.as_ref(), "eqa").await;
-            let holders: Vec<String> = (0..3).map(|i| format!("h{i}-eqf")).collect();
-            for k in holders
-                .iter()
-                .map(String::as_str)
-                .chain(["eqf-user", "eqf-subject"])
-            {
-                ops::register_typed_key(
-                    concrete.as_ref(),
-                    k,
-                    crate::federation::types::identity_type::NODE,
-                )
-                .await
-                .unwrap();
-            }
-            ops::seed_chartered_family_root(concrete.as_ref(), "eqf-accord", &holders, "eqf-user")
-                .await
-                .expect("the family-quorum fixture");
-            crate::federation::canonical_community_invariants::bodies::d_the_one_row_untrust(
+        use crate::federation::trust_root::INFRA_SERVE_SCOPE;
+        let q = rt.block_on(async {
+            let node = concrete
+                .node_key_id()
+                .expect("the runner sets the node key first");
+            let r = e2::rooted_trust_root(
                 concrete.as_ref(),
-                "eqc",
+                &crate::federation::edition2::fixture_genesis::HOLDER_SEEDS,
+                "quorum:2/3",
             )
             .await;
-            // `d` ends un-trusted; pin ciris-canonical again so the community
-            // arm answers VALID.
-            ops::emit_trust_edge(
+            crate::federation::edition2::fixture_trust_root::put_conferral(
                 concrete.as_ref(),
-                "eqc-consumer",
-                crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID,
-                None,
+                &r,
+                "eqa-subject",
+                &[INFRA_SERVE_SCOPE],
             )
             .await
-            .expect("re-pin ciris-canonical");
+            .expect("the key root confers");
+            let f = ops::seed_chartered_e2_root(concrete.as_ref(), "eqf-root", &node)
+                .await
+                .expect("the chartered root");
+            e2::put_key(
+                concrete.as_ref(),
+                "eqf-subject",
+                &[crate::federation::types::identity_type::USER],
+            )
+            .await;
+            ops::confer_e2(
+                concrete.as_ref(),
+                &f.seed,
+                "eqf-subject",
+                &[INFRA_SERVE_SCOPE],
+            )
+            .await
+            .expect("the chartered root confers");
+            Eq1774 {
+                node,
+                root: r.root.clone(),
+                subject_a: e2::kid("eqa-subject"),
+                holder: f.founders.first().cloned().unwrap_or_default(),
+                root_f: f.root,
+                subject_f: e2::kid("eqf-subject"),
+                wid: String::new(),
+                target: String::new(),
+            }
         });
-        let wid = seed_withdraws_1244(rt, concrete.as_ref(), "eq-issuer", "eq-target");
+        let (wid, target) = seed_withdraws_e2(rt, concrete.as_ref(), "eq-issuer", "eq-target");
+        let q = Eq1774 { wid, target, ..q };
         let proxy = proxy_1244(rt, concrete.clone());
 
         let mut red = Vec::new();
-        let (r, seeded) = diff_1774(rt, &concrete, &proxy, &wid, "seeded");
+        let (r, seeded) = diff_1774(rt, &concrete, &proxy, &q, "seeded");
         red.extend(r);
-        // The fixture is not trivial: all three roots answer VALID.
-        for q in [
+        // The fixture is not trivial: both roots answer VALID.
+        for name in [
             "trust_root_valid key root",
             "trust_root_valid family-quorum root",
-            "trust_root_valid community root",
         ] {
-            let a = &seeded.iter().find(|(n, _)| *n == q).unwrap().1;
+            let a = &seeded.iter().find(|(n, _)| *n == name).unwrap().1;
             assert!(
                 a.contains("valid: true"),
-                "I1774 fixture: {q} is not valid: {a}"
+                "I1774 fixture: {name} is not valid: {a}"
             );
         }
 
         rt.block_on(async {
             concrete
-                .set_active_halt("eqf-accord", "eq-halt")
+                .set_active_halt(&q.root_f, "eq-halt")
                 .await
                 .unwrap();
             concrete
-                .record_role_withdrawal("steward", "eqf-subject", None, "eq-digest")
+                .record_role_withdrawal("steward", &q.subject_f, None, "eq-digest")
                 .await
                 .unwrap();
             concrete
-                .record_canonical_withdrawal("eqf-subject", None, "eq-digest")
+                .record_canonical_withdrawal(&q.subject_f, None, "eq-digest")
                 .await
                 .unwrap();
         });
-        let (r, halted) = diff_1774(rt, &concrete, &proxy, &wid, "halted+withdrawn");
+        let (r, _) = diff_1774(rt, &concrete, &proxy, &q, "halted+withdrawn");
         red.extend(r);
-        let fam = &halted
-            .iter()
-            .find(|(n, _)| *n == "trust_root_valid family-quorum root")
-            .unwrap()
-            .1;
-        assert!(
-            fam.contains("halt_latched: Some(true)"),
-            "I1774 fixture: the halt latched: {fam}"
-        );
+        // v62.0.0 — a halt is reported, not a gate on trust (CC 4.2.1.1); only
+        // proxy/concrete agreement is asserted here.
 
-        rt.block_on(concrete.clear_active_halt("eqf-accord", "eq-halt"))
+        rt.block_on(concrete.clear_active_halt(&q.root_f, "eq-halt"))
             .unwrap();
-        let (r, _) = diff_1774(rt, &concrete, &proxy, &wid, "halt lifted");
+        let (r, _) = diff_1774(rt, &concrete, &proxy, &q, "halt lifted");
         red.extend(r);
 
         assert!(
@@ -10265,7 +10006,15 @@ mod tests {
     #[test]
     fn i1774_the_trust_walk_answers_the_same_through_the_proxy_sqlite() {
         let rt = test_runtime();
-        exercise_i1774(&rt, sqlite_backend_1244(&rt));
+        let b = sqlite_backend_1244(&rt);
+        // v62.0.0 (W1b precondition) — this node's key, set before the fixture.
+        let node = rt.block_on(crate::federation::edition2::fixture_switch::put_key(
+            b.as_ref(),
+            "eq-node",
+            &[crate::federation::types::identity_type::NODE],
+        ));
+        b.set_node_key_id(node);
+        exercise_i1774(&rt, b);
     }
 
     /// I1774 — postgres arm, in a database of its own (the community fixture
@@ -10285,6 +10034,13 @@ mod tests {
             crate::store::backend::Backend::run_migrations(&b)
                 .await
                 .expect("migrate");
+            let node = crate::federation::edition2::fixture_switch::put_key(
+                &b,
+                "eq-node",
+                &[crate::federation::types::identity_type::NODE],
+            )
+            .await;
+            b.set_node_key_id(node);
             b
         });
         exercise_i1774(&rt, Arc::new(b));
@@ -10603,6 +10359,11 @@ mod tests {
             "recheck_attestation",
             "v62.0.0 (wave G0) — the fold's re-check of a concluded row runs the plan in \
              the process that owns the store (`edition2::fold`); no DirectoryOp carries it",
+        ),
+        (
+            "put_fold_reason",
+            "v62.0.0 (wave G0 fix4) — the re-fold's marker and its restore run in the \
+             process that owns the store (`edition2::fold`); no DirectoryOp carries it",
         ),
         (
             "clear_occurrence_projection",

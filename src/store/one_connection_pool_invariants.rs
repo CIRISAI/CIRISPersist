@@ -10,13 +10,8 @@
 //! connection and run each door under a timeout
 //! that FAILS the test (a hang is the defect, never the test's own hang).
 //!
-//! - **I601** — the `signed_wire_index` re-index. `index_stored_record` held
-//!   its client and transaction while `entry_as_stored` reloaded the stored
-//!   bytes through the directory's reads, each of which takes a client. A
-//!   key registration and an attestation put each re-index after their
-//!   primary write; both must finish, AND the index must hold the record (a
-//!   re-index failure is logged, not returned, so finishing alone proves
-//!   nothing).
+//! - **I601** — the `signed_wire_index` re-index. v62.0.0: deleted with the
+//!   content-hash wire index (an earlier serving surface; slice F).
 //! - **I602** — the `delegates_to` cycle re-check. `put_attestation` and
 //!   `enter_mesh` re-ran the cycle gate under the delegation advisory lock,
 //!   inside the transaction holding the only client, and the gate's graph
@@ -35,10 +30,13 @@
 //!   and reach for a second no more: each finishes on a one-connection pool
 //!   whose checkout gives up after [`SHORT_WAIT`] (a nested checkout answers
 //!   `PoolExhausted`, so a regression fails fast instead of at the bound).
+//!   v62.0.0: the wire-index point-read leg is deleted with the content-hash
+//!   wire index; the occurrence-door leg stays.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::federation::delegation_cycle_invariants::bodies as dc;
+use crate::federation::edition2::fixture_switch as e2;
 use crate::federation::tier_ingest::test_support as ts;
 use crate::federation::{Error, FederationDirectory};
 use crate::store::postgres::PostgresBackend;
@@ -101,70 +99,6 @@ async fn within_bound<T>(what: &str, door: impl std::future::Future<Output = T>)
              waits for a second pooled client while holding the only one"
         ),
     }
-}
-
-/// The content hash the index must hold for `(kind, key)`: the stored bytes,
-/// read the way the point read reads them.
-async fn indexed(b: &PostgresBackend, kind: &str, key: &str) -> bool {
-    let want = crate::federation::wire_index::entry_as_stored(b, kind, key)
-        .await
-        .unwrap()
-        .expect("the record is stored");
-    b.list_wire_hashes_since(kind, None, 100_000)
-        .await
-        .unwrap()
-        .contains(&want)
-}
-
-/// **I601** — see the module doc.
-#[tokio::test(flavor = "multi_thread")]
-async fn i601_the_wire_index_reindex_completes_on_one_connection() {
-    let Some(b) = one_connection_backend("i601").await else {
-        return;
-    };
-    let tag = suffix();
-    let k = format!("i601-k-{tag}");
-    // v58.0.0 (CIRISPersist#991) — a key's record is its `key:record:v1` row,
-    // indexed on the Attestation kind after the door commits.
-    within_bound(
-        "I601 key registration",
-        b.put_public_key(crate::federation::SignedKeyRecord {
-            record: crate::federation::key_plane_invariants::bodies::pop_record(&k),
-        }),
-    )
-    .await
-    .expect("I601 the key registers");
-    let row_id = crate::federation::key_plane_invariants::bodies::key_row(&b, &k)
-        .await
-        .expect("I601 the key is a key:record:v1 row")
-        .attestation_id;
-    assert!(
-        indexed(
-            &b,
-            "Attestation",
-            &crate::federation::wire_index::record_key(&[("attestation_id", &row_id)])
-        )
-        .await,
-        "I601 the key row's re-index ran and stored its stored-bytes hash"
-    );
-    // A self-edge is not cycle-gated (the root charter's shape), so this put
-    // reaches the re-index without the delegation lock: I601 measures the
-    // re-index alone.
-    let id = within_bound(
-        "I601 attestation put",
-        ts::put_delegates_to(&b as &dyn FederationDirectory, &k, &k, None),
-    )
-    .await
-    .expect("I601 the self-edge admits");
-    assert!(
-        indexed(
-            &b,
-            "Attestation",
-            &crate::federation::wire_index::record_key(&[("attestation_id", &id)])
-        )
-        .await,
-        "I601 the attestation's re-index ran and stored its stored-bytes hash"
-    );
 }
 
 /// **I602** — see the module doc.
@@ -322,9 +256,15 @@ async fn i1482_occurrence_doors_complete_on_one_connection() {
     let d = &b as &dyn FederationDirectory;
     let tag = suffix();
     let (identity, occ) = (format!("i1482-id-{tag}"), format!("i1482-occ-{tag}"));
-    ts::register_hybrid_key(d, &identity).await;
+    let _ = e2::put_key(
+        d,
+        &identity,
+        &[crate::federation::types::identity_type::USER],
+    )
+    .await;
     // v61 (CIRISPersist#1122) — a node: an agent's occurrence projects no route.
-    ts::register_hybrid_key_as(d, &occ, &occ, crate::federation::types::identity_type::NODE).await;
+    let _ = e2::put_key(d, &occ, &[crate::federation::types::identity_type::NODE]).await;
+    let (identity, occ) = (e2::kid(&identity), e2::kid(&occ));
     let b64 = base64::engine::general_purpose::STANDARD;
     let row = crate::federation::IdentityOccurrence {
         identity_key_id: identity.clone(),
@@ -354,40 +294,6 @@ async fn i1482_occurrence_doors_complete_on_one_connection() {
         1,
         "I1482 the route projection ran"
     );
-}
-
-/// **I1482** — the wire-index point read reloads the record through the
-/// directory after reading its key.
-#[tokio::test(flavor = "multi_thread")]
-async fn i1482_the_wire_index_point_read_completes_on_one_connection() {
-    let Some(b) = starved_backend("i1482-wire", 1).await else {
-        return;
-    };
-    let k = format!("i1482-k-{}", suffix());
-    within_bound(
-        "I1482 key registration",
-        b.put_public_key(crate::federation::SignedKeyRecord {
-            record: crate::federation::key_plane_invariants::bodies::pop_record(&k),
-        }),
-    )
-    .await
-    .expect("I1482 the key registers");
-    let row_id = crate::federation::key_plane_invariants::bodies::key_row(&b, &k)
-        .await
-        .expect("I1482 the key row")
-        .attestation_id;
-    let key = crate::federation::wire_index::record_key(&[("attestation_id", &row_id)]);
-    let hash = crate::federation::wire_index::entry_as_stored(&b, "Attestation", &key)
-        .await
-        .unwrap()
-        .expect("I1482 stored");
-    let bytes = within_bound(
-        "I1482 lookup_signed_record_by_content_hash",
-        b.lookup_signed_record_by_content_hash("Attestation", &hash),
-    )
-    .await
-    .expect("I1482 the point read finishes");
-    assert!(bytes.is_some(), "I1482 the indexed record reloads");
 }
 
 /// **I1570** (v61, CIRISPersist#1166) — every family of Postgres checkouts

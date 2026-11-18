@@ -9,15 +9,20 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::consent::ScopedStance;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::ConsentState;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
     use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
-    use crate::federation::{admission, Attestation, FederationDirectory, SignedAttestation};
+    use crate::federation::{admission, Attestation, FederationDirectory};
 
     /// A federation-tier row signed by `signer` over `envelope`, targeting
-    /// `target`, with `subject_key_ids` — sign → seal → reseal, the crate's
-    /// fixture shape (the same body the #857 witnesses use).
+    /// `target`, with `subject_key_ids`.
+    ///
+    /// v62.0.0 (JSON cut, E5) — an edition-2 statement signed by `signer`'s
+    /// composite (a seed, or an identity-ref `e2::put_key` returned), mapped
+    /// through the door ([`e2::row_of`]): its `attestation_id` is the
+    /// node-computed row id ([`e2::rid`]), never `id`.
     pub(crate) fn row(
         id: &str,
         signer: &str,
@@ -27,8 +32,7 @@ pub(crate) mod bodies {
         at: chrono::DateTime<chrono::Utc>,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Attestation {
-        let (och, ed_sig, pqc_sig) = ts::sign_envelope(signer, &envelope);
-        let mut r = Attestation {
+        let r = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: signer.to_owned(),
             attested_key_id: target.to_owned(),
@@ -37,9 +41,9 @@ pub(crate) mod bodies {
             asserted_at: at,
             expires_at,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: signer.to_owned(),
             scrub_timestamp: at,
             pqc_completed_at: None,
@@ -51,9 +55,7 @@ pub(crate) mod bodies {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        ts::seal_row_in_place(signer, &mut r);
-        ts::reseal(&mut r);
-        r
+        e2::row_of(&r, signer)
     }
 
     pub(crate) fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -101,21 +103,22 @@ pub(crate) mod bodies {
         )
     }
 
+    /// v62.0.0 (JSON cut, E5) — the row's carried edition-2 statement through
+    /// the one entry (`e2::put_signed` → `ingest::put_statement`), which runs
+    /// every attestation gate the JSON door ran.
     pub(crate) async fn put(
         d: &dyn FederationDirectory,
         a: Attestation,
     ) -> Result<(), crate::federation::Error> {
-        d.put_attestation(SignedAttestation { attestation: a })
-            .await
-            .map(|_| ())
+        e2::put_signed(d, &a).await.map(|_| ())
     }
 
     /// **I104 — the door refuses a malformed scope token by name, and admits
     /// a well-formed non-canonical kind.**
     pub async fn i104_the_door_refuses_malformed_tokens(d: &dyn FederationDirectory, s: &str) {
         let (subject, target) = (format!("i104-s-{s}"), format!("i104-t-{s}"));
-        ts::register_identity_key(d, &subject, USER).await;
-        ts::register_identity_key(d, &target, USER).await;
+        let subject = e2::put_key(d, &subject, &[USER]).await;
+        let target = e2::put_key(d, &target, &[USER]).await;
         let refused: &[(&str, serde_json::Value, &str)] = &[
             ("retain-window", serde_json::json!("retain:soon"), "retain"),
             (
@@ -234,8 +237,8 @@ pub(crate) mod bodies {
     /// **I106 — `retain:<window>` is a lifecycle bound, not a match criterion.**
     pub async fn i106_retain_window_is_a_bound(d: &dyn FederationDirectory, s: &str) {
         let (subject, target) = (format!("i106-s-{s}"), format!("i106-t-{s}"));
-        ts::register_identity_key(d, &subject, USER).await;
-        ts::register_identity_key(d, &target, USER).await;
+        let subject = e2::put_key(d, &subject, &[USER]).await;
+        let target = e2::put_key(d, &target, &[USER]).await;
         put(
             d,
             stance(
@@ -329,19 +332,22 @@ pub(crate) mod bodies {
     pub async fn i106b_the_watch_honours_the_retain_window(d: &dyn FederationDirectory, s: &str) {
         use crate::federation::deletion_window::{kind, run_deletion_window_watch};
         let (subject, producer) = (format!("i106b-s-{s}"), format!("i106b-p-{s}"));
-        ts::register_identity_key(d, &subject, USER).await;
-        ts::register_identity_key(d, &producer, USER).await;
+        let subject = e2::put_key(d, &subject, &[USER]).await;
+        let producer = e2::put_key(d, &producer, &[USER]).await;
         // The producer holds a row ABOUT the subject, with no deletion_window.
+        // v62.0.0 (E5) — a registered dimension: the edition-2 door refuses
+        // open vocabulary (`i106b:held:v1` was one).
         let held = row(
             &format!("i106b-held-{s}"),
             &producer,
             &subject,
-            serde_json::json!({"id": format!("i106b-held-{s}"), "dimension": "i106b:held:v1", "score": 1.0,
+            serde_json::json!({"id": format!("i106b-held-{s}"), "dimension": "evidence:safety_battery:capture:a:b:v1", "score": 1.0,
                 crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(at("2026-05-01T00:00:00Z"))}),
             vec![subject.clone()],
             at("2026-05-01T00:00:00Z"),
             None,
         );
+        let held_id = e2::rid(&held);
         put(d, held).await.unwrap();
         // The subject lets the producer retain for one day.
         put(
@@ -378,7 +384,7 @@ pub(crate) mod bodies {
         let events = d.list_hard_case_events(filter()).await.unwrap();
         assert!(
             events.iter().any(|e| e.detail["subject_key_id"] == subject
-                && e.detail["attestation_id"] == format!("i106b-held-{s}")
+                && e.detail["attestation_id"] == held_id
                 && e.detail["basis"] == "retain_window"),
             "I106b: the breach names the row, the subject and its basis: {events:?}"
         );
@@ -392,7 +398,7 @@ pub(crate) mod bodies {
                 .await
                 .unwrap()
                 .iter()
-                .filter(|e| e.detail["attestation_id"] == format!("i106b-held-{s}"))
+                .filter(|e| e.detail["attestation_id"] == held_id)
                 .count(),
             1,
             "I106b: idempotent on the deterministic event id"
@@ -402,8 +408,8 @@ pub(crate) mod bodies {
     /// **I107 — the CC's literal composition pattern is inert, and pinned so.**
     pub async fn i107_the_cc_literal_pattern_is_inert(d: &dyn FederationDirectory, s: &str) {
         let (subject, target) = (format!("i107-s-{s}"), format!("i107-t-{s}"));
-        ts::register_identity_key(d, &subject, USER).await;
-        ts::register_identity_key(d, &target, USER).await;
+        let subject = e2::put_key(d, &subject, &[USER]).await;
+        let target = e2::put_key(d, &target, &[USER]).await;
         // A bare granted row + a `consent:scope:analyze` companion row.
         put(
             d,
@@ -456,25 +462,23 @@ pub(crate) mod bodies {
             format!("i111-n-{s}"),
             format!("i111-x-{s}"),
         );
-        for k in [&subject, &target, &node, &stranger] {
-            ts::register_identity_key(d, k, USER).await;
-        }
-        let g = format!("i111-g-{s}");
-        put(
-            d,
-            stance(
-                &g,
-                &subject,
-                &target,
-                "granted",
-                serde_json::json!("share"),
-                serde_json::json!({}),
-                "2026-05-01T00:00:00Z",
-                Some("2026-05-02T00:00:00Z"),
-            ),
-        )
-        .await
-        .unwrap();
+        let subject = e2::put_key(d, &subject, &[USER]).await;
+        let target = e2::put_key(d, &target, &[USER]).await;
+        let node = e2::put_key(d, &node, &[USER]).await;
+        let stranger = e2::put_key(d, &stranger, &[USER]).await;
+        let grant = stance(
+            &format!("i111-g-{s}"),
+            &subject,
+            &target,
+            "granted",
+            serde_json::json!("share"),
+            serde_json::json!({}),
+            "2026-05-01T00:00:00Z",
+            Some("2026-05-02T00:00:00Z"),
+        );
+        // v62.0.0 (E5) — an expired row's edge names the grant's row id.
+        let g = e2::rid(&grant);
+        put(d, grant).await.unwrap();
         let now = at("2026-05-03T00:00:00Z");
         let expired = |id: &str, by: &str, names: Option<&str>, asserted: &str| {
             let mut extras = serde_json::json!({});
@@ -506,22 +510,18 @@ pub(crate) mod bodies {
         .await
         .unwrap();
         // (b) an edge to a grant the subject did not author → ignored.
-        let other_g = format!("i111-og-{s}");
-        put(
-            d,
-            stance(
-                &other_g,
-                &stranger,
-                &target,
-                "granted",
-                serde_json::json!("share"),
-                serde_json::json!({}),
-                "2026-05-01T00:00:00Z",
-                Some("2026-05-02T00:00:00Z"),
-            ),
-        )
-        .await
-        .unwrap();
+        let other_grant = stance(
+            &format!("i111-og-{s}"),
+            &stranger,
+            &target,
+            "granted",
+            serde_json::json!("share"),
+            serde_json::json!({}),
+            "2026-05-01T00:00:00Z",
+            Some("2026-05-02T00:00:00Z"),
+        );
+        let other_g = e2::rid(&other_grant);
+        put(d, other_grant).await.unwrap();
         put(
             d,
             expired(
@@ -601,8 +601,8 @@ pub(crate) mod bodies {
     /// to this family do.**
     pub async fn i112_the_gate_honours_the_family_narrowing(d: &dyn FederationDirectory, s: &str) {
         let (scorer, subject) = (format!("i112-p-{s}"), format!("i112-s-{s}"));
-        ts::register_identity_key(d, &scorer, USER).await;
-        ts::register_identity_key(d, &subject, USER).await;
+        let scorer = e2::put_key(d, &scorer, &[USER]).await;
+        let subject = e2::put_key(d, &subject, &[USER]).await;
         let score = |n: &str| {
             let id = format!("i112-score-{n}-{s}");
             let env = serde_json::json!({"id": id, "dimension": "capacity:core_identity:v1", "score": 1.0, "confidence": 0.9,
@@ -617,6 +617,8 @@ pub(crate) mod bodies {
                 None,
             );
             r.weight = Some(1.0);
+            // v62.0.0 (E5) — `weight` is not carried by the mapping (E0.api
+            // §3); the re-seal is kept so the row's column is re-derived.
             ts::reseal(&mut r);
             r
         };
@@ -1095,6 +1097,7 @@ mod run {
     async fn i109_the_sweep_records_expiry_with_its_edge() {
         use super::bodies::{at, put, stance};
         use crate::federation::attestation_query::test_support::AllAttestations as _;
+        use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::hard_case::ConsentState;
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::USER;
@@ -1111,24 +1114,21 @@ mod run {
         let sq = engine.sqlite_backend().unwrap().clone();
         let d: &dyn FederationDirectory = sq.as_ref();
         let (subject, target) = (format!("i109-s-{run}"), format!("i109-t-{run}"));
-        ts::register_identity_key(d, &subject, USER).await;
-        ts::register_identity_key(d, &target, USER).await;
-        let g = format!("i109-g-{run}");
-        put(
-            d,
-            stance(
-                &g,
-                &subject,
-                &target,
-                "granted",
-                serde_json::json!(["share", "retain:1d"]),
-                serde_json::json!({"content_class": "medical"}),
-                "2026-05-01T00:00:00Z",
-                Some("2026-05-03T00:00:00Z"),
-            ),
-        )
-        .await
-        .unwrap();
+        let subject = e2::put_key(d, &subject, &[USER]).await;
+        let target = e2::put_key(d, &target, &[USER]).await;
+        let grant = stance(
+            &format!("i109-g-{run}"),
+            &subject,
+            &target,
+            "granted",
+            serde_json::json!(["share", "retain:1d"]),
+            serde_json::json!({"content_class": "medical"}),
+            "2026-05-01T00:00:00Z",
+            Some("2026-05-03T00:00:00Z"),
+        );
+        // v62.0.0 (E5) — the expired row's edge names the grant's row id.
+        let g = e2::rid(&grant);
+        put(d, grant).await.unwrap();
         // Before any lapse: nothing to record.
         let r = engine
             .run_consent_expiry_sweep(at("2026-05-01T12:00:00Z"))

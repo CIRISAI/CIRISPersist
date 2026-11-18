@@ -242,7 +242,11 @@ mod tests {
     async fn i2202_register_self_returns_the_identity_ref_sqlite() {
         let dir = tempfile::tempdir().expect("tempdir");
         let dsn = format!("sqlite:///{}", dir.path().join("node.db").display());
-        super::bodies::i2202_register_self_returns_the_identity_ref(&dsn, &tag()).await;
+        Box::pin(super::bodies::i2202_register_self_returns_the_identity_ref(
+            &dsn,
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "postgres")]
@@ -252,6 +256,10 @@ mod tests {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
-        super::bodies::i2202_register_self_returns_the_identity_ref(&dsn, &tag()).await;
+        Box::pin(super::bodies::i2202_register_self_returns_the_identity_ref(
+            &dsn,
+            &tag(),
+        ))
+        .await;
     }
 }

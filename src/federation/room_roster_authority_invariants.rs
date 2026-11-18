@@ -12,7 +12,8 @@
 #[cfg(test)]
 pub mod bodies {
     use crate::federation::cohort::Cohort;
-    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+    use crate::federation::edition2::ingest::StatementOutcome;
+
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         consensus_protocol, identity_type, Community, CommunityMember,
@@ -56,14 +57,21 @@ pub mod bodies {
         }
     }
 
+    /// v62 (E4): `k` live as an edition-2 `user` key (no start, no end, so
+    /// the fixed 2026 instants below stay inside its liveness).
     async fn user(d: &dyn FederationDirectory, k: &str) {
-        ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+        crate::federation::edition2::fixture_switch::put_key(d, k, &[identity_type::USER]).await;
     }
 
     /// A room of `names` (each `{tag}-{name}`, registered user keys), the
     /// first `founders` of them tagged `founder`, under `protocol`, signed by
     /// `record_signer` (default: the first member) and carrying `policy_blob`.
     /// The room id is no key. Returns the room id and the member key ids.
+    ///
+    /// v62 (E4, flip wave 2): the record is the `group:roster` statements of
+    /// its signer and listed members (T1 `community_voices`), and the
+    /// returned ids are the identity-refs the typed rows are keyed by
+    /// (`e2::kid`); every seed-taking fixture accepts them back.
     pub async fn make_group(
         d: &dyn FederationDirectory,
         tag: &str,
@@ -108,27 +116,16 @@ pub mod bodies {
         // v61, as the field holds one), which a peer still delivers: the
         // replicated door admits it as data, and every fold reads it as
         // before. An affiliation keeps `founder_only` on the local door.
-        let legacy = protocol == consensus_protocol::FOUNDER_ONLY
-            && crate::federation::affiliation_config::declared_cohort(&community.community)
-                .is_ok_and(|c| c != crate::federation::cohort::Cohort::Affiliations);
-        if legacy {
-            let outcome = d
-                .apply_replicated_community(community)
-                .await
-                .unwrap_or_else(|e| panic!("{tag}: legacy room: {e}"));
-            assert!(
-                matches!(
-                    outcome,
-                    crate::federation::ReplicatedCommunityOutcome::Inserted
-                ),
-                "{tag}: legacy room: {outcome:?}"
-            );
-        } else {
-            d.put_community(community)
-                .await
-                .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
-        }
-        (room, keys)
+        //
+        // v62 (E4): an edition-2 statement has one entry for local and
+        // replicated delivery (`ingest::put_statement`), so the legacy room
+        // and the ordinary one land the same way.
+        use crate::federation::edition2::fixture_switch as e2;
+        let founded_ms = u64::try_from(at("2026-01-01T00:00:00Z").timestamp_millis()).expect("ms");
+        e2::put_voices(d, &e2::community_voices(&community, 1, None, founded_ms))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+        (e2::kid(&room), keys.iter().map(|k| e2::kid(k)).collect())
     }
 
     /// The common case: alice (founder) and bob, under `protocol`.
@@ -141,50 +138,113 @@ pub mod bodies {
         (room, k[0].clone(), k[1].clone())
     }
 
+    // v62 (E4, flip wave 2): the roster changes are `membership:{stage}`
+    // statements (T1), one per signer, naming the held roster version
+    // (`refs.head`). A change short of the protocol is KEPT as voices with
+    // no typed row (`StatementOutcome::Pending`), the edition-2 form of the
+    // JSON door's `roster_consensus_insufficient`; see [`short_or_refused`].
+
+    /// The roster version a change names.
+    pub(crate) async fn head_of(
+        d: &dyn FederationDirectory,
+        room: &str,
+    ) -> Option<crate::federation::edition2::names::RowId> {
+        use crate::federation::edition2::fixture_switch as e2;
+        e2::held_head(d, &e2::kid_or_keep(room))
+            .await
+            .map(|(h, _)| h)
+    }
+
+    /// The member's consent, held as edition-2 rows before its widening
+    /// (the #955 growth gate): `proposer`'s proposal, the member's
+    /// acceptance. Best-effort, as `ConsentedWidening` writes it: a widening
+    /// that must be refused for another reason is still refused by the door.
+    pub(crate) async fn consent(
+        d: &dyn FederationDirectory,
+        proposer: &str,
+        w: &CommunityMembershipWidening,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::membership_acceptance::test_support::{
+            acceptance_row, proposal_row,
+        };
+        let p = proposal_row(
+            proposer,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            &w.community_key_id,
+            &w.member_key_id,
+            w.role.as_deref(),
+            w.effective_at,
+        );
+        if let Err(e) = e2::put_signed(d, &p).await {
+            eprintln!("room_roster_authority: proposal not written: {e}");
+            return;
+        }
+        if let Err(e) =
+            e2::put_signed(d, &acceptance_row(&w.member_key_id, &p, w.effective_at)).await
+        {
+            eprintln!("room_roster_authority: acceptance not written: {e}");
+        }
+    }
+
     /// A widening signed by `signers[0]` and co-signed by the rest.
-    async fn widen_by(
+    pub(crate) async fn widen_by(
         d: &dyn FederationDirectory,
         signers: &[&str],
         w: CommunityMembershipWidening,
-    ) -> Result<(), Error> {
+    ) -> Result<StatementOutcome, Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        consent(d, signers[0], &w).await;
+        let head = head_of(d, &w.community_key_id).await;
         let mut s = ts::sign_community_membership_widening(signers[0], w);
         for c in &signers[1..] {
             ts::cosign_community_membership_widening(&mut s, c);
         }
-        d.put_community_membership_widening_consented(s).await
+        e2::put_voices(d, &e2::community_widening_voices(&s, head.as_ref())).await
     }
 
     /// A revocation signed by `signers[0]` and co-signed by the rest.
-    async fn revoke_by(
+    pub(crate) async fn revoke_by(
         d: &dyn FederationDirectory,
         signers: &[&str],
         r: CommunityMembershipRevocation,
-    ) -> Result<(), Error> {
+    ) -> Result<StatementOutcome, Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        let head = head_of(d, &r.community_key_id).await;
         let mut s = ts::sign_community_membership_revocation(signers[0], r);
         for c in &signers[1..] {
             ts::cosign_community_membership_revocation(&mut s, c);
         }
-        d.put_community_membership_revocation(s).await
+        e2::put_voices(d, &e2::community_revocation_voices(&s, head.as_ref())).await
     }
 
     async fn widen(
         d: &dyn FederationDirectory,
         signer: &str,
         w: CommunityMembershipWidening,
-    ) -> Result<(), Error> {
-        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
-            signer, w,
-        ))
-        .await
+    ) -> Result<StatementOutcome, Error> {
+        widen_by(d, &[signer], w).await
     }
 
     async fn revoke(
         d: &dyn FederationDirectory,
         signer: &str,
         r: CommunityMembershipRevocation,
-    ) -> Result<(), Error> {
-        d.put_community_membership_revocation(ts::sign_community_membership_revocation(signer, r))
-            .await
+    ) -> Result<StatementOutcome, Error> {
+        revoke_by(d, &[signer], r).await
+    }
+
+    /// A change that must NOT land: `want` is the roster-authority rule.
+    /// For `roster_consensus_insufficient` the edition-2 door keeps the
+    /// short voices and lands no typed row (`Pending`), which is the same
+    /// verdict; every other rule is a refusal.
+    pub(crate) fn short_or_refused(r: Result<StatementOutcome, Error>, want: &str, what: &str) {
+        match r {
+            Ok(StatementOutcome::Pending { .. })
+                if want == crate::federation::ROSTER_CONSENSUS_INSUFFICIENT => {}
+            Ok(other) => panic!("{what}: landed ({other:?}); expected {want}"),
+            Err(e) => assert_eq!(rule_of(&e), want, "{what}: {e}"),
+        }
     }
 
     async fn active(d: &dyn FederationDirectory, room: &str) -> Vec<String> {
@@ -287,9 +347,8 @@ pub mod bodies {
             ROSTER_CONSENSUS_UNEVALUABLE as UNEVALUABLE,
         };
         let t = |n: u32| at(&format!("2026-03-{n:02}T00:00:00Z"));
-        let refused = |r: Result<(), Error>, want: &str, what: &str| {
-            let e = r.expect_err(what);
-            assert_eq!(rule_of(&e), want, "{tag} I171 {what}: {e}");
+        let refused = |r: Result<StatementOutcome, Error>, want: &str, what: &str| {
+            short_or_refused(r, want, &format!("{tag} I171 {what}"));
         };
         let newcomer = |n: &str| format!("{tag}-{n}");
         for n in ["x1", "x2", "x3", "x4", "x5", "x6", "eve"] {
@@ -312,7 +371,7 @@ pub mod bodies {
             None,
         )
         .await;
-        let founder_only = |res: Result<(), Error>, what: &str| match res {
+        let founder_only = |res: Result<StatementOutcome, Error>, what: &str| match res {
             Err(Error::CommunityConsensusProtocolViolation { rule, .. }) => assert_eq!(
                 rule,
                 crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY,
@@ -496,31 +555,19 @@ pub mod bodies {
         let dan = format!("{tag}-dan");
         user(a, &dan).await;
         user(b, &dan).await;
-        let mut rev = ts::sign_community_membership_revocation(
-            alice,
-            revocation(&room, bob, at("2026-03-01T00:00:00Z")),
-        );
-        ts::cosign_community_membership_revocation(&mut rev, carol);
-        let mut wid = ts::sign_community_membership_widening(
-            bob,
-            widening(&room, &dan, at("2026-03-02T00:00:00Z"), None),
-        );
-        ts::cosign_community_membership_widening(&mut wid, alice);
-        a.put_community_membership_widening_consented(wid.clone())
+        // v62 (E4, flip wave 2): the same statements reach both nodes in
+        // opposite orders (the helpers put the member's consent first).
+        let rev = || revocation(&room, bob, at("2026-03-01T00:00:00Z"));
+        let wid = || widening(&room, &dan, at("2026-03-02T00:00:00Z"), None);
+        widen_by(a, &[bob, alice], wid())
             .await
             .unwrap_or_else(|e| panic!("{tag} I172: A admits the widening first: {e}"));
-        a.put_community_membership_revocation(rev.clone())
-            .await
-            .unwrap();
-        b.put_community_membership_revocation(rev).await.unwrap();
-        let e = b
-            .put_community_membership_widening_consented(wid)
-            .await
-            .expect_err("B refuses: bob was out at t2");
-        assert_eq!(
-            rule_of(&e),
+        revoke_by(a, &[alice, carol], rev()).await.unwrap();
+        revoke_by(b, &[alice, carol], rev()).await.unwrap();
+        short_or_refused(
+            widen_by(b, &[bob, alice], wid()).await,
             crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
-            "{tag} I172: {e}"
+            &format!("{tag} I172: B refuses, bob was out at t2"),
         );
         let want = {
             let mut v = vec![alice.clone(), carol.clone()];
@@ -615,31 +662,27 @@ pub mod bodies {
             None,
         )
         .await;
-        let e = widen_by(
-            d,
-            &[&k[1], &k[2]],
-            widening(&r, &x, at("2026-03-01T00:00:00Z"), None),
-        )
-        .await
-        .expect_err("2 of 4 weight");
-        assert_eq!(
-            rule_of(&e),
+        short_or_refused(
+            widen_by(
+                d,
+                &[&k[1], &k[2]],
+                widening(&r, &x, at("2026-03-01T00:00:00Z"), None),
+            )
+            .await,
             crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
-            "{tag} I182 weighted: {e}"
+            &format!("{tag} I182 weighted: 2 of 4 weight"),
         );
         {
             // One weight short: the founder alone carries 3 of 4.
-            let e = widen_by(
-                d,
-                &[&k[0]],
-                widening(&r, &x, at("2026-03-02T00:00:00Z"), None),
-            )
-            .await
-            .expect_err("3 of 4 weight");
-            assert_eq!(
-                rule_of(&e),
+            short_or_refused(
+                widen_by(
+                    d,
+                    &[&k[0]],
+                    widening(&r, &x, at("2026-03-02T00:00:00Z"), None),
+                )
+                .await,
                 crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
-                "{tag} I182 weighted: {e}"
+                &format!("{tag} I182 weighted: 3 of 4 weight"),
             );
         }
         widen_by(
@@ -688,250 +731,12 @@ pub mod bodies {
         );
     }
 
-    fn unverified_signer(e: &Error) -> &str {
-        match e {
-            Error::FederationTierUnverified {
-                attesting_key_id, ..
-            } => attesting_key_id,
-            other => panic!("expected FederationTierUnverified, got {other}"),
-        }
-    }
-
-    fn assert_invalid(e: &Error, needle: &str, what: &str) {
-        assert!(
-            matches!(e, Error::InvalidArgument(m) if m.contains(needle)),
-            "{what}: expected InvalidArgument naming {needle:?}, got {e}"
-        );
-    }
-
-    /// **I176 — co-signatures are verified.** A co-signature over a different
-    /// envelope, a duplicate co-signer, and a co-signer equal to the primary
-    /// are each refused, before any write; a co-signed row round-trips its
-    /// co-signatures byte-exact through the signed since-read, and a
-    /// byte-identical re-put is the #861 no-op. Widening and community
-    /// revocation both; the family revocation's verify gate too.
-    pub async fn i176_cosignatures_are_verified(d: &dyn FederationDirectory, tag: &str) {
-        let (room, alice, bob) = make_room(d, tag, consensus_protocol::MAJORITY).await;
-        let carol = format!("{tag}-carol");
-        let dave = format!("{tag}-dave");
-        user(d, &carol).await;
-        user(d, &dave).await;
-        let t1 = at("2026-03-01T00:00:00Z");
-        let t2 = at("2026-03-02T00:00:00Z");
-
-        // ── widening: the refusals, none of which stores a row ──────────
-        let other = ts::sign_community_membership_widening(
-            &alice,
-            widening(&room, &dave, at("2026-02-01T00:00:00Z"), None),
-        );
-        let mut foreign = other.clone();
-        ts::cosign_community_membership_widening(&mut foreign, &bob);
-        let mut wrong_env =
-            ts::sign_community_membership_widening(&alice, widening(&room, &dave, t1, None));
-        wrong_env.cosignatures = foreign.cosignatures.clone();
-        let e = d
-            .put_community_membership_widening_consented(wrong_env)
-            .await
-            .expect_err("I176: a co-signature over another envelope");
-        assert_eq!(
-            unverified_signer(&e),
-            bob,
-            "{tag} I176: names the co-signer"
-        );
-
-        let mut dup =
-            ts::sign_community_membership_widening(&alice, widening(&room, &dave, t1, None));
-        ts::cosign_community_membership_widening(&mut dup, &bob);
-        ts::cosign_community_membership_widening(&mut dup, &bob);
-        let e = d
-            .put_community_membership_widening_consented(dup)
-            .await
-            .expect_err("I176: a duplicate co-signer");
-        assert_invalid(&e, "duplicate co-signer", "widening duplicate");
-
-        let mut selfco =
-            ts::sign_community_membership_widening(&alice, widening(&room, &dave, t1, None));
-        ts::cosign_community_membership_widening(&mut selfco, &alice);
-        let e = d
-            .put_community_membership_widening_consented(selfco)
-            .await
-            .expect_err("I176: the primary as its own co-signer");
-        assert_invalid(&e, "is the primary signer", "widening self co-sign");
-        assert!(
-            !active(d, &room).await.contains(&dave),
-            "{tag} I176: no refused widening stored a row"
-        );
-
-        // ── widening: the co-signed row round-trips byte-exact ──────────
-        let mut good =
-            ts::sign_community_membership_widening(&alice, widening(&room, &carol, t1, None));
-        ts::cosign_community_membership_widening(&mut good, &bob);
-        d.put_community_membership_widening_consented(good.clone())
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I176: a co-signed widening: {e}"));
-        // #861 — the byte-identical re-put is a no-op, not a refusal.
-        d.put_community_membership_widening_consented(good.clone())
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I176: an identical re-put: {e}"));
-        let served: Vec<_> = d
-            .list_signed_community_membership_widenings_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|w| {
-                w.widening.community_membership_widening.community_key_id == room
-                    && w.widening.community_membership_widening.member_key_id == carol
-            })
-            .collect();
-        assert_eq!(served.len(), 1, "{tag} I176: one widening row");
-        let mut expect = good.clone();
-        expect.community_membership_widening.persist_row_hash = served[0]
-            .widening
-            .community_membership_widening
-            .persist_row_hash
-            .clone();
-        assert_eq!(
-            serde_json::to_vec(&served[0].widening).unwrap(),
-            serde_json::to_vec(&expect).unwrap(),
-            "{tag} I176: the widening serves its co-signatures byte-exact"
-        );
-        assert_eq!(served[0].widening.cosignatures.len(), 1);
-        crate::federation::verify_community_membership_widening_admission(d, &served[0].widening)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I176: the served widening re-verifies: {e}"));
-        let signers = d.community_roster_signers(&room).await.unwrap();
-        let w = signers
-            .widening_signers
-            .iter()
-            .find(|s| s.member_key_id == carol)
-            .expect("carol's widening signer");
-        assert_eq!(w.authority_key_id.as_deref(), Some(alice.as_str()));
-        assert_eq!(
-            w.cosigner_key_ids,
-            vec![bob.clone()],
-            "{tag} I176: co-signers"
-        );
-
-        // ── community revocation: the same four legs ───────────────────
-        let mut foreign =
-            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t1));
-        ts::cosign_community_membership_revocation(&mut foreign, &bob);
-        let mut wrong_env =
-            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
-        wrong_env.cosignatures = foreign.cosignatures.clone();
-        let e = d
-            .put_community_membership_revocation(wrong_env)
-            .await
-            .expect_err("I176: a revocation co-signature over another envelope");
-        assert_eq!(unverified_signer(&e), bob);
-
-        let mut dup =
-            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
-        ts::cosign_community_membership_revocation(&mut dup, &bob);
-        ts::cosign_community_membership_revocation(&mut dup, &bob);
-        let e = d
-            .put_community_membership_revocation(dup)
-            .await
-            .expect_err("I176: a duplicate revocation co-signer");
-        assert_invalid(&e, "duplicate co-signer", "revocation duplicate");
-
-        let mut selfco =
-            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
-        ts::cosign_community_membership_revocation(&mut selfco, &alice);
-        let e = d
-            .put_community_membership_revocation(selfco)
-            .await
-            .expect_err("I176: the primary as its own revocation co-signer");
-        assert_invalid(&e, "is the primary signer", "revocation self co-sign");
-        assert!(
-            active(d, &room).await.contains(&carol),
-            "{tag} I176: no refused revocation stored a row"
-        );
-
-        let mut good_rev =
-            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
-        ts::cosign_community_membership_revocation(&mut good_rev, &bob);
-        d.put_community_membership_revocation(good_rev.clone())
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I176: a co-signed revocation: {e}"));
-        d.put_community_membership_revocation(good_rev.clone())
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I176: an identical revocation re-put: {e}"));
-        let served: Vec<_> = d
-            .list_signed_community_membership_revocations_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|r| {
-                r.revocation
-                    .community_membership_revocation
-                    .community_key_id
-                    == room
-                    && r.revocation
-                        .community_membership_revocation
-                        .removed_identity_key_id
-                        == carol
-            })
-            .collect();
-        assert_eq!(served.len(), 1, "{tag} I176: one revocation row");
-        let mut expect = good_rev.clone();
-        expect.community_membership_revocation.persist_row_hash = served[0]
-            .revocation
-            .community_membership_revocation
-            .persist_row_hash
-            .clone();
-        assert_eq!(
-            serde_json::to_vec(&served[0].revocation).unwrap(),
-            serde_json::to_vec(&expect).unwrap(),
-            "{tag} I176: the revocation serves its co-signatures byte-exact"
-        );
-        let signers = d.community_roster_signers(&room).await.unwrap();
-        let r = signers
-            .revocation_signers
-            .iter()
-            .find(|s| s.member_key_id == carol)
-            .expect("carol's revocation signer");
-        assert_eq!(r.cosigner_key_ids, vec![bob.clone()]);
-        assert!(!active(d, &room).await.contains(&carol));
-
-        // ── family revocation: the verify gate (no family needed) ──────
-        let fam_rev = || crate::federation::types::FamilyMembershipRevocation {
-            family_key_id: format!("{tag}-fam"),
-            removed_identity_key_id: carol.clone(),
-            removed_at: t2,
-            effective_at: t2,
-            reason: None,
-            witness_set: vec![],
-            persist_row_hash: String::new(),
-        };
-        let mut ok = ts::sign_family_membership_revocation(&alice, fam_rev());
-        ts::cosign_family_membership_revocation(&mut ok, &bob);
-        crate::federation::verify_family_membership_revocation_admission(d, &ok)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I176: a co-signed family revocation: {e}"));
-        let mut dup = ok.clone();
-        ts::cosign_family_membership_revocation(&mut dup, &bob);
-        let e = crate::federation::verify_family_membership_revocation_admission(d, &dup)
-            .await
-            .expect_err("I176: a duplicate family co-signer");
-        assert_invalid(&e, "duplicate co-signer", "family duplicate");
-        let mut selfco = ts::sign_family_membership_revocation(&alice, fam_rev());
-        ts::cosign_family_membership_revocation(&mut selfco, &alice);
-        let e = crate::federation::verify_family_membership_revocation_admission(d, &selfco)
-            .await
-            .expect_err("I176: the family primary as its own co-signer");
-        assert_invalid(&e, "is the primary signer", "family self co-sign");
-        let mut wrong_env = ts::sign_family_membership_revocation(&alice, fam_rev());
-        let mut moved = fam_rev();
-        moved.effective_at = t1;
-        let mut foreign = ts::sign_family_membership_revocation(&alice, moved);
-        ts::cosign_family_membership_revocation(&mut foreign, &bob);
-        wrong_env.cosignatures = foreign.cosignatures;
-        let e = crate::federation::verify_family_membership_revocation_admission(d, &wrong_env)
-            .await
-            .expect_err("I176: a family co-signature over another envelope");
-        assert_eq!(unverified_signer(&e), bob);
-    }
+    // v62 (E4, flip wave 2): I176 ("co-signatures are verified": a
+    // co-signature over another envelope, a duplicate co-signer, the primary
+    // as its own co-signer, and the byte-exact serve of `cosignatures`) is
+    // DELETED: those are the earlier form's `RosterCosignature` proof shapes
+    // (T1.api.md §3, "delete"). In edition 2 each signer is its own voice,
+    // a statement the door verifies (`edition2_statement_invalid`).
 
     /// **I1524 (fold half; CIRISPersist#1200) — a held removal stands.** A
     /// removal admitted on a moderator's standing before the door refused it
@@ -1025,7 +830,8 @@ pub mod bodies {
             moderators_of, DELEGATION_SCOPE_MODERATE, DELEGATION_SCOPE_REVIEW,
             DELEGATION_SCOPE_TAKEDOWN,
         };
-        use crate::federation::types::{attestation_type, SignedAttestation};
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::types::attestation_type;
 
         for (i, protocol) in ["majority", "unanimous", "quorum:3/4"].iter().enumerate() {
             let tag = format!("{tag}-{i}");
@@ -1093,10 +899,11 @@ pub mod bodies {
                     }),
                 )
             };
+            // v62 (E4): each row is its signer's edition-2 statement; its id
+            // is the node's.
             let row = review(plain, &format!("{tag}-plain"));
-            let id = row.attestation_id.clone();
-            let err = d
-                .put_attestation(SignedAttestation { attestation: row })
+            let id = e2::rid(&e2::row_of(&row, plain));
+            let err = e2::try_put_row(d, &row, plain)
                 .await
                 .expect_err("I1522: a plain member holds no review duty");
             assert_eq!(
@@ -1105,15 +912,13 @@ pub mod bodies {
                 "I1522 {protocol}: {err}"
             );
             assert!(d.get_attestation(&id).await.unwrap().is_none());
-            d.put_attestation(SignedAttestation {
-                attestation: review(founder, &format!("{tag}-founder")),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("I1522 {protocol}: the founder reviews: {e}"));
+            e2::try_put_row(d, &review(founder, &format!("{tag}-founder")), founder)
+                .await
+                .unwrap_or_else(|e| panic!("I1522 {protocol}: the founder reviews: {e}"));
 
             // The founder appoints one duty; only that duty moves.
-            let edge = |granter: &str, grantee: &str, id: &str| SignedAttestation {
-                attestation: signed_row(
+            let edge = |granter: &str, grantee: &str, id: &str| {
+                signed_row(
                     granter,
                     grantee,
                     attestation_type::DELEGATES_TO,
@@ -1122,9 +927,9 @@ pub mod bodies {
                         "scope": [DELEGATION_SCOPE_MODERATE],
                         "sub_delegation": false,
                     }),
-                ),
+                )
             };
-            d.put_attestation(edge(founder, modk, &format!("{tag}-appoint")))
+            e2::try_put_row(d, &edge(founder, modk, &format!("{tag}-appoint")), founder)
                 .await
                 .unwrap_or_else(|e| panic!("I1522 {protocol}: the appointment: {e}"));
             assert!(
@@ -1141,9 +946,8 @@ pub mod bodies {
 
             // A plain member's own edge roots nothing. The row may or may not
             // be stored; what it must not do is confer the duty.
-            let _ = d
-                .put_attestation(edge(plain, x, &format!("{tag}-self-appoint")))
-                .await;
+            let _ =
+                e2::try_put_row(d, &edge(plain, x, &format!("{tag}-self-appoint")), plain).await;
             assert!(
                 !is_named_moderator(d, x, &room, DELEGATION_SCOPE_MODERATE)
                     .await
@@ -1246,15 +1050,6 @@ mod run {
                     super::super::bodies::i182_declared_protocols(
                         &d as &dyn FederationDirectory,
                         &format!("i182-{}", super::suffix()),
-                    )
-                    .await
-                }
-                #[tokio::test]
-                async fn i176() {
-                    let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i176_cosignatures_are_verified(
-                        &d as &dyn FederationDirectory,
-                        &format!("i176-{}", super::suffix()),
                     )
                     .await
                 }

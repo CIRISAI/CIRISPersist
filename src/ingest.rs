@@ -569,13 +569,16 @@ where
         let mut canonical: Option<bool> = None;
         for event in &env.events {
             let BatchEvent::CompleteTrace { trace, .. } = event;
-            match self
-                .backend
-                .purge_tombstoned(
-                    crate::federation::steward_purge::PurgePlane::Trace.as_str(),
-                    &trace.trace_id,
-                )
-                .await
+            // v62.0.0 (wave GC2; CC rc21 ruling 8, CC 4.5.3) — a tombstone is a
+            // deletion duty while it STANDS: one an admitted reversal lifted
+            // declines nothing, and the re-offered trace is taken again
+            // (`takedown_tombstone::standing_tombstone`).
+            match crate::federation::takedown_tombstone::standing_tombstone(
+                self.backend.as_dyn_directory(),
+                crate::federation::steward_purge::PurgePlane::Trace.as_str(),
+                &trace.trace_id,
+            )
+            .await
             {
                 Ok(Some(notice_id)) => {
                     // INTERIM (Codex round 4 on PR #1057) — a trace a PROVEN
@@ -712,12 +715,31 @@ where
         // v62.0.0 (wave P7) — a statement-carrying event's `trace_blob` (the
         // trace's exact bytes, base64) is decoded and parsed into its `trace`;
         // `carried[i]` keeps the statement and the bytes as received.
-        #[allow(clippy::type_complexity)]
-        let (rewritten, carried): (Option<Vec<u8>>, Vec<Option<(Vec<u8>, Vec<u8>)>>) =
-            match expand_trace_blobs(bytes)? {
-                Some((r, c)) => (Some(r), c),
-                None => (None, Vec::new()),
-            };
+        //    A SEALED row-form event (a `self` / `family` trace, its blob an
+        //    at-rest envelope) carries no readable trace: it is taken out of
+        //    the typed batch, its row half checked here, and admitted with the
+        //    others in step 2 (its projection waits for this node's DEK).
+        let ExpandedBatch {
+            rewritten,
+            carried,
+            sealed,
+            sealed_only,
+        } = expand_trace_blobs(bytes)?.unwrap_or_default();
+        for (statement, blob) in &sealed {
+            check_trace_row_shape(statement, blob)?;
+        }
+        if sealed_only {
+            let mut signatures_verified = 0usize;
+            for (statement, blob) in &sealed {
+                admit_trace_statement(self.backend, None, statement, blob).await?;
+                signatures_verified += 1;
+            }
+            return Ok(BatchSummary {
+                envelopes_processed: sealed.len(),
+                signatures_verified,
+                ..BatchSummary::default()
+            });
+        }
         let env = BatchEnvelope::from_json(rewritten.as_deref().unwrap_or(bytes))?;
 
         // 2. Verify each CompleteTrace signature. Mission constraint
@@ -768,11 +790,16 @@ where
                 }
             }
         }
+        for (statement, blob) in &sealed {
+            admit_trace_statement(self.backend, None, statement, blob).await?;
+            signatures_verified += 1;
+        }
         let mut statement_signers: Vec<Option<String>> = vec![None; env.events.len()];
         for (i, event) in env.events.iter().enumerate() {
             let BatchEvent::CompleteTrace { trace, .. } = event;
             if let Some((statement, blob)) = carried.get(i).and_then(Option::as_ref) {
-                let iss = admit_trace_statement(self.backend, trace, statement, blob).await?;
+                let (iss, _held) =
+                    admit_trace_statement(self.backend, Some(trace), statement, blob).await?;
                 statement_signers[i] = Some(iss);
                 signatures_verified += 1;
             }
@@ -869,6 +896,13 @@ where
         for (i, event) in env.events.iter().enumerate() {
             match event {
                 BatchEvent::CompleteTrace { trace, .. } => {
+                    // v62.0.0 (wave P7) — a trace that arrived as its row: its
+                    // `trace_events` were projected in the row's own write
+                    // (`project_trace_row_from_held_blob`), never twice.
+                    if matches!(statement_signers.get(i), Some(Some(_))) {
+                        env_idx += trace.components.len();
+                        continue;
+                    }
                     // v0.4.6 (CIRISPersist#22) — typed Schema/Store
                     // split. `decompose` returns `store::Error`, which
                     // can be `Schema(SchemaError)` for missing/wrong
@@ -1005,6 +1039,27 @@ where
                                     if !held {
                                         reason = crate::scope::ScopeRefusalReason::MembershipUnresolved;
                                     }
+                                }
+                                // v62.0.0 (wave GC2; lead ruling on row 35, CC 2.7.3) —
+                                // "not a member" reads the roster (OTHER rows), so the
+                                // batch door no longer refuses on it. The trace's
+                                // edition-2 row (`trace:complete:v1`, through
+                                // `put_statement`) is its concluded form, and the fold
+                                // decides it there. Only the unresolved roster (a
+                                // retryable wait for a roster not held) stays here.
+                                if !matches!(
+                                    reason,
+                                    crate::scope::ScopeRefusalReason::MembershipUnresolved
+                                ) {
+                                    tracing::debug!(
+                                        write_path = "trace_ingest",
+                                        scope = %scope,
+                                        reason = %reason.kind(),
+                                        target = ?row.cohort_target_id,
+                                        "ciris-persist: write-scope membership is the fold's (row 35)"
+                                    );
+                                    env_idx += 1;
+                                    continue;
                                 }
                                 // §9.3 — Layer-1 write-side refusal counter.
                                 tracing::warn!(
@@ -1929,20 +1984,68 @@ pub fn parse_trace_blob(blob: &[u8]) -> Result<serde_json::Value, IngestError> {
     Ok(v)
 }
 
-/// v62.0.0 (wave P7) — the statement-carrying events of a raw batch: each
-/// event with a `statement` must carry its `trace_blob` (base64 of the blob's
-/// exact bytes) and no inline `trace`; the blob is parsed and put in place as
-/// the event's `trace`, so the typed envelope parses as before. Returns the
-/// rewritten batch bytes and, per event, `(statement bytes, blob bytes)`.
-/// `None` when no event carries a statement (the batch is untouched).
+/// v62.0.0 (wave P7) — refusal: a trace row's cohort and its blob's form
+/// disagree. A `self` / `family` trace blob is SEALED (an at-rest envelope,
+/// `Engine::seal_trace`), and any other trace blob is plaintext JSON.
+pub const TRACE_BLOB_SEAL_MISMATCH: &str = "trace_blob_seal_mismatch";
+
+/// v62.0.0 (wave P7; G0's fold) — HELD reason: a trace row whose blob this
+/// node does not hold yet concludes nothing (no `trace_events`); it re-folds
+/// when the blob lands (`fold::blob_slot`).
+pub const TRACE_BLOB_NOT_HELD: &str = "trace_blob_not_held";
+
+/// v62.0.0 (wave P7; G0's fold) — HELD reason: a SEALED trace blob this node
+/// holds but cannot open (no at-rest grant for it: no DEK). The binding and
+/// the projection wait; the row re-folds when a grant for the blob lands
+/// (`put_at_rest_grant(s)`) or the blob is re-stored.
+pub const TRACE_DEK_NOT_HELD: &str = "trace_dek_not_held";
+
+/// Is `blob` a sealed at-rest envelope (its magic prefix)?
+#[must_use]
+pub fn is_sealed_trace_blob(blob: &[u8]) -> bool {
+    blob.starts_with(&crate::federation::at_rest_cascade::AT_REST_ENVELOPE_MAGIC)
+}
+
+/// Does `cohort_scope` seal its blobs (`self`, `family`: the floor never
+/// records them plaintext)?
+pub(crate) fn cohort_seals(cohort_scope: &str) -> bool {
+    use crate::federation::types::cohort_scope::CryptoTier;
+    crate::federation::StorageFloor::resolved(CryptoTier::Plaintext)
+        .check_scope(cohort_scope)
+        .is_err()
+}
+
+/// v62.0.0 (wave P7) — what [`expand_trace_blobs`] made of a raw batch.
+#[derive(Debug, Default)]
+pub(crate) struct ExpandedBatch {
+    /// The batch with each PLAINTEXT row-form event's blob parsed into its
+    /// `trace`, and every SEALED row-form event removed; `None` when nothing
+    /// was rewritten.
+    pub(crate) rewritten: Option<Vec<u8>>,
+    /// Per remaining event: `(statement, blob)` when it is in the row form.
+    pub(crate) carried: Vec<Option<(Vec<u8>, Vec<u8>)>>,
+    /// The sealed row-form events: `(statement, envelope bytes)`. They carry
+    /// no readable trace; the statement door admits each, and its projection
+    /// waits for this node's DEK (`trace_dek_not_held`).
+    pub(crate) sealed: Vec<(Vec<u8>, Vec<u8>)>,
+    /// No event is left for the typed envelope (every event was sealed).
+    pub(crate) sealed_only: bool,
+}
+
+/// v62.0.0 (wave P7) — the row-form events of a raw batch. Each event with a
+/// `statement` must carry its `trace_blob` (base64 of the blob's exact bytes)
+/// and no inline `trace`.
+/// - A plaintext blob is parsed (no signature members) and put in place as
+///   the event's `trace`, so the typed envelope parses as before.
+/// - A sealed blob (an at-rest envelope) cannot be read here: the event is
+///   taken out of the batch and returned in `sealed`.
+///
+/// `None` when no event is in the row form (the batch is untouched).
 ///
 /// # Errors
 /// [`TRACE_STATEMENT_INVALID`], [`TRACE_BLOB_CARRIES_SIGNATURE`]; a batch
 /// that is not JSON as [`IngestError::Schema`].
-#[allow(clippy::type_complexity)]
-fn expand_trace_blobs(
-    bytes: &[u8],
-) -> Result<Option<(Vec<u8>, Vec<Option<(Vec<u8>, Vec<u8>)>>)>, IngestError> {
+pub(crate) fn expand_trace_blobs(bytes: &[u8]) -> Result<Option<ExpandedBatch>, IngestError> {
     let mentions = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
     if !mentions(b"\"statement\"") && !mentions(b"\"trace_blob\"") {
         return Ok(None);
@@ -1955,17 +2058,28 @@ fn expand_trace_blobs(
     else {
         return Ok(None);
     };
-    let mut carried = Vec::with_capacity(events.len());
+    let mut out = ExpandedBatch::default();
+    let mut kept: Vec<serde_json::Value> = Vec::with_capacity(events.len());
     let mut any = false;
-    for (i, event) in events.iter_mut().enumerate() {
+    for (i, mut event) in std::mem::take(events).into_iter().enumerate() {
         let Some(obj) = event.as_object_mut() else {
-            carried.push(None);
+            out.carried.push(None);
+            kept.push(event);
             continue;
         };
-        let statement = obj.get("statement").and_then(serde_json::Value::as_str);
-        let blob = obj.get("trace_blob").and_then(serde_json::Value::as_str);
+        let statement = obj
+            .get("statement")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let blob = obj
+            .get("trace_blob")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         match (statement, blob) {
-            (None, None) => carried.push(None),
+            (None, None) => {
+                out.carried.push(None);
+                kept.push(event);
+            }
             (None, Some(_)) => {
                 return Err(trace_statement_refused(
                     TRACE_STATEMENT_INVALID,
@@ -1988,47 +2102,46 @@ fn expand_trace_blobs(
                         format!("event {i} carries both a trace_blob and an inline trace"),
                     ));
                 }
-                let statement = decode_b64_member("statement", st)?;
-                let blob = decode_b64_member("trace_blob", b)?;
+                let statement = decode_b64_member("statement", &st)?;
+                let blob = decode_b64_member("trace_blob", &b)?;
+                any = true;
+                if is_sealed_trace_blob(&blob) {
+                    out.sealed.push((statement, blob));
+                    continue;
+                }
                 let trace = parse_trace_blob(&blob)?;
                 obj.remove("trace_blob");
                 obj.insert("trace".to_owned(), trace);
-                carried.push(Some((statement, blob)));
-                any = true;
+                out.carried.push(Some((statement, blob)));
+                kept.push(event);
             }
         }
     }
     if !any {
         return Ok(None);
     }
-    let rewritten = serde_json::to_vec(&raw).map_err(|e| IngestError::Schema(e.into()))?;
-    Ok(Some((rewritten, carried)))
+    out.sealed_only = kept.is_empty();
+    *events = kept;
+    out.rewritten = Some(serde_json::to_vec(&raw).map_err(|e| IngestError::Schema(e.into()))?);
+    Ok(Some(out))
 }
 
-/// v62.0.0 (wave P7) — **the content binding**, pure (no key read, no
-/// verify; the statement door verifies the same bytes next): the statement
-/// is a trace row whose payload commits to `blob`, the trace blob's bytes
-/// EXACTLY as received (`trace` is their parse). Returns the statement's
-/// `iss` (the agent's identity-ref), which the door then checks the signing
-/// key against (the key-of-issuer check).
+/// v62.0.0 (wave P7) — **the row half of the content binding**, pure: the
+/// statement is a trace row, and its manifest and `evidence_refs` name
+/// `blob`, the blob's bytes EXACTLY as received (for a sealed trace, the
+/// at-rest envelope). Its cohort and the blob's form agree: a `self` /
+/// `family` row names a sealed blob, any other row a plaintext one. Returns
+/// `(iss, payload)`.
 ///
 /// # Errors
 /// [`TRACE_STATEMENT_INVALID`] for a statement that is no trace row;
-/// [`TRACE_STATEMENT_CONTENT_MISMATCH`] naming the first member that
-/// disagrees.
-pub fn check_trace_statement_binding(
+/// [`TRACE_STATEMENT_CONTENT_MISMATCH`]; [`TRACE_BLOB_SEAL_MISMATCH`].
+pub fn check_trace_row_shape(
     statement: &[u8],
-    trace: &CompleteTrace,
     blob: &[u8],
-) -> Result<String, IngestError> {
+) -> Result<(String, ciris_verify_core::cde::Value), IngestError> {
     use ciris_verify_core::cde::Value;
     let invalid = |why: &str| trace_statement_refused(TRACE_STATEMENT_INVALID, why.to_owned());
-    let mismatch = |member: &str, detail: String| {
-        trace_statement_refused(
-            TRACE_STATEMENT_CONTENT_MISMATCH,
-            format!("trace_id={} {member}: {detail}", trace.trace_id),
-        )
-    };
     let (protected, payload) = crate::federation::edition2::liveness::statement_parts(statement)
         .ok_or_else(|| {
             invalid("the statement is not a COSE_Sign1 with a decodable header and payload")
@@ -2047,14 +2160,109 @@ pub fn check_trace_statement_binding(
         .and_then(Value::as_text)
         .ok_or_else(|| invalid("the statement carries no iss"))?
         .to_owned();
-    let text = |member: &str| payload.get_text(member).and_then(Value::as_text);
-
-    if text("dimension") != Some(TRACE_COMPLETE_DIMENSION) {
+    let trace_id = payload
+        .get_text("trace_id")
+        .and_then(Value::as_text)
+        .unwrap_or("?")
+        .to_owned();
+    let mismatch = |member: &str, detail: String| {
+        trace_statement_refused(
+            TRACE_STATEMENT_CONTENT_MISMATCH,
+            format!("trace_id={trace_id} {member}: {detail}"),
+        )
+    };
+    let dimension = payload.get_text("dimension").and_then(Value::as_text);
+    if dimension != Some(TRACE_COMPLETE_DIMENSION) {
         return Err(mismatch(
             "dimension",
-            format!("{:?}, not {TRACE_COMPLETE_DIMENSION}", text("dimension")),
+            format!("{dimension:?}, not {TRACE_COMPLETE_DIMENSION}"),
         ));
     }
+    let scope = payload
+        .get_text("cohort_scope")
+        .and_then(Value::as_text)
+        .unwrap_or("federation");
+    if cohort_seals(scope) != is_sealed_trace_blob(blob) {
+        return Err(trace_statement_refused(
+            TRACE_BLOB_SEAL_MISMATCH,
+            format!(
+                "trace_id={trace_id}: a {scope:?} trace's blob must be {} (a self/family \
+                 trace is sealed through Engine::seal_trace)",
+                if cohort_seals(scope) {
+                    "a sealed at-rest envelope"
+                } else {
+                    "plaintext"
+                }
+            ),
+        ));
+    }
+    // The bytes as received: hashed, never re-canonicalised (CC ruling).
+    let digest: [u8; 32] = Sha256::digest(blob).into();
+    let Some(manifest) = payload.get_text("manifest") else {
+        return Err(mismatch("manifest", "absent".to_owned()));
+    };
+    let m_text = |member: &str| manifest.get_text(member).and_then(Value::as_text);
+    let m_uint = |member: &str| manifest.get_text(member).and_then(Value::as_u64);
+    if m_text("schema") != Some("trace_manifest:v1") {
+        return Err(mismatch(
+            "manifest.schema",
+            format!("{:?}", m_text("schema")),
+        ));
+    }
+    let want_hash = format!("sha256:{}", hex::encode(digest));
+    if m_text("content_hash") != Some(want_hash.as_str()) {
+        return Err(mismatch(
+            "manifest.content_hash",
+            format!(
+                "{:?}; the blob's bytes hash to {want_hash}",
+                m_text("content_hash")
+            ),
+        ));
+    }
+    if m_uint("byte_len") != u64::try_from(blob.len()).ok() {
+        return Err(mismatch(
+            "manifest.byte_len",
+            format!("{:?} vs {}", m_uint("byte_len"), blob.len()),
+        ));
+    }
+    let names_content = payload
+        .get_text("evidence_refs")
+        .and_then(Value::as_array)
+        .is_some_and(|refs| {
+            refs.iter().any(|r| match r.as_array() {
+                Some([alg, d]) => {
+                    alg.as_i64() == Some(-16) && d.as_bytes() == Some(digest.as_slice())
+                }
+                _ => false,
+            })
+        });
+    if !names_content {
+        return Err(mismatch(
+            "evidence_refs",
+            format!("no [-16, {}] entry", hex::encode(digest)),
+        ));
+    }
+    Ok((iss, payload))
+}
+
+/// v62.0.0 (wave P7) — **the trace half of the content binding**, pure: the
+/// row's payload members agree with `trace`, the blob's (opened) parse.
+///
+/// # Errors
+/// [`TRACE_STATEMENT_CONTENT_MISMATCH`] naming the first member that
+/// disagrees.
+pub fn check_trace_row_members(
+    payload: &ciris_verify_core::cde::Value,
+    trace: &CompleteTrace,
+) -> Result<(), IngestError> {
+    use ciris_verify_core::cde::Value;
+    let mismatch = |member: &str, detail: String| {
+        trace_statement_refused(
+            TRACE_STATEMENT_CONTENT_MISMATCH,
+            format!("trace_id={} {member}: {detail}", trace.trace_id),
+        )
+    };
+    let text = |member: &str| payload.get_text(member).and_then(Value::as_text);
     if text("trace_id") != Some(trace.trace_id.as_str()) {
         return Err(mismatch("trace_id", format!("{:?}", text("trace_id"))));
     }
@@ -2092,44 +2300,19 @@ pub fn check_trace_statement_binding(
             ),
         ));
     }
-
-    // The bytes as received: hashed, never re-canonicalised (CC ruling).
-    let digest: [u8; 32] = Sha256::digest(blob).into();
-    let Some(manifest) = payload.get_text("manifest") else {
-        return Err(mismatch("manifest", "absent".to_owned()));
+    let manifest = payload.get_text("manifest");
+    let m_text = |member: &str| {
+        manifest
+            .and_then(|m| m.get_text(member))
+            .and_then(Value::as_text)
     };
-    let m_text = |member: &str| manifest.get_text(member).and_then(Value::as_text);
-    let m_uint = |member: &str| manifest.get_text(member).and_then(Value::as_u64);
-    if m_text("schema") != Some("trace_manifest:v1") {
-        return Err(mismatch(
-            "manifest.schema",
-            format!("{:?}", m_text("schema")),
-        ));
-    }
-    let want_hash = format!("sha256:{}", hex::encode(digest));
-    if m_text("content_hash") != Some(want_hash.as_str()) {
-        return Err(mismatch(
-            "manifest.content_hash",
-            format!(
-                "{:?}; the blob's bytes hash to {want_hash}",
-                m_text("content_hash")
-            ),
-        ));
-    }
-    if m_uint("byte_len") != u64::try_from(blob.len()).ok() {
-        return Err(mismatch(
-            "manifest.byte_len",
-            format!("{:?} vs {}", m_uint("byte_len"), blob.len()),
-        ));
-    }
-    if m_uint("component_count") != u64::try_from(trace.components.len()).ok() {
+    let component_count = manifest
+        .and_then(|m| m.get_text("component_count"))
+        .and_then(Value::as_u64);
+    if component_count != u64::try_from(trace.components.len()).ok() {
         return Err(mismatch(
             "manifest.component_count",
-            format!(
-                "{:?} vs {}",
-                m_uint("component_count"),
-                trace.components.len()
-            ),
+            format!("{component_count:?} vs {}", trace.components.len()),
         ));
     }
     if m_text("run_kind") != trace.signed_run_kind() {
@@ -2138,104 +2321,115 @@ pub fn check_trace_statement_binding(
             format!("{:?} vs {:?}", m_text("run_kind"), trace.signed_run_kind()),
         ));
     }
-    let names_content = payload
-        .get_text("evidence_refs")
-        .and_then(Value::as_array)
-        .is_some_and(|refs| {
-            refs.iter().any(|r| match r.as_array() {
-                Some([alg, d]) => {
-                    alg.as_i64() == Some(-16) && d.as_bytes() == Some(digest.as_slice())
-                }
-                _ => false,
-            })
-        });
-    if !names_content {
-        return Err(mismatch(
-            "evidence_refs",
-            format!("no [-16, {}] entry", hex::encode(digest)),
-        ));
-    }
+    Ok(())
+}
+
+/// v62.0.0 (wave P7) — **the content binding of a PLAINTEXT trace**, pure
+/// (no key read, no verify; the statement door verifies the same bytes
+/// next): [`check_trace_row_shape`] then [`check_trace_row_members`], with
+/// `trace` the parse of `blob`. Returns the statement's `iss`.
+///
+/// # Errors
+/// As the two halves.
+pub fn check_trace_statement_binding(
+    statement: &[u8],
+    trace: &CompleteTrace,
+    blob: &[u8],
+) -> Result<String, IngestError> {
+    let (iss, payload) = check_trace_row_shape(statement, blob)?;
+    check_trace_row_members(&payload, trace)?;
     Ok(iss)
 }
 
-/// v62.0.0 (wave P7; CC 2.6.1, 3.1.5; the ruling "a replicating trace is a
-/// forward-form row", the manifest form only) — **admit a trace's
-/// `trace:complete:v1` row and keep its blob.**
+/// v62.0.0 (wave P7; CC 2.6.1, 3.1.5; the rulings "a replicating trace is a
+/// forward-form row", "the manifest form is the only form", option A for
+/// sealed traces) — **admit a trace's `trace:complete:v1` row and keep its
+/// blob.**
 ///
-/// 1. the content binding ([`check_trace_statement_binding`], pure);
-/// 2. **the edition-2 statement door**
-///    ([`crate::federation::edition2::ingest::put_statement`], tier
-///    `federation`): Verify's reader (the composite signature under the key
-///    `kid` names; the key-of-issuer check, `kid_not_of_iss`), the key plane's
-///    liveness at the row's own `asserted_at`, and every attestation gate
-///    (`federation_trace_dimension_invalid`: the self-emission rule and the
-///    manifest shape; `trace_run_kind_mock`; the closed payload list of
-///    `trace:{form}:{version}`);
-/// 3. only a `Row` (new or held) or a further `Voice` of the held row is
-///    accepted;
-/// 4. the blob's bytes, exactly as received, go to the blob plane under
-///    their SHA-256 (the digest the row's `evidence_refs` names), through
-///    [`Backend::store_trace_blob`].
+/// 1. The row half of the binding ([`check_trace_row_shape`], pure); for a
+///    plaintext blob also the trace half ([`check_trace_row_members`]
+///    against `trace`).
+/// 2. The blob's bytes, exactly as received, go to the blob plane under
+///    their SHA-256 ([`Backend::store_trace_blob`]; a sealed envelope is
+///    stored verbatim at the sealed floor) BEFORE the row, so the row's own
+///    write can project from them.
+/// 3. **The edition-2 statement door** (`put_statement`, tier `federation`):
+///    Verify's reader (the key-of-issuer check), the key plane's liveness at
+///    the row's own `asserted_at`, every attestation gate, and the trace
+///    projection ([`project_trace_row_from_held_blob`]: the row's
+///    `trace_events` in its own write; a sealed blob this node cannot open
+///    holds the row `trace_dek_not_held`).
 ///
-/// No component signature is checked and no earlier-form directory is read.
-/// Returns the row's `iss`.
+/// Returns `(iss, held)`: `held` when the door kept the row concluding
+/// nothing (G0's `Pending`).
 ///
 /// # Errors
-/// [`TRACE_STATEMENT_INVALID`], [`TRACE_STATEMENT_CONTENT_MISMATCH`], the
-/// door's refusals ([`trace_refusal`]); a blob-plane failure as
-/// [`IngestError::Store`].
+/// [`TRACE_STATEMENT_INVALID`], [`TRACE_STATEMENT_CONTENT_MISMATCH`],
+/// [`TRACE_BLOB_SEAL_MISMATCH`], the door's refusals ([`trace_refusal`]); a
+/// blob-plane failure as [`IngestError::Store`].
 pub(crate) async fn admit_trace_statement<B>(
     backend: &B,
-    trace: &CompleteTrace,
+    trace: Option<&CompleteTrace>,
     statement: &[u8],
     blob: &[u8],
-) -> Result<String, IngestError>
+) -> Result<(String, bool), IngestError>
 where
     B: Backend + crate::federation::FederationDirectory + ?Sized,
 {
     use crate::federation::edition2::ingest::{put_statement, StatementOutcome, INGEST_TIER};
-    let iss = check_trace_statement_binding(statement, trace, blob)?;
-    let outcome = Box::pin(put_statement(backend, statement, None, INGEST_TIER))
-        .await
-        .map_err(trace_refusal)?;
-    match outcome {
-        StatementOutcome::Row { .. } | StatementOutcome::Voice { .. } => {}
-        StatementOutcome::KeyPlane { .. } | StatementOutcome::Pending { .. } => {
-            return Err(trace_statement_refused(
-                TRACE_STATEMENT_INVALID,
-                format!(
-                    "trace_id={}: the statement was not admitted as a row",
-                    trace.trace_id
-                ),
-            ));
-        }
+    use ciris_verify_core::cde::Value;
+    let (iss, payload) = check_trace_row_shape(statement, blob)?;
+    if let Some(t) = trace {
+        check_trace_row_members(&payload, t)?;
     }
+    let text = |member: &str| payload.get_text(member).and_then(Value::as_text);
+    let cohort_scope = text("cohort_scope").unwrap_or("federation").to_owned();
+    // The group the blob row names: the family, the room, or for a `self`
+    // trace its owner, the agent's identity (`iss`).
+    let group = text("family_id")
+        .or_else(|| text("community_id"))
+        .map(str::to_owned)
+        .or_else(|| (cohort_scope == "self").then(|| iss.clone()));
     let digest: [u8; 32] = Sha256::digest(blob).into();
     backend
         .store_trace_blob(
             &digest,
             blob.to_vec(),
-            &trace.cohort_scope,
-            trace.cohort_target_id.as_deref(),
+            &cohort_scope,
+            group.as_deref(),
             &iss,
         )
         .await
         .map_err(IngestError::Store)?;
-    Ok(iss)
+    let outcome = Box::pin(put_statement(backend, statement, None, INGEST_TIER))
+        .await
+        .map_err(trace_refusal)?;
+    match outcome {
+        StatementOutcome::Row { .. } | StatementOutcome::Voice { .. } => Ok((iss, false)),
+        StatementOutcome::Pending { .. } => Ok((iss, true)),
+        StatementOutcome::KeyPlane { .. } => Err(trace_statement_refused(
+            TRACE_STATEMENT_INVALID,
+            "the statement was admitted as a key-plane statement, not a trace row".to_owned(),
+        )),
+    }
 }
 
 /// v62.0.0 (wave P7) — **the blob-plane write of a trace blob**, shared by
 /// the sqlite and postgres [`Backend::store_trace_blob`] overrides: the bytes
-/// as received, `Inline`, under their SHA-256, at the trace's cohort, through
+/// as received, `Inline`, under their SHA-256, through
 /// [`crate::federation::BlobStorage::store_blob_local`] (hash-on-write; the
-/// node's holding claim is the claim emitter's, not this door's).
+/// holding claim is the claim emitter's, not this door's).
 ///
-/// The floor is `Plaintext`, which the floor admits for the commons and for
-/// a room. A `self` / `family` trace blob must be sealed (BLOB_ENCRYPTION_AT_REST
-/// §11.1), and the sealed write needs this node's community DEK path, which
-/// the ingest pipeline does not hold: it is NOT stored here (a warning names
-/// it). Its row is admitted and names it by digest; the bytes are this
-/// node's `trace_events` projection until the sealed path lands.
+/// - A plaintext blob is stored at the `Plaintext` floor (the commons, a
+///   room).
+/// - A sealed blob (an at-rest envelope: option A, the producer sealed it
+///   through `put_blob_scoped`) is stored VERBATIM at the
+///   `InvisibleEncrypted` floor (`self`, `family`). This node opens it only
+///   with an at-rest grant for it.
+///
+/// The floor refuses a contradiction (a plaintext `self` blob, a sealed
+/// commons one): never a warning-and-skip. Then every trace row held on this
+/// blob re-folds ([`refold_trace_blob`]).
 ///
 /// # Errors
 /// The blob plane's error, as [`StoreError::Backend`].
@@ -2248,20 +2442,18 @@ pub(crate) async fn store_trace_blob_on<T>(
     author_key_id: &str,
 ) -> Result<(), StoreError>
 where
-    T: crate::federation::BlobStorage + Sync,
+    T: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
 {
     use crate::federation::types::cohort_scope::CryptoTier;
-    let floor = crate::federation::StorageFloor::resolved(CryptoTier::Plaintext);
-    if let Err(e) = floor.check_scope(cohort_scope) {
-        tracing::warn!(
-            sha256 = %hex::encode(sha256),
-            cohort_scope,
-            error = %e,
-            "ciris-persist: trace blob not stored on the blob plane (a self/family blob \
-             must be sealed; the sealed trace path is not built)"
-        );
-        return Ok(());
-    }
+    let tier = if is_sealed_trace_blob(&blob) {
+        CryptoTier::InvisibleEncrypted
+    } else {
+        CryptoTier::Plaintext
+    };
+    let floor = crate::federation::StorageFloor::resolved(tier);
+    floor
+        .check_scope(cohort_scope)
+        .map_err(|e| StoreError::Backend(format!("trace blob floor: {e}")))?;
     store
         .store_blob_local(
             sha256,
@@ -2273,7 +2465,9 @@ where
             group_key_id,
         )
         .await
-        .map_err(|e| StoreError::Backend(format!("trace blob store: {e}")))
+        .map_err(|e| StoreError::Backend(format!("trace blob store: {e}")))?;
+    refold_trace_blob(store, sha256).await;
+    Ok(())
 }
 
 /// v62.0.0 (CC ruling: unsigned ⇒ local, never served) — **the crossing gate
@@ -2467,6 +2661,18 @@ pub fn prepare_trace_row(
     let blob = scrubbed_trace_blob(trace, level)?;
     let parsed: CompleteTrace =
         serde_json::from_slice(&blob).map_err(|e| IngestError::Schema(e.into()))?;
+    // Option A: a self/family trace is sealed before it is signed, which
+    // needs the node's DEK machinery: only `Engine::seal_trace` does that.
+    if cohort_seals(&parsed.cohort_scope) {
+        return Err(trace_statement_refused(
+            TRACE_BLOB_SEAL_MISMATCH,
+            format!(
+                "trace_id={}: a {:?} trace is sealed through Engine::seal_trace \
+                 (Engine.seal_trace_statement), never signed over plaintext",
+                parsed.trace_id, parsed.cohort_scope
+            ),
+        ));
+    }
     let payload = trace_row_payload(&parsed, &blob, iss)?;
     Ok((blob, payload))
 }
@@ -2508,6 +2714,254 @@ pub async fn seal_trace_row(
         statement,
         trace_blob,
     })
+}
+
+/// v62.0.0 (wave P7) — the inline bytes of the blob `sha256` if this node
+/// holds it (a trace blob is stored inline), `None` otherwise.
+///
+/// # Errors
+/// A blob-plane read failure, as `federation_backend`.
+pub(crate) async fn held_inline_blob<T>(
+    store: &T,
+    sha256: &[u8; 32],
+) -> Result<Option<Vec<u8>>, crate::federation::Error>
+where
+    T: crate::federation::BlobStorage + Sync,
+{
+    match store
+        .get_blob(sha256)
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("trace blob read: {e}")))?
+    {
+        Some(crate::federation::BlobBody::Inline(bytes)) => Ok(Some(bytes)),
+        _ => Ok(None),
+    }
+}
+
+/// v62.0.0 (wave P7) — what this node can read of a trace blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TraceBlobOpen {
+    /// Not held here (yet).
+    NotHeld,
+    /// Held; `stored` is the bytes as held (hashed by the row), `plaintext`
+    /// the trace JSON (equal to `stored` for a plaintext blob).
+    Open {
+        /// The bytes as stored and served.
+        stored: Vec<u8>,
+        /// The trace JSON.
+        plaintext: Vec<u8>,
+    },
+    /// Held, sealed, and this node holds no grant to open it.
+    NoDek(String),
+}
+
+/// v62.0.0 (wave P7) — **open a trace blob as this node**, shared by the
+/// sqlite and postgres `AttestationStore::open_trace_blob` impls. A sealed
+/// blob opens through the one viewer read
+/// (`at_rest_cascade::orchestrate::read_any_for_viewer`) as this node's own
+/// key (`node_key_id`); `NotGranted` (no at-rest grant: no DEK) and a node
+/// with no key are [`TraceBlobOpen::NoDek`].
+///
+/// # Errors
+/// A blob-plane read failure other than a missing grant.
+pub(crate) async fn open_trace_blob_on<T>(
+    store: &T,
+    sha256: &[u8; 32],
+) -> Result<TraceBlobOpen, crate::federation::Error>
+where
+    T: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
+{
+    let Some(stored) = held_inline_blob(store, sha256).await? else {
+        return Ok(TraceBlobOpen::NotHeld);
+    };
+    if !is_sealed_trace_blob(&stored) {
+        return Ok(TraceBlobOpen::Open {
+            plaintext: stored.clone(),
+            stored,
+        });
+    }
+    let Some(viewer) = crate::federation::FederationDirectory::node_key_id(store) else {
+        return Ok(TraceBlobOpen::NoDek(
+            "this node has no key to open a sealed trace blob as".to_owned(),
+        ));
+    };
+    match crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer(
+        store, sha256, &viewer, None,
+    )
+    .await
+    {
+        Ok(plaintext) => Ok(TraceBlobOpen::Open { stored, plaintext }),
+        Err(e @ crate::federation::BlobError::NotGranted { .. }) => {
+            Ok(TraceBlobOpen::NoDek(e.to_string()))
+        }
+        Err(e) => Err(crate::federation::Error::Backend(format!(
+            "sealed trace blob open: {e}"
+        ))),
+    }
+}
+
+/// The blob digest a stored trace row names (`evidence_refs[0]`, in the
+/// payload's `[-16, hex]` form or as 64 hex).
+fn trace_row_digest(envelope: &serde_json::Value) -> Option<[u8; 32]> {
+    let first = envelope.get("evidence_refs")?.as_array()?.first()?;
+    let text = match first {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Array(a) if a.len() == 2 && a[0].as_i64() == Some(-16) => {
+            a[1].as_str()?
+        }
+        _ => return None,
+    };
+    <[u8; 32]>::try_from(hex::decode(text).ok()?.as_slice()).ok()
+}
+
+/// v62.0.0 (wave P7) — **a trace row's `trace_events`, from its blob**, pure:
+/// the row half of the binding over `stored` (the bytes the row names), the
+/// opened `plaintext` parsed (no signature members), the trace half against
+/// it, the signer set to the row's attester, then the SAME
+/// [`crate::store::decompose::decompose`] the ingest path runs.
+///
+/// # Errors
+/// The binding's refusal as a named `federation_malformed_row` on plane
+/// `trace`.
+fn trace_projection_of(
+    statement: &[u8],
+    stored: &[u8],
+    plaintext: &[u8],
+    signer: &str,
+) -> Result<crate::store::decompose::Decomposed, crate::federation::Error> {
+    let named = |e: IngestError| match e {
+        IngestError::TraceRefused { kind, detail } => {
+            crate::federation::Error::malformed_row(TRACE_PLANE, kind, detail)
+        }
+        other => crate::federation::Error::malformed_row(
+            TRACE_PLANE,
+            TRACE_STATEMENT_INVALID,
+            other.to_string(),
+        ),
+    };
+    let (_, payload) = check_trace_row_shape(statement, stored).map_err(named)?;
+    let raw = parse_trace_blob(plaintext).map_err(named)?;
+    let mut trace: CompleteTrace = serde_json::from_value(raw).map_err(|e| {
+        crate::federation::Error::malformed_row(
+            TRACE_PLANE,
+            TRACE_STATEMENT_INVALID,
+            format!("the trace blob is no CompleteTrace: {e}"),
+        )
+    })?;
+    check_trace_row_members(&payload, &trace).map_err(named)?;
+    trace.signature_key_id = signer.to_owned();
+    crate::store::decompose::decompose(&trace).map_err(|e| {
+        crate::federation::Error::malformed_row(
+            TRACE_PLANE,
+            TRACE_STATEMENT_INVALID,
+            format!("the trace blob does not decompose: {e}"),
+        )
+    })
+}
+
+/// v62.0.0 (wave P7; G0's fold, option A) — **the trace projection at the
+/// attestation door**, inside the row's fold attempt (every edition-2 row
+/// door: the local statement door, `apply_replicated_statement`, tier
+/// ingest, and G0's re-fold).
+///
+/// - The blob is held and opens: the binding is checked HERE, before the
+///   write (a blob that does not bind refuses the row by name), and the
+///   row's `trace_events` are inserted in its own write.
+/// - The blob is not held: the row is HELD `trace_blob_not_held`, reading
+///   `fold::blob_slot(sha)`; it re-folds when the blob lands
+///   ([`refold_trace_blob`]).
+/// - The blob is sealed and this node holds no grant for it: the row is HELD
+///   `trace_dek_not_held`, reading the same slot; it re-folds when a grant
+///   for the blob lands (`put_at_rest_grant(s)` re-fold the slot).
+///
+/// Never admitted with a warning: a held row concludes nothing until it
+/// re-folds.
+///
+/// # Errors
+/// The binding's refusal; the hold (G0 keeps the voice); a read failure.
+pub(crate) async fn project_trace_row_from_held_blob<D>(
+    dir: &D,
+    row: &crate::federation::types::Attestation,
+) -> Result<Option<crate::store::decompose::Decomposed>, crate::federation::Error>
+where
+    D: crate::federation::attestation_admit::AttestationStore,
+{
+    use crate::federation::edition2::fold;
+    let env = &row.attestation_envelope;
+    if env.get("dimension").and_then(serde_json::Value::as_str) != Some(TRACE_COMPLETE_DIMENSION) {
+        return Ok(None);
+    }
+    let Some(statement_hex) = env
+        .get(crate::federation::edition2::ingest::STATEMENT_MEMBER)
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Some(sha) = trace_row_digest(env) else {
+        return Ok(None);
+    };
+    let statement = hex::decode(statement_hex).map_err(|e| {
+        crate::federation::Error::malformed_row(
+            TRACE_PLANE,
+            TRACE_STATEMENT_INVALID,
+            format!("the row's statement is not hex: {e}"),
+        )
+    })?;
+    fold::reads(fold::Dep::key(&fold::blob_slot(&sha)));
+    match dir.open_trace_blob(&sha).await? {
+        TraceBlobOpen::Open { stored, plaintext } => {
+            trace_projection_of(&statement, &stored, &plaintext, &row.attesting_key_id).map(Some)
+        }
+        TraceBlobOpen::NotHeld => Err(fold::hold(
+            TRACE_BLOB_NOT_HELD,
+            crate::federation::Error::malformed_row(
+                TRACE_PLANE,
+                TRACE_BLOB_NOT_HELD,
+                format!(
+                    "trace row {}: its blob {} is not held here yet",
+                    row.attestation_id,
+                    hex::encode(sha)
+                ),
+            ),
+        )),
+        TraceBlobOpen::NoDek(why) => Err(fold::hold(
+            TRACE_DEK_NOT_HELD,
+            crate::federation::Error::malformed_row(
+                TRACE_PLANE,
+                TRACE_DEK_NOT_HELD,
+                format!(
+                    "trace row {}: its sealed blob {} does not open here: {why}",
+                    row.attestation_id,
+                    hex::encode(sha)
+                ),
+            ),
+        )),
+    }
+}
+
+/// v62.0.0 (wave P7; G0's fold) — **a trace blob's bytes or keys changed
+/// here**: re-fold every row that read its slot (`fold::blob_slot(sha)`): a
+/// trace row held `trace_blob_not_held` or `trace_dek_not_held` concludes
+/// now, in its own write, with its `trace_events`. Called after a trace blob
+/// lands on any blob door (`store_trace_blob`, `put_blob_edition2`,
+/// `store_plaintext_local`, `adopt_sealed_blob`) and after an at-rest grant
+/// lands (`put_at_rest_grant(s)`). A re-fold failure never fails the write
+/// that called it: it is logged by name, and `refold_all` repairs.
+pub(crate) async fn refold_trace_blob<F>(dir: &F, sha256: &[u8; 32])
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    use crate::federation::edition2::fold;
+    let touched: std::collections::BTreeSet<String> =
+        std::iter::once(fold::Dep::key(&fold::blob_slot(sha256)).read_key()).collect();
+    if let Err(e) = fold::isolated(fold::refold_touched(dir, touched)).await {
+        tracing::warn!(
+            sha256 = %hex::encode(sha256),
+            reason = %e.kind(),
+            error = %e,
+            "ciris-persist: re-fold on a trace blob's slot failed (refold_all repairs)"
+        );
+    }
 }
 
 /// v62.0.0 (wave P7) — the batch with each statement-carrying trace's
@@ -2790,51 +3244,69 @@ mod tests {
         }
     }
 
-    /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-gate:
-    /// a verified writer that stamps `cohort_scope: community` for a
-    /// community it is NOT a member of is REFUSED, and ZERO rows persist
-    /// (mirrors `signature_mismatch_rejected_no_writes`). This is the
-    /// visibility-downgrade attempt the gate exists to block.
-    #[tokio::test]
-    async fn write_gate_refuses_non_member_community_zero_writes() {
-        let (bytes, key_id, vkey) =
-            make_signed_batch_bytes_with_cohort("community", Some("community-key:not-mine")).await;
-        let backend = crate::store::test_backend::test_backend();
-        backend.add_public_key(&key_id, vkey);
-        seed_test_pqc_key(&backend).await;
-
+    /// v62.0.0 (wave GC2; lead ruling on row 35, CC 2.7.3) — I3716: a
+    /// writer that stamps `cohort_scope: community` for a community it is NOT
+    /// a member of is no longer refused by the BATCH door: "not a member"
+    /// reads the roster (other rows), and the trace's edition-2 row
+    /// (`trace:complete:v1` through `put_statement`) is its concluded form,
+    /// where the fold decides it. (Was v4.0's AV-45 batch refusal, #160.)
+    /// The roster is HELD here (the community exists with another member),
+    /// so this is the terminal "not a member" case, not the retryable
+    /// `MembershipUnresolved` wait, which still refuses. Sqlite and postgres.
+    async fn i3716_body<D>(d: &D)
+    where
+        D: Backend + crate::federation::FederationDirectory + Sync,
+    {
+        let comm = format!("i3716-not-mine-{}", uuid::Uuid::new_v4().simple());
+        crate::federation::doors_takedown_invariants::bodies::community_of(
+            d.as_dyn_directory(),
+            &comm,
+            "i3716-someone-else",
+        )
+        .await;
+        assert!(
+            crate::federation::FederationDirectory::lookup_community(d, &comm)
+                .await
+                .unwrap()
+                .is_some(),
+            "I3716 precondition: the roster is held (not the unresolved wait)"
+        );
+        let (bytes, _key_id, _vkey) =
+            make_signed_batch_bytes_with_cohort("community", Some(&comm)).await;
         let (signer, signer_key_id) = make_test_signer().await;
-        // The writer (signer) is a member of a DIFFERENT community —
-        // not the one the trace claims. The claimed one EXISTS here with
-        // someone else on its roster, so this is the terminal "not a member"
-        // answer (v47.0.0, #797 — an ABSENT roster is `MembershipUnresolved`,
-        // see `write_gate_unresolved_roster_is_retryable_797`).
-        backend.add_community_membership("community-key:mine", &[signer_key_id.as_str()]);
-        backend.add_community_membership("community-key:not-mine", &["someone-else"]);
         let pipeline = IngestPipeline {
-            backend: &backend,
+            backend: d,
             canonicalizer: &PythonJsonDumpsCanonicalizer,
             scrubber: &NullScrubber,
             signer: &*signer,
             signer_key_id: &signer_key_id,
         };
-
-        let err = pipeline.receive_and_persist(&bytes).await.unwrap_err();
-        match err {
-            IngestError::ScopeRefused(crate::scope::ScopeRefusalReason::NoCommunityMembership) => {}
-            other => panic!("expected ScopeRefused(NoCommunityMembership), got {other:?}"),
+        // I3716: no batch-door write-scope refusal for "not a member".
+        if let Err(IngestError::ScopeRefused(r)) = pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+        {
+            panic!("I3716: the batch door refused on membership: {r:?}");
         }
-        // Stable boundary token + per-reason detail.
-        assert_eq!(err.kind(), "write_scope_refused");
-        assert_eq!(
-            err.detail().as_deref(),
-            Some("scope_no_community_membership")
-        );
-        // Zero writes — the refusal short-circuits before the insert.
-        assert!(
-            backend.snapshot_events().is_empty(),
-            "a refused cohort_scope downgrade must produce zero rows"
-        );
+    }
+
+    #[tokio::test]
+    async fn i3716_batch_door_does_not_refuse_a_non_member_community_sqlite() {
+        let backend = crate::store::test_backend::test_backend();
+        Box::pin(i3716_body(&backend)).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i3716_batch_door_does_not_refuse_a_non_member_community_postgres() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(i3716_body(&b)).await;
     }
 
     /// v47.0.0 (CIRISPersist#797) — a trace naming a community whose roster
@@ -3372,137 +3844,13 @@ mod tests {
         );
     }
 
-    /// v21.0.0 (CIRISPersist#501) — THE corpus-leg witness, the exact field
-    /// scenario that sat dark: node A ingests (mints the trace attestation);
-    /// the attestation REPLICATES to node B (arrives via `put_attestation`,
-    /// the wire path — NOT the ingest API); node B's scorer read
-    /// (`list_trace_summaries`) MUST see it. Before this cut node B's
-    /// `put_attestation` wrote `federation_attestations` only — the corpus
-    /// stayed empty forever (`n_summaries=0`, no error).
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn replicated_trace_attestation_materializes_scorer_corpus_501() {
-        use crate::federation::FederationDirectory as _;
-        use crate::read::ReadEngine as _;
-
-        // ── Node A: real ingest (the same fixture as the mint witness). ──
-        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let node_a = crate::store::test_backend::test_backend();
-        node_a.add_public_key(&key_id, vkey);
-        seed_test_pqc_key(&node_a).await;
-        let (signer, signer_key_id) = make_test_signer().await;
-        let pipeline = IngestPipeline {
-            backend: &node_a,
-            canonicalizer: &PythonJsonDumpsCanonicalizer,
-            scrubber: &NullScrubber,
-            signer: &*signer,
-            signer_key_id: &signer_key_id,
-        };
-        let s1 = pipeline.receive_and_persist(&bytes).await.unwrap();
-        assert_eq!(s1.trace_attestations_minted, 1);
-
-        // The minted attestation — what replication carries.
-        let filter: crate::read::AttestationFilter = serde_json::from_value(serde_json::json!({
-            "dimension_exact": TRACE_ATTESTATION_DIMENSION,
-            "tier": "Local",
-        }))
-        .unwrap();
-        let minted = node_a
-            .list_scores(&key_id, filter, None, 10)
-            .await
-            .unwrap()
-            .items
-            .remove(0);
-
-        // ── Node B (the canonical): the attestation arrives over the WIRE
-        // (put_attestation), promoted to federation tier as replication
-        // does. Sign it as the wire admission requires.
-        let node_b = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        node_b.run_migrations().await.unwrap();
-        node_b
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: crate::federation::tier_ingest::test_support::replicated_key_record(
-                    &key_id,
-                    "node",
-                    &key_id,
-                    &key_id,
-                    "501-nonce",
-                ),
-            })
-            .await
-            .expect("register producer on node B");
-        let mut replicated = minted.clone();
-        replicated.tier = crate::federation::types::attestation_tier::FEDERATION.to_string();
-        let (och, sig_c, sig_p) = crate::federation::tier_ingest::test_support::sign_envelope(
-            &key_id,
-            &replicated.attestation_envelope,
-        );
-        replicated.original_content_hash = och;
-        replicated.scrub_signature_classical = sig_c;
-        replicated.scrub_signature_pqc = sig_p;
-        replicated.scrub_key_id = key_id.clone();
-        // v31.0.0 (CIRISPersist#643) — the local mint stamped its mirror at the
-        // LOCAL tier; flipping `tier` does not change any bound column, but the
-        // re-seal is what keeps this fixture honest if it ever edits one.
-        crate::federation::tier_ingest::test_support::reseal(&mut replicated);
-        node_b
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: replicated,
-            })
-            .await
-            .expect("replicated trace attestation admits on node B");
-
-        // ── THE assertion: node B's scorer corpus is no longer dark. ──
-        let summaries = node_b
-            .list_trace_summaries(
-                crate::read::TraceFilter::default(),
-                None,
-                10,
-                crate::scope::CallerScope::Unauthenticated,
-            )
-            .await
-            .expect("list_trace_summaries");
-        assert_eq!(
-            summaries.items.len(),
-            1,
-            "(501) the replicated trace MUST appear in the scorer's corpus"
-        );
-        assert_eq!(
-            summaries.items[0].trace_id,
-            minted
-                .attestation_envelope
-                .get("trace_id")
-                .and_then(|v| v.as_str())
-                .unwrap()
-        );
-
-        // Idempotent: re-applying the same replication batch is a no-op.
-        let mut again = minted;
-        again.tier = crate::federation::types::attestation_tier::FEDERATION.to_string();
-        let (och2, sig_c2, sig_p2) = crate::federation::tier_ingest::test_support::sign_envelope(
-            &key_id,
-            &again.attestation_envelope,
-        );
-        again.original_content_hash = och2;
-        again.scrub_signature_classical = sig_c2;
-        again.scrub_signature_pqc = sig_p2;
-        again.scrub_key_id = key_id.clone();
-        let _ = node_b
-            .put_attestation(crate::federation::SignedAttestation { attestation: again })
-            .await; // Conflict-or-ok; either way:
-        let after = node_b
-            .list_trace_summaries(
-                crate::read::TraceFilter::default(),
-                None,
-                10,
-                crate::scope::CallerScope::Unauthenticated,
-            )
-            .await
-            .unwrap();
-        assert_eq!(after.items.len(), 1, "no duplicate summaries on replay");
-    }
+    // v62 (E4, wave 5): `replicated_trace_attestation_materializes_scorer_corpus_501`
+    // is DELETED. It re-signed a minted trace attestation under the agent's
+    // Ed25519-only trace key and replicated it as an earlier-form row; in v62
+    // every key is composite and no classical-only key exists (RULINGS,
+    // "Composite signatures only"), and a trace is one composite statement
+    // (CC trace ruling; P7 builds the composite trace ingest). Rewrite it as
+    // a composite trace replication once P7 publishes.
 
     /// v18.0.0 (#473) — an UNREGISTERED producer (the relay
     /// `TrustPreVerified` shape) skips the mint with honest accounting;

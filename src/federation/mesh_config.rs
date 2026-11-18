@@ -1134,6 +1134,15 @@ impl std::fmt::Display for MeshConfigRefusalReason {
 pub enum MeshConfigOutcome {
     /// Admitted and stored.
     Admitted,
+    /// v62.0.0 (wave GC7; CC rc21 item 14, CC 2.7.3) — **kept and
+    /// concluding nothing**: the row is stored, and the fold
+    /// ([`fold_mesh_config`]) does not count it, for the reason named. It is
+    /// not a refusal: the same row set folds the same way whichever row
+    /// arrived first.
+    Kept {
+        /// Why it concludes nothing (a [`MeshConfigRefusalReason`] token).
+        reason: MeshConfigRefusalReason,
+    },
     /// Not admitted; nothing was written.
     Refused {
         /// WHICH policy branch refused.
@@ -1146,8 +1155,18 @@ impl MeshConfigOutcome {
     #[must_use]
     pub const fn refusal(&self) -> Option<MeshConfigRefusalReason> {
         match self {
-            Self::Admitted => None,
+            Self::Admitted | Self::Kept { .. } => None,
             Self::Refused { reason } => Some(*reason),
+        }
+    }
+
+    /// v62.0.0 (wave GC7) — the reason a kept row concludes nothing, if it
+    /// was kept so.
+    #[must_use]
+    pub const fn kept_reason(&self) -> Option<MeshConfigRefusalReason> {
+        match self {
+            Self::Kept { reason } => Some(*reason),
+            Self::Admitted | Self::Refused { .. } => None,
         }
     }
 }
@@ -1265,6 +1284,49 @@ fn parse_row(row: &Attestation) -> Option<ParsedRow> {
         form,
         valid_until,
     })
+}
+
+/// v62.0.0 (wave GC7; CC rc21 item 14) — **CC 4.2.1 rule (3) as a fold.**
+/// "A holder's relief on a key whose own earlier relief there was in force
+/// at the new one's `asserted_at` concludes nothing." Of `rows` (one key and
+/// root's held rows, parsed), the ids of the emergency reliefs that conclude
+/// nothing for that reason.
+///
+/// "In force" is read as *concluding*: the reliefs are walked in
+/// `(asserted_at, attestation_id)` order, and a relief is back-to-back when
+/// an EARLIER relief of the same holder that itself concluded was in force
+/// at its `asserted_at`. So a relief that concludes nothing never makes a
+/// later one back-to-back, and a fresh window after the last concluding one
+/// closed is not a renewal. Strictly earlier: two reliefs at one instant are
+/// neither's renewal. A function of the row set, never of arrival order.
+fn back_to_back_reliefs(rows: &[(&Attestation, ParsedRow)]) -> std::collections::BTreeSet<String> {
+    let mut reliefs: Vec<&(&Attestation, ParsedRow)> = rows
+        .iter()
+        .filter(|(_, p)| p.form == MeshConfigForm::Emergency)
+        .collect();
+    reliefs.sort_by(|(a, _), (b, _)| {
+        a.asserted_at
+            .cmp(&b.asserted_at)
+            .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+    });
+    let mut concluding: Vec<&(&Attestation, ParsedRow)> = Vec::new();
+    let mut out = std::collections::BTreeSet::new();
+    for relief in reliefs {
+        let (r, p) = relief;
+        let chained = concluding.iter().any(|(q, pq)| {
+            pq.key == p.key
+                && pq.root_ref == p.root_ref
+                && q.attesting_key_id == r.attesting_key_id
+                && q.asserted_at < r.asserted_at
+                && pq.valid_until.is_none_or(|vu| vu > r.asserted_at)
+        });
+        if chained {
+            out.insert(r.attestation_id.clone());
+        } else {
+            concluding.push(relief);
+        }
+    }
+    out
 }
 
 /// The parsed shape of one mesh-config row.
@@ -1488,15 +1550,22 @@ pub fn fold_mesh_config(
 
         for root in &sorted_roots {
             // Step 1 — the counting rules.
-            let mut live: Vec<(&Attestation, ParsedRow)> = rows
+            let on_key: Vec<(&Attestation, ParsedRow)> = rows
                 .iter()
                 .filter_map(|r| parse_row(r).map(|p| (r, p)))
+                .filter(|(_, p)| p.key == key && &p.root_ref == root)
+                .collect();
+            // v62.0.0 (wave GC7; CC rc21 item 14) — a back-to-back relief is
+            // kept and concludes nothing.
+            let back_to_back = back_to_back_reliefs(&on_key);
+            let mut live: Vec<(&Attestation, ParsedRow)> = on_key
+                .iter()
                 .filter(|(r, p)| {
-                    p.key == key
-                        && &p.root_ref == root
-                        && r.asserted_at <= now
+                    r.asserted_at <= now
                         && p.valid_until.is_none_or(|vu| vu > now)
+                        && !back_to_back.contains(&r.attestation_id)
                 })
+                .cloned()
                 .collect();
             if live.is_empty() {
                 continue;
@@ -1786,6 +1855,20 @@ where
 {
     use MeshConfigRefusalReason as R;
     let refused = |reason: R| Ok(MeshConfigOutcome::Refused { reason });
+    // v62.0.0 (wave GC7; CC 2.7.3) — a gate below that reads OTHER rows
+    // (the node's trust edges, the root's conferrals, the root's held rows,
+    // the root's roster) is a fold condition: under a fold attempt the
+    // answer marks the row HELD with the refusal's own token, and the inputs
+    // are declared so it re-folds when they change. Outside an attempt (this
+    // node's own config door, today) the answer is the `Refused` it was. The
+    // shape, bounds and signature gates read only the row and stay refusals.
+    let held_as = |reason: R| {
+        super::edition2::fold::hold_detail(
+            reason.as_str(),
+            format!("mesh_config: {}", reason.as_str()),
+        );
+        Ok(MeshConfigOutcome::Refused { reason })
+    };
 
     // ── Shape. Split so the refusal names the branch rather than collapsing
     // every malformed row into one token a consumer cannot act on.
@@ -1852,14 +1935,20 @@ where
     }
 
     // ── The subscription. CC: "the trust edge is the subscription."
+    {
+        use super::edition2::fold::{reads, Dep};
+        reads(Dep::key(node_key_id));
+        reads(Dep::key(&root_ref));
+        reads(Dep::key(&row.attesting_key_id));
+    }
     let roots = super::trust_root::trusted_roots_of(directory, node_key_id, now).await?;
     if !roots.iter().any(|r| r == &root_ref) {
-        return refused(R::RootNotTrusted);
+        return held_as(R::RootNotTrusted);
     }
 
     // ── The authority, re-derived from this node's own state.
     match root_authorizes_author(directory, &root_ref, &row.attesting_key_id, now).await? {
-        AuthorAuthority::None => return refused(R::AuthorNotRootAuthorized),
+        AuthorAuthority::None => return held_as(R::AuthorNotRootAuthorized),
         // v30.0.0 (#601) — BIND the declared id to the edge just verified. The
         // door has always required `delegation_id` to be non-empty; until now
         // it never required it to be the conferral that authorised the author,
@@ -1868,7 +1957,7 @@ where
         AuthorAuthority::Conferred(edges) => {
             let declared = env_str(row, field::DELEGATION_ID).unwrap_or_default();
             if !edges.iter().any(|e| e == declared) {
-                return refused(R::DelegationIdNotConferring);
+                return held_as(R::DelegationIdNotConferring);
             }
         }
         // The author is the root: no delegation exists to name, so there is
@@ -1917,16 +2006,34 @@ where
 
     match form {
         // CC 4.2.1 rule 3 — "not renewable back-to-back by the same holder."
+        // v62.0.0 (wave GC7; CC rc21 item 14) — no longer refused: the row
+        // is KEPT and concludes nothing (`fold_mesh_config` does not count a
+        // relief the holder's own earlier one was in force at). Only an
+        // EARLIER relief makes this one back-to-back, so a later-arriving
+        // earlier relief does not flip a row already held.
         MeshConfigForm::Emergency => {
-            let chains = same_key.iter().any(|(prior, p)| {
-                p.form == MeshConfigForm::Emergency
-                    && prior.attesting_key_id == row.attesting_key_id
-                    && prior.attestation_id != row.attestation_id
-                    // The prior window has not closed before this one opens.
-                    && p.valid_until.is_none_or(|vu| vu > row.asserted_at)
-            });
-            if chains {
-                return refused(R::BackToBackRenewal);
+            let parsed = ParsedRow {
+                key,
+                value,
+                root_ref: root_ref.clone(),
+                form,
+                valid_until,
+            };
+            let mut with_row: Vec<(&Attestation, ParsedRow)> = same_key
+                .iter()
+                .filter(|(prior, _)| prior.attestation_id != row.attestation_id)
+                .cloned()
+                .collect();
+            with_row.push((row, parsed));
+            if back_to_back_reliefs(&with_row).contains(&row.attestation_id) {
+                directory
+                    .put_attestation(super::SignedAttestation {
+                        attestation: row.clone(),
+                    })
+                    .await?;
+                return Ok(MeshConfigOutcome::Kept {
+                    reason: R::BackToBackRenewal,
+                });
             }
         }
         // CC 4.2.1 rule 3 — durability belongs to QUORUM, not to history.
@@ -1942,8 +2049,12 @@ where
                         && p.form == MeshConfigForm::Emergency
                         && p.value == value
                 });
+                super::edition2::fold::reads(
+                    super::edition2::fold::Dep::row_hex(ratifies)
+                        .unwrap_or_else(|| super::edition2::fold::Dep::key(ratifies)),
+                );
                 if !ratifies_a_real_emergency {
-                    return refused(R::DurableUnratified);
+                    return held_as(R::DurableUnratified);
                 }
             }
             // Door 2 — COLD DURABLE, under the root's OWN quorum. What is
@@ -1951,7 +2062,7 @@ where
             // expires because it is unilateral"), not an unexercised one.
             None => {
                 if !root_quorum_reached(directory, &root_ref, row).await? {
-                    return refused(R::DurableWithoutRootQuorum);
+                    return held_as(R::DurableWithoutRootQuorum);
                 }
             }
         },
@@ -2540,6 +2651,55 @@ mod tests {
         assert_eq!(lo.effective, 300, "clamped; 5s would be MORE gossip");
         assert_eq!(lo.clamped_roots, vec!["root-a".to_owned()]);
         assert_eq!(lo.per_root[0].asked, 5);
+    }
+
+    /// **I3918** (wave GC7; CC rc21 item 14): a back-to-back emergency relief
+    /// is KEPT and concludes nothing. The fold never counts a relief whose
+    /// holder's own EARLIER concluding relief was in force at its
+    /// `asserted_at`; a relief that concluded nothing makes no later one
+    /// back-to-back; and the answer is the same for either order of the rows.
+    #[test]
+    fn i3918_back_to_back_relief_concludes_nothing_in_either_order() {
+        use MeshConfigKey as K;
+        let base = MeshConfigBaseline::owner_defaults(); // k_repair_target = 20
+        let roots = vec!["root-a".to_owned()];
+        let r = |id: &str, v: i64, at: &str, until: &str| {
+            row(
+                id,
+                "root-a",
+                "root-a",
+                K::RedundancyKRepairSymbols,
+                v,
+                at,
+                Some(until),
+            )
+        };
+        let fold_of = |rows: &[Attestation]| {
+            let f = fold_mesh_config("node-1", &base, &roots, rows, ts(NOW));
+            let s = f.setting(K::RedundancyKRepairSymbols).unwrap().clone();
+            (s.effective, s.row_id)
+        };
+        // e1 in force 10:00–13:00; e2 at 11:00 is its holder's renewal.
+        let e1 = r("e1", 10, "2026-08-03T10:00:00Z", "2026-08-03T13:00:00Z");
+        let e2 = r("e2", 8, "2026-08-03T11:00:00Z", "2026-08-03T14:00:00Z");
+        let fwd = fold_of(&[e1.clone(), e2.clone()]);
+        let rev = fold_of(&[e2, e1]);
+        assert_eq!(
+            fwd,
+            (10, Some("e1".to_owned())),
+            "I3918: the renewal concludes nothing; the first relief governs"
+        );
+        assert_eq!(fwd, rev, "I3918: the same answer for either order");
+        // A relief that concluded nothing makes no later one back-to-back:
+        // f1 closes at 11:30, f2 (11:00) is its renewal, f3 (11:45) opens
+        // after the last CONCLUDING relief closed.
+        let f1 = r("f1", 10, "2026-08-03T10:00:00Z", "2026-08-03T11:30:00Z");
+        let f2 = r("f2", 8, "2026-08-03T11:00:00Z", "2026-08-03T14:00:00Z");
+        let f3 = r("f3", 9, "2026-08-03T11:45:00Z", "2026-08-03T15:00:00Z");
+        let fwd = fold_of(&[f1.clone(), f2.clone(), f3.clone()]);
+        let rev = fold_of(&[f3, f2, f1]);
+        assert_eq!(fwd, (9, Some("f3".to_owned())), "I3918: f3 concludes");
+        assert_eq!(fwd, rev, "I3918: either order");
     }
 
     /// The relief direction is NOT blocked — a plane that refused everything
@@ -3292,10 +3452,43 @@ mod tests {
     // The executed door — every backend persist ships
     // ══════════════════════════════════════════════════════════════════
 
-    /// Register a key with its REAL deterministic hybrid pubkeys.
+    /// v62.0.0 (slice E6) — the seed each registered kid was put from, so a
+    /// fixture handed a kid signs with its key.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn register(dir: &dyn FederationDirectory, key_id: &str) {
-        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, key_id).await;
+    fn seeds() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+        static SEEDS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, String>>,
+        > = std::sync::OnceLock::new();
+        SEEDS.get_or_init(Default::default)
+    }
+
+    /// The seed of a registered kid (any other text is its own seed).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn seed_of(key: &str) -> String {
+        seeds()
+            .lock()
+            .expect("seed map")
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| key.to_owned())
+    }
+
+    /// Register the key of `seed`: v62.0.0, its edition-2 `key:record`
+    /// (`fixture_switch::put_key`). Returns its kid; the bodies name every
+    /// key by kid after registering it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn register(dir: &dyn FederationDirectory, seed: &str) -> String {
+        let k = crate::federation::edition2::fixture_switch::put_key(
+            dir,
+            seed,
+            &[crate::federation::types::identity_type::AGENT],
+        )
+        .await;
+        seeds()
+            .lock()
+            .expect("seed map")
+            .insert(k.clone(), seed.to_owned());
+        k
     }
 
     /// A really-hybrid-signed `delegates_to` carrying a `trust:*` job label.
@@ -3328,10 +3521,8 @@ mod tests {
         for (k, v) in extra {
             envelope[*k] = v.clone();
         }
-        let (och, sc, sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(from, &envelope);
         let now = Utc::now();
-        let mut sealed_row_ = Attestation {
+        let sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: from.to_owned(),
             attested_key_id: to.to_owned(),
@@ -3340,9 +3531,9 @@ mod tests {
             asserted_at: now,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: sc,
-            scrub_signature_pqc: sp,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: from.to_owned(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -3354,9 +3545,8 @@ mod tests {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(from, &mut sealed_row_);
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+        // v62.0.0 — signed once, as an edition-2 statement; its id computed.
+        crate::federation::edition2::fixture_switch::row_of(&sealed_row_, &seed_of(from))
     }
 
     /// A really-hybrid-signed mesh-config row, ready for the real door.
@@ -3383,9 +3573,7 @@ mod tests {
             ratifies,
             "congestion",
         );
-        let (och, sc, sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(author, &envelope);
-        let mut sealed_row_ = Attestation {
+        let sealed_row_ = Attestation {
             // UUID, not a slug: postgres types `attestation_id` as `uuid` and
             // rejects anything else at the driver.
             attestation_id: uuid::Uuid::new_v4().to_string(),
@@ -3396,9 +3584,9 @@ mod tests {
             asserted_at,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: sc,
-            scrub_signature_pqc: sp,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: author.to_owned(),
             scrub_timestamp: asserted_at,
             pqc_completed_at: None,
@@ -3410,9 +3598,8 @@ mod tests {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut sealed_row_);
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+        // v62.0.0 — signed once, as an edition-2 statement; its id computed.
+        crate::federation::edition2::fixture_switch::row_of(&sealed_row_, &seed_of(author))
     }
 
     /// **The whole plane, driven through the REAL doors, on one backend.**
@@ -3433,9 +3620,13 @@ mod tests {
         let delegate = format!("mc-deleg-{tag}");
         let stranger = format!("mc-stranger-{tag}");
         let outsider = format!("mc-outsider-{tag}");
-        for k in [&node, &root_a, &root_b, &delegate, &stranger, &outsider] {
-            register(dir, k).await;
-        }
+        // v62.0.0 — each name is rebound to its kid once registered.
+        let node = register(dir, &node).await;
+        let root_a = register(dir, &root_a).await;
+        let root_b = register(dir, &root_b).await;
+        let delegate = register(dir, &delegate).await;
+        let stranger = register(dir, &stranger).await;
+        let outsider = register(dir, &outsider).await;
 
         // The node's SUBSCRIPTION: live trust edges to two roots, and none to
         // `stranger`. CC 4.2.1: "the trust edge is the subscription."
@@ -3460,14 +3651,16 @@ mod tests {
         // the fixture was exercising the exact defect #601 reported, and
         // passing. A conferral whose id nothing references cannot witness that
         // `delegation_id` means anything.
-        let conferral_id = uuid::Uuid::new_v4().to_string();
+        let conferral = trust_edge(
+            &uuid::Uuid::new_v4().to_string(),
+            &root_a,
+            &delegate,
+            crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
+        );
+        // v62.0.0 — the id the row is stored under is computed.
+        let conferral_id = conferral.attestation_id.clone();
         dir.put_attestation(super::super::SignedAttestation {
-            attestation: trust_edge(
-                &conferral_id,
-                &root_a,
-                &delegate,
-                crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
-            ),
+            attestation: conferral,
         })
         .await
         .unwrap_or_else(|e| panic!("[{tag}] conferral must admit: {e}"));
@@ -3726,7 +3919,9 @@ mod tests {
             "att-deleg",
         );
         misfiled.attested_key_id = node.clone();
-        crate::federation::tier_ingest::test_support::reseal(&mut misfiled);
+        // v62.0.0 — re-signed over the new subject (an edition-2 statement).
+        let misfiled =
+            crate::federation::edition2::fixture_switch::row_of(&misfiled, &seed_of(&root_a));
         assert_eq!(
             door!(misfiled),
             MeshConfigOutcome::Refused {
@@ -3776,12 +3971,19 @@ mod tests {
             None,
             "att-deleg",
         );
+        // v62.0.0 (wave GC7; CC rc21 item 14) — KEPT, concluding nothing
+        // (the fold below never counts it), not refused.
+        let em2_id = em2.attestation_id.clone();
         assert_eq!(
             door!(em2),
-            MeshConfigOutcome::Refused {
+            MeshConfigOutcome::Kept {
                 reason: MeshConfigRefusalReason::BackToBackRenewal
             },
-            "[{tag}] CC 4.2.1 rule 3: not renewable back-to-back by the same holder"
+            "[{tag}] CC 4.2.1 rule 3: a back-to-back renewal is kept and concludes nothing"
+        );
+        assert!(
+            dir.get_attestation(&em2_id).await.unwrap().is_some(),
+            "[{tag}] I3918: the kept renewal is stored (the fold does not count it)"
         );
         // The same holder CAN act again once the first window has closed —
         // the ban is on CHAINING, not on ever acting twice.
@@ -3966,9 +4168,9 @@ mod tests {
         use MeshConfigKey as K;
         let node = format!("lc-node-{tag}");
         let root = format!("lc-root-{tag}");
-        for k in [&node, &root] {
-            register(dir, k).await;
-        }
+        // v62.0.0 — each name is rebound to its kid once registered.
+        let node = register(dir, &node).await;
+        let root = register(dir, &root).await;
         // The subscription — the trust edge CC 4.2.1 calls the subscription.
         dir.put_attestation(super::super::SignedAttestation {
             attestation: trust_edge(

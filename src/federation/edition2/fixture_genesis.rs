@@ -1108,9 +1108,19 @@ where
     }
     match offered {
         Err(e) => Err(e),
+        // v62.0.0 (wave GC5) — a bundle the door HELD (kept, concluding
+        // nothing: its count unmet, a named row Invalid, ...) is not
+        // installed: the fixture answers its held reason as the error.
         Ok(admission) => Err(Error::malformed_row(
             super::door::PLANE,
-            crate::federation::malformed_row::GENESIS_BUNDLE_MALFORMED,
+            admission
+                .not_placed
+                .iter()
+                .find(|n| n.object_id == c.object_id)
+                .map_or(
+                    crate::federation::malformed_row::GENESIS_BUNDLE_MALFORMED,
+                    |n| n.token,
+                ),
             format!(
                 "test_ceremony_v2: bundle {} is not held after the door: {:?}",
                 hex::encode(c.object_id),

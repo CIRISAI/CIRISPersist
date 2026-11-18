@@ -118,3 +118,80 @@ pub trait LedgerService: Send + Sync {
         ledger_id: &str,
     ) -> impl Future<Output = Result<Vec<ForkEvidenceRow>, Error>> + Send;
 }
+
+/// v62.0.0 (wave GC6; CC 2.7 rc21 X4) — **I3885: two heads at one seq are
+/// contested, in either arrival order.** Two ledgers (owners `{tag}-ab` and
+/// `{tag}-ba`) each receive heads `A` and `B` at seq 3, in opposite orders.
+/// Both end the same: the second offer answers `Contested`, no head concludes
+/// (`seq`/`head_hash` both `None`), both heads are kept as
+/// `ledger_triple_contested` evidence, a re-offer of either answers
+/// `Contested` and adds nothing, and a later seq advances nothing.
+#[cfg(test)]
+pub(crate) async fn contest_either_order_body<S: LedgerService>(svc: &S, tag: &str) {
+    use super::standard::LEDGER_TRIPLE_CONTESTED;
+    use super::types::AdvanceOutcome;
+    let mut ends = Vec::new();
+    for (owner, first, second) in [
+        (format!("{tag}-ab"), "hash-a", "hash-b"),
+        (format!("{tag}-ba"), "hash-b", "hash-a"),
+    ] {
+        let (id, _) = svc.register_ledger(&owner, "usd", "1").await.unwrap();
+        assert_eq!(
+            svc.advance_head(&id, 3, first, None, None).await.unwrap(),
+            AdvanceOutcome::Advanced,
+            "I3885: the first head lands"
+        );
+        assert_eq!(
+            svc.advance_head(&id, 3, second, None, None).await.unwrap(),
+            AdvanceOutcome::Contested,
+            "I3885: the second head contests it, never refused"
+        );
+        let row = svc.get_ledger(&id).await.unwrap().unwrap();
+        assert_eq!(
+            (row.seq, row.head_hash.as_deref()),
+            (None, None),
+            "I3885: neither head concludes"
+        );
+        assert_eq!(
+            svc.advance_head(&id, 3, first, None, None).await.unwrap(),
+            AdvanceOutcome::Contested,
+            "I3885: a re-offer of the first changes nothing"
+        );
+        assert_eq!(
+            svc.advance_head(&id, 4, "hash-c", None, None)
+                .await
+                .unwrap(),
+            AdvanceOutcome::Contested,
+            "I3885: nothing advances a contested ledger"
+        );
+        let kept: std::collections::BTreeSet<String> = svc
+            .list_fork_evidence(&id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|f| f.evidence_json["reason"] == LEDGER_TRIPLE_CONTESTED)
+            .map(|f| {
+                (
+                    f.seq,
+                    f.evidence_json["head_hash"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+            .map(|(seq, h)| format!("{seq}:{h}"))
+            .collect();
+        ends.push((row.seq, row.head_hash, kept));
+    }
+    assert_eq!(
+        ends[0], ends[1],
+        "I3885: the same end state whichever head arrived first"
+    );
+    assert_eq!(
+        ends[0].2,
+        ["3:hash-a".to_owned(), "3:hash-b".to_owned()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<String>>(),
+        "I3885: both heads kept, at the contested seq"
+    );
+}

@@ -25,14 +25,18 @@
 //!
 //! Mutation: make the writer return `Ok(())` at `HeldOccupant::WriteFallback`
 //! (the pre-H3 behaviour) and I1605 reds on the missing record.
+//!
+//! v62.0.0 (JSON cut, E5) — **I1605 is deleted**: its premise is a peer's row
+//! stored at an id this node chose. An edition-2 row id is computed from the
+//! statement's bytes, so no peer row can hold the id another row derives.
+//! **I1606 keeps its intent** (a re-record of this node's own event is a
+//! no-op: one record, one listed event) without pinning the chosen v1 id.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::hard_case::test_support::{declare_node, DeclaresNode};
     use crate::federation::hard_case::{self, HardCaseEvent};
-    use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{attestation_type, identity_type};
-    use crate::federation::{FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
 
     fn event(event_id: &str) -> HardCaseEvent {
         HardCaseEvent {
@@ -49,93 +53,24 @@ pub(crate) mod bodies {
         }
     }
 
-    /// **I1605 / I1606.**
-    pub(crate) async fn i1605_i1606_a_foreign_occupant_never_blocks_the_record<B>(b: &B, s: &str)
+    /// **I1606.** This node re-recording its own event is a no-op: the one
+    /// record stays held, and the event lists once.
+    pub(crate) async fn i1606_a_re_record_of_this_nodes_own_event_is_a_no_op<B>(b: &B, s: &str)
     where
         B: FederationDirectory + DeclaresNode,
     {
-        let node = format!("i1605-node-{s}");
-        let peer = format!("i1605-peer-{s}");
+        let node = format!("i1606-node-{s}");
         declare_node(b, &node).await;
-        ts::register_hybrid_key_as(b, &peer, &peer, identity_type::NODE).await;
 
-        // I1605 — the peer's row, about itself, under the v1 id this node's
-        // record of `claimed` derives.
-        let claimed = event(&format!("i1605-claimed-{s}"));
-        let v1 = hard_case::hard_case_attestation_id(&claimed.event_id);
-        let bound = hard_case::hard_case_attestation_id_for_emitter(&node, &claimed.event_id);
-        assert_ne!(v1, bound, "I1605: the two derivations differ");
-        let env = hard_case::hard_case_envelope(&claimed).expect("envelope");
-        let mut r = ts::bare_attestation(&v1, &peer, &peer, &env);
-        r.attestation_type = attestation_type::SCORES.to_owned();
-        r.weight = None;
-        ts::seal_row_in_place(&peer, &mut r);
-        b.put_attestation(SignedAttestation { attestation: r })
-            .await
-            .expect("I1605: the peer's row about itself is admitted");
-        let peer_row = b.get_attestation(&v1).await.unwrap().expect("held");
-
-        let before = hard_case::foreign_occupant_fallbacks_total();
-        b.record_hard_case(claimed.clone())
-            .await
-            .expect("I1605: a foreign occupant never blocks this node's record");
-        assert!(
-            hard_case::foreign_occupant_fallbacks_total() > before,
-            "I1605: the fallback is counted"
-        );
-        let mine = b
-            .get_attestation(&bound)
-            .await
-            .unwrap()
-            .expect("I1605: this node's record is held under the emitter-bound id");
-        assert_eq!(mine.attesting_key_id, node, "I1605: signed by this node");
-        assert_eq!(
-            hard_case::project_hard_case_row(&mine).map(|e| e.event_id),
-            Some(claimed.event_id.clone()),
-            "I1605: the fallback row carries this node's body and projects"
-        );
-        assert_eq!(
-            hard_case::held_record_of(b, &node, &claimed.event_id)
-                .await
-                .unwrap()
-                .map(|r| r.attestation_id),
-            Some(bound.clone()),
-            "I1605: the symmetric lookup finds it"
-        );
-        let listed = b
-            .list_hard_case_events(hard_case::HardCaseFilter::default())
-            .await
-            .expect("list")
-            .into_iter()
-            .filter(|e| e.event_id == claimed.event_id)
-            .collect::<Vec<_>>();
-        assert_eq!(listed.len(), 1, "I1605: one listed event per event_id");
-        assert_eq!(
-            listed[0].emitter_key_id, node,
-            "I1605: the listing holds this node's emitter-bound record over the v1 row"
-        );
-        assert_eq!(
-            b.get_attestation(&v1).await.unwrap(),
-            Some(peer_row),
-            "I1605: the peer's row is unchanged"
-        );
-        b.record_hard_case(claimed.clone())
-            .await
-            .expect("I1605: a re-record over the foreign occupant");
-        assert_eq!(
-            hard_case::held_record_of(b, &node, &claimed.event_id)
-                .await
-                .unwrap()
-                .map(|r| r.attestation_id),
-            Some(bound),
-            "I1605: still the one fallback record"
-        );
-
-        // I1606 — this node's own event, recorded twice: one row, at v1.
         let own = event(&format!("i1606-mine-{s}"));
         b.record_hard_case(own.clone())
             .await
             .expect("I1606: the first record");
+        let first = hard_case::held_record_of(b, &node, &own.event_id)
+            .await
+            .unwrap()
+            .map(|r| r.attestation_id)
+            .expect("I1606: the record is held");
         b.record_hard_case(own.clone())
             .await
             .expect("I1606: a re-record of this node's own event is a no-op");
@@ -144,19 +79,17 @@ pub(crate) mod bodies {
                 .await
                 .unwrap()
                 .map(|r| r.attestation_id),
-            Some(hard_case::hard_case_attestation_id(&own.event_id)),
-            "I1606: the record is at the v1 id"
+            Some(first),
+            "I1606: still the one record"
         );
-        assert!(
-            b.get_attestation(&hard_case::hard_case_attestation_id_for_emitter(
-                &node,
-                &own.event_id
-            ))
+        let listed = b
+            .list_hard_case_events(hard_case::HardCaseFilter::default())
             .await
-            .unwrap()
-            .is_none(),
-            "I1606: no fallback row without a foreign occupant"
-        );
+            .expect("list")
+            .into_iter()
+            .filter(|e| e.event_id == own.event_id)
+            .count();
+        assert_eq!(listed, 1, "I1606: one listed event per event_id");
     }
 }
 
@@ -170,30 +103,28 @@ mod runners {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn i1605_sqlite() {
+    async fn i1606_sqlite() {
         use crate::store::Backend as _;
         let b = crate::store::sqlite::SqliteBackend::open_in_memory()
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        Box::pin(bodies::i1605_i1606_a_foreign_occupant_never_blocks_the_record(&b, &tag("s")))
-            .await;
+        Box::pin(bodies::i1606_a_re_record_of_this_nodes_own_event_is_a_no_op(&b, &tag("s"))).await;
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    async fn i1605_postgres() {
+    async fn i1606_postgres() {
         use crate::store::Backend as _;
         let Some(dsn) = crate::test_pg::empty_dsn() else {
-            eprintln!("i1605 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            eprintln!("i1606 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
             return;
         };
         let b = crate::store::postgres::PostgresBackend::connect(&dsn)
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        Box::pin(bodies::i1605_i1606_a_foreign_occupant_never_blocks_the_record(&b, &tag("p")))
-            .await;
-        eprintln!("i1605 postgres: RAN");
+        Box::pin(bodies::i1606_a_re_record_of_this_nodes_own_event_is_a_no_op(&b, &tag("p"))).await;
+        eprintln!("i1606 postgres: RAN");
     }
 }

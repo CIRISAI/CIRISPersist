@@ -50,25 +50,49 @@
 //!   (`roster_removal_outside_window`); one inside the window is admitted; a
 //!   resignation is not a counted removal and is not bounded; the replicated
 //!   door applies a stale removal another node admitted, as data.
+//!
+//! v62.0.0 (JSON cut, E13) — **edition 2.** Every key is an E0 identity-ref;
+//! every room and family is founded by its founders' `group:roster` voices
+//! (E5's `found_*`); a version is the roster's v+1 naming the held head
+//! (T1.api §6); a widening or removal is its `membership:{stage}` voices
+//! naming the head; a membership event short of the group's protocol is kept
+//! `Pending` (the voice held, nothing admitted) where the earlier door
+//! refused `roster_consensus_insufficient`, and the witnesses accept either
+//! (the member stays out). Two nodes exchange edition-2 statements through
+//! the FILTERED serve path (`edition2::serve::statements_served_to`, the
+//! receiver as requester) into the receiver's replicated statement door
+//! (`apply_replicated_statement`). A founder's occurrence key is bound by
+//! O1's `identity:occurrence` (`e2::put_bind`).
+//!
+//! **Deleted (no edition-2 meaning):** the LEGACY `founder_only` room above
+//! the family — a v61 record a peer delivered and this node kept as data — and
+//! everything only it admits: I1500's legacy arm, **I1518** (its one escape)
+//! and **I1518b** (the escape replicated). No edition-2 door stores such a
+//! room (a `group:roster` version is judged at the record door, which refuses
+//! `founder_only` above the family), and v62 carries no v61 store. I1500's
+//! "a stored room never moves ONTO `founder_only`" stays, as a v+1 version.
+//! I1505 (`reverse_quorum` widenings) was deleted earlier (E5).
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use ciris_crypto::composite::CompositeSigningKey;
+
     use crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::group::{GroupRecord, MembershipRecord};
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::membership_acceptance::RULE_ACCEPTANCE_UNRESOLVED;
     use crate::federation::membership_acceptance_invariants::bodies::{
         found_affiliation, found_community, found_family, found_public_room, found_public_room_at,
-        proposal, put, reg, reply, widen_community,
+        id_of, proposal, put, reg, reply,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::COMMUNITY;
     use crate::federation::types::consensus_protocol::{FOUNDER_ONLY, OPEN_SELF_ADMIT};
     use crate::federation::types::{
-        Community, CommunityMember, CommunityMembershipRevocation, SignedCommunity,
+        Community, CommunityMembershipRevocation, CommunityMembershipWidening,
     };
-    use crate::federation::{
-        Error, FederationDirectory, ReplicatedCommunityOutcome, ReplicatedCommunityRefusal,
-        ROSTER_CONSENSUS_INSUFFICIENT,
-    };
+    use crate::federation::{Error, FederationDirectory, ROSTER_CONSENSUS_INSUFFICIENT};
     use chrono::{DateTime, Duration, Utc};
 
     fn ms(t: DateTime<Utc>) -> DateTime<Utc> {
@@ -76,7 +100,7 @@ pub(crate) mod bodies {
     }
 
     /// The rule a refusal names, whichever typed error carries it.
-    fn rule(e: &Error) -> String {
+    pub(crate) fn rule(e: &Error) -> String {
         match e {
             Error::CommunityConsensusProtocolViolation { rule, .. }
             | Error::RosterAuthorityUnauthorized { rule, .. }
@@ -93,29 +117,117 @@ pub(crate) mod bodies {
             .any(|m| m.key_id == k)
     }
 
-    fn record(cid: &str, founders: &[&str], protocol: &str) -> Community {
-        Community {
-            prev_head_digest: String::new(),
-            charter_digest: String::new(),
-            community_key_id: cid.to_owned(),
-            community_name: "I1500 room".into(),
-            members: founders
-                .iter()
-                .map(|k| CommunityMember {
-                    key_id: (*k).to_owned(),
-                    joined_at: ms(Utc::now() - Duration::days(1)),
-                    role: Some("founder".into()),
-                })
-                .collect(),
-            founded_at: ms(Utc::now() - Duration::days(1)),
-            consensus_protocol: protocol.to_owned(),
-            policy_blob: None,
-            persist_row_hash: String::new(),
+    fn keys_of(signers: &[&str]) -> Vec<CompositeSigningKey> {
+        signers.iter().map(|s| e2::signing_key(s)).collect()
+    }
+
+    /// v62.0.0 (E13) — **NOT admitted**: an edition-2 membership event the
+    /// group's protocol does not admit is either kept `Pending` (the voices
+    /// held, short of the protocol) or refused by one of `rules`. Anything
+    /// else (it landed, or another refusal) fails `what`.
+    pub(crate) fn not_admitted(out: Result<StatementOutcome, Error>, rules: &[&str], what: &str) {
+        match out {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            Err(e) if rules.contains(&rule(&e).as_str()) => {}
+            other => panic!("{what}: expected Pending or one of {rules:?}, got {other:?}"),
         }
     }
 
-    fn signed(founder: &str, c: Community) -> SignedCommunity {
-        ts::sign_community(founder, c)
+    /// The typed row landed.
+    pub(crate) fn landed(out: Result<StatementOutcome, Error>, what: &str) {
+        match out {
+            Ok(StatementOutcome::Row { .. }) => {}
+            other => panic!("{what}: expected the row to land, got {other:?}"),
+        }
+    }
+
+    /// v62.0.0 (E13) — the room's next version (T1.api §6): the held record
+    /// with `edit` applied, at the held head's version + 1 naming it, one
+    /// `group:roster` voice per signer.
+    async fn next_version(
+        d: &dyn FederationDirectory,
+        cid: &str,
+        edit: impl FnOnce(&mut Community),
+        signers: &[&str],
+    ) -> Result<StatementOutcome, Error> {
+        let mut next = d.lookup_community(cid).await.unwrap().expect("held");
+        edit(&mut next);
+        next.prev_head_digest = String::new();
+        next.persist_row_hash = String::new();
+        let (head, v) = e2::held_head(d, cid).await.expect("a held roster head");
+        let k = keys_of(signers);
+        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
+        e2::put_voices(
+            d,
+            &e2::roster_voices(
+                &GroupRecord::Community(next),
+                v + 1,
+                Some(&head),
+                e2::ms(Utc::now()),
+                &refs,
+            ),
+        )
+        .await
+    }
+
+    /// v62.0.0 (E13) — `member` widened into `cid` by `signers`' voices
+    /// (`membership:widening`, naming the held head), the outcome as the
+    /// door gave it. The member's consent is the caller's.
+    pub(crate) async fn widen(
+        d: &dyn FederationDirectory,
+        cid: &str,
+        signers: &[&str],
+        member: &str,
+        role: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<StatementOutcome, Error> {
+        let (head, _) = e2::held_head(d, cid).await.expect("a held roster head");
+        let w = MembershipRecord::CommunityWidening(CommunityMembershipWidening {
+            community_key_id: cid.to_owned(),
+            member_key_id: member.to_owned(),
+            joined_at: ms(at),
+            effective_at: ms(at),
+            role: role.map(str::to_owned),
+            persist_row_hash: String::new(),
+        });
+        let k = keys_of(signers);
+        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
+        e2::put_voices(d, &e2::membership_voices(&w, Some(&head), &refs)).await
+    }
+
+    /// v62.0.0 (E13) — the `membership:removal` voices of `signers` removing
+    /// `member` from `cid` at `at`, naming the held head.
+    async fn removal_voices(
+        d: &dyn FederationDirectory,
+        cid: &str,
+        signers: &[&str],
+        member: &str,
+        at: DateTime<Utc>,
+    ) -> Vec<Vec<u8>> {
+        let (head, _) = e2::held_head(d, cid).await.expect("a held roster head");
+        let r = MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
+            community_key_id: cid.to_owned(),
+            removed_identity_key_id: member.to_owned(),
+            removed_at: ms(at),
+            effective_at: ms(at),
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        });
+        let k = keys_of(signers);
+        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
+        e2::membership_voices(&r, Some(&head), &refs)
+    }
+
+    pub(crate) async fn remove(
+        d: &dyn FederationDirectory,
+        cid: &str,
+        signers: &[&str],
+        member: &str,
+        at: DateTime<Utc>,
+    ) -> Result<StatementOutcome, Error> {
+        let voices = removal_voices(d, cid, signers, member, at).await;
+        e2::put_voices(d, &voices).await
     }
 
     /// **I1500** — `founder_only` above the family.
@@ -123,19 +235,24 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        let (founder, room, aff, fam, legacy, kept) = (
+        let (founder, room, aff, fam, kept) = (
             format!("i1500-f-{s}"),
             format!("i1500-room-{s}"),
             format!("i1500-aff-{s}"),
             format!("i1500-fam-{s}"),
-            format!("i1500-legacy-{s}"),
             format!("i1500-kept-{s}"),
         );
-        reg(d, &[&founder, &room, &aff, &fam, &legacy, &kept]).await;
-        // The local door refuses a NEW founder_only room, by name, storing
+        reg(d, &[&founder, &room, &aff, &fam, &kept]).await;
+        let (founder, room, aff, fam, kept) = (
+            id_of(&founder),
+            id_of(&room),
+            id_of(&aff),
+            id_of(&fam),
+            id_of(&kept),
+        );
+        // The record door refuses a NEW founder_only room, by name, storing
         // nothing.
-        let e = d
-            .put_community(signed(&founder, record(&room, &[&founder], FOUNDER_ONLY)))
+        let e = found_community(d, &room, FOUNDER_ONLY, &[&founder], &[])
             .await
             .expect_err("I1500: founder_only above the family");
         assert_eq!(rule(&e), FOUNDER_ONLY_ABOVE_FAMILY, "I1500: {e}");
@@ -152,267 +269,25 @@ pub(crate) mod bodies {
         found_affiliation(d, &aff, FOUNDER_ONLY, &[&founder], &[])
             .await
             .expect("I1500: an affiliation keeps founder_only (CC 4.4.3.2.8)");
-        // A LEGACY room a peer delivers is kept as data and folds.
-        let outcome = d
-            .apply_replicated_community(signed(
-                &founder,
-                record(&legacy, &[&founder], FOUNDER_ONLY),
-            ))
-            .await
-            .expect("I1500: the replicated door");
-        assert_eq!(outcome, ReplicatedCommunityOutcome::Inserted, "I1500");
-        assert!(active(d, &legacy, &founder).await, "I1500: it folds");
-        // Its next version on the local supersede door must leave founder_only.
-        let held = d.lookup_community(&legacy).await.unwrap().expect("held");
-        let mut next = held.clone();
-        next.community_name = "renamed".into();
-        next.prev_head_digest = held.persist_row_hash.clone();
-        next.persist_row_hash = String::new();
-        let e = d
-            .supersede_community(signed(&founder, next.clone()), None)
-            .await
-            .expect_err("I1500: a legacy room's next version keeps founder_only");
-        assert_eq!(rule(&e), FOUNDER_ONLY_ABOVE_FAMILY, "I1500: {e}");
-        // v61 S2 — the escape is the protocol change ALONE (I1518).
-        let next = next_version(d, &legacy, |c| {
-            c.consensus_protocol = crate::federation::types::consensus_protocol::MAJORITY.into();
-        })
-        .await;
-        d.supersede_community(signed(&founder, next), None)
-            .await
-            .expect("I1500: the version that leaves founder_only is admitted");
-        // A peer may not move a stored room ONTO founder_only.
+        // A stored room never moves ONTO founder_only: its v+1 is refused.
         found_community(d, &kept, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let held = d.lookup_community(&kept).await.unwrap().expect("held");
-        let mut onto = held.clone();
-        onto.consensus_protocol = FOUNDER_ONLY.into();
-        onto.prev_head_digest = held.persist_row_hash.clone();
-        onto.persist_row_hash = String::new();
-        let outcome = d
-            .apply_replicated_community(signed(&founder, onto))
-            .await
-            .expect("I1500: a typed outcome");
+        let e = next_version(
+            d,
+            &kept,
+            |c| c.consensus_protocol = FOUNDER_ONLY.into(),
+            &[&founder],
+        )
+        .await
+        .expect_err("I1500: a version onto founder_only");
+        assert_eq!(rule(&e), FOUNDER_ONLY_ABOVE_FAMILY, "I1500: {e}");
         assert_eq!(
-            outcome,
-            ReplicatedCommunityOutcome::Refused {
-                reason: ReplicatedCommunityRefusal::DegradesConformance
-            },
-            "I1500: a stored room never moves onto one voice"
-        );
-        assert_eq!(
-            d.lookup_community(&kept)
-                .await
-                .unwrap()
-                .unwrap()
-                .consensus_protocol,
-            "quorum:1/1",
+            d.lookup_community(&kept).await.unwrap().unwrap(),
+            held,
             "I1500: the stored record stands"
         );
-    }
-
-    /// A legacy `founder_only` room `cid` founded by `founders` (all
-    /// founders, all signing), delivered by a peer and kept as data.
-    async fn legacy_founder_only_room(d: &dyn FederationDirectory, cid: &str, founders: &[&str]) {
-        let sc = legacy_founder_only_record(cid, founders);
-        assert_eq!(
-            d.apply_replicated_community(sc).await.expect("replicated"),
-            ReplicatedCommunityOutcome::Inserted,
-            "a legacy founder_only room is kept as data"
-        );
-    }
-
-    /// The signed legacy record [`legacy_founder_only_room`] delivers.
-    pub(crate) fn legacy_founder_only_record(cid: &str, founders: &[&str]) -> SignedCommunity {
-        let c = record(cid, founders, FOUNDER_ONLY);
-        let env = c.signing_envelope();
-        let mut sc = signed(founders[0], c);
-        sc.cosignatures = founders[1..]
-            .iter()
-            .map(|f| {
-                let (_h, classical, pqc) = ts::sign_envelope(f, &env);
-                crate::federation::types::RosterCosignature {
-                    authority_key_id: (*f).to_owned(),
-                    scrub_signature_classical: classical,
-                    scrub_signature_pqc: pqc,
-                }
-            })
-            .collect();
-        sc
-    }
-
-    /// The held record's next version: `edit` applied, chained to the head.
-    async fn next_version(
-        d: &dyn FederationDirectory,
-        cid: &str,
-        edit: impl FnOnce(&mut Community),
-    ) -> Community {
-        let held = d.lookup_community(cid).await.unwrap().expect("held");
-        let mut next = held.clone();
-        edit(&mut next);
-        next.prev_head_digest = held.persist_row_hash.clone();
-        next.persist_row_hash = String::new();
-        next
-    }
-
-    /// **I1518** (v61 S2) — `founder_only` above the family admits exactly
-    /// one event: the escape. A stored non-family, non-affiliation room under
-    /// `founder_only` takes a `group:roster:v1` supersede whose only change is
-    /// `consensus_protocol` leaving `founder_only`, signed by a founder (what
-    /// `founder_only` needs), on the local and the replicated door. Every
-    /// other membership event, and every other version, is refused
-    /// `founder_only_above_family`; a founder's own resignation is not.
-    pub(crate) async fn i1518_founder_only_admits_only_its_escape(
-        d: &dyn FederationDirectory,
-        s: &str,
-    ) {
-        use crate::federation::types::consensus_protocol::MAJORITY;
-        let k = |n: &str| format!("i1518-{n}-{s}");
-        let (f1, f2, f3, joiner, stranger, cid, peer_room) = (
-            k("f1"),
-            k("f2"),
-            k("f3"),
-            k("j"),
-            k("x"),
-            k("room"),
-            k("peer-room"),
-        );
-        reg(d, &[&f1, &f2, &f3, &joiner, &stranger, &cid, &peer_room]).await;
-        legacy_founder_only_room(d, &cid, &[&f1, &f2, &f3]).await;
-        let at = Utc::now() - Duration::hours(1);
-        let refused = |e: &Error, what: &str| {
-            assert_eq!(rule(e), FOUNDER_ONLY_ABOVE_FAMILY, "I1518 {what}: {e}");
-        };
-        // Membership events: a proposal, a widening, a removal.
-        let p = proposal(
-            &f1,
-            COMMUNITY,
-            &cid,
-            &joiner,
-            None,
-            at,
-            Some(Duration::days(7)),
-        );
-        refused(
-            &put(d, &p).await.expect_err("I1518: a proposal"),
-            "proposal",
-        );
-        refused(
-            &widen_community(
-                d,
-                &cid,
-                &[&f1, &f2],
-                &joiner,
-                None,
-                at + Duration::seconds(1),
-            )
-            .await
-            .expect_err("I1518: a widening"),
-            "widening",
-        );
-        refused(
-            &remove(d, &cid, &[&f1, &f2], &f3, at + Duration::seconds(2))
-                .await
-                .expect_err("I1518: a removal"),
-            "removal",
-        );
-        assert!(active(d, &cid, &f3).await, "I1518: f3 still in");
-        // A founder's own resignation stands.
-        remove(d, &cid, &[&f3], &f3, at + Duration::seconds(3))
-            .await
-            .expect("I1518: a resignation");
-        assert!(!active(d, &cid, &f3).await, "I1518: f3 left");
-        // Versions that are not the escape.
-        let stays = next_version(d, &cid, |c| c.community_name = "renamed".into()).await;
-        refused(
-            &d.supersede_community(signed(&f1, stays.clone()), None)
-                .await
-                .expect_err("I1518: a version that keeps founder_only"),
-            "stays founder_only",
-        );
-        assert_eq!(
-            d.apply_replicated_community(signed(&f1, stays))
-                .await
-                .expect("a typed outcome"),
-            ReplicatedCommunityOutcome::Refused {
-                reason: ReplicatedCommunityRefusal::DegradesConformance
-            },
-            "I1518: the replicated door refuses it too"
-        );
-        let with_members = next_version(d, &cid, |c| {
-            c.consensus_protocol = MAJORITY.into();
-            c.members.retain(|m| m.key_id != f2);
-        })
-        .await;
-        refused(
-            &d.supersede_community(signed(&f1, with_members), None)
-                .await
-                .expect_err("I1518: an escape that also changes members"),
-            "escape + members",
-        );
-        let escape = next_version(d, &cid, |c| c.consensus_protocol = MAJORITY.into()).await;
-        // `sign_community` cosigns as every listed member; the under-signed
-        // escape carries the stranger's signature alone.
-        let mut under = signed(&stranger, escape.clone());
-        under.cosignatures.clear();
-        refused(
-            &d.supersede_community(under, None)
-                .await
-                .expect_err("I1518: an escape no founder signed"),
-            "under-signed escape",
-        );
-        assert_eq!(
-            d.lookup_community(&cid)
-                .await
-                .unwrap()
-                .unwrap()
-                .consensus_protocol,
-            FOUNDER_ONLY,
-            "I1518: nothing moved yet"
-        );
-        // The escape, exactly founder_only -> majority, signed by a founder.
-        d.supersede_community(signed(&f1, escape), None)
-            .await
-            .expect("I1518: the escape");
-        assert_eq!(
-            d.lookup_community(&cid)
-                .await
-                .unwrap()
-                .unwrap()
-                .consensus_protocol,
-            MAJORITY,
-            "I1518: the room is under majority"
-        );
-        // After it, a widening under majority (both remaining founders).
-        let p = proposal(
-            &f1,
-            COMMUNITY,
-            &cid,
-            &joiner,
-            None,
-            at,
-            Some(Duration::days(7)),
-        );
-        put(d, &p).await.expect("I1518: a proposal under majority");
-        put(
-            d,
-            &reply(&joiner, &joiner, &p, true, at + Duration::seconds(10)),
-        )
-        .await
-        .expect("I1518: the joiner accepts");
-        widen_community(
-            d,
-            &cid,
-            &[&f1, &f2],
-            &joiner,
-            None,
-            at + Duration::seconds(11),
-        )
-        .await
-        .expect("I1518: a widening under majority");
-        assert!(active(d, &cid, &joiner).await, "I1518: the joiner is in");
-        let _ = peer_room;
     }
 
     /// **I1501** — `open:self_admit` only on a public room.
@@ -427,6 +302,12 @@ pub(crate) mod bodies {
             format!("i1501-pub-{s}"),
         );
         reg(d, &[&founder, &private, &fam, &public]).await;
+        let (founder, private, fam, public) = (
+            id_of(&founder),
+            id_of(&private),
+            id_of(&fam),
+            id_of(&public),
+        );
         let e = found_community(d, &private, OPEN_SELF_ADMIT, &[&founder], &[])
             .await
             .expect_err("I1501: a private room");
@@ -456,16 +337,14 @@ pub(crate) mod bodies {
         );
     }
 
-    /// The founder's standing proposal into `cid`, and `joiner`'s acceptance.
-    async fn accept_standing(
-        d: &dyn FederationDirectory,
-        founder: &str,
+    /// A standing proposal (no invitee) by `signer` into `cid`, at `at`.
+    pub(crate) fn standing(
+        signer: &str,
         cid: &str,
-        joiner: &str,
         at: DateTime<Utc>,
     ) -> crate::federation::Attestation {
         let mut p = proposal(
-            founder,
+            signer,
             COMMUNITY,
             cid,
             "",
@@ -474,7 +353,19 @@ pub(crate) mod bodies {
             Some(Duration::days(7)),
         );
         p.subject_key_ids.clear();
-        ts::seal_row_in_place(founder, &mut p);
+        ts::seal_row_in_place(signer, &mut p);
+        p
+    }
+
+    /// The founder's standing proposal into `cid`, and `joiner`'s acceptance.
+    async fn accept_standing(
+        d: &dyn FederationDirectory,
+        founder: &str,
+        cid: &str,
+        joiner: &str,
+        at: DateTime<Utc>,
+    ) -> crate::federation::Attestation {
+        let p = standing(founder, cid, at);
         put(d, &p).await.expect("the founder's standing proposal");
         put(
             d,
@@ -495,69 +386,78 @@ pub(crate) mod bodies {
             format!("i1502-closed-{s}"),
         );
         reg(d, &[&founder, &joiner, &late, &cid, &closed]).await;
+        let (founder, joiner, late, cid, closed) = (
+            id_of(&founder),
+            id_of(&joiner),
+            id_of(&late),
+            id_of(&cid),
+            id_of(&closed),
+        );
         found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
             .await
             .unwrap();
         let at = Utc::now() - Duration::hours(1);
-        let p = accept_standing(d, &founder, &cid, &joiner, at).await;
+        accept_standing(d, &founder, &cid, &joiner, at).await;
         // The founder signing FOR the joiner is not the joiner's own admission.
-        let e = widen_community(
-            d,
-            &cid,
-            &[&founder],
-            &joiner,
-            None,
-            at + Duration::seconds(2),
-        )
-        .await
-        .expect_err("I1502: a founder's widening of the joiner");
-        assert_eq!(rule(&e), ROSTER_CONSENSUS_INSUFFICIENT, "I1502: {e}");
+        not_admitted(
+            widen(
+                d,
+                &cid,
+                &[&founder],
+                &joiner,
+                None,
+                at + Duration::seconds(2),
+            )
+            .await,
+            &[ROSTER_CONSENSUS_INSUFFICIENT],
+            "I1502: a founder's widening of the joiner",
+        );
         assert!(!active(d, &cid, &joiner).await);
         // The joiner's own signature is the group's side.
-        widen_community(
-            d,
-            &cid,
-            &[&joiner],
-            &joiner,
-            None,
-            at + Duration::seconds(3),
-        )
-        .await
-        .expect("I1502: the joiner admits themselves");
+        landed(
+            widen(
+                d,
+                &cid,
+                &[&joiner],
+                &joiner,
+                None,
+                at + Duration::seconds(3),
+            )
+            .await,
+            "I1502: the joiner admits themselves",
+        );
         assert!(active(d, &cid, &joiner).await, "I1502: the joiner is in");
         // Without their acceptance a self-signed widening is still no consent.
-        let e = widen_community(d, &cid, &[&late], &late, None, at + Duration::seconds(4))
+        let e = widen(d, &cid, &[&late], &late, None, at + Duration::seconds(4))
             .await
             .expect_err("I1502: no acceptance");
         assert_eq!(rule(&e), RULE_ACCEPTANCE_UNRESOLVED, "I1502: {e}");
         // A seated member's self-promotion is a role change: two voices.
-        let e = widen_community(
-            d,
-            &cid,
-            &[&joiner],
-            &joiner,
-            Some("founder"),
-            at + Duration::seconds(5),
-        )
-        .await
-        .expect_err("I1502: a member promotes themselves");
-        assert_eq!(rule(&e), ROSTER_CONSENSUS_INSUFFICIENT, "I1502: {e}");
-        // Joining confers no authority: a member's standing proposal is refused.
-        let mut q = proposal(
-            &joiner,
-            COMMUNITY,
-            &cid,
-            "",
-            None,
-            at,
-            Some(Duration::days(7)),
+        not_admitted(
+            widen(
+                d,
+                &cid,
+                &[&joiner],
+                &joiner,
+                Some("founder"),
+                at + Duration::seconds(5),
+            )
+            .await,
+            &[ROSTER_CONSENSUS_INSUFFICIENT],
+            "I1502: a member promotes themselves",
         );
-        q.subject_key_ids.clear();
-        ts::seal_row_in_place(&joiner, &mut q);
-        put(d, &q)
+        assert!(
+            d.active_community_members(&cid)
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.key_id == joiner && m.role.as_deref() != Some("founder")),
+            "I1502: the joiner is still a plain member"
+        );
+        // Joining confers no authority: a member's standing proposal is refused.
+        put(d, &standing(&joiner, &cid, at))
             .await
             .expect_err("I1502: a non-founder's standing proposal");
-        let _ = p;
         // Every other protocol refuses a self-signed admission.
         found_community(d, &closed, "quorum:1/1", &[&founder], &[])
             .await
@@ -575,153 +475,28 @@ pub(crate) mod bodies {
         put(d, &reply(&late, &late, &p, true, at + Duration::seconds(1)))
             .await
             .unwrap();
-        let e = widen_community(d, &closed, &[&late], &late, None, at + Duration::seconds(2))
-            .await
-            .expect_err("I1502: a self-signed admission under quorum:1/1");
-        assert!(
-            rule(&e) == ROSTER_CONSENSUS_INSUFFICIENT
-                || rule(&e) == crate::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED,
-            "I1502: {e}"
+        not_admitted(
+            widen(d, &closed, &[&late], &late, None, at + Duration::seconds(2)).await,
+            &[
+                ROSTER_CONSENSUS_INSUFFICIENT,
+                crate::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED,
+            ],
+            "I1502: a self-signed admission under quorum:1/1",
         );
-        widen_community(
-            d,
-            &closed,
-            &[&founder],
-            &late,
-            None,
-            at + Duration::seconds(3),
-        )
-        .await
-        .expect("I1502: the founder's widening admits under quorum:1/1");
-    }
-
-    /// v62.0.0 (slice C) — a room under `reverse_quorum` is founded, a joiner
-    /// accepts the founder's proposal, and the founders' widening is REFUSED:
-    /// CC 3.2, "Not a membership rule: reverse quorum. … It admits no one and
-    /// confers no consent on anyone's behalf."
-    async fn reverse_room_refuses_joiner(
-        d: &dyn FederationDirectory,
-        cid: &str,
-        protocol: &str,
-        founders: &[&str],
-        signers: &[&str],
-        joiner: &str,
-        at: DateTime<Utc>,
-    ) {
-        found_community(d, cid, protocol, founders, &[])
-            .await
-            .unwrap();
-        let p = proposal(
-            founders[0],
-            COMMUNITY,
-            cid,
-            joiner,
-            None,
-            at,
-            Some(Duration::days(7)),
+        assert!(!active(d, &closed, &late).await);
+        landed(
+            widen(
+                d,
+                &closed,
+                &[&founder],
+                &late,
+                None,
+                at + Duration::seconds(3),
+            )
+            .await,
+            "I1502: the founder's widening admits under quorum:1/1",
         );
-        put(d, &p).await.unwrap();
-        put(
-            d,
-            &reply(joiner, joiner, &p, true, at + Duration::seconds(1)),
-        )
-        .await
-        .unwrap();
-        let effective = ms(at + Duration::seconds(2));
-        let e = widen_community(d, cid, signers, joiner, None, effective)
-            .await
-            .expect_err("CC 3.2: reverse_quorum admits no one");
-        assert!(
-            matches!(&e, Error::RosterAuthorityUnauthorized { rule, .. }
-                if *rule == "roster_consensus_unevaluable"),
-            "{e:?}"
-        );
-        assert!(!active(d, cid, joiner).await, "the joiner is not in");
-    }
-
-    /// **I1505** — was "the reverse path for adds" (objections under
-    /// `reverse_quorum` reversing a widening). v62.0.0 (slice C):
-    /// `reverse_quorum` is no membership protocol (CC 3.2, quoted on
-    /// [`reverse_room_refuses_joiner`]), so there is no add to reverse: the
-    /// widening itself is refused, at m = 2 of four and at m = 1 of three.
-    pub(crate) async fn i1505_a_widening_is_reversible_under_reverse_quorum(
-        d: &dyn FederationDirectory,
-        s: &str,
-    ) {
-        let k = |n: &str| format!("i1505-{n}-{s}");
-        let (a, b, c, e, j, j1) = (k("a"), k("b"), k("c"), k("e"), k("j"), k("j1"));
-        let (room, low) = (k("room"), k("low"));
-        reg(d, &[&a, &b, &c, &e, &j, &j1, &room, &low]).await;
-        let at = Utc::now() - Duration::minutes(30);
-        reverse_room_refuses_joiner(
-            d,
-            &room,
-            "reverse_quorum:2/4:86400",
-            &[&a, &b, &c, &e],
-            &[&a, &b, &c],
-            &j,
-            at,
-        )
-        .await;
-        reverse_room_refuses_joiner(
-            d,
-            &low,
-            "reverse_quorum:1/3:86400",
-            &[&a, &b, &c],
-            &[&a, &b],
-            &j1,
-            at,
-        )
-        .await;
-    }
-
-    async fn remove(
-        d: &dyn FederationDirectory,
-        cid: &str,
-        signers: &[&str],
-        member: &str,
-        at: DateTime<Utc>,
-    ) -> Result<(), Error> {
-        let mut r = ts::sign_community_membership_revocation(
-            signers[0],
-            CommunityMembershipRevocation {
-                community_key_id: cid.to_owned(),
-                removed_identity_key_id: member.to_owned(),
-                removed_at: ms(at),
-                effective_at: ms(at),
-                reason: None,
-                witness_set: Vec::new(),
-                persist_row_hash: String::new(),
-            },
-        );
-        for c in &signers[1..] {
-            ts::cosign_community_membership_revocation(&mut r, c);
-        }
-        d.put_community_membership_revocation(r).await
-    }
-
-    fn removal(
-        cid: &str,
-        signers: &[&str],
-        member: &str,
-        at: DateTime<Utc>,
-    ) -> crate::federation::types::SignedCommunityMembershipRevocation {
-        let mut r = ts::sign_community_membership_revocation(
-            signers[0],
-            CommunityMembershipRevocation {
-                community_key_id: cid.to_owned(),
-                removed_identity_key_id: member.to_owned(),
-                removed_at: ms(at),
-                effective_at: ms(at),
-                reason: None,
-                witness_set: Vec::new(),
-                persist_row_hash: String::new(),
-            },
-        );
-        for c in &signers[1..] {
-            ts::cosign_community_membership_revocation(&mut r, c);
-        }
-        r
+        assert!(active(d, &closed, &late).await);
     }
 
     /// **I1515** — the removal window under `open:self_admit`.
@@ -733,6 +508,14 @@ pub(crate) mod bodies {
         let k = |n: &str| format!("i1515-{n}-{s}");
         let (f1, f2, f3, f4, f5, cid) = (k("f1"), k("f2"), k("f3"), k("f4"), k("f5"), k("pub"));
         reg(d, &[&f1, &f2, &f3, &f4, &f5, &cid]).await;
+        let (f1, f2, f3, f4, f5, cid) = (
+            id_of(&f1),
+            id_of(&f2),
+            id_of(&f3),
+            id_of(&f4),
+            id_of(&f5),
+            id_of(&cid),
+        );
         let now = Utc::now();
         found_public_room_at(
             d,
@@ -745,14 +528,14 @@ pub(crate) mod bodies {
         .unwrap();
         assert_eq!(WINDOW, 259_200, "I1515: CC's window, 72 hours");
         // A resignation is a member's own act, not a counted removal.
-        d.put_community_membership_revocation(removal(&cid, &[&f5], &f5, now - Duration::days(5)))
-            .await
-            .expect("I1515: a stale resignation is not bounded");
+        landed(
+            remove(d, &cid, &[&f5], &f5, now - Duration::days(5)).await,
+            "I1515: a stale resignation is not bounded",
+        );
         assert!(!active(d, &cid, &f5).await, "I1515: f5 left");
         // Two voices, asserted four days before receipt: outside the window.
-        let stale = removal(&cid, &[&f1, &f2], &f3, now - Duration::days(4));
-        let e = d
-            .put_community_membership_revocation(stale.clone())
+        let stale = removal_voices(d, &cid, &[&f1, &f2], &f3, now - Duration::days(4)).await;
+        let e = e2::put_voices(d, &stale)
             .await
             .expect_err("I1515: a removal older than the window at the local door");
         assert_eq!(
@@ -763,33 +546,31 @@ pub(crate) mod bodies {
         assert!(active(d, &cid, &f3).await, "I1515: f3 still in");
         // The replicated door applies it as data: another node admitted it in
         // time, and this node's clock is no witness to when the voices signed.
-        let row = crate::federation::group_plane::plan_group_row(
-            &crate::federation::group_plane::GroupSigned::CommunityRevocation(stale),
-        )
-        .unwrap()
-        .expect("a hybrid-signed removal has a row");
-        let out = d
-            .apply_replicated_attestation(crate::federation::SignedAttestation { attestation: row })
+        for v in &stale {
+            crate::federation::edition2::ingest::apply_replicated_statement(
+                d,
+                v,
+                &e2::row_id_of(v).0,
+            )
             .await
-            .expect("I1515: the replicated door");
-        assert_eq!(
-            out,
-            crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
-            "I1515: a stale removal replicated in is applied"
-        );
+            .unwrap_or_else(|e| panic!("I1515: the replicated door: {e}"));
+        }
         assert!(
             !active(d, &cid, &f3).await,
             "I1515: f3 removed by the replica"
         );
         // Inside the window, at the local door: admitted.
-        d.put_community_membership_revocation(removal(
-            &cid,
-            &[&f1, &f2],
-            &f4,
-            now - Duration::seconds(WINDOW - 120),
-        ))
-        .await
-        .expect("I1515: a removal inside the window");
+        landed(
+            remove(
+                d,
+                &cid,
+                &[&f1, &f2],
+                &f4,
+                now - Duration::seconds(WINDOW - 120),
+            )
+            .await,
+            "I1515: a removal inside the window",
+        );
         assert!(!active(d, &cid, &f4).await, "I1515: f4 removed");
     }
 
@@ -803,132 +584,116 @@ pub(crate) mod bodies {
             format!("i1503-pub-{s}"),
         );
         reg(d, &[&f1, &f2, &f3, &joiner, &cid]).await;
+        let (f1, f2, f3, joiner, cid) = (
+            id_of(&f1),
+            id_of(&f2),
+            id_of(&f3),
+            id_of(&joiner),
+            id_of(&cid),
+        );
         found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&f1, &f2, &f3], &[])
             .await
             .unwrap();
         let at = Utc::now() - Duration::hours(2);
         accept_standing(d, &f1, &cid, &joiner, at).await;
-        widen_community(
-            d,
-            &cid,
-            &[&joiner],
-            &joiner,
-            None,
-            at + Duration::seconds(2),
-        )
-        .await
-        .unwrap();
+        landed(
+            widen(
+                d,
+                &cid,
+                &[&joiner],
+                &joiner,
+                None,
+                at + Duration::seconds(2),
+            )
+            .await,
+            "I1503: the joiner admits themselves",
+        );
         assert!(active(d, &cid, &joiner).await);
         // One voice never excludes — a founder's included.
-        let e = remove(d, &cid, &[&f1], &joiner, at + Duration::minutes(1))
-            .await
-            .expect_err("I1503: one voice");
-        assert_eq!(rule(&e), ROSTER_CONSENSUS_INSUFFICIENT, "I1503: {e}");
+        not_admitted(
+            remove(d, &cid, &[&f1], &joiner, at + Duration::minutes(1)).await,
+            &[ROSTER_CONSENSUS_INSUFFICIENT],
+            "I1503: one voice",
+        );
         assert!(active(d, &cid, &joiner).await, "I1503: still in");
         // Two distinct voices remove.
-        remove(d, &cid, &[&f1, &f2], &joiner, at + Duration::minutes(2))
-            .await
-            .expect("I1503: two voices");
+        landed(
+            remove(d, &cid, &[&f1, &f2], &joiner, at + Duration::minutes(2)).await,
+            "I1503: two voices",
+        );
         assert!(!active(d, &cid, &joiner).await, "I1503: removed");
         // Leaving stays a member's own act: no floor on a resignation.
-        remove(d, &cid, &[&f3], &f3, at + Duration::minutes(3))
-            .await
-            .expect("I1503: a resignation needs no one");
+        landed(
+            remove(d, &cid, &[&f3], &f3, at + Duration::minutes(3)).await,
+            "I1503: a resignation needs no one",
+        );
         assert!(!active(d, &cid, &f3).await);
     }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod two_node {
+    use super::bodies::{landed, remove, standing, widen};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::membership_acceptance_invariants::bodies::{
-        found_community, found_public_room, proposal, put, reg, reply, widen_community,
+        found_community, found_public_room, id_of, proposal, put, reg, reply,
     };
     use crate::federation::public_room::live_standing_proposal;
     use crate::federation::replication_audience::may_receive;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::COMMUNITY;
     use crate::federation::types::consensus_protocol::OPEN_SELF_ADMIT;
-    use crate::federation::types::{attestation_type, SignedAttestation};
-    use crate::federation::FederationDirectory;
+    use crate::federation::types::{attestation_type, device_class};
+    use crate::federation::{Error, FederationDirectory};
     use chrono::{Duration, Utc};
 
-    /// **I1518b** (v61 S2) — the escape from `founder_only` on the
-    /// REPLICATED door: node A supersedes a legacy `founder_only` room to
-    /// `majority` under its quorum (one founder's signature), and node B,
-    /// holding the same legacy record, applies A's version (`Superseded`).
-    pub(crate) async fn i1518b_the_escape_replicates(
-        a: &dyn FederationDirectory,
-        b: &dyn FederationDirectory,
-        s: &str,
+    /// v62.0.0 (E13) — **`from`'s statements to `to`** through the FILTERED
+    /// serve path (`edition2::serve::statements_served_to`, `requester` the
+    /// receiving node; the store's raw since-read is never a serve surface),
+    /// each into `to`'s replicated statement door under the id it names.
+    async fn replicate(
+        from: &dyn FederationDirectory,
+        to: &dyn FederationDirectory,
+        requester: &str,
     ) {
-        use crate::federation::types::consensus_protocol::{FOUNDER_ONLY, MAJORITY};
-        use crate::federation::ReplicatedCommunityOutcome;
-        let k = |n: &str| format!("i1518b-{n}-{s}");
-        let (f1, f2, cid) = (k("f1"), k("f2"), k("room"));
-        let legacy = super::bodies::legacy_founder_only_record(&cid, &[&f1, &f2]);
-        for d in [a, b] {
-            reg(d, &[&f1, &f2, &cid]).await;
-            assert_eq!(
-                d.apply_replicated_community(legacy.clone())
-                    .await
-                    .expect("replicated"),
-                ReplicatedCommunityOutcome::Inserted,
-                "I1518b: the legacy room on both nodes"
-            );
-        }
-        let held = a.lookup_community(&cid).await.unwrap().expect("held");
-        assert_eq!(held.consensus_protocol, FOUNDER_ONLY);
-        let mut next = held.clone();
-        next.consensus_protocol = MAJORITY.into();
-        next.prev_head_digest = held.persist_row_hash.clone();
-        next.persist_row_hash = String::new();
-        let members: Vec<String> = held.members.iter().map(|m| m.key_id.clone()).collect();
-        let change = a
-            .build_membership_change_envelope(
-                crate::federation::cohort::Cohort::Community,
-                &cid,
-                &members,
-                false,
-                Some(MAJORITY),
+        let mut cursor = None;
+        loop {
+            let page = crate::federation::edition2::serve::statements_served_to(
+                from,
+                cursor.as_ref(),
+                1000,
+                Some(requester),
             )
             .await
-            .expect("I1518b: the change envelope");
-        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
-        a.supersede_community_with_quorum(
-            ts::sign_community(&f1, next),
-            change,
-            vec![ts::threshold_sign(&f1, &bytes)],
-        )
-        .await
-        .expect("I1518b: the escape on node A");
-        let served = a
-            .list_signed_communities_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.community.community.community_key_id == cid)
-            .expect("A serves the room")
-            .community;
-        assert_eq!(served.community.consensus_protocol, MAJORITY);
-        assert_eq!(
-            b.apply_replicated_community(served)
-                .await
-                .expect("a typed outcome"),
-            ReplicatedCommunityOutcome::Superseded,
-            "I1518b: node B applies the escape"
-        );
-        assert_eq!(
-            b.lookup_community(&cid)
-                .await
-                .unwrap()
-                .unwrap()
-                .consensus_protocol,
-            MAJORITY,
-            "I1518b: B's room is under majority"
-        );
+            .expect("serve statements");
+            for st in &page.statements {
+                match crate::federation::edition2::names::RowId::of_statement(&st.bytes) {
+                    Some(id) => {
+                        crate::federation::edition2::ingest::apply_replicated_statement(
+                            to, &st.bytes, &id.0,
+                        )
+                        .await
+                        .unwrap_or_else(|e| panic!("a replicated statement: {e}"));
+                    }
+                    None => {
+                        e2::put_statement(to, &st.bytes)
+                            .await
+                            .unwrap_or_else(|e| panic!("a replicated statement: {e}"));
+                    }
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
     }
 
     /// **I1504** — a public room's standing proposal, on request.
+    ///
+    /// v62.0.0 (E13) — depends on T1.serve.patch: the filtered serve path's
+    /// group-plane arm (a room's roster and membership voices served to its
+    /// audience, I3006–I3008).
     pub(crate) async fn i1504_a_standing_proposal_is_served_on_request(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -943,6 +708,12 @@ pub(crate) mod two_node {
         for n in [a, b] {
             reg(n, &[&founder, &joiner, &cid, &private]).await;
         }
+        let (founder, joiner, cid, private) = (
+            id_of(&founder),
+            id_of(&joiner),
+            id_of(&cid),
+            id_of(&private),
+        );
         found_public_room(a, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
             .await
             .unwrap();
@@ -951,17 +722,7 @@ pub(crate) mod two_node {
             live_standing_proposal(a, &cid).await.unwrap().is_none(),
             "I1504: control — no proposal yet"
         );
-        let mut p = proposal(
-            &founder,
-            COMMUNITY,
-            &cid,
-            "",
-            None,
-            at,
-            Some(Duration::days(7)),
-        );
-        p.subject_key_ids.clear();
-        ts::seal_row_in_place(&founder, &mut p);
+        let p = standing(&founder, &cid, at);
         put(a, &p).await.unwrap();
         // The member's node answers the request with the live proposal ...
         let served = live_standing_proposal(a, &cid)
@@ -974,45 +735,44 @@ pub(crate) mod two_node {
             may_receive(a, &joiner, &served).await.unwrap().allowed(),
             "I1504: a non-member's node is in a public room's audience"
         );
-        // ... and admits on its replicated door, holding the room's record.
-        let room = a
-            .list_signed_communities_since(None, 1000)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|c| c.community.community.community_key_id == cid)
-            .expect("A serves the room");
-        b.put_community(room.community)
-            .await
-            .expect("I1504: B takes the room");
-        b.apply_replicated_attestation(SignedAttestation {
-            attestation: served.clone(),
-        })
-        .await
-        .expect("I1504: the requester's node stores the proposal");
+        // ... and admits on its replicated door, with the room's roster: A's
+        // statements served to the requester.
+        replicate(a, b, &b.node_key_id().unwrap_or_else(|| joiner.clone())).await;
+        assert!(
+            b.lookup_community(&cid).await.unwrap().is_some(),
+            "I1504: B takes the room"
+        );
+        assert!(
+            b.get_attestation(&p.attestation_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "I1504: the requester's node stores the proposal"
+        );
         // The requester accepts on their own node; the member's node admits
         // the acceptance and the requester's own widening.
         let acc = reply(&joiner, &joiner, &served, true, at + Duration::seconds(1));
         put(b, &acc).await.expect("I1504: the acceptance on B");
-        a.apply_replicated_attestation(SignedAttestation {
-            attestation: b
-                .get_attestation(&acc.attestation_id)
+        replicate(b, a, &a.node_key_id().unwrap_or_else(|| founder.clone())).await;
+        assert!(
+            a.get_attestation(&acc.attestation_id)
                 .await
                 .unwrap()
-                .unwrap(),
-        })
-        .await
-        .expect("I1504: A admits the acceptance");
-        widen_community(
-            a,
-            &cid,
-            &[&joiner],
-            &joiner,
-            None,
-            at + Duration::seconds(2),
-        )
-        .await
-        .expect("I1504: the joiner's own widening");
+                .is_some(),
+            "I1504: A admits the acceptance"
+        );
+        landed(
+            widen(
+                a,
+                &cid,
+                &[&joiner],
+                &joiner,
+                None,
+                at + Duration::seconds(2),
+            )
+            .await,
+            "I1504: the joiner's own widening",
+        );
         assert!(a
             .active_community_members(&cid)
             .await
@@ -1040,26 +800,6 @@ pub(crate) mod two_node {
             .await
             .unwrap();
         assert!(live_standing_proposal(a, &private).await.unwrap().is_none());
-    }
-
-    /// A standing proposal (no invitee) by `signer` into `cid`, at `at`.
-    fn standing(
-        signer: &str,
-        cid: &str,
-        at: chrono::DateTime<Utc>,
-    ) -> crate::federation::Attestation {
-        let mut p = proposal(
-            signer,
-            COMMUNITY,
-            cid,
-            "",
-            None,
-            at,
-            Some(Duration::days(7)),
-        );
-        p.subject_key_ids.clear();
-        ts::seal_row_in_place(signer, &mut p);
-        p
     }
 
     /// **I1624** (CIRISPersist#1188, the six `live_standing_proposal`
@@ -1092,6 +832,15 @@ pub(crate) mod two_node {
             k("pubq"),
         );
         reg(d, &[&f, &f2, &dv, &x, &j, &cid, &quorum_room]).await;
+        let (f, f2, dv, x, j, cid, quorum_room) = (
+            id_of(&f),
+            id_of(&f2),
+            id_of(&dv),
+            id_of(&x),
+            id_of(&j),
+            id_of(&cid),
+            id_of(&quorum_room),
+        );
         let at = Utc::now() - Duration::hours(1);
 
         // A public room under quorum:1/1, its founder's standing proposal held
@@ -1144,43 +893,30 @@ pub(crate) mod two_node {
             Some(by_f2.attestation_id.clone()),
             "I1624: f2's standing proposal is live while f2 is a founder"
         );
-        let resigned_at = chrono::DateTime::<Utc>::from_timestamp_millis(
-            (Utc::now() - Duration::minutes(30)).timestamp_millis(),
-        )
-        .expect("ms instant");
-        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &f2,
-            crate::federation::types::CommunityMembershipRevocation {
-                community_key_id: cid.clone(),
-                removed_identity_key_id: f2.clone(),
-                removed_at: resigned_at,
-                effective_at: resigned_at,
-                reason: None,
-                witness_set: Vec::new(),
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .expect("I1624: f2 resigns");
+        landed(
+            remove(d, &cid, &[&f2], &f2, Utc::now() - Duration::minutes(30)).await,
+            "I1624: f2 resigns",
+        );
         assert!(
             live_standing_proposal(d, &cid).await.unwrap().is_none(),
             "I1624: a resigned founder's standing proposal is not live"
         );
 
         // The founder's occurrence key signs one: the proposer is the founder.
-        let t = |secs: i64| {
-            chrono::DateTime::<Utc>::from_timestamp_millis(
-                (Utc::now() - Duration::seconds(secs)).timestamp_millis(),
+        // v62.0.0 (E13) — the occurrence is O1's `identity:occurrence` bind
+        // (author f, identity f, occurrence dv; both voices).
+        landed(
+            e2::put_bind(
+                d,
+                &f,
+                &f,
+                &dv,
+                device_class::SERVER,
+                &e2::BindOptions::default(),
             )
-            .expect("ms instant")
-        };
-        for (signer, when) in [(&f, t(3)), (&dv, t(1))] {
-            d.put_identity_occurrence(
-                ts::signed_content_only_occurrence(signer, &f, &dv, when).await,
-            )
-            .await
-            .expect("I1624: the occurrence binding, both halves");
-        }
+            .await,
+            "I1624: the occurrence binding, both halves",
+        );
         let by_device = standing(&dv, &cid, at + Duration::minutes(2));
         put(d, &by_device)
             .await
@@ -1194,7 +930,7 @@ pub(crate) mod two_node {
             "I1624: a founder's occurrence-signed standing proposal is live"
         );
 
-        // A stranger's withdraws, held before the proposal it names.
+        // A stranger's withdraws, offered before the proposal it names.
         let later = standing(&f, &cid, at + Duration::minutes(3));
         let mut w = ts::bare_attestation(
             &uuid::Uuid::new_v4().to_string(),
@@ -1208,12 +944,23 @@ pub(crate) mod two_node {
         w.attestation_type = attestation_type::WITHDRAWS.into();
         w.weight = None;
         ts::seal_row_in_place(&x, &mut w);
-        put(d, &w)
-            .await
-            .expect("I1624: a withdraws whose target is not held is admitted deferred");
+        // v62.0.0 (E13) — the edition-2 door may hold a composer whose target
+        // is not held yet, or refuse it retryably
+        // (`federation_withdraws_target_unheld`); either way it is held once
+        // the target is, and it still retires nothing.
+        let early_w = put(d, &w).await;
         put(d, &later)
             .await
             .expect("I1624: f's later standing proposal");
+        if let Err(e) = early_w {
+            assert!(
+                matches!(e, Error::WithdrawsTargetUnheld { .. }),
+                "I1624: a withdraws before its target waits retryably: {e:?}"
+            );
+            put(d, &w)
+                .await
+                .expect("I1624: the stranger's withdraws once its target is held");
+        }
         assert!(
             d.list_attestations_referencing(&later.attestation_id)
                 .await
@@ -1259,26 +1006,12 @@ mod runners {
                 case!(i1502_the_joiner_admits_themselves);
                 case!(i1503_removal_takes_two_voices);
                 case!(i1515_removal_window_under_open_self_admit);
-                case!(i1518_founder_only_admits_only_its_escape);
-                case!(i1505_a_widening_is_reversible_under_reverse_quorum);
 
                 #[tokio::test]
                 async fn i1624_a_standing_proposal_is_judged_at_the_read() {
                     let Some(d) = $fresh.await else { return };
                     super::super::two_node::i1624_a_standing_proposal_is_judged_at_the_read(
                         &d as &dyn FederationDirectory,
-                        &suffix(),
-                    )
-                    .await
-                }
-
-                #[tokio::test]
-                async fn i1518b_the_escape_replicates() {
-                    let Some(a) = $fresh.await else { return };
-                    let Some(b) = $fresh.await else { return };
-                    super::super::two_node::i1518b_the_escape_replicates(
-                        &a as &dyn FederationDirectory,
-                        &b as &dyn FederationDirectory,
                         &suffix(),
                     )
                     .await

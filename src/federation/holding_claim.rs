@@ -430,11 +430,38 @@ where
 ///
 /// # Errors
 ///
-/// `custody_ack_outside_cohort` (as the attestation door refuses it).
+/// [`BlobError::NotPartyTo`] for a holder outside the cohort (a local
+/// decline); the custody gate's own-bytes refusals.
+///
+/// v62.0.0 (wave GC2; CC rc21 ruling 11, CC 2.7.5) — a holder outside the
+/// claim's cohort is this node's LOCAL decline ([`BlobError::NotPartyTo`]:
+/// it keeps no bytes it is not party to, and may take them once it is), never
+/// a verdict on the claim. Decided structurally, ahead of the custody gate's
+/// own-bytes arms (a report about another device, a malformed report), which
+/// stay `InvalidArgument`.
 pub async fn check_holding_claim_audience(
     dir: &dyn FederationDirectory,
     row: &Attestation,
 ) -> Result<(), BlobError> {
+    let self_report = row.attesting_key_id == row.attested_key_id;
+    if self_report && matches!(parse_custody_ack(row), Ok(Some(_))) {
+        let target = super::admission::envelope_cohort_target(&row.attestation_envelope)
+            .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
+        if !super::custody_ack::holder_in_cohort(
+            dir,
+            &row.attesting_key_id,
+            &row.cohort_scope,
+            target,
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("holding claim audience: {e}")))?
+        {
+            return Err(BlobError::NotPartyTo {
+                cohort_scope: row.cohort_scope.clone(),
+                community_key_id: target.map(str::to_owned),
+            });
+        }
+    }
     super::custody_ack::check_custody_ack_admission(dir, row)
         .await
         .map_err(|e| BlobError::InvalidArgument(e.to_string()))
@@ -501,6 +528,11 @@ where
     else {
         return Ok(());
     };
+    // v62.0.0 (wave GC2; CC 2.7.3) — the scope compared against is THIS
+    // node's holding of the blob (another plane's state), so it is a fold
+    // read: the claim re-folds when the blob lands here or leaves
+    // ([`blob_dep`]), and a claim at the wrong scope is HELD, not refused.
+    super::edition2::fold::reads(blob_dep(&sha));
     // A held sealed row that records no group (pre-V177) has no derivable
     // target: the content's scope cannot be judged here, as for a blob not
     // held.
@@ -519,13 +551,43 @@ where
     if agrees {
         Ok(())
     } else {
-        Err(Error::InvalidArgument(format!(
-            "{CUSTODY_ACK_SCOPE_MISMATCH}: a holding claim about {} is placed at {} {:?}, but the \
-             content is at {} {:?} — a claim is placed at its content's scope, never one its \
-             emitter chooses (CC 3.1.3.3 rule 1)",
-            ack.blob_sha256_hex, got.cohort_scope, got.target, want.cohort_scope, want.target
-        )))
+        Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::CUSTODY_ACK_SCOPE_MISMATCH,
+            Error::InvalidArgument(format!(
+                "{CUSTODY_ACK_SCOPE_MISMATCH}: a holding claim about {} is placed at {} {:?}, but \
+                 the content is at {} {:?} — a claim is placed at its content's scope, never one \
+                 its emitter chooses (CC 3.1.3.3 rule 1)",
+                ack.blob_sha256_hex, got.cohort_scope, got.target, want.cohort_scope, want.target
+            )),
+        ))
     }
+}
+
+/// v62.0.0 (wave GC2; CC 2.7.3) — **the bytes plane's touch**: re-fold every
+/// row whose fold read this node's holding of `sha256` ([`blob_dep`]). A blob
+/// door calls it once the bytes are stored or removed (the shared emission,
+/// [`emit_holding_claim`], calls it for every door that reaches it).
+///
+/// # Errors
+/// Storage failures.
+pub async fn refold_on_blob<D>(dir: &D, sha256: &[u8; 32]) -> Result<(), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut touched = std::collections::BTreeSet::new();
+    touched.insert(blob_dep(sha256).read_key());
+    super::edition2::fold::refold_touched(dir, touched)
+        .await
+        .map(|_| ())
+}
+
+/// v62.0.0 (wave GC2) — the fold read of "this node's holding of the blob
+/// `sha256`": `key:blob:<hex>`. The bytes plane touches it when a blob lands
+/// or leaves (`edition2::fold::refold_touched`), so a holding claim judged
+/// against the blob's scope re-folds then.
+#[must_use]
+pub fn blob_dep(sha256: &[u8; 32]) -> super::edition2::fold::Dep {
+    super::edition2::fold::Dep::key(&format!("blob:{}", hex::encode(sha256)))
 }
 
 /// What [`emit_holding_claim`] did.
@@ -607,6 +669,11 @@ where
         .await?
         .ok_or_else(not_held)?
         .size_bytes;
+    // v62.0.0 (wave GC2; CC 2.7.3) — the blob is held here now: every
+    // holding claim whose fold read its scope ([`blob_dep`]) re-folds.
+    refold_on_blob(backend, sha256)
+        .await
+        .map_err(|e| BlobError::Backend(format!("holding claim re-fold: {e}")))?;
     let holder = local.federation_id().await;
     if !scope.is_directory()
         && !super::custody_ack::holder_in_cohort(

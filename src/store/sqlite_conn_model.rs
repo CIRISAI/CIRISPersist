@@ -443,7 +443,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // plane's un-project hook.
     ("fold_state", ConnClass::Read),
     ("fold_slot_rows", ConnClass::Read),
+    ("put_fold_reason", ConnClass::Write),
     ("fold_any_refolding", ConnClass::Read),
+    ("fold_slot_held", ConnClass::Read),
     ("clear_occurrence_projection", ConnClass::Write),
     // v62.0.0 (slice J0) — the edition-2 read models, the cross-form
     // refusal's edition read, and the statement serve listing.
@@ -958,7 +960,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("cosign_alias", ConnClass::Read),
     ("list_cosign_aliases", ConnClass::Read),
     ("read_group_plane_object", ConnClass::Read),
-    ("test_seed_wire_index", ConnClass::Write),
     // CIRISPersist#1198 — the V213 vote windows.
     ("vote_window_first_held", ConnClass::Read),
     // v59.0.0 (sealed-transport floor) — the eager key-plane rehome at open.

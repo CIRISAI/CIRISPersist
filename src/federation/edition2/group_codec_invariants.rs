@@ -112,12 +112,18 @@ fn i2990_roster_payload_reads_back_as_its_record() {
         assert_eq!(view.version, version, "I2990 version");
         assert_eq!(view.head, head.copied(), "I2990 refs.head");
         let back = record_of_roster(&view, String::new()).unwrap();
-        // A roster's members are a set, in key order (identity-refs are of
-        // one length, so their encodings sort as the text does).
+        // A roster's members are a set, in each element's encoding order: a
+        // member without a role (a 2-entry map) before one with a role (3
+        // entries), then by `key` (identity-refs are of one length, so their
+        // encodings sort as the text does).
         let mut expected = record.clone();
         match &mut expected {
-            GroupRecord::Family(f) => f.members.sort_by(|a, b| a.key_id.cmp(&b.key_id)),
-            GroupRecord::Community(c) => c.members.sort_by(|a, b| a.key_id.cmp(&b.key_id)),
+            GroupRecord::Family(f) => f
+                .members
+                .sort_by(|a, b| (a.role.is_some(), &a.key_id).cmp(&(b.role.is_some(), &b.key_id))),
+            GroupRecord::Community(c) => c
+                .members
+                .sort_by(|a, b| (a.role.is_some(), &a.key_id).cmp(&(b.role.is_some(), &b.key_id))),
         }
         assert_eq!(back, expected, "I2990 the record reads back");
         // Every voice of the version is a voice of ONE row.

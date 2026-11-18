@@ -31,6 +31,8 @@
 //! `verify_lifecycle_row`) and the fuse (`HaltLatch::apply_forward`).
 //! TODO(cut-a-halt-lifecycle).
 
+use std::collections::BTreeMap;
+
 use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::family::SelectContext;
 use ciris_verify_core::edition2::identity_ref;
@@ -89,6 +91,12 @@ pub struct InvocationOutcome {
     pub new: bool,
     /// Did it latch the accord's active halt (a constitutional halt).
     pub latched: bool,
+    /// v62.0.0 (wave GC4; CC 2.7.2, 2.7.3) — the statement is HELD and
+    /// concludes nothing: an earlier invocation of the same accord carries
+    /// its `invocation_id` or `nonce` (a replay). The fold reason is
+    /// `accord_invocation_replayed` (`edition2::fold::why_held`). The
+    /// ingest door answers `StatementOutcome::Pending` for it.
+    pub held: bool,
 }
 
 /// The retryable error of a waiting reading, naming the first key the
@@ -124,23 +132,68 @@ fn refusal_error(r: &HaltRefusal) -> Error {
     }
 }
 
-/// Is a held invocation statement a replay of `inv`: another row of the
-/// same accord naming the same `invocation_id` or `nonce`, still within its
-/// own `valid_until` at `inv`'s instant?
-fn replays(held: &[u8], inv: &InvocationRow) -> bool {
-    let Some((_, p)) = statement_parts(held) else {
-        return false;
-    };
-    if RowId::of_statement(held).is_some_and(|r| r.0 == *inv.row_id()) {
-        return false;
+/// v62.0.0 (wave GC4; CC 2.7.2 "one set, one answer") — one held
+/// invocation statement of an accord, as the replay fold reads it.
+#[derive(Debug, Clone)]
+struct HeldInvocation {
+    row: RowId,
+    asserted_at: u64,
+    valid_until: u64,
+    invocation_id: String,
+    nonce: Vec<u8>,
+    constitutional: bool,
+}
+
+impl HeldInvocation {
+    fn of(statement: &[u8], family: &str) -> Option<Self> {
+        let (_, p) = statement_parts(statement)?;
+        Some(Self {
+            row: RowId::of_statement(statement)?,
+            asserted_at: p.get_text("asserted_at").and_then(Value::as_u64)?,
+            valid_until: p.get_text("valid_until").and_then(Value::as_u64)?,
+            invocation_id: p
+                .get_text("invocation_id")
+                .and_then(Value::as_text)?
+                .to_owned(),
+            nonce: p.get_text("nonce").and_then(Value::as_bytes)?.to_vec(),
+            constitutional: family == FAMILY_CONSTITUTIONAL,
+        })
     }
-    let same_id = p.get_text("invocation_id").and_then(Value::as_text) == Some(inv.invocation_id());
-    let same_nonce = p.get_text("nonce").and_then(Value::as_bytes) == Some(&inv.nonce()[..]);
-    let live = p
-        .get_text("valid_until")
-        .and_then(Value::as_u64)
-        .is_some_and(|u| inv.asserted_at() < u);
-    (same_id || same_nonce) && live
+
+    /// The fold's order: `asserted_at`, then the row id.
+    fn rank(&self) -> (u64, RowId) {
+        (self.asserted_at, self.row)
+    }
+
+    /// Is `later` (ranked after `self`) a replay of `self`: the same
+    /// `invocation_id` or `nonce`, asserted before `self`'s `valid_until`?
+    fn replayed_by(&self, later: &Self) -> bool {
+        (self.invocation_id == later.invocation_id || self.nonce == later.nonce)
+            && later.asserted_at < self.valid_until
+    }
+}
+
+/// v62.0.0 (wave GC4; CC 2.7.2, 2.7.3) — **the replay fold** over every held
+/// invocation of one accord: in rank order, an invocation is a REPLAY when
+/// it is [`HeldInvocation::replayed_by`] an earlier invocation that is not
+/// itself a replay ("a replayed or second row changes nothing", CC 4.2.1.1:
+/// it excludes nothing). A function of the held set: the same invocations
+/// count whichever arrived first. Returns the replays, each with the row
+/// that excludes it.
+fn replay_fold(mut held: Vec<HeldInvocation>) -> BTreeMap<RowId, RowId> {
+    held.sort_by_key(HeldInvocation::rank);
+    held.dedup_by_key(|h| h.row);
+    let mut counted: Vec<&HeldInvocation> = Vec::new();
+    let mut replays = BTreeMap::new();
+    for h in &held {
+        match counted.iter().find(|c| c.replayed_by(h)) {
+            Some(by) => {
+                replays.insert(h.row, by.row);
+            }
+            None => counted.push(h),
+        }
+    }
+    replays
 }
 
 /// **The invocation store door.** `roster` is the bundle in force for the
@@ -150,9 +203,14 @@ fn replays(held: &[u8], inv: &InvocationRow) -> bool {
 ///   naming the key or the bundle;
 /// - `iss_not_holder` is refused by that name; every other refusal is
 ///   `accord_invocation_invalid` with the reader's token;
-/// - an invocation whose `invocation_id` or `nonce` a held invocation of the
-///   same accord already carries, within that one's `valid_until`, is
-///   refused `accord_invocation_replayed`;
+/// - v62.0.0 (wave GC4; CC 2.7.2, 2.7.3) — an invocation that collides with
+///   an earlier-ranked held invocation of the same accord (the same
+///   `invocation_id` or `nonce`, within that one's `valid_until`) is a
+///   replay: KEPT, concluding nothing (`held`, fold reason
+///   `accord_invocation_replayed`), never refused. An invocation that
+///   out-ranks a held one it collides with makes THAT one the replay: it is
+///   recorded held, and the active halt it latched is cleared. Whichever
+///   arrives first, the same invocation counts;
 /// - a valid invocation is kept in `ceg_statements`; a constitutional halt
 ///   latches the accord's active halt (`set_active_halt(accord_root, row
 ///   id)`): ONE holder's statement, no count.
@@ -184,25 +242,90 @@ where
         HaltReading::Refused(r) => return Err(refusal_error(&r)),
     };
     let accord_root = roster.accord_root();
-    for family in INVOCATION_FAMILIES {
-        for held in dir.edition2_statements_about(family, accord_root).await? {
-            if replays(&held, &inv) {
-                return Err(Error::malformed_row(
-                    PLANE,
-                    malformed_row::ACCORD_INVOCATION_REPLAYED,
-                    format!(
-                        "invocation {} (row {}) repeats the invocation_id or nonce of a held \
-                         invocation of {accord_root} still within its valid_until (CC 4.2.1.1)",
-                        inv.invocation_id(),
-                        hex::encode(inv.row_id()),
-                    ),
-                ));
-            }
-        }
-    }
     let admitted: AdmittedRow =
         super::door::admit_row(bytes, roster, None, SelectContext::default())?;
     let new = dir.put_edition2_statement(&admitted).await?;
+    // v62.0.0 (wave GC4; CC 2.7.2, 2.7.3) — the replay fold over every held
+    // invocation of the accord, this one included (it is kept first: a
+    // replay is held, never refused). Each row whose standing changed is
+    // recorded: a replay held `accord_invocation_replayed` (and a halt it
+    // latched un-latched), a row no longer a replay cleared.
+    let mut held = Vec::new();
+    let mut family_of: BTreeMap<RowId, &'static str> = BTreeMap::new();
+    for family in INVOCATION_FAMILIES {
+        for st in dir.edition2_statements_about(family, accord_root).await? {
+            if let Some(h) = HeldInvocation::of(&st, family) {
+                family_of.insert(h.row, family);
+                held.push(h);
+            }
+        }
+    }
+    let own = RowId(*inv.row_id());
+    if let std::collections::btree_map::Entry::Vacant(e) = family_of.entry(own) {
+        // The store lists what it holds; this one was just kept.
+        if let Some(f) = INVOCATION_FAMILIES
+            .iter()
+            .copied()
+            .find(|f| *f == admitted.family)
+        {
+            if let Some(h) = HeldInvocation::of(bytes, f) {
+                e.insert(f);
+                held.push(h);
+            }
+        }
+    }
+    let constitutional: BTreeMap<RowId, bool> =
+        held.iter().map(|h| (h.row, h.constitutional)).collect();
+    let replays = replay_fold(held);
+    for (row, family) in &family_of {
+        let was_held = dir.fold_held(row).await?.is_some();
+        match replays.get(row) {
+            Some(by) if !was_held || *row == own => {
+                record_replay(
+                    dir,
+                    *row,
+                    family,
+                    format!(
+                        "{}: invocation row {} repeats the invocation_id or nonce of the \
+                         earlier invocation row {} of {accord_root}, within its valid_until \
+                         (CC 4.2.1.1)",
+                        malformed_row::ACCORD_INVOCATION_REPLAYED,
+                        row.hex(),
+                        by.hex(),
+                    ),
+                )
+                .await?;
+                dir.clear_active_halt(accord_root, &row.hex()).await?;
+            }
+            None if was_held => {
+                super::fold::record(
+                    dir,
+                    *row,
+                    family,
+                    super::ingest::INGEST_TIER,
+                    None,
+                    std::iter::once(super::fold::Dep::Row(*row).read_key()).collect(),
+                )
+                .await?;
+                // No longer a replay: a constitutional halt latches if none is.
+                if *row != own
+                    && constitutional.get(row).copied().unwrap_or(false)
+                    && dir.get_active_halt(accord_root).await?.is_none()
+                {
+                    dir.set_active_halt(accord_root, &row.hex()).await?;
+                }
+            }
+            _ => {}
+        }
+    }
+    if replays.contains_key(&own) {
+        return Ok(InvocationOutcome {
+            invocation: inv,
+            new,
+            latched: false,
+            held: true,
+        });
+    }
     let latched = inv.kind() == InvokeKind::Constitutional;
     if latched {
         dir.set_active_halt(accord_root, &hex::encode(inv.row_id()))
@@ -212,5 +335,29 @@ where
         invocation: inv,
         new,
         latched,
+        held: false,
     })
+}
+
+/// v62.0.0 (wave GC4) — record an invocation row as a replay: held,
+/// concluding nothing, reason `accord_invocation_replayed`. It reads only
+/// its own row: the replay fold is re-run by [`put_invocation`] for every
+/// invocation of the accord that arrives (it is not a re-fold of
+/// `edition2::fold`, whose door tail does not re-enter the halt plane).
+async fn record_replay<F>(dir: &F, row: RowId, family: &str, detail: String) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    super::fold::record(
+        dir,
+        row,
+        family,
+        super::ingest::INGEST_TIER,
+        Some((
+            super::fold::reason::ACCORD_INVOCATION_REPLAYED.to_owned(),
+            detail,
+        )),
+        std::iter::once(super::fold::Dep::Row(row).read_key()).collect(),
+    )
+    .await
 }

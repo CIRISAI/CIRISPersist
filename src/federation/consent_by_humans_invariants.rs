@@ -1,9 +1,17 @@
 //! CIRISPersist#857 — witnesses for `FSD/CONSENT_BY_HUMANS.md` §5. One body
 //! per invariant, generic over the directory, run by every backend that folds
 //! consent (memory, sqlite, postgres), so the three cannot diverge.
+//!
+//! v62.0.0 (JSON cut, E7) — every key is an edition-2 `key:record`
+//! (`e2::put_key`, which returns the identity-ref the folds key on), and every
+//! row an edition-2 statement (`e2::row_of`) signed by its author's SEED. A
+//! row id is node-computed, so a body reads it off the row (`rid`). Peers a
+//! grant names ride `subject_key_ids`, which the codec writes as
+//! identity-refs (`e2::kid`).
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::ConsentState;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{AGENT, NODE, USER};
@@ -13,31 +21,31 @@ pub(crate) mod bodies {
         SignedAttestation,
     };
 
-    /// A federation-tier row signed by `signer` over `envelope`, targeting
-    /// `target`, with `subject_key_ids` — sign → seal → reseal, the crate's
-    /// fixture shape.
+    /// A federation-tier row signed by the key of SEED `signer` over
+    /// `envelope`, targeting `target` (an identity-ref, or a seed the codec
+    /// maps), with `subject_key_ids`: an edition-2 statement mapped onto the
+    /// typed row (v62.0.0, E7).
     fn row(
-        id: &str,
         signer: &str,
+        ty: &str,
         target: &str,
         envelope: serde_json::Value,
         subject_key_ids: Vec<String>,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Attestation {
-        let (och, ed_sig, pqc_sig) = ts::sign_envelope(signer, &envelope);
-        let mut r = Attestation {
-            attestation_id: id.to_owned(),
-            attesting_key_id: signer.to_owned(),
+        let r = Attestation {
+            attestation_id: String::new(),
+            attesting_key_id: e2::kid(signer),
             attested_key_id: target.to_owned(),
-            attestation_type: attestation_type::SCORES.to_owned(),
+            attestation_type: ty.to_owned(),
             weight: None,
             asserted_at: at,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
-            scrub_key_id: signer.to_owned(),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: e2::kid(signer),
             scrub_timestamp: at,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
@@ -48,9 +56,22 @@ pub(crate) mod bodies {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        ts::seal_row_in_place(signer, &mut r);
-        ts::reseal(&mut r);
-        r
+        e2::row_of(&r, signer)
+    }
+
+    /// v62.0.0 (CC 2.4.1.1) — a node / agent key's rows lapse when its record
+    /// ends, so every fixture instant is NOW-RELATIVE: the bodies' dates
+    /// (written against 2026-06-01) keep their spacing, shifted so that
+    /// 2026-06-01T00:00:00Z falls at today's UTC midnight minus 7 days.
+    fn relative(at: &str) -> chrono::DateTime<chrono::Utc> {
+        let written: chrono::DateTime<chrono::Utc> = at.parse().unwrap();
+        let origin: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
+        let today = chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc();
+        today - chrono::Duration::days(7) + (written - origin)
     }
 
     /// `consent:state:<stance>:v1` by `subject` about `target`, naming `scope`,
@@ -64,8 +85,7 @@ pub(crate) mod bodies {
         for_key: Option<&str>,
         at: &str,
     ) -> Attestation {
-        let at: chrono::DateTime<chrono::Utc> = at.parse().unwrap();
-        let at = admission::truncate_to_substrate_resolution(at);
+        let at = admission::truncate_to_substrate_resolution(relative(at));
         let mut env = serde_json::json!({
             "id": id,
             "dimension": format!("consent:state:{stance}:v1"),
@@ -75,20 +95,32 @@ pub(crate) mod bodies {
         if let Some(f) = for_key {
             env[cbh::FOR_KEY_ID] = serde_json::Value::String(f.to_owned());
         }
-        row(id, subject, target, env, Vec::new(), at)
+        row(
+            subject,
+            attestation_type::SCORES,
+            target,
+            env,
+            Vec::new(),
+            at,
+        )
     }
 
-    /// A `consent:replication:v1` grant by `author` to `peer`, optionally FOR `for_key`.
+    /// A `consent:replication:v1` grant by `author` (a SEED) to `peer`,
+    /// optionally FOR `for_key` (an identity-ref). `id` keeps two grants
+    /// distinct rows (the row id is over the payload).
     fn grant(id: &str, author: &str, peer: &str, for_key: Option<&str>) -> Attestation {
-        let mut payload =
-            serde_json::json!({"grants": "replication", "attestation_prefixes": ["i96-fixture:"]});
+        let mut payload = serde_json::json!({
+            "grants": "replication",
+            "attestation_prefixes": ["i96-fixture:"],
+            "label": id,
+        });
         if let Some(f) = for_key {
             payload[cbh::FOR_KEY_ID] = serde_json::Value::String(f.to_owned());
         }
         row(
-            id,
             author,
-            author,
+            attestation_type::SCORES,
+            &e2::kid(author),
             serde_json::json!({"dimension": crate::federation::consent_peer_set::DIMENSION, "payload": payload}),
             vec![peer.to_owned()],
             chrono::Utc::now(),
@@ -96,19 +128,72 @@ pub(crate) mod bodies {
     }
 
     /// A PLAIN conferral `delegates_to(user → agent)` — the `self_at_login`
-    /// delegation shape, no custody marker: a job, not stewardship.
+    /// delegation shape, no custody marker: a job, not stewardship. `user`
+    /// is a SEED, `agent` an identity-ref.
     fn conferral(id: &str, user: &str, agent: &str) -> Attestation {
-        let mut r = row(
-            id,
+        let at = relative("2026-05-01T00:00:00Z");
+        row(
             user,
+            attestation_type::DELEGATES_TO,
             agent,
             serde_json::json!({"id": id, "kind": "delegates_to", "delegate_key_id": agent, "scope": ["act_on_behalf", "message_io"], "sub_delegation": false}),
             Vec::new(),
-            "2026-05-01T00:00:00Z".parse().unwrap(),
+            at,
+        )
+    }
+
+    /// v62.0.0 (lead ruling; O1.api) — `owner` (a SEED) anchors `agent` (a
+    /// SEED): an agent is never an occurrence of a person (a key is a person's
+    /// or a machine's, never both). The anchor is the owner-authored
+    /// `ownership:responsible_party:agent` binding plus the agent's own voice.
+    async fn own_agent(d: &dyn FederationDirectory, owner: &str, agent: &str) {
+        let at = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after 1970");
+        e2::put_agent_owner_binding(d, owner, agent, at).await;
+    }
+
+    /// The held owner binding `owner → agent` (both identity-refs).
+    async fn owner_binding_row(
+        d: &dyn FederationDirectory,
+        owner: &str,
+        agent: &str,
+    ) -> Attestation {
+        d.list_attestations_for(agent)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| {
+                a.attesting_key_id == owner
+                    && a.attestation_type == attestation_type::DELEGATES_TO
+                    && a.attestation_envelope
+                        .get("dimension")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|dim| dim.starts_with("ownership:"))
+            })
+            .expect("the owner binding is held")
+    }
+
+    /// `owner` (a SEED) binds
+    /// node's own statement over it (RULINGS: an owner binding needs the
+    /// node's cosignature, C557).
+    async fn bind_owner(d: &dyn FederationDirectory, owner: &str, node: &str) {
+        // The builder dates its binding 2026-05-01; the node's voice is a
+        // node-key row, which must be now-relative (CC 2.4.1.1), so the
+        // binding is re-dated and re-sealed before the voice is taken.
+        let mut row = ts::owner_binding_attestation("", owner, node);
+        let at = admission::truncate_to_substrate_resolution(relative("2026-05-01T00:00:00Z"));
+        row.asserted_at = at;
+        row.scrub_timestamp = at;
+        row.attestation_envelope[crate::federation::envelope::paths::ASSERTED_AT] =
+            serde_json::Value::String(admission::render_signed_instant(at));
+        ts::reseal(&mut row);
+        put(d, row.clone()).await.expect("the owner binding");
+        let voice = e2::voice_of(
+            &e2::carried_statement(&row).expect("the binding carries its statement"),
+            node,
         );
-        r.attestation_type = attestation_type::DELEGATES_TO.to_owned();
-        ts::reseal(&mut r);
-        r
+        e2::put_statement(d, &voice)
+            .await
+            .expect("the node's voice on its owner binding");
     }
 
     async fn put(
@@ -151,9 +236,9 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        let (alice, agent) = (format!("i94-alice-{s}"), format!("i94-agent-{s}"));
-        ts::register_identity_key(d, &alice, USER).await;
-        ts::register_identity_key(d, &agent, AGENT).await;
+        let (alice_s, agent_s) = (format!("i94-alice-{s}"), format!("i94-agent-{s}"));
+        let alice = e2::put_key(d, &alice_s, &[USER]).await;
+        let agent = e2::put_key(d, &agent_s, &[AGENT]).await;
         // Server compose's transport self-occurrence: identity = the agent itself.
         occurrence(d, &agent, &agent, "agent", None).await;
         assert!(
@@ -171,7 +256,7 @@ pub(crate) mod bodies {
         );
 
         // A conferral (the login delegation's shape) is a job, not stewardship.
-        put(d, conferral(&format!("i94-conf-{s}"), &alice, &agent))
+        put(d, conferral(&format!("i94-conf-{s}"), &alice_s, &agent))
             .await
             .expect("I94: a conferral admits");
         assert!(
@@ -182,18 +267,10 @@ pub(crate) mod bodies {
             "I94: a conferral does not steward (Clause D)"
         );
 
-        // The login shape: the agent as an occurrence of the HUMAN — beside
-        // the self-row. This is the row `LIMIT 1` could miss.
-        occurrence(d, &alice, &agent, "agent", None).await;
-        let rows = d
-            .list_identity_occurrences_by_occurrence_key(&agent)
-            .await
-            .unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "I94 precondition: two identity rows for one occurrence key"
-        );
+        // v62.0.0 (lead ruling) — the human anchors the agent through the
+        // OWNER relation (an agent is never an occurrence of a person), beside
+        // the agent's self-row.
+        own_agent(d, &alice_s, &agent_s).await;
         assert_eq!(
             admission::steward_bindings_of(d, &agent).await.unwrap(),
             vec![alice.clone()],
@@ -214,32 +291,19 @@ pub(crate) mod bodies {
         want.sort();
         assert_eq!(p, want, "I94: {{k}} ∪ stewards");
 
-        // REVOKED under the human (active = admitted AND no effective
-        // revocation; expiry plays no part — v4.8.0's contract): the anchor is
-        // gone, the self-row still anchors nobody.
-        d.put_identity_occurrence_revocation_local(
-            crate::federation::IdentityOccurrenceRevocation {
-                identity_key_id: alice.clone(),
-                occurrence_key_id: agent.clone(),
-                // #421 re-assert semantics: an occurrence asserted AFTER the
-                // revocation's instants is re-established, so both instants sit
-                // strictly after the row's `asserted_at`.
-                revoked_at: chrono::Utc::now() + chrono::Duration::milliseconds(5),
-                effective_at: chrono::Utc::now() + chrono::Duration::milliseconds(5),
-                reason: None,
-                witness_set: Vec::new(),
-                persist_row_hash: String::new(),
-            },
-        )
-        .await
-        .expect("I94: the revocation lands");
+        // The owner WITHDRAWS the binding: the anchor is gone, the self-row
+        // still anchors nobody.
+        let binding = owner_binding_row(d, &alice, &agent).await;
+        e2::put_signed(d, &e2::composer_of("withdraws", &binding, &alice_s))
+            .await
+            .expect("I94: the owner withdraws the binding");
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(
             admission::steward_bindings_of(d, &agent)
                 .await
                 .unwrap()
                 .is_empty(),
-            "I94: a revoked device is not co-self with its former identity"
+            "I94: a withdrawn binding anchors nobody"
         );
     }
 
@@ -248,27 +312,18 @@ pub(crate) mod bodies {
     pub async fn i95_scoped_consent_by_principals(d: &dyn FederationDirectory, s: &str) {
         use ConsentState::*;
         let now = chrono::Utc::now();
-        let (canonical, alice, node, sibling) = (
+        let (canonical_s, alice_s, node_s, sibling_s) = (
             format!("i95-canon-{s}"),
             format!("i95-alice-{s}"),
             format!("i95-node-{s}"),
             format!("i95-sib-{s}"),
         );
-        for (k, t) in [
-            (&canonical, NODE),
-            (&alice, USER),
-            (&node, NODE),
-            (&sibling, AGENT),
-        ] {
-            ts::register_identity_key(d, k, t).await;
-        }
-        put(
-            d,
-            ts::owner_binding_attestation(&format!("i95-ob-{s}"), &alice, &node),
-        )
-        .await
-        .unwrap();
-        occurrence(d, &alice, &sibling, "agent", None).await;
+        let canonical = e2::put_key(d, &canonical_s, &[NODE]).await;
+        let alice = e2::put_key(d, &alice_s, &[USER]).await;
+        let node = e2::put_key(d, &node_s, &[NODE]).await;
+        let sibling = e2::put_key(d, &sibling_s, &[AGENT]).await;
+        bind_owner(d, &alice_s, &node_s).await;
+        own_agent(d, &alice_s, &sibling_s).await;
         let by = |subject: String, target: String| async move {
             cbh::resolve_scoped_consent_by_principals(d, &target, &subject, "analyze", None, now)
                 .await
@@ -285,7 +340,7 @@ pub(crate) mod bodies {
             d,
             state(
                 &format!("i95-gs-{s}"),
-                &alice,
+                &alice_s,
                 &canonical,
                 "granted",
                 "analyze",
@@ -310,7 +365,7 @@ pub(crate) mod bodies {
             d,
             state(
                 &format!("i95-gn-{s}"),
-                &alice,
+                &alice_s,
                 &canonical,
                 "granted",
                 "analyze",
@@ -337,7 +392,7 @@ pub(crate) mod bodies {
             d,
             state(
                 &format!("i95-g-{s}"),
-                &alice,
+                &alice_s,
                 &canonical,
                 "granted",
                 "analyze",
@@ -361,14 +416,14 @@ pub(crate) mod bodies {
         );
 
         // Legacy: a MACHINE-authored grant still counts — {k} is in the set.
-        let (legacy, t2) = (format!("i95-legacy-{s}"), format!("i95-t2-{s}"));
-        ts::register_identity_key(d, &legacy, AGENT).await;
-        ts::register_identity_key(d, &t2, NODE).await;
+        let legacy_s = format!("i95-legacy-{s}");
+        let legacy = e2::put_key(d, &legacy_s, &[AGENT]).await;
+        let t2 = e2::put_key(d, &format!("i95-t2-{s}"), &[NODE]).await;
         put(
             d,
             state(
                 &format!("i95-lg-{s}"),
-                &legacy,
+                &legacy_s,
                 &t2,
                 "granted",
                 "analyze",
@@ -385,15 +440,15 @@ pub(crate) mod bodies {
         );
 
         // Two principals: the agent's own legacy row + its steward's row naming it.
-        let (agent, t3) = (format!("i95-agent-{s}"), format!("i95-t3-{s}"));
-        ts::register_identity_key(d, &agent, AGENT).await;
-        ts::register_identity_key(d, &t3, NODE).await;
-        occurrence(d, &alice, &agent, "agent", None).await;
+        let agent_s = format!("i95-agent-{s}");
+        let agent = e2::put_key(d, &agent_s, &[AGENT]).await;
+        let t3 = e2::put_key(d, &format!("i95-t3-{s}"), &[NODE]).await;
+        own_agent(d, &alice_s, &agent_s).await;
         put(
             d,
             state(
                 &format!("i95-g3-{s}"),
-                &alice,
+                &alice_s,
                 &t3,
                 "granted",
                 "analyze",
@@ -412,7 +467,7 @@ pub(crate) mod bodies {
             d,
             state(
                 &format!("i95-ag-{s}"),
-                &agent,
+                &agent_s,
                 &t3,
                 "granted",
                 "analyze",
@@ -426,7 +481,7 @@ pub(crate) mod bodies {
             d,
             state(
                 &format!("i95-r3-{s}"),
-                &alice,
+                &alice_s,
                 &t3,
                 "revoked",
                 "analyze",
@@ -445,7 +500,7 @@ pub(crate) mod bodies {
             d,
             state(
                 &format!("i95-g3b-{s}"),
-                &alice,
+                &alice_s,
                 &t3,
                 "granted",
                 "analyze",
@@ -464,24 +519,20 @@ pub(crate) mod bodies {
     /// `purge_attestation_projections` (the sequence `purge_finalize` and the
     /// reaper run) `consent_peers_by_principals` no longer names the peer.
     pub async fn i829_a_deleted_grant_stops_authorising(d: &dyn FederationDirectory, s: &str) {
-        let (alice, node, p1) = (
+        let (alice_s, node_s, p1) = (
             format!("i829-alice-{s}"),
             format!("i829-node-{s}"),
             format!("i829-p1-{s}"),
         );
-        ts::register_identity_key(d, &alice, USER).await;
-        ts::register_identity_key(d, &node, NODE).await;
-        put(
-            d,
-            ts::owner_binding_attestation(&format!("i829-ob-{s}"), &alice, &node),
-        )
-        .await
-        .unwrap();
-        let gid = format!("i829-g-{s}");
-        put(d, grant(&gid, &alice, &p1, Some(&node))).await.unwrap();
+        e2::put_key(d, &alice_s, &[USER]).await;
+        let node = e2::put_key(d, &node_s, &[NODE]).await;
+        bind_owner(d, &alice_s, &node_s).await;
+        let g = grant(&format!("i829-g-{s}"), &alice_s, &p1, Some(&node));
+        let gid = g.attestation_id.clone();
+        put(d, g).await.unwrap();
         assert_eq!(
             cbh::consent_peers_by_principals(d, &node).await.unwrap(),
-            vec![p1.clone()],
+            vec![e2::kid(&p1)],
             "I829 control: the steward's grant names the node's peer"
         );
         assert!(
@@ -501,7 +552,7 @@ pub(crate) mod bodies {
     /// **I96** — the peer set by principals: own peers ∪ the steward's grants
     /// that NAME the machine; a grant for a sibling contributes nothing.
     pub async fn i96_consent_peers_by_principals(d: &dyn FederationDirectory, s: &str) {
-        let (alice, node, sibling, p1, p2, p3, p4) = (
+        let (alice_s, node_s, sibling_s, p1, p2, p3, p4) = (
             format!("i96-alice-{s}"),
             format!("i96-node-{s}"),
             format!("i96-sib-{s}"),
@@ -510,32 +561,27 @@ pub(crate) mod bodies {
             format!("i96-p3-{s}"),
             format!("i96-p4-{s}"),
         );
-        ts::register_identity_key(d, &alice, USER).await;
-        ts::register_identity_key(d, &node, NODE).await;
-        ts::register_identity_key(d, &sibling, AGENT).await;
-        put(
-            d,
-            ts::owner_binding_attestation(&format!("i96-ob-{s}"), &alice, &node),
-        )
-        .await
-        .unwrap();
-        occurrence(d, &alice, &sibling, "agent", None).await;
+        let _alice = e2::put_key(d, &alice_s, &[USER]).await;
+        let node = e2::put_key(d, &node_s, &[NODE]).await;
+        let sibling = e2::put_key(d, &sibling_s, &[AGENT]).await;
+        bind_owner(d, &alice_s, &node_s).await;
+        own_agent(d, &alice_s, &sibling_s).await;
         // The owner grants replication FOR the node to p1 and p2, FOR the
         // sibling to p4; the node itself to nobody — the split-key home.
-        put(d, grant(&format!("i96-g1-{s}"), &alice, &p1, Some(&node)))
+        put(d, grant(&format!("i96-g1-{s}"), &alice_s, &p1, Some(&node)))
             .await
             .unwrap();
-        put(d, grant(&format!("i96-g2-{s}"), &alice, &p2, Some(&node)))
+        put(d, grant(&format!("i96-g2-{s}"), &alice_s, &p2, Some(&node)))
             .await
             .unwrap();
         put(
             d,
-            grant(&format!("i96-g4-{s}"), &alice, &p4, Some(&sibling)),
+            grant(&format!("i96-g4-{s}"), &alice_s, &p4, Some(&sibling)),
         )
         .await
         .unwrap();
         assert!(d.list_consent_peers(&node).await.unwrap().is_empty(), "I96 precondition: the strict projection keyed by the node is EMPTY — the zero-traces defect");
-        let mut want = vec![p1.clone(), p2.clone()];
+        let mut want = vec![e2::kid(&p1), e2::kid(&p2)];
         want.sort();
         assert_eq!(
             cbh::consent_peers_by_principals(d, &node).await.unwrap(),
@@ -544,14 +590,14 @@ pub(crate) mod bodies {
         );
         assert_eq!(
             cbh::consent_peers_by_principals(d, &sibling).await.unwrap(),
-            vec![p4.clone()],
+            vec![e2::kid(&p4)],
             "I96: the sibling gets only its own"
         );
         // A legacy node-authored grant is unioned in, not lost.
-        put(d, grant(&format!("i96-g3-{s}"), &node, &p3, None))
+        put(d, grant(&format!("i96-g3-{s}"), &node_s, &p3, None))
             .await
             .unwrap();
-        let mut want3 = vec![p1, p2, p3];
+        let mut want3 = vec![e2::kid(&p1), e2::kid(&p2), e2::kid(&p3)];
         want3.sort();
         assert_eq!(
             cbh::consent_peers_by_principals(d, &node).await.unwrap(),
@@ -560,7 +606,7 @@ pub(crate) mod bodies {
         );
         // A stranger's grant naming the node contributes nothing: not a steward.
         let mallory = format!("i96-mallory-{s}");
-        ts::register_identity_key(d, &mallory, USER).await;
+        e2::put_key(d, &mallory, &[USER]).await;
         put(
             d,
             grant(
@@ -582,27 +628,33 @@ pub(crate) mod bodies {
     /// **I96 (b)** — a MACHINE author naming another key is refused at
     /// admission; a human may name any key; an unknown member still rejects.
     pub async fn i96b_for_key_id_admission(d: &dyn FederationDirectory, s: &str) {
-        let (alice, node, other) = (
+        let (alice_s, node_s, other_s) = (
             format!("i96b-alice-{s}"),
             format!("i96b-node-{s}"),
             format!("i96b-other-{s}"),
         );
-        ts::register_identity_key(d, &alice, USER).await;
-        ts::register_identity_key(d, &node, NODE).await;
-        ts::register_identity_key(d, &other, AGENT).await;
-        put(d, grant(&format!("i96b-self-{s}"), &node, "p", Some(&node)))
-            .await
-            .expect("I96 (b): a machine naming ITSELF admits");
-        let err = put(d, grant(&format!("i96b-x-{s}"), &node, "p", Some(&other)))
+        e2::put_key(d, &alice_s, &[USER]).await;
+        let node = e2::put_key(d, &node_s, &[NODE]).await;
+        let other = e2::put_key(d, &other_s, &[AGENT]).await;
+        put(
+            d,
+            grant(&format!("i96b-self-{s}"), &node_s, "p", Some(&node)),
+        )
+        .await
+        .expect("I96 (b): a machine naming ITSELF admits");
+        let err = put(d, grant(&format!("i96b-x-{s}"), &node_s, "p", Some(&other)))
             .await
             .expect_err("I96 (b): a machine naming ANOTHER key is refused");
         assert!(
             err.to_string().contains("for_key_id"),
             "I96 (b): the refusal names the member: {err}"
         );
-        put(d, grant(&format!("i96b-h-{s}"), &alice, "p", Some(&other)))
-            .await
-            .expect("I96 (b): a human may name any key");
+        put(
+            d,
+            grant(&format!("i96b-h-{s}"), &alice_s, "p", Some(&other)),
+        )
+        .await
+        .expect("I96 (b): a human may name any key");
     }
 }
 
@@ -669,6 +721,7 @@ mod run {
     #[tokio::test]
     async fn i97_login_anchor_crosses_and_the_far_node_walks_to_the_human() {
         use crate::engine::{SelfAtLoginInput, SelfAtLoginOccurrence};
+        use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::{AGENT, USER};
         use crate::federation::FederationDirectory;
@@ -697,12 +750,16 @@ mod run {
         );
         let alice_label = format!("i97-alice-{run}");
         let alice_signer = ts::local_signer(&alice_label);
-        let alice = alice_signer.derived_key_id();
-        let (app, agent) = (format!("i97-app-{run}"), format!("i97-agent-{run}"));
+        // v62.0.0 (JSON cut, E7) — the three keys are edition-2 records on
+        // both nodes; the identity the ceremony signs as is alice's
+        // identity-ref (E0: `signing_key` follows `local_signer`'s alias).
+        let alice = e2::kid(&alice_label);
+        let (app_s, agent_s) = (format!("i97-app-{run}"), format!("i97-agent-{run}"));
+        let (app, agent) = (e2::kid(&app_s), e2::kid(&agent_s));
         for s in [&sa, &sb] {
-            ts::register_hybrid_key_as(s.as_ref(), &alice, &alice_label, USER).await;
-            ts::register_hybrid_key_as(s.as_ref(), &app, &app, USER).await;
-            ts::register_hybrid_key_as(s.as_ref(), &agent, &agent, AGENT).await;
+            e2::put_key(s.as_ref(), &alice_label, &[USER]).await;
+            e2::put_key(s.as_ref(), &app_s, &[USER]).await;
+            e2::put_key(s.as_ref(), &agent_s, &[AGENT]).await;
         }
         let keys = || {
             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};

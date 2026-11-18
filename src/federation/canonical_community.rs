@@ -70,12 +70,24 @@
 //! pre-v50 squat at the reserved id — is `NotRooted`: it resolves to nothing, is
 //! served as `null` with the reason, and the accord's birth chain REPLACES it.
 
+use super::edition2::fold::{self, Dep};
 use super::types::{
     consensus_protocol as cp, identity_type, Community, KeyRecord, ScrubSig, SignedCommunity,
     SignedKeyRecord,
 };
 use super::{Error, FederationDirectory};
 use serde::{Deserialize, Serialize};
+
+/// v62.0.0 (wave GC8; CC 2.7.3) — declare what a trust-root fold reads
+/// beyond the row: the founder's (or cosigner's) own key plane and the rows
+/// about it (conferrals, occurrences, a genesis bundle placing it: a
+/// bundle's re-fold touches its holders' keys, G0 v3 §2), and the accord
+/// family's roster. No `family:` key (G0 v4 cost rule). A no-op outside a
+/// fold attempt.
+fn reads_founder(founder: &str) {
+    fold::reads(Dep::key(founder));
+    fold::reads(Dep::key(accord_family_key_id()));
+}
 
 /// The shipped default trust-root community id (CC 3.2 worked example; CC 4.4
 /// `pinned_trust.community_key_id`). Reserved to the trust-root door.
@@ -302,6 +314,13 @@ pub async fn check_founder_eligible<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC8; CC 2.7.3) — a founder is a MEMBER the record
+    // names, not the signer: every leg below reads other rows (the founder's
+    // key record, its occurrences, the accord's roster and conferrals, the
+    // genesis bundle). Each unmet leg is a fold condition: the row is held
+    // with the leg's token and re-folds when one of those rows lands or is
+    // withdrawn. Outside a fold attempt each is the refusal it was.
+    reads_founder(founder);
     // v62.0.0 (wave W1) — a holder of the genesis bundle in force is a seated
     // holder (#972: nothing more is asked of one), read before its key
     // record: the bundle placed its key.
@@ -309,10 +328,13 @@ where
         return Ok(());
     }
     let Some(record) = directory.lookup_public_key(founder).await? else {
-        return Err(violation(
-            community_key_id,
-            super::admission::INFRA_RULE_FOUNDER_NOT_CONFERRED,
-            format!("founder {founder:?} has no key record on this node"),
+        return Err(fold::hold(
+            fold::reason::gc8::FOUNDER_NOT_CONFERRED,
+            violation(
+                community_key_id,
+                super::admission::INFRA_RULE_FOUNDER_NOT_CONFERRED,
+                format!("founder {founder:?} has no key record on this node"),
+            ),
         ));
     };
     let arm = founder_arm_at(directory, &record, now).await?.0;
@@ -320,14 +342,17 @@ where
         return Ok(());
     }
     if arm == FounderArm::Neither {
-        return Err(violation(
-            community_key_id,
-            super::admission::INFRA_RULE_NODE_BEARING_FOUNDER,
-            format!(
-                "founder {founder:?} is not a human key (identity_type {:?}, and not a current \
-                 seat of the accord family): a node-bearing key MUST NOT be a founder of an \
-                 infrastructure community (CIRISPersist#925)",
-                record.identity_type
+        return Err(fold::hold(
+            fold::reason::gc8::NODE_BEARING_FOUNDER,
+            violation(
+                community_key_id,
+                super::admission::INFRA_RULE_NODE_BEARING_FOUNDER,
+                format!(
+                    "founder {founder:?} is not a human key (identity_type {:?}, and not a \
+                     current seat of the accord family): a node-bearing key MUST NOT be a \
+                     founder of an infrastructure community (CIRISPersist#925)",
+                    record.identity_type
+                ),
             ),
         ));
     }
@@ -339,15 +364,18 @@ where
     )
     .await?
     {
-        return Err(Error::RoleNotAccordConferred {
-            role: identity_type::STEWARD.to_owned(),
-            key_id: founder.to_owned(),
-            scrub_key_id: record.scrub_key_id.clone(),
-            reason: format!(
-                "a founder of trust-root community {community_key_id:?} must be an \
-                 accord-conferred steward key (CC 3.2 T2)"
-            ),
-        });
+        return Err(fold::hold(
+            fold::reason::gc8::ROLE_NOT_ACCORD_CONFERRED,
+            Error::RoleNotAccordConferred {
+                role: identity_type::STEWARD.to_owned(),
+                key_id: founder.to_owned(),
+                scrub_key_id: record.scrub_key_id.clone(),
+                reason: format!(
+                    "a founder of trust-root community {community_key_id:?} must be an \
+                     accord-conferred steward key (CC 3.2 T2)"
+                ),
+            },
+        ));
     }
     Ok(())
 }
@@ -1271,6 +1299,9 @@ where
     }
     check_trust_root_shape(&birth.community)?;
     for f in founders(&birth.community) {
+        // v62.0.0 (wave GC8) — the birth founder's eligibility reads other
+        // rows (as `check_founder_eligible`): a fold condition.
+        reads_founder(f);
         if !memo
             .founder_counts(
                 directory,
@@ -1281,10 +1312,13 @@ where
             )
             .await?
         {
-            return Err(violation(
-                id,
-                super::admission::INFRA_RULE_FOUNDER_NOT_CONFERRED,
-                format!("the birth's founder {f:?} was not an eligible founder at the birth"),
+            return Err(fold::hold(
+                fold::reason::gc8::FOUNDER_NOT_CONFERRED,
+                violation(
+                    id,
+                    super::admission::INFRA_RULE_FOUNDER_NOT_CONFERRED,
+                    format!("the birth's founder {f:?} was not an eligible founder at the birth"),
+                ),
             ));
         }
     }
@@ -1874,7 +1908,9 @@ where
     }
     let mut memo = Memo::at(now);
     let chain = chain_of(&signed);
-    match verify_chain_memo(directory, &chain, &mut memo).await {
+    // v62.0.0 (wave GC8; G0 v3 §4) — a READ: the chain's verdict becomes
+    // "not rooted", so the gates' fold marks are discarded (their reads kept).
+    match fold::unmarked(verify_chain_memo(directory, &chain, &mut memo)).await {
         Ok(()) => {}
         Err(e) if is_row_verdict(&e) => {
             return Ok((
@@ -2506,11 +2542,21 @@ where
         return Ok(());
     }
     let root = attested_key_id;
+    // v62.0.0 (wave GC8; CC 2.7.3) — freshness reads the root's lineage
+    // (its held head, its witness cosigns, its charter's window), which are
+    // other rows: an edge that is not fresh against them is HELD with
+    // `trust_root_head_stale` and re-folds when the root's rows change. The
+    // edge naming no head at all (`TrustRootHeadUnnamed`) is the row's own
+    // bytes and stays a refusal.
+    fold::reads(Dep::key(root));
     let refuse = |detail: String| {
-        Err(Error::TrustRootHeadStale {
-            root_key_id: root.to_owned(),
-            detail,
-        })
+        Err(fold::hold(
+            fold::reason::gc8::TRUST_ROOT_HEAD_STALE,
+            Error::TrustRootHeadStale {
+                root_key_id: root.to_owned(),
+                detail,
+            },
+        ))
     };
     // The lineage head the attach is judged against is the WITNESSED head the
     // fold serves (PR #943 review): with a witnessed H1 and an unwitnessed H2
@@ -2913,13 +2959,20 @@ fn check_amendment_immutables(prior: &Community, new: &Community) -> Result<(), 
         ));
     }
     check_trust_root_shape(new)?;
+    // v62.0.0 (wave GC8; CC 2.7.3) — the two arms above read the new
+    // version's own bytes and stay refusals. This one compares with the
+    // PRIOR version (the held head, when the walk starts from it): a fold
+    // condition, held with `grade_changed`.
     if new.consensus_protocol != prior.consensus_protocol {
-        return Err(violation(
-            id,
-            super::admission::INFRA_RULE_GRADE_CHANGED,
-            format!(
-                "consensus_protocol is entrenched: {:?} cannot become {:?}",
-                prior.consensus_protocol, new.consensus_protocol
+        return Err(fold::hold(
+            fold::reason::gc8::GRADE_CHANGED,
+            violation(
+                id,
+                super::admission::INFRA_RULE_GRADE_CHANGED,
+                format!(
+                    "consensus_protocol is entrenched: {:?} cannot become {:?}",
+                    prior.consensus_protocol, new.consensus_protocol
+                ),
             ),
         ));
     }
@@ -3008,6 +3061,9 @@ where
     check_founding_margin(&chain[0].community)?;
     // The door's one clock read; everything below judges at it.
     let now = crate::host::clock::now();
+    // v62.0.0 (wave GC8) — the held chain at this id is an input of the fold
+    // below (extends / re-birth over stalled).
+    fold::reads(Dep::key(&community.community_key_id));
     check_founders_eligible(directory, community, now).await?;
     let mut memo = Memo::at(now);
     let standing = chain_standing_at(directory, &community.community_key_id, now).await?;
@@ -3021,7 +3077,12 @@ where
             Extends::No if is_rebirth_over_stalled(&standing, &chain) => {
                 verify_chain_memo(directory, &chain, &mut memo).await?
             }
-            Extends::No => return Err(does_not_extend(&community.community_key_id)),
+            Extends::No => {
+                return Err(fold::hold(
+                    fold::reason::gc8::TRUST_ROOT_CHAIN,
+                    does_not_extend(&community.community_key_id),
+                ))
+            }
         }
     } else {
         verify_chain_memo(directory, &chain, &mut memo).await?;
@@ -3095,7 +3156,17 @@ pub async fn check_trust_root_at_door<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    match check_trust_root_community_admission(directory, signed).await {
+    // v62.0.0 (wave GC8; G0 v3 §4) — on the replicated door a non-canonical
+    // row's verdict is swallowed into "kept, not rooted": its fold marks must
+    // not hold the row, so they are discarded there (reads kept).
+    let swallows =
+        replicated && signed.community.community_key_id != CIRIS_CANONICAL_COMMUNITY_KEY_ID;
+    let verdict = if swallows {
+        fold::unmarked(check_trust_root_community_admission(directory, signed)).await
+    } else {
+        check_trust_root_community_admission(directory, signed).await
+    };
+    match verdict {
         Err(e)
             if replicated
                 && signed.community.community_key_id != CIRIS_CANONICAL_COMMUNITY_KEY_ID
@@ -3163,12 +3234,18 @@ fn extends(held: &SignedCommunity, chain: &[SignedCommunity]) -> Result<Extends,
     Ok(Extends::No)
 }
 
+/// v62.0.0 (wave GC8; CC 3.2 T6, rc21 ruling 16) — a chain that does not
+/// extend the held version is a competing TIP: it waits (held, concluding
+/// nothing, reason `trust_root_chain`), and a reader that holds the witnessed
+/// head holds it void for itself. "No lineage is settled by which version a
+/// node saw first." Every caller wraps this in `fold::hold`.
 fn does_not_extend(id: &str) -> Error {
     violation(
         id,
         super::admission::TRUST_ROOT_RULE_CHAIN,
-        "the offered chain does not extend the version this node holds (a re-birth or a fork \
-         of a rooted trust root is refused)",
+        "the offered chain does not extend the version this node holds: it is a competing tip \
+         and waits (held, concluding nothing); a reader holding the witnessed head holds it \
+         void (CC 3.2 T6)",
     )
 }
 
@@ -3222,6 +3299,7 @@ where
 {
     let mut chain = chain_of(offered);
     let id = offered.community.community_key_id.as_str();
+    fold::reads(Dep::key(id));
     let now = crate::host::clock::now();
     let mut memo = Memo::at(now);
     let standing = chain_standing_at(directory, id, now).await?;
@@ -3242,7 +3320,14 @@ where
                     verify_chain_memo(directory, &chain, &mut memo).await?;
                     (0, Some((REBIRTH_REPLACES_STALLED, held_hash)))
                 }
-                Extends::No => return Err(does_not_extend(id)),
+                // v62.0.0 (wave GC8; CC 2.7.8) — a chain that does not extend
+                // the held version is a fold condition, never a refusal.
+                Extends::No => {
+                    return Err(fold::hold(
+                        fold::reason::gc8::TRUST_ROOT_CHAIN,
+                        does_not_extend(id),
+                    ))
+                }
             }
         }
         (_, None) => {
@@ -3303,11 +3388,17 @@ where
             .await?
             .map(|c| c.persist_row_hash);
         if head_now.as_deref() != Some(row_hash(&version.community)?.as_str()) {
-            return Err(Error::Conflict(format!(
-                "trust-root chain {id}: version {} was held as a tip beside the head, not \
+            // v62.0.0 (wave GC8; rc21 ruling 16) — a version held as a tip
+            // waits: the row is held (`trust_root_chain`), never refused, and
+            // re-folds when the head moves.
+            return Err(fold::hold(
+                fold::reason::gc8::TRUST_ROOT_CHAIN,
+                Error::Conflict(format!(
+                    "trust-root chain {id}: version {} was held as a tip beside the head, not \
                  applied over it (the head moved); retryable",
-                i + 1
-            )));
+                    i + 1
+                )),
+            ));
         }
         written += 1;
     }
@@ -3364,6 +3455,7 @@ where
     F: FederationDirectory + ?Sized,
 {
     let id = new.community.community_key_id.clone();
+    fold::reads(Dep::key(&id));
     let now = crate::host::clock::now();
     let standing = chain_standing_at(directory, &id, now).await?;
     match standing.held() {
@@ -3388,11 +3480,16 @@ where
             "the trust root's chain stopped holding during the supersede; the founders' link \
              that stood in for the quorum no longer applies — retry",
         )),
-        None if is_trust_root_grade(&new.community) => Err(violation(
-            &id,
-            super::admission::INFRA_RULE_GRADE_CHANGED,
-            "a supersede cannot promote a community to trust-root grade — the accord's quorum \
-             founds a trust root (put_community)",
+        // v62.0.0 (wave GC8) — reads that no chain is held at the id: a fold
+        // condition (a birth landing later changes it).
+        None if is_trust_root_grade(&new.community) => Err(fold::hold(
+            fold::reason::gc8::GRADE_CHANGED,
+            violation(
+                &id,
+                super::admission::INFRA_RULE_GRADE_CHANGED,
+                "a supersede cannot promote a community to trust-root grade — the accord's \
+                 quorum founds a trust root (put_community)",
+            ),
         )),
         _ => Ok(new),
     }
@@ -3411,6 +3508,8 @@ where
     F: FederationDirectory + ?Sized,
 {
     let id = held.community.community_key_id.as_str();
+    // v62.0.0 (wave GC8) — the witness plane's cosigns are other rows.
+    fold::reads(Dep::key(id));
     let cosigns = match directory.list_lineage_head_cosigns_for(id).await {
         Ok(c) => c,
         Err(Error::Unsupported { .. }) => return Ok(()),
@@ -3436,20 +3535,23 @@ where
                 .as_deref()
                 .is_some_and(|p| anchors.iter().any(|a| a == p))
     }) {
-        return Err(violation(
-            id,
-            super::admission::TRUST_ROOT_RULE_BEHIND_WITNESS,
-            format!(
-                "the witness plane holds a cosign by {} for head {} whose prior {} is a \
+        return Err(fold::hold(
+            fold::reason::gc8::LINEAGE_HEAD_BEHIND_WITNESS,
+            violation(
+                id,
+                super::admission::TRUST_ROOT_RULE_BEHIND_WITNESS,
+                format!(
+                    "the witness plane holds a cosign by {} for head {} whose prior {} is a \
                  version this node holds (its head is {}): this node is behind the witnessed \
                  lineage (a restore or a lag) — fetch the witnessed head before extending \
                  (CC 3.2 T6 rc6, restore discipline)",
-                c.witness_key_id,
-                c.head_digest_sha256_hex,
-                c.prior_head_digest_sha256_hex
-                    .as_deref()
-                    .unwrap_or_default(),
-                head_digest
+                    c.witness_key_id,
+                    c.head_digest_sha256_hex,
+                    c.prior_head_digest_sha256_hex
+                        .as_deref()
+                        .unwrap_or_default(),
+                    head_digest
+                ),
             ),
         ));
     }
@@ -3492,6 +3594,24 @@ where
     F: FederationDirectory + ?Sized,
 {
     let founder = super::admission::MEMBER_ROLE_FOUNDER;
+    // v62.0.0 (wave GC8; CC 2.7.3) — the held head, its roster fold and its
+    // liveness are other rows: each leg that reads them is a fold
+    // condition. Seating a founder on a plane is the incoming row's own
+    // bytes (its role) and stays a refusal, ahead of the fold.
+    fold::reads(Dep::key(&community.community_key_id));
+    fold::reads(Dep::key(&incoming.key_id));
+    if !is_revocation && incoming.role.as_deref() == Some(founder) {
+        return Err(violation(
+            &community.community_key_id,
+            super::admission::TRUST_ROOT_RULE_FOUNDER_SEAT_ON_PLANE,
+            format!(
+                "founder seats of a trust-root community move only through the record (a \
+                 founders' amendment); the roster planes admit and remove members only \
+                 ({:?} widened as a founder)",
+                incoming.key_id
+            ),
+        ));
+    }
     let recorded = founders(community).contains(&incoming.key_id.as_str());
     let folded = super::effective_roster(directory, community)
         .await?
@@ -3512,13 +3632,17 @@ where
         if let Some(head) = lookup_signed_community(directory, &community.community_key_id).await? {
             let instant = head_instant(&head);
             if effective_at <= instant {
-                return Err(violation(
-                    &community.community_key_id,
-                    super::admission::TRUST_ROOT_RULE_RESIGNATION_BACKDATED,
-                    format!(
-                        "{:?}'s resignation is dated {effective_at}, not strictly after the \
-                         head's instant {instant}: a resignation cannot reach back over a link",
-                        incoming.key_id
+                return Err(fold::hold(
+                    fold::reason::gc8::RESIGNATION_BACKDATED,
+                    violation(
+                        &community.community_key_id,
+                        super::admission::TRUST_ROOT_RULE_RESIGNATION_BACKDATED,
+                        format!(
+                            "{:?}'s resignation is dated {effective_at}, not strictly after the \
+                             head's instant {instant}: a resignation cannot reach back over a \
+                             link",
+                            incoming.key_id
+                        ),
                     ),
                 ));
             }
@@ -3531,29 +3655,37 @@ where
     if !is_revocation && !(recorded || folded || seats_founder) {
         if let Some(head) = lookup_signed_community(directory, &community.community_key_id).await? {
             if !is_live(directory, &head, effective_at).await? {
-                return Err(violation(
-                    &community.community_key_id,
-                    super::admission::TRUST_ROOT_RULE_STALLED_NON_ADMITTING,
-                    format!(
-                        "the trust root is stalled (active founders at or below M): valid but \
-                         non-admitting (CC 3.2 T7) — {:?} is not admitted until the margin is \
-                         restored",
-                        incoming.key_id
+                return Err(fold::hold(
+                    fold::reason::gc8::LIVENESS_STALLED_NON_ADMITTING,
+                    violation(
+                        &community.community_key_id,
+                        super::admission::TRUST_ROOT_RULE_STALLED_NON_ADMITTING,
+                        format!(
+                            "the trust root is stalled (active founders at or below M): valid \
+                             but non-admitting (CC 3.2 T7) — {:?} is not admitted until the \
+                             margin is restored",
+                            incoming.key_id
+                        ),
                     ),
                 ));
             }
         }
     }
+    // `seats_founder` was refused above (the row's own bytes); what is left
+    // is a founder seat the HELD record or fold names: a fold condition.
     if recorded || folded || seats_founder {
-        return Err(violation(
-            &community.community_key_id,
-            super::admission::TRUST_ROOT_RULE_FOUNDER_SEAT_ON_PLANE,
-            format!(
-                "founder seats of a trust-root community move only through the record (a \
-                 founders' amendment); the roster planes admit and remove members only \
-                 ({:?} {})",
-                incoming.key_id,
-                if is_revocation { "revoked" } else { "widened" }
+        return Err(fold::hold(
+            fold::reason::gc8::FOUNDER_SEAT_ON_PLANE,
+            violation(
+                &community.community_key_id,
+                super::admission::TRUST_ROOT_RULE_FOUNDER_SEAT_ON_PLANE,
+                format!(
+                    "founder seats of a trust-root community move only through the record (a \
+                     founders' amendment); the roster planes admit and remove members only \
+                     ({:?} {})",
+                    incoming.key_id,
+                    if is_revocation { "revoked" } else { "widened" }
+                ),
             ),
         ));
     }
@@ -4053,12 +4185,14 @@ where
     let mut memo = Memo::at(now);
     let mut signers = std::collections::BTreeSet::new();
     for sig in signatures {
+        fold::reads(Dep::key(&sig.member_id));
         if !head
             .community
             .members
             .iter()
             .any(|m| m.key_id == sig.member_id)
         {
+            note_fold_reason(why::NOT_A_SEAT);
             return Ok(Err((
                 why::NOT_A_SEAT,
                 format!(
@@ -4074,6 +4208,7 @@ where
             )));
         }
         let Some(rec) = memo.record(directory, &sig.member_id).await? else {
+            note_fold_reason(why::COSIGNER_KEY_NOT_HELD);
             return Ok(Err((
                 why::COSIGNER_KEY_NOT_HELD,
                 format!(
@@ -4124,29 +4259,57 @@ where
     F: FederationDirectory + ?Sized,
 {
     use super::steward_purge::unauthorised_reason as why;
-    Ok(
-        match stored_standing_at(directory, community_key_id, now).await? {
-            StoredStanding::Rooted(head) => Ok(head),
-            StoredStanding::Stalled { reason, .. } => Err((
-                why::STALLED,
-                format!(
-                    "the trust root {community_key_id:?} is stalled ({reason}): valid but \
+    // v62.0.0 (wave GC8; CC 2.7.3) — the root's standing is other rows: an
+    // answer that is not `Rooted` is a fold condition, noted on the running
+    // attempt with its token (the caller still answers its refusal pair; at
+    // an edition-2 door the row is held and re-folds when the root's rows
+    // change). Outside an attempt nothing is marked.
+    fold::reads(Dep::key(community_key_id));
+    let out = match stored_standing_at(directory, community_key_id, now).await? {
+        StoredStanding::Rooted(head) => Ok(head),
+        StoredStanding::Stalled { reason, .. } => Err((
+            why::STALLED,
+            format!(
+                "the trust root {community_key_id:?} is stalled ({reason}): valid but \
                  non-admitting (CC 3.2 T7), so it authorises nothing new"
-                ),
-            )),
-            StoredStanding::NotRooted { reason } => Err((
-                why::ROOT_NOT_ROOTED,
-                format!("the row at {community_key_id:?} is not rooted ({reason})"),
-            )),
-            StoredStanding::Absent => Err((
-                why::ROOT_NOT_HELD,
-                format!(
+            ),
+        )),
+        StoredStanding::NotRooted { reason } => Err((
+            why::ROOT_NOT_ROOTED,
+            format!("the row at {community_key_id:?} is not rooted ({reason})"),
+        )),
+        StoredStanding::Absent => Err((
+            why::ROOT_NOT_HELD,
+            format!(
                 "no community row at {community_key_id:?}: the claimant is not a trust root this \
                  node holds"
             ),
-            )),
-        },
-    )
+        )),
+    };
+    if let Err((why_token, _)) = &out {
+        note_fold_reason(why_token);
+    }
+    Ok(out)
+}
+
+/// v62.0.0 (wave GC8) — mark the running fold attempt with the fold reason a
+/// trust-root count's refusal token names (`steward_purge::unauthorised_reason`).
+/// Only the tokens that read OTHER rows are fold conditions; a token about
+/// the notice's own bytes (no cosignature, a duplicate, a signature that does
+/// not verify, a malformed notice) marks nothing and stays a refusal.
+fn note_fold_reason(why_token: &str) {
+    use super::steward_purge::unauthorised_reason as why;
+    let r = match why_token {
+        t if t == why::ROOT_NOT_HELD => fold::reason::gc8::ROOT_NOT_HELD,
+        t if t == why::ROOT_NOT_ROOTED => fold::reason::gc8::ROOT_NOT_ROOTED,
+        t if t == why::STALLED => fold::reason::gc8::STALLED,
+        t if t == why::NOT_A_SEAT => fold::reason::gc8::NOT_A_SEAT,
+        t if t == why::COSIGNER_KEY_NOT_HELD => fold::reason::gc8::COSIGNER_KEY_NOT_HELD,
+        t if t == why::QUORUM_NOT_MET => fold::reason::COUNT_SHORT,
+        t if t == why::PROTOCOL_UNEVALUABLE => fold::reason::gc8::PROTOCOL_UNEVALUABLE,
+        _ => return,
+    };
+    fold::note(r);
 }
 
 /// v62.0.0 (wave T2) — the trust root's own `consensus_protocol` over
@@ -4166,7 +4329,9 @@ where
 {
     use super::steward_purge::unauthorised_reason as why;
     let mut seats: Vec<super::consensus::Seat> = Vec::with_capacity(head.community.members.len());
+    fold::reads(Dep::key(&head.community.community_key_id));
     for m in &head.community.members {
+        fold::reads(Dep::key(&m.key_id));
         seats.push(super::consensus::Seat {
             key_id: m.key_id.clone(),
             role: m.role.clone(),
@@ -4185,6 +4350,15 @@ where
         persons: super::key_person::PersonsAt::each_key(),
         high_water: None,
     });
+    // v62.0.0 (wave GC8) — a count short of the held head's protocol, or one
+    // the held roster cannot evaluate, is a fold condition.
+    match &verdict {
+        super::consensus::Verdict::Admit => {}
+        super::consensus::Verdict::Insufficient { .. } => note_fold_reason(why::QUORUM_NOT_MET),
+        super::consensus::Verdict::Unevaluable { .. } => {
+            note_fold_reason(why::PROTOCOL_UNEVALUABLE);
+        }
+    }
     match verdict {
         super::consensus::Verdict::Admit => Ok(Ok(signers)),
         super::consensus::Verdict::Insufficient { detail, .. } => Ok(Err((
@@ -4257,6 +4431,7 @@ where
     }
     for v in voices {
         if !head.community.members.iter().any(|m| m.key_id == *v) {
+            note_fold_reason(why::NOT_A_SEAT);
             return Ok(Err((
                 why::NOT_A_SEAT,
                 format!("voice {v:?} holds no seat on the trust root {community_key_id:?}"),

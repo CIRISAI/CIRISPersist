@@ -306,7 +306,12 @@ mod tests {
                 d.path().join(format!("{name}.db")).display()
             )
         };
-        b::i3055_a_hard_case_reaches_a_second_node(&dsn("a"), &dsn("b"), &tag()).await;
+        Box::pin(b::i3055_a_hard_case_reaches_a_second_node(
+            &dsn("a"),
+            &dsn("b"),
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "sqlite")]
@@ -319,7 +324,12 @@ mod tests {
                 d.path().join(format!("{name}.db")).display()
             )
         };
-        b::i3058_the_crossing_restates_a_local_hard_case(&dsn("a"), &dsn("b"), &tag()).await;
+        Box::pin(b::i3058_the_crossing_restates_a_local_hard_case(
+            &dsn("a"),
+            &dsn("b"),
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "sqlite")]
@@ -327,7 +337,11 @@ mod tests {
     async fn i3059_sqlite() {
         let d = tempfile::tempdir().unwrap();
         let dsn = format!("sqlite:///{}", d.path().join("a.db").display());
-        b::i3059_an_event_older_than_the_key_is_covered(&dsn, &tag()).await;
+        Box::pin(b::i3059_an_event_older_than_the_key_is_covered(
+            &dsn,
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "postgres")]
@@ -337,7 +351,7 @@ mod tests {
             eprintln!("i3059 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
             return;
         };
-        b::i3059_an_event_older_than_the_key_is_covered(&a, &tag()).await;
+        Box::pin(b::i3059_an_event_older_than_the_key_is_covered(&a, &tag())).await;
         eprintln!("i3059 postgres: RAN");
     }
 
@@ -351,7 +365,12 @@ mod tests {
             eprintln!("i3058 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
             return;
         };
-        b::i3058_the_crossing_restates_a_local_hard_case(&a, &bb, &tag()).await;
+        Box::pin(b::i3058_the_crossing_restates_a_local_hard_case(
+            &a,
+            &bb,
+            &tag(),
+        ))
+        .await;
         eprintln!("i3058 postgres: RAN");
     }
 
@@ -365,7 +384,7 @@ mod tests {
             eprintln!("i3055 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
             return;
         };
-        b::i3055_a_hard_case_reaches_a_second_node(&a, &bb, &tag()).await;
+        Box::pin(b::i3055_a_hard_case_reaches_a_second_node(&a, &bb, &tag())).await;
         eprintln!("i3055 postgres: RAN");
     }
 }
@@ -373,44 +392,44 @@ mod tests {
 #[cfg(test)]
 mod unit {
     use crate::federation::edition2::emit::payload_from_envelope;
-    use crate::federation::hard_case::{self, edition2_reals, HardCaseEvent};
+    use crate::federation::hard_case::{self, HardCaseEvent};
+    use ciris_verify_core::cde::Value;
 
-    /// **I3057** — a hard_case body carries no floats on the clean mesh:
-    /// every real, at any depth and under any member, is the fixed-scale
-    /// integer `round(x × 10^6)`, never a string; integers are unchanged. An
-    /// event whose `detail` holds reals then states as a payload (the payload
-    /// builder refuses any float).
-    #[test]
-    fn i3057_a_real_in_detail_is_a_fixed_scale_integer() {
-        assert_eq!(
-            edition2_reals(serde_json::json!({
-                "score": 0.75,
-                "ratio": 0.25,
-                "count": 3,
-                "nested": {"confidence": [0.5, 1], "drift": -1.5, "label": "x"},
-            })),
-            serde_json::json!({
-                "score": 750_000,
-                "ratio": 250_000,
-                "count": 3,
-                "nested": {"confidence": [500_000, 1], "drift": -1_500_000, "label": "x"},
-            }),
-            "I3057"
-        );
-        fn no_floats(v: &serde_json::Value) -> bool {
-            match v {
-                serde_json::Value::Number(n) => n.as_i64().is_some() || n.as_u64().is_some(),
-                serde_json::Value::Array(a) => a.iter().all(no_floats),
-                serde_json::Value::Object(o) => o.values().all(no_floats),
-                _ => true,
+    /// `4([exp, mantissa])`: a CBOR decimal fraction.
+    fn decimal(exp: i64, mantissa: i64) -> Value {
+        let int = |n: i64| {
+            if n >= 0 {
+                Value::Uint(n.unsigned_abs())
+            } else {
+                Value::Nint(n.unsigned_abs() - 1)
             }
-        }
+        };
+        Value::Tag(4, Box::new(Value::Array(vec![int(exp), int(mantissa)])))
+    }
+
+    /// **I3057** (CC ruling on reals in free-form bodies) — a hard_case
+    /// body's reals reach the payload encoder unchanged (the producer never
+    /// scales or restates them), and the ENCODED payload states each one
+    /// exactly: an integral value as a plain integer (`2.0` -> `2`), a
+    /// non-integral one as a tag-4 decimal fraction (`0.5` -> `4([-1, 5])`),
+    /// at any depth. Integers are unchanged. The encoder is P1's
+    /// (`payload_from_envelope(envelope, family, ..)` states every number in
+    /// the `hard_case` body member, registered in `payloads::BODY_MEMBERS`,
+    /// through `payloads::body_number`).
+    #[test]
+    fn i3057_body_reals_encode_as_int_or_decimal_fraction() {
+        let detail = serde_json::json!({
+            "ratio": 0.5,
+            "whole": 2.0,
+            "count": 3,
+            "nested": {"drift": [0.5, -1.5]},
+        });
         let event = HardCaseEvent {
             event_id: "i3057-ev".to_owned(),
             kind: hard_case::kind::LINEAGE_EQUIVOCATION.to_owned(),
             target_key_id: None,
             subject_key_id: None,
-            detail: serde_json::json!({"score": 0.5, "drift": 1.5}),
+            detail: detail.clone(),
             emitted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_790_000_000_000)
                 .expect("ms"),
             emitter_key_id: String::new(),
@@ -420,23 +439,34 @@ mod unit {
         let envelope = input.attestation_envelope.to_value();
         assert_eq!(
             envelope[hard_case::BODY_MEMBER]["detail"],
-            serde_json::json!({"score": 500_000, "drift": 1_500_000}),
-            "I3057: the stated detail"
+            detail,
+            "I3057: the producer passes the body's numbers through unchanged"
         );
-        assert!(
-            no_floats(&envelope[hard_case::BODY_MEMBER]),
-            "I3057: every number in the body is an integer"
+        let payload = payload_from_envelope(&envelope, "hard_case:.kind", 0, None, &[])
+            .expect("I3057: a body with reals encodes");
+        let encoded = payload
+            .get_text(hard_case::BODY_MEMBER)
+            .and_then(|b| b.get_text("detail"))
+            .expect("I3057: the encoded detail");
+        assert_eq!(
+            encoded.get_text("ratio"),
+            Some(&decimal(-1, 5)),
+            "I3057: 0.5 -> 4([-1, 5])"
         );
-        assert!(
-            payload_from_envelope(&envelope, "hard_case:.kind", 0, None, &[]).is_ok(),
-            "I3057: a detail with reals states as a payload"
+        assert_eq!(
+            encoded.get_text("whole"),
+            Some(&Value::Uint(2)),
+            "I3057: 2.0 -> 2"
         );
-        // Without the restatement the payload builder refuses the float.
-        let mut raw = envelope.clone();
-        raw[hard_case::BODY_MEMBER]["detail"]["drift"] = serde_json::json!(1.5);
-        assert!(
-            payload_from_envelope(&raw, "hard_case:.kind", 0, None, &[]).is_err(),
-            "I3057: a float in a payload is refused"
+        assert_eq!(
+            encoded.get_text("count"),
+            Some(&Value::Uint(3)),
+            "I3057: an integer is unchanged"
+        );
+        assert_eq!(
+            encoded.get_text("nested").and_then(|n| n.get_text("drift")),
+            Some(&Value::Array(vec![decimal(-1, 5), decimal(-1, -15)])),
+            "I3057: at any depth; -1.5 -> 4([-1, -15])"
         );
     }
 }

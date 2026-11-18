@@ -839,9 +839,10 @@ pub(crate) async fn i549_counters_equal_the_probe(
     backend: StoreBackend,
 ) {
     use crate::federation::audience_scan_invariants::bodies as asb;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::types::identity_type::{NODE, USER};
     use crate::federation::{
-        consent_by_humans as cbh, replication_audience as ra, trust_root as tr, SignedAttestation,
+        consent_by_humans as cbh, replication_audience as ra, trust_root as tr,
     };
 
     let now = chrono::Utc::now();
@@ -854,6 +855,7 @@ pub(crate) async fn i549_counters_equal_the_probe(
         format!("i549-b-{s}"),
     );
     let (owner, dev) = (format!("i549-owner-{s}"), format!("i549-dev-{s}"));
+    let (owner_s, dev_s) = (owner.clone(), dev.clone());
     asb::keys(
         d,
         &[
@@ -865,15 +867,20 @@ pub(crate) async fn i549_counters_equal_the_probe(
         ],
     )
     .await;
-    d.put_attestation(SignedAttestation {
-        attestation: asb::charter(&format!("i549-charter-{s}"), &root, &a, &b),
-    })
+    // v62 (E4): the builders' rows are edition-2 mapped rows; their
+    // statements go through the statement door.
+    e2::put_signed(
+        d,
+        &asb::charter(&format!("i549-charter-{s}"), &root, &a, &b),
+    )
     .await
     .expect("I549 charter");
     crate::federation::operational::test_support::emit_trust_edge(d, &a, &root, None)
         .await
         .expect("I549 a trusts the root");
     let _ = read_probe::take();
+    // v62 (E4): the folds name each key by its identity-ref.
+    let (root, a, owner, dev) = (e2::kid(&root), e2::kid(&a), e2::kid(&owner), e2::kid(&dev));
 
     // The admission of one row, then the folds.
     let mut probe_reads = 0;
@@ -892,9 +899,10 @@ pub(crate) async fn i549_counters_equal_the_probe(
     step!(
         "admission",
         Fold::AttestationAdmission,
-        d.put_attestation(SignedAttestation {
-            attestation: asb::grant(&owner, Some(&dev), Some(&[("community", "r1")]), None),
-        })
+        e2::put_signed(
+            d,
+            &asb::grant(&owner_s, Some(&dev_s), Some(&[("community", "r1")]), None)
+        )
         .await
         .expect("I549 grant")
     );

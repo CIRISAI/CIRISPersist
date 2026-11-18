@@ -128,6 +128,13 @@ pub enum AttestationRefusalReason {
     /// community holds no trace of one, whichever peer pushes it. RETRYABLE:
     /// the audience can widen (the node's owner joins, the membership plane
     /// arrives), and a re-offer then lands. APPENDED.
+    ///
+    /// v62.0.0 (wave GC8; CC 2.7.5 rc21, ruling 11) — a **LOCAL decline**,
+    /// never an admission verdict: "A node keeps a row only when it is in the
+    /// row's audience as it reads it. A row it declines is not Invalid, and it
+    /// may take the row once it is." Nothing is recorded against the row
+    /// ([`Self::is_local_decline`]). Only the earlier form can reach it: an
+    /// edition-2 row is applied as its statement and the fold decides it.
     NotInAudience,
 }
 
@@ -160,6 +167,15 @@ impl AttestationRefusalReason {
             self,
             Self::SelfRosterPending | Self::StoreConflict | Self::NotInAudience
         )
+    }
+
+    /// v62.0.0 (wave GC8; CC 2.7.5 rc21, ruling 11) — is this a LOCAL
+    /// decline (this node's own reading, e.g. of its audience) rather than a
+    /// verdict on the row? A declined row is not Invalid: nothing is recorded
+    /// against it, and it is taken once the local answer changes.
+    #[must_use]
+    pub const fn is_local_decline(&self) -> bool {
+        matches!(self, Self::NotInAudience)
     }
 
     /// The reason a self-roster door's [`Error::SelfRosterNotLanded`] maps to:
@@ -414,6 +430,57 @@ where
         .allowed())
 }
 
+/// v62.0.0 (wave GC8) — [`apply_planned`]'s edition-2 route: `None` for a
+/// row that carries no statement (or no edition-2 row id); else the
+/// replicated statement door's answer, in this plane's outcome. A statement
+/// kept and HELD (concluding nothing yet) is [`ReplicatedAttestationOutcome::HeldEquivalent`]:
+/// the act is held here, nothing is refused, and the sender stops re-offering.
+///
+/// # Errors
+/// A statement whose `ceg_statement` member is not hex; the statement door's
+/// errors (its door refusals: the statement's bytes, its signer's key plane).
+async fn apply_as_statement<D>(
+    dir: &D,
+    row: &Attestation,
+) -> Result<Option<ReplicatedAttestationOutcome>, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    use super::edition2::ingest::{
+        apply_replicated_statement, ReplicatedStatementOutcome, StatementOutcome, STATEMENT_MEMBER,
+    };
+    let Some(member) = row.attestation_envelope.get(STATEMENT_MEMBER) else {
+        return Ok(None);
+    };
+    let Some(row_id) = super::edition2::voices::carried_row_id(row) else {
+        return Ok(None);
+    };
+    let bytes = member
+        .as_str()
+        .and_then(|h| hex::decode(h).ok())
+        .ok_or_else(|| {
+            Error::malformed_row(
+                super::edition2::door::PLANE,
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!("`{STATEMENT_MEMBER}` is not lowercase hex"),
+            )
+        })?;
+    let kept = |o: &StatementOutcome, new: bool| match o {
+        StatementOutcome::Pending { .. } => ReplicatedAttestationOutcome::HeldEquivalent,
+        _ if new => ReplicatedAttestationOutcome::Inserted,
+        _ => ReplicatedAttestationOutcome::Unchanged,
+    };
+    Ok(Some(
+        match Box::pin(apply_replicated_statement(dir, &bytes, &row_id.0)).await? {
+            ReplicatedStatementOutcome::Admitted(o) => kept(&o, true),
+            ReplicatedStatementOutcome::Unchanged(o) => kept(&o, false),
+            ReplicatedStatementOutcome::Refused { reason } => {
+                ReplicatedAttestationOutcome::Refused { reason }
+            }
+        },
+    ))
+}
+
 pub(crate) async fn apply_planned<D>(
     dir: &D,
     attestation: super::SignedAttestation,
@@ -423,6 +490,21 @@ where
     D: super::FederationDirectory + ?Sized,
 {
     super::edition2::door::refuse_earlier_form_row("attestation", &attestation.attestation)?;
+    // v62.0.0 (wave GC8; CC 2.7.3) — **a row that carries its edition-2
+    // statement is applied as that statement**, through the replicated
+    // statement door (`edition2::ingest::apply_replicated_statement`), never
+    // through the plan below. The plan's verdicts read other rows (the row
+    // held under the same id: first-seen wins; this node's audience; the
+    // key-plane and group-plane doors' held state), so for an edition-2 row
+    // each is a fold condition: the statement door keeps the statement, runs
+    // the row's gates as a fold attempt, and holds what does not conclude
+    // (reason `why_held`), re-folding it when its inputs change. A row id is
+    // computed from the statement's bytes, so two different rows under one id
+    // cannot arise here. What is left below is the earlier form, which the
+    // shut doors refuse above.
+    if let Some(outcome) = Box::pin(apply_as_statement(dir, &attestation.attestation)).await? {
+        return Ok(outcome);
+    }
     use super::precedence;
     use ReplicatedAttestationOutcome as Outcome;
     use ReplicatedAttestationPlan as Plan;
@@ -629,8 +711,14 @@ where
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use crate::federation::types::{attestation_tier, attestation_type};
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::types::{attestation_tier, attestation_type, identity_type};
     use crate::federation::{FederationDirectory, SignedAttestation};
+
+    /// v62.0.0 (JSON cut, E7) — a dimension Verify's family matcher registers
+    /// (`evidence:{suite}:{kind}:{cell}:{prefix}`): an edition-2 row of an
+    /// unregistered dimension (`identity_binding:v1`) is refused at the door.
+    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
 
     // ── Pure plan + token tests (no backend, no directory) ────────────
 
@@ -827,22 +915,21 @@ mod tests {
         );
     }
 
-    // ── Entry-point witnesses (memory backend — the PUBLIC door) ──────
+    // ── Entry-point witnesses (the PUBLIC door) ───────────────────────
     //
     // One witness per outcome/reason variant through
-    // `FederationDirectory::apply_replicated_attestation`. The fixture
-    // recipe (deterministic hybrid keys + `seal_row_in_place`) is the
-    // corpus-standard one, so every row here clears the REAL admission
-    // stack — each witness measures the apply classification, not a gate
-    // upstream of it.
+    // `FederationDirectory::apply_replicated_attestation`. v62.0.0 (JSON cut,
+    // E7): every row is an edition-2 statement (`e2::row_of`) by an author
+    // whose `key:record` is live in the store (`e2::put_key`), so every row
+    // clears the REAL admission stack. The row id is the node-computed one:
+    // a caller never picks it, and reads it back off the row.
 
-    /// A fully-admissible federation-tier row: registered author, sealed
-    /// envelope (instants + #643 mirror + hybrid signatures).
-    fn sealed_row(id: &str, author: &str, envelope: serde_json::Value) -> Attestation {
-        let mut row = bare_row(id, author, "identity_binding:v1");
+    /// A fully-admissible federation-tier row by `author`: an edition-2
+    /// statement over `envelope`, mapped onto the typed row.
+    fn sealed_row(author: &str, envelope: serde_json::Value) -> Attestation {
+        let mut row = bare_row("", author, DIMENSION);
         row.attestation_envelope = envelope;
-        crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut row);
-        row
+        e2::row_of(&row, author)
     }
 
     fn envelope(dimension: &str, extra: serde_json::Value) -> serde_json::Value {
@@ -861,7 +948,9 @@ mod tests {
 
     async fn test_backend_with_author(author: &str) -> crate::store::sqlite::SqliteBackend {
         let dir = crate::store::test_backend::test_backend();
-        crate::federation::tier_ingest::test_support::register_hybrid_key(&dir, author).await;
+        // A `user` key covers every instant (E0.api v1.5): the fixture rows
+        // are dated 2026-01-01, before a default node/agent window.
+        e2::put_key(&dir, author, &[identity_type::USER]).await;
         dir
     }
 
@@ -871,11 +960,7 @@ mod tests {
     async fn apply_fresh_row_is_inserted() {
         let author = "att-apply-ins-author";
         let dir = test_backend_with_author(author).await;
-        let row = sealed_row(
-            &uuid::Uuid::new_v4().to_string(),
-            author,
-            envelope("identity_binding:v1", serde_json::json!({})),
-        );
+        let row = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
         let id = row.attestation_id.clone();
         let outcome = dir
             .apply_replicated_attestation(SignedAttestation { attestation: row })
@@ -895,11 +980,7 @@ mod tests {
     async fn apply_identical_reoffer_is_unchanged() {
         let author = "att-apply-unch-author";
         let dir = test_backend_with_author(author).await;
-        let row = sealed_row(
-            &uuid::Uuid::new_v4().to_string(),
-            author,
-            envelope("identity_binding:v1", serde_json::json!({})),
-        );
+        let row = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
         let id = row.attestation_id.clone();
         dir.apply_replicated_attestation(SignedAttestation {
             attestation: row.clone(),
@@ -926,73 +1007,6 @@ mod tests {
         assert_eq!(outcome, ReplicatedAttestationOutcome::Unchanged);
     }
 
-    /// `Refused { ConflictingAttestation }` — same id, different signed
-    /// content: refused as a DECISION, pre-write, with the stored row
-    /// untouched. The pre-write half is proven by faulting
-    /// `put_attestation` itself: the verdict must not change, because the
-    /// write step is never consulted for a row the plan refuses.
-    #[tokio::test]
-    async fn apply_conflicting_row_is_refused_pre_write() {
-        let author = "att-apply-conf-author";
-        let dir = std::sync::Arc::new(test_backend_with_author(author).await);
-        let id = uuid::Uuid::new_v4().to_string();
-        let first = sealed_row(
-            &id,
-            author,
-            envelope("identity_binding:v1", serde_json::json!({})),
-        );
-        dir.apply_replicated_attestation(SignedAttestation { attestation: first })
-            .await
-            .expect("first apply");
-        let stored_before = dir.get_attestation(&id).await.expect("get").expect("held");
-
-        // A rival mint of the SAME id with DIFFERENT signed content.
-        let rival = sealed_row(
-            &id,
-            author,
-            envelope(
-                "identity_binding:v1",
-                serde_json::json!({"note": "a different mint of the same id"}),
-            ),
-        );
-
-        // Through a directory whose put_attestation is FAULTED: if the
-        // decision reached the write step at all, the apply would error.
-        let no_writes = crate::federation::directory_double::FaultInjectingDirectory::new(
-            dir.clone() as std::sync::Arc<dyn FederationDirectory>,
-        )
-        .unsupported("put_attestation");
-        let outcome = no_writes
-            .apply_replicated_attestation(SignedAttestation {
-                attestation: rival.clone(),
-            })
-            .await
-            .expect("a refusal is an outcome, not an error — and pre-write");
-        assert_eq!(
-            outcome,
-            ReplicatedAttestationOutcome::Refused {
-                reason: AttestationRefusalReason::ConflictingAttestation
-            }
-        );
-        // Same verdict through the un-faulted door, and the row is untouched.
-        let outcome = dir
-            .apply_replicated_attestation(SignedAttestation { attestation: rival })
-            .await
-            .expect("apply");
-        assert_eq!(
-            outcome,
-            ReplicatedAttestationOutcome::Refused {
-                reason: AttestationRefusalReason::ConflictingAttestation
-            }
-        );
-        let stored_after = dir.get_attestation(&id).await.expect("get").expect("held");
-        assert_eq!(
-            crate::federation::types::compute_persist_row_hash(&stored_before).expect("hash"),
-            crate::federation::types::compute_persist_row_hash(&stored_after).expect("hash"),
-            "a refused apply must leave the stored row untouched"
-        );
-    }
-
     /// `Refused { AlreadyPresentIdentical }` — the same assertion re-signed
     /// (fresh ML-DSA bytes, fresh scrub_timestamp) is a duplicate, not a
     /// conflict. This is the witness that distinguishes the two variants:
@@ -1001,29 +1015,26 @@ mod tests {
     async fn apply_resigned_same_assertion_is_already_present() {
         let author = "att-apply-dup-author";
         let dir = test_backend_with_author(author).await;
-        let row = sealed_row(
-            &uuid::Uuid::new_v4().to_string(),
-            author,
-            envelope("identity_binding:v1", serde_json::json!({})),
-        );
+        let row = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
         dir.apply_replicated_attestation(SignedAttestation {
             attestation: row.clone(),
         })
         .await
         .expect("first apply");
 
-        // Re-sign the SAME sealed envelope: same signed bytes, new signature
-        // decoration. `sign_envelope` re-derives och from the same envelope,
-        // and ML-DSA-65 signing is randomized, so the pqc half differs.
-        let mut reoffer = row.clone();
-        let (och, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
+        // v62.0.0 (JSON cut, E7) — re-sign the SAME payload by the SAME
+        // author: a second statement (`voice_of`) over the same row. The row
+        // id is over (type, family, sub, author, payload), never the
+        // signature, so it is the same row; only the statement bytes differ.
+        let again = e2::voice_of(
+            &e2::carried_statement(&row).expect("the row carries its statement"),
             author,
-            &reoffer.attestation_envelope,
         );
-        assert_eq!(och, reoffer.original_content_hash, "same bytes, same hash");
-        reoffer.scrub_signature_classical = classical;
-        reoffer.scrub_signature_pqc = pqc;
-        reoffer.scrub_timestamp += chrono::Duration::seconds(11);
+        let reoffer = e2::row_of_statement(&again, &row.tier);
+        assert_eq!(
+            reoffer.attestation_id, row.attestation_id,
+            "same assertion, same row id"
+        );
         let outcome = dir
             .apply_replicated_attestation(SignedAttestation {
                 attestation: reoffer,
@@ -1048,12 +1059,7 @@ mod tests {
     async fn apply_without_a_plan_maps_duplicate_key_to_store_conflict() {
         let author = "att-apply-race-author";
         let dir = std::sync::Arc::new(test_backend_with_author(author).await);
-        let id = uuid::Uuid::new_v4().to_string();
-        let first = sealed_row(
-            &id,
-            author,
-            envelope("identity_binding:v1", serde_json::json!({})),
-        );
+        let first = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
         dir.apply_replicated_attestation(SignedAttestation {
             attestation: first.clone(),
         })
@@ -1085,33 +1091,13 @@ mod tests {
                 .expect("plan-free synced re-offer"),
             ReplicatedAttestationOutcome::Unchanged
         );
-        // A rival mint of the same id: the plan cannot run, the store's
-        // uniqueness fires, and the outcome is the typed store conflict.
-        let rival = sealed_row(
-            &id,
-            author,
-            envelope(
-                "identity_binding:v1",
-                serde_json::json!({"note": "rival mint, plan-free"}),
-            ),
-        );
-        let outcome = planless
-            .apply_replicated_attestation(SignedAttestation { attestation: rival })
-            .await
-            .expect("a store conflict is an outcome, not an error");
-        assert_eq!(
-            outcome,
-            ReplicatedAttestationOutcome::Refused {
-                reason: AttestationRefusalReason::StoreConflict
-            }
-        );
+        // v62.0.0 (JSON cut, E7) — the earlier "rival mint of the same id"
+        // arm is gone: an edition-2 row id is computed from the row's own
+        // bytes, so different content cannot carry the held row's id (the
+        // door refuses an offered id that is not the computed one).
         // And a FRESH row through the plan-free door still inserts — the
         // fallback degrades the plan, not the write.
-        let fresh = sealed_row(
-            &uuid::Uuid::new_v4().to_string(),
-            author,
-            envelope("identity_binding:v1", serde_json::json!({})),
-        );
+        let fresh = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
         assert_eq!(
             planless
                 .apply_replicated_attestation(SignedAttestation { attestation: fresh })
@@ -1151,11 +1137,7 @@ mod tests {
             "fixture must actually declare the fault it is testing"
         );
 
-        let row = sealed_row(
-            &uuid::Uuid::new_v4().to_string(),
-            author,
-            envelope("identity_binding:v1", serde_json::json!({})),
-        );
+        let row = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
         let result = failing
             .apply_replicated_attestation(SignedAttestation { attestation: row })
             .await;
@@ -1177,11 +1159,7 @@ mod tests {
 
         // The target the withdraws retracts — the author's own row (rule 1:
         // the producer's own retraction).
-        let target = sealed_row(
-            &uuid::Uuid::new_v4().to_string(),
-            author,
-            envelope("identity_binding:v1", serde_json::json!({})),
-        );
+        let target = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
         let target_id = target.attestation_id.clone();
         dir.apply_replicated_attestation(SignedAttestation {
             attestation: target,
@@ -1189,19 +1167,23 @@ mod tests {
         .await
         .expect("target applies");
 
-        let withdraws = |id: &str| {
-            let mut row = bare_row(id, author, "identity_binding:v1");
+        // v62.0.0 (JSON cut, E7) — a composer carries its target's family
+        // and names it by `refs.target` (the codec maps
+        // `references_attestation_id` onto it). `note` makes two composers
+        // over one triple two distinct rows (the row id is over the payload).
+        let withdraws = |note: &str| {
+            let mut row = bare_row("", author, DIMENSION);
             row.attestation_type = attestation_type::WITHDRAWS.to_owned();
             row.attestation_envelope = envelope(
-                "identity_binding:v1",
+                DIMENSION,
                 serde_json::json!({
                     crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID: target_id,
+                    "note": note,
                 }),
             );
-            crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut row);
-            row
+            e2::row_of(&row, author)
         };
-        let first = withdraws(&uuid::Uuid::new_v4().to_string());
+        let first = withdraws("first");
         assert_eq!(
             dir.apply_replicated_attestation(SignedAttestation { attestation: first })
                 .await
@@ -1211,8 +1193,8 @@ mod tests {
 
         // v61 (CIRISPersist#1157, CC rc14 3.1.9.4) — same triple, DIFFERENT
         // id: a distinct row, stored (the rank is read-time), never a replay.
-        let second_id = uuid::Uuid::new_v4().to_string();
-        let second = withdraws(&second_id);
+        let second = withdraws("second");
+        let second_id = second.attestation_id.clone();
         assert_eq!(
             dir.apply_replicated_attestation(SignedAttestation {
                 attestation: second

@@ -998,6 +998,7 @@ mod tests {
 #[cfg(test)]
 mod sweep_tests {
     use super::*;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::types::{attestation_type, cohort_scope};
     use crate::federation::FederationDirectory;
 
@@ -1015,38 +1016,6 @@ mod sweep_tests {
             CONFORMANT,
         )
         .expect("valid target")
-    }
-
-    /// A `federation_keys` row keyed by the signer's DERIVED id but carrying
-    /// `alias`'s REAL deterministic hybrid pubkeys, so an emitted row both
-    /// FK-resolves and hybrid-verifies at the ingest gate (the #247 floor).
-    fn derived_key(derived: &str, alias: &str) -> crate::federation::SignedKeyRecord {
-        let (ed_pk, mldsa_pk) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(alias);
-        crate::federation::SignedKeyRecord {
-            record: crate::federation::KeyRecord {
-                key_id: derived.into(),
-                pubkey_ed25519_base64: ed_pk,
-                pubkey_ml_dsa_65_base64: mldsa_pk,
-                algorithm: crate::federation::types::algorithm::HYBRID.into(),
-                identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
-                identity_ref: derived.into(),
-                valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
-                valid_until: None,
-                registration_envelope: serde_json::json!({ "id": derived }),
-                original_content_hash: "deadbeef".into(),
-                scrub_signature_classical: "c2lnbmF0dXJl".into(),
-                scrub_signature_pqc: None,
-                scrub_key_id: derived.into(),
-                scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            },
-        }
     }
 
     fn probe_input(id: &str, wrap_algorithm: &str) -> crate::federation::EmitAttestationInput {
@@ -1092,13 +1061,13 @@ mod sweep_tests {
         D: FederationDirectory + Sync + ?Sized,
     {
         let mine = signer.derived_key_id();
-        let theirs = foreign.derived_key_id();
-        dir.put_public_key(derived_key(&mine, &format!("vt-mine-{label}")))
-            .await
-            .expect("seed own key");
-        dir.put_public_key(derived_key(&theirs, &format!("vt-theirs-{label}")))
-            .await
-            .expect("seed foreign key");
+        let _theirs = foreign.derived_key_id();
+        // v62 (E3): each signer's key is live as an edition-2 `key:record`
+        // under its own seed (the `local_signer` alias), so an emitted row
+        // resolves its signer at the door.
+        let primitive = [crate::federation::types::identity_type::PRIMITIVE];
+        e2::put_key(dir, &format!("vt-mine-{label}"), &primitive).await;
+        e2::put_key(dir, &format!("vt-theirs-{label}"), &primitive).await;
 
         // ── seed ──────────────────────────────────────────────────────────
         let a = crate::federation::attestation_emit::emit_with_local_signer(
@@ -1354,9 +1323,14 @@ mod sweep_tests {
             .expect("engine");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
         let derived = engine.local_derived_key_id().await.expect("derived");
-        sq.put_public_key(derived_key(&derived, "vt-engine-host"))
-            .await
-            .expect("seed key");
+        // v62 (E3, X2 pass 2): the engine's key is live as an edition-2
+        // `key:record` under its seed (the `local_signer` alias).
+        e2::put_key(
+            &*sq,
+            "vt-engine-host",
+            &[crate::federation::types::identity_type::PRIMITIVE],
+        )
+        .await;
 
         let seeded = crate::federation::attestation_emit::emit_with_local_signer(
             &*sq,

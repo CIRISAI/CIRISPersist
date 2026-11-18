@@ -50,7 +50,15 @@
 //!   a founding roster some listed member has not signed yet
 //!   (`membership_founding_member_unsigned`). The voice is kept; a later
 //!   voice re-runs the door over all of them;
-//! - **refused**: any other refusal, and the voice is NOT kept.
+//! - **held** (v62.0.0, waves G0/GC5; CC 2.7.3; also [`StatementOutcome::Pending`]):
+//!   a gate that reads ANOTHER row found its condition unmet (a named
+//!   version not held yet, the held head, the roster planes, a member's
+//!   location proof, the group's cohort). It marks the door's fold attempt
+//!   (`edition2::fold::hold`): the voice is kept, the row concludes nothing
+//!   with that reason (`fold::why_held`), and it re-folds when what it read
+//!   changes;
+//! - **refused**: a refusal of the statement's own bytes or its signer's
+//!   key plane, and the voice is NOT kept.
 //!
 //! # A later version
 //!
@@ -58,9 +66,10 @@
 //! P1's payload table). The earlier form's `prev_head_digest` is the
 //! predecessor's typed `persist_row_hash`, which is a pure function of the
 //! predecessor's own statement, so it is re-derived from the held chain
-//! ([`prev_head_digest`]). A predecessor that is not held waits (the
-//! retryable `federation_withdraws_target_unheld`, the ordering gap of a row
-//! naming a row). The supersede proof's change envelope is the one
+//! ([`prev_head_digest`]). A predecessor that is not held yet is a fold
+//! condition (T1-fix2): the version is HELD (`link_unheld`), its voices
+//! kept, and G0's write-time re-fold lands it when the predecessor arrives,
+//! with no re-offer. The supersede proof's change envelope is the one
 //! `build_membership_change_envelope` gives for the record from this node's
 //! held state, and its signatures are the voices.
 
@@ -73,6 +82,7 @@ use ciris_verify_core::namespace_match;
 use sha2::Digest as _;
 
 use super::door::AdmittedRow;
+use super::fold::{self, reason, Dep};
 use super::ingest::{json_of, StatementOutcome};
 use super::liveness::statement_parts;
 use super::names::{names_of, single, Name, RowId};
@@ -157,6 +167,26 @@ pub fn payload_family_of(header_family: &str) -> Option<&'static str> {
         .iter()
         .map(|f| f.family)
         .find(|f| namespace_match::family_id(f) == header_family)
+}
+
+/// v62.0.0 (T1-fix2; ruling from K1's I2812, O1's self-roster rule, G0's
+/// fold) — **a row naming a row not held yet is HELD, not refused.** The
+/// named row is recorded as a read of the running fold attempt
+/// (`row:<named>`), and the attempt is held with reason `link_unheld`; the
+/// door keeps the voice and answers `Pending`. When the named row arrives,
+/// G0's write-time re-fold re-runs this door over the held voices and the row
+/// lands with no re-offer: the concluded set does not depend on arrival
+/// order. Outside an attempt (a read, the earlier form) this is the plain,
+/// retryable `federation_withdraws_target_unheld`.
+fn unheld(row_id: &RowId, named: &RowId) -> Error {
+    super::fold::reads(super::fold::Dep::Row(*named));
+    super::fold::hold(
+        super::fold::reason::LINK_UNHELD,
+        Error::WithdrawsTargetUnheld {
+            attestation_id: row_id.hex(),
+            target_attestation_id: named.hex(),
+        },
+    )
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -487,6 +517,13 @@ pub struct RosterView {
     pub names: Vec<Name>,
     /// The payload.
     pub payload: Value,
+    /// v62.0.0 (wave GC5; CC27 item 4, lead's ruling (b)) — for a
+    /// GEOGRAPHIC group: the charter's row id, resolved ONCE from the chain
+    /// head (the founding version's `refs.also.cites`, the cited row of the
+    /// trust family) by [`resolve_geographic_charter`]. Every other row a
+    /// geographic version cites is a location proof. `None` from the pure
+    /// reader ([`roster_view`]) and for any other group.
+    pub geographic_charter: Option<RowId>,
 }
 
 /// Read a `group:roster` payload whose CWT `sub` is `sub`.
@@ -519,6 +556,7 @@ pub fn roster_view(sub: &str, payload: &Value) -> Result<RosterView, Error> {
             .collect(),
         names,
         payload: payload.clone(),
+        geographic_charter: None,
     })
 }
 
@@ -580,12 +618,91 @@ fn roster_members(p: &Value) -> Result<Vec<CommunityMember>, Error> {
 
 /// The charter in force a roster names (`refs.also.cites`; the base table's
 /// `refs.also:charter`), as the earlier record's hex `charter_digest`.
-fn charter_of(names: &[Name]) -> String {
+///
+/// v62.0.0 (wave GC5; CC27 item 4, lead's ruling (b)) — a GEOGRAPHIC version
+/// cites its members' location proofs under `refs.also.cites` beside its
+/// charter, and a set of opaque row-refs cannot tell them apart purely. Its
+/// charter is the row id resolved once from the chain head
+/// ([`RosterView::geographic_charter`]), when the version cites it; no other
+/// cited row ever reads as the charter.
+fn charter_of(view: &RosterView) -> String {
+    if is_geographic(&view.payload) {
+        return view
+            .geographic_charter
+            .filter(|c| {
+                view.names
+                    .iter()
+                    .any(|n| n.role == CHARTER_ROLES[0] && n.row == *c)
+            })
+            .map(|r| r.hex())
+            .unwrap_or_default();
+    }
     CHARTER_ROLES
         .iter()
-        .find_map(|r| single(names, r))
+        .find_map(|r| single(&view.names, r))
         .map(|r| r.hex())
         .unwrap_or_default()
+}
+
+/// v62.0.0 (wave GC5; CC27 item 4, lead's ruling (b)) — **a geographic
+/// group's charter, resolved once at the chain head.** Follows `refs.head`
+/// from `view` down to the founding version (each a named row), and reads
+/// the founding's `refs.also.cites`: the cited row of the trust family is
+/// the charter. `None` for a group that is not geographic, for a founding
+/// that cites no trust row, and while a named version or cited row is not
+/// held (the door's own reads hold the version `link_unheld` then). Every
+/// read is the version's NAMED past (the group plane is FINAL).
+///
+/// # Errors
+/// A named version that does not read; directory failures.
+pub async fn resolve_geographic_charter<F>(
+    dir: &F,
+    view: &RosterView,
+) -> Result<Option<RowId>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if !is_geographic(&view.payload) {
+        return Ok(None);
+    }
+    let mut root = view.clone();
+    let mut steps = 0usize;
+    while let Some(h) = root.head {
+        steps += 1;
+        if steps > MAX_ROSTER_CHAIN {
+            return Ok(None);
+        }
+        fold::reads(Dep::Row(h));
+        let Some(st) = dir.edition2_voices(&h).await?.into_iter().next() else {
+            return Ok(None);
+        };
+        root = roster_view_of_statement(&st)?;
+    }
+    for n in root.names.iter().filter(|n| n.role == CHARTER_ROLES[0]) {
+        fold::reads(Dep::Row(n.row));
+        let Some(st) = dir.edition2_voices(&n.row).await?.into_iter().next() else {
+            continue;
+        };
+        let trust = statement_parts(&st).is_some_and(|(protected, _)| {
+            protected
+                .get_int(-70002)
+                .and_then(Value::as_text)
+                .is_some_and(super::typed::is_trust_family)
+        });
+        if trust {
+            return Ok(Some(n.row));
+        }
+    }
+    Ok(None)
+}
+
+/// Does a roster payload declare the `geographic` subkind (top level, or in
+/// its `policy`)?
+fn is_geographic(p: &Value) -> bool {
+    policy_blob_of(p).is_some_and(|b| {
+        b.get("cohort_subkind").and_then(serde_json::Value::as_str)
+            == Some(super::payloads::GEOGRAPHIC_SUBKIND)
+    })
 }
 
 /// A community's `policy_blob`: the payload's `policy` map, with the CC 3.2
@@ -638,7 +755,7 @@ pub fn record_of_roster(view: &RosterView, prev_head_digest: String) -> Result<G
     let members = roster_members(p)?;
     let founded_at = req_ms(p, "founded_at")?;
     let consensus_protocol = req_text(p, "consensus_protocol")?.to_owned();
-    let charter_digest = charter_of(&view.names);
+    let charter_digest = charter_of(view);
     Ok(match view.kind {
         GroupKind::Family => GroupRecord::Family(Family {
             family_key_id: view.group.clone(),
@@ -759,20 +876,26 @@ where
             )));
         }
         if !read.contains_key(&id) {
+            // v62.0.0 (wave GC5; CC 2.7.3) — a named version is an input of
+            // this row's fold: unheld, the row WAITS (held, re-folded when
+            // the version lands); of another group, it concludes nothing.
+            fold::reads(Dep::Row(id));
             let held = dir.edition2_voices(&id).await?;
             let Some(st) = held.first() else {
-                return Err(Error::WithdrawsTargetUnheld {
-                    attestation_id: row_id.hex(),
-                    target_attestation_id: id.hex(),
-                });
+                return Err(unheld(row_id, &id));
             };
-            let v = roster_view_of_statement(st)?;
+            let mut v = roster_view_of_statement(st)?;
+            // v62.0.0 (wave GC5; ruling (b)) — one charter for the chain.
+            v.geographic_charter = view.geographic_charter;
             if v.group != view.group || v.kind != view.kind {
-                return Err(invalid(format!(
-                    "group:roster: {} names a roster of another group ({:?})",
-                    row_id.hex(),
-                    v.group
-                )));
+                return Err(fold::hold(
+                    reason::NAMES_ANOTHER_GROUP,
+                    invalid(format!(
+                        "group:roster: {} names a roster of another group ({:?})",
+                        row_id.hex(),
+                        v.group
+                    )),
+                ));
             }
             read.insert(id, v);
         }
@@ -802,8 +925,10 @@ where
 /// of the same group.
 ///
 /// # Errors
-/// - the retryable `federation_withdraws_target_unheld` for a named version
-///   this node does not hold yet (an ordering gap);
+/// - for a named version this node does not hold yet: HELD (`link_unheld`)
+///   inside the door's fold attempt, so the voice is kept and lands when the
+///   version arrives; the retryable `federation_withdraws_target_unheld`
+///   outside one;
 /// - `edition2_payload_invalid` for a version that does not follow what it
 ///   names (1 with no `refs.head`; `refs.further_heads` with no `refs.head`),
 ///   a named version of another group or kind, or a chain past
@@ -867,10 +992,15 @@ where
         .max()
         .unwrap_or(0);
     if view.version != greatest.saturating_add(1) {
-        return Err(invalid(format!(
-            "group:roster: version {} does not follow the greatest version {greatest} it names",
-            view.version
-        )));
+        // v62.0.0 (wave GC5; CC 2.7.3) — the named versions' own numbers are
+        // another row's content: the version concludes nothing.
+        return Err(fold::hold(
+            reason::VERSION_DOES_NOT_FOLLOW,
+            invalid(format!(
+                "group:roster: version {} does not follow the greatest version {greatest} it names",
+                view.version
+            )),
+        ));
     }
     let prev = chosen_prev(view, &chain, &lineage);
     let merged = parents
@@ -1015,12 +1145,12 @@ where
     if let Some(table) = payload_family_of(&row.family) {
         super::payloads::check(table, &row.payload)?;
     }
-    // v62.0.0 (wave G0 follow-up; CC 2.7.3) — the group door runs as a FOLD
-    // attempt (`edition2::fold`): every input its gates read is recorded
-    // (the shared readers declare theirs; the group's own are declared
-    // here), and a shortfall is held with its reason, so the row re-folds
-    // exactly when one of those inputs changes.
-    let gates = async {
+    // v62.0.0 (T1-fix2; G0.api "every door is already inside an attempt")
+    // — the group door runs inside `ingest::put_admitted_row`'s ONE fold
+    // attempt (no inner attempt: it would swallow the marks and reads the
+    // outer records). The group's own reads are declared to it; the shared
+    // readers declare theirs.
+    {
         use super::fold::{reads, Dep};
         // The row's own voices, its subject (the group of a roster, the
         // member of a change), the group it changes, and every version it
@@ -1033,50 +1163,36 @@ where
         for n in &row.names {
             reads(Dep::Row(n.row));
         }
-        let voices = voices_of(dir, row).await?;
-        match plane {
-            GroupPlane::Roster => Box::pin(put_roster(dir, row, voices)).await,
-            GroupPlane::Widening | GroupPlane::Removal => {
-                Box::pin(put_membership(dir, row, plane, voices, replicated)).await
-            }
+    }
+    let voices = voices_of(dir, row).await?;
+    // A refusal a gate MARKED as a fold condition (`link_unheld`: a named row
+    // not held yet; a gate's `fold::hold`) returns as the error, and the
+    // outer attempt keeps the voice and holds the row with that reason
+    // (`Pending`). An unmarked refusal stays a refusal.
+    let landing = match plane {
+        GroupPlane::Roster => Box::pin(put_roster(dir, row, voices)).await?,
+        GroupPlane::Widening | GroupPlane::Removal => {
+            Box::pin(put_membership(dir, row, plane, voices, replicated)).await?
         }
     };
-    let (landing, attempted) = super::fold::attempt(row.row_id, None, gates).await;
-    let landing = landing?;
     let new = dir.put_edition2_statement(row).await?;
     Ok(match landing {
-        Landing::Landed => {
-            super::fold::record(dir, row.row_id, &row.family, tier, None, attempted.reads).await?;
-            StatementOutcome::Row {
-                row_id: row.row_id,
-                new,
-            }
-        }
+        Landing::Landed => StatementOutcome::Row {
+            row_id: row.row_id,
+            new,
+        },
         Landing::Short(e) => {
-            // The reason the gate noted (`count_short`), or, for a founding
-            // roster a listed member has not voiced yet (the founding rule's
-            // typed refusal, never a gate's note), `count_short` too.
-            let (reason, detail) = match attempted.held {
-                Some((r, d)) if !d.is_empty() => (r, d),
-                Some((r, _)) => (r, e.to_string()),
-                None => (super::fold::reason::COUNT_SHORT.to_owned(), e.to_string()),
-            };
+            // Short of the count: a gate noted it (`fold::note(count_short)`,
+            // through `note_short`), or the founding rule's typed refusal (a
+            // listed member has not voiced yet). The outer attempt records
+            // the hold (`count_short`) with every read.
             tracing::debug!(
                 row_id = %row.row_id.hex(),
                 family = %row.family,
-                reason = %reason,
-                detail = %detail,
-                "edition-2 group row held: short of its protocol"
-            );
-            super::fold::record(
-                dir,
-                row.row_id,
-                &row.family,
                 tier,
-                Some((reason, detail)),
-                attempted.reads,
-            )
-            .await?;
+                reason = %e,
+                "edition-2 group row held: short of its count"
+            );
             StatementOutcome::Pending {
                 row_id: row.row_id,
                 new,
@@ -1094,9 +1210,17 @@ async fn put_roster<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let view = roster_view(&row.sub, &row.payload)?;
+    let mut view = roster_view(&row.sub, &row.payload)?;
+    view.geographic_charter = resolve_geographic_charter(dir, &view).await?;
+    // v62.0.0 (wave GC5) — the group's held head, versions and tips are
+    // inputs of this row: a version of the group (its `sub`) re-folds it;
+    // so does a membership change of any member it lists (its `sub`).
+    fold::reads(Dep::key(&view.group));
     let MergeReading { prev, merged } = merge_reading(dir, &view, &row.row_id).await?;
     let record = record_of_roster(&view, prev.clone())?;
+    if let GroupRecord::Community(c) = &record {
+        check_named_location_proofs(dir, row, &view, c).await?;
+    }
     let offered_hash = record.persist_row_hash()?;
     let landing = Box::pin(put_roster_record(dir, row, &view, record, &prev, voices)).await?;
     // v62.0.0 (wave T1; CC 2.7.8) — a merge that became the head makes one
@@ -1105,6 +1229,125 @@ where
         drop_merged_tips(dir, &view, &offered_hash, &merged).await?;
     }
     Ok(landing)
+}
+
+/// The family id of a `location_proof:{version}` row (header -70002).
+fn location_proof_family() -> String {
+    namespace_match::family_id("location_proof:{version}")
+}
+
+/// v62.0.0 (wave GC5; CC rc21 3.2, CC27 item 4) — **a geographic version
+/// names each new member's `location_proof`.** For a community whose
+/// `policy_blob` declares the `geographic` subkind, the version cites under
+/// `refs.also.cites` ([`super::payloads::LOCATION_PROOF_ROLE`]) one
+/// `location_proof` row per member it adds (every member, on version 1;
+/// against the versions it names, on a later one). Each cited row is read
+/// by its family (the charter rides the same set and is skipped). The
+/// version:
+/// - WAITS for a cited row not held (held, `link_unheld`);
+/// - concludes nothing (held, `geographic_member_unlocated`) while a new
+///   member has no cited proof whose subject it is, whose cell is contained
+///   in the constraint cell, and that is live at the version's own
+///   `asserted_at` (stated at or before it; `valid_until`, if any, after
+///   it).
+///
+/// The group plane is FINAL (G0 v4): this reads only what the version
+/// names (the cited rows and the versions it extends), never current state
+/// or the clock. A withdrawal of a cited proof after the version concluded
+/// does not take the version back.
+///
+/// # Errors
+/// The holds above; `edition2_payload_invalid` for a named version that does
+/// not read; directory failures.
+async fn check_named_location_proofs<F>(
+    dir: &F,
+    row: &AdmittedRow,
+    view: &RosterView,
+    community: &Community,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(cell) =
+        crate::federation::location::geographic_constraint_cell(community.policy_blob.as_ref())
+    else {
+        return Ok(());
+    };
+    // The members the versions it extends already list.
+    let mut prior: BTreeSet<String> = BTreeSet::new();
+    for parent in view.parents() {
+        fold::reads(Dep::Row(parent));
+        if let Some(st) = dir.edition2_voices(&parent).await?.first() {
+            let pv = roster_view_of_statement(st)?;
+            if let GroupRecord::Community(pc) = record_of_roster(&pv, String::new())? {
+                prior.extend(pc.members.into_iter().map(|m| m.key_id));
+            }
+        }
+    }
+    let new: BTreeSet<&str> = community
+        .members
+        .iter()
+        .map(|m| m.key_id.as_str())
+        .filter(|k| !prior.contains(*k))
+        .collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    let family = location_proof_family();
+    let mut located: BTreeSet<String> = BTreeSet::new();
+    for n in view
+        .names
+        .iter()
+        .filter(|n| n.role == super::payloads::LOCATION_PROOF_ROLE)
+        .filter(|n| view.geographic_charter != Some(n.row))
+    {
+        fold::reads(Dep::Row(n.row));
+        let held = dir.edition2_voices(&n.row).await?;
+        let Some(st) = held.first() else {
+            return Err(fold::hold(
+                reason::LINK_UNHELD,
+                Error::WithdrawsTargetUnheld {
+                    attestation_id: row.row_id.hex(),
+                    target_attestation_id: n.row.hex(),
+                },
+            ));
+        };
+        let Some((protected, payload)) = statement_parts(st) else {
+            continue;
+        };
+        if protected.get_int(-70002).and_then(Value::as_text) != Some(family.as_str()) {
+            continue;
+        }
+        let Some(subject) = protected
+            .get_int(15)
+            .and_then(|c| c.get_int(2))
+            .and_then(Value::as_text)
+        else {
+            continue;
+        };
+        let stated = payload.get_text("asserted_at").and_then(Value::as_u64);
+        let until = payload.get_text("valid_until").and_then(Value::as_u64);
+        let live = stated.is_some_and(|t| t <= row.asserted_at_ms)
+            && until.is_none_or(|u| u > row.asserted_at_ms);
+        let contained = payload
+            .get_text("cell_id")
+            .and_then(Value::as_text)
+            .is_some_and(|c| crate::federation::location::h3_cell_contained(c, &cell));
+        if live && contained {
+            located.insert(subject.to_owned());
+        }
+    }
+    if let Some(missing) = new.iter().find(|k| !located.contains(**k)) {
+        return Err(fold::hold(
+            reason::GEOGRAPHIC_MEMBER_UNLOCATED,
+            invalid(format!(
+                "group:roster: geographic version {} names no live location_proof of new member \
+                 {missing} contained in the constraint cell {cell} at its asserted_at (CC 3.2)",
+                row.row_id.hex()
+            )),
+        ));
+    }
+    Ok(())
 }
 
 /// The tips a landed merge names leave the tip store, once the merge is the
@@ -1295,11 +1538,13 @@ where
         Cohort::Family => dir.lookup_family(group).await?.is_some(),
         _ => dir.lookup_community(group).await?.is_some(),
     };
+    fold::reads(Dep::key(group));
+    fold::reads(Dep::Row(*head));
     if !held {
-        return Err(Error::WithdrawsTargetUnheld {
-            attestation_id: row.row_id.hex(),
-            target_attestation_id: head.hex(),
-        });
+        // The group lands with the version `refs.head` names (or its own
+        // founding): a change to the group's rows re-folds this one.
+        super::fold::reads(super::fold::Dep::key(group));
+        return Err(unheld(&row.row_id, head));
     }
     let mut change_envelope = dir
         .build_membership_change_envelope(
@@ -1336,20 +1581,24 @@ where
     let Some(head) = view.head else {
         return Ok(());
     };
+    // v62.0.0 (wave GC5; CC 2.7.3) — the named roster version is an input:
+    // unheld, the change WAITS (held); of another group, it concludes
+    // nothing.
+    fold::reads(Dep::Row(head));
     let held = dir.edition2_voices(&head).await?;
     let Some(st) = held.first() else {
-        return Err(Error::WithdrawsTargetUnheld {
-            attestation_id: row.row_id.hex(),
-            target_attestation_id: head.hex(),
-        });
+        return Err(unheld(&row.row_id, &head));
     };
     let roster = roster_view_of_statement(st)?;
     if roster.group != view.group || roster.kind != view.kind {
-        return Err(invalid(format!(
-            "membership: refs.head of {} names a roster of another group ({:?})",
-            row.row_id.hex(),
-            roster.group
-        )));
+        return Err(fold::hold(
+            reason::NAMES_ANOTHER_GROUP,
+            invalid(format!(
+                "membership: refs.head of {} names a roster of another group ({:?})",
+                row.row_id.hex(),
+                roster.group
+            )),
+        ));
     }
     Ok(())
 }
@@ -1367,6 +1616,10 @@ where
     F: FederationDirectory + ?Sized,
 {
     let (view, record) = membership_of(plane, &row.sub, &row.payload)?;
+    // v62.0.0 (wave GC5) — the group's roster planes and head, and the
+    // member's own rows (its acceptance, its steward binding), are inputs.
+    fold::reads(Dep::key(&view.group));
+    fold::reads(Dep::key(&view.member));
     check_membership_head(dir, row, &view).await?;
     // A membership change is proposed by a member, never by the group key:
     // the primary is the first signer in order.
@@ -1631,6 +1884,34 @@ pub fn roster_payload_merging(
     further: &[RowId],
     asserted_at_ms: u64,
 ) -> Result<Value, Error> {
+    roster_payload_full(record, version, head, further, &[], asserted_at_ms)
+}
+
+/// v62.0.0 (wave GC5; CC rc21 3.2, CC27 item 4) — [`roster_payload`] of a
+/// GEOGRAPHIC community's version naming each new member's
+/// `location_proof` row under `refs.also.cites` (a set, its charter beside
+/// them; ruling (b), [`charter_of`]). For producers and fixtures.
+///
+/// # Errors
+/// As [`roster_payload`].
+pub fn roster_payload_citing(
+    record: &GroupRecord,
+    version: u64,
+    head: Option<&RowId>,
+    proofs: &[RowId],
+    asserted_at_ms: u64,
+) -> Result<Value, Error> {
+    roster_payload_full(record, version, head, &[], proofs, asserted_at_ms)
+}
+
+fn roster_payload_full(
+    record: &GroupRecord,
+    version: u64,
+    head: Option<&RowId>,
+    further: &[RowId],
+    proofs: &[RowId],
+    asserted_at_ms: u64,
+) -> Result<Value, Error> {
     let member_entry = |key: &str, joined: chrono::DateTime<chrono::Utc>, role: Option<&str>| {
         let mut e = vec![
             ("key", text(key)),
@@ -1668,7 +1949,12 @@ pub fn roster_payload_merging(
         ),
     };
     let mut members = members;
-    members.sort_by_key(|m| m.get_text("key").map(cde::encode).unwrap_or_default());
+    // A roster's `members` is a SET (CC 2.6.1.2; P1's `Ty::RosterMembers`):
+    // sorted by each ELEMENT's deterministic encoding, not by its `key`. A
+    // member with a `role` is a 3-entry map and encodes after every 2-entry
+    // one, so the two orders differ once roles are present.
+    members.sort_by_key(cde::encode);
+    members.dedup();
     let mut p = vec![
         ("asserted_at", Value::Uint(asserted_at_ms)),
         ("group_kind", text(kind)),
@@ -1707,15 +1993,31 @@ pub fn roster_payload_merging(
         set.dedup();
         refs.push((FURTHER_HEADS_ROLE, Value::Array(set)));
     }
+    // v62.0.0 (wave GC5; ruling (b)) — the charter and a geographic
+    // version's location proofs ride ONE `refs.also.cites` set (no wire
+    // change); a reader tells the charter apart at the chain head
+    // ([`resolve_geographic_charter`]).
+    let mut cites: Vec<Value> = proofs
+        .iter()
+        .map(|r| ciris_verify_core::edition2::row_ref(&r.0))
+        .collect();
     if !charter.is_empty() {
         let d: [u8; 32] = hex::decode(charter)
             .ok()
             .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
             .ok_or_else(|| invalid("charter_digest is not a 64-hex row id"))?;
-        refs.push((
-            "also",
-            det_map(vec![("cites", ciris_verify_core::edition2::row_ref(&d))]),
-        ));
+        cites.push(ciris_verify_core::edition2::row_ref(&d));
+    }
+    let mut also: Vec<(&str, Value)> = Vec::new();
+    if cites.len() == 1 {
+        also.push(("cites", cites.remove(0)));
+    } else if !cites.is_empty() {
+        cites.sort_by_key(cde::encode);
+        cites.dedup();
+        also.push(("cites", Value::Array(cites)));
+    }
+    if !also.is_empty() {
+        refs.push(("also", det_map(also)));
     }
     if !refs.is_empty() {
         p.push(("refs", det_map(refs)));

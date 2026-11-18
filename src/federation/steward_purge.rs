@@ -222,11 +222,39 @@ pub mod unauthorised_reason {
 
     /// The ordering gaps: a later row (or this node's clock) can turn the
     /// refusal into an authorisation, so a sender re-offers with a cap.
+    ///
+    /// v62.0.0 (wave GC6; CC 2.7 rc21 X9, CC 2.4.1.1 corrected: "A
+    /// tombstone waits for the notice it names") — every reason that READS
+    /// another row (the root's standing and roster, a seat, the held voices,
+    /// the protocol) is a wait, not a verdict: the tombstone is not executed
+    /// and is re-offered, and the same bundle authorises once those rows say
+    /// so. Only the notice's own bytes (`signature_invalid`,
+    /// `notice_malformed`, `wrong_basis`, `duplicate_cosigner`) and this
+    /// node's clock (`expired`) stay terminal. [`FOLD`] names them.
     pub const RETRYABLE: &[&str] = &[
         ROOT_NOT_HELD,
         ROOT_NOT_ROOTED,
         COSIGNER_KEY_NOT_HELD,
         NOT_YET_VALID,
+        STALLED,
+        NOT_A_SEAT,
+        NO_COSIGNATURE,
+        QUORUM_NOT_MET,
+        PROTOCOL_UNEVALUABLE,
+    ];
+
+    /// v62.0.0 (wave GC6) — the reasons that read other rows: inside a fold
+    /// attempt each holds (`fold::reason::PURGE_UNAUTHORISED`) rather than
+    /// refuses. `not_yet_valid` reads this node's clock, not a row.
+    pub const FOLD: &[&str] = &[
+        ROOT_NOT_HELD,
+        ROOT_NOT_ROOTED,
+        COSIGNER_KEY_NOT_HELD,
+        STALLED,
+        NOT_A_SEAT,
+        NO_COSIGNATURE,
+        QUORUM_NOT_MET,
+        PROTOCOL_UNEVALUABLE,
     ];
 
     /// Is `reason` an ordering gap?
@@ -246,7 +274,14 @@ fn unauthorised(notice_id: Option<&str>, reason: &'static str, detail: String) -
     if let Some(id) = notice_id {
         body["notice_id"] = serde_json::Value::String(id.to_owned());
     }
-    refused(token::UNAUTHORISED, body)
+    let e = refused(token::UNAUTHORISED, body);
+    // v62.0.0 (wave GC6; CC 2.7 rc21 X9) — a reason that reads another row
+    // is a fold condition: held inside an attempt, a retryable wait outside.
+    if unauthorised_reason::FOLD.contains(&reason) {
+        super::edition2::fold::hold(super::edition2::fold::reason::PURGE_UNAUTHORISED, e)
+    } else {
+        e
+    }
 }
 
 /// The `takedown_notice` basis that authorises a steward purge (CC 3.3.2
@@ -1132,6 +1167,15 @@ where
                     }
                     PurgePlane::Blob => {}
                 }
+                // v62.0.0 (v62 P8) — an edition-2 detection names its trace by
+                // digest (`evidence_refs` is `[-16, bstr]`), so a selected
+                // trace is evidence under that digest too.
+                if r.plane == PurgePlane::Trace {
+                    evidence.insert(
+                        crate::derived::detection_row::trace_evidence_ref(&r.id),
+                        r.record_id(),
+                    );
+                }
             }
             let mut grew = false;
             for f in &scores_with_refs {
@@ -1236,11 +1280,19 @@ fn withhold_orphaned_derivatives(
     withheld: &mut Vec<Withheld>,
 ) {
     loop {
-        let evidence: BTreeMap<String, String> = records
+        let mut evidence: BTreeMap<String, String> = records
             .values()
             .filter(|r| r.plane != PurgePlane::Blob)
             .map(|r| (r.id.clone(), r.record_id()))
             .collect();
+        // v62.0.0 (v62 P8) — a trace is evidence under its digest too
+        // (`detection_row::trace_evidence_ref`).
+        for r in records.values().filter(|r| r.plane == PurgePlane::Trace) {
+            evidence.insert(
+                crate::derived::detection_row::trace_evidence_ref(&r.id),
+                r.record_id(),
+            );
+        }
         let mut orphans: Vec<(String, String)> = Vec::new();
         let mut repoint: Vec<(String, String)> = Vec::new();
         for (key, r) in records.iter() {
@@ -2369,13 +2421,19 @@ where
     check_counts(&terms, &live)?;
     let digest = resolved.digest();
     if digest != terms.selection_digest {
-        return Err(refused(
-            token::SELECTION_DIGEST_MISMATCH,
-            serde_json::json!({
-                "notice_id": terms.notice_id,
-                "expected": terms.selection_digest,
-                "found": digest,
-            }),
+        // v62.0.0 (wave GC6; CC 2.7 rc21 X9: "One whose selection digest
+        // differs from the notice's concludes nothing") — held with that
+        // reason inside a fold attempt; not executed either way.
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::PURGE_SELECTION_DIGEST_MISMATCH,
+            refused(
+                token::SELECTION_DIGEST_MISMATCH,
+                serde_json::json!({
+                    "notice_id": terms.notice_id,
+                    "expected": terms.selection_digest,
+                    "found": digest,
+                }),
+            ),
         ));
     }
     let records = resolved.records;
@@ -3025,13 +3083,19 @@ where
     }
     let digest = selection_digest(&bundle.record_ids);
     if digest != terms.selection_digest {
-        return Err(refused(
-            token::SELECTION_DIGEST_MISMATCH,
-            serde_json::json!({
-                "notice_id": terms.notice_id,
-                "expected": terms.selection_digest,
-                "found": digest,
-            }),
+        // v62.0.0 (wave GC6; CC 2.7 rc21 X9: "One whose selection digest
+        // differs from the notice's concludes nothing") — held with that
+        // reason inside a fold attempt; not executed either way.
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::PURGE_SELECTION_DIGEST_MISMATCH,
+            refused(
+                token::SELECTION_DIGEST_MISMATCH,
+                serde_json::json!({
+                    "notice_id": terms.notice_id,
+                    "expected": terms.selection_digest,
+                    "found": digest,
+                }),
+            ),
         ));
     }
     let resolved = ResolvedSelection {
@@ -3068,20 +3132,29 @@ where
             v => v,
         };
         if let Err(reason) = verdict {
-            return Err(refused(
-                token::RETRACTION_INADMISSIBLE,
-                serde_json::json!({
-                    "notice_id": terms.notice_id,
-                    "record_id": record.record_id(),
-                    "plane": record.plane.as_str(),
-                    "index": index,
-                    "total": records.len(),
-                    "reason": reason,
-                }),
+            // v62.0.0 (wave GC6; CC 2.7.3) — this reads a HELD row the
+            // bundle names (its family / exclusion class): a fold condition.
+            // Held inside a fold attempt; the tombstone is not executed
+            // either way (whole or nothing, CC 4.5.3).
+            return Err(super::edition2::fold::hold(
+                super::edition2::fold::reason::PURGE_RETRACTION_INADMISSIBLE,
+                refused(
+                    token::RETRACTION_INADMISSIBLE,
+                    serde_json::json!({
+                        "notice_id": terms.notice_id,
+                        "record_id": record.record_id(),
+                        "plane": record.plane.as_str(),
+                        "index": index,
+                        "total": records.len(),
+                        "reason": reason,
+                    }),
+                ),
             ));
         }
     }
     // INTERIM: the receiver applies the same gate to what it holds.
+    // v62.0.0 (wave GC6) — it reads the held rows' subjects' key records: a
+    // fold condition (held inside an attempt; storage errors pass through).
     refuse_human_subjects(
         directory,
         &records,
@@ -3089,7 +3162,13 @@ where
         true,
         Some(&terms.notice_id),
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        super::membership_acceptance::hold_unless_storage(
+            super::edition2::fold::reason::PURGE_HUMAN_SUBJECT,
+            e,
+        )
+    })?;
     let (notice_jcs, cosignatures_json) = if let Some(row) = &notice_row {
         let held = directory.edition2_voices(row).await?;
         (
@@ -3163,17 +3242,32 @@ pub async fn refuse_if_tombstoned<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    match directory.purge_tombstoned(plane.as_str(), record_ref).await {
-        Ok(Some(notice_id)) => Err(refused(
+    // v62.0.0 (wave GC6; CC 2.7 rc21 ruling 8, CC 4.5.3 corrected: "While a
+    // tombstone stands, a node does not keep the record's bytes … This is a
+    // deletion duty, not a verdict on the row, and a reversal lifts it.") —
+    // the record is declined only while a notice tombstoning it STANDS: a
+    // notice an admitted reconsideration reversed withholds nothing, so a
+    // re-offered record is kept again (the bytes plane's rule,
+    // [`standing_notice`], on the record planes). Re-derived at every ask,
+    // never stored: a withdrawn reversal declines it again.
+    // GC2's `takedown_tombstone::standing_tombstone` is that one rule (the
+    // first notice no admitted reversal lifted).
+    if let Some(notice_id) = super::takedown_tombstone::standing_tombstone(
+        directory.as_dyn_directory(),
+        plane.as_str(),
+        record_ref,
+    )
+    .await?
+    {
+        return Err(refused(
             token::TOMBSTONED,
             serde_json::json!({
                 "record_id": format!("{}:{record_ref}", plane.as_str()),
                 "notice_id": notice_id,
             }),
-        )),
-        Ok(None) | Err(Error::Unsupported { .. }) => Ok(()),
-        Err(e) => Err(e),
+        ));
     }
+    Ok(())
 }
 
 /// The accountability family `row` belongs to, if any
@@ -3732,14 +3826,19 @@ pub async fn refuse_if_tombstoned_attestation<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    // Cheap first: an id nothing tombstoned needs no subject lookups.
-    match directory
-        .purge_tombstoned(PurgePlane::Attestation.as_str(), &row.attestation_id)
-        .await
+    // Cheap first: an id no STANDING tombstone names needs no subject
+    // lookups. v62.0.0 (wave GC6; CC 2.7 rc21 ruling 8) — GC2's
+    // `standing_tombstone`: a tombstone an admitted reversal lifted is no
+    // deletion duty, and the row is kept again.
+    if super::takedown_tombstone::standing_tombstone(
+        directory.as_dyn_directory(),
+        PurgePlane::Attestation.as_str(),
+        &row.attestation_id,
+    )
+    .await?
+    .is_none()
     {
-        Ok(None) | Err(Error::Unsupported { .. }) => return Ok(()),
-        Ok(Some(_)) => {}
-        Err(e) => return Err(e),
+        return Ok(());
     }
     if accountability_record_of(row).is_some() {
         return Ok(());

@@ -13,16 +13,17 @@
 //! - **I3152** a stranger's voice is refused, and not kept.
 //! - Every bind and revocation names its head (REQUIRED); the chain starts
 //!   at the genesis key's own `key:record` row.
-//! - **I3185** (CC27 item 2) an occurrence revocation naming the self-roster
-//!   head H1 = {alice, phone} is counted over H1 after the roster grew to
-//!   {alice, phone, tablet}: alice + tablet (2 of 3 now) are `Pending`;
-//!   phone's voice makes 2 of 2 over H1 and lands it.
+//! - **I3185** (CC27 item 2, CC 2.7.8) a revocation naming H1 after its
+//!   successor H2 landed here is VOID: every voice (all three roster keys)
+//!   is kept and `Pending`, nothing is revoked, and the receipt settles
+//!   `void_superseded`.
 //! - **I3186** a revocation naming a head this node does not hold WAITS: its
 //!   voices are kept `Pending`, never refused; delivering the head re-plans
 //!   it at write time (no manual executor call) and it lands.
-//! - **I3187** (CC: refs.head required) an evicted key's voice on a
-//!   revocation naming a head from BEFORE its eviction is admitted as a
-//!   statement but not counted once this node holds the later head.
+//! - **I3187** an evicted key's voice (signed before its eviction took
+//!   effect) is admitted but not counted at the head after the eviction;
+//!   the same revocation naming the pre-eviction head is VOID
+//!   (`void_superseded`).
 //! - **I3153** a revocation of a key by itself lands in
 //!   `federation_revocations` (`revocations_for_subject`), through
 //!   `put_revocation`.
@@ -39,12 +40,14 @@
 //! - **I3160** a content key grant lands and is projected (the pending index
 //!   a grant admitted before its bytes waits in).
 //! - **I3161** a key grant with a text `wrapped_dek` is `edition2_payload_invalid`.
-//! - **I3162** a delivery receipt of an unpublished root is refused by the
-//!   receipt door's JOIN, and kept nowhere.
+//! - **I3162** a delivery receipt of an unpublished root WAITS for the
+//!   publication (v62.0.0 wave GC7, CC 2.7.3): kept, `Pending`, held with
+//!   reason `receipt_root_unpublished`, and no receipt row.
 //! - **I3163** against a published root it lands in
 //!   `federation_stream_delivery_receipts` and as its signed row.
-//! - **I3164** a second root at the same `k` is the receipt door's
-//!   equivocation refusal.
+//! - **I3164** a second root at the same `k` is kept and concludes nothing
+//!   (held, `receipt_equivocation`; v62.0.0 wave GC7), the first receipt
+//!   standing.
 //! - **I3165** a cosign statement is kept beside its event in
 //!   `ceg_statements` only (`Voice`), never in `federation_attestations`.
 //! - **I3166** a cosign of an event not held waits
@@ -52,8 +55,9 @@
 //! - **I3167** a `steward_purge` notice is kept, voice by voice, `Pending`,
 //!   never as an attestation row.
 //! - **I3168** a `dmca512` notice passes the notice shape on its projected
-//!   envelope and meets the takedown authority (unbound content:
-//!   `takedown_content_unbound`), and is not kept.
+//!   envelope and meets the takedown authority (unbound content): v62 wave
+//!   GC2, it is HELD (`Pending`, kept, no typed row) with reason
+//!   `takedown_content_unbound`.
 //! - **I3169** the purge door's count reads the notice's voices: with none
 //!   held it is `no_cosignature`; with two founders' voices held, the fold
 //!   (`cosign::edition2_voices`) is exactly their issuers and the count
@@ -218,7 +222,7 @@ async fn occurrence_revocation_body<D: FederationDirectory + ?Sized>(d: &D) {
         witness_set: vec![],
         persist_row_hash: String::new(),
     };
-    let p = occurrence_revocation_payload(&rev, &a, None, &h1, &[], t).unwrap();
+    let p = occurrence_revocation_payload(&rev, None, None, &h1, &[], t).unwrap();
 
     // I3152 — a stranger's voice.
     let stranger = sign_as(&mallory, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p);
@@ -231,7 +235,7 @@ async fn occurrence_revocation_body<D: FederationDirectory + ?Sized>(d: &D) {
             occurrence_key_id: iref(&mallory),
             ..rev.clone()
         },
-        &a,
+        None,
         None,
         &h1,
         &[],
@@ -313,8 +317,9 @@ async fn bind_at<D: FederationDirectory + ?Sized>(
     rid(&own)
 }
 
-/// I3185 (CC27 item 2): an occurrence revocation is counted over the
-/// self-roster head it NAMES, not the roster now.
+/// I3185 (CC27 item 2, CC 2.7.8): an occurrence revocation naming a head
+/// whose successor this node has landed is VOID: kept, Pending, settled
+/// `void_superseded`, never landed.
 async fn named_head_body<D: FederationDirectory + ?Sized>(d: &D) {
     let (alice, phone, tablet) = (key(210), key(211), key(212));
     register(d, &[&alice, &phone, &tablet]).await;
@@ -333,35 +338,38 @@ async fn named_head_body<D: FederationDirectory + ?Sized>(d: &D) {
         persist_row_hash: String::new(),
     };
 
-    // I3185 — phone's revocation names H1. alice + tablet (both signing as
-    // alice) are 2 of 3 of the roster NOW, which would land it; over H1 only
-    // alice counts (1 of 2): it is held.
-    let p = occurrence_revocation_payload(&rev(ph.as_str()), &a, None, &h1, &[], t).unwrap();
-    for v in [&alice, &tablet] {
-        let out = put(d, &sign_as(v, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p))
+    // I3185 (CC 2.7.8, O1 v8) — phone's revocation names H1, whose successor
+    // H2 this node has landed: the row is VOID here. Every voice is kept and
+    // answers Pending, nothing is revoked (not even with all three of the
+    // roster's keys voicing it), and the receipt settles `void_superseded`.
+    let p = occurrence_revocation_payload(&rev(ph.as_str()), None, None, &h1, &[], t).unwrap();
+    let mut row = None;
+    for v in [&alice, &tablet, &phone] {
+        let st = sign_as(v, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p);
+        row = Some(rid(&st));
+        let out = put(d, &st)
             .await
-            .unwrap();
+            .expect("I3185 a superseded head is never refused");
         assert!(
             matches!(out, StatementOutcome::Pending { .. }),
-            "I3185 counted over the named head, not the roster now: {out:?}"
+            "I3185 a row on a superseded head is VOID: {out:?}"
         );
+        assert!(kept(d, &st).await, "I3185 the voice is kept");
     }
     assert!(
         !is_revoked(d, &a, &ph).await,
-        "I3185 nothing lands short of H1's majority"
+        "I3185 a VOID row revokes nothing"
     );
-    // phone's own voice as alice makes 2 of 2 over H1.
-    let out = put(
-        d,
-        &sign_as(&phone, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p),
-    )
-    .await
-    .unwrap();
-    assert!(
-        matches!(out, StatementOutcome::Row { .. }),
-        "I3185 the named head's majority lands it: {out:?}"
+    let receipt = d
+        .edition2_roster_proposal(&row.expect("a row").hex())
+        .await
+        .unwrap()
+        .expect("I3185 the proposal's receipt");
+    assert_eq!(
+        receipt.outcome.as_deref(),
+        Some(crate::federation::self_roster::VOID_OUTCOME),
+        "I3185 settled void_superseded"
     );
-    assert!(is_revoked(d, &a, &ph).await, "I3185 revoked");
 
     // I3186 has its own body (`waiting_head_body`).
 }
@@ -414,7 +422,7 @@ async fn waiting_head_body<D: FederationDirectory + ?Sized>(d: &D) {
         witness_set: vec![],
         persist_row_hash: String::new(),
     };
-    let p = occurrence_revocation_payload(&rev, &c, None, &h2, &[], t).unwrap();
+    let p = occurrence_revocation_payload(&rev, None, None, &h2, &[], t).unwrap();
     let voices = [
         sign(&carol, &ph, OCCURRENCE_REVOCATION_PREFIX, &p),
         sign_as(&phone, &c, &ph, OCCURRENCE_REVOCATION_PREFIX, &p),
@@ -451,9 +459,9 @@ async fn waiting_head_body<D: FederationDirectory + ?Sized>(d: &D) {
     );
 }
 
-/// I3187 (CC's ruling on refs.head): an evicted key's voice on a revocation
-/// naming a head from BEFORE its eviction is not counted once this node
-/// holds the later head.
+/// I3187 (CC's ruling on refs.head; CC 2.7.8): an evicted key's voice is
+/// not counted at the head after its eviction, and a revocation naming the
+/// pre-eviction head is VOID once this node has landed its successor.
 async fn evicted_voice_body<D: FederationDirectory + ?Sized>(d: &D) {
     let (bob, phone, tablet) = (key(220), key(221), key(222));
     register(d, &[&bob, &phone, &tablet]).await;
@@ -472,7 +480,7 @@ async fn evicted_voice_body<D: FederationDirectory + ?Sized>(d: &D) {
     };
     // H3: phone evicted (named H2; bob + tablet are 2 of 3).
     let evict =
-        occurrence_revocation_payload(&rev(ph.as_str(), t1), &b, None, &h2, &[], t1).unwrap();
+        occurrence_revocation_payload(&rev(ph.as_str(), t1), None, None, &h2, &[], t1).unwrap();
     put(d, &sign(&bob, &ph, OCCURRENCE_REVOCATION_PREFIX, &evict))
         .await
         .unwrap();
@@ -486,29 +494,22 @@ async fn evicted_voice_body<D: FederationDirectory + ?Sized>(d: &D) {
         matches!(out, StatementOutcome::Row { .. }),
         "I3187 phone evicted: {out:?}"
     );
-    // The tablet's revocation names H2 and was signed BEFORE the eviction
-    // took effect, so phone's voice passes the door (its seat was live then).
+    // The tablet's revocation names the CURRENT head H3 = {bob, tablet} and
+    // was signed BEFORE the eviction took effect, so phone's voice passes
+    // the door (its seat was live then) but phone is not on H3: it is not
+    // counted. bob alone is 1 of 2.
+    let h3 = rid(&sign(&bob, &ph, OCCURRENCE_REVOCATION_PREFIX, &evict));
     let t0 = t1 - 5_000;
-    let p = occurrence_revocation_payload(&rev(tb.as_str(), t0), &b, None, &h2, &[], t0).unwrap();
-    let out = put(
-        d,
-        &sign_as(&phone, &b, &tb, OCCURRENCE_REVOCATION_PREFIX, &p),
-    )
-    .await
-    .expect("I3187 the evicted key's voice is admitted as a statement");
-    assert!(
-        matches!(out, StatementOutcome::Pending { .. }),
-        "I3187 {out:?}"
-    );
-    // Over H2 alone phone + bob would be 2 of 3; this node holds H3, so
-    // phone is not counted: bob alone is short.
-    let out = put(d, &sign(&bob, &tb, OCCURRENCE_REVOCATION_PREFIX, &p))
-        .await
-        .unwrap();
-    assert!(
-        matches!(out, StatementOutcome::Pending { .. }),
-        "I3187 the evicted key is not counted once the later head is held: {out:?}"
-    );
+    let p = occurrence_revocation_payload(&rev(tb.as_str(), t0), None, None, &h3, &[], t0).unwrap();
+    for v in [&phone, &bob] {
+        let out = put(d, &sign_as(v, &b, &tb, OCCURRENCE_REVOCATION_PREFIX, &p))
+            .await
+            .expect("I3187 an evicted key's voice is a statement, never a refusal");
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "I3187 the evicted key is not counted at the head after its eviction: {out:?}"
+        );
+    }
     assert!(!is_revoked(d, &b, &tb).await, "I3187 nothing lands");
     let out = put(
         d,
@@ -518,7 +519,33 @@ async fn evicted_voice_body<D: FederationDirectory + ?Sized>(d: &D) {
     .unwrap();
     assert!(
         matches!(out, StatementOutcome::Row { .. }),
-        "I3187 bob + tablet, both live, are 2 of 3: {out:?}"
+        "I3187 bob + tablet are 2 of 2 over H3: {out:?}"
+    );
+
+    // The same revocation naming the superseded H2 is VOID (CC 2.7.8): even
+    // bob + tablet do not land it; it is kept and settled void_superseded.
+    let stale =
+        occurrence_revocation_payload(&rev(tb.as_str(), t0 + 1), None, None, &h2, &[], t0 + 1)
+            .unwrap();
+    let mut row = None;
+    for v in [&bob, &tablet] {
+        let st = sign_as(v, &b, &tb, OCCURRENCE_REVOCATION_PREFIX, &stale);
+        row = Some(rid(&st));
+        let out = put(d, &st).await.unwrap();
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "I3187 a row on the superseded H2 is VOID: {out:?}"
+        );
+    }
+    let receipt = d
+        .edition2_roster_proposal(&row.expect("a row").hex())
+        .await
+        .unwrap()
+        .expect("I3187 the stale proposal's receipt");
+    assert_eq!(
+        receipt.outcome.as_deref(),
+        Some(crate::federation::self_roster::VOID_OUTCOME),
+        "I3187 settled void_superseded"
     );
 }
 
@@ -784,12 +811,31 @@ async fn takedown_body<D: FederationDirectory + ?Sized>(d: &D) {
     let ci = iref(&claimant);
     let p = takedown_payload("dmca512", &ci, &[0x45; 32], &holders, &notice, exp, t).unwrap();
     let st = sign(&claimant, &ci, TAKEDOWN_PREFIX, &p);
-    let e = put(d, &st).await.unwrap_err();
+    // v62.0.0 (wave GC2; CC 2.7.3) — the authority reads OTHER rows (the
+    // content's binding): the notice is HELD, concluding nothing, with the
+    // refusal's token as its reason (it concludes when a binding lands:
+    // `attestation_fold_invariants` I3710–I3713).
+    let out = put(d, &st)
+        .await
+        .expect("I3168 the shape passed; the notice is held");
     assert!(
-        matches!(e, Error::PurgeRefused { token, .. } if token == "takedown_content_unbound"),
-        "I3168 the shape passed; the authority refused: {e:?}"
+        matches!(out, StatementOutcome::Pending { new: true, .. }),
+        "I3168 held, concluding nothing: {out:?}"
     );
-    assert!(!kept(d, &st).await, "I3168 not kept");
+    assert!(kept(d, &st).await, "I3168 kept");
+    assert!(
+        d.get_attestation(&rid(&st).hex()).await.unwrap().is_none(),
+        "I3168 no typed row"
+    );
+    assert_eq!(
+        super::fold::why_held(d, &rid(&st))
+            .await
+            .unwrap()
+            .map(|h| h.reason)
+            .as_deref(),
+        Some("takedown_content_unbound"),
+        "I3168 the authority's token is the reason"
+    );
 }
 
 async fn key_grant_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) {
@@ -1295,12 +1341,20 @@ async fn receipt_refused_body<B: FederationDirectory + BlobStorage + Sync>(d: &B
         DELIVERY_RECEIPT_PREFIX,
         &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
     );
-    let e = put(d, &st).await.unwrap_err();
+    let out = put(d, &st).await;
     assert!(
-        matches!(e, Error::InvalidArgument(ref m) if m.contains("unpublished root")),
-        "I3162 the JOIN: {e:?}"
+        matches!(out, Ok(StatementOutcome::Pending { .. })),
+        "I3162 the JOIN waits: {out:?}"
     );
-    assert!(!kept(d, &st).await, "I3162 not kept");
+    assert_eq!(
+        super::fold::why_held(d, &rid(&st))
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(super::fold::reason::RECEIPT_ROOT_UNPUBLISHED.to_owned()),
+        "I3162 held, reason receipt_root_unpublished"
+    );
+    assert!(kept(d, &st).await, "I3162 kept");
     assert!(
         d.list_delivery_receipts_for(STREAM, 10)
             .await
@@ -1340,12 +1394,23 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
         DELIVERY_RECEIPT_PREFIX,
         &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT_B, now_ms()),
     );
-    let e = put(d, &equivocal).await.unwrap_err();
+    let out = put(d, &equivocal).await;
     assert!(
-        matches!(e, Error::InvalidArgument(ref m) if m.contains("equivocation")),
-        "I3164 {e:?}"
+        matches!(out, Ok(StatementOutcome::Pending { .. })),
+        "I3164 kept, concluding nothing: {out:?}"
     );
-    assert!(!kept(d, &equivocal).await, "I3164 not kept");
+    assert_eq!(
+        super::fold::why_held(d, &rid(&equivocal))
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(super::fold::reason::RECEIPT_EQUIVOCATION.to_owned()),
+        "I3164 held, reason receipt_equivocation"
+    );
+    assert!(kept(d, &equivocal).await, "I3164 kept");
+    let listed = d.list_delivery_receipts_for(STREAM, 10).await.unwrap();
+    assert_eq!(listed.len(), 1, "I3164 the first receipt stands alone");
+    assert_eq!(listed[0].chunk_root, ROOT, "I3164");
 }
 
 #[cfg(feature = "sqlite")]

@@ -264,13 +264,31 @@ pub(crate) async fn supersede_group_row_planned<D: GroupSupersedeStore>(
     let cohort_str = check_supersede_cohort(cohort)?;
     let group_key_id = super::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
     let head = decode_planned_head(cohort, new_snapshot)?;
-    let written = dir
-        .store_planned_supersede(PlannedSupersede {
-            cohort_str,
-            head,
-            authorization,
-        })
-        .await?;
+    let planned = PlannedSupersede {
+        cohort_str,
+        head,
+        authorization,
+    };
+    // v62.0.0 (wave GC5; CC 2.7.3) — the head verdict once on THIS task,
+    // ahead of the executor's transaction: its fold conditions (a stale
+    // proof, a `prev_head_digest` naming no held head) read the held head,
+    // and mark the fold attempt here. Inside the executor the verdict runs
+    // on the backend's writer (sqlite's blocking connection), where no
+    // attempt is in scope, so a mark there would be lost and the two
+    // backends would answer differently. The executor still re-asks it
+    // under its lock (the race guard).
+    let held_hash = match cohort {
+        Cohort::Family => dir
+            .lookup_family(&group_key_id)
+            .await?
+            .map(|f| f.persist_row_hash),
+        _ => dir
+            .lookup_community(&group_key_id)
+            .await?
+            .map(|c| c.persist_row_hash),
+    };
+    held_head_verdict(&planned, held_hash.as_deref())?;
+    let written = dir.store_planned_supersede(planned).await?;
     let version = written.version;
     // v62.0.0 (kernel pass 2, I2811) — a tip is held beside the head: the
     // head's `group:roster:v1` row stays the head's.

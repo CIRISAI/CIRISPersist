@@ -44,6 +44,7 @@ pub(crate) mod bodies {
     use std::collections::{BTreeSet, HashSet};
 
     use crate::federation::audience_scan_invariants::bodies::owner_allow_list_reference;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::read_probe;
     use crate::federation::replication_audience as ra;
     use crate::federation::replication_audience_invariants::bodies as rab;
@@ -71,10 +72,58 @@ pub(crate) mod bodies {
             .count()
     }
 
+    /// v62.0.0 (JSON cut, E7) — a flipped row through the one entry
+    /// (`e2::put_signed`); an owner binding also takes the node's own voice
+    /// (C557).
     async fn put(d: &dyn FederationDirectory, a: Attestation) -> Result<(), Error> {
-        d.put_attestation(SignedAttestation { attestation: a })
-            .await
-            .map(|_| ())
+        // A held (earlier-form) body's row carries no statement: the JSON door.
+        if e2::carried_statement(&a).is_none() {
+            return d
+                .put_attestation(SignedAttestation { attestation: a })
+                .await
+                .map(|_| ());
+        }
+        e2::put_signed(d, &a).await?;
+        if a.attestation_type == attestation_type::DELEGATES_TO
+            && admission::is_owner_binding_envelope(&a.attestation_envelope)
+        {
+            let st = e2::carried_statement(&a).expect("the binding carries its statement");
+            e2::put_statement(d, &e2::voice_of(&st, &a.attested_key_id)).await?;
+        }
+        Ok(())
+    }
+
+    /// v62.0.0 (JSON cut, E7) — `owner` binds `node`, NOW-relative: the
+    /// builder stamps a fixed instant, and the node's voice is a node-key row
+    /// (CC 2.4.1.1), so the binding is re-dated to an hour ago and re-sealed.
+    fn owner_binding(owner: &str, node: &str) -> Attestation {
+        let at = admission::truncate_to_substrate_resolution(
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        );
+        let mut ob = ts::owner_binding_attestation("", owner, node);
+        ob.asserted_at = at;
+        ob.scrub_timestamp = at;
+        ob.attestation_envelope[crate::federation::envelope::paths::ASSERTED_AT] =
+            serde_json::Value::String(admission::render_signed_instant(at));
+        ts::reseal(&mut ob);
+        ob
+    }
+
+    /// v62.0.0 (JSON cut, E7; P5c, CC ruling) — `machine`'s own
+    /// SELF-occurrence (identity = occurrence = the machine, signed by it:
+    /// O1's self pair): WHAT KIND of device it is. The owner binding says only
+    /// WHO its human is.
+    async fn self_occurrence(d: &dyn FederationDirectory, machine: &str, class: &str) {
+        e2::put_bind(
+            d,
+            machine,
+            machine,
+            machine,
+            class,
+            &e2::BindOptions::default(),
+        )
+        .await
+        .expect("the machine's own self-occurrence is admitted");
     }
 
     /// A structural composer of `kind` by `author`, attested to `attested`,
@@ -98,46 +147,61 @@ pub(crate) mod bodies {
         node: &str,
         cohort: ra::OwnerCohort<'_>,
     ) -> Result<bool, Error> {
-        if owner == node
-            || !dir
-                .active_identities_for_occurrence(node)
-                .await?
-                .iter()
-                .any(|p| p == owner)
-        {
+        // v62.0.0 (JSON cut, E7; P5c) — a node is a person's device by the
+        // person's OWNER BINDING (no machine sits under a person's key: WHO),
+        // and its class is its own live self-occurrence's (none: server; an
+        // owned agent is OwnedAgent, P5c update 4: WHAT KIND).
+        // The oracle is otherwise the v53.1.5 body.
+        if owner == node {
             return Ok(false);
         }
-        let Some(occ) = dir
-            .list_identity_occurrences_active(owner)
+        match admission::owner_of(dir, node).await {
+            Ok(Some(o)) if o == owner => {}
+            Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        // An owned agent is OwnedAgent; an unnamed or unknown class is server.
+        let is_agent = dir.lookup_public_key(node).await?.is_some_and(|r| {
+            crate::federation::types::identity_type::set_contains(
+                &r.identity_type,
+                crate::federation::types::identity_type::AGENT,
+            )
+        });
+        // P5c update 1 — the class is the node's own live self-occurrence's.
+        let now = chrono::Utc::now();
+        let stated = dir
+            .list_identity_occurrences_active(node)
             .await?
             .into_iter()
-            .filter(|o| o.occurrence_key_id == node)
+            .filter(|o| o.identity_key_id == node && o.occurrence_key_id == node)
+            .filter(|o| o.valid_until.is_none_or(|vu| vu > now))
             .max_by_key(|o| o.asserted_at)
-        else {
+            .and_then(|o| ra::NodeClass::of_device_class(&o.device_class));
+        // P5c update 4 — an agent the owner OWNS (`owner_of` checked above) is
+        // `OwnedAgent` whatever its self-occurrence says.
+        let class = if is_agent {
+            Some(ra::NodeClass::OwnedAgent)
+        } else {
+            stated.or_else(|| ra::NodeClass::of_device_class("server"))
+        };
+        let Some(class) = class else {
             return Ok(false);
         };
-        if occ.occurrence_key_id == owner {
-            return Ok(true);
-        }
-        let Some(class) = ra::NodeClass::of_device_class(&occ.device_class) else {
-            return Ok(false);
-        };
-        let list = owner_allow_list_reference(dir, owner, &occ.occurrence_key_id).await?;
+        let list = owner_allow_list_reference(dir, owner, node).await?;
         Ok(ra::class_allows(class, list.as_ref(), cohort))
     }
 
-    /// `owner_nodes_receiving` as v53.1.5 shipped it.
+    /// `owner_nodes_receiving`, its oracle (v62.0.0, P5c: over the nodes the
+    /// owner OWNS).
     pub async fn owner_nodes_receiving_reference(
         dir: &dyn FederationDirectory,
         owner: &str,
         cohort: ra::OwnerCohort<'_>,
     ) -> Result<Vec<String>, Error> {
-        let mut nodes: BTreeSet<String> = BTreeSet::new();
-        for o in dir.list_identity_occurrences_active(owner).await? {
-            if o.occurrence_key_id != owner {
-                nodes.insert(o.occurrence_key_id);
-            }
-        }
+        let nodes: BTreeSet<String> = nodes_owned_by_reference(dir, owner)
+            .await?
+            .into_iter()
+            .collect();
         let mut out = Vec::new();
         for n in nodes {
             if owner_node_receives_reference(dir, owner, &n, cohort).await? {
@@ -195,15 +259,31 @@ pub(crate) mod bodies {
     /// withdrawn list, a family; and one owner's lists are read ONCE per
     /// call, never per node.
     pub async fn i540_send_set_reads_each_owners_lists_once(d: &dyn FederationDirectory, s: &str) {
-        let (o1, o2) = (format!("i540-o1-{s}"), format!("i540-o2-{s}"));
-        let nodes: Vec<String> = (1..=4).map(|i| format!("i540-n{i}-{s}")).collect();
-        let fid = format!("i540-fam-{s}");
+        // v62.0.0 (JSON cut, E7; P5c) — keys by identity-ref; each node is its
+        // owner's device by an owner binding with the node's own voice (no
+        // node sits under a person's key, O1), and states its class by its
+        // own self-occurrence.
+        let (o1, o2) = (
+            e2::kid(&format!("i540-o1-{s}")),
+            e2::kid(&format!("i540-o2-{s}")),
+        );
+        let nodes: Vec<String> = (1..=4)
+            .map(|i| e2::kid(&format!("i540-n{i}-{s}")))
+            .collect();
+        let fid = e2::kid(&format!("i540-fam-{s}"));
         rab::users(d, &[&o1, &o2]).await;
         rab::nodes(d, &nodes.iter().map(String::as_str).collect::<Vec<_>>()).await;
-        rab::claim(d, &o1, &nodes[0], "laptop").await;
-        rab::claim(d, &o1, &nodes[1], "server").await;
-        rab::claim(d, &o1, &nodes[2], "phone").await;
-        rab::claim(d, &o2, &nodes[3], "laptop").await;
+        for (owner, node, class) in [
+            (&o1, &nodes[0], "laptop"),
+            (&o1, &nodes[1], "server"),
+            (&o1, &nodes[2], "phone"),
+            (&o2, &nodes[3], "laptop"),
+        ] {
+            put(d, owner_binding(owner, node))
+                .await
+                .expect("the owner binds its device");
+            self_occurrence(d, node, class).await;
+        }
         rab::family(d, &fid, &[&o1, &o2]).await;
         // o1: a list on the laptop (family only), a list on the server (one
         // room), nothing on the phone; a second list on the laptop, withdrawn.
@@ -302,9 +382,14 @@ pub(crate) mod bodies {
         }
         // Literals: the laptop gets the family, the server does not; the
         // phone (no list) gets everything; r1 reaches the server only.
+        // (Kids sort by hash, not by index: the set is compared sorted.)
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
         assert_eq!(
             ra::owner_nodes_receiving(d, &o1, family).await.unwrap(),
-            vec![nodes[0].clone(), nodes[2].clone()]
+            sorted(vec![nodes[0].clone(), nodes[2].clone()])
         );
         assert_eq!(
             ra::owner_nodes_receiving(
@@ -317,7 +402,7 @@ pub(crate) mod bodies {
             )
             .await
             .unwrap(),
-            vec![nodes[1].clone(), nodes[2].clone()]
+            sorted(vec![nodes[1].clone(), nodes[2].clone()])
         );
     }
 
@@ -399,17 +484,20 @@ pub(crate) mod bodies {
     ) {
         use crate::federation::membership_acceptance::live_invitees_of;
         use crate::federation::membership_acceptance_invariants::bodies as mab;
-        let (a, b) = (format!("i541-a-{s}"), format!("i541-b-{s}"));
+        let (a, b) = (
+            e2::kid(&format!("i541-a-{s}")),
+            e2::kid(&format!("i541-b-{s}")),
+        );
         let (x, y, z, w) = (
-            format!("i541-x-{s}"),
-            format!("i541-y-{s}"),
-            format!("i541-z-{s}"),
-            format!("i541-w-{s}"),
+            e2::kid(&format!("i541-x-{s}")),
+            e2::kid(&format!("i541-y-{s}")),
+            e2::kid(&format!("i541-z-{s}")),
+            e2::kid(&format!("i541-w-{s}")),
         );
         let (room, other, fam) = (
-            format!("i541-room-{s}"),
-            format!("i541-other-{s}"),
-            format!("i541-fam-{s}"),
+            e2::kid(&format!("i541-room-{s}")),
+            e2::kid(&format!("i541-other-{s}")),
+            e2::kid(&format!("i541-fam-{s}")),
         );
         mab::reg(d, &[&a, &b, &x, &y, &z, &w]).await;
         mab::found_community(d, &room, "quorum:1/1", &[&a, &b], &[])
@@ -593,15 +681,15 @@ pub(crate) mod bodies {
     pub async fn i542_live_granters_read_the_subjects_edges(d: &dyn FederationDirectory, s: &str) {
         use admission::DelegationEdgeFilter::{AnyDelegation, OwnerBindingOnly};
         let (u1, u2, u3) = (
-            format!("i542-u1-{s}"),
-            format!("i542-u2-{s}"),
-            format!("i542-u3-{s}"),
+            e2::kid(&format!("i542-u1-{s}")),
+            e2::kid(&format!("i542-u2-{s}")),
+            e2::kid(&format!("i542-u3-{s}")),
         );
         let (agent, node, node2, peer) = (
-            format!("i542-agent-{s}"),
-            format!("i542-node-{s}"),
-            format!("i542-node2-{s}"),
-            format!("i542-peer-{s}"),
+            e2::kid(&format!("i542-agent-{s}")),
+            e2::kid(&format!("i542-node-{s}")),
+            e2::kid(&format!("i542-node2-{s}")),
+            e2::kid(&format!("i542-peer-{s}")),
         );
         for (k, t) in [
             (&u1, USER),
@@ -641,7 +729,7 @@ pub(crate) mod bodies {
         // naming it). Only the composers-attested-to-the-subject read sees
         // this retraction — the per-granter check does not, because u4
         // retracted nothing — which is what makes that read load-bearing.
-        let u4 = format!("i542-u4-{s}");
+        let u4 = e2::kid(&format!("i542-u4-{s}"));
         ts::register_hybrid_key_as(d, &u4, &u4, USER).await;
         let mut e4 = conferral(&u4, &agent);
         e4.subject_key_ids = vec![agent.clone()];
@@ -663,13 +751,10 @@ pub(crate) mod bodies {
         // u1 owns the node; u2 owns a second node, then withdraws that
         // binding (a node has exactly one owner, so two bindings on one node
         // are refused at the door).
-        put(
-            d,
-            ts::owner_binding_attestation(&format!("i542-ob1-{s}"), &u1, &node),
-        )
-        .await
-        .expect("u1 owns the node");
-        let ob2 = ts::owner_binding_attestation(&format!("i542-ob2-{s}"), &u2, &node2);
+        put(d, owner_binding(&u1, &node))
+            .await
+            .expect("u1 owns the node");
+        let ob2 = owner_binding(&u2, &node2);
         put(d, ob2.clone()).await.expect("u2 owns node2");
         put(
             d,
@@ -816,7 +901,10 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        let (t, other) = (format!("i543-t-{s}"), format!("i543-other-{s}"));
+        let (t, other) = (
+            e2::kid(&format!("i543-t-{s}")),
+            e2::kid(&format!("i543-other-{s}")),
+        );
         ts::register_hybrid_key_as(d, &t, &t, NODE).await;
         ts::register_hybrid_key_as(d, &other, &other, NODE).await;
         put(d, self_report(&t, "live")).await.expect("live");
@@ -853,7 +941,13 @@ pub(crate) mod bodies {
         foreign.attested_key_id = t.clone();
         ts::reseal(&mut foreign);
         candidates.push(("another attester, same leaf", foreign, false));
-        let w = composer(&t, &t, attestation_type::WITHDRAWS, "nothing");
+        // v62.0.0 (JSON cut, E7) — an edition-2 composer names a HELD row.
+        let w = composer(
+            &t,
+            &t,
+            attestation_type::WITHDRAWS,
+            &withdrawn.attestation_id,
+        );
         candidates.push(("a withdraws is exempt", w, false));
 
         let _ = read_probe::take();
@@ -1072,12 +1166,14 @@ pub(crate) mod bodies {
     ) {
         use crate::federation::replication_audience_invariants::bodies as rab;
         let (u1, u2, u3) = (
-            format!("i545-u1-{s}"),
-            format!("i545-u2-{s}"),
-            format!("i545-u3-{s}"),
+            e2::kid(&format!("i545-u1-{s}")),
+            e2::kid(&format!("i545-u2-{s}")),
+            e2::kid(&format!("i545-u3-{s}")),
         );
-        let n: Vec<String> = (1..=8).map(|i| format!("i545-n{i}-{s}")).collect();
-        let agent = format!("i545-agent-{s}");
+        let n: Vec<String> = (1..=8)
+            .map(|i| e2::kid(&format!("i545-n{i}-{s}")))
+            .collect();
+        let agent = e2::kid(&format!("i545-agent-{s}"));
         rab::users(d, &[&u1, &u2, &u3]).await;
         rab::nodes(d, &n.iter().map(String::as_str).collect::<Vec<_>>()).await;
         ts::register_hybrid_key_as(d, &agent, &agent, AGENT).await;
@@ -1085,7 +1181,7 @@ pub(crate) mod bodies {
         rab::claim(d, &u1, &n[0], "laptop").await;
         rab::claim(d, &u1, &n[1], "server").await;
         // u1 binds n3, then recants it.
-        let b3 = ts::owner_binding_attestation(&format!("i545-b3-{s}"), &u1, &n[2]);
+        let b3 = owner_binding(&u1, &n[2]);
         put(d, b3.clone()).await.expect("u1 → n3");
         put(
             d,
@@ -1113,7 +1209,7 @@ pub(crate) mod bodies {
         .await
         .expect("n4 withdraws u1's binding");
         // u1 binds n5, then withdraws it.
-        let b5 = ts::owner_binding_attestation(&format!("i545-b5-{s}"), &u1, &n[4]);
+        let b5 = owner_binding(&u1, &n[4]);
         put(d, b5.clone()).await.expect("u1 → n5");
         put(
             d,
@@ -1123,7 +1219,7 @@ pub(crate) mod bodies {
         .expect("u1 withdraws n5");
         // u1 binds n6, then supersedes that binding (whatever the fold makes
         // of a superseded edge, both bodies must make the same of it).
-        let b6 = ts::owner_binding_attestation(&format!("i545-b6-{s}"), &u1, &n[5]);
+        let b6 = owner_binding(&u1, &n[5]);
         put(d, b6.clone()).await.expect("u1 → n6");
         put(
             d,
@@ -1287,12 +1383,13 @@ pub(crate) mod bodies {
             capability_roots_to_trusted_root, live_conferrals, INFRA_ATTEST_SCOPE,
             INFRA_SERVE_SCOPE,
         };
+        // v62.0.0 (JSON cut, E7; E4) — `gs::fixture` is E9's edition-2 root:
+        // the user is THIS node, the root and subject identity-refs, the grant
+        // a rid; `supersede` / `withdraw` return the composer's rid.
         let fx = gs::fixture(d, &format!("i546-{s}")).await;
-        let succ = format!("i546-succ-{s}");
-        let succ2 = format!("i546-succ2-{s}");
-        gs::supersede(
+        let succ = gs::supersede(
             d,
-            &succ,
+            &format!("i546-succ-{s}"),
             &fx.root,
             &fx.subject,
             &fx.grant,
@@ -1300,9 +1397,16 @@ pub(crate) mod bodies {
         )
         .await
         .expect("the root rotates its grant");
-        gs::supersede(d, &succ2, &fx.root, &fx.subject, &succ, INFRA_SERVE_SCOPE)
-            .await
-            .expect("the root rotates it again");
+        let succ2 = gs::supersede(
+            d,
+            &format!("i546-succ2-{s}"),
+            &fx.root,
+            &fx.subject,
+            &succ,
+            INFRA_SERVE_SCOPE,
+        )
+        .await
+        .expect("the root rotates it again");
         let foreign = format!("i546-foreign-{s}");
         ts::register_hybrid_key_as(d, &foreign, &foreign, NODE).await;
         // The door may or may not admit it; either way both bodies must agree.
@@ -1316,7 +1420,7 @@ pub(crate) mod bodies {
         )
         .await;
         let fx2 = gs::fixture(d, &format!("i546b-{s}")).await;
-        gs::withdraw(
+        let _ = gs::withdraw(
             d,
             &format!("i546-w-{s}"),
             &fx2.root,
@@ -1447,190 +1551,87 @@ pub(crate) mod bodies {
     /// key; and no walk reads any key's whole slice (`list_attestations_by` /
     /// `_for`), while the v53.1.6 bodies do.
     pub async fn i547_trust_root_walks_read_what_they_select(d: &dyn FederationDirectory, s: &str) {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::canonical_community::{
             live_charter_rows, v53_1_6_reference::live_charter_rows_reference,
         };
-        use crate::federation::grant_supersede_invariants::bodies as gs;
+        use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::operational::test_support as ot;
         use crate::federation::trust_root::{
             self as tr, v53_1_6_reference as r, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
         };
-
-        // (1) The family root and a transit pair that shares it.
-        let tag = format!("i547t-{s}");
-        ot::exercise_transit_eligibility_family_root(d, &tag)
-            .await
-            .expect("the family-root transit fixture");
-        let (accord, tuser, peer) = (
-            format!("{tag}-accord"),
-            format!("{tag}-user"),
-            format!("{tag}-peer"),
+        // v62.0.0 (JSON cut, E7) — the roots are edition 2: E9's twins
+        // (`seed_chartered_e2_root`: founded by the bundle's holders, chartered,
+        // accepted by a granter; `confer_e2`; `accept_e2_root`; `withdraw_e2`).
+        // Users and subjects are `user` keys named by identity-refs. The
+        // earlier corpus (the accord families with co-scrubbed charters, the
+        // heartbeat drill, `grant_supersede_invariants::fixture`'s rotations)
+        // does not come back; the property is unchanged: every bounded walk
+        // equals its v53.1.6 body, and none reads a whole slice.
+        let key = |n: &str| format!("i547-{n}-{s}");
+        let (u1, u2, u3) = (
+            e2::put_key(d, &key("u1"), &[USER]).await,
+            e2::put_key(d, &key("u2"), &[USER]).await,
+            e2::put_key(d, &key("u3"), &[USER]).await,
         );
-        // (The exercise ends with that family's roster grown past its
-        // charter's quorum, so it is a family root that is NOT valid.) A second
-        // family, chartered at 2-of-3 and trusted by the pair: a valid one.
-        let accord2 = format!("i547-accord2-{s}");
-        let holders: Vec<String> = (0..3).map(|i| format!("i547-h{i}-{s}")).collect();
-        for h in &holders {
-            ot::register_typed_key(d, h, NODE).await.expect("holder");
-        }
-        ot::seed_chartered_family_root(d, &accord2, &holders, &tuser)
+        let (s1_seed, s2_seed) = (key("s1"), key("s2"));
+        let s1 = e2::put_key(d, &s1_seed, &[USER]).await;
+        let s2 = e2::put_key(d, &s2_seed, &[USER]).await;
+        // ra: chartered, accepted by u1, its grant to s1 live.
+        let ra = ot::seed_chartered_e2_root(d, &key("ra"), &u1)
             .await
-            .expect("the second family root");
-        ot::emit_trust_edge(d, &peer, &accord2, None)
+            .expect("root a");
+        let g1 = ot::confer_e2(d, &ra.seed, &s1_seed, &[INFRA_SERVE_SCOPE])
             .await
-            .expect("the peer trusts it too");
-        // A third family, chartered, then its charter withdrawn by the holder
-        // who signed it (a composer attested to the family).
-        let accord3 = format!("i547-accord3-{s}");
-        ot::seed_chartered_family_root(d, &accord3, &holders, &tuser)
+            .expect("ra confers on s1");
+        // rb: chartered, accepted by u2 (and u1), its grant to s2 withdrawn.
+        let rb = ot::seed_chartered_e2_root(d, &key("rb"), &u2)
             .await
-            .expect("the third family root");
-        put(
-            d,
-            composer(
-                &holders[0],
-                &accord3,
-                attestation_type::WITHDRAWS,
-                &format!("{accord3}-charter"),
-            ),
-        )
-        .await
-        .expect("holder 0 withdraws accord3's charter");
-        // Ten bystanders trust each family: rows ABOUT a family no charter
-        // read needs.
+            .expect("root b");
+        ot::accept_e2_root(d, &u1, &rb.root)
+            .await
+            .expect("u1 accepts rb");
+        let g2 = ot::confer_e2(d, &rb.seed, &s2_seed, &[INFRA_SERVE_SCOPE])
+            .await
+            .expect("rb confers on s2");
+        ot::withdraw_e2(d, &rb.seed, &s2, &g2)
+            .await
+            .expect("rb withdraws its grant");
+        // rc: chartered, accepted by u3, then its root withdraws its charter.
+        let rc = ot::seed_chartered_e2_root(d, &key("rc"), &u3)
+            .await
+            .expect("root c");
+        ot::withdraw_e2(d, &rc.seed, &rc.root, &rc.charter)
+            .await
+            .expect("rc withdraws its charter");
+        // u1's own edges: to rc, accepted then withdrawn.
+        let e_w = ot::accept_e2_root(d, &u1, &rc.root)
+            .await
+            .expect("u1 accepts rc");
+        ot::withdraw_e2(d, &u1, &rc.root, &e_w)
+            .await
+            .expect("u1 withdraws it");
+        // Ten bystanders accept ra and rb: rows ABOUT a root no charter read
+        // needs.
         for i in 0..10 {
-            let b = format!("i547-by{i}-{s}");
-            ts::register_hybrid_key_as(d, &b, &b, NODE).await;
-            for fam in [&accord, &accord2] {
-                ot::emit_trust_edge(d, &b, fam, None)
+            let b = e2::put_key(d, &key(&format!("by{i}")), &[USER]).await;
+            for root in [&ra.root, &rb.root] {
+                ot::accept_e2_root(d, &b, root)
                     .await
-                    .expect("a bystander's trust edge");
+                    .expect("a bystander's acceptance");
             }
         }
-        // (2) Key roots: a grant rotated twice; a grant withdrawn; a root that
-        // withdraws its own charter.
-        let fx = gs::fixture(d, &format!("i547a-{s}")).await;
-        let succ = format!("i547-succ-{s}");
-        gs::supersede(
-            d,
-            &succ,
-            &fx.root,
-            &fx.subject,
-            &fx.grant,
-            INFRA_SERVE_SCOPE,
-        )
-        .await
-        .expect("rotation 1");
-        gs::supersede(
-            d,
-            &format!("i547-succ2-{s}"),
-            &fx.root,
-            &fx.subject,
-            &succ,
-            INFRA_SERVE_SCOPE,
-        )
-        .await
-        .expect("rotation 2");
-        let fx2 = gs::fixture(d, &format!("i547b-{s}")).await;
-        gs::withdraw(
-            d,
-            &format!("i547-w-{s}"),
-            &fx2.root,
-            &fx2.subject,
-            &fx2.grant,
-        )
-        .await;
-        let fx3 = gs::fixture(d, &format!("i547c-{s}")).await;
-        let charter3 = d
-            .all_attestations_by(&fx3.root)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|a| {
-                a.attestation_type == attestation_type::DELEGATES_TO
-                    && a.attested_key_id == fx3.root
-            })
-            .expect("fx3's self-charter");
-        put(
-            d,
-            composer(
-                &fx3.root,
-                &fx3.root,
-                attestation_type::WITHDRAWS,
-                &charter3.attestation_id,
-            ),
-        )
-        .await
-        .expect("fx3's root withdraws its charter");
-        // fx's root drill, withdrawn by its witness (a composer attested to
-        // the root): the drill leg reads its composers too.
-        let drill = d
-            .all_attestations_for(&fx.root)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|a| {
-                admission::envelope_dimension(&a.attestation_envelope)
-                    == Some(tr::ACCORD_HEARTBEAT_DIMENSION)
-            })
-            .expect("fx's root drill");
-        put(
-            d,
-            composer(
-                &drill.attesting_key_id,
-                &fx.root,
-                attestation_type::WITHDRAWS,
-                &drill.attestation_id,
-            ),
-        )
-        .await
-        .expect("the witness withdraws fx's drill");
-        // (3) fx.user's own edges: to fx2's root, withdrawn; to fx3's root,
-        // recanted; to the accord, live; to fx2's root again, expired.
-        let e_w = ot::emit_trust_edge(d, &fx.user, &fx2.root, None)
-            .await
-            .expect("edge to fx2");
-        put(
-            d,
-            composer(&fx.user, &fx2.root, attestation_type::WITHDRAWS, &e_w),
-        )
-        .await
-        .expect("fx.user withdraws it");
-        let e_r = ot::emit_trust_edge(d, &fx.user, &fx3.root, None)
-            .await
-            .expect("edge to fx3");
-        put(
-            d,
-            composer(&fx.user, &fx3.root, attestation_type::RECANTS, &e_r),
-        )
-        .await
-        .expect("fx.user recants it");
-        ot::emit_trust_edge(d, &fx.user, &accord, None)
-            .await
-            .expect("fx.user trusts the accord");
-        let _ = ot::emit_trust_edge(
-            d,
-            &fx.user,
-            &fx2.root,
-            Some(chrono::Utc::now() - chrono::Duration::days(1)),
-        )
-        .await;
-        // (4) Unrelated history under every key.
-        for k in [&fx.user, &fx.root, &fx.subject, &tuser, &peer] {
+        // Unrelated history under every key.
+        for k in [&u1, &u2, &s1, &ra.root] {
             for i in 0..6 {
                 put(d, self_report(k, &format!("i547-{i}")))
                     .await
                     .expect("noise");
             }
         }
-
+        let (fx_user, fx_subject) = (&u1, &s1);
+        let users = [&u1, &u2, &u3, &s1];
+        let roots = [&ra.root, &rb.root, &rc.root, &u1];
         let roster = admission::accord_holder_roster_key_ids();
-        let users = [&fx.user, &fx2.user, &fx3.user, &tuser, &peer];
-        let roots = [
-            &fx.root, &fx2.root, &fx3.root, &accord, &accord2, &accord3, &fx.user,
-        ];
         let now = chrono::Utc::now();
         let _ = read_probe::take();
         macro_rules! same {
@@ -1650,7 +1651,7 @@ pub(crate) mod bodies {
             }};
         }
         let mut reference_slice_reads = 0;
-        for k in users.into_iter().chain([&fx.subject]) {
+        for k in users.into_iter().chain([&s2]) {
             let l = same!(
                 format!("trusted_roots_of({k})"),
                 tr::trusted_roots_of(d, k, now).await.unwrap(),
@@ -1668,12 +1669,7 @@ pub(crate) mod bodies {
                 reference_slice_reads += slice_reads(&l);
             }
         }
-        for (u, subj) in [
-            (&fx.user, &fx.subject),
-            (&fx2.user, &fx2.subject),
-            (&fx3.user, &fx3.subject),
-            (&tuser, &peer),
-        ] {
+        for (u, subj) in [(&u1, &s1), (&u2, &s2), (&u3, &s1), (&u1, &s2)] {
             for scope in [INFRA_SERVE_SCOPE, INFRA_ATTEST_SCOPE] {
                 let l = same!(
                     format!("capability_roots({u}, {subj}, {scope})"),
@@ -1689,12 +1685,7 @@ pub(crate) mod bodies {
                 reference_slice_reads += slice_reads(&l);
             }
         }
-        for (u, p) in [
-            (&tuser, &peer),
-            (&peer, &tuser),
-            (&fx.user, &peer),
-            (&fx.user, &tuser),
-        ] {
+        for (u, p) in [(&u1, &u2), (&u2, &u1), (&u1, &s1), (&u3, &u1)] {
             let l = same!(
                 format!("transit_eligibility_walk({u}, {p})"),
                 tr::transit_eligibility_walk(d, u, p).await.unwrap(),
@@ -1705,10 +1696,10 @@ pub(crate) mod bodies {
             reference_slice_reads += slice_reads(&l);
         }
         for (subj, granter) in [
-            (&fx.subject, &fx.root),
-            (&fx2.subject, &fx2.root),
-            (&fx.subject, &fx2.root),
-            (&peer, &tuser),
+            (&s1, &ra.root),
+            (&s2, &rb.root),
+            (&s1, &rb.root),
+            (&u2, &u1),
         ] {
             for scope in [INFRA_SERVE_SCOPE, INFRA_ATTEST_SCOPE] {
                 let l = same!(
@@ -1723,7 +1714,7 @@ pub(crate) mod bodies {
                 reference_slice_reads += slice_reads(&l);
             }
         }
-        for fam in [&accord, &accord2, &accord3, &fx.root, &fx3.root] {
+        for fam in [&ra.root, &rb.root, &rc.root] {
             let ids =
                 |v: Vec<Attestation>| v.into_iter().map(|a| a.attestation_id).collect::<Vec<_>>();
             let l = same!(
@@ -1737,10 +1728,10 @@ pub(crate) mod bodies {
             reference_slice_reads > 0,
             "I547: the v53.1.6 bodies read whole slices (the red)"
         );
-        // The family's about-read returns its charters, never the eleven
-        // trust edges naming it.
-        for fam in [&accord, &accord2] {
-            let _ = tr::trust_root_valid(d, &tuser, fam).await.unwrap();
+        // The root's about-read returns its charters, never the bystanders'
+        // acceptance edges naming it.
+        for fam in [&ra.root, &rb.root] {
+            let _ = tr::trust_root_valid(d, &u1, fam).await.unwrap();
             let log = read_probe::take();
             let typed = rows_of(&log, "list_attestations_for_types", fam);
             assert!(
@@ -1748,57 +1739,36 @@ pub(crate) mod bodies {
                 "I547: {fam}'s typed read returns its charters only ({typed} rows): {log:?}"
             );
         }
-        // Literals: the head of fx's rotation confers; fx2's withdrawn grant
-        // and fx3's withdrawn charter confer nothing; the pair shares the
-        // accord.
+        // Literals: ra's grant confers; rb's withdrawn grant and rc's withdrawn
+        // charter confer nothing; u1 holds ra.
         assert_eq!(
             tr::capability_roots_to_trusted_root_over_roster(
                 d,
-                &fx.user,
-                &fx.subject,
+                fx_user,
+                fx_subject,
                 INFRA_SERVE_SCOPE,
                 &roster
             )
             .await
             .unwrap()
             .map(|g| g.grant_attestation_id),
-            Some(format!("i547-succ2-{s}"))
+            Some(g1.hex())
         );
+        assert!(tr::capability_roots_to_trusted_root_over_roster(
+            d,
+            &u2,
+            &s2,
+            INFRA_SERVE_SCOPE,
+            &roster
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(tr::trust_root_valid(d, &u1, &ra.root).await.unwrap().valid);
+        assert!(!tr::trust_root_valid(d, &u3, &rc.root).await.unwrap().valid);
         assert!(
-            !tr::trust_root_valid(d, &fx3.user, &fx3.root)
-                .await
-                .unwrap()
-                .valid
-        );
-        assert_eq!(
-            tr::transit_eligibility_walk(d, &tuser, &peer)
-                .await
-                .unwrap()
-                .0
-                .via_root,
-            Some(accord2.clone())
-        );
-        assert!(
-            tr::trust_root_valid(d, &tuser, &accord2)
-                .await
-                .unwrap()
-                .valid
-        );
-        assert!(
-            !tr::trust_root_valid(d, &tuser, &accord)
-                .await
-                .unwrap()
-                .valid
-        );
-        assert!(
-            !tr::trust_root_valid(d, &tuser, &accord3)
-                .await
-                .unwrap()
-                .valid
-        );
-        assert!(
-            live_charter_rows(d, &accord3).await.unwrap().is_empty(),
-            "I547: accord3's withdrawn charter is no live charter"
+            live_charter_rows(d, &rc.root).await.unwrap().is_empty(),
+            "I547: rc's withdrawn charter is no live charter"
         );
     }
 }
@@ -1814,24 +1784,34 @@ mod runners {
             mod $modname {
                 use super::suffix;
                 use crate::federation::FederationDirectory;
-                macro_rules! case {
+                // v62.0.0 (JSON cut, E7) — FLIPPED bodies: no earlier-form wrap.
+                macro_rules! flipped {
                     ($name:ident, $body:ident) => {
                         #[tokio::test]
                         async fn $name() {
                             let Some(d) = $fresh.await else { return };
-                            super::super::bodies::$body(&d as &dyn FederationDirectory, &suffix())
-                                .await
+                            let s = suffix();
+                            // v62.0.0 (JSON cut, E7) — this node's key, set
+                            // first (the edition-2 trust-root fixtures read it).
+                            let node = crate::federation::edition2::fixture_switch::put_key(
+                                &d,
+                                &format!("br-node-{s}"),
+                                &[crate::federation::types::identity_type::NODE],
+                            )
+                            .await;
+                            d.set_node_key_id(node);
+                            super::super::bodies::$body(&d as &dyn FederationDirectory, &s).await
                         }
                     };
                 }
-                case!(i540, i540_send_set_reads_each_owners_lists_once);
-                case!(i542, i542_live_granters_read_the_subjects_edges);
-                case!(i543, i543_the_config_renewal_check_reads_the_leaf);
-                case!(i544, i544_custody_acks_read_the_devices_reports_of_the_blob);
-                case!(i545, i545_nodes_of_reads_the_stewards_delegations);
-                case!(i546, i546_live_conferrals_read_each_rows_composers);
-                case!(i547, i547_trust_root_walks_read_what_they_select);
-                $(case!($sql_only, $sql_body);)*
+                flipped!(i540, i540_send_set_reads_each_owners_lists_once);
+                flipped!(i542, i542_live_granters_read_the_subjects_edges);
+                flipped!(i543, i543_the_config_renewal_check_reads_the_leaf);
+                flipped!(i544, i544_custody_acks_read_the_devices_reports_of_the_blob);
+                flipped!(i545, i545_nodes_of_reads_the_stewards_delegations);
+                flipped!(i546, i546_live_conferrals_read_each_rows_composers);
+                flipped!(i547, i547_trust_root_walks_read_what_they_select);
+                $(flipped!($sql_only, $sql_body);)*
             }
         };
     }

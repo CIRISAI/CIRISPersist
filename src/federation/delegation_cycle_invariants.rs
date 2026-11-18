@@ -62,17 +62,41 @@
 //! the gate, its lock and its re-ask: nothing is refused for closing a cycle,
 //! so there is nothing to serialize.
 
+//!
+//! v62.0.0 (slice E6) — every edge is an edition-2 row signed by its
+//! granter's `key:record` (`fixture_switch`): fixtures name keys by SEED,
+//! every read (`has_fed_edge`, the walk) by KID (`kid_or_keep`). Gate (a),
+//! the granter's BARE retraction (a `withdraws` naming no row), is deleted
+//! from I590 (3) and I608 (a): Verify's reader requires a composer's
+//! `refs.target`, so an edition-2 retraction always names its edge (gate (b)).
+
 /// The backend-agnostic witness body; `run` instantiates it per backend.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         attestation_tier, attestation_type, cohort_scope, identity_type,
     };
     use crate::federation::{Error, FederationDirectory};
 
+    /// v62.0.0 — the key of seed `k`, an edition-2 `key:record`.
     pub(crate) async fn agent(d: &dyn FederationDirectory, k: &str) {
-        ts::register_hybrid_key_as(d, k, k, identity_type::AGENT).await;
+        let _ = e2::put_key(d, k, &[identity_type::AGENT]).await;
+    }
+
+    /// A row's envelope instant follows its column (a fixture that moves
+    /// `asserted_at` before signing): `statement_of` reads the envelope's.
+    fn restamp(row: &mut crate::federation::Attestation) {
+        let at = crate::federation::admission::render_signed_instant(row.asserted_at);
+        if let Some(env) = row.attestation_envelope.as_object_mut() {
+            if env.contains_key(crate::federation::envelope::paths::ASSERTED_AT) {
+                env.insert(
+                    crate::federation::envelope::paths::ASSERTED_AT.to_owned(),
+                    serde_json::json!(at),
+                );
+            }
+        }
     }
 
     /// v62.0.0 (slice C) — the cycle-closing edge is ADMITTED: the kernel's
@@ -99,10 +123,14 @@ pub mod bodies {
                 e.kind()
             )
         });
-        let seen =
-            crate::federation::admission::delegation_path_hops(d, to, from, chrono::Utc::now())
-                .await
-                .expect("the walk reads");
+        let seen = crate::federation::admission::delegation_path_hops(
+            d,
+            &e2::kid_or_keep(to),
+            &e2::kid_or_keep(from),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the walk reads");
         assert_eq!(
             seen,
             Some(hops),
@@ -120,18 +148,6 @@ pub mod bodies {
         );
     }
 
-    /// A `withdraws` by `granter` against `grantee` naming NO attestation —
-    /// the granter's bare edge retraction (gate (a) of the walks).
-    async fn bare_retraction(d: &dyn FederationDirectory, granter: &str, grantee: &str) {
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut row = ts::bare_attestation(&id, granter, grantee, &serde_json::json!({ "id": id }));
-        row.attestation_type = attestation_type::WITHDRAWS.to_owned();
-        ts::seal_row_in_place(granter, &mut row);
-        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
-            .await
-            .expect("a granter's bare retraction admits");
-    }
-
     /// A `delegates_to(granter → grantee)` shaped like
     /// [`ts::put_delegates_to`]'s, with `shape` applied before the seal.
     async fn put_edge(
@@ -141,18 +157,23 @@ pub mod bodies {
         shape: impl FnOnce(&mut crate::federation::Attestation),
     ) -> Result<String, Error> {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut row = ts::bare_attestation(
-            &id,
-            granter,
-            grantee,
-            &serde_json::json!({ "references_attestation_id": id, "scope": ["act_on_behalf"] }),
-        );
+        // Built in the earlier shape, shaped, then signed once (v62.0.0).
+        let mut row = e2::with_earlier_form(|| {
+            ts::bare_attestation(
+                &id,
+                granter,
+                grantee,
+                &serde_json::json!({ "id": id, "scope": ["act_on_behalf"] }),
+            )
+        });
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         shape(&mut row);
-        ts::seal_row_in_place(granter, &mut row);
+        restamp(&mut row);
+        let row = e2::row_of(&row, granter);
+        let stored = row.attestation_id.clone();
         d.put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await?;
-        Ok(id)
+        Ok(stored)
     }
 
     /// Stage a LOCAL `delegates_to(from → to)` and describe its crossing.
@@ -168,8 +189,8 @@ pub mod bodies {
         let staged_id = d
             .attestation_insert_local(crate::federation::types::LocalAttestationInput {
                 attestation_id: None,
-                attesting_key_id: from.to_owned(),
-                attested_key_id: Some(to.to_owned()),
+                attesting_key_id: e2::kid_or_keep(from),
+                attested_key_id: Some(e2::kid_or_keep(to)),
                 attestation_type: attestation_type::DELEGATES_TO.to_owned(),
                 weight: Some(1.0),
                 expires_at: None,
@@ -196,33 +217,39 @@ pub mod bodies {
     /// Is a federation-tier `delegates_to(from → to)` stored?
     pub(crate) async fn has_fed_edge(d: &dyn FederationDirectory, from: &str, to: &str) -> bool {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
-        d.all_attestations_by(from).await.unwrap().iter().any(|r| {
+        let (from, to) = (e2::kid_or_keep(from), e2::kid_or_keep(to));
+        d.all_attestations_by(&from).await.unwrap().iter().any(|r| {
             r.attestation_type == attestation_type::DELEGATES_TO
                 && r.attested_key_id == to
                 && r.tier == attestation_tier::FEDERATION
         })
     }
 
-    /// A retraction by `granter` against `grantee` (naming `target` when
-    /// given), signed `ahead` in the future: inside the admitted skew, so the
-    /// door stores it, and not yet in force at `now`.
+    /// A retraction by `granter` against `grantee` naming the edge `target`,
+    /// signed `ahead` in the future: inside the admitted skew, so the door
+    /// stores it, and not yet in force at `now`. v62.0.0: a composer carries
+    /// its target's family (`self:delegates_to`, the edge's), and names the
+    /// edge by `refs.target` (`target` is its computed id).
     async fn future_retraction(
         d: &dyn FederationDirectory,
         granter: &str,
         grantee: &str,
-        target: Option<&str>,
+        target: &str,
         ahead: chrono::Duration,
     ) {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut envelope = serde_json::json!({ "id": id });
-        if let Some(t) = target {
-            envelope["references_attestation_id"] = serde_json::json!(t);
-        }
-        let mut row = ts::bare_attestation(&id, granter, grantee, &envelope);
+        let envelope = serde_json::json!({
+            "id": id,
+            "references_attestation_id": target,
+        });
+        let mut row =
+            e2::with_earlier_form(|| ts::bare_attestation(&id, granter, grantee, &envelope));
         row.attestation_type = attestation_type::WITHDRAWS.to_owned();
         row.asserted_at += ahead;
         row.scrub_timestamp = row.asserted_at;
-        ts::seal_row_in_place(granter, &mut row);
+        restamp(&mut row);
+        let statement = e2::statement_of_family(&row, granter, "self:delegates_to");
+        let row = e2::row_of_statement(&statement, attestation_tier::FEDERATION);
         d.put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
             .expect("a retraction inside the future skew is admitted");
@@ -231,32 +258,18 @@ pub mod bodies {
     /// I608 — see the module doc.
     pub async fn i608_a_future_retraction_hides_no_edge(d: &dyn FederationDirectory, tag: &str) {
         let k = |n: &str| format!("{tag}-{n}");
-        for n in ["a", "b", "e", "f"] {
+        for n in ["e", "f"] {
             agent(d, &k(n)).await;
         }
         let ahead = crate::federation::operational::CLOCK_SKEW_TOLERANCE / 2;
-        // Gate (a): b → a, and b's bare retraction against a signed ahead.
-        let (a, b) = (k("a"), k("b"));
-        ts::put_delegates_to(d, &b, &a, None)
-            .await
-            .expect("I608 (a) b → a");
-        future_retraction(d, &b, &a, None, ahead).await;
-        expect_cycle(
-            d,
-            ts::put_delegates_to(d, &a, &b, None).await,
-            &a,
-            &b,
-            1,
-            "I608 (a): b's retraction of b → a is not in force yet, so a → b closes a live cycle",
-        )
-        .await;
-        assert_no_edge(d, &a, &b, "I608 (a)").await;
+        // v62.0.0 — gate (a) (a bare retraction, naming no edge) is deleted:
+        // an edition-2 composer names its target.
         // Gate (b): e → f with f a subject; f withdraws it by name, ahead.
         let (e, f) = (k("e"), k("f"));
         let ef = put_edge(d, &e, &f, |r| r.subject_key_ids = vec![f.clone()])
             .await
             .expect("I608 (b) e → f, f a subject");
-        future_retraction(d, &f, &f, Some(&ef), ahead).await;
+        future_retraction(d, &f, &f, &ef, ahead).await;
         expect_cycle(
             d,
             ts::put_delegates_to(d, &f, &e, None).await,
@@ -374,14 +387,8 @@ pub mod bodies {
             .await
             .expect("(2) a → a is a root self-declaration, admitted");
 
-        // (3) gate (a): the granter's bare retraction against the recipient.
-        // `a → c` (admitted above) still reaches c; withdraw it too, so the
-        // only paths from a to c are retracted ones.
-        bare_retraction(d, &b, &c).await;
-        bare_retraction(d, &a, &c).await;
-        ts::put_delegates_to(d, &c, &a, None)
-            .await
-            .expect("(3) with b → c and a → c retracted by their granters, c → a closes nothing");
+        // (3) gate (a), the granter's BARE retraction: deleted in v62.0.0 (an
+        // edition-2 composer names its target; gate (b) is (4)).
 
         // (4) gate (b), the #593 clause: a retraction NAMING the edge, by a
         // party other than its granter (so gate (a), which reads only the
@@ -628,8 +635,8 @@ pub mod bodies {
         let staged_id = d
             .attestation_insert_local(crate::federation::types::LocalAttestationInput {
                 attestation_id: None,
-                attesting_key_id: y.clone(),
-                attested_key_id: Some(x.clone()),
+                attesting_key_id: e2::kid(&y),
+                attested_key_id: Some(e2::kid(&x)),
                 attestation_type: attestation_type::DELEGATES_TO.to_owned(),
                 weight: Some(1.0),
                 expires_at: None,

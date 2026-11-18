@@ -592,8 +592,20 @@ pub async fn record_quarantine_marker(
         return refused(QuarantineRefusalReason::NotFiledAgainstSubject);
     }
 
+    // v62.0.0 (wave GC8; CC 2.7.3) — the three legs below that read OTHER
+    // rows (the SUBJECT's key record, the withhold marker a release names,
+    // the duty-holder's seats and chains) are fold conditions: each marks
+    // the running fold attempt with its token, so a marker reached under an
+    // attempt is HELD and re-folds when the subject's key, the named marker
+    // or a seat / delegation lands. Outside an attempt (this earlier-form
+    // door) the outcome is the refusal it was. The marker's own fields and
+    // its author's signature stay door refusals.
+    use super::edition2::fold as e2fold;
+    e2fold::reads(e2fold::Dep::key(&subject));
+    e2fold::reads(e2fold::Dep::key(&marker.attesting_key_id));
     // The subject must be a key this node can name.
     if directory.lookup_public_key(&subject).await?.is_none() {
+        e2fold::note(e2fold::reason::gc8::SUBJECT_KEY_UNKNOWN);
         return refused(QuarantineRefusalReason::SubjectKeyUnknown);
     }
 
@@ -616,12 +628,19 @@ pub async fn record_quarantine_marker(
     // key — the same test `fold_quarantine` applies, so a release cannot be
     // admitted under one rule and re-priced under another.
     if let Some(marker_id) = &releases {
+        if let Some(named_row) = hex::decode(marker_id)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        {
+            e2fold::reads(e2fold::Dep::Row(super::edition2::names::RowId(named_row)));
+        }
         let named = directory.get_attestation(marker_id).await?;
         let resolves = named.is_some_and(|row| {
             envelope_str(&row, "dimension") == Some(DIMENSION_WITHHELD)
                 && envelope_str(&row, field::QUARANTINES) == Some(subject.as_str())
         });
         if !resolves {
+            e2fold::note(e2fold::reason::gc8::MARKER_UNKNOWN);
             return refused(QuarantineRefusalReason::MarkerUnknown);
         }
     }
@@ -630,7 +649,8 @@ pub async fn record_quarantine_marker(
     match super::admission::check_delegated_duty_scores_admission(directory, marker).await {
         Ok(()) => {}
         Err(Error::DelegatedScopeUnauthorized { .. }) => {
-            return refused(QuarantineRefusalReason::SlashUnauthorized)
+            e2fold::note(e2fold::reason::gc8::SLASH_UNAUTHORIZED);
+            return refused(QuarantineRefusalReason::SlashUnauthorized);
         }
         Err(e) => return Err(e),
     }
@@ -1076,15 +1096,12 @@ mod tests {
 pub(crate) mod test_support {
     use super::*;
     use crate::federation::admission::{DELEGATION_SCOPE_MODERATE, DELEGATION_SCOPE_SLASH};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::{
         admin_action_event, admin_action_kind, admin_field, admin_op, AdminActionRefusal,
         HardCaseFilter,
     };
-    use crate::federation::tier_ingest::test_support::{hybrid_pubkeys, sign_envelope};
-    use crate::federation::types::{
-        attestation_tier, attestation_type, Community, CommunityMember,
-    };
-    use crate::federation::{SignedAttestation, SignedKeyRecord};
+    use crate::federation::types::{attestation_tier, attestation_type};
 
     /// Register `key_id` as a **`user`**-role identity carrying its real
     /// deterministic hybrid pubkeys.
@@ -1111,61 +1128,55 @@ pub(crate) mod test_support {
         register_key(dir, key_id, crate::federation::types::identity_type::AGENT).await;
     }
 
+    /// v62 (E3): the key is live through its edition-2 `key:record`
+    /// (`e2::put_key`); `key_id` is the SEED, the stored id is `e2::kid(key_id)`.
     async fn register_key(dir: &dyn FederationDirectory, key_id: &str, identity_type: &str) {
-        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
-        let now = Utc::now();
-        dir.put_public_key(SignedKeyRecord {
-            record: crate::federation::KeyRecord {
-                key_id: key_id.to_owned(),
-                pubkey_ed25519_base64: ed_pk,
-                pubkey_ml_dsa_65_base64: mldsa_pk,
-                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-                identity_type: identity_type.to_owned(),
-                identity_ref: key_id.to_owned(),
-                valid_from: now,
-                valid_until: None,
-                registration_envelope: serde_json::json!({ "id": key_id }),
-                original_content_hash: "deadbeef".to_owned(),
-                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
-                scrub_signature_pqc: None,
-                scrub_key_id: key_id.to_owned(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            },
-        })
-        .await
-        .expect("register user key");
+        e2::put_key(dir, key_id, &[identity_type]).await;
     }
 
     /// A federation-tier `scores` row carrying `envelope`, authored + scrubbed
     /// by `author`, about `subject`.
     fn signed_row(
-        id: &str,
         author: &str,
         subject: &str,
         envelope: serde_json::Value,
         asserted_at: DateTime<Utc>,
     ) -> Attestation {
-        let (och, ed_sig, pqc_sig) = sign_envelope(author, &envelope);
-        let mut sealed_row_ = Attestation {
-            attestation_id: id.to_owned(),
-            attesting_key_id: author.to_owned(),
+        // v62 (E3): an edition-2 statement by `author` (a seed); the row id is
+        // node-computed, so callers read `attestation_id` off the result.
+        e2::row_of(
+            &unsigned_row(
+                author,
+                subject,
+                attestation_type::SCORES,
+                envelope,
+                asserted_at,
+            ),
+            author,
+        )
+    }
+
+    /// The unsigned, earlier-form-shaped row the codec signs.
+    fn unsigned_row(
+        author: &str,
+        subject: &str,
+        attestation_type: &str,
+        envelope: serde_json::Value,
+        asserted_at: DateTime<Utc>,
+    ) -> Attestation {
+        Attestation {
+            attestation_id: String::new(),
+            attesting_key_id: e2::kid(author),
             attested_key_id: subject.to_owned(),
-            attestation_type: attestation_type::SCORES.to_owned(),
+            attestation_type: attestation_type.to_owned(),
             weight: None,
             asserted_at,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
-            scrub_key_id: author.to_owned(),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: e2::kid(author),
             scrub_timestamp: asserted_at,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
@@ -1175,15 +1186,11 @@ pub(crate) mod test_support {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut sealed_row_);
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+        }
     }
 
     /// A `delegates_to` edge `granter → grantee` bearing `scopes`.
     fn delegation_row(
-        id: &str,
         granter: &str,
         grantee: &str,
         scopes: &[&str],
@@ -1195,33 +1202,18 @@ pub(crate) mod test_support {
         });
         // v60.0.0 (#1048) — a duty edge carries a term (CC 2.4).
         crate::federation::admission::with_test_term(&mut envelope, at);
-        let (och, ed_sig, pqc_sig) = sign_envelope(granter, &envelope);
-        let mut sealed_row_ = Attestation {
-            attestation_id: id.to_owned(),
-            attesting_key_id: granter.to_owned(),
-            attested_key_id: grantee.to_owned(),
-            attestation_type: attestation_type::DELEGATES_TO.to_owned(),
-            weight: None,
-            asserted_at: at,
-            expires_at: None,
-            attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
-            scrub_key_id: granter.to_owned(),
-            scrub_timestamp: at,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: "federation".to_owned(),
-            tier: attestation_tier::FEDERATION.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(granter, &mut sealed_row_);
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+        // v62 (E3): a duty edge is a `self:delegates_to` row (RULINGS).
+        let a = unsigned_row(
+            granter,
+            grantee,
+            attestation_type::DELEGATES_TO,
+            envelope,
+            at,
+        );
+        e2::row_of_statement(
+            &e2::statement_of_family(&a, granter, "self:delegates_to"),
+            attestation_tier::FEDERATION,
+        )
     }
 
     /// Is `id` present in the relay page `list_attestation_log` serves?
@@ -1268,72 +1260,79 @@ pub(crate) mod test_support {
         for k in [&deputy_slash, &deputy_mod] {
             register_agent_key(dir, k).await;
         }
+        // v62 (E3): the seeds sign; the stored, compared ids are identity-refs.
+        let (founder_k, stranger_k, actor_k, community_k) = (
+            e2::kid(&founder),
+            e2::kid(&stranger),
+            e2::kid(&actor),
+            e2::kid(&community),
+        );
 
         // A community whose authority set is {founder, member}. `actor` and
-        // `stranger` are deliberately NOT members.
-        dir.put_community(
-            crate::federation::tier_ingest::test_support::sign_community(
-                &founder,
-                Community {
-                    prev_head_digest: String::new(),
-                    charter_digest: String::new(),
-                    community_key_id: community.clone(),
-                    community_name: format!("commons {community}"),
-                    members: vec![
-                        CommunityMember {
-                            key_id: founder.clone(),
-                            joined_at: now,
-                            role: Some("founder".to_owned()),
-                        },
-                        CommunityMember {
-                            key_id: member.clone(),
-                            joined_at: now,
-                            role: Some("member".to_owned()),
-                        },
-                    ],
-                    founded_at: now,
-                    consensus_protocol: "majority".to_owned(),
-                    policy_blob: None,
-                    persist_row_hash: String::new(),
-                },
-            ),
+        // `stranger` are deliberately NOT members. v62 (E3): the typed builder
+        // through T1's `group:roster` voices (the founder and each listed
+        // member), keyed by identity-refs.
+        let community_row = crate::federation::tier_ingest::test_support::sign_community(
+            &founder,
+            crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: community.clone(),
+                community_name: format!("commons {community}"),
+                members: vec![
+                    crate::federation::types::CommunityMember {
+                        key_id: founder.clone(),
+                        joined_at: now,
+                        role: Some("founder".to_owned()),
+                    },
+                    crate::federation::types::CommunityMember {
+                        key_id: member.clone(),
+                        joined_at: now,
+                        role: Some("member".to_owned()),
+                    },
+                ],
+                founded_at: now,
+                consensus_protocol: "majority".to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        e2::put_voices(
+            dir,
+            &e2::community_voices(&community_row, 1, None, e2::ms(now)),
         )
         .await
-        .expect("put_community");
+        .expect("the community roster lands");
 
         // An ordinary federation-tier row by the actor — the thing serving
         // will (and then will not) hand to peers.
-        let actor_row_id = uuid::Uuid::new_v4().to_string();
         let actor_row = signed_row(
-            &actor_row_id,
             &actor,
-            &actor,
+            &actor_k,
             serde_json::json!({
                 "dimension": "testimonial_witness:commons_act:v1",
                 "payload": {"action": "an ordinary row"},
             }),
             now,
         );
-        dir.put_attestation(SignedAttestation {
-            attestation: actor_row,
-        })
-        .await
-        .expect("the actor's row lands normally");
+        let actor_row_id = actor_row.attestation_id.clone();
+        e2::put_signed(dir, &actor_row)
+            .await
+            .expect("the actor's row lands normally");
         assert!(
             served(dir, &actor_row_id).await,
             "({suffix}) before any marker the row is served"
         );
 
-        let mk = |id: &str, author: &str, subject: &str, env: serde_json::Value| {
-            signed_row(id, author, subject, env, Utc::now())
+        let mk = |author: &str, subject: &str, env: serde_json::Value| {
+            signed_row(author, subject, env, Utc::now())
         };
 
         // ── (1) UNATTRIBUTED: no delegation_id ⇒ refused.
         let bare = mk(
-            &uuid::Uuid::new_v4().to_string(),
             &founder,
-            &actor,
-            withhold_envelope(&actor, &community, "", "spam"),
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "", "spam"),
         );
         assert_eq!(
             record_quarantine_marker(dir, &bare)
@@ -1347,10 +1346,9 @@ pub(crate) mod test_support {
 
         // ── (2) FILED AGAINST THE WRONG KEY ⇒ refused (it would be inert).
         let misfiled = mk(
-            &uuid::Uuid::new_v4().to_string(),
             &founder,
-            &stranger, // attested_key_id ≠ quarantines_key_id
-            withhold_envelope(&actor, &community, "att-deleg", "spam"),
+            &stranger_k, // attested_key_id ≠ quarantines_key_id
+            withhold_envelope(&actor_k, &community_k, "att-deleg", "spam"),
         );
         assert_eq!(
             record_quarantine_marker(dir, &misfiled)
@@ -1362,12 +1360,11 @@ pub(crate) mod test_support {
         );
 
         // ── (3) SUBJECT THIS NODE CANNOT NAME ⇒ refused.
-        let ghost = format!("qa-ghost-{suffix}");
+        let ghost = e2::kid(&format!("qa-ghost-{suffix}"));
         let unknown = mk(
-            &uuid::Uuid::new_v4().to_string(),
             &founder,
             &ghost,
-            withhold_envelope(&ghost, &community, "att-deleg", "spam"),
+            withhold_envelope(&ghost, &community_k, "att-deleg", "spam"),
         );
         assert_eq!(
             record_quarantine_marker(dir, &unknown)
@@ -1380,10 +1377,9 @@ pub(crate) mod test_support {
 
         // ── (4) A NON-HOLDER'S MARKER ⇒ refused naming the scope.
         let usurper = mk(
-            &uuid::Uuid::new_v4().to_string(),
             &stranger,
-            &actor,
-            withhold_envelope(&actor, &community, "att-deleg", "spam"),
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "att-deleg", "spam"),
         );
         assert_eq!(
             record_quarantine_marker(dir, &usurper)
@@ -1394,7 +1390,7 @@ pub(crate) mod test_support {
             "({suffix}) `slash` is a gate, not a stored label — the #333 lesson"
         );
         assert!(
-            !resolve_quarantine(dir, &actor, Utc::now())
+            !resolve_quarantine(dir, &actor_k, Utc::now())
                 .await
                 .expect("resolve")
                 .withholds(),
@@ -1403,13 +1399,12 @@ pub(crate) mod test_support {
         assert!(served(dir, &actor_row_id).await, "({suffix}) still served");
 
         // ── (5) THE HOLDER'S MARKER LANDS, and serving stops.
-        let withhold_id = uuid::Uuid::new_v4().to_string();
         let withhold = mk(
-            &withhold_id,
             &founder,
-            &actor,
-            withhold_envelope(&actor, &community, "att-deleg-1", "sustained spam"),
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "att-deleg-1", "sustained spam"),
         );
+        let withhold_id = withhold.attestation_id.clone();
         assert_eq!(
             record_quarantine_marker(dir, &withhold)
                 .await
@@ -1417,12 +1412,12 @@ pub(crate) mod test_support {
             QuarantineOutcome::Admitted,
             "({suffix}) a steward-bound community authority holds `slash` as-self"
         );
-        let fold = resolve_quarantine(dir, &actor, Utc::now())
+        let fold = resolve_quarantine(dir, &actor_k, Utc::now())
             .await
             .expect("resolve");
         assert_eq!(fold.state, QuarantineState::Withheld, "({suffix})");
         assert_eq!(fold.marker_id.as_deref(), Some(withhold_id.as_str()));
-        assert_eq!(fold.decided_by.as_deref(), Some(founder.as_str()));
+        assert_eq!(fold.decided_by.as_deref(), Some(founder_k.as_str()));
         assert_eq!(
             fold.delegation_id.as_deref(),
             Some("att-deleg-1"),
@@ -1449,19 +1444,18 @@ pub(crate) mod test_support {
         );
 
         // ── (7) REVERSIBLE: a release restores serving, both acts survive.
-        let release_id = uuid::Uuid::new_v4().to_string();
         let release = mk(
-            &release_id,
             &founder,
-            &actor,
+            &actor_k,
             release_envelope(
-                &actor,
-                &community,
+                &actor_k,
+                &community_k,
                 &withhold_id,
                 "att-deleg-1",
                 "appeal upheld",
             ),
         );
+        let release_id = release.attestation_id.clone();
         assert_eq!(
             record_quarantine_marker(dir, &release)
                 .await
@@ -1469,7 +1463,7 @@ pub(crate) mod test_support {
             QuarantineOutcome::Admitted,
             "({suffix})"
         );
-        let fold = resolve_quarantine(dir, &actor, Utc::now())
+        let fold = resolve_quarantine(dir, &actor_k, Utc::now())
             .await
             .expect("resolve");
         assert_eq!(fold.state, QuarantineState::Released, "({suffix})");
@@ -1483,10 +1477,15 @@ pub(crate) mod test_support {
         );
         // A release naming a marker this node does not hold is refused.
         let dangling = mk(
-            &uuid::Uuid::new_v4().to_string(),
             &founder,
-            &actor,
-            release_envelope(&actor, &community, "no-such-marker", "att-deleg-1", "nope"),
+            &actor_k,
+            release_envelope(
+                &actor_k,
+                &community_k,
+                "no-such-marker",
+                "att-deleg-1",
+                "nope",
+            ),
         );
         assert_eq!(
             record_quarantine_marker(dir, &dangling)
@@ -1503,23 +1502,17 @@ pub(crate) mod test_support {
             (&deputy_mod, DELEGATION_SCOPE_MODERATE),
             (&deputy_slash, DELEGATION_SCOPE_SLASH),
         ] {
-            dir.put_attestation(SignedAttestation {
-                attestation: delegation_row(
-                    &uuid::Uuid::new_v4().to_string(),
-                    &founder,
-                    deputy,
-                    &[scope],
-                    Utc::now(),
-                ),
-            })
+            e2::put_signed(
+                dir,
+                &delegation_row(&founder, &e2::kid(deputy), &[scope], Utc::now()),
+            )
             .await
             .expect("delegates_to lands");
         }
         let by_mod_deputy = mk(
-            &uuid::Uuid::new_v4().to_string(),
             &deputy_mod,
-            &actor,
-            withhold_envelope(&actor, &community, "att-deleg-2", "reported"),
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "att-deleg-2", "reported"),
         );
         assert_eq!(
             record_quarantine_marker(dir, &by_mod_deputy)
@@ -1531,10 +1524,9 @@ pub(crate) mod test_support {
              authority to write a note is not an authority to take away"
         );
         let by_slash_deputy = mk(
-            &uuid::Uuid::new_v4().to_string(),
             &deputy_slash,
-            &actor,
-            withhold_envelope(&actor, &community, "att-deleg-3", "delegated"),
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "att-deleg-3", "delegated"),
         );
         assert_eq!(
             record_quarantine_marker(dir, &by_slash_deputy)
@@ -1552,8 +1544,8 @@ pub(crate) mod test_support {
         let quarantine_kind = admin_action_kind(admin_op::QUARANTINE);
         let mut unattributed = admin_action_event(
             admin_op::QUARANTINE,
-            &actor,
-            Some(&founder),
+            &actor_k,
+            Some(&founder_k),
             "att-deleg-1",
             "sustained spam",
             Utc::now(),
@@ -1592,8 +1584,8 @@ pub(crate) mod test_support {
         );
         let attributed = admin_action_event(
             admin_op::QUARANTINE,
-            &actor,
-            Some(&founder),
+            &actor_k,
+            Some(&founder_k),
             "att-deleg-1",
             "sustained spam",
             Utc::now(),

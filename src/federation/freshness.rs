@@ -289,89 +289,64 @@ pub(crate) mod test_support {
     /// **`touch_claim_monotonic_max_only_advances`** — the anti-rollback
     /// matrix: T1 inserts (`Advanced`), T2 > T1 advances (`Advanced`), T0 <
     /// T1 is a silent no-op (`NotFresher`) that does NOT clobber the
-    /// stored T2, and a byte-identical re-put of T2 is `NotFresher` (the
-    /// strict `>` guard — equal is never "fresher").
+    /// stored T2, and a re-put of T2 is `NotFresher` (the strict `>` guard —
+    /// equal is never "fresher").
+    ///
+    /// v62.0.0 (lead's ruling; P5b): a touch claim is NODE-LOCAL. It is
+    /// written unsigned through `put_touch_claim_local` and read through
+    /// `freshness_floor`; the signed door is the earlier form F removes. The
+    /// instants are relative to now (inside the skew bound).
     pub(crate) async fn run_monotonic_max_matrix(dir: &dyn FederationDirectory, suffix: &str) {
-        // SelfTouch requires the attester to BE the touched target (or a
-        // registered occurrence of it) — the simplest case is the target
-        // touching itself, so `target == key_id`.
-        let key_id = format!("touch-self-{suffix}");
-        let target = key_id.clone();
-        let identity = register_identity(dir, &key_id).await;
-
-        let t1 = signed_claim(
-            &identity,
-            &key_id,
-            &target,
-            "occurrence",
-            ts("2026-07-01T00:00:00Z"),
-            SignerForm::SelfTouch,
-            cohort_scope::SELF,
-        )
-        .await;
+        let target = format!("touch-self-{suffix}");
+        let base = crate::federation::admission::truncate_to_substrate_resolution(Utc::now())
+            - chrono::Duration::days(10);
+        let (t0, t1, t2) = (
+            base - chrono::Duration::days(1),
+            base,
+            base + chrono::Duration::days(1),
+        );
+        let put = |at: DateTime<Utc>| {
+            let target = target.clone();
+            async move {
+                dir.put_touch_claim_local(&target, "occurrence", at, cohort_scope::SELF)
+                    .await
+                    .unwrap()
+            }
+        };
+        let floor = || {
+            let target = target.clone();
+            async move {
+                dir.freshness_floor(&target, "occurrence")
+                    .await
+                    .unwrap()
+                    .expect("row exists")
+                    .fresh_as_of
+            }
+        };
         assert_eq!(
-            dir.put_touch_claim(&t1).await.unwrap(),
+            put(t1).await,
             TouchApplyOutcome::Advanced,
             "fresh insert must advance"
         );
-        let stored = dir
-            .lookup_freshness_floor(&target, "occurrence")
-            .await
-            .unwrap()
-            .expect("row exists");
-        assert_eq!(stored.fresh_as_of, t1.fresh_as_of);
-
-        let t2 = signed_claim(
-            &identity,
-            &key_id,
-            &target,
-            "occurrence",
-            ts("2026-07-02T00:00:00Z"),
-            SignerForm::SelfTouch,
-            cohort_scope::SELF,
-        )
-        .await;
+        assert_eq!(floor().await, t1);
         assert_eq!(
-            dir.put_touch_claim(&t2).await.unwrap(),
+            put(t2).await,
             TouchApplyOutcome::Advanced,
             "strictly-greater fresh_as_of must advance"
         );
+        assert_eq!(floor().await, t2);
         assert_eq!(
-            dir.lookup_freshness_floor(&target, "occurrence")
-                .await
-                .unwrap()
-                .unwrap()
-                .fresh_as_of,
-            t2.fresh_as_of
-        );
-
-        let t0 = signed_claim(
-            &identity,
-            &key_id,
-            &target,
-            "occurrence",
-            ts("2026-06-15T00:00:00Z"),
-            SignerForm::SelfTouch,
-            cohort_scope::SELF,
-        )
-        .await;
-        assert_eq!(
-            dir.put_touch_claim(&t0).await.unwrap(),
+            put(t0).await,
             TouchApplyOutcome::NotFresher,
             "an OLDER fresh_as_of must be a no-op, never an error"
         );
         assert_eq!(
-            dir.lookup_freshness_floor(&target, "occurrence")
-                .await
-                .unwrap()
-                .unwrap()
-                .fresh_as_of,
-            t2.fresh_as_of,
+            floor().await,
+            t2,
             "the older no-op must not clobber the stored, fresher T2"
         );
-
         assert_eq!(
-            dir.put_touch_claim(&t2).await.unwrap(),
+            put(t2).await,
             TouchApplyOutcome::NotFresher,
             "re-putting the SAME fresh_as_of is NotFresher (strict > guard, equal never wins)"
         );
@@ -381,69 +356,18 @@ pub(crate) mod test_support {
     /// than [`crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW`] ahead
     /// of wall-clock `now()` is rejected: monotonic-max stops a claim from
     /// rolling the floor BACK, this guard stops a lying clock from jumping
-    /// it FORWARD past what any real touch could attest.
+    /// it FORWARD past what any real touch could attest. v62.0.0: through the
+    /// node-local write (P5b).
     pub(crate) async fn run_future_skew_rejection(dir: &dyn FederationDirectory, suffix: &str) {
-        let key_id = format!("touch-future-self-{suffix}");
-        let target = key_id.clone();
-        let identity = register_identity(dir, &key_id).await;
-
+        let target = format!("touch-future-self-{suffix}");
         let far_future = Utc::now() + chrono::Duration::hours(1);
-        let claim = signed_claim(
-            &identity,
-            &key_id,
-            &target,
-            "occurrence",
-            far_future,
-            SignerForm::SelfTouch,
-            cohort_scope::SELF,
-        )
-        .await;
         let err = dir
-            .put_touch_claim(&claim)
+            .put_touch_claim_local(&target, "occurrence", far_future, cohort_scope::SELF)
             .await
             .expect_err("fresh_as_of an hour in the future must be rejected (5m default skew)");
         assert_eq!(err.kind(), "federation_invalid_argument");
         assert!(
-            dir.lookup_freshness_floor(&target, "occurrence")
-                .await
-                .unwrap()
-                .is_none(),
-            "a rejected claim must not be written"
-        );
-    }
-
-    /// **`touch_claim_requires_valid_hybrid_signature`** — a forged
-    /// signature is rejected; the row stays untouched. Mirrors the
-    /// transport-destination forged-sig witness
-    /// ([`crate::federation::self_at_login::test_support::run_signed_transport_route_matrix`]).
-    pub(crate) async fn run_forged_signature_rejection(
-        dir: &dyn FederationDirectory,
-        suffix: &str,
-    ) {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-
-        let key_id = format!("touch-forged-self-{suffix}");
-        let target = key_id.clone();
-        let identity = register_identity(dir, &key_id).await;
-
-        let mut claim = signed_claim(
-            &identity,
-            &key_id,
-            &target,
-            "occurrence",
-            ts("2026-07-01T00:00:00Z"),
-            SignerForm::SelfTouch,
-            cohort_scope::SELF,
-        )
-        .await;
-        claim.signature.ed25519_signature_base64 = B64.encode([0u8; 64]);
-        let err = dir
-            .put_touch_claim(&claim)
-            .await
-            .expect_err("a forged signature must be rejected");
-        assert_eq!(err.kind(), "federation_signature_invalid");
-        assert!(
-            dir.lookup_freshness_floor(&target, "occurrence")
+            dir.freshness_floor(&target, "occurrence")
                 .await
                 .unwrap()
                 .is_none(),
@@ -454,195 +378,20 @@ pub(crate) mod test_support {
     /// **`touch_claim_cohort_scope_validated`** — a `cohort_scope` outside
     /// the closed set (`self` / `family` / `community` / `affiliations` /
     /// `species` / `biosphere` / `federation`) is rejected — the MANDATORY
-    /// privacy row (§4).
+    /// privacy row (§4). v62.0.0: through the node-local write (P5b).
     pub(crate) async fn run_cohort_scope_validation(dir: &dyn FederationDirectory, suffix: &str) {
-        let key_id = format!("touch-cohort-self-{suffix}");
-        let target = key_id.clone();
-        let identity = register_identity(dir, &key_id).await;
-
-        let claim = signed_claim(
-            &identity,
-            &key_id,
-            &target,
-            "occurrence",
-            ts("2026-07-01T00:00:00Z"),
-            SignerForm::SelfTouch,
-            "global", // not in the closed set — rejected
-        )
-        .await;
+        let target = format!("touch-cohort-self-{suffix}");
+        let at = Utc::now() - chrono::Duration::days(1);
         let err = dir
-            .put_touch_claim(&claim)
+            .put_touch_claim_local(&target, "occurrence", at, "global") // not in the closed set
             .await
             .expect_err("an invalid cohort_scope must be rejected");
         assert_eq!(err.kind(), "federation_cohort_scope_rejected");
         assert!(dir
-            .lookup_freshness_floor(&target, "occurrence")
+            .freshness_floor(&target, "occurrence")
             .await
             .unwrap()
             .is_none());
-    }
-
-    /// **Round-trip byte-exactness**: a real signed touch, once admitted,
-    /// reads back via `lookup_freshness_floor` byte-identical to what was
-    /// put (mirrors the #507b "the stored row IS the exact value re-served"
-    /// discipline the signed-wire-index planes carry).
-    pub(crate) async fn run_round_trip(dir: &dyn FederationDirectory, suffix: &str) {
-        let key_id = format!("touch-roundtrip-self-{suffix}");
-        let target = key_id.clone();
-        let identity = register_identity(dir, &key_id).await;
-
-        let claim = signed_claim(
-            &identity,
-            &key_id,
-            &target,
-            "canonical",
-            ts("2026-07-04T12:00:00Z"),
-            SignerForm::SelfTouch,
-            cohort_scope::FAMILY,
-        )
-        .await;
-        assert_eq!(
-            dir.put_touch_claim(&claim).await.unwrap(),
-            TouchApplyOutcome::Advanced
-        );
-        let stored = dir
-            .lookup_freshness_floor(&target, "canonical")
-            .await
-            .unwrap()
-            .expect("row exists");
-        assert_eq!(stored, claim, "round-trip must be byte-exact");
-    }
-
-    /// A `witness_touch` from an attester independent of the target is
-    /// admitted; a `witness_touch` claiming to BE the target it witnesses
-    /// is rejected (the opposite bar from `self_touch`).
-    pub(crate) async fn run_witness_touch_relationship(
-        dir: &dyn FederationDirectory,
-        suffix: &str,
-    ) {
-        let target_key_id = format!("touch-witnessed-{suffix}");
-        let witness_key_id = format!("touch-witness-{suffix}");
-        let witness = register_identity(dir, &witness_key_id).await;
-        // The target itself must also be a registered key for the
-        // self-vs-witness relationship check to have a subject.
-        register_identity(dir, &target_key_id).await;
-
-        let good = signed_claim(
-            &witness,
-            &witness_key_id,
-            &target_key_id,
-            "occurrence",
-            ts("2026-07-01T00:00:00Z"),
-            SignerForm::WitnessTouch,
-            cohort_scope::SELF,
-        )
-        .await;
-        assert_eq!(
-            dir.put_touch_claim(&good).await.unwrap(),
-            TouchApplyOutcome::Advanced,
-            "an independent witness must be admitted"
-        );
-
-        // A "witness_touch" that claims to BE its own target is rejected —
-        // a witness cannot be the thing it witnesses.
-        let self_as_witness = signed_claim(
-            &witness,
-            &witness_key_id,
-            &witness_key_id,
-            "occurrence",
-            ts("2026-07-01T00:00:00Z"),
-            SignerForm::WitnessTouch,
-            cohort_scope::SELF,
-        )
-        .await;
-        let err = dir
-            .put_touch_claim(&self_as_witness)
-            .await
-            .expect_err("witness_touch of one's own key must be rejected");
-        assert_eq!(err.kind(), "federation_signature_invalid");
-    }
-
-    /// v21.10.0 (CIRISPersist#519 b2) — the **NOfMCosigned tally**: a
-    /// NOfMCosigned touch with the primary attester + a real independent
-    /// co-signature (both over the same envelope, both registered, distinct
-    /// from the target) is admitted; the SAME touch with the co-signature set
-    /// absent, or with a forged co-signature, is REFUSED — so it is genuinely
-    /// >= 2-of-N, not the 1-of-1 it verified as before this cut.
-    pub(crate) async fn run_nofm_cosigned_tally(dir: &dyn FederationDirectory, suffix: &str) {
-        use super::TOUCH_COSIGNATURES_FIELD;
-        use ciris_verify_core::threshold::ThresholdSignature;
-        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
-
-        let target = format!("nofm-target-{suffix}");
-        let primary_id = format!("nofm-primary-{suffix}");
-        let cosigner_id = format!("nofm-cosigner-{suffix}");
-        register_identity(dir, &target).await;
-        let primary = register_identity(dir, &primary_id).await;
-        let cosigner = register_identity(dir, &cosigner_id).await;
-
-        // Primary builds + signs a NOfMCosigned touch (envelope has no
-        // cosignatures yet — they cannot be inside the bytes they sign).
-        let base = signed_claim(
-            &primary,
-            &primary_id,
-            &target,
-            "occurrence",
-            ts("2026-07-01T00:00:00Z"),
-            SignerForm::NOfMCosigned,
-            cohort_scope::SELF,
-        )
-        .await;
-
-        // The co-signer signs the SAME base envelope.
-        let (_e, cosig) =
-            produce_signed_identity_occurrence(&*cosigner, base.signed_envelope.clone())
-                .await
-                .expect("co-sign the touch envelope");
-        let cosig_ts = ThresholdSignature {
-            member_id: cosigner_id.clone(),
-            ed25519_signature_base64: cosig.ed25519_signature_base64.clone(),
-            mldsa65_signature_base64: cosig.mldsa65_signature_base64.clone(),
-        };
-        let attach = |claim: &SignedTouchClaim, sigs: serde_json::Value| -> SignedTouchClaim {
-            let mut env = claim.signed_envelope.clone();
-            env.as_object_mut()
-                .unwrap()
-                .insert(TOUCH_COSIGNATURES_FIELD.to_owned(), sigs);
-            SignedTouchClaim {
-                signed_envelope: env,
-                ..claim.clone()
-            }
-        };
-
-        // (a) missing co-signature set → refused.
-        let err = dir
-            .put_touch_claim(&base)
-            .await
-            .expect_err("NOfMCosigned without a co-signature set must be refused");
-        assert_eq!(err.kind(), "federation_signature_invalid");
-
-        // (b) a real independent co-signature → admitted.
-        let good = attach(&base, serde_json::json!([cosig_ts]));
-        assert_eq!(
-            dir.put_touch_claim(&good).await.unwrap(),
-            TouchApplyOutcome::Advanced,
-            "primary + a real independent co-signer must be admitted"
-        );
-
-        // (c) a FORGED co-signature (valid shape, wrong bytes) → refused.
-        let forged = attach(
-            &base,
-            serde_json::json!([{
-                "member_id": cosigner_id,
-                "ed25519_signature_base64": "AA",
-                "mldsa65_signature_base64": null,
-            }]),
-        );
-        let err = dir
-            .put_touch_claim(&forged)
-            .await
-            .expect_err("a forged co-signature must be refused");
-        assert_eq!(err.kind(), "federation_signature_invalid");
     }
 }
 

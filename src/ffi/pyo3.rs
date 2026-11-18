@@ -6450,14 +6450,16 @@ impl PyEngine {
     }
 
     /// v62.0.0 (wave P7; CC 3.1.5) — scrub a trace with persist's own scrubber and seal the scrubbed bytes as its `trace:complete:v1` row.
-    /// FFI mirror of [`crate::ingest::seal_trace_row`].
+    /// FFI mirror of [`crate::Engine::seal_trace`].
     ///
     /// `trace_json` is the trace as the agent produced it; `trace_level` the
     /// level to scrub and seal at (`generic` | `detailed` | `full_traces`; it
     /// must equal the trace's own `trace_level` member when that is present).
     /// Persist drops the signature members, runs its scrubber at that level
     /// and hashes and signs ONLY the scrubber's output, so an unscrubbed trace
-    /// cannot be sealed through this door. Returns `(statement, trace_blob)`:
+    /// cannot be sealed through this door. A `self` / `family` trace is
+    /// SEALED first (`Engine::seal_trace`, option A): the returned blob is the
+    /// at-rest envelope, and the row names its digest. Returns `(statement, trace_blob)`:
     /// send both in the batch event (`"statement"` = base64(statement),
     /// `"trace_blob"` = base64(trace_blob), no inline `"trace"`), and store or
     /// serve `trace_blob` exactly as returned. The row is signed by this
@@ -6485,17 +6487,26 @@ impl PyEngine {
                     "trace_level {trace_level:?} is not generic | detailed | full_traces"
                 ))
             })?;
-            let signer = self.local_signer.clone().ok_or_else(|| {
-                PyValueError::new_err(
+            if self.local_signer.is_none() {
+                return Err(PyValueError::new_err(
                     "no local signing key configured (pass local_key_id + local_key_path \
                      to the Engine constructor)",
-                )
-            })?;
+                ));
+            }
+            // v62.0.0 (option A) — through the Engine: a self/family trace is
+            // sealed (put_blob_scoped) before its row is signed.
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
             let sealed = py.detach(move || {
-                runtime.block_on(async move {
-                    crate::ingest::seal_trace_row(&signer, &trace, level).await
-                })
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move { engine.seal_trace(&trace, level).await })
             });
             let sealed = sealed.map_err(|e| ingest_err_to_py(e, "seal_trace_statement"))?;
             Ok((
@@ -11233,7 +11244,9 @@ impl PyEngine {
     /// `prior_head_digest_sha256_hex?`, `signed_at`, `witness_key_id`,
     /// `signature_classical`, `signature_pqc`). Returns the typed outcome as
     /// JSON: `{"outcome": "inserted" | "unchanged" | "held_for_unknown_head" |
-    /// "refused", "reason"?: <rule>}`. Nothing is ever deleted.
+    /// "kept_not_counted" | "refused", "reason"?: <rule>}` (v62.0.0, CC 2.7
+    /// rc21 item 15: a cosign whose rule reads other rows is kept and does
+    /// not count). Nothing is ever deleted.
     fn put_lineage_head_cosign_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
@@ -29132,7 +29145,7 @@ impl PyEngine {
     // The working index over owner-serialized ledgers: L1 registration
     // (one ledger per (identity, unit, standard_version) triple — the id
     // is DERIVED, never caller-chosen), L4 head bookkeeping (forward-only;
-    // a differing hash at the stored seq refuses as fork-shaped), L5
+    // a differing hash at the stored seq is contested, v62 X4), L5
     // checkpoints (immutable — a witnessed fact pins, never flips), L2/L6
     // entry-range pointers, L8 fork-evidence records (detection records,
     // adjudication punishes — a fork NEVER fires slashing from here).
@@ -29205,9 +29218,10 @@ impl PyEngine {
     }
 
     /// CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome
-    /// (`"advanced"` / `"unchanged"` / `"stale"`); a DIFFERENT hash at the
-    /// stored seq raises `Conflict` (the fork shape — assemble evidence
-    /// with `ledger_detect_double_head` and record it, per L8).
+    /// (`"advanced"` / `"unchanged"` / `"stale"` / `"contested"`); a DIFFERENT
+    /// hash at the stored seq is `"contested"` (v62.0.0, CC 2.7 rc21 X4: both
+    /// heads kept as fork evidence, neither concludes, the stored head is
+    /// cleared, and every later advance answers `"contested"`).
     #[cfg(feature = "ledgers")]
     #[pyo3(signature = (ledger_id, seq, head_hash, witness_anchor_ref=None, source_envelope_ref=None))]
     fn ledger_advance_head(
@@ -36460,11 +36474,17 @@ mod tests {
     }
 
     /// v39.0.0 — the cohabitation path (a PyEngine reconstructing a
-    /// hybrid-capable Engine over the shared backend) crosses a row this node
+    /// signing Engine over the shared backend) crosses a row this node
     /// authored: the node signs AS THE ACTOR, over the same bytes.
+    ///
+    /// v62.0.0 (JSON cut, E7) — the node's key is the edition-2 record its
+    /// self-registration writes (an identity-ref, not the earlier derived
+    /// id), and the crossed row carries the node's composite statement
+    /// (the earlier separate Ed25519 / ML-DSA-65 scrub columns and the JCS
+    /// content hash are no longer asserted).
     #[cfg(feature = "sqlite")]
     #[test]
-    fn enter_mesh_via_cohab_reconstruction_hybrid_signs() {
+    fn enter_mesh_via_cohab_reconstruction_signs_as_the_actor() {
         use crate::federation::{
             crossing, CrossingBasis, FederationDirectory, MeshCrossingOutcome,
         };
@@ -36486,8 +36506,6 @@ mod tests {
                 Some(Arc::new(pqc)),
                 Some("promote-pqc".to_string()),
             ));
-            let derived = local.derived_key_id();
-            assert_ne!(derived, "occ", "derived id differs from the alias");
             let signer: Arc<dyn HardwareSigner> = Arc::new(
                 crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
             );
@@ -36502,7 +36520,11 @@ mod tests {
                 .register_self_federation_key("steward", None, None)
                 .await
                 .expect("register self");
-            assert_eq!(registered, derived);
+            assert!(
+                crate::federation::edition2::fixture_switch::is_kid(&registered),
+                "the node's key id is an identity-ref: {registered}"
+            );
+            let derived = registered.clone();
             let att_id = sq
                 .attestation_upsert_local(crate::federation::types::LocalAttestationInput {
                     attestation_id: None,
@@ -36513,7 +36535,8 @@ mod tests {
                     expires_at: None,
                     attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
                         serde_json::json!({
-                            "id": "att-1", "dimension": "identity_binding:v1",
+                            "id": "att-1",
+                            "dimension": "evidence:safety_battery:capture:a:b:v1",
                             "score": 1.0, "confidence": 0.9,
                         }),
                     )
@@ -36553,14 +36576,10 @@ mod tests {
                 crate::federation::types::attestation_tier::FEDERATION
             );
             assert_eq!(row.scrub_key_id, derived, "the node signed AS THE ACTOR");
-            assert!(!row.scrub_signature_classical.is_empty(), "Ed25519 signed");
             assert!(
-                row.scrub_signature_pqc
-                    .as_deref()
-                    .is_some_and(|s| !s.is_empty()),
-                "ML-DSA-65 signed (synchronous hybrid)"
+                crate::federation::edition2::fixture_switch::carried_statement(&row).is_some(),
+                "the crossed row carries the node's composite statement"
             );
-            assert_eq!(row.original_content_hash.len(), 64);
         });
     }
 
@@ -38633,137 +38652,17 @@ fn install_panic_logger() -> bool {
 
 // ─── CIRISPersist#735 — the FFI canonicalization parity witness ─────────
 
-/// v37.0.0 (CIRISPersist#735) — **the FFI signing/verifying surface must mint
-/// and rebuild the bytes the Rust gates rebuild.**
-///
-/// This is the THIRD instance of the #714 / #716 class (`#714` →
-/// `canonicalize_envelope_for_signing`, fixed v35.0.0 `060b8e9`; `#716` →
-/// `canonicalize_for_edge_signing`, flipping in v37.0.0; this → the PyO3
-/// cold-path PQC signer and the PyO3 `verify_signed_*` rebuild). Every
-/// instance was found while fixing the previous one, so the witness is
-/// written to fail for the whole class, not for one address.
-///
-/// # Why an ASCII test proves nothing here
-///
-/// `PythonJsonDumpsCanonicalizer` and `ceg_produce_canonicalize` (RFC 8785
-/// JCS at the current produce epoch) agree **byte-for-byte** on the
-/// structured-ASCII shapes persist's own envelopes usually carry — key_ids,
-/// SHA-256 hex, ISO stamps, base64. That agreement is exactly why this defect
-/// survived from the v4.15.0 produce flip to v37.0.0 with a green suite. So
-/// every assertion below runs on a corpus that is pinned to DIVERGE
-/// (`the_divergent_corpus_actually_diverges`), and the parity assertions are
-/// paired with that pin so a future reader can tell the witness is
-/// load-bearing rather than vacuous.
-///
-/// `blobs.rs`'s `put_blob_signing_canonicalizer_identity_holding_claim_envelope`
-/// and `pipeline.rs`'s edge-signing pins record the ASCII-AGREEMENT property;
-/// this module is deliberately their mirror image.
-#[cfg(test)]
-mod canonicalizer_parity_735 {
-    // Deliberately NO `use super::*`: every reference to the two functions
-    // under test is spelled `super::` at the call site, so a reader can see
-    // which module's rule is being pinned without resolving a glob.
-    use crate::verify::canonical::{ceg_produce_canonicalize, Canonicalizer};
-    use crate::verify::PythonJsonDumpsCanonicalizer;
-
-    /// Envelopes on which the two canonicalization rules DISAGREE, in the two
-    /// ways they can: raw UTF-8 vs `\uXXXX` escapes, and wire float tokens
-    /// vs ECMAScript number serialization.
-    ///
-    /// These are not synthetic. `family_name`, `reason` and `policy_blob` all
-    /// reach federation signed bytes and nothing on any write path enforces
-    /// ASCII, so a multilingual mesh mints these envelopes as a matter of
-    /// course.
-    fn divergent_corpus() -> Vec<serde_json::Value> {
-        vec![
-            // Non-ASCII on the fields that genuinely reach a signed envelope.
-            serde_json::json!({
-                "family_name": "家族",
-                "reason": "révocation — clé compromise",
-                "purpose": "⚠️ federation registration",
-            }),
-            // A policy_blob carrying non-ASCII nested below the top level:
-            // the divergence is not a top-level-only property.
-            serde_json::json!({
-                "policy_blob": {"note": "h\u{00e9}llo", "tier": "commons"},
-                "kind": "registration",
-            }),
-            // Non-ES float tokens. `1e-05` and the long decimal are preserved
-            // verbatim by serde_json's arbitrary_precision parse and
-            // re-serialized per ECMAScript rules by JCS — unicode is not the
-            // only axis (this is the shape #714's commit message calls out).
-            serde_json::from_str::<serde_json::Value>(
-                r#"{"cost_usd":0.0031992000000000006,"score":1e-05,"kind":"attestation"}"#,
-            )
-            .expect("wire float fixture parses"),
-        ]
-    }
-
-    /// **The anti-vacuity pin.** Every other test in this module asserts
-    /// PARITY between two rules; on an all-ASCII corpus those assertions pass
-    /// against the *unfixed* code and prove nothing (feedback: a check that
-    /// cannot fail is a report). This test asserts the corpus actually
-    /// exercises the V1/V2 divergence, so a later "simplification" of the
-    /// fixtures to ASCII reds HERE rather than silently disarming the module.
-    #[test]
-    fn the_divergent_corpus_actually_diverges() {
-        for env in divergent_corpus() {
-            let v1 = PythonJsonDumpsCanonicalizer
-                .canonicalize_value(&env)
-                .expect("v1 canonicalize");
-            let jcs = ceg_produce_canonicalize(&env).expect("jcs canonicalize");
-            assert_ne!(
-                v1, jcs,
-                "fixture must exercise the V1/V2 divergence — an all-agreeing \
-                 corpus makes every parity assertion in this module vacuous: {env}"
-            );
-        }
-    }
-
-    /// **CIRISPersist#735 — the FFI verify side rebuilds the gate's bytes.**
-    ///
-    /// `canonicalize_envelope_value` feeds `verify_signed_key_record`,
-    /// `verify_signed_attestation` and `verify_signed_revocation` — the
-    /// verify-without-storing primitive a peer uses for dry-runs and
-    /// trust-graph audits. Its Rust twins (`register::verify_key_registration`,
-    /// `admission.rs`'s accord quorum, `operational.rs`'s scrub verifies) all
-    /// rebuild with `ceg_produce_canonicalize`.
-    ///
-    /// While it hand-built the V1 rule, a peer's dry-run said VERIFIED about a
-    /// non-ASCII envelope that every write door refuses — a false green in
-    /// front of a closed door, which is worse than a red.
-    ///
-    /// Note the ABSENCE of a signature strip on both sides: these envelopes
-    /// carry their signature in row columns, so the twins canonicalize whole.
-    #[test]
-    fn canonicalize_envelope_value_is_the_produce_gate() {
-        for env in divergent_corpus() {
-            let ffi = super::canonicalize_envelope_value(&env).expect("ffi canonicalize");
-            let gate = ceg_produce_canonicalize(&env).expect("gate canonicalize");
-            assert_eq!(
-                String::from_utf8_lossy(&ffi),
-                String::from_utf8_lossy(&gate),
-                "the FFI verify side must rebuild the bytes the Rust twins rebuild \
-                 — CIRISPersist#735: {env}"
-            );
-            let v1 = PythonJsonDumpsCanonicalizer
-                .canonicalize_value(&env)
-                .expect("v1 canonicalize");
-            assert_ne!(
-                ffi, v1,
-                "and must NOT be the V1 rule on a divergent envelope — otherwise \
-                 this assertion is vacuous: {env}"
-            );
-        }
-    }
-}
+// v62.0.0 (JSON cut, E7) — `mod canonicalizer_parity_735` is deleted: its
+// one parity test pinned the FFI verify side of the earlier-form signed
+// objects (`verify_signed_key_record` / `_attestation` / `_revocation`) to the
+// JCS produce gate, and its corpus pin existed only to keep that test honest.
 
 // ─── the #714 / #716 / #735 class, instance FIVE — the verify_trace gate ────
 
 /// v37.0.0 — **`Engine.verify_trace` and `receive_and_persist` must return the
 /// SAME answer about the same trace.**
 ///
-/// The FIFTH instance of the class documented on [`canonicalizer_parity_735`]
+/// The FIFTH instance of the class documented on `canonicalizer_parity_735`
 /// (#714 → #716 → #735 → `Engine::register_self_federation_key` →
 /// here). Instances 1–4 were *produce*-side: bytes minted under one rule and
 /// rebuilt under another. This one is *verify*-side and worse in a specific

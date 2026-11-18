@@ -369,10 +369,20 @@ pub(crate) async fn body(d: &dyn crate::federation::FederationDirectory) {
             halt(&key(3), "halt-dedup", 0x23, 2_500_000, 3_500_000),
         ),
     ] {
-        let e = put_invocation(d, &st, Some(genesis)).await.unwrap_err();
+        // v62.0.0 (wave GC4; CC 2.7.2, 2.7.3) — a replay is KEPT and
+        // concludes nothing (held `accord_invocation_replayed`), never
+        // refused; it does not latch.
+        let out = put_invocation(d, &st, Some(genesis))
+            .await
+            .unwrap_or_else(|e| panic!("I2104 {why}: held, not refused: {e:?}"));
+        assert!(out.held && !out.latched, "I2104 {why}: held, no latch");
         assert_eq!(
-            reason(&e),
-            malformed_row::ACCORD_INVOCATION_REPLAYED,
+            super::fold::why_held(d, &super::names::RowId(*out.invocation.row_id()))
+                .await
+                .unwrap()
+                .map(|h| h.reason)
+                .as_deref(),
+            Some(malformed_row::ACCORD_INVOCATION_REPLAYED),
             "I2104 {why}"
         );
     }
@@ -384,6 +394,124 @@ pub(crate) async fn body(d: &dyn crate::federation::FederationDirectory) {
     )
     .await
     .expect("I2104 after valid_until");
+}
+
+/// **I3790 / I3791 (wave GC4; CC 2.7.2 "one set, one answer", CC 2.7.3)** —
+/// the invocation replay is a FOLD, not a refusal, and its answer does not
+/// depend on arrival order. Two constitutional halts of one accord share a
+/// `nonce`; `early` is asserted first and `late` within `early`'s
+/// `valid_until`.
+///
+/// - I3790, `early` then `late`: `late` is HELD (kept, no latch, reason
+///   `accord_invocation_replayed`); `early` is counted and is the active halt.
+/// - I3791, `late` then `early` (another nonce): `late` is counted and
+///   latches first; `early`'s arrival UN-concludes it (held, reason
+///   `accord_invocation_replayed`, its latch cleared) and `early` is the
+///   active halt — the same standing as I3790.
+///
+/// Mutation targets: the rank comparison in `replay_fold`, the
+/// `clear_active_halt` of a row that becomes a replay.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) async fn replay_order_body(d: &dyn crate::federation::FederationDirectory) {
+    use super::fold::{reason, why_held};
+    use super::halt::put_invocation;
+    use super::names::RowId;
+    let v = vectors();
+    let rs = rosters(&v);
+    let genesis = &rs["genesis"];
+    let b1 = key(2);
+    let c1 = key(3);
+    let held_reason =
+        |row: RowId| async move { why_held(d, &row).await.unwrap().map(|h| h.reason) };
+    let active = || async {
+        d.get_active_halt(ACCORD)
+            .await
+            .unwrap()
+            .map(|h| h.active_halt_id)
+    };
+
+    // I3790: early, then late.
+    let early = halt(&b1, "gc4-early-1", 0x31, 5_000_000, 6_000_000);
+    let late = halt(&c1, "gc4-late-1", 0x31, 5_500_000, 6_500_000);
+    let e = put_invocation(d, &early, Some(genesis))
+        .await
+        .expect("I3790 early");
+    assert!(!e.held && e.latched, "I3790: early counts and latches");
+    let l = put_invocation(d, &late, Some(genesis))
+        .await
+        .expect("I3790: a replay is held, never refused");
+    assert!(l.new && l.held && !l.latched, "I3790: late is held: {l:?}");
+    let (e_id, l_id) = (RowId(*e.invocation.row_id()), RowId(*l.invocation.row_id()));
+    assert_eq!(
+        held_reason(l_id).await.as_deref(),
+        Some(reason::ACCORD_INVOCATION_REPLAYED),
+        "I3790"
+    );
+    assert_eq!(held_reason(e_id).await, None, "I3790: early concludes");
+    assert_eq!(
+        active().await,
+        Some(e_id.hex()),
+        "I3790: early is the active halt"
+    );
+
+    // I3791: late, then early.
+    let early = halt(&b1, "gc4-early-2", 0x41, 7_000_000, 8_000_000);
+    let late = halt(&c1, "gc4-late-2", 0x41, 7_500_000, 8_500_000);
+    let l = put_invocation(d, &late, Some(genesis))
+        .await
+        .expect("I3791 late");
+    assert!(
+        !l.held && l.latched,
+        "I3791: alone, late counts and latches"
+    );
+    let l_id = RowId(*l.invocation.row_id());
+    assert_eq!(active().await, Some(l_id.hex()), "I3791: late latched");
+    let e = put_invocation(d, &early, Some(genesis))
+        .await
+        .expect("I3791 early");
+    let e_id = RowId(*e.invocation.row_id());
+    assert!(!e.held && e.latched, "I3791: early counts and latches");
+    assert_eq!(
+        held_reason(l_id).await.as_deref(),
+        Some(reason::ACCORD_INVOCATION_REPLAYED),
+        "I3791: late is UN-concluded by early's arrival"
+    );
+    assert_eq!(held_reason(e_id).await, None, "I3791: early concludes");
+    assert_eq!(
+        active().await,
+        Some(e_id.hex()),
+        "I3791: the same active halt as I3790's order"
+    );
+    // A re-offer of the replay changes nothing.
+    let again = put_invocation(d, &late, Some(genesis))
+        .await
+        .expect("I3791 re-offer");
+    assert!(!again.new && again.held, "I3791: still held");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3790_i3791_replay_order_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(replay_order_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3790_i3791_replay_order_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(replay_order_body(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]

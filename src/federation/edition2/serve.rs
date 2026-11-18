@@ -15,9 +15,11 @@
 //!   served. (Stricter than the JSON read: the tombstone's
 //!   accountability-record and person-subject voids are not granted here; a
 //!   withheld void is a row a peer re-fetches from a node that grants it.)
-//! - **about the requester** (v62.0.0, wave T1): a row whose subject
-//!   (`attested_key_id`) or a `subject_key_ids` entry is the requester, or a
-//!   principal of it, is served to it: an invitee its own invitation;
+//! - **the delivered key** (v62.0.0, wave T1; CC 2.1): the audience is the
+//!   members at the head plus the key the family delivers the row to (a
+//!   membership proposal's invitee, a key grant's recipient, the owner's own
+//!   node on an owner-binding), so an invitee is served its invitation. No
+//!   blanket rule serves a row to every key it names;
 //! - **audience** ("never serve what the requester is not party to"): a
 //!   commons row (`federation` / `species` / `biosphere`) is served to
 //!   anyone; a `self` / `family` / room (`community`, `affiliations`) row
@@ -136,14 +138,16 @@ where
     {
         return Ok(false);
     }
-    // v62.0.0 (wave T1) — a row ABOUT the requester (its subject, or an
-    // invitee it names in `subject_key_ids`) is served to it: an invitee is
-    // not a member yet, but its invitation is about it, and its node must be
-    // able to answer it (CC 3.1.3.2).
+    // v62.0.0 (wave T1; CC 2.1, "whom a targeted row may name") — the
+    // audience is the members at the head PLUS the key the family delivers
+    // the row to: a membership proposal's invitee, a key grant's recipient,
+    // the owner's own node on an owner-binding. An invitation delivered to
+    // the invitee's key reaches the invitee before it joins. A row merely
+    // ABOUT a key gets no such reach: a named subject is within the audience
+    // by the admission rule (`subject_outside_audience`), so the audience
+    // rule below serves it.
     if let Some(peer) = requester {
-        let named = std::iter::once(row.attested_key_id.as_str())
-            .chain(row.subject_key_ids.iter().map(String::as_str));
-        if super::group_serve::names_the_requester(dir, named, peer).await? {
+        if super::group_serve::delivered_to_requester(dir, &row, peer).await? {
             return Ok(true);
         }
     }

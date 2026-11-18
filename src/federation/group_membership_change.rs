@@ -27,6 +27,8 @@ use ciris_verify_core::accord_genesis::{
 use ciris_verify_core::threshold::{Role, ThresholdMember};
 use serde_json::{json, Value};
 
+use super::edition2::fold as e2fold;
+
 /// The v22 default `consensus_protocol` of a prior envelope that names none.
 const ACCORD_CONSENSUS_PROTOCOL: &str = "quorum:2/3";
 
@@ -106,6 +108,12 @@ fn reject_duplicate_member_keys(members: &[ThresholdMember]) -> Result<(), Accor
 
 /// Resolve member `key_id`s to their pinned entries, in order; a missing one
 /// is [`AccordGenesisError::MemberNotInDirectory`].
+///
+/// v62.0.0 (wave GC8; CC 2.7.3) — a member is not the signer: its key
+/// record is another row. Each member is declared read, and a missing one
+/// marks the running fold attempt `member_not_in_directory` (the row is
+/// held and re-folds when the record lands); outside an attempt it is the
+/// refusal it was.
 fn resolve_members(
     member_ids: &[String],
     directory: &[ThresholdMember],
@@ -113,12 +121,16 @@ fn resolve_members(
     member_ids
         .iter()
         .map(|key_id| {
+            e2fold::reads(e2fold::Dep::key(key_id));
             directory
                 .iter()
                 .find(|m| &m.member_id == key_id)
                 .cloned()
-                .ok_or(AccordGenesisError::MemberNotInDirectory {
-                    key_id: key_id.clone(),
+                .ok_or_else(|| {
+                    e2fold::note(e2fold::reason::gc8::MEMBER_NOT_IN_DIRECTORY);
+                    AccordGenesisError::MemberNotInDirectory {
+                        key_id: key_id.clone(),
+                    }
                 })
         })
         .collect()
@@ -198,9 +210,20 @@ pub fn validate_membership_change_structure(
     let _new_threshold = quorum_threshold_from_envelope(new_envelope)?;
 
     let new_roster = resolve_members(&new_ids, directory)?;
-    reject_duplicate_member_keys(&new_roster)?;
+    // v62.0.0 (wave GC8) — two members sharing a key is read from their HELD
+    // key records: a fold condition.
+    reject_duplicate_member_keys(&new_roster).inspect_err(|_| {
+        e2fold::note(e2fold::reason::gc8::DUPLICATE_FOUNDER_KEY);
+    })?;
 
+    // v62.0.0 (wave GC8; CC 2.7.3) — the three checks below compare with the
+    // PRIOR envelope, the held head: each is a fold condition
+    // (`prior_roster_mismatch`), re-folded when the group's head changes.
+    if let Some(g) = prior_envelope.get("family_key_id").and_then(Value::as_str) {
+        e2fold::reads(e2fold::Dep::key(g));
+    }
     if new_envelope.get("family_key_id") != prior_envelope.get("family_key_id") {
+        e2fold::note(e2fold::reason::gc8::PRIOR_ROSTER_MISMATCH);
         return Err(AccordGenesisError::MalformedEnvelope {
             detail: "membership change must keep the same family_key_id".to_string(),
         });
@@ -210,6 +233,7 @@ pub fn validate_membership_change_structure(
     let new_entrenched =
         new_envelope.get("consensus_protocol_entrenched") == Some(&Value::Bool(true));
     if prior_entrenched && !new_entrenched {
+        e2fold::note(e2fold::reason::gc8::PRIOR_ROSTER_MISMATCH);
         return Err(AccordGenesisError::MalformedEnvelope {
             detail: "membership change must not lift consensus_protocol_entrenched".to_string(),
         });
@@ -230,6 +254,7 @@ pub fn validate_membership_change_structure(
         })
         .unwrap_or_default();
     if claimed_prior != envelope_member_key_ids(prior_envelope)? {
+        e2fold::note(e2fold::reason::gc8::PRIOR_ROSTER_MISMATCH);
         return Err(AccordGenesisError::MalformedEnvelope {
             detail: "supersedes.prior_member_key_ids does not match the prior group".to_string(),
         });

@@ -46,9 +46,10 @@
 //!   is at `self` (its author's own hosts only), a counted unit at whatever
 //!   scope its signers chose. No special case.
 //!
-//! - **a statement about the requester** (its `sub`, or an invitee in its
-//!   `subject_key_ids`) is served to it, as a row about it is
-//!   ([`names_the_requester`]): an invitee its own invitation.
+//! - **no blanket "about the requester" rule** (CC 2.1): a statement that
+//!   merely names a key is served by its scope rule like any other; the
+//!   delivered key (an invitee, a grant recipient, an owner-binding's node)
+//!   is the row path's ([`delivered_to_requester`]).
 //!
 //! Anonymous reads (no requester) are served the commons only, as before.
 
@@ -115,18 +116,6 @@ where
     let Some(iss) = iss else {
         return Ok(false);
     };
-    // A statement ABOUT the requester (its `sub`, or an invitee in its
-    // `subject_key_ids`) is served to it, as for a row.
-    if let Some(peer) = requester {
-        let subjects: Vec<&str> = payload
-            .get_text("subject_key_ids")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_text).collect())
-            .unwrap_or_default();
-        if names_the_requester(dir, sub.into_iter().chain(subjects), peer).await? {
-            return Ok(true);
-        }
-    }
     scope_servable(dir, iss, &payload, requester).await
 }
 
@@ -270,31 +259,54 @@ where
     Ok(principals.iter().any(|p| party.contains(p)))
 }
 
-/// v62.0.0 (wave T1) — **is the requester one of `named`** (a row's
-/// subject, an invitee it names)? The requester itself, or a principal it
-/// acts for (`self_collective::principals_of`: a node's owner, an
-/// occurrence's identity): an invitee's node is served the invitation about
-/// its person. Empty names never match.
+/// v62.0.0 (wave T1; CC 2.1, "whom a targeted row may name") — **the keys
+/// a row's family DELIVERS it to**, beyond the members at its head: a
+/// membership proposal's invitee (`subject_key_ids`), a key grant's recipient
+/// (`attested_key_id`), the owner's own node on an owner-binding (the bound
+/// device). Empty for every other row: a row about a key reaches it only
+/// through the audience rule.
+#[must_use]
+pub fn delivered_keys(row: &crate::federation::types::Attestation) -> Vec<String> {
+    use crate::federation::membership_acceptance::{membership_row, MembershipRow};
+    if membership_row(row) == Some(MembershipRow::Proposal) {
+        return row.subject_key_ids.clone();
+    }
+    if crate::federation::key_grant::is_key_grant_row(row) {
+        return vec![row.attested_key_id.clone()];
+    }
+    if let Some((_owner, node)) = crate::federation::owner_binding_of(row) {
+        return vec![node];
+    }
+    Vec::new()
+}
+
+/// **Is `row` delivered to the requester?** The requester is one of
+/// [`delivered_keys`], or a principal it acts for
+/// (`self_collective::principals_of`: an invitee's node is served the
+/// invitation delivered to its person).
 ///
 /// # Errors
 /// Directory reads.
-pub async fn names_the_requester<'a, F>(
+pub async fn delivered_to_requester<F>(
     dir: &F,
-    named: impl Iterator<Item = &'a str>,
+    row: &crate::federation::types::Attestation,
     peer: &str,
 ) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let named: BTreeSet<&str> = named.filter(|n| !n.is_empty()).collect();
-    if named.is_empty() {
+    let delivered: BTreeSet<String> = delivered_keys(row)
+        .into_iter()
+        .filter(|k| !k.is_empty())
+        .collect();
+    if delivered.is_empty() {
         return Ok(false);
     }
-    if named.contains(peer) {
+    if delivered.contains(peer) {
         return Ok(true);
     }
     let principals = crate::federation::self_collective::principals_of(dir, peer).await?;
-    Ok(principals.iter().any(|p| named.contains(p.as_str())))
+    Ok(principals.iter().any(|p| delivered.contains(p)))
 }
 
 /// Any other statement-only row: the scope its payload states. `self` (and

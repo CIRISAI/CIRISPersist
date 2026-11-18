@@ -32,6 +32,7 @@
 //!   the axis is not mis-built: nothing emitted, the ledger cleared.
 
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::epoch_minter_invariants::bodies::Pick;
     use crate::federation::key_grant::{
         emit_dirty_axes, is_key_grant_row, misbuilt_axis_state, KeyGrantAxis, KeyGrantRow,
@@ -169,14 +170,18 @@ pub(crate) mod bodies {
         use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
         use crate::federation::types::identity_type::USER;
         let p = pair(dsn_a, dsn_b, run, pick, "i763").await;
-        let fam = format!("i763-fam-{run}");
-        ts::register_hybrid_key_as(p.sa.as_ref(), &fam, &fam, USER).await;
-        p.sa.put_family(ts::sign_family(
-            &fam,
+        // v62.0.0 (flip wave 2, T1.api §3) — the family is an edition-2
+        // `group:roster` version: its key and every listed member are live
+        // edition-2 keys, and the typed row lands through the voices
+        // (`e2::family_voices`), keyed by identity-refs.
+        let fam_seed = format!("i763-fam-{run}");
+        let fam = e2::put_key(p.sa.as_ref(), &fam_seed, &[USER]).await;
+        let signed = ts::sign_family(
+            &fam_seed,
             crate::federation::types::Family {
                 prev_head_digest: String::new(),
                 charter_digest: String::new(),
-                family_key_id: fam.clone(),
+                family_key_id: fam_seed.clone(),
                 family_name: "I763 Household".into(),
                 members: vec![crate::federation::types::FamilyMember {
                     key_id: p.owner.clone(),
@@ -190,9 +195,11 @@ pub(crate) mod bodies {
                 dissolved_at: None,
                 persist_row_hash: String::new(),
             },
-        ))
-        .await
-        .expect("I763: seed the family");
+        );
+        let at_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after 1970");
+        e2::put_voices(p.sa.as_ref(), &e2::family_voices(&signed, 1, None, at_ms))
+            .await
+            .expect("I763: seed the family");
         let sealed = encrypt_and_cascade(
             p.sa.as_ref(),
             FAMILY,
@@ -286,46 +293,6 @@ pub(crate) mod bodies {
         );
         // (3) The real loop builds the right axis: emitted, then cleared.
         loop_reaches_the_second_device(&p, &sha, SELF, &p.owner, "I764 (3)").await;
-    }
-
-    /// **I765** — see the module doc.
-    pub(crate) async fn i765_a_legacy_v2_chunk_zero_reaches_the_owners_second_device<B>(
-        dsn_a: &str,
-        dsn_b: &str,
-        run: &str,
-        pick: Pick<B>,
-    ) where
-        B: BlobStorage + FederationDirectory + Sync + 'static,
-    {
-        let p = pair(dsn_a, dsn_b, run, pick, "i765").await;
-        let stream = format!("i765-{run}");
-        let segs: Vec<Vec<u8>> = (0..3).map(|i| vec![i as u8 + 1; 90]).collect();
-        let dag = crate::federation::chunk_dag_cascade::test_support::write_legacy_v2_dag(
-            &p.a,
-            p.sa.as_ref(),
-            SELF,
-            &p.owner,
-            &stream,
-            &segs,
-            None,
-        )
-        .await
-        .expect("I765: the v52 writer");
-        let chunk0 = dag.chunk_sha256[0];
-        p.a.emit_pending_key_grants()
-            .await
-            .expect("I765: the dirty loop");
-        assert_eq!(
-            content_rows_to(p.sa.as_ref(), &p.key_a, &chunk0, &p.key_b)
-                .await
-                .len(),
-            1,
-            "I765: chunk 0's content row reached the second device through the dirty loop"
-        );
-        assert!(
-            !dirty(p.sa.as_ref(), &p.key_a, &chunk0).await,
-            "I765: chunk 0's ledger cleared after its row"
-        );
     }
 
     /// **I766** — see the module doc.
@@ -438,17 +405,6 @@ pub(crate) mod bodies {
                 async fn i766() {
                     let Some((a, b)) = $dsn else { return };
                     i766_a_legitimate_withholding_still_clears(&a, &b, &run(), $pick).await
-                }
-                #[tokio::test]
-                async fn i765() {
-                    let Some((a, b)) = $dsn else { return };
-                    i765_a_legacy_v2_chunk_zero_reaches_the_owners_second_device(
-                        &a,
-                        &b,
-                        &run(),
-                        $pick,
-                    )
-                    .await
                 }
             }
         };

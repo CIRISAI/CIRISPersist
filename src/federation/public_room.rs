@@ -32,6 +32,7 @@
 //!    nodes must not disagree about which rows exist, so the door admits an
 //!    authorized row and the fold picks the room's one live listing.
 
+use super::edition2::fold::{self, reason, Dep};
 use super::types::{attestation_type, cohort_scope as cs};
 use super::{Attestation, Community, Error, FederationDirectory};
 
@@ -154,26 +155,53 @@ pub async fn check_public_room_conformance(
             ),
         ));
     }
+    // v62.0.0 (wave GC6; CC 2.7.3) — the rules above read the version's own
+    // bytes (refused); this one reads the HELD head: a fold. Declared, and a
+    // crossing is held with its token, re-folded when the head changes.
+    fold::reads(Dep::key(&community.community_key_id));
     if let Some(stored) = directory
         .lookup_community(&community.community_key_id)
         .await?
     {
         if is_public_community(&stored) != is_public_community(community) {
-            return Err(violation(
-                community,
-                PUBLIC_RULE_SUBKIND_CROSSES_PUBLIC,
-                format!(
-                    "the stored record is {:?} and this version is {:?}: a room's tier is fixed \
-                     at founding across the `public` boundary — content already written is \
-                     plaintext to everyone, or sealed to a roster that never consented to \
-                     publication",
-                    super::community_subkind(&stored),
-                    super::community_subkind(community)
+            return Err(fold::hold(
+                reason::PUBLIC_SUBKIND_CHANGED,
+                violation(
+                    community,
+                    PUBLIC_RULE_SUBKIND_CROSSES_PUBLIC,
+                    format!(
+                        "the stored record is {:?} and this version is {:?}: a room's tier is \
+                         fixed at founding across the `public` boundary — content already \
+                         written is plaintext to everyone, or sealed to a roster that never \
+                         consented to publication",
+                        super::community_subkind(&stored),
+                        super::community_subkind(community)
+                    ),
                 ),
             ));
         }
     }
     Ok(())
+}
+
+/// v62.0.0 (wave GC6; CC 2.7 rc21 X14, CC 4.4.3.17 corrected: "That
+/// signature counts only from a key with a live federation-scope
+/// owner-binding") — **does a public room joiner's signature count?** True
+/// while `joiner_key_id` holds a live owner binding carried at
+/// `cohort_scope: federation` (the one announced-owner fold,
+/// [`admission::serve_seat_owner_announced`](super::admission::serve_seat_owner_announced)).
+/// A FOLD read: `key:<joiner>` is declared, so the joiner's acceptance
+/// re-folds when the binding lands or is withdrawn.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn joiner_owner_bound<F>(directory: &F, joiner_key_id: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    fold::reads(Dep::key(joiner_key_id));
+    super::admission::serve_seat_owner_announced(directory, joiner_key_id).await
 }
 
 /// Is `row` a listing row (any of the five types carrying the leaf)?
@@ -251,28 +279,41 @@ pub async fn check_community_listing_admission(
              `moderate`-holder from creation (CC 4.5.4)",
         ));
     }
+    // v62.0.0 (wave GC6; CC 2.7.3) — everything above is the row's own
+    // bytes (refused, nothing kept). Everything below reads OTHER rows (the
+    // room's record, its effective roster, its moderate delegations, the
+    // signer's person binding): a fold. Each read is declared, and each miss
+    // HOLDS the listing with its own token, re-folded when an input lands or
+    // is withdrawn.
+    fold::reads(Dep::key(community_key_id));
+    fold::reads(Dep::key(&row.attesting_key_id));
     // A gate asks about the SIGNER's authority, and the room record is where
     // that authority lives: without it the signer cannot be checked, so the
-    // row waits for the record — refused RETRYABLY as the ordering gap it is
-    // (`scope_membership_unresolved`, the "roster not held here yet" shape,
-    // CIRISPersist#797), and admitted when re-offered after the record lands.
+    // row waits for the record (`scope_membership_unresolved`, the "roster
+    // not held here yet" shape, CIRISPersist#797). In a fold attempt it is
+    // HELD and concludes when the record lands; at the earlier-form door it
+    // is the retryable refusal it always was.
     let Some(room) = directory.lookup_community(community_key_id).await? else {
-        tracing::warn!(
+        tracing::debug!(
             community_key_id = %community_key_id,
             attestation_id = %row.attestation_id,
-            "ciris-persist: community:listing:v1 refused — room record not held yet; retryable"
+            "ciris-persist: community:listing:v1 waits — room record not held yet"
         );
-        return Err(Error::WriteScopeRefused(
-            crate::scope::ScopeRefusalReason::MembershipUnresolved,
+        return Err(fold::hold(
+            reason::SCOPE_MEMBERSHIP_UNRESOLVED,
+            Error::WriteScopeRefused(crate::scope::ScopeRefusalReason::MembershipUnresolved),
         ));
     };
     if !is_public_community(&room) {
-        return Err(listing_refusal(
-            LISTING_ROOM_NOT_PUBLIC,
-            format!(
-                "{community_key_id:?} is {:?}, not `public` — a private room's id arrives out \
-                 of band and is never listed",
-                super::community_subkind(&room)
+        return Err(fold::hold(
+            reason::COMMUNITY_LISTING_ROOM_NOT_PUBLIC,
+            listing_refusal(
+                LISTING_ROOM_NOT_PUBLIC,
+                format!(
+                    "{community_key_id:?} is {:?}, not `public` — a private room's id arrives \
+                     out of band and is never listed",
+                    super::community_subkind(&room)
+                ),
             ),
         ));
     }
@@ -282,18 +323,22 @@ pub async fn check_community_listing_admission(
     let room_admission = is_open_admission(&room).then_some(ADMISSION_OPEN);
     let admission_agrees = env_str(row, ADMISSION_MEMBER) == room_admission;
     if !subkind_agrees || !admission_agrees {
-        return Err(listing_refusal(
-            LISTING_MALFORMED,
-            format!(
-                "the listing states cohort_subkind {:?} and admission {:?}; the room's record \
-                 says {COHORT_SUBKIND_PUBLIC:?} and {room_admission:?}",
-                env_str(row, "cohort_subkind"),
-                env_str(row, ADMISSION_MEMBER)
+        return Err(fold::hold(
+            reason::COMMUNITY_LISTING_MALFORMED,
+            listing_refusal(
+                LISTING_MALFORMED,
+                format!(
+                    "the listing states cohort_subkind {:?} and admission {:?}; the room's \
+                     record says {COHORT_SUBKIND_PUBLIC:?} and {room_admission:?}",
+                    env_str(row, "cohort_subkind"),
+                    env_str(row, ADMISSION_MEMBER)
+                ),
             ),
         ));
     }
     let signer =
         super::admission::admission_identity_for_writer(directory, &row.attesting_key_id).await?;
+    fold::reads(Dep::key(&signer));
     let founder = super::effective_roster(directory, &room)
         .await?
         .iter()
@@ -316,11 +361,15 @@ pub async fn check_community_listing_admission(
             return Ok(());
         }
     }
-    Err(listing_refusal(
-        LISTING_SIGNER_NOT_AUTHORIZED,
-        format!(
-            "{:?} is neither a founder of {community_key_id:?} nor a current `moderate`-holder",
-            row.attesting_key_id
+    Err(fold::hold(
+        reason::COMMUNITY_LISTING_SIGNER_NOT_AUTHORIZED,
+        listing_refusal(
+            LISTING_SIGNER_NOT_AUTHORIZED,
+            format!(
+                "{:?} is neither a founder of {community_key_id:?} nor a current \
+                 `moderate`-holder",
+                row.attesting_key_id
+            ),
         ),
     ))
 }

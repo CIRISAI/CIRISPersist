@@ -10,24 +10,22 @@
 #[cfg(test)]
 pub mod bodies {
     use crate::federation::consent_by_humans as cbh;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{NODE, USER};
     use crate::federation::types::{attestation_tier, attestation_type};
-    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+    use crate::federation::{Attestation, FederationDirectory};
 
-    /// A federation-tier row signed by `signer` — the consent-by-humans
-    /// fixture shape (sign → seal → reseal).
-    pub(crate) fn row(
-        id: &str,
+    /// The unsigned literal [`row`] states (the payload of its statement).
+    fn literal(
         signer: &str,
         target: &str,
         envelope: serde_json::Value,
         subject_key_ids: Vec<String>,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Attestation {
-        let (och, ed_sig, pqc_sig) = ts::sign_envelope(signer, &envelope);
-        let mut r = Attestation {
-            attestation_id: id.to_owned(),
+        Attestation {
+            attestation_id: String::new(),
             attesting_key_id: signer.to_owned(),
             attested_key_id: target.to_owned(),
             attestation_type: attestation_type::SCORES.to_owned(),
@@ -35,9 +33,9 @@ pub mod bodies {
             asserted_at: at,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: signer.to_owned(),
             scrub_timestamp: at,
             pqc_completed_at: None,
@@ -48,9 +46,26 @@ pub mod bodies {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        };
-        ts::reseal(&mut r);
-        r
+        }
+    }
+
+    /// A federation-tier row signed by `signer`: the door's mapping of the
+    /// signer's edition-2 statement. `id` is kept for the callers' shape and
+    /// is NOT the row's id: an edition-2 row id is node-computed, so a caller
+    /// reads `attestation_id` off the returned row.
+    pub(crate) fn row(
+        id: &str,
+        signer: &str,
+        target: &str,
+        envelope: serde_json::Value,
+        subject_key_ids: Vec<String>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Attestation {
+        let _ = id;
+        e2::row_of(
+            &literal(signer, target, envelope, subject_key_ids, at),
+            signer,
+        )
     }
 
     /// A `consent:replication:v1` grant by `author` toward `peer`, naming
@@ -78,11 +93,20 @@ pub mod bodies {
         )
     }
 
-    /// `author` withdraws its own row `target` — the structural composer the
-    /// peer-set projection folds on (`revocation_fold_target`).
+    /// `author` withdraws its own row `target` (a row id) — the structural
+    /// composer the peer-set projection folds on (`revocation_fold_target`).
+    /// Edition 2: the composer carries its target's family (a consent grant)
+    /// and names the target in `refs.target`. `id` is ignored (see [`row`]).
     pub(crate) fn withdraws(id: &str, author: &str, target: &str) -> Attestation {
-        let mut r = row(
-            id,
+        let _ = id;
+        let family = e2::family_of(&literal(
+            author,
+            author,
+            serde_json::json!({"dimension": crate::federation::consent_peer_set::DIMENSION}),
+            Vec::new(),
+            chrono::Utc::now(),
+        ));
+        let mut r = literal(
             author,
             author,
             serde_json::json!({"references_attestation_id": target}),
@@ -90,12 +114,22 @@ pub mod bodies {
             chrono::Utc::now(),
         );
         r.attestation_type = attestation_type::WITHDRAWS.to_owned();
-        ts::reseal(&mut r);
-        r
+        e2::row_of_statement(&e2::statement_of_family(&r, author, &family), &r.tier)
+    }
+
+    /// An owner binding `owner → node`, put with the node's own voice
+    /// (edition 2, C557: a binding counts only with the node's statement).
+    async fn put_owner_binding(d: &dyn FederationDirectory, owner: &str, node: &str) {
+        let b = ts::owner_binding_attestation("", owner, node);
+        let st = e2::carried_statement(&b).expect("a flipped binding carries its statement");
+        put(d, b).await;
+        e2::put_statement(d, &e2::voice_of(&st, node))
+            .await
+            .unwrap_or_else(|e| panic!("put the node's voice: {e}"));
     }
 
     pub(crate) async fn put(d: &dyn FederationDirectory, a: Attestation) {
-        d.put_attestation(SignedAttestation { attestation: a })
+        crate::federation::edition2::fixture_switch::put_signed(d, &a)
             .await
             .unwrap_or_else(|e| panic!("put {}: {e}", "attestation"));
     }
@@ -112,20 +146,23 @@ pub mod bodies {
             ts::register_identity_key(d, k, NODE).await;
         }
         for machine in [&node, &actor] {
-            put(
-                d,
-                ts::owner_binding_attestation(&format!("i169-ob-{machine}"), &alice, machine),
-            )
-            .await;
+            put_owner_binding(d, &alice, machine).await;
         }
-        let g_node = format!("i169-g-node-{s}");
-        let g_actor = format!("i169-g-actor-{s}");
-        put(d, grant(&g_node, &alice, &peer, Some(&node), &["trace:"])).await;
-        put(d, grant(&g_actor, &alice, &peer, Some(&actor), &["trace:"])).await;
+        // Edition 2: every key is named by its identity-ref, and a row by
+        // its node-computed id (read off the row).
+        let (alice_k, node_k, actor_k) = (e2::kid(&alice), e2::kid(&node), e2::kid(&actor));
+        let g_node_row = grant("", &alice, &peer, Some(&node), &["trace:"]);
+        let g_actor_row = grant("", &alice, &peer, Some(&actor), &["trace:"]);
+        let (g_node, g_actor) = (
+            g_node_row.attestation_id.clone(),
+            g_actor_row.attestation_id.clone(),
+        );
+        put(d, g_node_row).await;
+        put(d, g_actor_row).await;
         // The attester-keyed reader holds BOTH (the V152 key), and the
         // peer set has the peer once.
         let live: Vec<String> = d
-            .list_live_consent_grants_by(&alice)
+            .list_live_consent_grants_by(&alice_k)
             .await
             .unwrap()
             .into_iter()
@@ -136,11 +173,11 @@ pub mod bodies {
             "I169: both per-key grants are live for the author: {live:?}"
         );
         assert_eq!(
-            d.list_consent_peers(&alice).await.unwrap(),
-            vec![peer.clone()]
+            d.list_consent_peers(&alice_k).await.unwrap(),
+            vec![e2::kid(&peer)]
         );
         // By principals: each machine sees exactly the grant that names it.
-        let for_node: Vec<String> = cbh::live_egress_grants_by_principals(d, &node)
+        let for_node: Vec<String> = cbh::live_egress_grants_by_principals(d, &node_k)
             .await
             .unwrap()
             .into_iter()
@@ -151,7 +188,7 @@ pub mod bodies {
             vec![g_node.clone()],
             "I169: the node's grant, not the actor's"
         );
-        let for_actor: Vec<String> = cbh::live_egress_grants_by_principals(d, &actor)
+        let for_actor: Vec<String> = cbh::live_egress_grants_by_principals(d, &actor_k)
             .await
             .unwrap()
             .into_iter()
@@ -163,7 +200,7 @@ pub mod bodies {
         // predicate looks (a reader that ignored `for_key_id` would hide
         // behind the predicate, and the predicate behind the reader).
         let read_for_node: Vec<String> = d
-            .list_live_consent_grants_for(&node)
+            .list_live_consent_grants_for(&node_k)
             .await
             .unwrap()
             .into_iter()
@@ -178,11 +215,11 @@ pub mod bodies {
         // `for_key_id` tells the node's grant from the actor's.
         let g_node_row = d.get_attestation(&g_node).await.unwrap().unwrap();
         let g_actor_row = d.get_attestation(&g_actor).await.unwrap().unwrap();
-        assert!(cbh::grant_is_authored_for(d, &g_node_row, &node)
+        assert!(cbh::grant_is_authored_for(d, &g_node_row, &node_k)
             .await
             .unwrap());
         assert!(
-            !cbh::grant_is_authored_for(d, &g_actor_row, &node)
+            !cbh::grant_is_authored_for(d, &g_actor_row, &node_k)
                 .await
                 .unwrap(),
             "I169: a bound steward's grant for a SIBLING machine is not the node's"
@@ -190,7 +227,7 @@ pub mod bodies {
         // And the crossing's covering check — the door a replicated row
         // reaches — refuses the sibling's grant and accepts the node's.
         let sent_by_node = row(
-            &format!("i169-row-{s}"),
+            "",
             &node,
             &node,
             serde_json::json!({"dimension": "trace:demo:v1", "trace": {}}),
@@ -225,18 +262,8 @@ pub mod bodies {
         // A stranger's grant naming the node is NOT the node's (no binding).
         let mallory = format!("i169-mallory-{s}");
         ts::register_identity_key(d, &mallory, USER).await;
-        put(
-            d,
-            grant(
-                &format!("i169-g-mallory-{s}"),
-                &mallory,
-                &other,
-                Some(&node),
-                &["trace:"],
-            ),
-        )
-        .await;
-        let for_node_again: Vec<String> = cbh::live_egress_grants_by_principals(d, &node)
+        put(d, grant("", &mallory, &other, Some(&node), &["trace:"])).await;
+        let for_node_again: Vec<String> = cbh::live_egress_grants_by_principals(d, &node_k)
             .await
             .unwrap()
             .into_iter()
@@ -249,9 +276,9 @@ pub mod bodies {
         );
         // Withdrawing the actor's grant leaves the node's grant live and the
         // peer still a peer of the author (the V109 key used to drop it).
-        put(d, withdraws(&format!("i169-w-{s}"), &alice, &g_actor)).await;
+        put(d, withdraws("", &alice, &g_actor)).await;
         let live: Vec<String> = d
-            .list_live_consent_grants_by(&alice)
+            .list_live_consent_grants_by(&alice_k)
             .await
             .unwrap()
             .into_iter()
@@ -263,10 +290,10 @@ pub mod bodies {
             "I169: the node's grant survives the actor's withdrawal"
         );
         assert_eq!(
-            d.list_consent_peers(&alice).await.unwrap(),
-            vec![peer.clone()]
+            d.list_consent_peers(&alice_k).await.unwrap(),
+            vec![e2::kid(&peer)]
         );
-        assert!(cbh::live_egress_grants_by_principals(d, &actor)
+        assert!(cbh::live_egress_grants_by_principals(d, &actor_k)
             .await
             .unwrap()
             .is_empty());
@@ -324,6 +351,7 @@ mod run {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i168_the_sweep_promotes_an_owned_agents_rows() {
+        Box::pin(crate::federation::edition2::fixture_switch::with_earlier_form_async(async {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::attestation_tier;
         use crate::federation::types::identity_type::{NODE, USER};
@@ -449,6 +477,8 @@ mod run {
         // Idempotent: a second sweep has nothing left.
         let again = engine.promote_consented_backlog().await.expect("sweep");
         assert_eq!(again.promoted, 0);
+    }))
+    .await
     }
 }
 

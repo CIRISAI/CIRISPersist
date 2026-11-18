@@ -50,6 +50,7 @@ pub mod bodies {
         DELEGATION_SCOPE_MODERATE, DELEGATION_SCOPE_REVIEW, DELEGATION_SCOPE_SLASH,
         DELEGATION_SCOPE_TAKEDOWN, DELEGATION_VALID_FROM_FIELD, DELEGATION_VALID_UNTIL_FIELD,
     };
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::licensure_chain_invariants::bodies::{
         base, edge, licence, must_put, must_refuse_as, officer,
     };
@@ -155,8 +156,10 @@ pub mod bodies {
 
     /// No `delegates_to` from `from` to `to` is stored.
     async fn assert_no_edge(d: &dyn FederationDirectory, from: &str, to: &str, what: &str) {
+        // Edition 2: rows name their keys by identity-ref.
+        let (from, to) = (e2::kid(from), e2::kid_or_keep(to));
         assert!(
-            !d.list_attestations_by(from)
+            !d.list_attestations_by(&from)
                 .await
                 .unwrap()
                 .iter()
@@ -705,9 +708,12 @@ mod lens {
     use chrono::{Duration, Utc};
 
     fn edge(envelope: serde_json::Value) -> crate::federation::Attestation {
-        let mut row = crate::federation::tier_ingest::test_support::bare_attestation(
-            "i1230", "a", "b", &envelope,
-        );
+        // An unsigned in-memory row for a pure lens: the skeleton only.
+        let mut row = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+            crate::federation::tier_ingest::test_support::bare_attestation(
+                "i1230", "a", "b", &envelope,
+            )
+        });
         row.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
         // Signed after the rules took effect (the grandfather arms set their
         // own instant).

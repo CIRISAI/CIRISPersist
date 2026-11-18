@@ -37,7 +37,6 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use ciris_verify_core::cde::Value;
-use ciris_verify_core::edition2::family::SelectContext;
 use ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY;
 use ciris_verify_core::edition2::{identity_ref, Digest32};
 use sha2::Digest as _;
@@ -79,6 +78,10 @@ where
         // Verify's reader requires the composer's target; nothing to bind.
         return Ok(());
     };
+    // v62.0.0 (wave G0 v5.1; GC1's door gap) — the target is another row:
+    // an unheld one is WAITED for, never refused (CC 2.7.3); its arrival
+    // re-folds this composer.
+    super::fold::reads(super::fold::Dep::Row(target));
     let held = dir.edition2_voices(&target).await?;
     let family = held.iter().find_map(|st| {
         statement_parts(st).and_then(|(h, _)| {
@@ -88,22 +91,30 @@ where
         })
     });
     let Some(family) = family else {
-        return Err(Error::WithdrawsTargetUnheld {
-            attestation_id: row.row_id.hex(),
-            target_attestation_id: target.hex(),
-        });
+        return Err(super::fold::hold(
+            super::fold::reason::LINK_UNHELD,
+            Error::WithdrawsTargetUnheld {
+                attestation_id: row.row_id.hex(),
+                target_attestation_id: target.hex(),
+            },
+        ));
     };
     if family != row.family {
-        return Err(Error::malformed_row(
-            PLANE,
-            malformed_row::COMPOSER_FAMILY_MISMATCH,
-            format!(
-                "the {} row {} carries family `{}`, but its target {} is of `{family}`: a \
+        // Held too: read from another row, so the verdict must not depend
+        // on whether the target arrived first.
+        return Err(super::fold::hold(
+            super::fold::reason::COMPOSER_FAMILY_MISMATCH,
+            Error::malformed_row(
+                PLANE,
+                malformed_row::COMPOSER_FAMILY_MISMATCH,
+                format!(
+                    "the {} row {} carries family `{}`, but its target {} is of `{family}`: a \
                  composer carries its target's family",
-                row.row_type,
-                row.row_id.hex(),
-                row.family,
-                target.hex()
+                    row.row_type,
+                    row.row_id.hex(),
+                    row.family,
+                    target.hex()
+                ),
             ),
         ));
     }
@@ -187,11 +198,9 @@ where
             .edition2_statements_about(KEY_RECORD_FAMILY, &subject)
             .await?
         {
-            // v62.0.0 (wave G0 v4) — a key statement the fold holds back
-            // (its row concludes nothing) is not key plane.
-            if super::fold::is_held_back(dir, &st).await? {
-                continue;
-            }
+            // v62.0.0 (wave G0 fix2) — a `key:record` is the signer's own
+            // key plane: a DOOR input, never held by the fold, so none is
+            // skipped here (only a held-back revocation is, below).
             if let Some(signer) = statement_kid(&st) {
                 if signer != kid {
                     queue.push_back(signer);
@@ -204,10 +213,7 @@ where
             if let Some(target) = record_target(&st) {
                 for rival in dir.edition2_rows_naming(&target, "target").await? {
                     for v in dir.edition2_voices(&rival).await? {
-                        if is_key_record(&v)
-                            && !held.holds(&v)
-                            && !super::fold::is_held_back(dir, &v).await?
-                        {
+                        if is_key_record(&v) && !held.holds(&v) {
                             held.insert_record(v);
                         }
                     }
@@ -242,7 +248,7 @@ fn record_target(statement: &[u8]) -> Option<super::names::RowId> {
 }
 
 /// Is this statement of the family `key:record`?
-fn is_key_record(statement: &[u8]) -> bool {
+pub(crate) fn is_key_record(statement: &[u8]) -> bool {
     statement_parts(statement)
         .is_some_and(|(p, _)| p.get_int(-70002).and_then(Value::as_text) == Some(KEY_RECORD_FAMILY))
 }
@@ -290,6 +296,13 @@ pub fn json_of(v: &Value) -> serde_json::Value {
         ),
         Value::Bool(b) => J::Bool(*b),
         Value::Null => J::Null,
+        // v62.0.0 (wave P1e; lead's ruling) — a normalised tag-4 decimal (a
+        // free-form body's non-integral number) reads back as its EXACT JSON
+        // number (`payloads::json_number_of_decimal`); any other tag keeps
+        // the tagged form.
+        Value::Tag(4, _) if super::payloads::json_number_of_decimal(v).is_some() => {
+            super::payloads::json_number_of_decimal(v).map_or(J::Null, J::Number)
+        }
         Value::Tag(t, inner) => serde_json::json!({ "tag": t, "value": json_of(inner) }),
         Value::Simple(s) => serde_json::json!({ "simple": s }),
     }
@@ -562,7 +575,9 @@ where
     .await?;
     let keys = held_keys_for(dir, &bytes).await?;
     let offered = offered_row_id(row)?;
-    let admitted = admit_row(&bytes, &keys, Some(&offered), SelectContext::default())?;
+    // v62.0.0 (T2-fix1) — the context the family's authorship cell reads.
+    let ctx = super::typed::family_context(dir, &bytes).await?;
+    let admitted = admit_row(&bytes, &keys, Some(&offered), ctx)?;
     require_admission_signer_is_person(&keys, &admitted)?;
     let expected = attestation_of(&admitted, &row.tier)?;
     require_projection(&expected, row)?;
@@ -866,9 +881,19 @@ where
         let accord = super::halt::named_accord_root(bytes).unwrap_or_default();
         let roster = super::halt::roster_in_force(dir, &accord).await?;
         let out = super::halt::put_invocation(dir, bytes, roster.as_ref()).await?;
-        return Ok(StatementOutcome::Row {
-            row_id: super::names::RowId(*out.invocation.row_id()),
-            new: out.new,
+        let row_id = super::names::RowId(*out.invocation.row_id());
+        // v62.0.0 (wave GC4; CC 2.7.3) — a replayed invocation is kept and
+        // concludes nothing (`edition2::halt`): the held outcome.
+        return Ok(if out.held {
+            StatementOutcome::Pending {
+                row_id,
+                new: out.new,
+            }
+        } else {
+            StatementOutcome::Row {
+                row_id,
+                new: out.new,
+            }
         });
     }
     let mut keys = held_keys_for(dir, bytes).await?;
@@ -881,15 +906,14 @@ where
     // holder signs its record"): offered, it is its own key source. It gives
     // liveness only through its own verification.
     keys.insert_record(bytes.to_vec());
+    // v62.0.0 (T2-fix1) — the context a family's authorship cell reads
+    // (`identity`, `group`, `seats`; CC 3.1.3), supplied by the door so a
+    // family whose cell reads it is never `authorship_undetermined`.
+    let ctx = super::typed::family_context(dir, bytes).await?;
     let admitted = if already_held {
-        admit_row(
-            bytes,
-            &keys.without_revocations(),
-            offered_id,
-            SelectContext::default(),
-        )?
+        admit_row(bytes, &keys.without_revocations(), offered_id, ctx)?
     } else {
-        admit_row(bytes, &keys, offered_id, SelectContext::default())?
+        admit_row(bytes, &keys, offered_id, ctx)?
     };
     // v62.0.0 (wave P1e) — an admission row's signer is a person.
     require_admission_signer_is_person(&keys, &admitted)?;
@@ -967,6 +991,9 @@ where
             )),
         )
         .await;
+        // v62.0.0 (wave G0 v5.1) — a FINAL-plane hold must declare what it
+        // waits for; its declared reads only ever conclude it (monotone).
+        super::fold::enforce_final_plane(plane_name, admitted, att.held.as_ref(), &att.reads);
         let out = match (out, att.held) {
             (Ok(o), _) => {
                 match &o {
@@ -1012,6 +1039,10 @@ where
                 }
                 o
             }
+            // v62.0.0 (wave G0 fix2) — a `key:record` is the signer's own key
+            // plane (a door input): it never holds. A mark set during its
+            // route does not keep it; its refusal stands.
+            (Err(e), Some(_)) if admitted.family == KEY_RECORD_FAMILY => return Err(e),
             (Err(e), Some((r, detail))) => {
                 let new = dir.put_edition2_statement(admitted).await?;
                 let detail = if detail.is_empty() {
@@ -1064,48 +1095,49 @@ fn key_statement_about(admitted: &AdmittedRow) -> Option<Digest32> {
 #[must_use]
 pub fn fold_plane_of(admitted: &AdmittedRow) -> (&'static str, String) {
     use super::fold::plane;
+    use super::typed::TypedPlane;
     let own = || format!("row:{}", admitted.row_id.hex());
-    if super::group::group_plane_of(&admitted.row_type, &admitted.family, &admitted.payload)
-        .is_some()
-    {
-        return (plane::GROUP, format!("group:{}", admitted.sub));
-    }
-    if admitted.family == super::occurrence::OCCURRENCE_FAMILY {
-        return match super::fold::occurrence_pair(admitted) {
+    // No wildcard: a new `Route` or `TypedPlane` fails to compile here.
+    match route_of(admitted) {
+        Route::Group(_) => (plane::GROUP, format!("group:{}", admitted.sub)),
+        Route::Occurrence => match super::fold::occurrence_pair(admitted) {
             Some((identity, occurrence)) => (
                 plane::OCCURRENCE,
                 format!("occurrence:{identity}|{occurrence}"),
             ),
             None => (plane::OCCURRENCE, own()),
-        };
-    }
-    if super::typed::is_trust_family(&admitted.family) {
-        return (plane::TRUST, own());
-    }
-    if let Some(p) = super::typed::typed_plane_of(&admitted.row_type, &admitted.family) {
-        use super::typed::TypedPlane;
-        let name = match p {
-            TypedPlane::Takedown if super::typed::is_steward_purge(admitted) => plane::TYPED_FINAL,
-            TypedPlane::Takedown | TypedPlane::Custody | TypedPlane::KeyGrant => {
-                plane::TYPED_ATTESTATION
+        },
+        Route::Trust => (plane::TRUST, own()),
+        // v4 — a holding claim folds into its blob's slot, so its bytes are
+        // kept-but-not-served while it is held (`fold::bytes_servable`).
+        Route::Typed(TypedPlane::Custody) => {
+            match super::typed::holding_claim_of(&admitted.bytes) {
+                Ok(claim) => (
+                    plane::TYPED_ATTESTATION,
+                    super::fold::blob_slot(&claim.sha256),
+                ),
+                Err(_) => (plane::TYPED_ATTESTATION, own()),
             }
+        }
+        Route::Typed(TypedPlane::Takedown) if super::typed::is_steward_purge(admitted) => {
+            (plane::TYPED_FINAL, own())
+        }
+        Route::Typed(TypedPlane::Takedown | TypedPlane::KeyGrant) => {
+            (plane::TYPED_ATTESTATION, own())
+        }
+        Route::Typed(
             TypedPlane::OccurrenceRevocation
             | TypedPlane::Cosign
             | TypedPlane::Revocation
-            | TypedPlane::DeliveryReceipt => plane::TYPED_FINAL,
-        };
-        return (name, own());
-    }
-    if admitted.family == super::transport_rebind::REBIND_FAMILY {
-        return (plane::REBIND, format!("rebind:{}", admitted.sub));
-    }
-    if admitted.family == KEY_RECORD_FAMILY || admitted.family == KEY_REVOCATION_FAMILY {
-        return match key_statement_about(admitted) {
+            | TypedPlane::DeliveryReceipt,
+        ) => (plane::TYPED_FINAL, own()),
+        Route::Rebind => (plane::REBIND, format!("rebind:{}", admitted.sub)),
+        Route::Key => match key_statement_about(admitted) {
             Some(kid) => (plane::KEY, format!("key:{}", hex::encode(kid))),
             None => (plane::KEY, own()),
-        };
+        },
+        Route::Attestation => (plane::ATTESTATION, own()),
     }
-    (plane::ATTESTATION, own())
 }
 
 /// The routing [`put_admitted_row`] runs inside its fold attempt.
@@ -1122,71 +1154,119 @@ where
     let bytes: &[u8] = &admitted.bytes;
     // A composer names a held row of its own family (every plane).
     check_composer_target(dir, admitted).await?;
-    // v62.0.0 (wave T1) — the group planes: a `group:roster` version or a
-    // counted membership change lands in its typed table through the typed
-    // door, counted over every voice of the row (`edition2::group`).
+    // v62.0.0 (wave G0 v5) — ONE routing (`route_of`), matched without a
+    // wildcard here and in `fold_plane_of`: a new route fails to compile
+    // until both the door and the fold's plane map name it.
+    match route_of(admitted) {
+        // v62.0.0 (wave T1) — the group planes: a `group:roster` version or
+        // a counted membership change lands in its typed table through the
+        // typed door, counted over every voice of the row (`edition2::group`).
+        Route::Group(plane) => {
+            Box::pin(super::group::put_group_statement(
+                dir, admitted, plane, replicated, tier,
+            ))
+            .await
+        }
+        // v62.0.0 (wave O1; CC 3.3.6) — an occurrence bind's voices: held,
+        // and the bind written to the occurrence table when it lands
+        // (`edition2::occurrence`), never an attestation row.
+        Route::Occurrence => Box::pin(super::occurrence::put_occurrence_voice(dir, admitted)).await,
+        // v62.0.0 (wave T2; CC 3.2 T3) — a trust edge (or its composer) keeps
+        // the attestation door and re-derives the v1.3 trust plane's row of
+        // the keys it touches (`edition2::typed::project_trust_for`).
+        Route::Trust => Box::pin(super::typed::put_trust_statement(dir, admitted, tier)).await,
+        // v62.0.0 (wave T2) — the remaining families with a typed table (an
+        // occurrence revocation, a revocation, a takedown notice, a custody
+        // report, a key grant, a delivery receipt, a cosign state) land there
+        // through the JSON form's own door (`edition2::typed`).
+        Route::Typed(plane) => {
+            Box::pin(super::typed::put_typed_statement(
+                dir, admitted, plane, tier,
+            ))
+            .await
+        }
+        // v62.0.0 (wave W1; CC 3.1.3, 3.4.7) — a seat's counted re-bind: held
+        // in the statement store, counted by the holders of the genesis
+        // bundle in force (`edition2::transport_rebind`), never an
+        // attestation row.
+        Route::Rebind => Box::pin(super::transport_rebind::put_rebind_voice(dir, admitted)).await,
+        Route::Key => {
+            let new = dir.put_edition2_statement(admitted).await?;
+            // v62.0.0 (slice J0) — the read models: the key this statement
+            // is about, projected into `federation_keys` and its honoured
+            // revocations into `federation_revocations`, re-derived from the
+            // held key plane every time (`projection::project_key`).
+            let about = if admitted.family == KEY_RECORD_FAMILY {
+                super::liveness::recorded_kid(bytes)
+            } else {
+                kid_of_identity_ref(&admitted.sub)
+            };
+            if let Some(kid) = about {
+                super::projection::project_key(dir, &kid).await?;
+            }
+            Ok(StatementOutcome::KeyPlane {
+                row_id: admitted.row_id,
+                new,
+            })
+        }
+        Route::Attestation => {
+            // A further voice of a row already held (a counted row, CC 2.6.1.9): the
+            // row is admitted, and this voice joins its fold under `event_row_id`
+            // (`cosign::edition2_voices`), never a second row. v62.0.0 (wave V1b) —
+            // a row not held yet runs the attestation gates counted by ALL its
+            // voices, this one included; a gate that finds them short keeps the
+            // voice and answers `Pending` (`edition2::voices::put_counted_row`).
+            Box::pin(super::voices::put_counted_row(dir, admitted, tier, origin)).await
+        }
+    }
+}
+
+/// v62.0.0 (wave G0 v5) — **the one routing** of an admitted row, in the
+/// order `put_admitted_row` has always applied it. Both the door
+/// (`put_admitted_row_doors`) and the fold's plane map ([`fold_plane_of`])
+/// match it exhaustively, with no wildcard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// T1's group planes.
+    Group(super::group::GroupPlane),
+    /// O1's occurrence bind.
+    Occurrence,
+    /// T2's trust edges.
+    Trust,
+    /// T2's typed families.
+    Typed(super::typed::TypedPlane),
+    /// W1's counted re-bind.
+    Rebind,
+    /// The key plane.
+    Key,
+    /// Everything else: the attestation gates (`voices::put_counted_row`).
+    Attestation,
+}
+
+/// The [`Route`] of an admitted row.
+#[must_use]
+pub fn route_of(admitted: &AdmittedRow) -> Route {
     if let Some(plane) =
         super::group::group_plane_of(&admitted.row_type, &admitted.family, &admitted.payload)
     {
-        return Box::pin(super::group::put_group_statement(
-            dir, admitted, plane, replicated, tier,
-        ))
-        .await;
+        return Route::Group(plane);
     }
-    // v62.0.0 (wave O1; CC 3.3.6) — an occurrence bind's voices: held, and
-    // the bind written to the occurrence table when it lands
-    // (`edition2::occurrence`), never an attestation row.
     if admitted.family == super::occurrence::OCCURRENCE_FAMILY {
-        return Box::pin(super::occurrence::put_occurrence_voice(dir, admitted)).await;
+        return Route::Occurrence;
     }
-    // v62.0.0 (wave W1; CC 3.1.3, 3.4.7) — a seat's counted re-bind: held
-    // in the statement store, counted by the holders of the genesis bundle
-    // in force (`edition2::transport_rebind`), never an attestation row.
-    if admitted.family == super::transport_rebind::REBIND_FAMILY {
-        return Box::pin(super::transport_rebind::put_rebind_voice(dir, admitted)).await;
-    }
-    // v62.0.0 (wave T2) — the remaining families with a typed table (an
-    // occurrence revocation, a revocation, a takedown notice, a custody
-    // report, a key grant, a delivery receipt, a cosign state) land there
-    // through the JSON form's own door (`edition2::typed`).
-    // v62.0.0 (wave T2; CC 3.2 T3) — a trust edge (or its composer) keeps
-    // the attestation door and re-derives the v1.3 trust plane's row of the
-    // keys it touches (`edition2::typed::project_trust_for`).
     if super::typed::is_trust_family(&admitted.family) {
-        return Box::pin(super::typed::put_trust_statement(dir, admitted, tier)).await;
+        return Route::Trust;
     }
     if let Some(plane) = super::typed::typed_plane_of(&admitted.row_type, &admitted.family) {
-        return Box::pin(super::typed::put_typed_statement(
-            dir, admitted, plane, tier,
-        ))
-        .await;
+        return Route::Typed(plane);
+    }
+    if admitted.family == super::transport_rebind::REBIND_FAMILY {
+        return Route::Rebind;
     }
     if admitted.family == KEY_RECORD_FAMILY || admitted.family == KEY_REVOCATION_FAMILY {
-        let new = dir.put_edition2_statement(admitted).await?;
-        // v62.0.0 (slice J0) — the read models: the key this statement is
-        // about, projected into `federation_keys` and its honoured
-        // revocations into `federation_revocations`, re-derived from the
-        // held key plane every time (`projection::project_key`).
-        let about = if admitted.family == KEY_RECORD_FAMILY {
-            super::liveness::recorded_kid(bytes)
-        } else {
-            kid_of_identity_ref(&admitted.sub)
-        };
-        if let Some(kid) = about {
-            super::projection::project_key(dir, &kid).await?;
-        }
-        return Ok(StatementOutcome::KeyPlane {
-            row_id: admitted.row_id,
-            new,
-        });
+        return Route::Key;
     }
-    // A further voice of a row already held (a counted row, CC 2.6.1.9): the
-    // row is admitted, and this voice joins its fold under `event_row_id`
-    // (`cosign::edition2_voices`), never a second row. v62.0.0 (wave V1b) —
-    // a row not held yet runs the attestation gates counted by ALL its
-    // voices, this one included; a gate that finds them short keeps the
-    // voice and answers `Pending` (`edition2::voices::put_counted_row`).
-    Box::pin(super::voices::put_counted_row(dir, admitted, tier, origin)).await
+    Route::Attestation
 }
 
 /// The tier replication and tier ingest deliver at.

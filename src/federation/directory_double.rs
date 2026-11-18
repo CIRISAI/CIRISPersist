@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 172 delegations, generated. Every one: fault first, then delegate.
+// 174 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -440,6 +440,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.fold_held_page(after, limit).await
+    }
+    async fn fold_slot_held(&self, slot: &str) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("fold_slot_held") {
+            return Err(e);
+        }
+        self.inner.fold_slot_held(slot).await
     }
     async fn fold_slot_rows(&self, slot: &str) -> Result<Vec<edition2::names::RowId>, Error> {
         if let Some(e) = self.faulted("fold_slot_rows") {
@@ -1527,6 +1533,16 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.put_family_membership_widening(widening).await
+    }
+    async fn put_fold_reason(
+        &self,
+        row_id: &edition2::names::RowId,
+        held: Option<(String, String)>,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("put_fold_reason") {
+            return Err(e);
+        }
+        self.inner.put_fold_reason(row_id, held).await
     }
     async fn put_fold_record(&self, rec: &edition2::fold::FoldRecord) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_fold_record") {

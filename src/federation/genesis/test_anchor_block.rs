@@ -198,86 +198,9 @@ pub fn decode_seed_b64(seed_b64: &str) -> Result<[u8; 32], Error> {
 mod tests {
     use super::*;
 
-    /// The consumers' block (CIRISServer `harness/mesh-repro/docker-compose.yml`,
-    /// minted by CIRISEdge's generator) for the shared seed — the Ed25519
-    /// side byte-for-byte, the long PQC values by SHA-256.
-    const COMPOSE_ROOT: &str = "ebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ=";
-    const COMPOSE_SCRUB: &str =
-        "ZOkeMQA9qWCJTjzCn9osJLwedBxvg0y+dusOp9bErJZKbZDouYSq3DWwGyXH3BpquFtBwRAeIb6502i+Ffi8Bg==";
-    const COMPOSE_PQC_SHA256: &str =
-        "7729242d8f30ef6d9e0bb159e113fd9d2bcbb53a944a727a0452a9b8a2a6bbd3";
-
-    fn sha256_hex(s: &str) -> String {
-        use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(s.as_bytes()))
-    }
-
-    /// **I159 — one block per pair, and it is the consumers' block.**
-    #[test]
-    fn i159_the_minter_reproduces_the_consumers_block() {
-        let seed = decode_seed_b64(TEST_ANCHOR_SHARED_SEED_B64).unwrap();
-        assert_eq!(seed, core::array::from_fn(|i| (i + 1) as u8));
-        let block = mint_test_anchor_block(&[seed]).unwrap();
-        assert_eq!(block.holders.len(), 1);
-        let h = &block.holders[0];
-        assert_eq!(h.key_id, "test-accord-holder-0");
-        assert_eq!(
-            h.root, COMPOSE_ROOT,
-            "I159: the Ed25519 pubkey is the harnesses'"
-        );
-        assert_eq!(
-            sha256_hex(&h.pqc),
-            COMPOSE_PQC_SHA256,
-            "I159: the ML-DSA-65 pubkey is the harnesses' (the seed domain is persist's now)"
-        );
-        assert_eq!(
-            h.scrub, COMPOSE_SCRUB,
-            "I159: Ed25519 is deterministic — the scrub IS the proof of one block per pair"
-        );
-        assert_eq!(h.seed, TEST_ANCHOR_SHARED_SEED_B64);
-        // The PQC scrub is randomized: pinned by verification, over the
-        // SAME preimage the seeder and the rooting walk use.
-        let envelope = crate::federation::genesis::test_anchor_registration_envelope(
-            &h.key_id,
-            &h.root,
-            Some(&h.pqc),
-        );
-        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope).unwrap();
-        crate::verify::hybrid::verify_hybrid(
-            &canonical,
-            &h.scrub,
-            Some(&h.scrub_pqc),
-            &h.root,
-            Some(&h.pqc),
-            crate::verify::hybrid::HybridPolicy::Strict,
-            None,
-        )
-        .expect("I159: both halves verify over persist's canonical envelope");
-        // Seven keys, in order, compose-ready.
-        let text = block.compose_lines();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 7);
-        for (line, var) in lines.iter().zip(TEST_ANCHOR_ENV_VARS) {
-            assert!(
-                line.starts_with(&format!("  {var}: \"")) && line.ends_with('"'),
-                "I159: compose line shape: {line}"
-            );
-        }
-        assert_eq!(
-            lines[6],
-            format!(
-                "  CIRIS_TEST_TRUST_ROOT_MINTED_BY: \"{}\"",
-                test_anchor_minted_by()
-            )
-        );
-        // Two holders: comma-joined slots, distinct keys.
-        let two = mint_test_anchor_block(&[seed, [0x42u8; 32]]).unwrap();
-        let pairs = two.env_pairs();
-        assert_eq!(pairs[1].1.split(',').count(), 2);
-        assert_ne!(two.holders[0].root, two.holders[1].root);
-        assert_eq!(two.holders[1].key_id, "test-accord-holder-1");
-        assert!(mint_test_anchor_block(&[]).is_err());
-    }
+    // v62.0.0 (JSON cut, E7) — I159 (the block's hybrid scrub over the JCS
+    // registration envelope, pinned to the consumers' compose block) is
+    // deleted: it pins earlier-form signing.
 
     /// **I162 (pure half) — the minted-by pair is derived, not typed.**
     ///

@@ -32,6 +32,7 @@
 //!   no authority of its own.
 
 use super::cohort::Cohort;
+use super::edition2::fold::{self, reason, Dep};
 use super::group_supersede_admit::HeadVerdict;
 use super::types::{GroupSupersedeProof, SignedCommunity, SignedFamily};
 use super::{Error, FederationDirectory};
@@ -201,6 +202,9 @@ where
     F: FederationDirectory + ?Sized,
 {
     let f = &family.family;
+    // v62.0.0 (wave GC5; CC 2.7.3) — the held head, its versions and the
+    // roster planes the composition below folds are inputs of this row.
+    fold::reads(Dep::key(&f.family_key_id));
     let Some(held) = dir.lookup_family(&f.family_key_id).await? else {
         // v52.0.0 (#955, Q1) — a founding record admits only its signers.
         check_family_founding(dir, family).await?;
@@ -318,6 +322,8 @@ where
     F: FederationDirectory + ?Sized,
 {
     let c = &community.community;
+    // v62.0.0 (wave GC5; CC 2.7.3) — the held head is an input of this row.
+    fold::reads(Dep::key(&c.community_key_id));
     let Some(stored) = dir.lookup_community(&c.community_key_id).await? else {
         // v52.0.0 (#955, Q1) — a founding record admits only its signers.
         check_community_founding(dir, community).await?;
@@ -338,7 +344,10 @@ where
     // affiliation's prior versions are `affiliations`, as the local supersede
     // door records them).
     let cohort = super::affiliation_config::declared_cohort(c)?;
-    super::affiliation_config::check_record_is(&stored, cohort)?;
+    // v62.0.0 (wave GC5) — the HELD record's cohort is another row's word:
+    // a mismatch holds the version (`federation_affiliation_cohort_mismatch`).
+    super::affiliation_config::check_record_is(&stored, cohort)
+        .map_err(super::affiliation_config::hold_cohort_mismatch)?;
     let offer = Offer {
         cohort,
         kind: "community",
@@ -495,10 +504,17 @@ where
     F: FederationDirectory + ?Sized,
 {
     match written {
-        Err(Error::Conflict(m)) => match dir.lookup_community(community_key_id).await? {
-            Some(held) if held.persist_row_hash == offered_hash => Ok(Some(0)),
-            _ => Err(Error::Conflict(m)),
-        },
+        Err(Error::Conflict(m)) => {
+            // v62.0.0 (wave GC5; CC 2.7.3) — the race is decided by the row
+            // held after it: another row. A differing winner holds this
+            // version (`group_occupied_by_another_version`), concluding
+            // nothing; it re-folds when the group's head moves.
+            fold::reads(Dep::key(community_key_id));
+            match dir.lookup_community(community_key_id).await? {
+                Some(held) if held.persist_row_hash == offered_hash => Ok(Some(0)),
+                _ => Err(fold::hold(reason::GROUP_OCCUPIED, Error::Conflict(m))),
+            }
+        }
         other => other,
     }
 }
@@ -512,12 +528,19 @@ where
     if stored.persist_row_hash == offer.offered_hash {
         return Ok(false);
     }
+    // v62.0.0 (wave GC5; CC 2.7.3) — every check below reads the head this
+    // node holds (another row): unmet, the version is HELD, concluding
+    // nothing, and re-folds when the group's head moves.
+    fold::reads(Dep::key(offer.group_key_id));
     let Some(proof) = offer.proof else {
-        return Err(group_reput_refusal(
-            offer.kind,
-            offer.group_key_id,
-            &stored.persist_row_hash,
-            &offer.offered_hash,
+        return Err(fold::hold(
+            reason::GROUP_OCCUPIED,
+            group_reput_refusal(
+                offer.kind,
+                offer.group_key_id,
+                &stored.persist_row_hash,
+                &offer.offered_hash,
+            ),
         ));
     };
     // v62.0.0 (kernel pass 2, I2811) — the proof names the version the
@@ -692,8 +715,13 @@ pub(crate) fn check_prev_head_names_held(
         (Err(_), HeadReading::Tip) => Ok(HeadVerdict::Tip),
         // the kernel reads a version that names no held head as a tip; one
         // that names the held head is admitted above, so this arm is the
-        // former refusal, kept rather than turned into an admission
-        (Err(e), HeadReading::Extends | HeadReading::NothingHeld) => Err(e),
+        // former refusal, kept rather than turned into an admission.
+        // v62.0.0 (wave GC5; CC 2.7.3) — it reads the held head (another
+        // row): the version is HELD (`lineage_prev_head_mismatch`),
+        // concluding nothing, never refused.
+        (Err(e), HeadReading::Extends | HeadReading::NothingHeld) => {
+            Err(fold::hold(reason::LINEAGE_PREV_HEAD_MISMATCH, e))
+        }
     }
 }
 
@@ -714,7 +742,11 @@ pub(crate) fn check_proof_names_versions_prior(
     stored_persist_row_hash: &str,
 ) -> Result<(), Error> {
     if offered_prev_head_digest.is_empty() || offered_prev_head_digest == stored_persist_row_hash {
-        return check_proof_names_prior(kind, group_key_id, proof, stored_persist_row_hash);
+        // v62.0.0 (wave GC5; CC 2.7.3) — STALE reads the held head: the
+        // version waits for the intermediate one (held, re-folded). The
+        // contradiction below is inside the row itself: a door refusal.
+        return check_proof_names_prior(kind, group_key_id, proof, stored_persist_row_hash)
+            .map_err(|e| fold::hold(reason::STALE_SUPERSEDE_PROOF, e));
     }
     if proof.prior_persist_row_hash == offered_prev_head_digest {
         return Ok(());
@@ -781,10 +813,16 @@ pub(crate) fn check_family_entrenchment(
     change_envelope: &serde_json::Value,
 ) -> Result<(), Error> {
     if stored_entrenched && !offered_entrenched {
-        return Err(Error::InvalidArgument(
-            "supersede: an entrenched family refuses an amendment that lifts \
-             consensus_protocol_entrenched"
-                .to_string(),
+        // v62.0.0 (wave GC5; CC 2.7.3) — the stored head's entrenchment is
+        // another row's: held (`family_entrenched`). The envelope-vs-row
+        // clause below reads only the offered bytes: a door refusal.
+        return Err(fold::hold(
+            reason::FAMILY_ENTRENCHED,
+            Error::InvalidArgument(
+                "supersede: an entrenched family refuses an amendment that lifts \
+                 consensus_protocol_entrenched"
+                    .to_string(),
+            ),
         ));
     }
     let envelope_entrenched = change_envelope.get("consensus_protocol_entrenched")
@@ -812,6 +850,8 @@ where
     F: FederationDirectory + ?Sized,
 {
     super::admission::check_family_consensus_protocol_form(&new.family.consensus_protocol)?;
+    // v62.0.0 (wave GC5) — the held head and its roster planes are inputs.
+    fold::reads(Dep::key(&new.family.family_key_id));
     super::verify_family_admission(dir, &new).await?;
     // v52.0.0 (#956) — a dissolved family admits no change, on either door.
     super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)
@@ -877,6 +917,8 @@ where
     F: FederationDirectory + ?Sized,
 {
     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
+    // v62.0.0 (wave GC5) — the held head and its roster planes are inputs.
+    fold::reads(Dep::key(&new.community.community_key_id));
     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the held record is the
     // cohort this door addresses, the new version declares the same cohort,
     // and an affiliation's config validates against the new roster.

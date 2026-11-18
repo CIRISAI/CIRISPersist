@@ -21,45 +21,52 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_query::FOLD_PAGE;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::read_probe::{self, Read};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::attestation_type;
-    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+    use crate::federation::{Attestation, FederationDirectory};
 
-    /// Land `n` third-party `scores` rows by `author` about `subject` under
-    /// dimensions no fold reads. Returns their ids.
+    /// Land `n` third-party `scores` rows by the key of seed `author_seed`
+    /// about `subject` under dimensions no fold reads. Returns their ids.
+    /// v62.0.0: each is an edition-2 row (`fixture_switch::row_of`), under a
+    /// registered family (`integrity:{aspect}`), put through the statement
+    /// door; its id is computed.
     pub async fn noise(
         d: &dyn FederationDirectory,
-        author: &str,
+        author_seed: &str,
         subject: &str,
         n: usize,
     ) -> Vec<String> {
         let mut ids = Vec::new();
         for i in 0..n {
             let id = uuid::Uuid::new_v4().to_string();
-            let env = serde_json::json!({ "dimension": format!("i907noise:n{i}:v1"), "id": id });
-            let mut r = ts::bare_attestation(&id, author, subject, &env);
+            let env =
+                serde_json::json!({ "dimension": format!("integrity:i907noise_n{i}"), "id": id });
+            // Built in the earlier shape, adjusted, then signed once.
+            let mut r =
+                e2::with_earlier_form(|| ts::bare_attestation(&id, author_seed, subject, &env));
             r.attestation_type = attestation_type::SCORES.into();
             r.weight = None;
             r.asserted_at = chrono::Utc::now() - chrono::Duration::minutes(60 - i as i64);
             r.scrub_timestamp = r.asserted_at;
-            ts::seal_row_in_place(author, &mut r);
-            d.put_attestation(SignedAttestation { attestation: r })
-                .await
-                .expect("I907 noise row lands");
-            ids.push(id);
+            let r = e2::row_of(&r, author_seed);
+            e2::put_signed(d, &r).await.expect("I907 noise row lands");
+            ids.push(r.attestation_id);
         }
         ids
     }
 
-    /// Two registered keys, unique per run.
-    pub async fn keys(d: &dyn FederationDirectory, tag: &str) -> (String, String) {
+    /// Two registered keys, unique per run: `[(kid, seed); 2]`. v62.0.0:
+    /// edition-2 `key:record`s (`fixture_switch::put_key`); a fold reads the
+    /// kid, a fixture signs with the seed.
+    pub async fn keys(d: &dyn FederationDirectory, tag: &str) -> [(String, String); 2] {
         let s = uuid::Uuid::new_v4().simple().to_string();
         let a = format!("{tag}-a-{}", &s[..10]);
         let b = format!("{tag}-b-{}", &s[..10]);
-        ts::register_hybrid_key(d, &a).await;
-        ts::register_hybrid_key(d, &b).await;
-        (a, b)
+        let ka = e2::put_key(d, &a, &[crate::federation::types::identity_type::AGENT]).await;
+        let kb = e2::put_key(d, &b, &[crate::federation::types::identity_type::AGENT]).await;
+        [(ka, a), (kb, b)]
     }
 
     /// The reads keyed on `key` (as the door they answer as).
@@ -103,9 +110,9 @@ pub(crate) mod bodies {
     /// **I907** — the trust/ownership plane: quarantine markers, the objection
     /// fold, the post-reclaim rebinding gate and the node's trust-root signal.
     pub async fn i907_trust_and_ownership_folds_read_bounded(d: &dyn FederationDirectory) {
-        let (k, other) = keys(d, "i907").await;
+        let [(k, _), (other, other_seed)] = keys(d, "i907").await;
         let n = 7;
-        noise(d, &other, &k, n).await;
+        noise(d, &other_seed, &k, n).await;
         let now = chrono::Utc::now();
 
         // Quarantine markers about K: the `quarantine:` family only.
@@ -144,7 +151,7 @@ pub(crate) mod bodies {
             "dimension": crate::federation::types::owner_binding::DIMENSION,
             "id": id,
         });
-        let mut binding: Attestation = ts::bare_attestation(&id, &other, &k, &env);
+        let mut binding: Attestation = ts::bare_attestation(&id, &other_seed, &k, &env);
         binding.attestation_type = attestation_type::DELEGATES_TO.into();
         let _ = read_probe::take();
         crate::federation::ownership_reclaim::check_post_reclaim_rebinding_admission(d, &binding)
@@ -154,8 +161,8 @@ pub(crate) mod bodies {
 
         // The node's trust-root signal walks ITS whole authored slice: in
         // pages, every row once, and it is readable.
-        let (me, _) = keys(d, "i907me").await;
-        noise(d, &me, &other, n).await;
+        let [(me, me_seed), _] = keys(d, "i907me").await;
+        noise(d, &me_seed, &other, n).await;
         let _ = read_probe::take();
         let signal =
             crate::federation::node_state::resolve_trust_root_signal(d, Some(&me), None, now).await;
@@ -184,12 +191,12 @@ pub(crate) mod bodies {
     /// a group's public charter and the family's charter rows are held by
     /// I535/I540/I547.)
     pub async fn i908_consent_and_audience_folds_read_bounded(d: &dyn FederationDirectory) {
-        let (k, other) = keys(d, "i908").await;
+        let [(k, k_seed), (other, other_seed)] = keys(d, "i908").await;
         let n = 7;
-        noise(d, &other, &k, n).await;
+        noise(d, &other_seed, &k, n).await;
         // The node's own noise about itself, too: the community-trust read
         // pins the node as author AND subject.
-        noise(d, &k, &k, n).await;
+        noise(d, &k_seed, &k, n).await;
 
         let _ = read_probe::take();
         let consent =
@@ -248,9 +255,9 @@ pub(crate) mod bodies {
     /// The content-class flag reads one dimension's `scores` rows. `d` must
     /// know its node key (the content-class door asks for it).
     pub async fn i909_identity_fact_folds_read_bounded(d: &dyn FederationDirectory) {
-        let (k, other) = keys(d, "i909").await;
+        let [(k, _), (_other, other_seed)] = keys(d, "i909").await;
         let n = 7;
-        noise(d, &other, &k, n).await;
+        noise(d, &other_seed, &k, n).await;
         let now = chrono::Utc::now();
 
         let _ = read_probe::take();
@@ -302,10 +309,10 @@ pub(crate) mod bodies {
     /// at-rest cascade) read narrowed; the subject's wire refs walk its slice
     /// in pages, each row once.
     pub async fn i911_custody_config_and_index_folds_read_bounded(d: &dyn FederationDirectory) {
-        let (k, other) = keys(d, "i911").await;
+        let [(k, k_seed), (other, other_seed)] = keys(d, "i911").await;
         let n = 7;
-        noise(d, &k, &other, n).await;
-        noise(d, &other, &k, n).await;
+        noise(d, &k_seed, &other, n).await;
+        noise(d, &other_seed, &k, n).await;
         let now = chrono::Utc::now();
 
         let _ = read_probe::take();
@@ -349,9 +356,9 @@ pub(crate) mod bodies {
     /// about the key; `list_signed_records(Attestation)` — every row about the
     /// subject, by definition — walks the slice in pages, each row once.
     pub async fn i912_trait_default_bodies_read_bounded(d: &dyn FederationDirectory) {
-        let (k, other) = keys(d, "i912").await;
+        let [(k, _), (_other, other_seed)] = keys(d, "i912").await;
         let n = 7;
-        noise(d, &other, &k, n).await;
+        noise(d, &other_seed, &k, n).await;
 
         let _ = read_probe::take();
         let delegations = d.delegations_to(&k).await.expect("I912 delegations_to");

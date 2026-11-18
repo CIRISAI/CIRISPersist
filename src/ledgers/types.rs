@@ -80,9 +80,9 @@ pub enum RegisterOutcome {
 
 /// Outcome of [`crate::ledgers::LedgerService::advance_head`].
 ///
-/// The fork-shaped case — a DIFFERENT hash at the CURRENT seq — is not an
-/// outcome: it is `Error::Conflict`, because the door refuses rather than
-/// choosing a winner (L8: detection is the roster's, adjudication is the
+/// The fork-shaped case — a DIFFERENT hash at the CURRENT seq — is
+/// [`AdvanceOutcome::Contested`] (v62.0.0, CC 2.7 rc21 X4): neither head is
+/// chosen, both are kept (L8: detection is the roster's, adjudication is the
 /// adjudication plane's, and this table is neither).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,4 +94,10 @@ pub enum AdvanceOutcome {
     /// The offered seq is below the stored head — normal under
     /// replication, recorded as a no-op, never an error.
     Stale,
+    /// v62.0.0 (wave GC6; CC 2.7 rc21 X4) — two heads at one seq: the
+    /// ledger is CONTESTED (`ledger_triple_contested`). Both heads are kept
+    /// (fork evidence), neither concludes (no stored head), and every later
+    /// advance answers this, whichever head arrived first. Was
+    /// `Error::Conflict` (first-wins). APPENDED.
+    Contested,
 }

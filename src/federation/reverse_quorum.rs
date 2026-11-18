@@ -1988,6 +1988,29 @@ where
     admit_objection(directory, objection, Some(action)).await
 }
 
+/// v62.0.0 (wave GC7; CC 2.7.3) — a vote-row gate that read ANOTHER row
+/// (the cohort's record and protocol, the named action or objection) is a
+/// fold condition: under a fold attempt it marks the row HELD with the
+/// reason's own token; outside one (these local doors, today) the answer is
+/// the `Refused` it was. The shape and signature gates stay refusals.
+fn held_as(reason: ObjectionRefusalReason) -> ObjectionRefusalReason {
+    super::edition2::fold::hold_detail(
+        reason.as_str(),
+        format!("reverse_quorum: {}", reason.as_str()),
+    );
+    reason
+}
+
+/// v62.0.0 (wave GC7) — declare a vote row's fold inputs: its cohort and the
+/// rows it names, so it re-folds when any of them lands or changes.
+fn declare_reads(cohort_key_id: &str, named: &[&str]) {
+    use super::edition2::fold::{reads, Dep};
+    reads(Dep::key(cohort_key_id));
+    for n in named {
+        reads(Dep::row_hex(n).unwrap_or_else(|| Dep::key(n)));
+    }
+}
+
 /// The one objection door: `supplied = None` reads the action by the id the
 /// objection names ([`record_objection`]); `Some` takes the caller's
 /// [`ActionRef`] and checks the objection names it
@@ -2015,11 +2038,12 @@ where
         return refused(ObjectionRefusalReason::MalformedEnvelope);
     }
 
+    declare_reads(&cohort_key_id, &[action_id.as_str()]);
     let Some((_, policy)) = cohort_state(directory, cohort, &cohort_key_id).await? else {
-        return refused(ObjectionRefusalReason::CohortUnknown);
+        return refused(held_as(ObjectionRefusalReason::CohortUnknown));
     };
     if policy.is_none() {
-        return refused(ObjectionRefusalReason::NotGoverned);
+        return refused(held_as(ObjectionRefusalReason::NotGoverned));
     }
 
     // ── NO MEMBERSHIP GATE (CC's ruling on #1198, item 2). Every verifiable
@@ -2036,7 +2060,7 @@ where
         .as_ref()
         .is_some_and(|(actor, _)| objection.attested_key_id != *actor)
     {
-        return refused(ObjectionRefusalReason::NotFiledAgainstActor);
+        return refused(held_as(ObjectionRefusalReason::NotFiledAgainstActor));
     }
 
     // The objector's own signature, re-verified against pubkeys resolved from
@@ -2111,8 +2135,12 @@ where
         return Ok(refuse(ObjectionRefusalReason::MalformedEnvelope, empty));
     };
 
+    declare_reads(&cohort_key_id, &[objection_id.as_str()]);
     let Some((roster, policy)) = cohort_state(directory, cohort, &cohort_key_id).await? else {
-        return Ok(refuse(ObjectionRefusalReason::CohortUnknown, empty));
+        return Ok(refuse(
+            held_as(ObjectionRefusalReason::CohortUnknown),
+            empty,
+        ));
     };
     // CIRISPersist#1198 (CC 4.5.13) — the m-of-n counts persons.
     let scrubs = dismissal.scrubs();
@@ -2130,7 +2158,7 @@ where
     let roster_size = persons.seated(&roster).len();
     let Some(policy) = policy else {
         return Ok(refuse(
-            ObjectionRefusalReason::NotGoverned,
+            held_as(ObjectionRefusalReason::NotGoverned),
             DismissalQuorum {
                 counted: 0,
                 required: 0,
@@ -2155,7 +2183,7 @@ where
         .is_some_and(|o| dismissal.attested_key_id != o.attested_key_id)
     {
         return Ok(refuse(
-            ObjectionRefusalReason::NotFiledAgainstActor,
+            held_as(ObjectionRefusalReason::NotFiledAgainstActor),
             DismissalQuorum {
                 counted: 0,
                 required: policy.dismissal_threshold(roster_size),
@@ -2294,16 +2322,17 @@ where
         return refused(ObjectionRefusalReason::MalformedEnvelope);
     }
 
+    declare_reads(&cohort_key_id, &[action_id.as_str(), objection_id.as_str()]);
     let Some((_, policy)) = cohort_state(directory, cohort, &cohort_key_id).await? else {
-        return refused(ObjectionRefusalReason::CohortUnknown);
+        return refused(held_as(ObjectionRefusalReason::CohortUnknown));
     };
     let Some(policy) = policy else {
-        return refused(ObjectionRefusalReason::NotGoverned);
+        return refused(held_as(ObjectionRefusalReason::NotGoverned));
     };
     // A ballot on a cohort with no steward tier could never be counted by
     // anything: no deadline, no silence, no escalated pool.
     if policy.steward.is_none() {
-        return refused(ObjectionRefusalReason::StewardTierNotAdopted);
+        return refused(held_as(ObjectionRefusalReason::StewardTierNotAdopted));
     }
 
     // The respondent pool is a SUBSET of the roster, and the FOLD holds that
@@ -2317,7 +2346,7 @@ where
         // Filed where the fold looks (see `objections_against`), or stored and
         // never counted.
         if ballot.attested_key_id != actor {
-            return refused(ObjectionRefusalReason::NotFiledAgainstActor);
+            return refused(held_as(ObjectionRefusalReason::NotFiledAgainstActor));
         }
         // RECUSAL, at the door: the actor does not vote on the objection to
         // their own act. Refused rather than silently dropped by the fold, so a
@@ -2326,10 +2355,10 @@ where
         // devices are recused by the fold, which knows them whatever order the
         // rows arrived in.
         if ballot.attesting_key_id == actor {
-            return refused(ObjectionRefusalReason::ActorRecused);
+            return refused(held_as(ObjectionRefusalReason::ActorRecused));
         }
         if ballot.asserted_at < asserted_at {
-            return refused(ObjectionRefusalReason::BallotPredatesAction);
+            return refused(held_as(ObjectionRefusalReason::BallotPredatesAction));
         }
     }
 
@@ -4334,152 +4363,6 @@ pub(crate) mod test_support {
         )
         .await
         .expect("put_community");
-    }
-
-    /// v50.0.0 (CIRISPersist#925 review M2/P3) — **a `node`-bearing founder
-    /// is no reverse-quorum duty-holder.** Two twin legacy infrastructure rooms
-    /// (planted through the replicated entry, `apply_replicated_community`,
-    /// which admits them as data) under `reverse_quorum:1/7:60+escalate:0:3`, founders
-    /// `{human, second}`. In each, the human removes `x`; a member objects in
-    /// the window; the second founder UPHOLDS the objection in the steward
-    /// window; three members OVERRULE it.
-    ///
-    /// - Where the second founder is NOT `node`-bearing it is a seated
-    ///   duty-holder: its ruling upholds (a strict majority of one), escalation
-    ///   never opens, the objection counts, and the removal is REVERSED — `x`
-    ///   is back.
-    /// - Where it IS `node`-bearing (it agreed to be an occurrence of a `node`
-    ///   identity) it is no duty-holder: nobody is seated, the tier escalates
-    ///   on the passed deadline, the respondent pool dismisses the objection
-    ///   3-to-1, and the removal STANDS — its uphold counted only as one
-    ///   respondent ballot.
-    ///
-    /// Generic over the backend (CIRISPersist#1198): the objection is held
-    /// through [`hold_objection_at`], so this node's window opens at `t`.
-    pub(crate) async fn exercise_node_bearing_founder_is_no_reverse_quorum_duty_holder<D>(
-        store: &D,
-        suffix: &str,
-    ) where
-        D: crate::federation::attestation_admit::AttestationStore,
-    {
-        use crate::federation::tier_ingest::test_support as ts;
-        let dir: &dyn FederationDirectory = store;
-        let node_identity = format!("p3node-{suffix}");
-        ts::register_hybrid_key_as(
-            dir,
-            &node_identity,
-            &node_identity,
-            crate::federation::types::identity_type::NODE,
-        )
-        .await;
-        for (leg, bound) in [("bound", true), ("free", false)] {
-            let name = |n: &str| format!("p3{n}-{leg}-{suffix}");
-            let (human, second, objector, x) =
-                (name("human"), name("second"), name("objector"), name("x"));
-            let overrulers = [name("m1"), name("m2"), name("m3")];
-            let room = name("room");
-            for k in [&human, &second, &objector, &x]
-                .into_iter()
-                .chain(overrulers.iter())
-            {
-                register_user_key(dir, k).await;
-            }
-            let t = Utc::now() - Duration::seconds(300);
-            if bound {
-                for (signer, at) in [
-                    (&node_identity, t - Duration::seconds(20)),
-                    (&second, t - Duration::seconds(10)),
-                ] {
-                    dir.put_identity_occurrence(
-                        ts::signed_content_only_occurrence(signer, &node_identity, &second, at)
-                            .await,
-                    )
-                    .await
-                    .unwrap_or_else(|e| panic!("({suffix}) P3: the binding: {e}"));
-                }
-            }
-            let founded = t - Duration::seconds(3600);
-            let member = |k: &String, role: &str| CommunityMember {
-                key_id: k.clone(),
-                joined_at: founded,
-                role: Some(role.to_owned()),
-            };
-            let mut members = vec![member(&human, "founder"), member(&second, "founder")];
-            for k in [&objector, &x].into_iter().chain(overrulers.iter()) {
-                members.push(member(k, "member"));
-            }
-            // v61 (CIRISPersist#1148) — a directory that declares its node key
-            // stores a replicated record only when it is in the record's
-            // audience: the declaring host is seated as a plain member.
-            if let Some(host) = dir.node_key_id() {
-                if dir.lookup_public_key(&host).await.unwrap().is_none() {
-                    register_user_key(dir, &host).await;
-                }
-                members.push(member(&host, "member"));
-            }
-            let planted = dir
-                .apply_replicated_community(ts::sign_community(
-                    &human,
-                    Community {
-                        prev_head_digest: String::new(),
-                        charter_digest: String::new(),
-                        community_key_id: room.clone(),
-                        community_name: "legacy infrastructure commons".into(),
-                        members,
-                        founded_at: founded,
-                        consensus_protocol: "reverse_quorum:1/7:60+escalate:0:3".into(),
-                        policy_blob: Some(
-                            serde_json::json!({ "cohort_subkind": "infrastructure" }),
-                        ),
-                        persist_row_hash: String::new(),
-                    },
-                ))
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("({suffix}) P3: the legacy room is replicated data: {e}")
-                });
-            assert_eq!(
-                planted,
-                crate::federation::ReplicatedCommunityOutcome::Inserted,
-                "({suffix}) P3: the replicated entry admits the legacy room as data"
-            );
-            // v62.0.0 (slice C) — `reverse_quorum` is no membership protocol.
-            // CC 3.2: "Not a membership rule: reverse quorum. … It admits no
-            // one and confers no consent on anyone's behalf." The human's
-            // removal of x — the roster change whose reversal this witness
-            // weighed the node-bearing founder's ruling on — is refused, so
-            // the roster plane never reaches the escalation fold and no
-            // founder's ruling (node-bearing or not) moves the roster.
-            let e = dir
-                .put_community_membership_revocation(ts::sign_community_membership_revocation(
-                    &human,
-                    crate::federation::types::CommunityMembershipRevocation {
-                        community_key_id: room.clone(),
-                        removed_identity_key_id: x.clone(),
-                        removed_at: t,
-                        effective_at: t,
-                        reason: None,
-                        witness_set: vec![],
-                        persist_row_hash: String::new(),
-                    },
-                ))
-                .await
-                .expect_err("CC 3.2: reverse_quorum admits no removal");
-            assert!(
-                matches!(&e, Error::RosterAuthorityUnauthorized { rule, .. }
-                    if *rule == "roster_consensus_unevaluable"),
-                "({suffix}) P3 {leg}: {e:?}"
-            );
-            let active: Vec<String> = dir
-                .active_community_members(&room)
-                .await
-                .expect("active")
-                .into_iter()
-                .map(|m| m.key_id)
-                .collect();
-            assert!(active.contains(&x), "({suffix}) P3 {leg}: x stays seated");
-            let _ = (&objector, &overrulers, &second, store);
-        }
     }
 
     /// v49.0.0 — **I181: a reverse-quorum roster removal is protective and

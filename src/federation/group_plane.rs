@@ -1217,6 +1217,9 @@ where
             return Ok(GroupPlaneApplied::HeldEquivalent);
         }
     }
+    // v62.0.0 (wave GC4) — the group this row changes: a fold that holds
+    // the row below reads every row about it.
+    let group_key: String = signed.group_key_id().to_owned();
     match signed {
         GroupSigned::Family(s) => dir.put_family(s).await?,
         GroupSigned::Community(s) => match door {
@@ -1227,17 +1230,32 @@ where
                     // X2 build fix: K1's fork held as a tip is applied, not refused.
                     O::Inserted | O::Superseded | O::Unchanged | O::HeldAsTip => {}
                     O::Refused { reason } => {
-                        return Ok(GroupPlaneApplied::Refused(match reason {
+                        let token = match reason {
                             super::group_amendment::ReplicatedCommunityRefusal::ConflictingRecord => {
-                                "conflicting_record"
+                                super::edition2::fold::reason::CONFLICTING_RECORD
                             }
                             super::group_amendment::ReplicatedCommunityRefusal::DegradesConformance => {
-                                "degrades_conformance"
+                                super::edition2::fold::reason::DEGRADES_CONFORMANCE
                             }
                             super::group_amendment::ReplicatedCommunityRefusal::NotInAudience => {
-                                "not_in_audience"
+                                super::edition2::fold::reason::NOT_IN_AUDIENCE
                             }
-                        }));
+                        };
+                        // v62.0.0 (wave GC4; CC 2.7.3) — each reads the held
+                        // record of the community (or this node's place in
+                        // its audience): inside a fold attempt the row is
+                        // HELD with the typed door's token, re-folded by any
+                        // row about the community. The caller's refusal
+                        // stands outside one.
+                        super::edition2::fold::reads(super::edition2::fold::Dep::key(&group_key));
+                        super::edition2::fold::hold_detail(
+                            token,
+                            format!(
+                                "group-plane row {} not applied: {token}",
+                                row.attestation_id
+                            ),
+                        );
+                        return Ok(GroupPlaneApplied::Refused(token));
                     }
                 }
             }
@@ -1277,7 +1295,19 @@ where
         if dir.get_attestation(&row.attestation_id).await?.is_some() {
             GroupPlaneApplied::Changed
         } else {
-            GroupPlaneApplied::Refused("held_object_differs")
+            // v62.0.0 (wave GC4; CC 2.7.2) — another object is held under
+            // the same key (first arrival kept it): this row is HELD beside
+            // it, concluding nothing, and re-folds on any row about the
+            // group.
+            super::edition2::fold::reads(super::edition2::fold::Dep::key(&group_key));
+            super::edition2::fold::hold_detail(
+                super::edition2::fold::reason::HELD_OBJECT_DIFFERS,
+                format!(
+                    "group-plane row {} not applied: held_object_differs",
+                    row.attestation_id
+                ),
+            );
+            GroupPlaneApplied::Refused(super::edition2::fold::reason::HELD_OBJECT_DIFFERS)
         },
     )
 }
@@ -1380,11 +1410,20 @@ pub async fn refuse_if_community_dissolved<D>(dir: &D, community_key_id: &str) -
 where
     D: super::FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC4; CC 2.7.3) — dissolution is read from OTHER rows
+    // (the community's record rows and the cosigned `withdraws` naming
+    // them): a change to a dissolved community is HELD
+    // (`group_dissolved`), and re-folds when a row about the community
+    // lands or is withdrawn.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(community_key_id));
     match community_dissolved_at(dir, community_key_id).await? {
-        Some(dissolved_at) => Err(Error::GroupDissolved {
-            group_key_id: community_key_id.to_owned(),
-            dissolved_at,
-        }),
+        Some(dissolved_at) => Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::GROUP_DISSOLVED,
+            Error::GroupDissolved {
+                group_key_id: community_key_id.to_owned(),
+                dissolved_at,
+            },
+        )),
         None => Ok(()),
     }
 }
@@ -1429,29 +1468,53 @@ pub(crate) async fn check_cosigned_withdraws(
     } else {
         4
     };
+    // v62.0.0 (wave GC4; CC 2.7.3) — every verdict below reads the NAMED
+    // target row (its kind, its signer) and, for a group's decision, the
+    // group's record and roster: they are fold conditions. The `withdraws`
+    // is HELD on a failed one (never refused), reading the target and the
+    // group, so it re-folds when either changes.
+    super::edition2::fold::reads(
+        super::edition2::fold::Dep::row_hex(&target.attestation_id)
+            .unwrap_or_else(|| super::edition2::fold::Dep::key(&target.attestation_id)),
+    );
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(signed.group_key_id()));
     match (family, consensus_source_for(family.dimension())) {
         (GroupPlaneFamily::Roster, _) if signed.kind() == GroupKind::Family => {
-            Err(Error::InvalidArgument(format!(
+            Err(super::edition2::fold::hold(
+                super::edition2::fold::reason::GROUP_RECORD_WITHDRAWS_REFUSED,
+                Error::InvalidArgument(format!(
                 "{GROUP_RECORD_WITHDRAWS_REFUSED}: withdraws names the family record row {} of {}: \
                  a family's dissolution is its quorum-proved terminal amendment (dissolved_at, \
                  CIRISPersist#956), never a withdraws; a record changes by a supersede under \
                  its protocol",
                 target.attestation_id,
                 signed.group_key_id()
-            )))
+            )),
+            ))
         }
         (_, Some(ConsensusSource::Signer)) => {
             if issuer == target.attesting_key_id {
                 Ok(Some(1))
             } else {
-                Err(Error::WithdrawsNotAdmitted {
-                    issuer: issuer.to_owned(),
-                    target_attestation_id: target.attestation_id.clone(),
-                    beyond_delegation_depth_cap: false,
-                })
+                Err(super::edition2::fold::hold(
+                    super::edition2::fold::reason::WITHDRAWS_NOT_ADMITTED,
+                    Error::WithdrawsNotAdmitted {
+                        issuer: issuer.to_owned(),
+                        target_attestation_id: target.attestation_id.clone(),
+                        beyond_delegation_depth_cap: false,
+                    },
+                ))
             }
         }
         (_, _) => {
+            // v62.0.0 (wave GC4) — the count reads the group's roster: a
+            // membership change of any group re-folds it (the coarse family
+            // dependency; a roster version touches `key:<group>`, read above).
+            super::edition2::fold::reads(super::edition2::fold::Dep::Family(
+                ciris_verify_core::namespace_match::family_id(
+                    super::edition2::group::MEMBERSHIP_PREFIX,
+                ),
+            ));
             let group = signed.group_key_id();
             let (protocol, policy_blob, roster): (String, Option<serde_json::Value>, Vec<_>) =
                 match signed.kind() {
@@ -1559,27 +1622,38 @@ pub(crate) async fn check_cosigned_withdraws(
             if verdict.admits() {
                 Ok(Some(rule))
             } else {
-                Err(Error::RosterAuthorityUnauthorized {
-                    group_key_id: group.to_owned(),
-                    offered_authority_key_id: issuer.to_owned(),
-                    rule: super::ROSTER_CONSENSUS_INSUFFICIENT,
-                    // v61.4.0 (CIRISPersist#1250; CC 5.2) — the eligible
-                    // signers go only to an issuer seated in the roster (as
-                    // itself or as one of its person's devices).
-                    shortfall: verdict
-                        .shortfall()
-                        .cloned()
-                        .map(|s| s.for_caller(ids.iter().any(|k| persons.same_person(k, issuer)))),
-                })
+                // v62.0.0 (wave GC4; CC 2.6.1.9) — the voices are short of
+                // the group's protocol over its roster: HELD `count_short`
+                // (a later voice, a roster change, re-folds it; V1b's
+                // shortfall shape).
+                Err(super::edition2::fold::hold(
+                    super::edition2::fold::reason::COUNT_SHORT,
+                    Error::RosterAuthorityUnauthorized {
+                        group_key_id: group.to_owned(),
+                        offered_authority_key_id: issuer.to_owned(),
+                        rule: super::ROSTER_CONSENSUS_INSUFFICIENT,
+                        // v61.4.0 (CIRISPersist#1250; CC 5.2) — the eligible
+                        // signers go only to an issuer seated in the roster (as
+                        // itself or as one of its person's devices).
+                        shortfall: verdict.shortfall().cloned().map(|s| {
+                            s.for_caller(ids.iter().any(|k| persons.same_person(k, issuer)))
+                        }),
+                    },
+                ))
             }
         }
     }
 }
 
 fn unknown_group(group: &str) -> Error {
-    Error::InvalidArgument(format!(
-        "withdraws names a roster event of {group}, a group this node does not hold"
-    ))
+    // v62.0.0 (wave GC4; CC 2.7.3) — the group is not held: the `withdraws`
+    // WAITS for it (`link_unheld`; its key is already read above).
+    super::edition2::fold::hold(
+        super::edition2::fold::reason::LINK_UNHELD,
+        Error::InvalidArgument(format!(
+            "withdraws names a roster event of {group}, a group this node does not hold"
+        )),
+    )
 }
 
 /// v61 (CIRISPersist#991) — **the projection follows a retraction**: once a
@@ -1776,8 +1850,7 @@ mod tests {
     }
 
     /// A record's row is signed at its head instant: an amendment's
-    /// `amended_at`, else `founded_at`. An Ed25519-only record has no row;
-    /// a row reads back to the object it was minted from.
+    /// `amended_at`, else `founded_at`. A row reads back to the object it was minted from.
     #[test]
     fn a_record_row_is_signed_at_its_head_instant() {
         let founded = plan_group_row(&family(None)).unwrap().unwrap();
@@ -1803,11 +1876,8 @@ mod tests {
             Some(family(None)),
             "the row carries its object"
         );
-        let mut ed25519_only = family(None);
-        if let GroupSigned::Family(f) = &mut ed25519_only {
-            f.scrub_signature_pqc = None;
-        }
-        assert!(plan_group_row(&ed25519_only).unwrap().is_none());
+        // v62.0.0: the Ed25519-only (hybrid-pending) leg is deleted; a
+        // composite signature is atomic.
         // Unsigned either way: no signer, or no signature.
         for unsigned in [
             |f: &mut SignedFamily| f.authority_key_id.clear(),

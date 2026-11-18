@@ -627,65 +627,79 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i_ifp_1_open_settles_a_v60_node_sqlite() {
-        let dir = tempfile::tempdir().unwrap();
-        let dsn = format!("sqlite:///{}", dir.path().join("node.db").display());
-        let t = tag();
-        let alias = format!("ifp-node-{t}");
-        let open = || {
-            let (dsn, alias) = (dsn.clone(), alias.clone());
-            async move {
-                let engine = crate::Engine::with_signer_pre_genesis(
-                    crate::federation::tier_ingest::test_support::local_signer(&alias),
-                    &dsn,
-                )
-                .await
-                .unwrap();
-                let _ = engine
-                    .register_self_federation_key(
-                        crate::federation::types::identity_type::NODE,
-                        None,
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                let backend = engine.sqlite_backend().unwrap().clone();
-                Opened { engine, backend }
-            }
-        };
-        Box::pin(bodies::i_ifp_1_open_settles_a_v60_node(open, &t)).await;
+        // v62 (E4): HELD — earlier-form behaviour (the v60->v61 open-time pass over stored JSON rows); a DELETE candidate with settle_instant_forms in F (its bodies are shared with ffi/pyo3/instant_form_open_tests.rs). Runs in the earlier form (wrapped)
+        // until it flips.
+        Box::pin(
+            crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
+                let dir = tempfile::tempdir().unwrap();
+                let dsn = format!("sqlite:///{}", dir.path().join("node.db").display());
+                let t = tag();
+                let alias = format!("ifp-node-{t}");
+                let open = || {
+                    let (dsn, alias) = (dsn.clone(), alias.clone());
+                    async move {
+                        let engine = crate::Engine::with_signer_pre_genesis(
+                            crate::federation::tier_ingest::test_support::local_signer(&alias),
+                            &dsn,
+                        )
+                        .await
+                        .unwrap();
+                        let _ = engine
+                            .register_self_federation_key(
+                                crate::federation::types::identity_type::NODE,
+                                None,
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        let backend = engine.sqlite_backend().unwrap().clone();
+                        Opened { engine, backend }
+                    }
+                };
+                Box::pin(bodies::i_ifp_1_open_settles_a_v60_node(open, &t)).await;
+            }),
+        )
+        .await
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i_ifp_1_open_settles_a_v60_node_postgres() {
-        let Some(dsn) = crate::test_pg::isolated_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let t = tag();
-        let alias = format!("ifp-node-{t}");
-        let open = || {
-            let (dsn, alias) = (dsn.clone(), alias.clone());
-            async move {
-                let engine = crate::Engine::with_signer_pre_genesis(
-                    crate::federation::tier_ingest::test_support::local_signer(&alias),
-                    &dsn,
-                )
-                .await
-                .unwrap();
-                let _ = engine
-                    .register_self_federation_key(
-                        crate::federation::types::identity_type::NODE,
-                        None,
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                let backend = engine.postgres_backend().unwrap().clone();
-                Opened { engine, backend }
-            }
-        };
-        Box::pin(bodies::i_ifp_1_open_settles_a_v60_node(open, &t)).await;
+        // v62 (E4): HELD — earlier-form behaviour (the v60->v61 open-time pass over stored JSON rows); a DELETE candidate with settle_instant_forms in F (its bodies are shared with ffi/pyo3/instant_form_open_tests.rs). Runs in the earlier form (wrapped)
+        // until it flips.
+        Box::pin(
+            crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
+                let Some(dsn) = crate::test_pg::isolated_dsn() else {
+                    eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                    return;
+                };
+                let t = tag();
+                let alias = format!("ifp-node-{t}");
+                let open = || {
+                    let (dsn, alias) = (dsn.clone(), alias.clone());
+                    async move {
+                        let engine = crate::Engine::with_signer_pre_genesis(
+                            crate::federation::tier_ingest::test_support::local_signer(&alias),
+                            &dsn,
+                        )
+                        .await
+                        .unwrap();
+                        let _ = engine
+                            .register_self_federation_key(
+                                crate::federation::types::identity_type::NODE,
+                                None,
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        let backend = engine.postgres_backend().unwrap().clone();
+                        Opened { engine, backend }
+                    }
+                };
+                Box::pin(bodies::i_ifp_1_open_settles_a_v60_node(open, &t)).await;
+            }),
+        )
+        .await
     }
 }
 

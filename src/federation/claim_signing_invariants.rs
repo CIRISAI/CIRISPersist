@@ -107,7 +107,7 @@ mod tests {
             "I79: signed by the holder's derived key"
         );
         assert!(
-            claim.scrub_signature_pqc.is_some(),
+            crate::federation::edition2::fixture_switch::carried_statement(&claim).is_some(),
             "I79: an Engine with a LocalSigner signs the holding claim HYBRID — a \
              classical-only claim is confined to local tier (CC 5.3.2.4.3.1) and every peer \
              refuses it; row {} (tier={}) carries no PQC half",
@@ -163,7 +163,7 @@ mod tests {
             "I79/2: signed by the holder's derived key"
         );
         assert!(
-            claim.scrub_signature_pqc.is_some(),
+            crate::federation::edition2::fixture_switch::carried_statement(&claim).is_some(),
             "I79/2: the commons door announces HYBRID when the Engine has a LocalSigner; \
              row {} (tier={}) carries no PQC half",
             claim.attestation_type,
@@ -222,7 +222,6 @@ mod tests {
         let attester = crate::federation::tier_ingest::test_support::local_signer("i81-attester");
         let other = crate::federation::tier_ingest::test_support::local_signer("i81-other");
         assert_ne!(attester.federation_id().await, other.federation_id().await);
-        // v62.0.0 — the signer's id is its composite identity-ref.
         let key = attester.federation_id().await;
         let sha = [0x81u8; 32];
         let scope = ClaimScope::of_content(CryptoTier::Plaintext, "federation", None).unwrap();
@@ -279,7 +278,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(body),
                 None,
-                &local.derived_key_id(),
+                &local.federation_id().await,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -340,7 +339,7 @@ mod tests {
             Some(local.clone()),
         );
 
-        let node_key = local.derived_key_id();
+        let node_key = local.federation_id().await;
 
         // The commons door: the blob is addressed by a sha the CALLER knows, so
         // "was anything stored?" is directly observable — no guessing at a
@@ -447,7 +446,7 @@ mod tests {
         use crate::signing::LocalSigner;
 
         let node = crate::federation::tier_ingest::test_support::local_signer("i89-node");
-        let node_key = node.derived_key_id();
+        let node_key = node.federation_id_now();
         assert!(
             node.pqc_signer().is_some(),
             "I89: precondition — the node signer is hybrid"
@@ -461,7 +460,7 @@ mod tests {
         // PQC half, so only the identity clause can reject it.
         let foreign = crate::federation::tier_ingest::test_support::local_signer("i89-foreign");
         assert_ne!(
-            foreign.derived_key_id(),
+            foreign.federation_id_now(),
             node_key,
             "I89: precondition — the foreign signer is a different identity"
         );
@@ -477,7 +476,7 @@ mod tests {
         // and the message says the refusal precedes any write.
         let ed = ed25519_dalek::SigningKey::from_bytes(&[0x89u8; 32]);
         let classical = LocalSigner::from_parts(ed, "i89-classical".to_owned(), None, None);
-        let classical_key = classical.derived_key_id();
+        let classical_key = classical.federation_id_now();
         let err = check_announcing_signer(&classical, &classical_key)
             .expect_err("I89: a PQC-less LocalSigner must not announce");
         let msg = err.to_string();
@@ -721,46 +720,53 @@ mod tests {
     /// retroactively un-shared; admitting the row would leave a revocation
     /// the emitter believes took effect and nothing enforces. Forward secrecy
     /// on this axis is rotation (§15).
+    ///
+    /// v62.0.0 (slice E6) — kept in the earlier form on purpose (its builders
+    /// run under `with_earlier_form`): the targets are seeded below the doors
+    /// under peer-chosen ids, and `check_withdraws_admission` is judged over
+    /// the typed row, which an edition-2 composer could only name by a
+    /// computed id.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i85_a_withdraws_naming_a_key_grant_row_is_refused_sqlite() {
-        use crate::federation::tier_ingest::test_support as ts;
-        use crate::federation::types::identity_type::USER;
-        use crate::store::Backend as _;
-        let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        backend.run_migrations().await.unwrap();
-        let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("i85-minter-{run}");
-        ts::register_identity_key(&backend, &minter, USER).await;
-        // A HELD retired key_grant carrier (a v54 node's set, kept on an
-        // upgraded node — v55.0.0, #989: refused at every door now, so it is
-        // seeded below the doors), and a `scores` key-grant ROW, the v55
-        // shape (seeded the same way: this witness is about the composer
-        // gate, not the row's own admission).
-        let target_id = format!("kg-{run}");
-        let row_id = format!("kgr-{run}");
-        {
-            let conn = backend.conn_handle();
-            let conn = conn.lock();
-            for (id, ty, env) in [
-                (
-                    target_id.clone(),
-                    "key_grant:epoch:v1",
-                    serde_json::json!({ "id": target_id, "kind": "key_grant" }),
-                ),
-                (
-                    row_id.clone(),
-                    "scores",
-                    serde_json::json!({
-                        "id": row_id,
-                        "dimension": crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION,
-                    }),
-                ),
-            ] {
-                conn.execute(
-                    "INSERT INTO federation_attestations (\
+        Box::pin(crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
+            use crate::federation::tier_ingest::test_support as ts;
+            use crate::federation::types::identity_type::USER;
+            use crate::store::Backend as _;
+            let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            backend.run_migrations().await.unwrap();
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let minter = format!("i85-minter-{run}");
+            ts::register_identity_key(&backend, &minter, USER).await;
+            // A HELD retired key_grant carrier (a v54 node's set, kept on an
+            // upgraded node — v55.0.0, #989: refused at every door now, so it is
+            // seeded below the doors), and a `scores` key-grant ROW, the v55
+            // shape (seeded the same way: this witness is about the composer
+            // gate, not the row's own admission).
+            let target_id = format!("kg-{run}");
+            let row_id = format!("kgr-{run}");
+            {
+                let conn = backend.conn_handle();
+                let conn = conn.lock();
+                for (id, ty, env) in [
+                    (
+                        target_id.clone(),
+                        "key_grant:epoch:v1",
+                        serde_json::json!({ "id": target_id, "kind": "key_grant" }),
+                    ),
+                    (
+                        row_id.clone(),
+                        "scores",
+                        serde_json::json!({
+                            "id": row_id,
+                            "dimension": crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION,
+                        }),
+                    ),
+                ] {
+                    conn.execute(
+                        "INSERT INTO federation_attestations (\
                         attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
@@ -769,92 +775,109 @@ mod tests {
                      ) VALUES (?1, ?2, ?2, ?3, NULL, '2026-01-01T00:00:00Z', NULL, ?4, x'00', \
                         'c2ln', NULL, ?2, '2026-01-01T00:00:00Z', NULL, '0', 'federation', \
                         'community', '2026-01-01T00:00:00Z')",
-                    rusqlite::params![id, minter, ty, env.to_string()],
-                )
-                .expect("I85: the held row is seeded");
+                        rusqlite::params![id, minter, ty, env.to_string()],
+                    )
+                    .expect("I85: the held row is seeded");
+                }
             }
-        }
-        // v55.0.0 (#989, CC 3.3.2 rc7) — a withdraws or a recants naming the
-        // ROW is refused too, the sealer's own recants included.
-        for (kind, ty) in [
-            (
-                "withdraws",
-                crate::federation::types::attestation_type::WITHDRAWS,
-            ),
-            (
-                "recants",
-                crate::federation::types::attestation_type::RECANTS,
-            ),
-        ] {
-            let id = format!("{kind}-row-{run}");
-            let mut c = ts::bare_attestation(
-                &id,
-                &minter,
-                &minter,
-                &serde_json::json!({
-                    "id": id,
-                    "kind": kind,
-                    "references_attestation_id": row_id,
-                }),
-            );
-            c.attestation_type = ty.to_owned();
-            let c = ts::seal_row(&minter, c);
-            let err = crate::federation::admission::check_withdraws_admission(&backend, &c)
+            // v55.0.0 (#989, CC 3.3.2 rc7) — a withdraws or a recants naming the
+            // ROW is refused too, the sealer's own recants included.
+            for (kind, ty) in [
+                (
+                    "withdraws",
+                    crate::federation::types::attestation_type::WITHDRAWS,
+                ),
+                (
+                    "recants",
+                    crate::federation::types::attestation_type::RECANTS,
+                ),
+            ] {
+                let id = format!("{kind}-row-{run}");
+                let mut c = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+                    ts::bare_attestation(
+                        &id,
+                        &minter,
+                        &minter,
+                        &serde_json::json!({
+                            "id": id,
+                            "kind": kind,
+                            "references_attestation_id": row_id,
+                        }),
+                    )
+                });
+                c.attestation_type = ty.to_owned();
+                let c = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+                    ts::seal_row(&minter, c)
+                });
+                let err = crate::federation::admission::check_withdraws_admission(&backend, &c)
+                    .await
+                    .expect_err("I85: a composer naming a key-grant row is refused");
+                assert!(
+                    err.to_string().contains("cannot be retroactively"),
+                    "I85 ({kind} of the row): {err}"
+                );
+            }
+            let w_id = format!("w-{run}");
+            let mut w = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+                ts::bare_attestation(
+                    &w_id,
+                    &minter,
+                    &minter,
+                    &serde_json::json!({
+                        "id": w_id,
+                        "kind": "withdraws",
+                        "references_attestation_id": target_id,
+                    }),
+                )
+            });
+            w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.to_owned();
+            let w = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+                ts::seal_row(&minter, w)
+            });
+            let err = crate::federation::admission::check_withdraws_admission(&backend, &w)
                 .await
-                .expect_err("I85: a composer naming a key-grant row is refused");
+                .expect_err("I85: a withdraws on a key_grant row must be refused");
+            let msg = err.to_string();
             assert!(
-                err.to_string().contains("cannot be retroactively"),
-                "I85 ({kind} of the row): {err}"
+                msg.contains("cannot be retroactively un-shared") && msg.contains("rotate"),
+                "I85: the refusal says why and names the remedy: {msg}"
             );
-        }
-        let w_id = format!("w-{run}");
-        let mut w = ts::bare_attestation(
-            &w_id,
-            &minter,
-            &minter,
-            &serde_json::json!({
-                "id": w_id,
-                "kind": "withdraws",
-                "references_attestation_id": target_id,
-            }),
-        );
-        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.to_owned();
-        let w = ts::seal_row(&minter, w);
-        let err = crate::federation::admission::check_withdraws_admission(&backend, &w)
-            .await
-            .expect_err("I85: a withdraws on a key_grant row must be refused");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cannot be retroactively un-shared") && msg.contains("rotate"),
-            "I85: the refusal says why and names the remedy: {msg}"
-        );
-        // (b) PR #852 review — the DEFERRED case: the same withdraws arriving
-        // BEFORE its target. Nothing rechecks a deferred row when its target
-        // lands, so the verdict that needs no target — the declared type —
-        // is given now.
-        let absent = format!("kg-absent-{run}");
-        let mut deferred = ts::bare_attestation(
-            &format!("w2-{run}"),
-            &minter,
-            &minter,
-            &serde_json::json!({
-                "id": format!("w2-{run}"),
-                "kind": "withdraws",
-                "references_attestation_id": absent,
-                "references_attestation_type": "key_grant:epoch:v1",
-            }),
-        );
-        deferred.attestation_type =
-            crate::federation::types::attestation_type::WITHDRAWS.to_owned();
-        let deferred = ts::seal_row(&minter, deferred);
-        let err = crate::federation::admission::check_withdraws_admission(&backend, &deferred)
-            .await
-            .expect_err("I85 (b): a deferred withdraws declaring a key_grant target is refused");
-        assert!(
-            err.to_string()
-                .contains("cannot be retroactively un-shared"),
-            "I85 (b): {err}"
-        );
+            // (b) PR #852 review — the DEFERRED case: the same withdraws arriving
+            // BEFORE its target. Nothing rechecks a deferred row when its target
+            // lands, so the verdict that needs no target — the declared type —
+            // is given now.
+            let absent = format!("kg-absent-{run}");
+            let mut deferred =
+                crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+                    ts::bare_attestation(
+                        &format!("w2-{run}"),
+                        &minter,
+                        &minter,
+                        &serde_json::json!({
+                            "id": format!("w2-{run}"),
+                            "kind": "withdraws",
+                            "references_attestation_id": absent,
+                            "references_attestation_type": "key_grant:epoch:v1",
+                        }),
+                    )
+                });
+            deferred.attestation_type =
+                crate::federation::types::attestation_type::WITHDRAWS.to_owned();
+            let deferred = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+                ts::seal_row(&minter, deferred)
+            });
+            let err = crate::federation::admission::check_withdraws_admission(&backend, &deferred)
+                .await
+                .expect_err(
+                    "I85 (b): a deferred withdraws declaring a key_grant target is refused",
+                );
+            assert!(
+                err.to_string()
+                    .contains("cannot be retroactively un-shared"),
+                "I85 (b): {err}"
+            );
+        }))
+        .await
     }
 
     /// **I86 (PR #852 review) — the row records the AUTHOR, the claim the
@@ -878,9 +901,19 @@ mod tests {
         );
         backend.run_migrations().await.unwrap();
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let local = ts::local_signer(&format!("i86-node-{run}"));
-        let peer = format!("i86-peer-{run}");
-        ts::register_hybrid_key_as(backend.as_ref(), &peer, &peer, USER).await;
+        let alias = format!("i86-node-{run}");
+        let local = ts::local_signer(&alias);
+        // v62.0.0 — edition-2 keys: the node's own (its LocalSigner signs as
+        // `kid(alias)`) and the peer author's.
+        let _node =
+            crate::federation::edition2::fixture_switch::put_key(backend.as_ref(), &alias, &[USER])
+                .await;
+        let peer = crate::federation::edition2::fixture_switch::put_key(
+            backend.as_ref(),
+            &format!("i86-peer-{run}"),
+            &[USER],
+        )
+        .await;
         let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
             crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
         );
@@ -941,7 +974,10 @@ mod tests {
                     .is_some_and(|c| c.blob_sha256_hex == hex::encode(sha))
             })
             .expect("I86: the claim is stored under the node");
-        assert!(claim.scrub_signature_pqc.is_some(), "I86: hybrid claim");
+        assert!(
+            crate::federation::edition2::fixture_switch::carried_statement(&claim).is_some(),
+            "I86: the claim is an edition-2 statement"
+        );
     }
 
     /// **I87 (PR #852 review) — a LocalOnly adopt needs no announcing signer.**
@@ -980,7 +1016,7 @@ mod tests {
         let comm = format!("i87-comm-{run}");
         seed_community_everywhere(&[&n], &comm, &[(&author, Some(&n))]).await;
         let local = ts::local_signer(&format!("i87-node-{run}"));
-        assert_eq!(local.derived_key_id(), node);
+        assert_eq!(local.federation_id().await, node);
         let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
             crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
         );
@@ -1015,69 +1051,30 @@ mod tests {
         );
     }
 
-    /// **I84 (b) — the subject gate runs on INGEST, not only on emit.** A
-    /// remote signer can hybrid-sign a row carrying a malformed subject; the
-    /// backend's own admission must refuse it, or replication stores the same
-    /// unmatchable revocation authority the emit path rejects.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i84b_a_replicated_row_with_a_malformed_subject_is_refused_sqlite() {
-        use crate::federation::tier_ingest::test_support as ts;
-        use crate::federation::types::identity_type::USER;
-        use crate::federation::FederationDirectory;
-        use crate::store::Backend as _;
-        let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        backend.run_migrations().await.unwrap();
-        let run = uuid::Uuid::new_v4().simple().to_string();
-        let signer = format!("i84b-signer-{run}");
-        ts::register_identity_key(&backend, &signer, USER).await;
-        let id = format!("i84b-{run}");
-        let mut row = ts::bare_attestation(
-            &id,
-            &signer,
-            &signer,
-            &serde_json::json!({ "id": id, "kind": "scores" }),
+    /// **I84 (b) — the subject gate is ONE gate.** v60.0.0 (#854, I1172):
+    /// ingest and emit ask the same validator, so a raw base64 pubkey subject
+    /// (uppercase), the shape cirisnode's retired Contributions carried, is
+    /// refused by it.
+    ///
+    /// v62.0.0 (slice E6) — the replicated-row legs are deleted: an edition-2
+    /// subject is an identity-ref by encoding (`IdentityRefs`), so a signer
+    /// cannot offer a malformed text subject at the statement door; the
+    /// validator the earlier door ran is witnessed by I84 and here.
+    #[test]
+    fn i84b_the_one_subject_gate_refuses_a_base64_subject() {
+        let b64_subject = "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU=".to_owned();
+        let err = crate::federation::validate_subject_key_ids(std::slice::from_ref(&b64_subject))
+            .expect_err("I1172: the one gate refuses an uppercase subject");
+        assert!(
+            err.to_string().contains("uppercase"),
+            "I1172: the refusal names the clause: {err}"
         );
-        row.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
-        // The malformed subject a remote signer can perfectly well sign.
-        row.subject_key_ids = vec![format!("canonical:sha256:{}", "a".repeat(63))];
-        let row = ts::seal_row(&signer, row);
-        let err = backend
-            .apply_replicated_attestation(crate::federation::SignedAttestation { attestation: row })
-            .await
-            .expect_err("I84 (b): the ingest gate refuses a malformed subject");
+        let short = format!("canonical:sha256:{}", "a".repeat(63));
+        let err = crate::federation::validate_subject_key_ids(std::slice::from_ref(&short))
+            .expect_err("I84 (b): a short canonical digest is refused");
         assert!(
             err.to_string().contains("CC 2.3.2.1"),
             "I84 (b): the refusal cites the clause: {err}"
-        );
-        // v60.0.0 (#854) — I1172: ingest and emit are ONE gate. A raw base64
-        // pubkey subject (uppercase), the shape cirisnode's retired
-        // Contributions carried, is refused on a replicated row exactly as the
-        // emit path refuses it.
-        let b64_subject = "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU=".to_owned();
-        crate::federation::validate_subject_key_ids(std::slice::from_ref(&b64_subject))
-            .expect_err("I1172: the one gate refuses an uppercase subject");
-        let id2 = format!("i1172-{run}");
-        let mut row2 = ts::bare_attestation(
-            &id2,
-            &signer,
-            &signer,
-            &serde_json::json!({ "id": id2, "kind": "scores" }),
-        );
-        row2.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
-        row2.subject_key_ids = vec![b64_subject];
-        let row2 = ts::seal_row(&signer, row2);
-        let err = backend
-            .apply_replicated_attestation(crate::federation::SignedAttestation {
-                attestation: row2,
-            })
-            .await
-            .expect_err("I1172: a replicated row with an uppercase subject is refused at ingest");
-        assert!(
-            err.to_string().contains("uppercase"),
-            "I1172: the ingest refusal names the clause: {err}"
         );
     }
 }

@@ -737,51 +737,23 @@ pub fn build_capsule_with_destructor<'py>(
 #[cfg(feature = "sqlite")]
 mod tests {
     use super::*;
-    use crate::federation::types::{algorithm, identity_type, KeyRecord};
-    use crate::federation::{FederationDirectory, SignedKeyRecord};
+    use crate::federation::types::identity_type;
     use crate::store::backend::Backend;
     use crate::store::sqlite::SqliteBackend;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use ed25519_dalek::SigningKey;
     use std::sync::mpsc;
     use std::sync::Arc;
 
     // ── shared helpers ─────────────────────────────────────────────
 
-    /// A minimal-but-valid `SignedKeyRecord` — the sqlite `put_public_key`
-    /// admission gate requires a real 32-byte Ed25519 pubkey + `hybrid`
-    /// algorithm, but does NOT verify a signature, so a deterministic seed
-    /// suffices to satisfy the `edge_outbound_queue` FK on
-    /// `federation_keys(key_id)`.
-    fn valid_key_record(key_id: &str, seed: u8) -> SignedKeyRecord {
-        let vk = SigningKey::from_bytes(&[seed; 32]).verifying_key();
-        let now = chrono::Utc::now();
-        SignedKeyRecord {
-            record: KeyRecord {
-                key_id: key_id.into(),
-                pubkey_ed25519_base64: B64.encode(vk.to_bytes()),
-                pubkey_ml_dsa_65_base64: None,
-                algorithm: algorithm::HYBRID.into(),
-                identity_type: identity_type::PRIMITIVE.into(),
-                identity_ref: key_id.into(),
-                valid_from: now,
-                valid_until: None,
-                registration_envelope: serde_json::json!({ "id": key_id }),
-                original_content_hash: "deadbeef".into(),
-                scrub_signature_classical: String::new(),
-                scrub_signature_pqc: None,
-                scrub_key_id: key_id.into(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            },
-        }
+    /// The seeds of the sender and destination keys. v62.0.0: each is an
+    /// edition-2 `key:record` put through the statement door
+    /// (`fixture_switch::put_key`), so its `federation_keys` row (the
+    /// `edge_outbound_queue` FK target) is the projection, keyed `kid(seed)`.
+    const SENDER: &str = "sender-1";
+    const DEST: &str = "dest-1";
+
+    fn kid(seed: &str) -> String {
+        crate::federation::edition2::fixture_switch::kid(seed)
     }
 
     async fn sqlite_dispatch() -> BackendDispatch {
@@ -794,14 +766,14 @@ mod tests {
             .expect("run migrations (creates edge_outbound_queue)");
         // Seed the sender + destination federation_keys rows the outbound
         // FK references (real backends enforce it; SQLite has FKs ON).
-        backend
-            .put_public_key(valid_key_record("sender-1", 1))
-            .await
-            .expect("register sender key");
-        backend
-            .put_public_key(valid_key_record("dest-1", 2))
-            .await
-            .expect("register destination key");
+        for seed in [SENDER, DEST] {
+            let _ = crate::federation::edition2::fixture_switch::put_key(
+                &backend,
+                seed,
+                &[identity_type::PRIMITIVE],
+            )
+            .await;
+        }
         BackendDispatch::Sqlite(Arc::new(backend))
     }
 
@@ -876,8 +848,8 @@ mod tests {
         let now = chrono::Utc::now();
         for i in 0..2u8 {
             let op = OutboundQueueOp::EnqueueOutbound {
-                sender_key_id: "sender-1".into(),
-                destination_key_id: "dest-1".into(),
+                sender_key_id: kid(SENDER),
+                destination_key_id: kid(DEST),
                 message_type: "AttestationGossip".into(),
                 edge_schema_version: "1.0.0".into(),
                 envelope_bytes: vec![i; 4],
@@ -911,8 +883,8 @@ mod tests {
 
         let now = chrono::Utc::now();
         let enqueue = OutboundQueueOp::EnqueueOutbound {
-            sender_key_id: "sender-1".into(),
-            destination_key_id: "dest-1".into(),
+            sender_key_id: kid(SENDER),
+            destination_key_id: kid(DEST),
             message_type: "AttestationGossip".into(),
             edge_schema_version: "1.0.0".into(),
             envelope_bytes: b"hello".to_vec(),

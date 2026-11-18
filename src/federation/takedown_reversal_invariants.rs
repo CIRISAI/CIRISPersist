@@ -37,9 +37,7 @@ pub(crate) mod bodies {
     use crate::federation::steward_purge::{self as sp, test_clock};
     use crate::federation::takedown_tombstone as td;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{
-        attestation_type, cohort_scope, Attestation, SignedAttestation,
-    };
+    use crate::federation::types::{attestation_type, cohort_scope, Attestation};
     use crate::federation::{Error, FederationDirectory};
 
     pub(crate) const NODE: &str = "c-node-1";
@@ -61,6 +59,8 @@ pub(crate) mod bodies {
         comm: &str,
         sha: &str,
     ) {
+        // v62.0.0 (JSON cut, E7; E12) — a registered dimension, the room by
+        // its identity-ref, through the one entry.
         let id = uuid::Uuid::new_v4().to_string();
         let mut row = ts::bare_attestation(
             &id,
@@ -68,19 +68,17 @@ pub(crate) mod bodies {
             member,
             &serde_json::json!({
                 "id": id,
-                "dimension": "content:established:v1",
+                "dimension": crate::federation::doors_takedown_invariants::bodies::BINDING_DIMENSION,
                 "evidence_refs": [sha],
-                "community_id": comm,
+                "community_id": crate::federation::edition2::fixture_switch::kid_or_keep(comm),
             }),
         );
         row.attestation_type = attestation_type::SCORES.into();
         row.weight = None;
         row.cohort_scope = cohort_scope::COMMUNITY.into();
-        dir.put_attestation(SignedAttestation {
-            attestation: ts::seal_row(member, row),
-        })
-        .await
-        .expect("the community binding row");
+        crate::federation::edition2::fixture_switch::put_signed(dir, &ts::seal_row(member, row))
+            .await
+            .expect("the community binding row");
     }
 
     /// A `reconsideration:new_evidence:v1` ruling by `by` naming
@@ -105,7 +103,9 @@ pub(crate) mod bodies {
             env["outcome"] = serde_json::json!(outcome);
         }
         if !community.is_empty() {
-            env["community_id"] = serde_json::json!(community);
+            env["community_id"] = serde_json::json!(
+                crate::federation::edition2::fixture_switch::kid_or_keep(community)
+            );
         }
         let mut row = ts::bare_attestation(&id, by, by, &env);
         row.attestation_type = attestation_type::SCORES.into();
@@ -114,8 +114,9 @@ pub(crate) mod bodies {
         ts::seal_row(by, row)
     }
 
+    /// v62.0.0 (JSON cut, E7) — a flipped row through the one entry.
     pub(crate) async fn put(dir: &dyn FederationDirectory, row: Attestation) -> Result<(), Error> {
-        dir.put_attestation(SignedAttestation { attestation: row })
+        crate::federation::edition2::fixture_switch::put_signed(dir, &row)
             .await
             .map(|_| ())
     }
@@ -329,7 +330,8 @@ pub(crate) mod engine_bodies {
                 &sha,
                 BlobBody::Inline(bytes.to_vec()),
                 None,
-                author,
+                // v62.0.0 (JSON cut, E7) — the author named by its identity-ref.
+                &crate::federation::edition2::fixture_switch::kid_or_keep(author),
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -384,7 +386,13 @@ pub(crate) mod engine_bodies {
         )
         .await;
         let signer_a = ts::local_signer(&format!("em-a-{run}"));
-        assert_eq!(signer_a.derived_key_id(), l.node_a, "the ladder's signer");
+        // v62.0.0 (JSON cut, E7) — the ladder's node id is the signer's
+        // identity-ref (cut B's `federation_id`, E4), not the earlier derived id.
+        assert_eq!(
+            signer_a.federation_id().await,
+            l.node_a,
+            "the ladder's signer"
+        );
         let n = crate::federation::holding_claim::retract_own_claims(
             l.ba.as_dyn_directory(),
             &l.node_a,
@@ -777,13 +785,13 @@ mod run {
     #[tokio::test]
     async fn i1367_sqlite() {
         use crate::federation::epoch_minter_invariants::bodies::Pick;
-        super::engine_bodies::i1367_the_holders_follow_the_reversal(
+        Box::pin(super::engine_bodies::i1367_the_holders_follow_the_reversal(
             "sqlite::memory:",
             "sqlite::memory:",
             &suffix(),
             (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
                 as Pick<crate::store::sqlite::SqliteBackend>,
-        )
+        ))
         .await;
     }
 
@@ -794,13 +802,13 @@ mod run {
         let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
             return;
         };
-        super::engine_bodies::i1367_the_holders_follow_the_reversal(
+        Box::pin(super::engine_bodies::i1367_the_holders_follow_the_reversal(
             &a,
             &b,
             &suffix(),
             (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
                 as Pick<crate::store::postgres::PostgresBackend>,
-        )
+        ))
         .await;
     }
 

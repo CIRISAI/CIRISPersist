@@ -67,7 +67,8 @@ mod sqlite {
                 [],
             )
             .expect_err("I3604: the FK refuses");
-        let e = crate::store::sqlite::map_revocation_sqlite_err(PLANE)(fk);
+        let e =
+            crate::store::sqlite::map_revocation_sqlite_err(PLANE, vec!["not-held".to_owned()])(fk);
         assert_link_not_held(&e, "I3604 sqlite");
 
         c.execute(
@@ -81,7 +82,9 @@ mod sqlite {
                 [],
             )
             .expect_err("I3604: the PK refuses");
-        let e = crate::store::sqlite::map_revocation_sqlite_err(PLANE)(dup);
+        let e = crate::store::sqlite::map_revocation_sqlite_err(PLANE, vec!["not-held".to_owned()])(
+            dup,
+        );
         assert!(!e.is_wait(), "I3604: a UNIQUE refusal is not a wait: {e}");
         assert_eq!(e.kind(), "federation_backend", "I3604: {e}");
     }
@@ -132,7 +135,7 @@ mod pg {
             .execute(insert, &[&"c1", &"not-held"])
             .await
             .expect_err("I3605: the FK refuses again");
-        let e = crate::store::postgres::map_revocation_pg_err(PLANE)(fk_again);
+        let e = crate::store::postgres::map_revocation_pg_err(PLANE, &["not-held"])(fk_again);
         assert_link_not_held(&e, "I3605 revocation mapper");
 
         client

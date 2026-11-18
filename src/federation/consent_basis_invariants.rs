@@ -5,6 +5,11 @@
 //! and postgres. Fixture shapes follow the `probe-consent-stance` witnesses
 //! (W1041b/c): a node's owner-binding for the `delegates_to` path, an active
 //! occurrence row for the `occurrence_of` path.
+//!
+//! v62.0.0 (slice E6) — every key is an edition-2 `key:record`
+//! (`fixture_switch::put_key`): a fixture signs with the SEED (`*_s`), every
+//! fold, envelope member and occurrence names the KID. A row's id is
+//! computed, so each witness reads the id off the row it put.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -13,6 +18,7 @@ pub(crate) mod bodies {
         self as cbh, ConsentBasis, ConsentBasisRow, ConsentPrincipalPath as Path, FOR_KEY_ID,
     };
     use crate::federation::consent_scope_invariants::bodies::{put, stance};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::ConsentState;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{AGENT, NODE, USER};
@@ -65,6 +71,33 @@ pub(crate) mod bodies {
         (state, basis)
     }
 
+    /// An instant `days` before now, as the RFC 3339 text `stance` reads.
+    /// v62.0.0 — rows signed by `node`/`agent` keys are NOW-RELATIVE: under
+    /// CC 2.4.1.1 such a key's rows lapse when its record ends (365 days at
+    /// most), so a fixed date would rot.
+    fn ago(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// Put `a`; its (computed) id.
+    async fn put_id(d: &dyn FederationDirectory, a: Attestation) -> String {
+        let id = a.attestation_id.clone();
+        put(d, a).await.unwrap();
+        id
+    }
+
+    /// The owner binding `owner_s` -> `node_s` with the node's own voice
+    /// (`ownership:*` carries the node as its second signer).
+    async fn put_owner_binding(d: &dyn FederationDirectory, id: &str, owner_s: &str, node_s: &str) {
+        let ob = ts::owner_binding_attestation(id, owner_s, node_s);
+        let st = e2::carried_statement(&ob).expect("an edition-2 owner binding");
+        put(d, ob).await.unwrap();
+        e2::put_statement(d, &e2::voice_of(&st, node_s))
+            .await
+            .expect("the node's voice on its owner binding");
+    }
+
     fn row(principal: &str, paths: &[Path], id: &str) -> ConsentBasisRow {
         ConsentBasisRow {
             principal: principal.to_owned(),
@@ -103,20 +136,26 @@ pub(crate) mod bodies {
     /// `subject`. With no consent anywhere: `Unspecified` and an EMPTY basis —
     /// a gate gap reads apart from a lapsed grant.
     pub async fn i622_the_subjects_own_grant(d: &dyn FederationDirectory, s: &str) {
-        let (x, subj) = (format!("i622-x-{s}"), format!("i622-s-{s}"));
-        ts::register_identity_key(d, &x, NODE).await;
-        ts::register_identity_key(d, &subj, AGENT).await;
+        let (x_s, subj_s) = (format!("i622-x-{s}"), format!("i622-s-{s}"));
+        let x = e2::put_key(d, &x_s, &[NODE]).await;
+        let subj = e2::put_key(d, &subj_s, &[AGENT]).await;
         let (state, b) = basis(d, &x, &subj).await;
         assert_eq!(state, ConsentState::Unspecified);
         assert!(b.rows.is_empty(), "I622: unspecified has no basis: {b:?}");
 
-        let g = format!("i622-g-{s}");
-        put(
+        let g = put_id(
             d,
-            consent(&g, &subj, &x, "granted", None, "2026-09-01T00:00:00Z", None),
+            consent(
+                &format!("i622-g-{s}"),
+                &subj_s,
+                &x,
+                "granted",
+                None,
+                &ago(2),
+                None,
+            ),
         )
-        .await
-        .unwrap();
+        .await;
         let (state, b) = basis(d, &x, &subj).await;
         assert_eq!(state, ConsentState::Granted);
         assert_eq!(b.rows, vec![row(&subj, &[Path::Subject], &g)], "I622");
@@ -130,29 +169,22 @@ pub(crate) mod bodies {
     /// its path. A steward's grant naming NO machine is not a basis (and does
     /// not grant).
     pub async fn i623_the_steward_paths(d: &dyn FederationDirectory, s: &str) {
-        let x = format!("i623-x-{s}");
-        ts::register_identity_key(d, &x, NODE).await;
+        let x = e2::put_key(d, &format!("i623-x-{s}"), &[NODE]).await;
 
         // delegates_to: node N owned by human A.
-        let (n, a) = (format!("i623-n-{s}"), format!("i623-a-{s}"));
-        ts::register_identity_key(d, &n, NODE).await;
-        ts::register_identity_key(d, &a, USER).await;
-        put(
-            d,
-            ts::owner_binding_attestation(&format!("i623-ob-{s}"), &a, &n),
-        )
-        .await
-        .unwrap();
-        let blanket = format!("i623-blanket-{s}");
+        let (n_s, a_s) = (format!("i623-n-{s}"), format!("i623-a-{s}"));
+        let n = e2::put_key(d, &n_s, &[NODE]).await;
+        let a = e2::put_key(d, &a_s, &[USER]).await;
+        put_owner_binding(d, &format!("i623-ob-{s}"), &a_s, &n_s).await;
         put(
             d,
             consent(
-                &blanket,
-                &a,
+                &format!("i623-blanket-{s}"),
+                &a_s,
                 &x,
                 "granted",
                 None,
-                "2026-09-01T00:00:00Z",
+                &ago(2),
                 None,
             ),
         )
@@ -165,21 +197,19 @@ pub(crate) mod bodies {
             "I623: a blanket grant names no machine"
         );
         assert!(b.rows.is_empty(), "I623: {b:?}");
-        let ga = format!("i623-ga-{s}");
-        put(
+        let ga = put_id(
             d,
             consent(
-                &ga,
-                &a,
+                &format!("i623-ga-{s}"),
+                &a_s,
                 &x,
                 "granted",
                 Some(&n),
-                "2026-09-02T00:00:00Z",
+                &ago(1),
                 None,
             ),
         )
-        .await
-        .unwrap();
+        .await;
         let (state, b) = basis(d, &x, &n).await;
         assert_eq!(state, ConsentState::Granted);
         assert_eq!(
@@ -190,9 +220,11 @@ pub(crate) mod bodies {
         assert_granted_basis_is_live(d, &b, "I623").await;
 
         // occurrence_of: agent G, an active occurrence of human U.
-        let (g, u) = (format!("i623-g-{s}"), format!("i623-u-{s}"));
-        ts::register_identity_key(d, &g, AGENT).await;
-        ts::register_identity_key(d, &u, USER).await;
+        let (g, u_s) = (
+            e2::put_key(d, &format!("i623-g-{s}"), &[AGENT]).await,
+            format!("i623-u-{s}"),
+        );
+        let u = e2::put_key(d, &u_s, &[USER]).await;
         d.put_identity_occurrence_local(IdentityOccurrence {
             identity_key_id: u.clone(),
             occurrence_key_id: g.clone(),
@@ -206,21 +238,19 @@ pub(crate) mod bodies {
         })
         .await
         .unwrap();
-        let gu = format!("i623-gu-{s}");
-        put(
+        let gu = put_id(
             d,
             consent(
-                &gu,
-                &u,
+                &format!("i623-gu-{s}"),
+                &u_s,
                 &x,
                 "granted",
                 Some(&g),
-                "2026-09-01T00:00:00Z",
+                &ago(2),
                 None,
             ),
         )
-        .await
-        .unwrap();
+        .await;
         let (state, b) = basis(d, &x, &g).await;
         assert_eq!(state, ConsentState::Granted);
         assert_eq!(
@@ -238,8 +268,7 @@ pub(crate) mod bodies {
     /// past) and whose anchor grants: `Granted`, the basis names the anchor's
     /// live grant only, never the expired row.
     pub async fn i624_the_basis_follows_the_combined_state(d: &dyn FederationDirectory, s: &str) {
-        let x = format!("i624-x-{s}");
-        ts::register_identity_key(d, &x, NODE).await;
+        let x = e2::put_key(d, &format!("i624-x-{s}"), &[NODE]).await;
         let occurrence = |u: &str, g: &str| IdentityOccurrence {
             identity_key_id: u.to_owned(),
             occurrence_key_id: g.to_owned(),
@@ -252,34 +281,39 @@ pub(crate) mod bodies {
             persist_row_hash: String::new(),
         };
 
-        let (g, u) = (format!("i624-g-{s}"), format!("i624-u-{s}"));
-        ts::register_identity_key(d, &g, AGENT).await;
-        ts::register_identity_key(d, &u, USER).await;
+        let (g_s, u_s) = (format!("i624-g-{s}"), format!("i624-u-{s}"));
+        let g = e2::put_key(d, &g_s, &[AGENT]).await;
+        let u = e2::put_key(d, &u_s, &[USER]).await;
         d.put_identity_occurrence_local(occurrence(&u, &g))
             .await
             .unwrap();
-        let own = format!("i624-own-{s}");
-        put(
-            d,
-            consent(&own, &g, &x, "granted", None, "2026-09-01T00:00:00Z", None),
-        )
-        .await
-        .unwrap();
-        let stop = format!("i624-stop-{s}");
         put(
             d,
             consent(
-                &stop,
-                &u,
+                &format!("i624-own-{s}"),
+                &g_s,
                 &x,
-                "revoked",
-                Some(&g),
-                "2026-09-02T00:00:00Z",
+                "granted",
+                None,
+                &ago(2),
                 None,
             ),
         )
         .await
         .unwrap();
+        let stop = put_id(
+            d,
+            consent(
+                &format!("i624-stop-{s}"),
+                &u_s,
+                &x,
+                "revoked",
+                Some(&g),
+                &ago(1),
+                None,
+            ),
+        )
+        .await;
         let (state, b) = basis(d, &x, &g).await;
         assert_eq!(state, ConsentState::Revoked);
         assert_eq!(
@@ -288,42 +322,39 @@ pub(crate) mod bodies {
             "I624: a revoked basis names the revocation, not the grant beside it"
         );
 
-        let (h, v) = (format!("i624-h-{s}"), format!("i624-v-{s}"));
-        ts::register_identity_key(d, &h, AGENT).await;
-        ts::register_identity_key(d, &v, USER).await;
+        let (h_s, v_s) = (format!("i624-h-{s}"), format!("i624-v-{s}"));
+        let h = e2::put_key(d, &h_s, &[AGENT]).await;
+        let v = e2::put_key(d, &v_s, &[USER]).await;
         d.put_identity_occurrence_local(occurrence(&v, &h))
             .await
             .unwrap();
-        let lapsed = format!("i624-lapsed-{s}");
         put(
             d,
             consent(
-                &lapsed,
-                &h,
+                &format!("i624-lapsed-{s}"),
+                &h_s,
                 &x,
                 "granted",
                 None,
-                "2026-01-01T00:00:00Z",
-                Some("2026-02-01T00:00:00Z"),
+                &ago(60),
+                Some(ago(30).as_str()),
             ),
         )
         .await
         .unwrap();
-        let live = format!("i624-live-{s}");
-        put(
+        let live = put_id(
             d,
             consent(
-                &live,
-                &v,
+                &format!("i624-live-{s}"),
+                &v_s,
                 &x,
                 "granted",
                 Some(&h),
-                "2026-09-01T00:00:00Z",
+                &ago(2),
                 None,
             ),
         )
-        .await
-        .unwrap();
+        .await;
         let (state, b) = basis(d, &x, &h).await;
         assert_eq!(state, ConsentState::Granted);
         assert_eq!(

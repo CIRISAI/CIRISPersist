@@ -247,6 +247,9 @@ where
     )
     .await
     .map_err(|e| BlobError::Backend(format!("pending key_grant projection: {e}")))?;
+    // v62.0.0 (wave P7; G0's fold) — a sealed trace blob arrived: a trace row
+    // held on it re-folds (it opens now, or stays held `trace_dek_not_held`).
+    crate::ingest::refold_trace_blob(backend, &sha256).await;
     Ok(AdoptOutcome {
         sha256,
         announced: announce,
@@ -303,6 +306,107 @@ pub struct AdoptChunkItem<'a> {
     pub plaintext_size: u64,
 }
 
+/// v62.0.0 (wave GC7; CC 2.7.3, the lead's `hold_bytes` ruling) — **a
+/// stream-keyed chunk offered under a community epoch is KEPT, not lost.**
+/// The verdict reads the stream's key rows (a fold), so the chunks are
+/// stored as a stream-keyed chunk is stored (the floor of the provenance's
+/// tier, no community binding: nothing is bound under a key that did not
+/// seal it) and each is held back with [`fold::hold_bytes`]: kept, never
+/// served or replicated ([`fold::bytes_servable`]) until a re-offer under
+/// the chunk provenance concludes it (`release_if_held`). Every item still
+/// answers the refusal it did, so the caller re-offers. `would_hold` (the
+/// operator rule: never store what this node is not party to) runs first
+/// and still declines the write.
+///
+/// [`fold::hold_bytes`]: crate::federation::edition2::fold::hold_bytes
+/// [`fold::bytes_servable`]: crate::federation::edition2::fold::bytes_servable
+#[allow(clippy::too_many_arguments)]
+async fn keep_stream_keyed_chunks_held<B, F>(
+    backend: &B,
+    ctx: &HoldContext<'_, F>,
+    stream_id: &str,
+    shaped: &[(usize, &AdoptChunkItem<'_>)],
+    epoch: u64,
+    provenance: &BlobProvenance,
+    community_epoch: u64,
+    mut answers: Vec<Option<Result<[u8; 32], BlobError>>>,
+) -> Result<Vec<Result<[u8; 32], BlobError>>, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+    F: Fn(&str) -> bool,
+{
+    use crate::federation::edition2::fold::{self, reason, Dep};
+    use crate::federation::edition2::names::RowId;
+    let floor = StorageFloor::resolved(provenance.tier);
+    floor.check_scope(&provenance.cohort_scope)?;
+    would_hold(backend, ctx, provenance).await?;
+    let refusal = || BlobError::StreamKeyedChunkCommunityEpoch {
+        stream_id: stream_id.to_owned(),
+        epoch,
+        community_epoch,
+        chunk_sha256_hex: None,
+    };
+    let stored = backend
+        .adopt_sealed_chunks_at(
+            stream_id,
+            shaped
+                .iter()
+                .map(|(_, i)| (i.seq, i.envelope.to_vec(), i.plaintext_size))
+                .collect(),
+            epoch,
+            &provenance.cohort_scope,
+            &provenance.author_key_id,
+            floor,
+            None,
+            provenance
+                .community_key_id
+                .as_deref()
+                .filter(|_| provenance.tier == CryptoTier::CommunityDek),
+        )
+        .await?;
+    let detail = refusal().to_string();
+    for ((slot, _), got) in shaped.iter().zip(stored) {
+        answers[*slot] = Some(match got {
+            Ok(sha256) => {
+                let reads = std::iter::once(Dep::key(stream_id).read_key()).collect();
+                fold::hold_bytes(
+                    backend,
+                    RowId(sha256),
+                    &sha256,
+                    reason::STREAM_KEYED_CHUNK_COMMUNITY_EPOCH,
+                    &detail,
+                    reads,
+                )
+                .await
+                .map_err(|e| BlobError::Backend(format!("hold_bytes: {e}")))?;
+                Err(refusal())
+            }
+            Err(e) => Err(e),
+        });
+    }
+    Ok(answers.into_iter().map(|a| a.expect("answered")).collect())
+}
+
+/// v62.0.0 (wave GC7) — release bytes a fold held back, when it did (one
+/// fold-state read per stored chunk otherwise).
+async fn release_if_held<B>(backend: &B, sha256: &[u8; 32]) -> Result<(), BlobError>
+where
+    B: FederationDirectory + Sync + ?Sized,
+{
+    use crate::federation::edition2::fold;
+    use crate::federation::edition2::names::RowId;
+    let row = RowId(*sha256);
+    let held = fold::why_held(backend, &row)
+        .await
+        .map_err(|e| BlobError::Backend(format!("fold state: {e}")))?;
+    if held.is_some() {
+        fold::release_bytes(backend, row, sha256, std::collections::BTreeSet::new())
+            .await
+            .map_err(|e| BlobError::Backend(format!("release_bytes: {e}")))?;
+    }
+    Ok(())
+}
+
 /// v55.0.0 (CIRISPersist#977) — **a stream-keyed room chunk is never bound
 /// under a community epoch.** A `community_dek` chunk provenance that names
 /// an epoch is the pre-v55 shape (a chunk sealed under the community DEK);
@@ -348,13 +452,23 @@ where
             .stream_dek_grants(stream_id, epoch, &provenance.author_key_id)
             .await?
             .is_empty();
+    // v62.0.0 (wave GC7; CC 2.7.3) — the verdict reads other rows (the
+    // stream's DEK rows and wraps): under a fold attempt it HOLDS the chunk
+    // (reason `stream_keyed_chunk_community_epoch`) and declares the stream,
+    // so a key row arriving re-folds it; outside one it is the refusal it was.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(stream_id));
     if stream_keyed {
-        return Err(BlobError::StreamKeyedChunkCommunityEpoch {
+        let err = BlobError::StreamKeyedChunkCommunityEpoch {
             stream_id: stream_id.to_owned(),
             epoch,
             community_epoch: named,
             chunk_sha256_hex: None,
-        });
+        };
+        super::edition2::fold::hold_detail(
+            super::edition2::fold::reason::STREAM_KEYED_CHUNK_COMMUNITY_EPOCH,
+            err.to_string(),
+        );
+        return Err(err);
     }
     Ok(())
 }
@@ -406,15 +520,39 @@ where
         floor.check_scope(&provenance.cohort_scope)?;
         (floor, None)
     } else {
-        refuse_community_epoch_on_a_stream_keyed_chunk(
+        match refuse_community_epoch_on_a_stream_keyed_chunk(
             backend,
             ctx.our_key_id,
             stream_id,
             epoch,
             provenance,
         )
-        .await?;
-        resolve_provenance(backend, ctx.our_key_id, provenance).await?
+        .await
+        {
+            Ok(()) => resolve_provenance(backend, ctx.our_key_id, provenance).await?,
+            // v62.0.0 (wave GC7; CC 2.7.3, the lead's `hold_bytes` ruling) —
+            // a FOLD condition (it reads the stream's key rows): the bytes
+            // are KEPT, stored unbound as a stream-keyed chunk is, and held
+            // back (not served) under `stream_keyed_chunk_community_epoch`.
+            // A re-offer under the chunk provenance repairs the same
+            // `(seq, sha)` and releases them (below).
+            Err(BlobError::StreamKeyedChunkCommunityEpoch {
+                community_epoch, ..
+            }) => {
+                return Box::pin(keep_stream_keyed_chunks_held(
+                    backend,
+                    ctx,
+                    stream_id,
+                    &shaped,
+                    epoch,
+                    provenance,
+                    community_epoch,
+                    answers,
+                ))
+                .await;
+            }
+            Err(e) => return Err(e),
+        }
     };
     would_hold(backend, ctx, provenance).await?;
     let stored = backend
@@ -440,6 +578,9 @@ where
         .await?;
     for ((slot, _), got) in shaped.iter().zip(stored) {
         if let Ok(sha256) = &got {
+            // v62.0.0 (wave GC7) — bytes an earlier offer kept held back
+            // (`keep_stream_keyed_chunks_held`) conclude now: served again.
+            release_if_held(backend, sha256).await?;
             // #848 §13 (PR #850 review, round three) — a self/family chunk
             // has its own DEK and its own content-axis set; the set that
             // arrived before the chunk projects here, exactly as for a blob.

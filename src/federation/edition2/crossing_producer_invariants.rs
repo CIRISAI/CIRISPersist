@@ -42,6 +42,10 @@
 //!   `rekey_community_member_revoke_voices` is `None` while the removal is
 //!   short of the community's protocol, `Some(epoch)` once counted, and the
 //!   removal lands once. **I3544** — the family founding twin.
+//! - **I3545** — the agent-occurrence delegation (Verify's second signers:
+//!   the delegate, its owner) never lands on the owner's voice alone: without
+//!   the agent's pen it is Pending and its draft is handed back; the agent's
+//!   voice lands it at federation, authored by the owner.
 //!
 //! Mutations: drop the re-stamp in `enter_mesh` (sqlite / postgres), and
 //! I3521 reds; route an edition-2 row through `custody_for`, and I3520 reds
@@ -513,6 +517,10 @@ pub(crate) mod bodies {
             .await
             .expect("I3538: self_at_login");
         assert!(out.bind_drafts.is_empty(), "I3538: every voice was in hand");
+        assert!(
+            out.delegation_promoted,
+            "I3538: the delegation lands on the owner's and the agent's voices"
+        );
         assert_eq!(
             out.agent_identity_key_id, agent_id,
             "I3538: the agent's own identity"
@@ -547,6 +555,98 @@ pub(crate) mod bodies {
             .as_deref(),
             Some(u_id.as_str()),
             "I3538: the owner binding was stated"
+        );
+    }
+
+    /// I3545.
+    pub(crate) async fn i3545_the_delegation_needs_the_agents_voice(dsn: &str, tag: &str) {
+        use super::super::producer_invariants::bodies::signer;
+        use crate::engine::{SelfAtLoginInput, SelfAtLoginOccurrence};
+        let alias = |who: &str| format!("{tag}-3545-{who}");
+        let a = node(dsn, &alias("user")).await;
+        let u_id = a
+            .register_self_federation_key(identity_type::USER, None, None)
+            .await
+            .expect("I3545: the user registers");
+        let mut ids = Vec::new();
+        for (who, ty) in [
+            ("app", identity_type::USER),
+            ("agent", identity_type::AGENT),
+        ] {
+            let e = node(dsn, &alias(who)).await;
+            ids.push(
+                e.register_self_federation_key(ty, None, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("I3545: {who} registers: {e}")),
+            );
+        }
+        let (app_id, agent_id) = (ids[0].clone(), ids[1].clone());
+        // The agent's pen is NOT handed over.
+        let out = a
+            .self_at_login(SelfAtLoginInput {
+                identity_key_id: u_id.clone(),
+                identity_signer: Some(signer(&alias("user"), &alias("user"))),
+                app: SelfAtLoginOccurrence {
+                    occurrence_key_id: app_id,
+                    device_class: crate::federation::device_class::PHONE.to_owned(),
+                    occurrence_signer: Some(signer(&alias("app"), &alias("app"))),
+                    ..SelfAtLoginOccurrence::default()
+                },
+                agent: SelfAtLoginOccurrence {
+                    occurrence_key_id: agent_id.clone(),
+                    device_class: crate::federation::device_class::AGENT.to_owned(),
+                    ..SelfAtLoginOccurrence::default()
+                },
+                bilateral_pair_id: uuid::Uuid::new_v4().to_string(),
+                delegation_scope: None,
+            })
+            .await
+            .expect("I3545: self_at_login");
+        assert!(
+            !out.delegation_promoted,
+            "I3545: the owner's voice alone never lands the delegation"
+        );
+        let dir = a.federation_directory();
+        let rid = crate::federation::edition2::names::RowId(
+            crate::federation::edition2::store::id_of_hex(&out.delegation_id).expect("a row id"),
+        );
+        assert!(
+            dir.get_attestation(&out.delegation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "I3545: not landed (Pending)"
+        );
+        // The agent's voice, from the draft the login handed back.
+        let draft = out
+            .bind_drafts
+            .iter()
+            .find(|(k, d)| {
+                *k == agent_id
+                    && crate::federation::edition2::names::RowId::of_statement(
+                        &d.assemble(Vec::new()),
+                    ) == Some(rid)
+            })
+            .map(|(_, d)| d.clone())
+            .expect("I3545: the agent's delegation draft");
+        let agent_engine = node(dsn, &alias("agent")).await;
+        let st = agent_engine
+            .sign_draft(&draft)
+            .await
+            .expect("I3545: signed");
+        a.put_edition2_statement(&st, None)
+            .await
+            .expect("I3545: the agent's voice is admitted");
+        let row = dir
+            .get_attestation(&out.delegation_id)
+            .await
+            .unwrap()
+            .expect("I3545: the delegation lands on both voices");
+        assert_eq!(row.attesting_key_id, u_id, "I3545: authored by the owner");
+        assert_eq!(
+            row.tier,
+            crate::federation::types::attestation_tier::FEDERATION,
+            "I3545"
         );
     }
 
@@ -989,5 +1089,27 @@ mod tests {
         };
         Box::pin(b::i3542_founding_and_rekey(&a, &tag())).await;
         eprintln!("i3542 postgres: RAN");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i3545_sqlite() {
+        let d = tempfile::tempdir().unwrap();
+        Box::pin(b::i3545_the_delegation_needs_the_agents_voice(
+            &sqlite_dsn(&d, "a"),
+            &tag(),
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i3545_postgres() {
+        let Some(a) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i3545 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        Box::pin(b::i3545_the_delegation_needs_the_agents_voice(&a, &tag())).await;
+        eprintln!("i3545 postgres: RAN");
     }
 }

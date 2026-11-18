@@ -252,48 +252,18 @@ pub fn enforce_admission_invariants(
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::types::{attestation_tier, identity_type};
-    use crate::federation::{Attestation, FederationDirectory, KeyRecord, SignedKeyRecord};
+    use crate::federation::Attestation;
     use crate::store::sqlite::SqliteBackend;
 
     // ── shared test fixtures ────────────────────────────────────────────
 
-    fn fix_key(key_id: &str, identity_type_value: &str) -> KeyRecord {
-        let (ed_pk, mldsa_pk) =
-            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
-        let mut row = KeyRecord {
-            key_id: key_id.into(),
-            pubkey_ed25519_base64: ed_pk,
-            pubkey_ml_dsa_65_base64: mldsa_pk,
-            algorithm: crate::federation::types::algorithm::HYBRID.into(),
-            identity_type: identity_type_value.into(),
-            identity_ref: key_id.into(),
-            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
-            valid_until: None,
-            registration_envelope: serde_json::json!({"id": key_id}),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "c2lnbmF0dXJl".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-            attestation_evidence: Some(
-                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                ),
-            ),
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        // v22.0.0 (CIRISPersist#543) — an `accord_holder` claim is
-        // `ConferralMode::HardwareAttested`, so it needs real evidence on
-        // EVERY backend (memory included, as of #543). Satisfy the gate, do
-        // not bypass it.
-        crate::federation::hardware_attestation::test_support::attach_hardware_evidence(&mut row);
-        row
-    }
+    // v62.0.0 (the JSON cut): a key is live by its edition-2 `key:record`
+    // (`e2::put_key`), and its id is the identity-ref `e2::kid(label)`. The
+    // rows below are never offered to a door (the gate under test reads the
+    // row's fields and the attester's identity set, never its signature), so
+    // they stay plain rows naming the attester by its kid.
 
     fn fix_attestation(id: &str, attn_type: &str, attesting: &str, attested: &str) -> Attestation {
         // v37.0.0 (CIRISPersist#733) — an `accord:*` row names its own accord or
@@ -310,10 +280,11 @@ mod tests {
         if attn_type.starts_with("accord:") {
             envelope["accord_root"] = serde_json::json!("wia-accord-root");
         }
+        let (attesting, attested) = (e2::kid_or_keep(attesting), e2::kid_or_keep(attested));
         Attestation {
             attestation_id: id.into(),
-            attesting_key_id: attesting.into(),
-            attested_key_id: attested.into(),
+            attesting_key_id: attesting.clone(),
+            attested_key_id: attested,
             attestation_type: attn_type.into(),
             weight: Some(1.0),
             asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
@@ -322,7 +293,7 @@ mod tests {
             original_content_hash: "abc123".into(),
             scrub_signature_classical: "c2ln".into(),
             scrub_signature_pqc: None,
-            scrub_key_id: attesting.into(),
+            scrub_key_id: attesting,
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
@@ -335,33 +306,20 @@ mod tests {
         }
     }
 
-    /// Register `key_id` carrying `identity_type_value`.
+    /// Register `key_id` (a seed label) carrying `identity_type_value`.
     ///
-    /// v22.0.0 (CIRISPersist#543) — an `identity_type` whose `ConferralMode` is
-    /// `AccordCoScrubbed` (`trusted_publisher` / `lenscore_detector`: claims
-    /// ABOUT A THIRD PARTY) may not be self-asserted at any `federation_keys`
-    /// write chokepoint, so the fixture confers it for real — a genesis accord
-    /// roster standing in the test directory co-scrubs the record to the family
-    /// m-of-n. Every other type still registers self-scrubbed, which is what
-    /// the gate permits.
+    /// v62.0.0 (the JSON cut): the key becomes live by its self-signed
+    /// edition-2 `key:record` naming the identity set; the record is the
+    /// conferral the gate reads (an `accord_holder` record is admitted by the
+    /// key-record rules, `edition2::liveness`). The earlier co-scrub conferral
+    /// of `trusted_publisher` / `lenscore_detector` is earlier-form.
     async fn register(backend: &SqliteBackend, key_id: &str, identity_type_value: &str) {
-        let record = fix_key(key_id, identity_type_value);
-        let accord_conferred = identity_type::parse_set(identity_type_value)
-            .iter()
-            .any(|t| {
-                identity_type::conferral_mode(t)
-                    == Some(identity_type::ConferralMode::AccordCoScrubbed)
-            });
-        if accord_conferred {
-            crate::federation::operational::test_support::put_accord_conferred_key(backend, record)
-                .await
-                .unwrap();
-        } else {
-            backend
-                .put_public_key(SignedKeyRecord { record })
-                .await
-                .unwrap();
-        }
+        let types: Vec<&str> = identity_type_value
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        let _ = e2::put_key(backend, key_id, &types).await;
     }
 
     // ── §1 typed reader + classifier ────────────────────────────────────

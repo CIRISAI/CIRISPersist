@@ -591,13 +591,17 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
     );
 
     // I2001: an earlier-form key answers 1 both ways (a stored JSON key).
-    let json = crate::federation::tier_ingest::test_support::replicated_key_record(
-        "j0-json-key",
-        "agent",
-        "j0-json-key",
-        "j0-json-key",
-        "j0",
-    );
+    // v62.0.0 (slice E6) — the earlier form on purpose: the builders emit
+    // edition 2 by default, and this leg needs a stored JSON key.
+    let json = super::fixture_switch::with_earlier_form(|| {
+        crate::federation::tier_ingest::test_support::replicated_key_record(
+            "j0-json-key",
+            "agent",
+            "j0-json-key",
+            "j0-json-key",
+            "j0",
+        )
+    });
     d.put_public_key(crate::federation::SignedKeyRecord {
         record: json.clone(),
     })
@@ -622,9 +626,12 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
 
     // ── I2007b: an earlier-form row is never overwritten ──
     let squat = key(74);
-    let json_squat = crate::federation::tier_ingest::test_support::replicated_key_record(
-        "j0-squat", "agent", "j0-squat", "j0-squat", "j0",
-    );
+    // The earlier form on purpose (see I2001 above).
+    let json_squat = super::fixture_switch::with_earlier_form(|| {
+        crate::federation::tier_ingest::test_support::replicated_key_record(
+            "j0-squat", "agent", "j0-squat", "j0-squat", "j0",
+        )
+    });
     let squat_id = iref(&squat);
     raw.exec(&format!(
         "INSERT INTO {q}federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, \

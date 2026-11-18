@@ -11,11 +11,21 @@
 //! I142 measures the axis AND the order it composes in: the gate refuses a
 //! room the caller is not in even when the filter names it, so a filter can
 //! never widen an audience.
+//!
+//! v62.0.0 (the JSON cut): the seeded rows are edition-2 statements
+//! (`edition2::fixture_switch`), keys are live by their `key:record` and
+//! named by `kid(label)`, and a row's id is node-computed (`seed` returns
+//! it). `note:draft:v1` (unregistered in Verify's family model) became
+//! `trust:i142:v1`. v62.0.0 (wave T1): I144's rooms land through the
+//! edition-2 group door as their founders' voices; `seed_room*`, `seed` and
+//! `seed_row` follow the switch, so a caller held under the earlier form
+//! still gets the typed door.
 
 /// The I142 / I143 bodies, one per backend runner and reusable by a
 /// consumer's own anchor lane (that is what `test-anchor` is for).
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::read::AttestationFilter;
     use crate::scope::{caller_scope_from_directory, CallerScope};
@@ -125,12 +135,34 @@ pub mod bodies {
                 }
             })
             .collect();
-        b.put_community(signed)
-            .await
-            .unwrap_or_else(|e| panic!("I144 room {comm}: {e}"));
+        // v62.0.0 (wave T1): under edition 2 the room lands through the group
+        // door as its founders' voices (every listed member a voice); a test
+        // held under the earlier form keeps the typed door.
+        if e2::emit_edition2() {
+            let voices =
+                e2::community_voices_naming_held(b, &signed, e2::ms(chrono::Utc::now())).await;
+            e2::put_voices(b, &voices)
+                .await
+                .unwrap_or_else(|e| panic!("I144 room {comm}: {e}"));
+        } else {
+            b.put_community(signed)
+                .await
+                .unwrap_or_else(|e| panic!("I144 room {comm}: {e}"));
+        }
     }
 
-    /// Seed one scoped attestation row through the local put door.
+    /// The id a key-taking read or a cohort member names `x` by: its kid
+    /// under edition 2, the label in a held test.
+    fn sid(x: &str) -> String {
+        if e2::emit_edition2() {
+            e2::kid_or_keep(x)
+        } else {
+            x.to_owned()
+        }
+    }
+
+    /// Seed one scoped attestation row through the put door; returns its
+    /// node-computed id.
     pub async fn seed<B>(
         b: &B,
         id: &str,
@@ -138,12 +170,15 @@ pub mod bodies {
         scope: &str,
         target: Option<&str>,
         dim: &str,
-    ) where
+    ) -> String
+    where
         B: crate::federation::FederationDirectory + Sync,
     {
-        seed_row(b, id, attester, scope, target, dim)
+        let row = row_for(id, attester, scope, target, dim);
+        put_row_either(b, &row)
             .await
             .unwrap_or_else(|e| panic!("I142 seed {id}: {e}"));
+        row.attestation_id
     }
 
     /// `seed`, but handing back the door's verdict — a witness that a row
@@ -155,18 +190,61 @@ pub mod bodies {
         scope: &str,
         target: Option<&str>,
         dim: &str,
-    ) -> Result<crate::federation::AttestationOutcome, crate::federation::Error>
+    ) -> Result<
+        Option<crate::federation::edition2::ingest::StatementOutcome>,
+        crate::federation::Error,
+    >
     where
         B: crate::federation::FederationDirectory + Sync,
     {
+        put_row_either(b, &row_for(id, attester, scope, target, dim)).await
+    }
+
+    /// Put `row` through the door its form takes: an edition-2 row by its
+    /// carried statement; an earlier-form row (I144, HELD under the earlier
+    /// form) through `put_attestation`. `None` stands for an earlier-form
+    /// outcome.
+    async fn put_row_either<B>(
+        b: &B,
+        row: &crate::federation::Attestation,
+    ) -> Result<
+        Option<crate::federation::edition2::ingest::StatementOutcome>,
+        crate::federation::Error,
+    >
+    where
+        B: crate::federation::FederationDirectory + Sync,
+    {
+        if e2::carried_statement(row).is_some() {
+            e2::put_signed(b, row).await.map(Some)
+        } else {
+            b.put_attestation(crate::federation::SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .map(|_| None)
+        }
+    }
+
+    /// The scoped row `seed` puts: the earlier-form shape, signed as its
+    /// edition-2 statement by `attester`. `id` rides the envelope so two
+    /// rows of one shape stay distinct.
+    fn row_for(
+        id: &str,
+        attester: &str,
+        scope: &str,
+        target: Option<&str>,
+        dim: &str,
+    ) -> crate::federation::Attestation {
         // The cohort TARGET rides `attested_key_id` on this plane (V114 admits
         // a keyless family there) — it is the column the §4.3 gate compares.
-        let mut row = ts::bare_attestation(
-            id,
-            attester,
-            attester,
-            &serde_json::json!({ "id": id, "dimension": dim, "cohort_scope": scope }),
-        );
+        let mut row = e2::with_earlier_form(|| {
+            ts::bare_attestation(
+                id,
+                attester,
+                attester,
+                &serde_json::json!({ "id": id, "dimension": dim, "cohort_scope": scope }),
+            )
+        });
         // AV-84 (#592): the row is attested to its own PRODUCER, and names
         // its ROOM in the signed envelope's cohort-target member. Both gates
         // read the envelope member — the write gate (AV-45) directly, the
@@ -178,15 +256,16 @@ pub mod bodies {
                 _ => "",
             };
             if !member.is_empty() {
-                row.attestation_envelope[member] = serde_json::json!(tk);
+                row.attestation_envelope[member] = serde_json::json!(sid(tk));
             }
         }
         row.attestation_type = "scores".into();
         row.cohort_scope = scope.to_owned();
         row.subject_key_ids = vec![attester.to_owned()];
+        // The seal flips with the switch: edition 2 by default, the earlier
+        // form inside a HELD test.
         ts::seal_row_in_place(attester, &mut row);
-        b.put_attestation(crate::federation::SignedAttestation { attestation: row })
-            .await
+        row
     }
 
     /// **I142 — the drive query.** The cohort axes select, AND with the other
@@ -196,16 +275,16 @@ pub mod bodies {
         B: crate::federation::FederationDirectory + crate::ceg::ReadEngine + Sync,
     {
         let owner = format!("i142-owner-{s}");
-        ts::register_identity_key(b, &owner, crate::federation::types::identity_type::USER).await;
-        seed(b, &format!("i142-f1-{s}"), &owner, "self", None, "file:v1").await;
-        seed(b, &format!("i142-f2-{s}"), &owner, "self", None, "file:v1").await;
-        seed(
+        let _ = e2::put_key(b, &owner, &[crate::federation::types::identity_type::USER]).await;
+        let f1 = seed(b, &format!("i142-f1-{s}"), &owner, "self", None, "file:v1").await;
+        let f2 = seed(b, &format!("i142-f2-{s}"), &owner, "self", None, "file:v1").await;
+        let note = seed(
             b,
             &format!("i142-note-{s}"),
             &owner,
             "self",
             None,
-            "note:draft:v1",
+            "trust:i142:v1",
         )
         .await;
         seed(
@@ -221,7 +300,9 @@ pub mod bodies {
         // The admission is RESOLVED, never fabricated: `for_test` is
         // `#[cfg(test)]` by design and this module also compiles under
         // `test-anchor`. Resolving exercises the builder the doors use.
-        let me = caller_scope_from_directory(b, &owner).await.unwrap();
+        let me = caller_scope_from_directory(b, &e2::kid(&owner))
+            .await
+            .unwrap();
         let me = || me.clone();
         let ids = |f: AttestationFilter, sc: CallerScope| async move {
             let mut v: Vec<String> = crate::ceg::ReadEngine::list_attestations(b, f, None, 100, sc)
@@ -245,11 +326,11 @@ pub mod bodies {
                 me()
             )
             .await,
-            vec![
-                format!("i142-f1-{s}"),
-                format!("i142-f2-{s}"),
-                format!("i142-note-{s}")
-            ],
+            {
+                let mut v = vec![f1.clone(), f2.clone(), note];
+                v.sort();
+                v
+            },
             "I142: `cohort_scope` selects the self rows and excludes the federation one"
         );
         // …and ANDs with the dimension axis: that IS the drive listing.
@@ -263,20 +344,30 @@ pub mod bodies {
                 me()
             )
             .await,
-            vec![format!("i142-f1-{s}"), format!("i142-f2-{s}")],
+            {
+                let mut v = vec![f1, f2];
+                v.sort();
+                v
+            },
             "I142: the drive listing — cohort AND dimension, not OR"
         );
         // A stranger sees none of it: the GATE refuses, not the filter.
         let stranger = format!("i142-stranger-{s}");
-        ts::register_identity_key(b, &stranger, crate::federation::types::identity_type::USER)
-            .await;
+        let _ = e2::put_key(
+            b,
+            &stranger,
+            &[crate::federation::types::identity_type::USER],
+        )
+        .await;
         assert!(
             ids(
                 AttestationFilter {
                     cohort_scope: Some("self".into()),
                     ..Default::default()
                 },
-                caller_scope_from_directory(b, &stranger).await.unwrap(),
+                caller_scope_from_directory(b, &e2::kid(&stranger))
+                    .await
+                    .unwrap(),
             )
             .await
             .is_empty(),
@@ -343,8 +434,8 @@ pub mod bodies {
         B: crate::federation::FederationDirectory + crate::ceg::ReadEngine + Sync,
     {
         let owner = format!("i142m-owner-{s}");
-        ts::register_identity_key(b, &owner, crate::federation::types::identity_type::USER).await;
-        seed(
+        let _ = e2::put_key(b, &owner, &[crate::federation::types::identity_type::USER]).await;
+        let self_row = seed(
             b,
             &format!("i142m-self-{s}"),
             &owner,
@@ -353,7 +444,7 @@ pub mod bodies {
             "file:v1",
         )
         .await;
-        seed(
+        let fed_row = seed(
             b,
             &format!("i142m-fed-{s}"),
             &owner,
@@ -363,7 +454,7 @@ pub mod bodies {
         )
         .await;
         let page = |f: AttestationFilter| {
-            let owner = owner.clone();
+            let owner = e2::kid(&owner);
             async move {
                 let mut v: Vec<String> =
                     <B as crate::federation::FederationDirectory>::list_scores(
@@ -385,7 +476,7 @@ pub mod bodies {
         })
         .await;
         assert!(
-            all.contains(&format!("i142m-fed-{s}")),
+            all.contains(&fed_row),
             "I142-scores: the federation row is on the scores plane to begin with: {all:?}"
         );
         assert_eq!(
@@ -395,7 +486,7 @@ pub mod bodies {
                 ..Default::default()
             })
             .await,
-            vec![format!("i142m-self-{s}")],
+            vec![self_row],
             "I142-scores: the cohort axis selects on the scores plane too, through \
              sqlite_cohort_axes / pg_cohort_axes"
         );
@@ -429,8 +520,15 @@ pub mod bodies {
         seed_room(b, &other_room, &[&producer, &elsewhere]).await;
         // The row: AV-84 shape — attested to its own PRODUCER, room named in
         // the signed envelope.
-        let id = format!("i144-row-{s}");
-        seed(b, &id, &producer, "community", Some(&room), "file:v1").await;
+        let id = seed(
+            b,
+            &format!("i144-row-{s}"),
+            &producer,
+            "community",
+            Some(&room),
+            "file:v1",
+        )
+        .await;
         // A targeted row that names NO room cannot be STORED: the write gate
         // has nothing to check membership against and refuses. So the read
         // gate's fail-closed arm (`cohort_target.is_some_and(..)`) is defence
@@ -462,7 +560,7 @@ pub mod bodies {
         // `list_attestations` substrate and returns early, which is how the
         // memory leg of this witness was vacuous for two mutants.
         let scores = |caller: &str| {
-            let caller = caller.to_owned();
+            let caller = sid(caller);
             async move {
                 let mut v: Vec<String> =
                     <B as crate::federation::FederationDirectory>::list_scores(
@@ -520,7 +618,7 @@ pub mod bodies {
             }
         }
         let ids = |caller: &str| {
-            let caller = caller.to_owned();
+            let caller = sid(caller);
             async move {
                 let scope = caller_scope_from_directory(b, &caller).await.unwrap();
                 let mut v: Vec<String> = crate::ceg::ReadEngine::list_attestations(

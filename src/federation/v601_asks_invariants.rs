@@ -2,17 +2,12 @@
 //! witnessed on every backend through the doors a consumer calls.
 //!
 //! - **I1360 (CIRISPersist#1117; CC 4.2.6 / CC 4.5.1.2)** — the accord
-//!   threshold is ONE function: `accord_threshold(n) = ⌊n/2⌋ + 1`, and the
-//!   threshold this node reports over its standing roster is the one its
-//!   co-scrub gate counts against. Two holder signatures confer over a roster
-//!   of three (the reported `m` is 2) and do not over a roster of four (the
-//!   reported `m` is 3); a roster id this node holds no key for counts toward
-//!   neither.
-//! - **I1361 (CIRISPersist#1119; CC 5.4.6 item 4)** — `infra:relay` is
-//!   conferred on the accord plane exactly as `infra:serve` is: a key record
-//!   claiming it under a two-of-three holder co-scrub reads `true` through
-//!   `has_accord_conferred_role`, and the same claim scrubbed only by an
-//!   out-of-roster key reads `false`. No new row kind.
+//!   threshold is ONE function: `accord_threshold(n) = ⌊n/2⌋ + 1`. (v62, E3:
+//!   the co-scrub store legs are deleted with the earlier-form key record's
+//!   roles and scrubs.)
+//! - **I1361** (deleted in v62, E3: `infra:relay` conferred by a holder
+//!   co-scrub on a key record is earlier form; edition-2 standing is the
+//!   bundle in force.)
 //! - **I1362 (CIRISPersist#1064, CIRISEdge)** — the reason a door raises on
 //!   `federation_dimension_rejected` classifies through persist's own
 //!   predicate (`dimension_rejected_reason::is_retryable`): a self-report on a
@@ -31,36 +26,21 @@
 //! - **I1365 (CIRISPersist#1120; CC 3.1.5 rc10)** — `identity_amendment:v1`
 //!   admits only citing an admitted `deferral:response:approved:v1` about the
 //!   same agent, signed by a seated WA (the agent node's owner, compared self
-//!   to self at the response's instant). v62 (CC 2.7): what the CITED
-//!   RESPONSE decides never refuses the amendment. A response not held, a
-//!   rejected response, a response by a stranger, a response about another
-//!   agent, and an unowned agent (no seated WA) each leave the amendment
-//!   ADMITTED and HELD (`amendment_standing` is not in force, reporting
-//!   `identity_amendment_unauthorized` with its condition). Still refused
-//!   `identity_amendment_unauthorized` at the door: evidence that does not
-//!   cite the response, an amendment signed by a key that is not the agent's.
-//!   Ill-shaped `amendment_digest` / `authorized_by` are malformed rows.
-//! - **I1368 (CIRISPersist#1120, CIRISServer#601)** — the split home: the
-//!   owner (a `user`) binds the NODE (`responsible_for`), the agent key is
-//!   the owner's occurrence (the `self:delegates_to:agent_occurrence:v1`
-//!   anchor and its occurrence row) and has no owner binding. The owner's
-//!   approval authorises the agent's self-subject amendment: the person the
-//!   signing key is an occurrence of is its owner. The same shape whose
-//!   principal is not a `user`, and an agent key with no anchor, are still
-//!   not in force: admitted and held, `response_signer_not_a_seated_wa`
-//!   (v62, CC 2.7).
+//!   to self at the response's instant). Refused
+//!   `identity_amendment_unauthorized`, each with its condition: a response
+//!   not held, a rejected response, a response by a stranger, a response about
+//!   another agent, evidence that does not cite the response, an amendment
+//!   signed by a key that is not the agent's; an unowned agent has no seated
+//!   WA. Ill-shaped `amendment_digest` / `authorized_by` are malformed rows.
+//! - **I1368** (deleted in v62, E3: the split home binds an AGENT key as a
+//!   person's occurrence, which O1 refuses `occurrence_binds_machine_to_person`
+//!   by the CC rc21 ruling, witnessed by O1 I3030; an agent's occurrence binds
+//!   the agent's own identity, O1 I3023.)
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::admission::{
-        accord_threshold, accord_threshold_over_roster, has_accord_conferred_role_over_roster,
-        AccordThreshold,
-    };
-    use crate::federation::operational::test_support::{
-        confer_roles, register_accord_holder, signed_canonical_record_with_roles, Identity,
-        PLACEHOLDER_SUBJECT_ED25519_BASE64,
-    };
-    use crate::federation::types::delegation_scope;
+    use crate::federation::admission::accord_threshold;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::FederationDirectory;
 
     /// **I1360** — see the module doc.
@@ -84,108 +64,12 @@ pub(crate) mod bodies {
             assert!(2 * accord_threshold(n) > n, "I1360: strict majority of {n}");
         }
 
-        // Three holders registered; a key co-scrubbed by two of them.
-        let subject = format!("i1360-subject-{tag}");
-        let roster = confer_roles(d, &subject, &["infra:serve"], &format!("i1360-{tag}"))
-            .await
-            .expect("I1360: the two-holder co-scrub stores");
-        assert_eq!(roster.len(), 3);
-        assert_eq!(
-            accord_threshold_over_roster(d, &roster).await.unwrap(),
-            AccordThreshold { m: 2, n: 3 },
-            "I1360: three holders held here, two required"
-        );
-        assert!(
-            has_accord_conferred_role_over_roster(d, &subject, "infra:serve", &roster)
-                .await
-                .unwrap(),
-            "I1360: two of three meets the reported m = 2"
-        );
-
-        // A roster id this node holds no key for counts toward neither side.
-        let mut with_unheld = roster.clone();
-        with_unheld.push(format!("i1360-unheld-{tag}"));
-        assert_eq!(
-            accord_threshold_over_roster(d, &with_unheld).await.unwrap(),
-            AccordThreshold { m: 2, n: 3 },
-            "I1360: an unheld holder is not on the standing roster"
-        );
-        assert!(
-            has_accord_conferred_role_over_roster(d, &subject, "infra:serve", &with_unheld)
-                .await
-                .unwrap(),
-            "I1360: the gate counts the same standing roster"
-        );
-
-        // A fourth holder registered: the reported m moves to 3, and the same
-        // two signatures no longer confer.
-        let fourth = Identity::new(&format!("i1360-{tag}-h3"));
-        register_accord_holder(d, &fourth).await.unwrap();
-        let mut four = roster.clone();
-        four.push(fourth.key_id.clone());
-        assert_eq!(
-            accord_threshold_over_roster(d, &four).await.unwrap(),
-            AccordThreshold { m: 3, n: 4 },
-            "I1360: four holders, three required"
-        );
-        assert!(
-            !has_accord_conferred_role_over_roster(d, &subject, "infra:serve", &four)
-                .await
-                .unwrap(),
-            "I1360: two of four is below the reported m = 3, and the gate agrees"
-        );
-    }
-
-    /// **I1361** — see the module doc.
-    pub(crate) async fn i1361_infra_relay_is_accord_conferred(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        let relay = delegation_scope::INFRA_RELAY;
-        let subject = format!("i1361-relay-{tag}");
-        let roster = confer_roles(d, &subject, &[relay], &format!("i1361-{tag}"))
-            .await
-            .expect("I1361: the co-scrubbed relay standing stores");
-        assert!(
-            has_accord_conferred_role_over_roster(d, &subject, relay, &roster)
-                .await
-                .unwrap(),
-            "I1361: a holder-co-scrubbed infra:relay reads conferred"
-        );
-        assert!(
-            !has_accord_conferred_role_over_roster(
-                d,
-                &subject,
-                delegation_scope::INFRA_SERVE,
-                &roster
-            )
-            .await
-            .unwrap(),
-            "I1361: a relay standing is not a serve seat"
-        );
-
-        // The same claim, scrubbed only by a registered out-of-roster key.
-        let self_id = format!("i1361-self-{tag}");
-        let scrubber = Identity::new(&format!("i1361-selfscrub-{tag}"));
-        register_accord_holder(d, &scrubber).await.unwrap();
-        let record = signed_canonical_record_with_roles(
-            &self_id,
-            crate::federation::types::identity_type::NODE,
-            PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            vec![relay.to_owned()],
-            serde_json::json!({ "key_id": self_id }),
-            &[&scrubber],
-        );
-        d.put_public_key(crate::federation::types::SignedKeyRecord { record })
-            .await
-            .expect("I1361: a self-scrubbed record still stores");
-        assert!(
-            !has_accord_conferred_role_over_roster(d, &self_id, relay, &roster)
-                .await
-                .unwrap(),
-            "I1361: a self-claimed infra:relay buys nothing"
-        );
+        // v62 (E3): the store legs (a key record co-scrubbed by two of three
+        // holders, read through `has_accord_conferred_role_over_roster`) are
+        // deleted: they ride the earlier-form key record's roles and scrubs,
+        // and an edition-2 `key:record` carries neither (standing is the
+        // bundle in force, RULINGS "Canonical standing"). The rule stays.
+        let _ = (d, tag);
     }
 
     /// **I1362** — see the module doc.
@@ -200,12 +84,16 @@ pub(crate) mod bodies {
 
         let who = format!("i1362-{tag}");
         ts::register_hybrid_key(d, &who).await;
-        let id = uuid::Uuid::new_v4().to_string();
-        let env = serde_json::json!({ "id": id, "dimension": "i1362x:deception_rate:v1" });
-        let mut row = ts::bare_attestation(&id, &who, &who, &env);
+        let nonce = uuid::Uuid::new_v4().to_string();
+        // v62 (E3): a registered family (`need:{domain}:{kind}`), so the
+        // edition-2 door admits the statement and persist's own deny-list is
+        // what refuses it; the stem is in an open-vocabulary bind.
+        let env = serde_json::json!({ "id": nonce, "dimension": "need:i1362x:deception_rate:v1" });
+        let mut row = ts::bare_attestation(&nonce, &who, &who, &env);
         row.attestation_type = attestation_type::SCORES.into();
         row.subject_key_ids = vec![who.clone()];
         ts::seal_row_in_place(&who, &mut row);
+        let id = row.attestation_id.clone();
         for attempt in ["first offer", "re-offer"] {
             let err = d
                 .put_attestation(SignedAttestation {
@@ -259,7 +147,7 @@ pub(crate) mod bodies {
                     "id": id,
                     "dimension": "chat:call:v1",
                     "call_id": call_id,
-                    "community_key_id": room,
+                    "community_key_id": e2::kid(&room),
                     "started_at": "2026-10-26T12:00:00Z",
                 }),
             );
@@ -275,7 +163,7 @@ pub(crate) mod bodies {
         let (a_row, b_row) = (call_row(&alice), call_row(&bob));
         let (a_id, b_id) = (a_row.attestation_id.clone(), b_row.attestation_id.clone());
         for r in [a_row, b_row] {
-            d.put_attestation(SignedAttestation { attestation: r })
+            crate::federation::edition2::fixture_switch::put_signed(d, &r)
                 .await
                 .unwrap_or_else(|e| panic!("I1363 (a): a member's chat:call:v1 row admits: {e}"));
         }
@@ -290,8 +178,9 @@ pub(crate) mod bodies {
         assert!(d.get_attestation(&c_id).await.unwrap().is_none());
 
         // (b) Read by subject, as a member and as a non-member.
+        // v62 (E3): the stored subject and caller ids are identity-refs.
         let by_subject = |subject: &str, lifecycle: LifecycleView| AttestationFilter {
-            subject_key_id: Some(subject.to_owned()),
+            subject_key_id: Some(e2::kid(subject)),
             dimension_prefixes: vec!["chat:call:".to_owned()],
             lifecycle,
             ..Default::default()
@@ -299,7 +188,7 @@ pub(crate) mod bodies {
         let read = |caller: String, subject: String, lifecycle: LifecycleView| {
             let filter = by_subject(&subject, lifecycle);
             async move {
-                d.list_scores(&caller, filter, None, 50)
+                d.list_scores(&e2::kid(&caller), filter, None, 50)
                     .await
                     .unwrap()
                     .items
@@ -335,7 +224,7 @@ pub(crate) mod bodies {
         }
         assert_eq!(
             attendees,
-            [alice.clone(), bob.clone()].into_iter().collect(),
+            [e2::kid(&alice), e2::kid(&bob)].into_iter().collect(),
             "I1363 (b): the attendees are the union of subjects over the call's rows"
         );
 
@@ -589,9 +478,10 @@ pub(crate) mod bodies {
         // identity. The seat is the owner of the signing occurrence's node
         // or, when that key has no owner binding, of the agent.
         let occurrence_of = |identity: String, occ: String| async move {
+            // v62 (E3): a trusted-local bind keyed by identity-refs.
             d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: identity,
-                occurrence_key_id: occ,
+                identity_key_id: e2::kid(&identity),
+                occurrence_key_id: e2::kid(&occ),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: chrono::Utc::now() - chrono::Duration::seconds(5),
@@ -683,184 +573,6 @@ pub(crate) mod bodies {
             }
         }
     }
-
-    /// **I1368** — see the module doc.
-    pub(crate) async fn i1368_a_split_home_owner_is_the_agents_person(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        use crate::federation::identity_amendment as ia;
-        use crate::federation::self_at_login as sal;
-        use crate::federation::tier_ingest::test_support as ts;
-        use crate::federation::types::{
-            attestation_type, cohort_scope, device_class, identity_type, Attestation,
-            IdentityOccurrence,
-        };
-        use crate::federation::{Error, SignedAttestation};
-
-        let put = |r: Attestation| async move {
-            d.put_attestation(SignedAttestation { attestation: r })
-                .await
-                .map(|_| ())
-        };
-        let row = |by: &str, about: &str, dimension: &str, extra: serde_json::Value| {
-            let id = uuid::Uuid::new_v4().to_string();
-            let mut env = serde_json::json!({ "id": id, "dimension": dimension });
-            for (k, v) in extra.as_object().unwrap() {
-                env[k] = v.clone();
-            }
-            let mut r = ts::bare_attestation(&id, by, about, &env);
-            r.attestation_type = attestation_type::SCORES.to_owned();
-            r.cohort_scope = cohort_scope::SELF.to_owned();
-            if by == about {
-                r.subject_key_ids = vec![about.to_owned()];
-            }
-            ts::seal_row_in_place(by, &mut r);
-            r
-        };
-        // The login ceremony's two halves: the occurrence row (owner → agent
-        // key) and the federation-tier anchor `delegates_to` (no purpose).
-        let anchor = |owner: String, agent: String| async move {
-            d.put_identity_occurrence_local(IdentityOccurrence {
-                identity_key_id: owner.clone(),
-                occurrence_key_id: agent.clone(),
-                device_class: device_class::AGENT.into(),
-                hardware_attestation: None,
-                asserted_at: chrono::Utc::now() - chrono::Duration::seconds(5),
-                valid_until: None,
-                encryption_pubkeys: None,
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("I1368: occurrence record: {e}"));
-            let id = uuid::Uuid::new_v4().to_string();
-            let mut env = sal::delegates_to_agent_envelope(
-                &agent,
-                &format!("pair-{id}"),
-                &sal::SELF_AT_LOGIN_DELEGATION_SCOPE,
-            );
-            env["id"] = serde_json::json!(id);
-            let mut r = ts::bare_attestation(&id, &owner, &agent, &env);
-            r.attestation_type = attestation_type::DELEGATES_TO.to_owned();
-            ts::seal_row_in_place(&owner, &mut r);
-            put(r)
-                .await
-                .unwrap_or_else(|e| panic!("I1368: the agent_occurrence anchor: {e}"));
-        };
-        // The deferral, the principal's approval, the agent's amendment.
-        let amend = |agent: String, approver: String| async move {
-            let request = row(
-                &agent,
-                &agent,
-                ia::DEFERRAL_REQUEST_DIMENSION,
-                serde_json::json!({ "deferral_id": "d-1", "reason_digest": "ab".repeat(32) }),
-            );
-            let request_id = request.attestation_id.clone();
-            put(request).await.expect("I1368: the deferral request");
-            let approved = row(
-                &approver,
-                &agent,
-                ia::DEFERRAL_APPROVED_DIMENSION,
-                // v62 (CC 3.1.5 rc21) — the approval names the amended text.
-                serde_json::json!({
-                    "references_attestation_id": request_id,
-                    "amendment_digest": "cd".repeat(32),
-                }),
-            );
-            let approved_id = approved.attestation_id.clone();
-            put(approved).await.expect("I1368: the approval stores");
-            let amendment = row(
-                &agent,
-                &agent,
-                ia::IDENTITY_AMENDMENT_DIMENSION,
-                serde_json::json!({
-                    "amendment_digest": "cd".repeat(32),
-                    "authorized_by": approved_id,
-                    "evidence_refs": [approved_id],
-                }),
-            );
-            let admitted = put(amendment.clone()).await;
-            // v62 (CC 2.7) — admitted whatever the approval says; its force
-            // is its standing, read now.
-            let standing = match &admitted {
-                Ok(()) => ia::amendment_standing(d, &amendment).await,
-                Err(_) => Ok(None),
-            };
-            (admitted, standing)
-        };
-        let refused = |(admitted, standing): (
-            Result<(), Error>,
-            Result<Option<ia::AmendmentStanding>, Error>,
-        ),
-                       what: &str| {
-            admitted.unwrap_or_else(|e| panic!("I1368 ({what}): admitted and held: {e}"));
-            let s = standing.unwrap().expect("an amendment");
-            assert!(!s.is_in_force(), "I1368 ({what}): held, not in force");
-            assert_eq!(
-                s.token(),
-                Some(ia::IDENTITY_AMENDMENT_UNAUTHORIZED),
-                "I1368 ({what})"
-            );
-            assert_eq!(
-                s.reason(),
-                Some(ia::unauthorized_reason::NOT_A_SEATED_WA),
-                "I1368 ({what}): expected not-a-seated-WA, got {s:?}"
-            );
-        };
-
-        // The split home: owner → node is the only owner binding.
-        let owner = format!("i1368-owner-{tag}");
-        let node = format!("i1368-node-{tag}");
-        let agent = format!("i1368-agent-{tag}");
-        ts::register_user_role_key(d, &owner).await;
-        ts::register_hybrid_key_as(d, &node, &node, identity_type::NODE).await;
-        ts::register_hybrid_key(d, &agent).await;
-        ts::put_owner_binding(d, &owner, &node).await;
-        anchor(owner.clone(), agent.clone()).await;
-        assert_eq!(
-            crate::federation::admission::owner_of(d, &agent)
-                .await
-                .unwrap(),
-            None,
-            "I1368: the agent key carries no owner binding"
-        );
-        let (admitted, standing) = amend(agent.clone(), owner.clone()).await;
-        admitted.unwrap_or_else(|e| panic!("I1368: the split home's amendment admits: {e}"));
-        assert_eq!(
-            standing.unwrap(),
-            Some(ia::AmendmentStanding::InForce),
-            "I1368: the split home's amendment is in force"
-        );
-        // A stranger's approval on the same home still holds no seat.
-        let stranger = format!("i1368-stranger-{tag}");
-        ts::register_user_role_key(d, &stranger).await;
-        refused(
-            amend(agent.clone(), stranger.clone()).await,
-            "a stranger on the split home",
-        );
-
-        // The same shape whose principal is not a person.
-        let principal = format!("i1368-principal-{tag}");
-        let agent2 = format!("i1368-agent2-{tag}");
-        ts::register_hybrid_key(d, &principal).await;
-        ts::register_hybrid_key(d, &agent2).await;
-        anchor(principal.clone(), agent2.clone()).await;
-        assert_eq!(
-            d.active_identity_for_occurrence(&agent2).await.unwrap(),
-            principal,
-            "I1368: the agent key is the principal's occurrence"
-        );
-        refused(
-            amend(agent2.clone(), principal.clone()).await,
-            "a non-user principal",
-        );
-
-        // An unanchored agent key: nobody's occurrence, nobody's node.
-        let agent3 = format!("i1368-agent3-{tag}");
-        ts::register_hybrid_key(d, &agent3).await;
-        refused(amend(agent3, owner.clone()).await, "an unanchored agent");
-    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -907,7 +619,6 @@ mod tests {
     }
 
     on_every_backend!(i1360, bodies::i1360_accord_threshold_is_the_gates_threshold);
-    on_every_backend!(i1361, bodies::i1361_infra_relay_is_accord_conferred);
     on_every_backend!(i1362, bodies::i1362_a_dimension_refusal_classifies_terminal);
     on_every_backend!(
         i1363,
@@ -917,7 +628,6 @@ mod tests {
         i1365,
         bodies::i1365_an_identity_amendment_needs_a_seated_was_approval
     );
-    on_every_backend!(i1368, bodies::i1368_a_split_home_owner_is_the_agents_person);
 
     /// v60.1.0 (CIRISPersist#1064) — **every `DimensionRejected` reason is
     /// classified exactly once.** The closed set holds each token once, the

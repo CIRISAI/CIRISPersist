@@ -100,7 +100,7 @@ async fn bind(
 }
 
 /// A voice of an `identity:occurrence_revocation` (an eviction, CC
-/// 3.3.6.4), the self's (`iss` = `author` = the identity), signed by the
+/// 3.3.6.4), the self's (`iss` = the identity; COUNTED, so no `author`), signed by the
 /// E0 seed `seed`, on the identity's current roster head.
 async fn revocation_voice(
     d: &dyn FederationDirectory,
@@ -112,7 +112,6 @@ async fn revocation_voice(
     let h = head(d, &rev.identity_key_id).await;
     let payload = map(vec![
         ("asserted_at", Value::Uint(asserted_at)),
-        ("author", Value::Text(rev.identity_key_id.clone())),
         ("identity_key_id", Value::Text(rev.identity_key_id.clone())),
         (
             "occurrence_key_id",
@@ -223,7 +222,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
     // I3045: two keys. The user's statement alone is held.
     let (out, row) = propose(d, &u, &user, &d2, t + 1).await;
     assert!(
-        matches!(out, StatementOutcome::Voice { .. }),
+        matches!(out, StatementOutcome::Pending { .. }),
         "I3045: at two keys the add is a proposal: {out:?}"
     );
     assert!(
@@ -251,7 +250,10 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
 
     // I3046: three keys; the user's proposal of d3 waits out the window.
     let (out, row3) = propose(d, &u, &user, &d3, t + 2).await;
-    assert!(matches!(out, StatementOutcome::Voice { .. }), "I3046: held");
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I3046: held"
+    );
     advance(sr::W_SELF_SECS - 60);
     sr::execute_for(d, &u).await.unwrap();
     assert!(
@@ -272,7 +274,10 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
 
     // I3047: four keys; d1 and d2 (two of the three others) object to d4.
     let (out, row4) = propose(d, &u, &user, &d4, t + 3).await;
-    assert!(matches!(out, StatementOutcome::Voice { .. }), "I3047: held");
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I3047: held"
+    );
     for voter in [&d1, &d2] {
         put(d, &objection(voter, &u, &row4, now_ms()))
             .await
@@ -357,7 +362,7 @@ pub(crate) async fn eviction_body(d: &dyn FederationDirectory) {
         &voice,
         &keys,
         None,
-        ciris_verify_core::edition2::family::SelectContext::default(),
+        super::typed::family_context(d, &voice).await.unwrap(),
     )
     .unwrap();
     d.put_edition2_statement(&admitted).await.unwrap();
@@ -396,7 +401,7 @@ pub(crate) async fn eviction_body(d: &dyn FederationDirectory) {
     let row3 = RowId::of_statement(&voices[0]).unwrap();
     assert!(matches!(
         put_bind(d, u, u, d3, "laptop", &late).await,
-        Ok(StatementOutcome::Voice { .. })
+        Ok(StatementOutcome::Pending { .. })
     ));
     assert!(open(d, &uk).await.contains(&row3.hex()), "I3049: held");
     let withdraws = sign_row_statement(
@@ -461,7 +466,7 @@ pub(crate) async fn eviction_body(d: &dyn FederationDirectory) {
             st,
             &keys,
             None,
-            ciris_verify_core::edition2::family::SelectContext::default(),
+            super::typed::family_context(d, st).await.unwrap(),
         )
         .unwrap();
         d.put_edition2_statement(&a).await.unwrap();
@@ -515,7 +520,7 @@ async fn hold_and_gate(d: &dyn FederationDirectory, voice: &[u8]) -> (RowId, boo
         voice,
         &keys,
         None,
-        ciris_verify_core::edition2::family::SelectContext::default(),
+        super::typed::family_context(d, voice).await.unwrap(),
     )
     .unwrap();
     d.put_edition2_statement(&a).await.unwrap();
@@ -667,12 +672,13 @@ async fn i3640_i3641_postgres() {
 /// - I3642: `self_roster::roster_at_head` folds the chain: at the genesis
 ///   key's own record it is `{f}`; at d1's bind `{f, d1}`; at d2's bind
 ///   `{f, d1, d2}`.
-/// - I3643: the count is over the named head, not the roster now: d2 (on
-///   the roster at d2's bind, not at d1's) proposing d3 on d1's bind is
-///   refused for good (its proposer is not on the roster it names); on d2's
-///   bind the same proposal is held.
-/// - I3644: a bind naming a head this node does not hold waits (the
-///   retryable unknown signer naming `row:<hex>`), and binds nothing.
+/// - I3643 (CC 2.7.8): d2 proposing d3 on d1's bind, whose successor (d2's
+///   bind) this node acknowledged, is a VOID sibling: `Pending`, kept,
+///   settled `void_superseded`, never refused; on d2's bind the same
+///   proposal is held short of its count.
+/// - I3644: a bind naming a head this node does not hold yet WAITS
+///   (`Pending`, its receipt open), never refused; once the head is
+///   delivered and lands, the bind lands with no manual step.
 pub(crate) async fn head_body(d: &dyn FederationDirectory) {
     let (f, d1, d2, d3) = (key(140), key(141), key(142), key(143));
     for k in [&f, &d1, &d2, &d3] {
@@ -686,7 +692,7 @@ pub(crate) async fn head_body(d: &dyn FederationDirectory) {
     let h1 = head(d, &fk).await;
     assert_ne!(h1, g0, "I3642: d1's bind is the head now");
     let (out, _) = propose(d, &fk, &f, &d2, t + 1).await;
-    assert!(matches!(out, StatementOutcome::Voice { .. }), "d2 waits");
+    assert!(matches!(out, StatementOutcome::Pending { .. }), "d2 waits");
     assert!(matches!(
         put(d, &bind_at(&d1, &fk, &fk, &iref(&d2), t + 1, &h1)).await,
         Ok(StatementOutcome::Row { .. })
@@ -713,12 +719,28 @@ pub(crate) async fn head_body(d: &dyn FederationDirectory) {
     put(d, &bind_at(&d3, &k3, &fk, &k3, t + 2, &h1))
         .await
         .unwrap();
-    let e = put(d, &bind_at(&d2, &fk, &fk, &k3, t + 2, &h1))
-        .await
-        .unwrap_err();
+    // CC 2.7.8: h1's successor h2 is acknowledged here, so a row on h1 is a
+    // VOID sibling for this reader: held (kept), concluding nothing, never
+    // refused.
+    let stale = bind_at(&d2, &fk, &fk, &k3, t + 2, &h1);
+    let stale_row = RowId::of_statement(&stale).unwrap();
+    let out = put(d, &stale).await;
     assert!(
-        matches!(e, Error::SelfRosterNotLanded { .. }),
-        "I3643: over h1 the proposer d2 is not on the roster: {e:?}"
+        matches!(out, Ok(StatementOutcome::Pending { .. })),
+        "I3643: a row on the superseded head h1 is held, not refused: {out:?}"
+    );
+    assert_eq!(
+        d.edition2_roster_proposal(&stale_row.hex())
+            .await
+            .unwrap()
+            .and_then(|r| r.outcome)
+            .as_deref(),
+        Some(sr::VOID_OUTCOME),
+        "I3643: void for this reader"
+    );
+    assert!(
+        !d.edition2_voices(&stale_row).await.unwrap().is_empty(),
+        "I3643: its statements are kept"
     );
     put(d, &bind_at(&d3, &k3, &fk, &k3, t + 3, &h2))
         .await
@@ -726,30 +748,55 @@ pub(crate) async fn head_body(d: &dyn FederationDirectory) {
     assert!(
         matches!(
             put(d, &bind_at(&d2, &fk, &fk, &k3, t + 3, &h2)).await,
-            Ok(StatementOutcome::Voice { .. })
+            Ok(StatementOutcome::Pending { .. })
         ),
         "I3643: over h2 the same proposal is held (one voice of three)"
     );
     assert!(!active(d, &fk, &k3).await, "I3643: d3 not a roster key");
 
-    // I3644: a head this node does not hold.
-    let unheld = RowId([0x77; 32]);
-    put(d, &bind_at(&d3, &k3, &fk, &k3, t + 4, &unheld))
+    // I3644: a head this node does not hold yet: the row WAITS (CC 2.7.3),
+    // held and concluding nothing, never refused; when the head is
+    // delivered, the row lands with no manual step (G0's re-fold re-runs
+    // its door: the gate declared `row:<head>`).
+    let (k5, k6) = (key(144), key(145));
+    for k in [&k5, &k6] {
+        put(d, &key_record(k, &["primitive"], 0, None))
+            .await
+            .unwrap();
+    }
+    let (r5, r6) = (iref(&k5), iref(&k6));
+    // X: k5's bind on h2 (not a roster change), NOT delivered yet.
+    let x = [
+        bind_at(&k5, &r5, &fk, &r5, t + 4, &h2),
+        bind_at(&f, &fk, &fk, &r5, t + 4, &h2),
+    ];
+    let hx = RowId::of_statement(&x[0]).unwrap();
+    // W: k6's bind on X.
+    put(d, &bind_at(&k6, &r6, &fk, &r6, t + 5, &hx))
         .await
         .unwrap();
-    let e = put(d, &bind_at(&f, &fk, &fk, &k3, t + 4, &unheld))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        e.kind(),
-        "federation_attester_key_unknown",
-        "I3644: the row waits on its head: {e}"
+    let w = bind_at(&f, &fk, &fk, &r6, t + 5, &hx);
+    let out = put(d, &w).await;
+    assert!(
+        matches!(out, Ok(StatementOutcome::Pending { .. })),
+        "I3644: the row waits on its head: {out:?}"
     );
     assert!(
-        e.to_string().contains(&unheld.hex()),
-        "I3644: names it: {e}"
+        open(d, &fk)
+            .await
+            .contains(&RowId::of_statement(&w).unwrap().hex()),
+        "I3644: its receipt is open"
     );
-    assert!(!active(d, &fk, &k3).await, "I3644: nothing bound");
+    assert!(!active(d, &fk, &r6).await, "I3644: nothing bound yet");
+    // Deliver X: it lands, and W lands with it, unprompted.
+    for v in &x {
+        put(d, v).await.unwrap();
+    }
+    assert!(active(d, &fk, &r5).await, "I3644: the head X landed");
+    assert!(
+        active(d, &fk, &r6).await,
+        "I3644: the waiting row landed once its head arrived, no execute_for"
+    );
 }
 
 #[cfg(feature = "sqlite")]
@@ -775,4 +822,266 @@ async fn i3642_to_i3644_postgres() {
         .unwrap();
     b.run_migrations().await.unwrap();
     Box::pin(head_body(&b)).await;
+}
+
+/// Bind `occurrence` under `identity` (E0 seeds) on exactly `heads`
+/// (`refs.head`, then `refs.further_heads`): the occurrence key's own
+/// voice and the identity's author voice, NOT put.
+fn bind_on(
+    identity: &str,
+    occurrence: &str,
+    class: &str,
+    heads: &[RowId],
+    at: u64,
+) -> Vec<Vec<u8>> {
+    use super::fixture_occurrence::{occurrence_bind_voices, BindOptions};
+    let opts = BindOptions {
+        asserted_at_ms: at,
+        head: heads.first().copied(),
+        further_heads: heads.iter().skip(1).copied().collect(),
+        ..BindOptions::default()
+    };
+    occurrence_bind_voices(identity, identity, occurrence, class, &opts)
+}
+
+/// `signer`'s author voice as `identity` (E0 seeds) over the payload of
+/// the held author statement `author_st`: a further roster key's assent.
+fn as_identity(signer: &str, identity: &str, author_st: &[u8]) -> Vec<u8> {
+    use super::fixture_switch as e2;
+    let (_, payload) = super::liveness::statement_parts(author_st).unwrap();
+    let sub = payload
+        .get_text("occurrence_key_id")
+        .and_then(Value::as_text)
+        .unwrap()
+        .to_owned();
+    sign_row_statement(
+        &e2::signing_key(signer),
+        &e2::kid(identity),
+        &sub,
+        "scores",
+        OCCURRENCE_FAMILY,
+        &payload,
+        vec![],
+    )
+    .unwrap()
+}
+
+/// **I3645–I3648** (wave O1, the second block; CC 3.3.6.4, the CC 2.7
+/// ruling, CC 2.7.8, CC rc21's `refs.further_heads`) on one backend, E0
+/// seeds:
+/// - I3645: a proposal waiting on a head it names lands, WITHOUT any
+///   `execute_for`, once that head lands (the fold re-plans it: the gate
+///   declared `row:<head>`).
+/// - I3646: a sibling (A) of a head whose successor (B) this node
+///   acknowledged is VOID here: kept, settled `void_superseded`, and B is
+///   the one tip; a merge naming B and A lands and is the one tip after.
+/// - I3647: merging never revives: A evicts e2, B (on the head before)
+///   still holds e2; the roster at B holds e2, at {B, A} and at the merge
+///   row it does not (e1 stays).
+/// - I3648: a genesis thief's sibling naming the genesis record, after this
+///   node acknowledged the honest successor, is VOID, and binds nothing.
+pub(crate) async fn fork_body(d: &dyn FederationDirectory) {
+    use super::fixture_occurrence::{put_bind, BindOptions};
+    use super::fixture_switch as e2;
+    use super::occurrence::current_roster_heads;
+    let seeds = [
+        "fk-h", "fk-x1", "fk-x2", "fk-t", "fk-g", "fk-e1", "fk-e2", "fk-p1", "fk-p2", "fk-q",
+    ];
+    for s in seeds {
+        let types: &[&str] = if s.contains("-p") || s.contains("-q") {
+            &["primitive"]
+        } else {
+            &["user"]
+        };
+        e2::put_key(d, s, types).await;
+    }
+    let at = now_ms() - 3_600_000;
+    let opts = BindOptions {
+        asserted_at_ms: at,
+        ..BindOptions::default()
+    };
+
+    // I3645: h's roster {h, x1}; a proposal of x2 names X (q's bind), which
+    // is not held yet.
+    let hk = e2::kid("fk-h");
+    let g0 = head(d, &hk).await;
+    assert!(matches!(
+        put_bind(d, "fk-h", "fk-h", "fk-x1", "laptop", &opts).await,
+        Ok(StatementOutcome::Row { .. })
+    ));
+    let h1 = head(d, &hk).await;
+    let x = bind_on("fk-h", "fk-q", "service", &[h1], at + 1);
+    let rx = RowId::of_statement(&x[0]).unwrap();
+    let p = bind_on("fk-h", "fk-x2", "laptop", &[rx], at + 2);
+    assert!(matches!(
+        put(d, &p[0]).await,
+        Ok(StatementOutcome::Voice { .. })
+    ));
+    for v in [p[1].clone(), as_identity("fk-x1", "fk-h", &p[1])] {
+        assert!(
+            matches!(put(d, &v).await, Ok(StatementOutcome::Pending { .. })),
+            "I3645: waits on X"
+        );
+    }
+    assert!(!active(d, &hk, &e2::kid("fk-x2")).await, "I3645: not yet");
+    for v in &x {
+        put(d, v).await.unwrap();
+    }
+    assert!(
+        active(d, &hk, &e2::kid("fk-x2")).await,
+        "I3645: X landed, and the waiting proposal landed on the fold's re-plan (h and x1 \
+         are 2 of 2 over X)"
+    );
+
+    // I3646 / I3647: g's roster {g, e1, e2} at H2.
+    let gk = e2::kid("fk-g");
+    assert!(matches!(
+        put_bind(d, "fk-g", "fk-g", "fk-e1", "laptop", &opts).await,
+        Ok(StatementOutcome::Row { .. })
+    ));
+    let g1 = head(d, &gk).await;
+    let b2 = bind_on("fk-g", "fk-e2", "laptop", &[g1], at + 3);
+    put(d, &b2[0]).await.unwrap();
+    put(d, &b2[1]).await.unwrap();
+    assert!(matches!(
+        put(d, &as_identity("fk-e1", "fk-g", &b2[1])).await,
+        Ok(StatementOutcome::Row { .. })
+    ));
+    let g2 = head(d, &gk).await;
+    // Branch B: p1's bind on H2 (not a roster change: lands at once; this
+    // node acknowledges it).
+    let bb = bind_on("fk-g", "fk-p1", "service", &[g2], at + 4);
+    for v in &bb {
+        put(d, v).await.unwrap();
+    }
+    let rb = RowId::of_statement(&bb[0]).unwrap();
+    // Branch A: e2's eviction on H2, by g and e1 (2 of 3), arriving after B:
+    // a sibling of the acknowledged B, so VOID here (CC 2.7.8), kept.
+    let now = crate::host::clock::now();
+    let rev = crate::federation::types::IdentityOccurrenceRevocation {
+        identity_key_id: gk.clone(),
+        occurrence_key_id: e2::kid("fk-e2"),
+        revoked_at: now,
+        effective_at: now,
+        reason: None,
+        witness_set: Vec::new(),
+        persist_row_hash: String::new(),
+    };
+    let ev = |seed: &str| {
+        let ms = |t: chrono::DateTime<chrono::Utc>| u64::try_from(t.timestamp_millis()).unwrap();
+        sign_row_statement(
+            &e2::signing_key(seed),
+            &gk,
+            &rev.occurrence_key_id,
+            "scores",
+            super::occurrence::OCCURRENCE_REVOCATION_FAMILY,
+            &map(vec![
+                ("asserted_at", Value::Uint(at + 5)),
+                ("identity_key_id", Value::Text(gk.clone())),
+                (
+                    "occurrence_key_id",
+                    Value::Text(rev.occurrence_key_id.clone()),
+                ),
+                ("revoked_at", Value::Uint(ms(rev.revoked_at))),
+                ("effective_at", Value::Uint(ms(rev.effective_at))),
+                (
+                    "refs",
+                    map(vec![("head", ciris_verify_core::edition2::row_ref(&g2.0))]),
+                ),
+            ]),
+            vec![],
+        )
+        .unwrap()
+    };
+    let (ra, lands) = hold_and_gate(d, &ev("fk-g")).await;
+    assert!(!lands, "I3646: A is void here");
+    let (_, lands) = hold_and_gate(d, &ev("fk-e1")).await;
+    assert!(!lands, "I3646: A stays void at two of three");
+    let outcome = |r: RowId| async move {
+        d.edition2_roster_proposal(&r.hex())
+            .await
+            .unwrap()
+            .and_then(|r| r.outcome)
+    };
+    assert_eq!(
+        outcome(ra).await.as_deref(),
+        Some(sr::VOID_OUTCOME),
+        "I3646: A settled void for this reader"
+    );
+    assert_eq!(
+        current_roster_heads(d, &gk).await.unwrap(),
+        Some((rb, Vec::new())),
+        "I3646: one acknowledged tip, B"
+    );
+
+    // I3647: at B the roster still holds e2 (A never landed here); a merge
+    // naming B and A counts without e2 (an eviction on any merged branch
+    // stands, the void sibling's included), and e1 stays.
+    let e2k = e2::kid("fk-e2");
+    let r = sr::roster_at_head(d, &gk, &rb).await.unwrap();
+    assert!(r.contains(&e2k), "I3647: at B, e2 is a member: {r:?}");
+    let r = sr::roster_at_heads(d, &gk, &[rb, ra]).await.unwrap();
+    assert!(!r.contains(&e2k), "I3647: at {{B, A}}: {r:?}");
+    assert!(r.contains(&e2::kid("fk-e1")), "I3647: e1 stays");
+
+    // I3646: the merge row (p2's bind naming B and A) lands and is the one tip.
+    let m = bind_on("fk-g", "fk-p2", "service", &[rb, ra], at + 6);
+    for v in &m {
+        put(d, v).await.unwrap();
+    }
+    let rm = RowId::of_statement(&m[0]).unwrap();
+    assert_eq!(
+        current_roster_heads(d, &gk).await.unwrap(),
+        Some((rm, Vec::new())),
+        "I3646: the merge is the one tip"
+    );
+    let r = sr::roster_at_head(d, &gk, &rm).await.unwrap();
+    assert!(!r.contains(&e2k), "I3647: at the merge: {r:?}");
+
+    // I3648 (CC 2.7.8): a genesis thief's sibling. h's genesis key binds t on
+    // the genesis record g0, whose successor (x1's bind) this node
+    // acknowledged: VOID here, though over g0 alone ({h}) it would land.
+    let t = bind_on("fk-h", "fk-t", "laptop", &[g0], at + 8);
+    put(d, &t[0]).await.unwrap();
+    let out = put(d, &t[1]).await;
+    assert!(
+        matches!(out, Ok(StatementOutcome::Pending { .. })),
+        "I3648: held, not landed: {out:?}"
+    );
+    assert_eq!(
+        outcome(RowId::of_statement(&t[0]).unwrap())
+            .await
+            .as_deref(),
+        Some(sr::VOID_OUTCOME),
+        "I3648: void for this reader"
+    );
+    assert!(
+        !active(d, &hk, &e2::kid("fk-t")).await,
+        "I3648: t not bound"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3645_to_i3648_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(fork_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3645_to_i3648_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(fork_body(&b)).await;
 }

@@ -720,16 +720,37 @@ where
             }),
         });
     };
+    // v62.0.0 (wave GC7; CC 2.7.3) — "asked of this node's own state": the
+    // target, its withdraws and the producer's key records are other rows.
+    // Declared, and an unmet answer HOLDS under a fold attempt
+    // (`subject_erasure_unauthorised`), re-folded when any of them changes;
+    // outside one it is the refusal it was. (An erasure is an EFFECT gate,
+    // CC 2.7.5: nothing is destroyed while it is held.)
+    {
+        use super::edition2::fold::{reads, Dep};
+        reads(
+            Dep::row_hex(&target.attestation_id)
+                .unwrap_or_else(|| Dep::key(&target.attestation_id)),
+        );
+        reads(
+            Dep::row_hex(&withdraws.attestation_id)
+                .unwrap_or_else(|| Dep::key(&withdraws.attestation_id)),
+        );
+        reads(Dep::key(&target.attesting_key_id));
+    }
     let admitted = erasing_withdraws(directory, &target)
         .await?
         .is_some_and(|w| w.attestation_id == withdraws.attestation_id);
     if !admitted {
-        return Err(unauth(
-            &notice_id,
-            format!(
-                "withdraws {} is not the producer's rule-1 withdraws of {} that this node \
-                 admits (CC 4.5.3; asked of this node's own state)",
-                withdraws.attestation_id, target.attestation_id
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::SUBJECT_ERASURE_UNAUTHORISED,
+            unauth(
+                &notice_id,
+                format!(
+                    "withdraws {} is not the producer's rule-1 withdraws of {} that this node \
+                     admits (CC 4.5.3; asked of this node's own state)",
+                    withdraws.attestation_id, target.attestation_id
+                ),
             ),
         ));
     }

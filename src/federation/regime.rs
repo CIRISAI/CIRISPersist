@@ -126,8 +126,8 @@
 //! What DID come out of that clause is a defect: the federation-tier ban was
 //! unenforced here, so an `x_private:*` row promoted cleanly on every backend.
 //! [`check_private_use_not_federatable`](super::admission::check_private_use_not_federatable)
-//! closes it, and
-//! [`tests::private_use_is_banned_from_federation_tier`] holds all three doors.
+//! closes it. (v62.0.0: its JSON-door witness is retired; an edition-2
+//! statement cannot name an unregistered dimension at all.)
 //!
 //! # The replication half — the decision
 //!
@@ -487,14 +487,14 @@ mod tests {
         dimension: &str,
     ) -> Result<(String, String), crate::federation::Error> {
         use crate::federation::types::{attestation_tier, cohort_scope};
-        use crate::federation::SignedAttestation;
 
-        let (id, attester, mut row) = build_row(dir, suffix, dimension).await;
+        let (_, attester, mut row) = build_row(dir, suffix, dimension).await;
         row.tier = attestation_tier::LOCAL.to_owned();
         row.cohort_scope = cohort_scope::SELF.to_owned();
         crate::federation::tier_ingest::test_support::reseal(&mut row);
-        dir.put_attestation(SignedAttestation { attestation: row })
-            .await?;
+        // v62.0.0 (E5) — the re-seal re-signs, so the id is the re-sealed row's.
+        let id = crate::federation::edition2::fixture_switch::rid(&row);
+        crate::federation::edition2::fixture_switch::put_signed(dir, &row).await?;
         Ok((id, attester))
     }
 
@@ -533,22 +533,6 @@ mod tests {
         Ok(())
     }
 
-    /// **Door 3** — the DIRECT federation-tier write. A promotion ban that only
-    /// covers the promote path is not a ban; an inbound peer row arrives here.
-    #[cfg(any(test, feature = "test-anchor"))]
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn write_at_federation_tier(
-        dir: &dyn crate::federation::FederationDirectory,
-        suffix: &str,
-        dimension: &str,
-    ) -> Result<(), crate::federation::Error> {
-        use crate::federation::SignedAttestation;
-        let (_, _, row) = build_row(dir, suffix, dimension).await;
-        dir.put_attestation(SignedAttestation { attestation: row })
-            .await
-            .map(|_| ())
-    }
-
     /// Register `attester`/`subject` and build a really-hybrid-signed `scores`
     /// row on `dimension` (federation tier, federation scope — callers
     /// downgrade). Returns `(id, attester, row)`.
@@ -559,18 +543,20 @@ mod tests {
         suffix: &str,
         dimension: &str,
     ) -> (String, String, crate::federation::Attestation) {
-        let attester = format!("regime571-attester-{suffix}");
-        let subject = format!("regime571-subject-{suffix}");
-        for k in [&attester, &subject] {
-            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
-        }
-        // UUID, not a readable slug: postgres types `attestation_id` as `uuid`
-        // and rejects anything else at the driver.
-        let id = uuid::Uuid::new_v4().to_string();
+        // v62.0.0 (JSON cut, E5) — edition-2 `key:record`s (agent, as
+        // `register_hybrid_key` registered), named by identity-ref; the row
+        // is the flipped builder's, so its id is the node-computed row id.
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::types::identity_type::AGENT;
+        let attester = e2::put_key(dir, &format!("regime571-attester-{suffix}"), &[AGENT]).await;
+        let subject = e2::put_key(dir, &format!("regime571-subject-{suffix}"), &[AGENT]).await;
         let row = crate::federation::bootstrap_admission::test_support::scores_row(
-            &id, &attester, &subject, dimension,
+            &uuid::Uuid::new_v4().to_string(),
+            &attester,
+            &subject,
+            dimension,
         );
-        (id, attester, row)
+        (e2::rid(&row), attester, row)
     }
 
     /// **The backend-uniform half of the decision.** On every backend persist
@@ -589,25 +575,12 @@ mod tests {
                 });
         }
 
-        let probe = format!(
-            "{}manifest:v1",
-            crate::federation::admission::R2_PROBE_UNREGISTERED_STEM
-        );
-        let err = regime_row_survives_both_doors(dir, &format!("{tag}-probe"), &probe)
-            .await
-            .expect_err("a governed-but-unregistered family must be refused on the same path");
-        assert_eq!(
-            err.kind(),
-            "federation_namespace_family_unregistered",
-            "the R2 door must be the thing refusing on {tag}, not some unrelated gate"
-        );
-
-        // ── CC 3.1.7 R2 Private Use, the contrast that makes the decision
-        //    legible: `x_private:*` is the range `regime:*` was considered for
-        //    and rejected for, and it is BANNED from federation tier on every
-        //    door. Asserted right next to the admit so the two verdicts are
-        //    read together.
-        private_use_is_banned_from_federation_tier(dir, tag).await;
+        // v62.0.0 (JSON cut, E5) — the R2 probe arm and the private-use arm
+        // (`private_use_is_banned_from_federation_tier`) are deleted: an
+        // unregistered dimension (the probe stem, `x_private:*`) cannot be
+        // signed as an edition-2 statement at all (the codec names no family
+        // for it, and the edition-2 door refuses it `statement_invalid` before
+        // any R2 gate), so the JSON gate arms they witnessed are unreachable.
 
         // ── The other family the same re-vendor unblocked. Rides this body so
         //    it inherits the three-backend trio rather than growing a fourth.
@@ -704,71 +677,6 @@ mod tests {
             err.kind(),
             "federation_reserved_prefix_emitter_mismatch",
             "the reserved-prefix gate must be what refuses `age_assurance:` on {tag}"
-        );
-    }
-
-    /// **CC 3.1.7 R2, the Private Use range** (landed on rc3 after v26.0.0
-    /// shipped #590): *"private-use families MUST NOT admit at federation tier
-    /// under any authority."*
-    ///
-    /// Three doors, because a ban that covers one is not a ban:
-    ///
-    /// 1. the **local** write still ADMITS — Private Use is a legitimate range,
-    ///    not a forbidden one, and refusing it locally would delete the thing
-    ///    CC created it for (RFC 6648: no legitimate unregistered range is how
-    ///    `X-` squatting gets minted);
-    /// 2. the **promotion** local→federation is REFUSED;
-    /// 3. the **direct federation-tier write** — the shape an inbound peer row
-    ///    arrives in — is REFUSED.
-    ///
-    /// "Under any authority" is why the refusal is unconditional on the
-    /// attester rather than resolved through `authority_for`: there is no
-    /// identity, role, or co-scrub that buys a private-use row a federation
-    /// tier.
-    #[cfg(any(test, feature = "test-anchor"))]
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn private_use_is_banned_from_federation_tier(
-        dir: &dyn crate::federation::FederationDirectory,
-        tag: &str,
-    ) {
-        use crate::federation::admission::PRIVATE_USE_FAMILY_STEM;
-
-        let dim = format!("{PRIVATE_USE_FAMILY_STEM}regime:composition:v1");
-
-        // (1) local ADMITS — the range exists to be usable.
-        let (id, attester) = land_local(dir, &format!("{tag}-xp"), &dim)
-            .await
-            .unwrap_or_else(|e| panic!("{dim} must admit at LOCAL tier on {tag}: {e}"));
-
-        // (2) promotion REFUSED.
-        let err = promote_to_federation(dir, &id, &attester)
-            .await
-            .expect_err("CC 3.1.7 R2: a private-use row must not be promotable to federation tier");
-        assert_eq!(
-            err.kind(),
-            "federation_namespace_private_use_not_federatable",
-            "the private-use ban must be what refuses the promotion on {tag}"
-        );
-
-        // The refused promotion left the row untouched (verify-before-mutation).
-        let after = dir
-            .get_attestation(&id)
-            .await
-            .expect("read back")
-            .expect("row survives a refused promotion");
-        assert_eq!(
-            after.tier,
-            crate::federation::types::attestation_tier::LOCAL
-        );
-
-        // (3) the DIRECT federation-tier write REFUSED — the inbound-peer shape.
-        let err = write_at_federation_tier(dir, &format!("{tag}-xpdirect"), &dim)
-            .await
-            .expect_err("CC 3.1.7 R2: a private-use row must not admit at federation tier");
-        assert_eq!(
-            err.kind(),
-            "federation_namespace_private_use_not_federatable",
-            "the private-use ban must be what refuses the direct write on {tag}"
         );
     }
 
@@ -946,17 +854,17 @@ mod tests {
     async fn a_consent_grant_naming_regime_federates_a_regime_row() {
         let alias = "node-571-sq";
         let signer = crate::federation::tier_ingest::test_support::local_signer(alias);
-        let derived = signer.derived_key_id();
         let engine = crate::engine::Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("engine");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
-        // The signer's keypair is seeded from its ALIAS, while the rows it
-        // signs are keyed by its DERIVED id — register the derived id carrying
-        // the alias's pubkeys, else the federation-tier ingest gate refuses
-        // this node's own grant.
-        crate::federation::tier_ingest::test_support::register_hybrid_key_aliased(
-            &*sq, &derived, alias,
+        // v62.0.0 (JSON cut, E5) — the signer's composite is seeded from its
+        // ALIAS (`e2::signing_key(alias)`); its edition-2 `key:record` makes it
+        // live, and its identity-ref is the key id its rows carry.
+        let derived = crate::federation::edition2::fixture_switch::put_key(
+            &*sq,
+            alias,
+            &[crate::federation::types::identity_type::AGENT],
         )
         .await;
         consent_grant_body(&engine, &*sq, &derived, "sq").await;
@@ -976,13 +884,15 @@ mod tests {
         let tag = uuid::Uuid::new_v4().simple().to_string();
         let alias = format!("node-571-pg-{tag}");
         let signer = crate::federation::tier_ingest::test_support::local_signer(&alias);
-        let derived = signer.derived_key_id();
         let engine = crate::engine::Engine::with_signer(signer, &dsn)
             .await
             .expect("pg engine");
         let pg = engine.postgres_backend().expect("pg").clone();
-        crate::federation::tier_ingest::test_support::register_hybrid_key_aliased(
-            &*pg, &derived, &alias,
+        // v62.0.0 (E5) — as the sqlite twin.
+        let derived = crate::federation::edition2::fixture_switch::put_key(
+            &*pg,
+            &alias,
+            &[crate::federation::types::identity_type::AGENT],
         )
         .await;
         consent_grant_body(&engine, &*pg, &derived, &tag).await;

@@ -1353,8 +1353,19 @@ pub(crate) mod test_support {
         is_load_bearing, may_release_copy, AntiEntropy, DependencyKind, LoadBearing, MayRelease,
         ObjectRef,
     };
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::types::{attestation_tier, attestation_type};
-    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+    use crate::federation::{Attestation, FederationDirectory};
+
+    /// v62.0.0 (JSON cut, E5) — put a row through the one entry and return the
+    /// id it is stored under (the node-computed row id).
+    async fn put(dir: &dyn FederationDirectory, r: Attestation, what: &str) -> String {
+        let id = e2::rid(&r);
+        e2::put_signed(dir, &r)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        id
+    }
 
     /// A federation-tier row carrying `dimension`, authored by `author` about
     /// `subject`. One fixture for every family the witness exercises: the
@@ -1381,10 +1392,8 @@ pub(crate) mod test_support {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        let (och, ed_sig, pqc_sig) =
-            crate::federation::tier_ingest::test_support::sign_envelope(author, &envelope);
         let now = chrono::Utc::now();
-        let mut sealed_row_ = Attestation {
+        let literal = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: author.to_owned(),
             attested_key_id: subject.to_owned(),
@@ -1393,9 +1402,9 @@ pub(crate) mod test_support {
             asserted_at: now,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: author.to_owned(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -1407,9 +1416,10 @@ pub(crate) mod test_support {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut sealed_row_);
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+        // v62.0.0 (E5) — an edition-2 statement signed by `author`; `id` is
+        // not its id (read `e2::rid`).
+        let _ = id;
+        e2::row_of(&literal, author)
     }
 
     async fn verdict(dir: &dyn FederationDirectory, attestation_id: &str) -> LoadBearing {
@@ -1460,6 +1470,14 @@ pub(crate) mod test_support {
         )
         .await;
         register_hybrid_key(dir, &root).await;
+        // v62.0.0 (E5) — the registrations are edition-2 `key:record`s; each
+        // key is named by its identity-ref from here on.
+        let (node, inert_peer, live_peer, root) = (
+            e2::kid(&node),
+            e2::kid(&inert_peer),
+            e2::kid(&live_peer),
+            e2::kid(&root),
+        );
 
         // ── (1) THE 234-ROW CASE. Grants naming a peer this node holds
         //    nothing from: they authorize a holding that does not exist here,
@@ -1467,19 +1485,22 @@ pub(crate) mod test_support {
         let mut inert = Vec::new();
         for _ in 0..INERT_GRANTS {
             let id = uuid::Uuid::new_v4().to_string();
-            dir.put_attestation(SignedAttestation {
-                attestation: row(
+            let id = put(
+                dir,
+                row(
                     &id,
                     &node,
                     &node,
                     attestation_type::SCORES,
                     CONSENT_REPLICATION,
                     vec![inert_peer.clone()],
-                    serde_json::Value::Null,
+                    // v62.0.0 (E5) — the `id` member keeps the N grants distinct
+                    // (an edition-2 row id is a function of the bytes).
+                    serde_json::json!({ "id": id }),
                 ),
-            })
-            .await
-            .expect("inert grant admits");
+                "inert grant admits",
+            )
+            .await;
             inert.push(id);
         }
         for id in &inert {
@@ -1491,10 +1512,10 @@ pub(crate) mod test_support {
         }
 
         // ── (2) The SAME grant shape, naming a peer whose trace we retain.
-        let live_grant = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(SignedAttestation {
-            attestation: row(
-                &live_grant,
+        let live_grant = put(
+            dir,
+            row(
+                &uuid::Uuid::new_v4().to_string(),
                 &node,
                 &node,
                 attestation_type::SCORES,
@@ -1502,19 +1523,19 @@ pub(crate) mod test_support {
                 vec![live_peer.clone()],
                 serde_json::Value::Null,
             ),
-        })
-        .await
-        .expect("live grant admits");
+            "live grant admits",
+        )
+        .await;
         assert_eq!(
             verdict(dir, &live_grant).await,
             LoadBearing::No,
             "no data retained under it yet — inert until something depends on it"
         );
 
-        let retained_trace = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(SignedAttestation {
-            attestation: row(
-                &retained_trace,
+        let retained_trace = put(
+            dir,
+            row(
+                &uuid::Uuid::new_v4().to_string(),
                 &live_peer,
                 &live_peer,
                 attestation_type::SCORES,
@@ -1532,9 +1553,9 @@ pub(crate) mod test_support {
                     "trace": {"step": "load-bearing witness"},
                 }),
             ),
-        })
-        .await
-        .expect("retained trace admits");
+            "retained trace admits",
+        )
+        .await;
 
         match verdict(dir, &live_grant).await {
             LoadBearing::Yes { because } => {
@@ -1559,10 +1580,10 @@ pub(crate) mod test_support {
 
         // ── (3) `trust:accepts:v1` — the un-trust lever. Yes with NOTHING
         //    else present, because it is DECLARED, never inferred.
-        let accepts = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(SignedAttestation {
-            attestation: row(
-                &accepts,
+        let accepts = put(
+            dir,
+            row(
+                &uuid::Uuid::new_v4().to_string(),
                 &node,
                 &root,
                 attestation_type::DELEGATES_TO,
@@ -1570,9 +1591,9 @@ pub(crate) mod test_support {
                 Vec::new(),
                 serde_json::Value::Null,
             ),
-        })
-        .await
-        .expect("trust:accepts:v1 admits");
+            "trust:accepts:v1 admits",
+        )
+        .await;
         match verdict(dir, &accepts).await {
             LoadBearing::Yes { because } => assert!(
                 because
@@ -1592,26 +1613,11 @@ pub(crate) mod test_support {
             other => panic!("a declared-`undeclared` family must read Unknown, got {other:?}"),
         }
 
-        // ── (5) A dimension outside the manifest: still Unknown, never `No`.
-        //    `No` by omission is the one answer this primitive may not give.
-        let alien = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(SignedAttestation {
-            attestation: row(
-                &alien,
-                &node,
-                &node,
-                attestation_type::SCORES,
-                "definitely_not_a_ciris_family:xyzzy:v1",
-                Vec::new(),
-                serde_json::Value::Null,
-            ),
-        })
-        .await
-        .expect("alien-dimension row admits");
-        assert!(
-            matches!(verdict(dir, &alien).await, LoadBearing::Unknown { .. }),
-            "an unresolvable family is fail-secure Unknown, never No"
-        );
+        // ── (5) v62.0.0 (JSON cut, E5) — the stored alien-dimension arm is
+        //    deleted: an edition-2 statement cannot name an unregistered
+        //    dimension (the door refuses it), so no such row can be held. The
+        //    resolver's own `None` for it is pinned by
+        //    `tests::dimension_resolves_to_its_manifest_family`.
 
         // ── (6) The key-record arm: a key NAMED by held rows is load-bearing.
         match is_load_bearing(
@@ -1858,27 +1864,32 @@ pub(crate) mod test_support {
         for k in [&a, &b, &c] {
             crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
         }
+        // v62.0.0 (E5) — named by identity-ref (the edition-2 records' ids).
+        let (a, b, c) = (e2::kid(&a), e2::kid(&b), e2::kid(&c));
         // THE CYCLE: a→b and b→a. Plus b→c, which is reachable from `a` ONLY
         // through the cycle.
-        let edges = [
+        let mut edges = Vec::new();
+        for (label, author, subject) in [
             (format!("lbc-ab-{suffix}"), a.clone(), b.clone()),
             (format!("lbc-ba-{suffix}"), b.clone(), a.clone()),
             (format!("lbc-bc-{suffix}"), b.clone(), c.clone()),
-        ];
-        for (id, author, subject) in &edges {
-            dir.put_attestation(SignedAttestation {
-                attestation: row(
-                    id,
-                    author,
-                    subject,
+        ] {
+            // v62.0.0 (E5) — the edge is stored under its node-computed id.
+            let id = put(
+                dir,
+                row(
+                    &label,
+                    &author,
+                    &subject,
                     attestation_type::SCORES,
                     "trust:accepts:v1",
                     vec![subject.clone()],
                     serde_json::json!({}),
                 ),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("closure fixture {id}: {e}"));
+                &format!("closure fixture {label}"),
+            )
+            .await;
+            edges.push((id, author, subject));
         }
 
         let closure = load_bearing_closure(

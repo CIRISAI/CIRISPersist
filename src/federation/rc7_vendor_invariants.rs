@@ -29,57 +29,73 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_emit::{assemble, stamp_and_canonicalize};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::envelope::EnvelopeCore;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
-    use crate::federation::types::{cohort_scope, EmitAttestationInput, SignedAttestation};
+    use crate::federation::types::{cohort_scope, EmitAttestationInput};
     use crate::federation::{Attestation, FederationDirectory};
 
+    /// v62 (E4): `key` is the identity-ref the store names the key by
+    /// (`e2::kid(alias)`); `alias` is the test seed the edition-2 statement
+    /// is signed with.
     pub(crate) struct Who {
         pub signer: std::sync::Arc<crate::signing::LocalSigner>,
         pub key: String,
+        pub alias: String,
     }
 
     pub(crate) async fn who<B: FederationDirectory + Sync>(b: &B, alias: &str) -> Who {
         let signer = ts::local_signer(alias);
-        let key = signer.derived_key_id();
-        ts::register_hybrid_key_as(b, &key, alias, USER).await;
-        Who { signer, key }
+        let key = e2::put_key(b, alias, &[USER]).await;
+        Who {
+            signer,
+            key,
+            alias: alias.to_owned(),
+        }
     }
 
     fn input(t: &str, scope: &str, env: serde_json::Value) -> EmitAttestationInput {
         EmitAttestationInput::with_envelope(t, EnvelopeCore::from_value(env).unwrap(), scope)
     }
 
-    /// A signed row as a peer would send it, assembled past the emit gates.
+    /// A row as a peer would send it, assembled past the emit gates
+    /// (earlier-shaped; [`put`] offers it as `w`'s edition-2 statement).
     async fn signed(w: &Who, mut i: EmitAttestationInput) -> Attestation {
         let canonical = stamp_and_canonicalize(&mut i, &w.key, chrono::Utc::now()).unwrap();
         let sig = w.signer.sign_hybrid(&canonical).await.unwrap();
         assemble(w.key.clone(), &canonical, sig, i).unwrap().0
     }
 
+    /// `row` as `w`'s edition-2 statement through the statement door; the
+    /// stored row id.
     async fn put<B: FederationDirectory + Sync>(
         b: &B,
+        w: &Who,
         row: Attestation,
-    ) -> Result<(), crate::federation::Error> {
-        b.put_attestation(SignedAttestation { attestation: row })
+    ) -> Result<String, crate::federation::Error> {
+        e2::try_put_row(b, &row, &w.alias)
             .await
-            .map(|_| ())
+            .map(|r| e2::rid(&r))
     }
 
     async fn refused<B: FederationDirectory + Sync>(
         b: &B,
+        w: &Who,
         row: Attestation,
         kind: &str,
         why: &str,
     ) {
-        let id = row.attestation_id.clone();
-        let e = put(b, row).await.expect_err(why);
+        // The id the node would compute, when the statement is well-formed.
+        let id = e2::try_row_of(&row, &w.alias).ok().map(|r| e2::rid(&r));
+        let e = put(b, w, row).await.expect_err(why);
         assert_eq!(e.kind(), kind, "{why}: {e}");
-        assert!(
-            b.get_attestation(&id).await.unwrap().is_none(),
-            "{why}: a refused row is not stored"
-        );
+        if let Some(id) = id {
+            assert!(
+                b.get_attestation(&id).await.unwrap().is_none(),
+                "{why}: a refused row is not stored"
+            );
+        }
     }
 
     /// **I703** — settlement rows admit from the payer, on the private and the
@@ -109,8 +125,7 @@ pub(crate) mod bodies {
                 input("scores", scope, settlement("settlement:paid:v1")),
             )
             .await;
-            let id = r.attestation_id.clone();
-            put(b, r)
+            let id = put(b, &payer, r)
                 .await
                 .unwrap_or_else(|e| panic!("I703 a {scope} settlement:paid:v1 row admits: {e}"));
             assert!(
@@ -127,7 +142,7 @@ pub(crate) mod bodies {
             ),
         )
         .await;
-        put(b, r)
+        put(b, &payee, r)
             .await
             .unwrap_or_else(|e| panic!("I703 the payee's counter-attestation admits: {e}"));
     }
@@ -154,6 +169,7 @@ pub(crate) mod bodies {
             let r = signed(&payer, input("scores", scope, env)).await;
             refused(
                 b,
+                &payer,
                 r,
                 "federation_payment_processor_identifier",
                 "I704 a settlement row carries no payment-processor identifier",
@@ -174,7 +190,7 @@ pub(crate) mod bodies {
             ),
         )
         .await;
-        put(b, r)
+        put(b, &payer, r)
             .await
             .expect("I704 the processor scan reaches settlement rows only");
     }
@@ -197,8 +213,7 @@ pub(crate) mod bodies {
             input("scores", cohort_scope::FEDERATION, head(&lid)),
         )
         .await;
-        let id = r.attestation_id.clone();
-        put(b, r)
+        let id = put(b, &owner, r)
             .await
             .unwrap_or_else(|e| panic!("I705 the owner's ledger:head row admits: {e}"));
         assert!(b.get_attestation(&id).await.unwrap().is_some());
@@ -208,6 +223,7 @@ pub(crate) mod bodies {
         let r = signed(&stranger, i).await;
         refused(
             b,
+            &stranger,
             r,
             "federation_signer_not_acting_for",
             "I705 a ledger row by a key that does not act for its owner",
@@ -225,6 +241,7 @@ pub(crate) mod bodies {
         .await;
         refused(
             b,
+            &owner,
             r,
             "federation_dimension_rejected",
             "I705 the L1 binding refuses a foreign ledger_id",
@@ -232,55 +249,12 @@ pub(crate) mod bodies {
         .await;
     }
 
-    /// **I706** — the dimensions rc7 opened and persist held shut until v61
-    /// built their door (CIRISPersist#991): a row naming one is admitted only
-    /// as a minted `scores` row carrying its signed object. A bare `scores`
-    /// row is malformed at the group-plane door; any other type is refused by
-    /// the generic plan (`group_plane_row_shape`). Neither is stored.
-    pub async fn i706_held_dimensions_refused<B: FederationDirectory + Sync>(b: &B, s: &str) {
-        let w = who(b, &format!("i706-{s}")).await;
-        // `key_grant:{axis}:v1` left this list with v55 slice B (#989): its
-        // door is the row rule (I742–I745).
-        for dim in [
-            "membership:widening:v1",
-            "membership:removal:v1",
-            "membership:resignation:v1",
-        ] {
-            for t in ["scores", "delegates_to"] {
-                let mut i = input(
-                    t,
-                    cohort_scope::FEDERATION,
-                    serde_json::json!({"dimension": dim, "score": 1, "confidence": 1}),
-                );
-                if t == "delegates_to" {
-                    i.attested_key_id = Some(w.key.clone());
-                }
-                let r = signed(&w, i).await;
-                let id = r.attestation_id.clone();
-                let e = put(b, r)
-                    .await
-                    .expect_err("I706 a group-plane dimension outside its door is refused");
-                if t == "scores" {
-                    assert_eq!(
-                        e.kind(),
-                        "federation_malformed_row",
-                        "I706 {t} {dim}: a bare scores row carries no object: {e}"
-                    );
-                } else {
-                    assert!(
-                        matches!(
-                            &e,
-                            crate::federation::Error::DimensionRejected { reason, .. }
-                                if *reason
-                                    == crate::federation::group_plane::GROUP_PLANE_ROW_SHAPE_REASON
-                        ),
-                        "I706 {t} {dim}: {e}"
-                    );
-                }
-                assert!(b.get_attestation(&id).await.unwrap().is_none());
-            }
-        }
-    }
+    // v62 (E4): I706 (the rc7 `membership:{stage}:v1` dimensions held shut
+    // outside the JSON group-plane door) is deleted: it asserts the earlier
+    // form's group-plane row shape (`group_plane_row_shape`, a bare `scores`
+    // row "carries no object"). In edition 2 `membership:{stage}` is a
+    // counted family of its own (`e2::membership_statement`), so the premise
+    // does not exist.
 
     #[cfg(test)]
     macro_rules! runners {
@@ -304,11 +278,6 @@ pub(crate) mod bodies {
                 async fn i705() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i705_ledger_owner_rule(&b, &suffix()).await
-                }
-                #[tokio::test]
-                async fn i706() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i706_held_dimensions_refused(&b, &suffix()).await
                 }
             }
         };

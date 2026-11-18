@@ -804,25 +804,25 @@ pub const CONSENT_GRAMMAR_HASH: &str =
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
     use super::GRANT_DIMENSION;
-    use crate::federation::types::{attestation_tier, attestation_type};
-    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::types::{attestation_tier, attestation_type, identity_type};
+    use crate::federation::{Attestation, FederationDirectory};
 
-    /// Build an UNSIGNED-then-signed `consent:replication:v1` candidate
-    /// row carrying an arbitrary `payload` — the #510 admission-rejection
-    /// exercise's fixture. Signed exactly like
-    /// `consent_peer_set::test_support::grant` (so every gate up to the
-    /// #510 grammar check passes and the #510 check is the ONE that
-    /// fires).
+    /// A `consent:replication:v1` candidate row carrying an arbitrary
+    /// `payload`, earlier-shaped and UNSIGNED: the #510 admission-rejection
+    /// exercise's fixture. v62 (E4): the caller offers it as `node`'s
+    /// edition-2 statement (`e2::try_put_row`), so every gate up to the #510
+    /// grammar check runs on a well-signed statement and the #510 check is
+    /// the ONE that fires.
     fn bad_grant(id: &str, node: &str, payload: serde_json::Value) -> Attestation {
         let envelope = serde_json::json!({
             "dimension": GRANT_DIMENSION,
             "subject_key_ids": [format!("peer-of-{node}")],
             "payload": payload,
         });
-        let (och, ed_sig, pqc_sig) =
-            crate::federation::tier_ingest::test_support::sign_envelope(node, &envelope);
-        let now = chrono::Utc::now();
-        let mut sealed_row_ = Attestation {
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: node.to_owned(),
             attested_key_id: node.to_owned(),
@@ -831,9 +831,9 @@ pub(crate) mod test_support {
             asserted_at: now,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: node.to_owned(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -844,14 +844,11 @@ pub(crate) mod test_support {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(node, &mut sealed_row_);
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+        }
     }
 
-    fn expect_510_reject(
-        result: &Result<crate::federation::AttestationOutcome, crate::federation::Error>,
+    fn expect_510_reject<T: std::fmt::Debug>(
+        result: &Result<T, crate::federation::Error>,
         what: &str,
     ) {
         match result {
@@ -877,7 +874,7 @@ pub(crate) mod test_support {
         suffix: &str,
     ) {
         let node = format!("node-510-{suffix}");
-        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &node).await;
+        e2::put_key(dir, &node, &[identity_type::AGENT]).await;
 
         // ── unknown restriction op ──
         let id1 = uuid::Uuid::new_v4().to_string();
@@ -890,9 +887,7 @@ pub(crate) mod test_support {
                 "restrictions": [{"op": "quantum_redaction"}],
             }),
         );
-        let err1 = dir
-            .put_attestation(SignedAttestation { attestation: bad1 })
-            .await;
+        let err1 = e2::try_put_row(dir, &bad1, &node).await;
         expect_510_reject(&err1, "an unknown restriction op");
 
         // ── unknown top-level payload field ──
@@ -906,9 +901,7 @@ pub(crate) mod test_support {
                 "unexpected_field_510": true,
             }),
         );
-        let err2 = dir
-            .put_attestation(SignedAttestation { attestation: bad2 })
-            .await;
+        let err2 = e2::try_put_row(dir, &bad2, &node).await;
         expect_510_reject(&err2, "an unknown top-level payload field");
 
         // ── nonconsentable kind ──
@@ -922,9 +915,7 @@ pub(crate) mod test_support {
                 "kinds": ["Key"],
             }),
         );
-        let err3 = dir
-            .put_attestation(SignedAttestation { attestation: bad3 })
-            .await;
+        let err3 = e2::try_put_row(dir, &bad3, &node).await;
         expect_510_reject(&err3, "a non-consentable kind");
     }
 }

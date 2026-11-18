@@ -23,15 +23,18 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::ceg::list::federation::AttestationCursor;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::steward_purge::{self as sp, PurgePlane};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, identity_type as it, Attestation};
-    use crate::federation::{FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
     use chrono::{DateTime, Duration, Utc};
 
-    /// The read under test's dimension, and a second one beside it.
-    pub(crate) const DIM: &str = "i1544:invite:v1";
-    const OTHER_DIM: &str = "i1544:other:v1";
+    /// The read under test's dimension, and a second one beside it. v62
+    /// (E4): both under a family Verify's matcher registers (`chat:*`); the
+    /// door refuses a dimension it does not register.
+    pub(crate) const DIM: &str = "chat:i1544_invite:v1";
+    const OTHER_DIM: &str = "chat:i1544_other:v1";
 
     /// A whole-second instant `secs` before a fixed base well in the past.
     pub(crate) fn at(secs: i64) -> DateTime<Utc> {
@@ -40,36 +43,45 @@ pub(crate) mod bodies {
     }
 
     /// The attester (an agent, so its own key is not a person subject) and
-    /// the key K the read names, both tagged.
+    /// the key K the read names, both tagged. v62 (E4): the attester is
+    /// returned as its SEED (it signs); K as the identity-ref the store
+    /// names it by (`e2::kid`).
     pub(crate) async fn keys(d: &dyn FederationDirectory, tag: &str) -> (String, String) {
         let a = format!("i1544-attester-{tag}");
-        ts::register_hybrid_key(d, &a).await;
-        (a, format!("i1544-subject-{tag}"))
+        e2::put_key(d, &a, &[it::AGENT]).await;
+        (a, e2::kid(&format!("i1544-subject-{tag}")))
+    }
+
+    /// The literal [`put_naming`] offers: a self-report by `a` naming
+    /// `subjects` under `dim`, asserted at `when`; `n` keeps two rows at one
+    /// instant distinct.
+    fn naming(a: &str, subjects: &[&str], dim: &str, when: DateTime<Utc>, n: &str) -> Attestation {
+        let env = serde_json::json!({ "dimension": dim, "n": n });
+        let mut r = e2::with_earlier_form(|| ts::bare_attestation(n, a, a, &env));
+        r.attestation_type = attestation_type::SCORES.into();
+        r.weight = None;
+        r.asserted_at = when;
+        r.scrub_timestamp = when;
+        r.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+        r
     }
 
     /// A federation-tier self-report by `a` naming `subjects` under `dim`,
-    /// asserted at `when`, sealed and put through the door. Returns its id.
+    /// asserted at `when`, put through the statement door as `a`'s edition-2
+    /// statement. Returns its node-computed id (v62: `n` only labels it).
     pub(crate) async fn put_naming(
         d: &dyn FederationDirectory,
         a: &str,
         subjects: &[&str],
         dim: &str,
         when: DateTime<Utc>,
-        id: Option<&str>,
+        n: Option<&str>,
     ) -> String {
-        let id = id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
-        let env = serde_json::json!({ "dimension": dim, "n": id });
-        let mut r = ts::bare_attestation(&id, a, a, &env);
-        r.attestation_type = attestation_type::SCORES.into();
-        r.weight = None;
-        r.asserted_at = when;
-        r.scrub_timestamp = when;
-        r.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
-        ts::seal_row_in_place(a, &mut r);
-        d.put_attestation(SignedAttestation { attestation: r })
+        let n = n.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
+        let stored = e2::try_put_row(d, &naming(a, subjects, dim, when, &n), a)
             .await
-            .unwrap_or_else(|e| panic!("I1544 fixture {id} admits: {e}"));
-        id
+            .unwrap_or_else(|e| panic!("I1544 fixture {n} admits: {e}"));
+        e2::rid(&stored)
     }
 
     /// Every page of the read from the head, `limit` per page: the ids in
@@ -107,18 +119,17 @@ pub(crate) mod bodies {
     /// **I1544** — the selection and the order.
     pub(crate) async fn i1544_rows_naming_k_newest_first(d: &dyn FederationDirectory, tag: &str) {
         let (a, k) = keys(d, tag).await;
-        let other = format!("i1544-other-{tag}");
+        let other = e2::kid(&format!("i1544-other-{tag}"));
         let oldest = put_naming(d, &a, &[&k], DIM, at(30), None).await;
-        // A tie on the signed instant: the id breaks it, descending.
-        // Real UUIDs: postgres stores the id as `uuid`, and lowercase-hex
-        // UUIDs order alike as text and as bytes.
+        // A tie on the signed instant: the id breaks it, descending. v62
+        // (E4): the ids are node-computed (lowercase hex, which orders alike
+        // as text and as bytes), so the fixture sorts what it got.
         let mut tie = [
-            uuid::Uuid::new_v4().to_string(),
-            uuid::Uuid::new_v4().to_string(),
+            put_naming(d, &a, &[&k], DIM, at(20), Some("tie-a")).await,
+            put_naming(d, &a, &[&k], DIM, at(20), Some("tie-b")).await,
         ];
         tie.sort();
-        let tie_lo = put_naming(d, &a, &[&k], DIM, at(20), Some(&tie[0])).await;
-        let tie_hi = put_naming(d, &a, &[&k], DIM, at(20), Some(&tie[1])).await;
+        let [tie_lo, tie_hi] = tie;
         let among = put_naming(d, &a, &[&other, &k], DIM, at(15), None).await;
         let newest = put_naming(d, &a, &[&k], DIM, at(10), None).await;
         // Neither of these is K's under DIM.
@@ -152,7 +163,12 @@ pub(crate) mod bodies {
             .expect("I1544 served");
         assert_eq!(elsewhere.items.len(), 1, "I1544 {tag}: K's other dimension");
         let nobody = d
-            .list_attestations_naming_by_dimension(&format!("i1544-nobody-{tag}"), DIM, None, 100)
+            .list_attestations_naming_by_dimension(
+                &e2::kid(&format!("i1544-nobody-{tag}")),
+                DIM,
+                None,
+                100,
+            )
             .await
             .expect("I1544 served");
         assert!(nobody.items.is_empty() && nobody.next_cursor.is_none());
@@ -253,32 +269,30 @@ pub(crate) mod bodies {
         tag: &str,
     ) {
         let (a, k) = keys(d, tag).await;
-        let person = format!("i1547-person-{tag}");
-        ts::register_hybrid_key_as(d, &person, &person, it::USER).await;
+        let person = e2::put_key(d, &format!("i1547-person-{tag}"), &[it::USER]).await;
         let kept = put_naming(d, &a, &[&k], DIM, at(40), None).await;
         let doomed = put_naming(d, &a, &[&k], DIM, at(30), None).await;
         // Names a PERSON too: a tombstone is void for it, so it stays served
         // (Codex round 4 on PR #1057, the same rule as the cursor read).
         let void = put_naming(d, &a, &[&k, &person], DIM, at(20), None).await;
-        let local = d
-            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: a.clone(),
-                attested_key_id: None,
-                attestation_type: attestation_type::SCORES.to_owned(),
-                weight: None,
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    serde_json::json!({ "dimension": DIM, "n": "local" }),
-                )
-                .expect("object"),
-                subject_key_ids: vec![k.clone()],
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
-                scrub_signature_classical: None,
-                scrub_signature_pqc: None,
-            })
-            .await
-            .expect("I1547 the local row is written");
+        // v62 (E4): the local-tier row is `a`'s edition-2 statement put at
+        // tier `local` (the earlier caller-signed local input is refused).
+        let local = {
+            use crate::federation::edition2::ingest::{put_statement, StatementOutcome};
+            use crate::federation::types::{attestation_tier, cohort_scope};
+            let mut r = naming(&a, &[&k], DIM, at(25), "local");
+            r.cohort_scope = cohort_scope::SELF.to_owned();
+            r.tier = attestation_tier::LOCAL.to_owned();
+            match put_statement(d, &e2::statement_of(&r, &a), None, attestation_tier::LOCAL)
+                .await
+                .expect("I1547 the local row is written")
+            {
+                StatementOutcome::Row { row_id, .. }
+                | StatementOutcome::Voice { row_id, .. }
+                | StatementOutcome::KeyPlane { row_id, .. }
+                | StatementOutcome::Pending { row_id, .. } => row_id.hex(),
+            }
+        };
         assert!(
             d.get_attestation(&local).await.expect("read").is_some(),
             "I1547 {tag}: the local row is held"

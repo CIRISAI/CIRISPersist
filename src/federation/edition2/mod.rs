@@ -47,6 +47,18 @@ pub mod fixture_switch;
 pub mod fold;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod fold_invariants;
+// v62.0.0 (wave GC3; CC 2.7.3) — witnesses of GC3's fold conversions.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod gc3_fold_invariants;
+// v62.0.0 (wave GC4) — the GC4 conversions' witnesses (I3792–I3795).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod fold_gc4_invariants;
+// v62.0.0 (wave GC1; CC 2.7.3) — the admission.rs gates' folds (I3670-I3675).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod admission_fold_invariants;
+// v62.0.0 (wave GC8) — the CC 2.7 conversion's witnesses (I3950–I3960).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod fold_gc8_invariants;
 // v62.0.0 (wave W1b) — a ROOTED edition-2 trust root, for any test.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_trust_root;
@@ -88,6 +100,8 @@ mod earlier_form_refusal_invariants;
 mod emit_digest_invariants;
 #[cfg(test)]
 mod fixture_genesis_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod gc5_fold_invariants;
 #[cfg(test)]
 mod genesis_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]

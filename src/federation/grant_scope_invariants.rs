@@ -40,6 +40,7 @@
 /// The consent body, generic over the directory.
 #[cfg(test)]
 pub mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{AGENT, NODE, USER};
     use crate::federation::types::{attestation_tier, attestation_type};
@@ -48,10 +49,9 @@ pub mod bodies {
         SignedAttestation,
     };
 
-    /// A federation-tier row by `signer` (sealed with `seed`'s deterministic
-    /// keys) — the crate's fixture shape.
+    /// The unsigned literal of [`row`]: the payload its statement carries.
     #[allow(clippy::too_many_arguments)]
-    pub fn row(
+    fn literal(
         id: &str,
         signer: &str,
         seed: &str,
@@ -65,8 +65,8 @@ pub mod bodies {
         if verb == attestation_type::DELEGATES_TO {
             admission::with_test_term(&mut envelope, at);
         }
-        let mut r = Attestation {
-            attestation_id: id.to_owned(),
+        let r = Attestation {
+            attestation_id: String::new(),
             attesting_key_id: signer.to_owned(),
             attested_key_id: target.to_owned(),
             attestation_type: verb.to_owned(),
@@ -88,8 +88,37 @@ pub mod bodies {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        ts::seal_row_in_place(seed, &mut r);
+        let _ = (id, seed);
         r
+    }
+
+    /// A federation-tier row by `seed`'s key — the door's mapping of its
+    /// edition-2 statement over the literal. Edition 2: the signer IS
+    /// `seed` (`iss` = `e2::kid(seed)`; `signer` is the literal's
+    /// `attesting_key_id`, which the codec replaces), and `id` is NOT the
+    /// row's id (node-computed: read `attestation_id` off the row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn row(
+        id: &str,
+        signer: &str,
+        seed: &str,
+        target: &str,
+        verb: &str,
+        envelope: serde_json::Value,
+        subject_key_ids: Vec<String>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Attestation {
+        let lit = literal(
+            id,
+            signer,
+            seed,
+            target,
+            verb,
+            envelope,
+            subject_key_ids,
+            at,
+        );
+        e2::row_of(&lit, seed)
     }
 
     /// `delegates_to(granter → grantee)` carrying `scope`, sealed with
@@ -105,7 +134,7 @@ pub mod bodies {
         ttl: Option<chrono::Duration>,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut r = row(
+        let mut lit = literal(
             &id,
             granter,
             seed,
@@ -115,9 +144,11 @@ pub mod bodies {
             Vec::new(),
             admission::truncate_to_substrate_resolution(at),
         );
-        r.expires_at = ttl.map(|t| r.asserted_at + t);
-        ts::seal_row_in_place(seed, &mut r);
-        d.put_attestation(SignedAttestation { attestation: r })
+        lit.expires_at = ttl.map(|t| lit.asserted_at + t);
+        // One signing step, after the end is set (edition 2).
+        let r = e2::row_of(&lit, seed);
+        let id = r.attestation_id.clone();
+        crate::federation::edition2::fixture_switch::put_signed(d, &r)
             .await
             .unwrap_or_else(|e| panic!("delegates_to({granter} → {grantee}, {scope}): {e}"));
         id
@@ -168,6 +199,8 @@ pub mod bodies {
             Vec::new(),
             admission::truncate_to_substrate_resolution(at),
         );
+        // Edition 2: the row id is node-computed.
+        let id = r.attestation_id.clone();
         d.put_attestation(SignedAttestation { attestation: r })
             .await
             .map(|_| id)
@@ -182,7 +215,8 @@ pub mod bodies {
         target: &str,
     ) {
         let id = uuid::Uuid::new_v4().to_string();
-        let r = row(
+        let at = admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let lit = literal(
             &id,
             granter,
             seed,
@@ -190,9 +224,22 @@ pub mod bodies {
             attestation_type::WITHDRAWS,
             serde_json::json!({ "id": id, "references_attestation_id": target }),
             Vec::new(),
-            admission::truncate_to_substrate_resolution(chrono::Utc::now()),
+            at,
         );
-        d.put_attestation(SignedAttestation { attestation: r })
+        // Edition 2: a composer carries its TARGET's family (a
+        // `delegates_to`, so `self:delegates_to`).
+        let family = e2::family_of(&literal(
+            "",
+            granter,
+            seed,
+            grantee,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({ "kind": "delegates_to" }),
+            Vec::new(),
+            at,
+        ));
+        let r = e2::row_of_statement(&e2::statement_of_family(&lit, seed, &family), &lit.tier);
+        crate::federation::edition2::fixture_switch::put_signed(d, &r)
             .await
             .unwrap_or_else(|e| panic!("withdraws {target}: {e}"));
     }
@@ -407,6 +454,7 @@ pub mod key_grant_arms {
     use crate::federation::admission::{DELEGATION_SCOPE_GRANT, DELEGATION_SCOPE_MODERATE};
     use crate::federation::at_rest_cascade::blob_invariants::node_signer;
     use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::key_grant::{admit_replicated_key_grant, KeyGrantAxis, KeyGrantRow};
     use crate::federation::key_grant_invariants::two_node::{
         seed_community_everywhere, sign_row_unstored, Node,
@@ -465,9 +513,12 @@ pub mod key_grant_arms {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let owner = format!("{tag}-owner-{run}");
         ts::register_hybrid_key_as(a.backend, &owner, &owner, USER).await;
+        // Edition 2: `owner` is the seed; the planes name the key by its
+        // identity-ref.
+        let owner_k = e2::kid(&owner);
         a.backend
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: owner.clone(),
+                identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
@@ -482,7 +533,7 @@ pub mod key_grant_arms {
         let sealed = encrypt_and_cascade(
             a.backend,
             SELF,
-            &owner,
+            &owner_k,
             b"the ledger",
             None,
             None,
@@ -500,12 +551,12 @@ pub mod key_grant_arms {
             axis: KeyGrantAxis::Content {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: SELF.into(),
-                owner_key_id: owner.clone(),
+                owner_key_id: owner_k.clone(),
             },
             wrap: wrap(recipient),
         };
         let r1 = format!("{tag}-r1-{run}");
-        recipient_of(a, &owner, &r1).await;
+        recipient_of(a, &owner_k, &r1).await;
         let r = admit_replicated_key_grant(
             a.backend,
             sign_row_unstored(&delegate, &set_for(&r1)).await,
@@ -571,7 +622,7 @@ pub mod key_grant_arms {
 
         withdraw(dir, &owner, &owner, &d_key, &edge).await;
         let r2 = format!("{tag}-r2-{run}");
-        recipient_of(a, &owner, &r2).await;
+        recipient_of(a, &owner_k, &r2).await;
         let r = admit_replicated_key_grant(
             a.backend,
             sign_row_unstored(&delegate, &set_for(&r2)).await,
@@ -603,9 +654,12 @@ pub mod key_grant_arms {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let owner = format!("{tag}-i596-owner-{run}");
         ts::register_hybrid_key_as(a.backend, &owner, &owner, USER).await;
+        // Edition 2: `owner` is the seed; the planes name the key by its
+        // identity-ref.
+        let owner_k = e2::kid(&owner);
         a.backend
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: owner.clone(),
+                identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
@@ -620,7 +674,7 @@ pub mod key_grant_arms {
         let sealed = encrypt_and_cascade(
             a.backend,
             SELF,
-            &owner,
+            &owner_k,
             b"the ledger",
             None,
             None,
@@ -633,7 +687,7 @@ pub mod key_grant_arms {
             axis: KeyGrantAxis::Content {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: SELF.into(),
-                owner_key_id: owner.clone(),
+                owner_key_id: owner_k.clone(),
             },
             wrap: wrap(recipient),
         };
@@ -693,7 +747,7 @@ pub mod key_grant_arms {
                 ),
             }
             let recipient = format!("{tag}-i596-r{i}-{run}");
-            recipient_of(a, &owner, &recipient).await;
+            recipient_of(a, &owner_k, &recipient).await;
             let r = admit_replicated_key_grant(
                 a.backend,
                 sign_row_unstored(&delegate, &set_for(&recipient)).await,
@@ -744,9 +798,12 @@ pub mod key_grant_arms {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let owner = format!("{tag}-i1221-owner-{run}");
         ts::register_hybrid_key_as(a.backend, &owner, &owner, USER).await;
+        // Edition 2: `owner` is the seed; the planes name the key by its
+        // identity-ref.
+        let owner_k = e2::kid(&owner);
         a.backend
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: owner.clone(),
+                identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
@@ -761,7 +818,7 @@ pub mod key_grant_arms {
         let sealed = encrypt_and_cascade(
             a.backend,
             SELF,
-            &owner,
+            &owner_k,
             b"the ledger",
             None,
             None,
@@ -774,7 +831,7 @@ pub mod key_grant_arms {
             axis: KeyGrantAxis::Content {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: SELF.into(),
-                owner_key_id: owner.clone(),
+                owner_key_id: owner_k.clone(),
             },
             wrap: wrap(recipient),
         };
@@ -793,7 +850,7 @@ pub mod key_grant_arms {
         )
         .await;
         let r0 = format!("{tag}-i1221-r0-{run}");
-        recipient_of(a, &owner, &r0).await;
+        recipient_of(a, &owner_k, &r0).await;
         admit_replicated_key_grant(
             a.backend,
             sign_row_unstored_at(&delegate, &set_for(&r0), now - chrono::Duration::days(4)).await,
@@ -802,7 +859,7 @@ pub mod key_grant_arms {
         .unwrap_or_else(|e| panic!("{tag} I1221: an old row whose chain stands: {e}"));
         withdraw(dir, &owner, &owner, &d_key, &edge).await;
         let r1 = format!("{tag}-i1221-r1-{run}");
-        recipient_of(a, &owner, &r1).await;
+        recipient_of(a, &owner_k, &r1).await;
         let admitted = admit_replicated_key_grant(
             a.backend,
             sign_row_unstored_at(&delegate, &set_for(&r1), now - chrono::Duration::hours(1)).await,
@@ -819,7 +876,7 @@ pub mod key_grant_arms {
             "{tag} I1221: the projection judges at the signed instant too: {admitted:?}"
         );
         let r2 = format!("{tag}-i1221-r2-{run}");
-        recipient_of(a, &owner, &r2).await;
+        recipient_of(a, &owner_k, &r2).await;
         let e = admit_replicated_key_grant(
             a.backend,
             sign_row_unstored_at(&delegate, &set_for(&r2), now - chrono::Duration::days(4)).await,
@@ -844,7 +901,7 @@ pub mod key_grant_arms {
         let mut not_self = sign_row_unstored_at(&delegate, &set_for(&r2), now)
             .await
             .attestation;
-        not_self.attesting_key_id = owner.clone();
+        not_self.attesting_key_id = owner_k.clone();
         let e = crate::federation::key_grant::check_key_grant_row_admission(dir, &not_self)
             .await
             .expect_err("a row attested for another key");

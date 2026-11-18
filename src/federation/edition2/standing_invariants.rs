@@ -5,8 +5,8 @@
 //! postgres.
 //!
 //! - **I3080** — a live self-signed `key:record` declaring `lenscore_detector`
-//!   cannot emit a reserved `detection:*` row: the row is refused
-//!   `ReservedPrefixEmitterMismatch`, naming the `infra:detect` delegation from
+//!   cannot emit a reserved `detection:*` row: the row is HELD (v62 GC1,
+//!   CC 2.7.3) `reserved_prefix_emitter_mismatch`, naming the `infra:detect` delegation from
 //!   a root this node trusts (the clause that decides, not the missing node
 //!   identity before it), and nothing is stored. The projection still carries
 //!   the label, so the refusal is not about the label's absence.
@@ -16,8 +16,8 @@
 //!   (Uses E0's `fixture_switch` builders; see P4.md "assumed APIs".)
 //! - **I3082** — a live self-signed `key:record` declaring `accord_holder`
 //!   cannot emit an `accord:*` row: with no genesis bundle in force seating it,
-//!   the row is refused `AccordDimensionRequiresAccordHolder`, and nothing is
-//!   stored.
+//!   the row is HELD (v62 GC1) `accord_dimension_requires_accord_holder`, and
+//!   nothing is concluded.
 //! - **I3083** — a self-declared `accord_holder` is not a halt signer: its
 //!   constitutional halt never reads Valid against the roster of the bundle in
 //!   force (its kid is not placed: it waits), and the accord's active halt is
@@ -35,7 +35,7 @@ use super::door_invariants::fixture::{iref, key, key_record, map};
 use super::halt::{put_invocation, HaltRoster, FAMILY_CONSTITUTIONAL};
 use super::ingest::{put_statement, INGEST_TIER};
 use super::names::RowId;
-use crate::federation::{Error, FederationDirectory};
+use crate::federation::FederationDirectory;
 
 const ACCORD: &str = "humanity-accord";
 
@@ -143,28 +143,38 @@ pub(crate) async fn self_declared_detector_body(d: &dyn FederationDirectory) {
         projected.identity_type
     );
     let row = detection_row(&det, 5_000);
-    let e = put_statement(d, &row, None, INGEST_TIER)
+    // v62.0.0 (wave GC1; CC 2.7.3) — the conferral is read from OTHER rows,
+    // so the row is HELD `reserved_prefix_emitter_mismatch` (kept, concluding
+    // nothing), never refused; it concludes if a conferral lands.
+    let out = put_statement(d, &row, None, INGEST_TIER)
         .await
-        .expect_err("I3080: a self-declared detector must not emit detection:*");
-    match &e {
-        Error::ReservedPrefixEmitterMismatch {
-            prefix, required, ..
-        } => {
-            assert!(
-                prefix.starts_with("detection:"),
-                "I3080: the detection rule decides; prefix {prefix}"
-            );
-            assert!(
-                required.iter().any(|r| r
-                    .contains(crate::federation::types::delegation_scope::INFRA_DETECT)
-                    && r.contains("from a root this node trusts")),
-                "I3080: the refusal names the missing conferral, not the node identity: \
-                 {required:?}"
-            );
-        }
-        other => panic!("I3080: expected ReservedPrefixEmitterMismatch, got {other:?}"),
-    }
-    assert!(!stored(d, &row).await, "I3080: nothing stored");
+        .expect("I3080: a self-declared detector's detection:* row is kept, held");
+    assert!(
+        matches!(out, super::ingest::StatementOutcome::Pending { .. }),
+        "I3080: held: {out:?}"
+    );
+    let h = super::fold::why_held(d, &RowId::of_statement(&row).expect("a row id"))
+        .await
+        .unwrap()
+        .expect("I3080: held, and says why");
+    assert_eq!(
+        h.reason,
+        super::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH,
+        "I3080: the reserved-prefix fold decides"
+    );
+    assert!(
+        h.detail.contains("detection:"),
+        "I3080: the detection rule decides: {}",
+        h.detail
+    );
+    assert!(
+        h.detail
+            .contains(crate::federation::types::delegation_scope::INFRA_DETECT)
+            && h.detail.contains("from a root this node trusts"),
+        "I3080: the hold names the missing conferral, not the node identity: {}",
+        h.detail
+    );
+    assert!(!stored(d, &row).await, "I3080: nothing concluded");
 }
 
 /// I3081: the conferred detector (E0's builders). The caller has set this
@@ -279,14 +289,26 @@ pub(crate) async fn self_declared_accord_holder_row_body(d: &dyn FederationDirec
     .await
     .expect("I3082: the pretender's own record is live");
     let row = accord_row(&pretender, 5_000);
-    let e = put_statement(d, &row, None, INGEST_TIER)
+    // v62.0.0 (wave GC1; CC 2.7.3) — accord standing is read from OTHER rows
+    // (the bundle in force): HELD `accord_dimension_requires_accord_holder`,
+    // kept and concluding nothing.
+    let out = put_statement(d, &row, None, INGEST_TIER)
         .await
-        .expect_err("I3082: a self-declared accord holder must not emit accord:*");
+        .expect("I3082: a self-declared accord holder's accord:* row is kept, held");
     assert!(
-        matches!(e, Error::AccordDimensionRequiresAccordHolder { .. }),
-        "I3082: expected AccordDimensionRequiresAccordHolder, got {e:?}"
+        matches!(out, super::ingest::StatementOutcome::Pending { .. }),
+        "I3082: held: {out:?}"
     );
-    assert!(!stored(d, &row).await, "I3082: nothing stored");
+    assert_eq!(
+        super::fold::why_held(d, &RowId::of_statement(&row).expect("a row id"))
+            .await
+            .unwrap()
+            .map(|h| h.reason)
+            .as_deref(),
+        Some(super::fold::reason::gc1::ACCORD_DIMENSION_REQUIRES_ACCORD_HOLDER),
+        "I3082: held, and says why"
+    );
+    assert!(!stored(d, &row).await, "I3082: nothing concluded");
 }
 
 /// I3083 + I3084: the halt door judges the signer against the bundle in force,

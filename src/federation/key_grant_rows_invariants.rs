@@ -28,50 +28,22 @@
 
 #![cfg(test)]
 
-/// I746 (sqlite; v60 #1002 moved it off the retired memory backend) — a held retired carrier (a v54 SET row, planted below the
-/// door) is never served by the since-read, under `Report`; a row planted
-/// the same way of a registered type is (the control).
-#[cfg(feature = "sqlite")]
-mod sqlite_serve {
-    use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::FederationDirectory;
-
-    #[tokio::test]
-    async fn i746_never_serves_a_held_retired_carrier() {
-        let m = crate::store::test_backend::test_backend();
-        let control = ts::owner_binding_attestation("i746-control", "i746-owner", "i746-node");
-        let mut set = ts::owner_binding_attestation("i746-set", "i746-owner", "i746-node");
-        set.attestation_type = crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION.into();
-        m.plant_attestation_below_the_door(control);
-        m.plant_attestation_below_the_door(set);
-        let served: Vec<String> = m
-            .list_attestations_since(None, 100)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|s| s.attestation.attestation_id)
-            .collect();
-        assert!(
-            served.iter().any(|id| id == "i746-control"),
-            "I746 control: {served:?}"
-        );
-        assert!(
-            !served.iter().any(|id| id == "i746-set"),
-            "I746: {served:?}"
-        );
-    }
-}
+// v62.0.0 (JSON cut, E7) — I746 (a held retired v54 SET carrier planted
+// below the door is never served) is deleted: nothing carries into an
+// edition-2 store (the earlier store is deleted at upgrade), so no node holds
+// a retired carrier to serve.
 
 /// I742 — the admission rule, at the attestation plane's door, on any
 /// directory (no blob plane needed). It signs through the two-node harness,
 /// which is backend-gated.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod directory {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRefusalReason, KeyGrantRow};
     use crate::federation::key_grant_invariants::two_node::sign_row_unstored;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
-    use crate::federation::{Error, FederationDirectory, GrantWrap, SignedAttestation};
+    use crate::federation::{Error, FederationDirectory, GrantWrap};
 
     fn wrap(r: &str) -> GrantWrap {
         GrantWrap {
@@ -117,36 +89,40 @@ pub(crate) mod directory {
     where
         D: FederationDirectory + Sync + 'static,
     {
-        let comm = format!("i742-comm-{s}");
-        let (alice, bob) = (format!("i742-alice-{s}"), format!("i742-bob-{s}"));
-        let minter = ts::local_signer(&format!("i742-minter-{s}"));
-        let mallory = ts::local_signer(&format!("i742-mallory-{s}"));
-        let (m_key, mal_key) = (minter.derived_key_id(), mallory.derived_key_id());
-        let bob_dev = format!("i742-bobdev-{s}");
+        // v62.0.0 (JSON cut, E7) — edition-2 keys (ids are identity-refs), the
+        // room as its `group:roster` voices (T1 §3), occurrences and wraps keyed
+        // by identity-refs, and rows through the one entry (`e2::put_signed`).
+        let (minter_alias, mallory_alias) =
+            (format!("i742-minter-{s}"), format!("i742-mallory-{s}"));
+        let minter = ts::local_signer(&minter_alias);
+        let mallory = ts::local_signer(&mallory_alias);
+        let m_key = e2::put_key(d, &minter_alias, &[USER]).await;
+        e2::put_key(d, &mallory_alias, &[USER]).await;
+        let mal_key = e2::kid(&mallory_alias);
+        let (comm_s, alice_s, bob_s) = (
+            format!("i742-comm-{s}"),
+            format!("i742-alice-{s}"),
+            format!("i742-bob-{s}"),
+        );
+        let comm = e2::put_key(d, &comm_s, &[USER]).await;
+        let alice = e2::put_key(d, &alice_s, &[USER]).await;
+        let bob = e2::put_key(d, &bob_s, &[USER]).await;
+        let bob_dev = e2::put_key(d, &format!("i742-bobdev-{s}"), &[USER]).await;
         // A key that is no member's occurrence.
-        let x_key = format!("i742-stranger-{s}");
-        for (k, alias) in [
-            (&m_key, format!("i742-minter-{s}")),
-            (&mal_key, format!("i742-mallory-{s}")),
-        ] {
-            ts::register_hybrid_key_as(d, k, &alias, USER).await;
-        }
-        for k in [&comm, &alice, &bob, &bob_dev, &x_key] {
-            ts::register_hybrid_key_as(d, k, k, USER).await;
-        }
+        let x_key = e2::put_key(d, &format!("i742-stranger-{s}"), &[USER]).await;
         occurrence(d, &alice, &m_key).await;
         occurrence(d, &bob, &bob_dev).await;
         // Mallory is a member's device (bob's), so the write-scope gate admits
         // her and the key-grant rule is what refuses: she is not the minter.
         occurrence(d, &bob, &mal_key).await;
-        d.put_community(ts::sign_community(
-            &comm,
+        let signed = ts::sign_community(
+            &comm_s,
             crate::federation::types::Community {
                 prev_head_digest: String::new(),
                 charter_digest: String::new(),
-                community_key_id: comm.clone(),
+                community_key_id: comm_s.clone(),
                 community_name: "I742 Co-op".into(),
-                members: [&alice, &bob]
+                members: [&alice_s, &bob_s]
                     .into_iter()
                     .map(|k| crate::federation::types::CommunityMember {
                         key_id: k.clone(),
@@ -160,9 +136,11 @@ pub(crate) mod directory {
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("I742 seed community: {e}"));
+        );
+        let at_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after 1970");
+        e2::put_voices(d, &e2::community_voices(&signed, 1, None, at_ms))
+            .await
+            .unwrap_or_else(|e| panic!("I742 seed community: {e}"));
         let row_to = |recipient: &str| KeyGrantRow {
             axis: KeyGrantAxis::Epoch {
                 community_key_id: comm.clone(),
@@ -173,80 +151,15 @@ pub(crate) mod directory {
         };
         let put = |a: crate::federation::Attestation| async move {
             let id = a.attestation_id.clone();
-            let r = d
-                .put_attestation(SignedAttestation { attestation: a })
-                .await
-                .map(|_| ());
+            let r = e2::put_signed(d, &a).await.map(|_| ());
             (id, r)
         };
 
-        // A row signed under another attestation_type (a forger's shapes),
-        // with a valid signature, so the door's own rules are what answer.
-        // The mint refuses a retired carrier, so this skips the mint's slot.
-        let signed_as = |t: &'static str| {
-            let row = row_to(&bob_dev);
-            let (minter, bob_dev) = (minter.clone(), bob_dev.clone());
-            async move {
-                let mut input = row.emit_input().unwrap();
-                input.attestation_type = t.to_owned();
-                input.attested_key_id = Some(bob_dev);
-                let key = minter.derived_key_id();
-                let canonical = crate::federation::attestation_emit::stamp_and_canonicalize(
-                    &mut input,
-                    &key,
-                    chrono::Utc::now(),
-                )
-                .unwrap();
-                let sig = minter.sign_hybrid(&canonical).await.unwrap();
-                crate::federation::attestation_emit::assemble_for_door_witness(
-                    key, &canonical, sig, input,
-                )
-                .unwrap()
-                .0
-            }
-        };
-
-        // (1) A SET row — the retired rc6 carrier — is refused.
-        let (id, r) =
-            put(signed_as(crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION).await).await;
-        // The plane door's row-type gate: a retired carrier (CC 2.4 rc7).
-        let e = r.expect_err("I742 (1)");
-        assert!(
-            matches!(&e, Error::AttestationTypeUnregistered { .. }),
-            "I742 (1): {e:?}"
-        );
-        assert!(d.get_attestation(&id).await.unwrap().is_none(), "I742 (1)");
-
-        // (2) A `key_grant:` dimension on a composer is no key-grant row.
-        // At the door the targeted-cohort gate may answer first (a composer
-        // naming bob at community scope); the key-grant rule itself, asked
-        // directly, names it malformed.
-        let composer = signed_as(crate::federation::types::attestation_type::DELEGATES_TO).await;
-        assert_eq!(
-            reason(
-                &crate::federation::key_grant::check_key_grant_row_admission(
-                    d as &dyn FederationDirectory,
-                    &composer
-                )
-                .await
-                .expect_err("I742 (2) the rule")
-            ),
-            "malformed"
-        );
-        let (id, r) = put(composer).await;
-        let e = r.expect_err("I742 (2)");
-        assert!(
-            matches!(&e, Error::CohortStandingRefused { .. })
-                || matches!(
-                    &e,
-                    Error::KeyGrantRefused {
-                        reason: "malformed",
-                        ..
-                    }
-                ),
-            "I742 (2): {e:?}"
-        );
-        assert!(d.get_attestation(&id).await.unwrap().is_none(), "I742 (2)");
+        // v62.0.0 (JSON cut, E7) — legs (1) (a retired SET carrier: a row
+        // whose TYPE is the key-grant dimension) and (2) (a `key_grant:`
+        // dimension on a `delegates_to` composer, through the earlier emit
+        // path) are deleted: an edition-2 row type is one of five and its
+        // family is the header's, so neither shape can be minted.
 
         // (3) Mallory signs the minter's counter.
         let (id, r) = put(sign_row_unstored(&mallory, &row_to(&bob_dev))
@@ -288,8 +201,8 @@ pub(crate) mod directory {
         r.unwrap_or_else(|e| panic!("I742 (5) the minter's row to a member's device: {e}"));
         assert!(d.get_attestation(&row_id).await.unwrap().is_some());
 
-        // (6) Never withdrawn: a `withdraws` (any signer) and the sealer's own
-        // `recants` naming the row are refused.
+        // (6) Never withdrawn: a `withdraws` and the sealer's own `recants`
+        // naming the row are refused (the composer carries the row's family).
         for (kind, ty) in [
             (
                 "withdraws",
@@ -300,13 +213,11 @@ pub(crate) mod directory {
                 crate::federation::types::attestation_type::RECANTS,
             ),
         ] {
-            let cid = format!("i742-{kind}-{s}");
             let mut c = ts::bare_attestation(
-                &cid,
+                "",
                 &m_key,
                 &m_key,
                 &serde_json::json!({
-                    "id": cid,
                     "kind": kind,
                     "references_attestation_id": row_id,
                 }),
@@ -363,6 +274,7 @@ pub(crate) mod directory {
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod two_nodes {
     use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::key_grant::{
         emit_epoch_key_grant_with_local_signer, is_key_grant_row, KeyGrantAxis, KeyGrantRow,
     };
@@ -408,18 +320,22 @@ pub(crate) mod two_nodes {
         B: BlobStorage + FederationDirectory + Sync,
     {
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let comm = format!("{tag}-comm-{run}");
+        let comm_s = format!("{tag}-comm-{run}");
         let (alice, bob, carol) = (
             format!("{tag}-alice-{run}"),
             format!("{tag}-bob-{run}"),
             format!("{tag}-carol-{run}"),
         );
+        // v62.0.0 (JSON cut, E7) — E6's flipped `seed_community_everywhere`
+        // takes SEEDS and lands the room as its roster voices; the room is
+        // read back as its identity-ref.
         seed_community_everywhere(
             &[a, b, c],
-            &comm,
+            &comm_s,
             &[(&alice, Some(a)), (&bob, Some(b)), (&carol, Some(c))],
         )
         .await;
+        let comm = e2::kid(&comm_s);
         let sealed =
             encrypt_and_cascade_community(a.backend, &comm, b"three ways", None, Some(&a.key))
                 .await
@@ -468,8 +384,9 @@ pub(crate) mod two_nodes {
             // Through the generic door (B), and the attributed sync door (C).
             let row = mine.remove(0);
             if label == "B" {
-                node.backend
-                    .apply_replicated_attestation(SignedAttestation { attestation: row })
+                // v62.0.0 (JSON cut, E7) — the generic door for a row carrying
+                // its statement is the one entry.
+                e2::put_signed(node.backend, &row)
                     .await
                     .unwrap_or_else(|e| panic!("{tag} I743: B admits its row: {e}"));
             } else {
@@ -531,7 +448,7 @@ pub(crate) mod two_nodes {
         B: BlobStorage + FederationDirectory + Sync,
     {
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let comm = format!("{tag}-comm-{run}");
+        let comm_s = format!("{tag}-comm-{run}");
         let (alice, bob, xavier) = (
             format!("{tag}-alice-{run}"),
             format!("{tag}-bob-{run}"),
@@ -539,14 +456,17 @@ pub(crate) mod two_nodes {
         );
         seed_community_everywhere(
             &[a, b],
-            &comm,
+            &comm_s,
             &[(&alice, Some(a)), (&bob, Some(b)), (&xavier, None)],
         )
         .await;
-        let x_occ = format!("{tag}-x-occ-{run}");
-        ts::register_hybrid_key_as(a.backend, &x_occ, &x_occ, USER).await;
+        // v62.0.0 (JSON cut, E7) — identity-refs throughout (E6's helpers).
+        let comm = e2::kid(&comm_s);
+        let x_occ = e2::put_key(a.backend, &format!("{tag}-x-occ-{run}"), &[USER]).await;
         crate::federation::at_rest_cascade::blob_invariants::join_as_occurrence(
-            a.backend, &xavier, &x_occ,
+            a.backend,
+            &e2::kid(&xavier),
+            &x_occ,
         )
         .await;
         let sealed = encrypt_and_cascade_community(a.backend, &comm, b"once", None, Some(&a.key))
@@ -554,10 +474,12 @@ pub(crate) mod two_nodes {
             .unwrap();
         assert!(sealed.granted.contains(&x_occ), "{tag} I744: X wrapped");
         // X leaves BEFORE the first emission: the wrap stays local, no row.
+        // v62.0.0 (lead ruling) — the leave is a `membership:removal`
+        // statement naming the held roster head (T1 §3), X's own voice.
         let rev = ts::sign_community_membership_revocation(
             &xavier,
             crate::federation::types::CommunityMembershipRevocation {
-                community_key_id: comm.clone(),
+                community_key_id: comm_s.clone(),
                 removed_identity_key_id: xavier.clone(),
                 removed_at: chrono::Utc::now(),
                 effective_at: chrono::Utc::now(),
@@ -566,10 +488,13 @@ pub(crate) mod two_nodes {
                 persist_row_hash: String::new(),
             },
         );
-        a.backend
-            .put_community_membership_revocation(rev)
-            .await
-            .unwrap();
+        let head = e2::held_head(a.backend, &comm).await.map(|(h, _)| h);
+        e2::put_voices(
+            a.backend,
+            &e2::community_revocation_voices(&rev, head.as_ref()),
+        )
+        .await
+        .expect("I744: X leaves");
         let first = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
             .await
             .unwrap()

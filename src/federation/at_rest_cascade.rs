@@ -4338,6 +4338,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let mut spoofed = AT_REST_ENVELOPE_MAGIC.to_vec();
         spoofed.extend_from_slice(b"board minutes in the clear");
         for scope in [SELF, FAMILY, COMMUNITY, AFFILIATIONS] {
@@ -4427,6 +4433,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let sealed = encrypt_and_cascade_community(backend, &comm, b"minutes", None, Some(&minter))
             .await
             .unwrap();
@@ -4474,6 +4486,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None, Some(&minter))
             .await
             .unwrap();
@@ -4559,6 +4577,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None, Some(&minter))
             .await
             .unwrap();
@@ -4639,6 +4663,11 @@ pub mod blob_invariants {
             &node,
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let minter = signer.derived_key_id();
 
         let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None, Some(&minter))
@@ -4716,21 +4745,37 @@ pub mod blob_invariants {
     /// first implementation passed `cohort_subkind = None` to the tier
     /// resolver, so infra content was refused at the write door AND by the
     /// cascade — unstorable by any route.
-    pub async fn exercise_i10_infra_carveout_resolved_from_directory<B>(backend: &B, tag: &str)
-    where
-        B: BlobStorage + FederationDirectory + Sync,
+    // v62.0.0 (E5) — test builds only: the rooted-room fixture lives in a
+    // `cfg(test)` module (`canonical_community_invariants`).
+    #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+    pub(crate) async fn exercise_i10_infra_carveout_resolved_from_directory<B>(
+        backend: &B,
+        tag: &str,
+    ) where
+        B: BlobStorage
+            + FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + crate::federation::canonical_community_invariants::bodies::SetNodeKey
+            + Sync,
     {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let comm = format!("{tag}-infra-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         let node = format!("{tag}-node-{run}");
-        crate::federation::community_dek::lifecycle_support::seed_community_with(
+        // v62.0.0 (JSON cut, E5) — an AUTHORIZED infrastructure community on
+        // edition 2: a conformant record reached by this node's trust walk
+        // (`rooted_infrastructure_room_e2`, W1's shared root), its member
+        // seeded with a keyed occurrence first.
+        crate::federation::community_dek::lifecycle_support::seed_member(
+            backend, &alice, &alice_occ,
+        )
+        .await;
+        let comm = crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room_e2(
             backend,
             &comm,
-            &[(&alice, &alice_occ)],
-            crate::federation::types::identity_type::SUBSTRATE_PERSIST,
-            Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+            &[&alice],
+            tag,
         )
         .await;
         let signer = node_signer(backend, &node).await;
@@ -4774,9 +4819,16 @@ pub mod blob_invariants {
     /// door is forbidden to make. So the infra row was written as plaintext,
     /// classified `CommunityDek` on read, and failed for lack of a binding it
     /// correctly did not have. (C2-1)
-    pub async fn exercise_i15_infra_row_reads_back_as_plaintext<B>(backend: &B, tag: &str)
+    // v62.0.0 (E5) — test builds only: the rooted-room fixture lives in a
+    // `cfg(test)` module (`canonical_community_invariants`).
+    #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+    pub(crate) async fn exercise_i15_infra_row_reads_back_as_plaintext<B>(backend: &B, tag: &str)
     where
-        B: BlobStorage + FederationDirectory + Sync,
+        B: BlobStorage
+            + FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + crate::federation::canonical_community_invariants::bodies::SetNodeKey
+            + Sync,
     {
         use crate::federation::at_rest_cascade::orchestrate::{
             put_blob_scoped, read_any_for_viewer,
@@ -4787,12 +4839,19 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         let node = format!("{tag}-node-{run}");
-        crate::federation::community_dek::lifecycle_support::seed_community_with(
+        // v62.0.0 (JSON cut, E5) — an AUTHORIZED infrastructure community on
+        // edition 2: a conformant record reached by this node's trust walk
+        // (`rooted_infrastructure_room_e2`, W1's shared root), its member
+        // seeded with a keyed occurrence first.
+        crate::federation::community_dek::lifecycle_support::seed_member(
+            backend, &alice, &alice_occ,
+        )
+        .await;
+        let comm = crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room_e2(
             backend,
             &comm,
-            &[(&alice, &alice_occ)],
-            crate::federation::types::identity_type::SUBSTRATE_PERSIST,
-            Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+            &[&alice],
+            tag,
         )
         .await;
         let signer = node_signer(backend, &node).await;
@@ -4857,6 +4916,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let sealed = encrypt_and_cascade_community(backend, &comm, b"before", None, Some(&minter))
             .await
             .unwrap();
@@ -4965,6 +5030,11 @@ pub mod blob_invariants {
             &node,
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let minter = signer.derived_key_id();
         let node_derived = signer.derived_key_id();
         async fn withdraws_by<D: FederationDirectory + Sync>(backend: &D, node: &str) -> usize {
@@ -5132,6 +5202,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None, Some(&minter))
             .await
             .unwrap();
@@ -5217,6 +5293,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None, Some(&minter))
             .await
             .unwrap();
@@ -5310,6 +5392,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let signer = node_signer(backend, &node).await;
 
         let plaintext = format!("{tag} an image the matcher must see AS IS {run}").into_bytes();
@@ -5377,6 +5465,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let signer = node_signer(backend, &node).await;
         let minter = signer.derived_key_id();
         assert!(matcher.refuse, "{tag} I21b: fixture — a refusing matcher");
@@ -5470,6 +5564,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let signer = node_signer(backend, &node).await;
         let res = put_blob_scoped(
             backend,
@@ -5556,6 +5656,12 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let signer = node_signer(backend, &node).await;
         let minter = signer.derived_key_id();
         let node_derived = signer.derived_key_id();
@@ -5654,6 +5760,14 @@ pub mod blob_invariants {
         let bob_occ = format!("{tag}-bob-occ-{run}");
         let stranger = format!("{tag}-stranger-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ), (&bob, &bob_occ)]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, alice_occ, bob, bob_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+            crate::federation::community_dek::lifecycle_support::id_of(&bob),
+            crate::federation::community_dek::lifecycle_support::id_of(&bob_occ),
+        );
         let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
         // #848 — the sweep runs over the signer's own counter: the sweeper
         // is the minter of everything sealed below.
@@ -5915,11 +6029,22 @@ pub mod blob_invariants {
         let owner = format!("{tag}-owner-{run}");
         let owner_occ = format!("{tag}-owner-occ-{run}");
         seed_member(backend, &owner, &owner_occ).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (owner, owner_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&owner),
+            crate::federation::community_dek::lifecycle_support::id_of(&owner_occ),
+        );
         // community: alice as a member.
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _alice, alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
 
         for (scope, key, viewer, tier) in [
             (
@@ -6170,6 +6295,13 @@ pub mod blob_invariants {
             &[(&alice, &[]), (&bob, &[(&bob_phone, false)])],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, alice, bob, bob_phone) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&bob),
+            crate::federation::community_dek::lifecycle_support::id_of(&bob_phone),
+        );
         let res = put_blob_scoped(
             backend,
             &signer,
@@ -6210,6 +6342,11 @@ pub mod blob_invariants {
         let comm2 = format!("{tag}-843-lone-{run}");
         let lone = format!("{tag}-lone-{run}");
         seed_community_shaped(backend, &comm2, &[(&lone, &[])]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm2, lone) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm2),
+            crate::federation::community_dek::lifecycle_support::id_of(&lone),
+        );
         let res2 = put_blob_scoped(
             backend,
             &signer,
@@ -6254,6 +6391,17 @@ pub mod blob_invariants {
             ],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm3, carol, carol_laptop, carol_old, dave, dave_phone, erin, erin_phone) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm3),
+            crate::federation::community_dek::lifecycle_support::id_of(&carol),
+            crate::federation::community_dek::lifecycle_support::id_of(&carol_laptop),
+            crate::federation::community_dek::lifecycle_support::id_of(&carol_old),
+            crate::federation::community_dek::lifecycle_support::id_of(&dave),
+            crate::federation::community_dek::lifecycle_support::id_of(&dave_phone),
+            crate::federation::community_dek::lifecycle_support::id_of(&erin),
+            crate::federation::community_dek::lifecycle_support::id_of(&erin_phone),
+        );
         revoke_member(backend, &comm3, &erin).await;
         let res3 = put_blob_scoped(
             backend,
@@ -6327,6 +6475,13 @@ pub mod blob_invariants {
             &[(&fay, &[]), (&gus, &[(&gus_phone, false)])],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (fam, fay, gus, gus_phone) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&fam),
+            crate::federation::community_dek::lifecycle_support::id_of(&fay),
+            crate::federation::community_dek::lifecycle_support::id_of(&gus),
+            crate::federation::community_dek::lifecycle_support::id_of(&gus_phone),
+        );
         let res4 = put_blob_scoped(backend, &signer, FAMILY, Some(&fam), b"list", None, None)
             .await
             .unwrap_or_else(|e| panic!("{tag} I54/4: family write: {e}"));
@@ -6349,6 +6504,8 @@ pub mod blob_invariants {
 
         let owner = format!("{tag}-owner-{run}");
         seed_member_shaped(backend, &owner, &[]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let owner = crate::federation::community_dek::lifecycle_support::id_of(&owner);
         let res5 = put_blob_scoped(backend, &signer, SELF, Some(&owner), b"note", None, None)
             .await
             .unwrap_or_else(|e| panic!("{tag} I54/4: self write: {e}"));
@@ -6424,8 +6581,14 @@ pub mod blob_invariants {
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
         backend
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: identity_key_id.to_owned(),
-                occurrence_key_id: occurrence_key_id.to_owned(),
+                // v62.0.0 (wave 3, E5) — keyed as the directory keys them
+                // (identity-refs under the switch, `lifecycle_support::id_of`).
+                identity_key_id: crate::federation::community_dek::lifecycle_support::id_of(
+                    identity_key_id,
+                ),
+                occurrence_key_id: crate::federation::community_dek::lifecycle_support::id_of(
+                    occurrence_key_id,
+                ),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: crate::host::clock::now(),
@@ -6468,12 +6631,23 @@ pub mod blob_invariants {
         );
         binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         ts::seal_row_in_place(owner_key_id, &mut binding);
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: binding,
-            })
-            .await
-            .unwrap_or_else(|e| panic!("confer infra:serve on {server_key_id}: {e}"));
+        // v62.0.0 (JSON cut, E5) — a sealed edition-2 row enters through the
+        // one entry (it runs the attestation gates); a held (earlier-form)
+        // caller's row through the JSON door as before.
+        let put =
+            if crate::federation::edition2::fixture_switch::carried_statement(&binding).is_some() {
+                crate::federation::edition2::fixture_switch::put_signed(backend, &binding)
+                    .await
+                    .map(|_| ())
+            } else {
+                backend
+                    .put_attestation(crate::federation::SignedAttestation {
+                        attestation: binding,
+                    })
+                    .await
+                    .map(|_| ())
+            };
+        put.unwrap_or_else(|e| panic!("confer infra:serve on {server_key_id}: {e}"));
     }
 
     /// #846 — a sealed community envelope to adopt: cascades `body` under
@@ -6540,6 +6714,12 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         join_as_occurrence(backend, &alice, &our).await;
 
         // Three envelopes, one per author class, all at the community tier.
@@ -6614,6 +6794,11 @@ pub mod blob_invariants {
                 backend, &owner, &owner_occ,
             )
             .await;
+            // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+            let (owner, _owner_occ) = (
+                crate::federation::community_dek::lifecycle_support::id_of(&owner),
+                crate::federation::community_dek::lifecycle_support::id_of(&owner_occ),
+            );
             let r = encrypt_and_cascade(backend, SELF, &owner, b"own note", None, None, Some(&our))
                 .await
                 .unwrap();
@@ -6687,11 +6872,23 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         join_as_occurrence(backend, &alice, &our).await;
         let theirs = format!("{tag}-theirs-{run}");
         let bob = format!("{tag}-bob-{run}");
         let bob_occ = format!("{tag}-bob-occ-{run}");
         seed_community(backend, &theirs, &[(&bob, &bob_occ)]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (theirs, bob, _bob_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&theirs),
+            crate::federation::community_dek::lifecycle_support::id_of(&bob),
+            crate::federation::community_dek::lifecycle_support::id_of(&bob_occ),
+        );
 
         let (env_theirs, ep_theirs, sha_theirs) =
             sealed_community_envelope(backend, &theirs, b"their minutes", &peer).await;
@@ -6798,6 +6995,13 @@ pub mod blob_invariants {
         let server = format!("{tag}-server-{run}");
         let owner = format!("{tag}-owner-{run}");
         confer_mesh_server(backend, &server, &owner).await;
+        // v62.0.0 (JSON cut, E5) — the live key is the edition-2 record's
+        // identity-ref (`register_identity_key` flipped to `e2::put_key`).
+        let server = if crate::federation::edition2::fixture_switch::emit_edition2() {
+            crate::federation::edition2::fixture_switch::kid(&server)
+        } else {
+            server
+        };
         assert_eq!(
             resolve_serve_tier(backend, &server, &server).await.unwrap(),
             ServeTier::MeshServer,
@@ -6851,6 +7055,12 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         join_as_occurrence(backend, &alice, &our).await;
         let local = |k: &str| k == our;
 
@@ -6955,6 +7165,14 @@ pub mod blob_invariants {
             let bob = format!("{tag}-bob-{run}");
             let bob_occ = format!("{tag}-bob-occ-{run}");
             seed_community(backend, &comm, &[(&alice, &alice_occ), (&bob, &bob_occ)]).await;
+            // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+            let (comm, alice, _alice_occ, bob, _bob_occ) = (
+                crate::federation::community_dek::lifecycle_support::id_of(&comm),
+                crate::federation::community_dek::lifecycle_support::id_of(&alice),
+                crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+                crate::federation::community_dek::lifecycle_support::id_of(&bob),
+                crate::federation::community_dek::lifecycle_support::id_of(&bob_occ),
+            );
             join_as_occurrence(backend, &alice, &our).await;
             join_as_occurrence(backend, &bob, &author).await;
 
@@ -7074,6 +7292,12 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &ghost, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (ghost, alice, alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&ghost),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         join_as_occurrence(backend, &alice, &our).await;
         assert_eq!(
             backend
@@ -7089,6 +7313,12 @@ pub mod blob_invariants {
         let carol = format!("{tag}-carol-{run}");
         let carol_occ = format!("{tag}-carol-occ-{run}");
         seed_community(backend, &comm, &[(&carol, &carol_occ)]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, _carol, _carol_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&carol),
+            crate::federation::community_dek::lifecycle_support::id_of(&carol_occ),
+        );
         let (env_a, _, sha_a) = sealed_community_envelope(backend, &comm, b"far away", &peer).await;
         backend.delete_blob(&sha_a).await.unwrap();
         let out = adopt_sealed_blob(
@@ -7208,6 +7438,12 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
+        let (comm, alice, _alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         join_as_occurrence(backend, &alice, &our).await;
 
         // Announce: this node is a holder, and the provenance is in the clear.

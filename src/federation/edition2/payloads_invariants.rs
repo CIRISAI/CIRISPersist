@@ -101,6 +101,26 @@
 //!   `identity:occurrence_revocation` REQUIRE `refs.head` (the identity's
 //!   last landed self-roster row) and take an optional
 //!   `refs.further_heads`.
+//! - **I3995** (CC ruling, free-form body numbers) — `body_number`: an
+//!   integral value is a plain integer (`2.0` → 2, `1e2` → 100), a
+//!   non-integral one tag 4 normalised (`0.5` → 4([-1,5]), `1.25` →
+//!   4([-2,125])), from the exact decimal text; a mantissa outside i64 and
+//!   an integral value outside the CBOR range are refused
+//!   `body_number_unrepresentable`.
+//! - **I3996** — the reader refuses a non-normalised tag 4 (4([-1,50]),
+//!   4([0,3])) with `edition2_payload_invalid`, anywhere in a payload, at the
+//!   door's schema step.
+//! - **I3997** (FINAL, CC) — a deferral request and response route by
+//!   `community_id` (the pair room); there is no `room` member.
+//! - **I3998** — `location_proof:{version}` (CC 3.3.3): `cell_id`
+//!   (lowercase hex), `cell_resolution` (at most 7), optional
+//!   `attestation_evidence`; no `subject_key_id` member (the subject is the
+//!   `sub`).
+//! - **I3999** (lead's ruling, the entry point) — the decoder reads a
+//!   normalised tag-4 decimal back as its EXACT JSON number
+//!   (`json_number_of_decimal`, and `ingest::json_of` / `attestation_of`),
+//!   the inverse of `body_number`; the free-form bodies are `body` on every
+//!   family and `hard_case:{kind}`'s `hard_case`.
 //! - **I2919** (wave P1d) — the list is enforced AT THE DOOR: for each mapped
 //!   family, a statement whose payload breaks its list (an unknown member, a
 //!   missing required one, a wrong type, a closed leaf) is refused
@@ -394,14 +414,20 @@ fn i2901_the_charter_is_cited_and_the_also_roles_are_closed() {
         "I2901 `charter` is no also role",
     );
     // The closure holds on every mapped family.
+    // `widening()` already carries `refs`: REPLACE it (a second `refs` key
+    // would be a duplicate map key, and the first, the base's, would be read).
     let with_also = |role: &str| {
-        widening(vec![(
-            "refs",
-            refs(vec![
-                ("head", ref2(&[0x40; 32])),
-                ("also", map(vec![(leak(role), ref_set(0x52))])),
-            ]),
-        )])
+        with(
+            &widening(vec![]),
+            vec![(
+                "refs",
+                refs(vec![
+                    ("head", ref2(&[0x40; 32])),
+                    ("also", map(vec![(leak(role), ref_set(0x52))])),
+                ]),
+            )],
+            &[],
+        )
     };
     ok(
         MEMBERSHIP,
@@ -492,18 +518,18 @@ fn i2904_roster_members_is_a_set() {
     let reversed = Value::Array(vec![s[1].clone(), s[0].clone()]);
     ok(
         ROSTER,
-        &roster(1, vec![("members", sorted.clone())]),
+        &with(&roster(1, vec![]), vec![("members", sorted.clone())], &[]),
         "I2904 sorted",
     );
     bad(
         ROSTER,
-        &roster(1, vec![("members", reversed)]),
+        &with(&roster(1, vec![]), vec![("members", reversed)], &[]),
         "I2904 unsorted",
     );
     let twice = roster_members(vec![roster_member(121, 10), roster_member(121, 11)]);
     bad(
         ROSTER,
-        &roster(1, vec![("members", twice)]),
+        &with(&roster(1, vec![]), vec![("members", twice)], &[]),
         "I2904 one entry per key",
     );
     let stray = roster_members(vec![
@@ -516,7 +542,7 @@ fn i2904_roster_members_is_a_set() {
     ]);
     bad(
         ROSTER,
-        &roster(1, vec![("members", stray)]),
+        &with(&roster(1, vec![]), vec![("members", stray)], &[]),
         "I2904 an entry carries only key, joined_at, role",
     );
     let _ = b;
@@ -1271,6 +1297,12 @@ fn door_cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             approval(),
             with(&approval(), vec![("call_fingerprint", ms(1))], &[]),
             "a wrong type",
+        ),
+        (
+            "location_proof:{version}",
+            location_proof(),
+            with(&location_proof(), vec![("cell_resolution", ms(9))], &[]),
+            "finer than rough",
         ),
         (
             "deferral:request",
@@ -2316,4 +2348,245 @@ fn i3993_occurrence_rows_name_their_roster_head() {
             "I3993 further_heads without head",
         );
     }
+}
+
+// ---- body numbers, the pair room, location proofs (I3995–I3998) ----------
+
+fn num(text: &str) -> serde_json::Number {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"))
+}
+
+fn tag4(e: i64, m: i64) -> Value {
+    let int = |v: i64| {
+        if v >= 0 {
+            Value::Uint(v.unsigned_abs())
+        } else {
+            Value::Nint(v.unsigned_abs() - 1)
+        }
+    };
+    Value::Tag(4, Box::new(Value::Array(vec![int(e), int(m)])))
+}
+
+/// I3995: the shared body-number helper.
+#[test]
+fn i3995_body_numbers_are_exact_decimals() {
+    use super::payloads::body_number;
+    for (text, want) in [
+        ("2.0", Value::Uint(2)),
+        ("1e2", Value::Uint(100)),
+        ("1E+2", Value::Uint(100)),
+        ("-3", Value::Nint(2)),
+        ("0", Value::Uint(0)),
+        ("-0.0", Value::Uint(0)),
+        ("0.5", tag4(-1, 5)),
+        ("1.25", tag4(-2, 125)),
+        ("-0.050", tag4(-2, -5)),
+        ("12.50e-1", tag4(-2, 125)),
+        ("0.1", tag4(-1, 1)),
+        // Never via f64: 0.1 + 0.2's exact text stays exact.
+        ("0.30000000000000004", tag4(-17, 30_000_000_000_000_004)),
+    ] {
+        assert_eq!(body_number(&num(text)).unwrap(), want, "I3995 {text}");
+    }
+    for text in [
+        "92233720368547758.08",
+        "1e40",
+        "-1e40",
+        "0.123456789012345678901",
+    ] {
+        let e = body_number(&num(text)).unwrap_err();
+        assert_eq!(
+            reason(&e),
+            malformed_row::BODY_NUMBER_UNREPRESENTABLE,
+            "I3995 {text} is refused"
+        );
+    }
+    // The top of the CBOR integer range still states.
+    assert_eq!(
+        body_number(&num("18446744073709551615")).unwrap(),
+        Value::Uint(u64::MAX)
+    );
+}
+
+/// I3996: the reader refuses a non-normalised decimal, at the door.
+#[test]
+fn i3996_a_non_normalised_decimal_is_refused() {
+    use super::payloads::{check_body_numbers, check_by_id};
+    check_body_numbers(&tag4(-1, 5)).expect("I3996 normalised");
+    check_body_numbers(&map(vec![("x", Value::Array(vec![tag4(-2, 125)]))])).expect("I3996 nested");
+    for (bad_v, what) in [
+        (tag4(-1, 50), "a mantissa divisible by 10"),
+        (tag4(0, 3), "a zero exponent"),
+        (tag4(1, 3), "a positive exponent"),
+        (tag4(-1, 0), "a zero mantissa"),
+        (
+            Value::Tag(4, Box::new(Value::Array(vec![Value::Text("x".into())]))),
+            "not [exponent, mantissa]",
+        ),
+    ] {
+        let e = check_body_numbers(&map(vec![("deep", map(vec![("n", bad_v)]))])).unwrap_err();
+        assert_eq!(
+            reason(&e),
+            malformed_row::EDITION2_PAYLOAD_INVALID,
+            "I3996 {what}"
+        );
+    }
+    // At the door's schema step, in a body, on any family.
+    let p = map(vec![
+        ("asserted_at", ms(1_000)),
+        ("body", map(vec![("ratio", tag4(-1, 50))])),
+    ]);
+    let e = check_by_id("evidence:.suite:.kind:.cell:.prefix", "scores", &p).unwrap_err();
+    assert_eq!(
+        reason(&e),
+        malformed_row::EDITION2_PAYLOAD_INVALID,
+        "I3996 door"
+    );
+    let ok_p = map(vec![
+        ("asserted_at", ms(1_000)),
+        ("body", map(vec![("ratio", tag4(-1, 5))])),
+    ]);
+    check_by_id("evidence:.suite:.kind:.cell:.prefix", "scores", &ok_p).expect("I3996 ok");
+}
+
+/// I3997: the pair room is `community_id` (FINAL, CC).
+#[test]
+fn i3997_a_deferral_routes_by_community_id() {
+    let room = id(244);
+    for (fam, p) in [
+        ("deferral:request", deferral_request()),
+        ("deferral:response:{outcome}", approval()),
+    ] {
+        ok(
+            fam,
+            &with(&p, vec![("community_id", txt(&room))], &[]),
+            "I3997 the pair room rides community_id",
+        );
+        bad(
+            fam,
+            &with(&p, vec![("room", txt(&room))], &[]),
+            "I3997 there is no room member",
+        );
+    }
+}
+
+/// A `location_proof:v1` payload.
+fn location_proof() -> Value {
+    map(vec![
+        ("asserted_at", ms(1_000)),
+        ("author", txt(&id(245))),
+        ("dimension", txt("location_proof:v1")),
+        ("cell_id", txt("872830828ffffff")),
+        ("cell_resolution", ms(7)),
+        ("valid_until", ms(9_000)),
+    ])
+}
+
+/// I3998: the location proof's list.
+#[test]
+fn i3998_a_location_proof() {
+    let lp = "location_proof:{version}";
+    ok(
+        lp,
+        &location_proof(),
+        "I3998 cell_id, resolution 7, valid_until",
+    );
+    ok(
+        lp,
+        &with(
+            &location_proof(),
+            vec![("attestation_evidence", Value::Bytes(vec![1; 8]))],
+            &[],
+        ),
+        "I3998 hardware evidence",
+    );
+    ok(
+        lp,
+        &with(&location_proof(), vec![], &["valid_until"]),
+        "I3998 indefinite",
+    );
+    bad(
+        lp,
+        &with(&location_proof(), vec![("cell_resolution", ms(8))], &[]),
+        "I3998 rough-only",
+    );
+    bad(
+        lp,
+        &with(
+            &location_proof(),
+            vec![("cell_id", txt("872830828FFFFFF"))],
+            &[],
+        ),
+        "I3998 lowercase hex",
+    );
+    bad(
+        lp,
+        &with(&location_proof(), vec![], &["cell_id"]),
+        "I3998 cell_id required",
+    );
+    bad(
+        lp,
+        &with(
+            &location_proof(),
+            vec![("subject_key_id", txt(&id(245)))],
+            &[],
+        ),
+        "I3998 the subject is the sub, not a member",
+    );
+}
+
+/// I3999: the decoder's exact inverse, and the body subtrees.
+#[test]
+fn i3999_a_decimal_reads_back_exactly() {
+    use super::payloads::{body_number, is_body_member, json_number_of_decimal};
+    use ciris_verify_core::namespace_match::family_id;
+    for (text, back) in [
+        ("0.5", "0.5"),
+        ("1.25", "1.25"),
+        ("-0.050", "-0.05"),
+        ("12.50e-1", "1.25"),
+        ("0.0001", "0.0001"),
+        ("0.30000000000000004", "0.30000000000000004"),
+    ] {
+        let v = body_number(&num(text)).unwrap();
+        let n = json_number_of_decimal(&v).unwrap_or_else(|| panic!("I3999 {text}"));
+        assert_eq!(n.to_string(), back, "I3999 {text} reads back exactly");
+        // And states again as the same decimal.
+        assert_eq!(body_number(&n).unwrap(), v, "I3999 {text} round-trips");
+    }
+    assert!(
+        json_number_of_decimal(&tag4(-1, 50)).is_none(),
+        "I3999 not normalised"
+    );
+    assert!(
+        json_number_of_decimal(&Value::Uint(2)).is_none(),
+        "I3999 an integer is no decimal"
+    );
+    // The mapping reads a body's decimal as a JSON number.
+    let a = super::ingest::attestation_of(
+        &admitted(
+            "evidence:.suite:.kind:.cell:.prefix",
+            map(vec![
+                ("asserted_at", ms(1_000)),
+                ("body", map(vec![("ratio", tag4(-2, 125))])),
+            ]),
+        ),
+        "federation",
+    )
+    .unwrap();
+    assert_eq!(
+        a.attestation_envelope["body"]["ratio"].to_string(),
+        "1.25",
+        "I3999 the mapping's body number"
+    );
+    assert!(is_body_member(
+        "evidence:.suite:.kind:.cell:.prefix",
+        "body"
+    ));
+    assert!(is_body_member(&family_id("hard_case:{kind}"), "hard_case"));
+    assert!(!is_body_member(
+        "evidence:.suite:.kind:.cell:.prefix",
+        "hard_case"
+    ));
+    assert!(!is_body_member(&family_id("hard_case:{kind}"), "score"));
 }

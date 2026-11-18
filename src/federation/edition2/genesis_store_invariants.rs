@@ -451,17 +451,27 @@ pub(crate) async fn body(d: &dyn FederationDirectory, fresh: &dyn FederationDire
     assert_eq!(again.placed.len(), 1, "I2314: idempotent");
     assert_eq!(held_voices(d).await, voices, "I2314: idempotent");
 
-    // I2315: a minority concludes nothing.
+    // I2315: a minority concludes nothing. v62.0.0 (wave GC5; CC 2.6.1.11):
+    // it is HELD (its voices kept, its reason recorded), never refused.
     let minority = case(f, "later_minority");
-    let e = put_genesis_bundle(d, &offered(f, minority), None)
+    let out = put_genesis_bundle(d, &offered(f, minority), None)
         .await
-        .unwrap_err();
+        .unwrap();
+    assert!(out.placed.is_empty(), "I2315: concludes nothing: {out:?}");
     assert_eq!(
-        reason(&e),
-        malformed_row::GENESIS_BUNDLE_COUNT_UNMET,
-        "I2315: {e:?}"
+        out.not_placed.first().map(|n| n.token),
+        Some(malformed_row::GENESIS_BUNDLE_COUNT_UNMET),
+        "I2315: {out:?}"
     );
-    assert_eq!(held_voices(d).await, voices, "I2315: nothing stored");
+    assert_eq!(
+        super::fold::why_held(d, &RowId(oid(minority)))
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(malformed_row::GENESIS_BUNDLE_COUNT_UNMET.to_owned()),
+        "I2315: held, its reason the count"
+    );
+    assert!(held_voices(d).await > voices, "I2315: its voices are kept");
     let g = genesis_in_force(d).await.unwrap();
     assert_eq!(
         g.head.as_ref().map(|p| p.object_id),
@@ -596,18 +606,39 @@ pub(crate) async fn body_lineages(
     // I2320: a re-seat.
     let r = vectors::reseat();
     place(reseated, r, "first_valid").await;
-    let voices = held_voices(reseated).await;
+    let _voices = held_voices(reseated).await;
     let bad = case(r, "reseat_binding_signed_by_old_key");
-    let e = put_genesis_bundle(reseated, &offered(r, bad), None)
+    // v62.0.0 (wave GC5; CC 2.6.1.11) — a named Invalid row: the bundle is
+    // HELD, concluding nothing, never refused.
+    let out = put_genesis_bundle(reseated, &offered(r, bad), None)
         .await
-        .unwrap_err();
+        .unwrap();
+    assert!(out.placed.is_empty(), "I2320: concludes nothing: {out:?}");
+    let n = out.not_placed.first().expect("I2320: not placed");
     assert_eq!(
-        reason(&e),
+        n.token,
         malformed_row::GENESIS_BUNDLE_ROW_INVALID,
-        "I2320: {e:?}"
+        "I2320: {out:?}"
     );
-    assert!(message(&e).starts_with("row_signer"), "I2320: {e:?}");
-    assert_eq!(held_voices(reseated).await, voices, "I2320: nothing stored");
+    assert_eq!(n.detail.as_deref(), Some("row_signer"), "I2320: {out:?}");
+    assert_eq!(
+        super::fold::why_held(reseated, &RowId(oid(bad)))
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(malformed_row::GENESIS_BUNDLE_ROW_INVALID.to_owned()),
+        "I2320: held"
+    );
+    assert_eq!(
+        genesis_in_force(reseated)
+            .await
+            .unwrap()
+            .head
+            .map(|p| p.object_id),
+        Some(oid(case(r, "first_valid"))),
+        "I2320: the held bundle is not in force"
+    );
+    let voices = held_voices(reseated).await;
     // The counted re-seat, with the write failing inside its transaction
     // after every row, key read model and voice was written: NOTHING stays.
     let good = case(r, "reseat_seat_new_key");

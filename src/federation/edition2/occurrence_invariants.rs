@@ -13,10 +13,12 @@
 //!   AUTHORED by the agent's owner (its `ownership:…:agent:…` binding
 //!   held): the owner's statement plus the agent occurrence key's own is
 //!   admitted to the occurrence table.
-//! - I3032: the agent identity authoring its own occurrence is refused
-//!   `agent_occurrence_not_owner_authored`.
-//! - I3033: an agent with no owner binding: its bind is refused
-//!   `agent_occurrence_unowned`, and nothing is bound.
+//! - I3032: the agent identity authoring its own occurrence is HELD,
+//!   concluding nothing, reason `agent_occurrence_not_owner_authored`
+//!   (v62.0.0 wave GC7, CC 2.7.3: the owner is another row's word).
+//! - I3033: an agent with no owner binding: its bind is HELD, concluding
+//!   nothing, reason `agent_occurrence_unowned`; nothing is bound; once the
+//!   owner binding is held the row re-folds and no longer holds.
 //! - I3034: an edition-2 bind appears in the signed occurrence listing,
 //!   which serves its statements (`ceg_statement`, `ceg_statements`) and no
 //!   earlier-form signature.
@@ -329,16 +331,36 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
     let ai = iref(&agent);
     let ak = iref(&agent_key);
     // I3033 (first, before any owner binding): an unowned agent's bind is
-    // refused, at its first voice, and nothing is held.
+    // HELD (v62.0.0 wave GC7): kept, concluding nothing, with the reason.
     let unowned = bind_authored(d, &agent_key, &ak, &u, &ai, &ak, "agent", 11_500, None).await;
-    let e = put(d, &unowned).await.unwrap_err();
+    let out = put(d, &unowned).await;
+    let Ok(StatementOutcome::Pending {
+        row_id: unowned_row,
+        ..
+    }) = out
+    else {
+        panic!("I3033: the unowned agent's bind is held: {out:?}");
+    };
     assert_eq!(
-        reason(&e),
-        malformed_row::AGENT_OCCURRENCE_UNOWNED,
-        "I3033: {e}"
+        super::fold::why_held(d, &unowned_row)
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(super::fold::reason::AGENT_OCCURRENCE_UNOWNED.to_owned()),
+        "I3033: held, reason agent_occurrence_unowned"
     );
     assert_eq!(bound(d, &ai, &ak).await, None, "I3033: nothing bound");
     put_agent_owner_binding(d, &user, &agent, 5_000).await;
+    // The fixture stores the binding's voices directly (no door tail), so
+    // the re-fold its arrival would run is run here.
+    super::fold::refold_rows(d, std::iter::once(unowned_row).collect())
+        .await
+        .unwrap();
+    assert_eq!(
+        super::fold::why_held(d, &unowned_row).await.unwrap(),
+        None,
+        "I3033: the owner binding held, the row no longer holds"
+    );
     let agent_own = bind_authored(d, &agent_key, &ak, &u, &ai, &ak, "agent", 12_000, None).await;
     assert!(
         matches!(put(d, &agent_own).await, Ok(StatementOutcome::Voice { .. })),
@@ -354,15 +376,21 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         Some("agent"),
         "I3023: the agent bind is in the occurrence table"
     );
-    // I3032: the agent identity authoring its own occurrence is refused,
-    // whichever voice arrives.
+    // I3032: the agent identity authoring its own occurrence is HELD,
+    // concluding nothing, whichever voice arrives (v62.0.0 wave GC7).
     for (signer, iss) in [(&agent, ai.as_str()), (&agent_key, ak.as_str())] {
         let st = bind_authored(d, signer, iss, &ai, &ai, &ak, "agent", 13_000, None).await;
-        let e = put(d, &st).await.unwrap_err();
+        let out = put(d, &st).await;
+        let Ok(StatementOutcome::Pending { row_id, .. }) = out else {
+            panic!("I3032 ({iss}): held: {out:?}");
+        };
         assert_eq!(
-            reason(&e),
-            malformed_row::AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
-            "I3032 ({iss}): {e}"
+            super::fold::why_held(d, &row_id)
+                .await
+                .unwrap()
+                .map(|h| h.reason),
+            Some(super::fold::reason::AGENT_OCCURRENCE_NOT_OWNER_AUTHORED.to_owned()),
+            "I3032 ({iss}): reason agent_occurrence_not_owner_authored"
         );
     }
 
@@ -582,4 +610,165 @@ async fn i3020_to_i3024_postgres() {
         .unwrap();
     b.run_migrations().await.unwrap();
     Box::pin(body(&b)).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  I3910 (wave GC7; CC 2.7.3) — the agent-owner fold, either arrival order
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The owner binding of [`put_agent_owner_binding`], with the door's tail
+/// re-fold run for each voice (`fold::refold_touched` over what the voice
+/// touches), so the dependency index, not the test, wakes the held bind.
+async fn put_agent_owner_binding_refolding(
+    d: &dyn FederationDirectory,
+    owner: &CompositeSigningKey,
+    agent: &CompositeSigningKey,
+    asserted_at: u64,
+) {
+    let family = ciris_verify_core::namespace_match::family_id(
+        "ownership:{relation}:{target_kind}:{version}",
+    );
+    let payload = map(vec![
+        ("asserted_at", Value::Uint(asserted_at)),
+        ("author", Value::Text(iref(owner))),
+        (
+            "dimension",
+            Value::Text("ownership:responsible_party:agent:v1".into()),
+        ),
+    ]);
+    for (signer, iss) in [(owner, iref(owner)), (agent, iref(agent))] {
+        let st = sign_row_statement(
+            signer,
+            &iss,
+            &iref(agent),
+            "delegates_to",
+            &family,
+            &payload,
+            vec![],
+        )
+        .unwrap();
+        let keys = held_keys_for(d, &st).await.unwrap();
+        let admitted = super::door::admit_row(
+            &st,
+            &keys,
+            None,
+            ciris_verify_core::edition2::family::SelectContext::default(),
+        )
+        .unwrap_or_else(|e| panic!("I3910: owner binding voice of {iss}: {e}"));
+        d.put_edition2_statement(&admitted).await.unwrap();
+        super::fold::refold_touched(d, super::fold::touches(&admitted))
+            .await
+            .unwrap();
+    }
+}
+
+/// One store, one arrival order: the agent's occurrence key's own statement
+/// (the bind's first voice) and the owner binding, `bind_first` deciding
+/// which lands first; then the owner's statement. Returns what the store
+/// answers at the end: the held reason of the bind's row (none) and the
+/// occurrence table's device class.
+async fn i3910_one_order(
+    d: &dyn FederationDirectory,
+    bind_first: bool,
+) -> (Option<String>, Option<String>) {
+    let user = key(90);
+    let agent = key(91);
+    let agent_key = key(92);
+    put(d, &key_record(&user, &["user"], 0, None))
+        .await
+        .unwrap();
+    for k in [&agent, &agent_key] {
+        put(
+            d,
+            &key_record(k, &["agent"], 1_000, Some(1_000 + 2_592_000_000)),
+        )
+        .await
+        .unwrap();
+    }
+    let (u, ai, ak) = (iref(&user), iref(&agent), iref(&agent_key));
+    let own = bind_authored(d, &agent_key, &ak, &u, &ai, &ak, "agent", 12_000, None).await;
+    let row_id = if bind_first {
+        let out = put(d, &own).await;
+        let Ok(StatementOutcome::Pending { row_id, .. }) = out else {
+            panic!("I3910: with no owner binding held, the bind is held: {out:?}");
+        };
+        assert_eq!(
+            super::fold::why_held(d, &row_id)
+                .await
+                .unwrap()
+                .map(|h| h.reason),
+            Some(super::fold::reason::AGENT_OCCURRENCE_UNOWNED.to_owned()),
+            "I3910: held, concluding nothing, reason agent_occurrence_unowned"
+        );
+        assert_eq!(bound(d, &ai, &ak).await, None, "I3910: nothing bound");
+        put_agent_owner_binding_refolding(d, &user, &agent, 5_000).await;
+        row_id
+    } else {
+        put_agent_owner_binding_refolding(d, &user, &agent, 5_000).await;
+        let out = put(d, &own).await;
+        let Ok(StatementOutcome::Voice { row_id, .. }) = out else {
+            panic!("I3910: with the owner binding held, the key's own voice is kept: {out:?}");
+        };
+        row_id
+    };
+    let held_after_binding = super::fold::why_held(d, &row_id)
+        .await
+        .unwrap()
+        .map(|h| h.reason);
+    let by_owner = bind_authored(d, &user, &u, &u, &ai, &ak, "agent", 12_000, None).await;
+    let out = put(d, &by_owner).await;
+    assert!(
+        matches!(out, Ok(StatementOutcome::Row { row_id: r, .. }) if r == row_id),
+        "I3910 (bind_first={bind_first}): the owner's statement lands the bind: {out:?}"
+    );
+    (held_after_binding, bound(d, &ai, &ak).await)
+}
+
+/// I3910 (wave GC7; CC 2.7.3): an agent occurrence bind whose owner binding
+/// is not held is HELD (reason `agent_occurrence_unowned`), never refused;
+/// the owner binding's arrival re-folds it through the dependency index; and
+/// the answer is the same whichever arrived first: no hold, and the bind in
+/// the occurrence table once the owner's statement lands.
+async fn i3910_body(first: &dyn FederationDirectory, second: &dyn FederationDirectory) {
+    let a = i3910_one_order(first, true).await;
+    let b = i3910_one_order(second, false).await;
+    assert_eq!(
+        a.0, None,
+        "I3910: the owner binding's arrival releases the hold"
+    );
+    assert_eq!(a, b, "I3910: the same answer for either arrival order");
+    assert_eq!(a.1.as_deref(), Some("agent"), "I3910: the bind landed");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3910_agent_owner_fold_order_sqlite() {
+    use crate::store::Backend as _;
+    let open = || async {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        b
+    };
+    let (x, y) = (open().await, open().await);
+    Box::pin(i3910_body(&x, &y)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3910_agent_owner_fold_order_postgres() {
+    use crate::store::Backend as _;
+    let mut stores = Vec::new();
+    for _ in 0..2 {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        stores.push(b);
+    }
+    Box::pin(i3910_body(&stores[0], &stores[1])).await;
 }

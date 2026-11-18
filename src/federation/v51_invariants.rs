@@ -24,10 +24,10 @@
 
 #[cfg(all(test, feature = "postgres"))]
 mod postgres {
-    use crate::federation::admission::steward_liveness_test_support::{register, signed_row};
+    use crate::federation::admission::steward_liveness_test_support::signed_row;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{attestation_type, identity_type as it, SignedAttestation};
-    use crate::federation::{AttestationOutcome, Error, FederationDirectory};
+    use crate::federation::types::{attestation_type, identity_type as it};
+    use crate::federation::{Error, FederationDirectory};
     use crate::store::Backend as _;
 
     fn suffix() -> String {
@@ -41,6 +41,10 @@ mod postgres {
     /// `AlreadyHeld` without re-projecting.
     #[tokio::test]
     async fn i125_a_failed_projection_rolls_the_row_back_on_postgres() {
+        // v62.0.0 (JSON cut, E7) — edition-2 keys; the row is a statement put
+        // through the one entry, whose door is the same transaction.
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::StatementOutcome;
         let Some(dsn) = crate::test_pg::empty_dsn() else {
             return;
         };
@@ -50,10 +54,8 @@ mod postgres {
         b.run_migrations().await.unwrap();
         let d: &dyn FederationDirectory = &b;
         let s = suffix();
-        let granter = format!("g933-{s}");
-        let recipient = format!("r933-{s}");
-        register(d, &granter, &[it::USER]).await;
-        register(d, &recipient, &[it::PRIMITIVE]).await;
+        let granter = e2::put_key(d, &format!("g933-{s}"), &[it::USER]).await;
+        let recipient = e2::put_key(d, &format!("r933-{s}"), &[it::PRIMITIVE]).await;
         let mut row = signed_row(
             &granter,
             &recipient,
@@ -64,11 +66,7 @@ mod postgres {
         let id = row.attestation_id.clone();
 
         b.test_hooks().fail_next("pg_project_consent_peer_set", 1);
-        let got = d
-            .put_attestation(SignedAttestation {
-                attestation: row.clone(),
-            })
-            .await;
+        let got = e2::put_signed(d, &row).await;
         assert!(
             matches!(&got, Err(Error::Backend(m)) if m.contains("injected transient")),
             "the projection's failure is the door's failure: {got:?}"
@@ -79,61 +77,19 @@ mod postgres {
         );
 
         b.test_hooks().fail_next("pg_project_consent_peer_set", 0);
-        let again = d
-            .put_attestation(SignedAttestation { attestation: row })
-            .await
-            .unwrap();
-        assert_eq!(
-            again,
-            AttestationOutcome::Inserted,
-            "the retry INSERTS (never `AlreadyHeld` over an unprojected row)"
+        let again = e2::put_signed(d, &row).await.unwrap();
+        assert!(
+            matches!(again, StatementOutcome::Row { new: true, .. }),
+            "the retry INSERTS (never already-held over an unprojected row): {again:?}"
         );
         assert!(d.get_attestation(&id).await.unwrap().is_some());
     }
 
-    /// I125b (PR #943 review) — a DIFFERENT row under an occupied id is
-    /// refused, and its projections are not committed: a consent grant's
-    /// peer (the `consent_peer_set` projection, which gates replication)
-    /// never enters the peer set from a row that was not stored.
-    #[tokio::test]
-    async fn i125b_a_refused_duplicate_projects_nothing_on_postgres() {
-        use crate::federation::consent_peer_set::test_support::grant;
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            return;
-        };
-        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        let d: &dyn FederationDirectory = &b;
-        let s = suffix();
-        let node = format!("n943-{s}");
-        let (first, second) = (format!("p943a-{s}"), format!("p943b-{s}"));
-        ts::register_hybrid_key(d, &node).await;
-        let id = uuid::Uuid::new_v4().to_string();
-        assert_eq!(
-            d.put_attestation(SignedAttestation {
-                attestation: grant(&id, &node, &first),
-            })
-            .await
-            .unwrap(),
-            AttestationOutcome::Inserted
-        );
-        let got = d
-            .put_attestation(SignedAttestation {
-                attestation: grant(&id, &node, &second),
-            })
-            .await;
-        assert!(
-            !matches!(got, Ok(AttestationOutcome::Inserted)),
-            "a different row under an occupied id is not stored: {got:?}"
-        );
-        assert_eq!(
-            d.list_consent_peers(&node).await.unwrap(),
-            vec![first],
-            "the refused row's peer never entered the replication peer set"
-        );
-    }
+    // v62.0.0 (JSON cut, E7) — I125b (a DIFFERENT row under an occupied id
+    // is refused and projects nothing) is deleted: an edition-2 row id is
+    // computed from its bytes, so a different row cannot carry a held row's id
+    // (an offered id that is not the computed one is `row_id_mismatch`,
+    // `edition2::ingest_invariants` I1909).
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -312,6 +268,8 @@ mod descriptor {
                 use super::*;
                 #[tokio::test]
                 async fn i122() {
+                    // v62.0.0 (JSON cut, E7) — the ladder is kid-keyed (E4) and its room
+                    // lands as voices (E6).
                     let Some((a, b)) = $dsns else { return };
                     i122_the_descriptor_opens_for_whoever_opens_the_bytes(&a, &b, &suffix(), $pick)
                         .await
@@ -347,11 +305,13 @@ pub(crate) mod live_fold {
     //! owner's (or subject's, or delegate's) withdrawal was stored as withdrawn
     //! and still listed as Live. Edge's `lifecycle_of` mirrored it
     //! (CIRISEdge#712).
-    use crate::federation::admission::steward_liveness_test_support::{register, withdraws_of};
+    use crate::federation::admission::steward_liveness_test_support::withdraws_of;
     use crate::federation::consent_peer_set::test_support::grant;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{identity_type as it, SignedAttestation};
-    use crate::federation::{AttestationOutcome, Error, FederationDirectory};
+    use crate::federation::types::identity_type as it;
+    use crate::federation::{Error, FederationDirectory};
     use crate::read::{AttestationFilter, LifecycleView};
 
     fn suffix() -> String {
@@ -393,32 +353,49 @@ pub(crate) mod live_fold {
             format!("lf-peer-{s}"),
             format!("lf-stranger-{s}"),
         );
-        register(d, &owner, &[it::USER]).await;
-        register(d, &node, &[it::NODE]).await;
-        register(d, &peer, &[it::USER]).await;
-        register(d, &stranger, &[it::USER]).await;
-        let put = |a: crate::federation::Attestation| async move {
-            d.put_attestation(SignedAttestation { attestation: a })
-                .await
-        };
-        put(ts::owner_binding_attestation(
-            &format!("lf-ob-{s}"),
-            &owner,
-            &node,
-        ))
-        .await
-        .expect("the owner binds the node");
-        // two node-authored rows naming the peer as subject
-        let (a, b) = (
-            uuid::Uuid::new_v4().to_string(),
-            uuid::Uuid::new_v4().to_string(),
+        // v62.0.0 (JSON cut, E7) — edition-2 keys (ids are identity-refs; the
+        // earlier-form helpers resolve a minted kid to its seed, E0 v1.9),
+        // rows through the one entry, ids node-computed.
+        let owner = e2::put_key(d, &owner, &[it::USER]).await;
+        let node = e2::put_key(d, &node, &[it::NODE]).await;
+        let peer = e2::put_key(d, &peer, &[it::USER]).await;
+        let stranger = e2::put_key(d, &stranger, &[it::USER]).await;
+        let put = |a: crate::federation::Attestation| async move { e2::put_signed(d, &a).await };
+        // The owner binds the node; the node's own voice completes it (C557).
+        // Re-dated NOW-relative (the node's voice is a node-key row, CC 2.4.1.1).
+        let at = crate::federation::admission::truncate_to_substrate_resolution(
+            chrono::Utc::now() - chrono::Duration::hours(1),
         );
-        for id in [&a, &b] {
-            assert_eq!(
-                put(grant(id, &node, &peer)).await.expect("stored"),
-                AttestationOutcome::Inserted
+        let mut ob = ts::owner_binding_attestation("", &owner, &node);
+        ob.asserted_at = at;
+        ob.scrub_timestamp = at;
+        ob.attestation_envelope[crate::federation::envelope::paths::ASSERTED_AT] =
+            serde_json::Value::String(crate::federation::admission::render_signed_instant(at));
+        ts::reseal(&mut ob);
+        put(ob.clone()).await.expect("the owner binds the node");
+        e2::put_statement(
+            d,
+            &e2::voice_of(&e2::carried_statement(&ob).expect("carried"), &node),
+        )
+        .await
+        .expect("the node's voice on its owner binding");
+        // two node-authored rows naming the peer as subject
+        let mut ids = Vec::new();
+        for id in [
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        ] {
+            let g = grant(&id, &node, &peer);
+            ids.push(g.attestation_id.clone());
+            assert!(
+                matches!(
+                    put(g).await.expect("stored"),
+                    StatementOutcome::Row { new: true, .. }
+                ),
+                "a fresh grant lands"
             );
         }
+        let (a, b) = (ids[0].clone(), ids[1].clone());
         let live = listed(d, &node, LifecycleView::Live).await;
         assert!(
             live.contains(&a) && live.contains(&b),
@@ -561,43 +538,81 @@ pub(crate) mod live_fold {
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod owner_withdraw {
-    use crate::federation::admission::steward_liveness_test_support::{
-        register, signed_row, withdraws_of,
-    };
+    use crate::federation::admission::steward_liveness_test_support::{signed_row, withdraws_of};
     use crate::federation::admission::{owner_of, resolve_withdraws_admission_rule};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{attestation_type, identity_type as it, SignedAttestation};
-    use crate::federation::{Error, FederationDirectory};
+    use crate::federation::types::{attestation_type, identity_type as it};
+    use crate::federation::{Attestation, Error, FederationDirectory};
+    use chrono::{DateTime, Duration, Utc};
 
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
     }
 
-    /// I126 — see the module doc.
+    /// v62.0.0 (JSON cut, E7) — a registered dimension (the fixtures' `x:y`
+    /// is not).
+    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+
+    /// v62.0.0 (JSON cut, E7) — `owner` binds `node` at `at` (NOW-relative:
+    /// the node's voice is a node-key row, CC 2.4.1.1), optionally expiring:
+    /// the owner's row, re-dated from the builder's fixed instant and
+    /// re-sealed, then the node's own voice (C557). Returns the stored row.
+    async fn bind(
+        d: &dyn FederationDirectory,
+        owner: &str,
+        node: &str,
+        at: DateTime<Utc>,
+        expires: Option<DateTime<Utc>>,
+    ) -> Attestation {
+        let at = crate::federation::admission::truncate_to_substrate_resolution(at);
+        let mut ob = ts::owner_binding_attestation("", owner, node);
+        ob.asserted_at = at;
+        ob.scrub_timestamp = at;
+        ob.attestation_envelope[crate::federation::envelope::paths::ASSERTED_AT] =
+            serde_json::Value::String(crate::federation::admission::render_signed_instant(at));
+        ob.expires_at = expires;
+        ts::reseal(&mut ob);
+        e2::put_signed(d, &ob).await.expect("the owner binding");
+        e2::put_statement(
+            d,
+            &e2::voice_of(&e2::carried_statement(&ob).expect("carried"), node),
+        )
+        .await
+        .expect("the node's voice on its owner binding");
+        ob
+    }
+
+    /// A row `node` produced at `at` about `subject` (not stored).
+    fn produced(node: &str, subject: &str, at: Option<DateTime<Utc>>) -> Attestation {
+        let mut row = signed_row(
+            node,
+            subject,
+            attestation_type::SCORES,
+            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": DIMENSION }),
+        );
+        if let Some(at) = at {
+            row.asserted_at = crate::federation::admission::truncate_to_substrate_resolution(at);
+            row.scrub_timestamp = row.asserted_at;
+            ts::reseal(&mut row);
+        }
+        row
+    }
+
+    /// I126 — see the module doc. v62.0.0 (JSON cut, E7): edition-2 keys
+    /// (identity-refs), owner bindings with the node's voice, every instant
+    /// now-relative; a binding's era is its own `asserted_at` (no more fixed
+    /// 2026-05-01 stamp).
     pub(crate) async fn i126_the_owner_withdraws_its_nodes_row(d: &dyn FederationDirectory) {
         let s = suffix();
-        let (owner, node, stranger, subject) = (
-            format!("ow-owner-{s}"),
-            format!("ow-node-{s}"),
-            format!("ow-stranger-{s}"),
-            format!("ow-subject-{s}"),
-        );
-        register(d, &owner, &[it::USER]).await;
-        register(d, &node, &[it::NODE]).await;
-        register(d, &stranger, &[it::USER]).await;
-        register(d, &subject, &[it::USER]).await;
-        d.put_attestation(SignedAttestation {
-            attestation: ts::owner_binding_attestation(&format!("ob-{s}"), &owner, &node),
-        })
-        .await
-        .expect("the owner binds the node");
-        // a row the node produced AFTER the binding (signed_row stamps now)
-        let after = signed_row(
-            &node,
-            &subject,
-            attestation_type::SCORES,
-            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
-        );
+        let owner = e2::put_key(d, &format!("ow-owner-{s}"), &[it::USER]).await;
+        let node = e2::put_key(d, &format!("ow-node-{s}"), &[it::NODE]).await;
+        let stranger = e2::put_key(d, &format!("ow-stranger-{s}"), &[it::USER]).await;
+        let subject = e2::put_key(d, &format!("ow-subject-{s}"), &[it::USER]).await;
+        let bound_at = Utc::now() - Duration::hours(2);
+        bind(d, &owner, &node, bound_at, None).await;
+        // a row the node produced AFTER the binding
+        let after = produced(&node, &subject, None);
         assert_eq!(
             resolve_withdraws_admission_rule(d, &owner, &after)
                 .await
@@ -612,15 +627,8 @@ pub(crate) mod owner_withdraw {
             ),
             "a stranger is refused"
         );
-        // a row the node produced BEFORE the owner's binding (2026-05-01)
-        let mut before = signed_row(
-            &node,
-            &subject,
-            attestation_type::SCORES,
-            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
-        );
-        before.asserted_at = "2026-04-01T00:00:00Z".parse().unwrap();
-        ts::reseal(&mut before);
+        // a row the node produced BEFORE the owner's binding
+        let before = produced(&node, &subject, Some(bound_at - Duration::hours(1)));
         assert!(
             matches!(
                 resolve_withdraws_admission_rule(d, &owner, &before).await,
@@ -635,50 +643,24 @@ pub(crate) mod owner_withdraw {
                 .unwrap(),
             1
         );
-        // PR #943 review — A→B→A. The first owner's binding LAPSES (its
-        // expiry), the node is bound to another owner and produces a row, that
-        // owner withdraws, and the first owner binds the node again. The old
-        // binding predates the row but was not in force when it was produced —
-        // refused. (A withdrawal by the granter itself retires every later edge
-        // from it too, so A→B→A through a self-withdrawal cannot return to A;
-        // the reachable paths are a lapse and a CC 4.3 reclaim.)
-        let node2 = format!("ow-node2-{s}");
-        let other = format!("ow-other-{s}");
-        register(d, &node2, &[it::NODE]).await;
-        register(d, &other, &[it::USER]).await;
-        let put = |a: crate::federation::Attestation| async move {
-            d.put_attestation(SignedAttestation { attestation: a })
-                .await
-                .expect("stored")
-        };
-        let lapses_at = put_lapsing_owner_binding(
-            d,
-            &format!("ob1-{s}"),
-            &owner,
-            &node2,
-            std::time::Duration::ZERO,
-        )
-        .await;
+        // PR #943 review — A→B→A. The first owner's binding LAPSES, the node is
+        // bound to another owner and produces a row, that owner withdraws its
+        // binding, and the first owner binds the node again. The first owner
+        // did not own the node when B's row was produced — refused.
+        let node2 = e2::put_key(d, &format!("ow-node2-{s}"), &[it::NODE]).await;
+        let other = e2::put_key(d, &format!("ow-other-{s}"), &[it::USER]).await;
+        let lapses_at =
+            put_lapsing_owner_binding(d, &owner, &node2, std::time::Duration::ZERO).await;
         sleep_past(lapses_at).await;
         assert_eq!(
             owner_of(d, &node2).await.unwrap(),
             None,
             "precondition: the first binding lapsed"
         );
-        put(ts::owner_binding_attestation(
-            &format!("ob2-{s}"),
-            &other,
-            &node2,
-        ))
-        .await;
+        let ob2 = bind(d, &other, &node2, Utc::now(), None).await;
         assert_eq!(owner_of(d, &node2).await.unwrap(), Some(other.clone()));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let under_other = signed_row(
-            &node2,
-            &subject,
-            attestation_type::SCORES,
-            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
-        );
+        let under_other = produced(&node2, &subject, None);
         assert_eq!(
             resolve_withdraws_admission_rule(d, &other, &under_other)
                 .await
@@ -687,14 +669,11 @@ pub(crate) mod owner_withdraw {
             "the owner at the row's instant withdraws it"
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        put(withdraws_of(&other, &node2, &format!("ob2-{s}"))).await;
+        e2::put_signed(d, &withdraws_of(&other, &node2, &ob2.attestation_id))
+            .await
+            .expect("B withdraws its binding");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        put(ts::owner_binding_attestation(
-            &format!("ob3-{s}"),
-            &owner,
-            &node2,
-        ))
-        .await;
+        bind(d, &owner, &node2, Utc::now(), None).await;
         assert_eq!(
             owner_of(d, &node2).await.unwrap(),
             Some(owner.clone()),
@@ -708,33 +687,18 @@ pub(crate) mod owner_withdraw {
             "A→B→A: the returning owner did not own the node when B's row was produced"
         );
         // the hand-off: C owns node3 and withdraws its binding; A binds node3
-        // and the node produces a row. C's era ended (its withdrawal) before
-        // the row, so A — the only owner in force then — retracts it.
-        let node3 = format!("ow-node3-{s}");
-        let prior = format!("ow-prior-{s}");
-        register(d, &node3, &[it::NODE]).await;
-        register(d, &prior, &[it::USER]).await;
-        put(ts::owner_binding_attestation(
-            &format!("obc-{s}"),
-            &prior,
-            &node3,
-        ))
-        .await;
-        put(withdraws_of(&prior, &node3, &format!("obc-{s}"))).await;
+        // and the node produces a row. C's era ended before the row, so A —
+        // the only owner in force then — retracts it.
+        let node3 = e2::put_key(d, &format!("ow-node3-{s}"), &[it::NODE]).await;
+        let prior = e2::put_key(d, &format!("ow-prior-{s}"), &[it::USER]).await;
+        let obc = bind(d, &prior, &node3, Utc::now() - Duration::minutes(10), None).await;
+        e2::put_signed(d, &withdraws_of(&prior, &node3, &obc.attestation_id))
+            .await
+            .expect("C withdraws its binding");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        put(ts::owner_binding_attestation(
-            &format!("oba-{s}"),
-            &owner,
-            &node3,
-        ))
-        .await;
+        bind(d, &owner, &node3, Utc::now(), None).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let under_a = signed_row(
-            &node3,
-            &subject,
-            attestation_type::SCORES,
-            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
-        );
+        let under_a = produced(&node3, &subject, None);
         assert_eq!(
             resolve_withdraws_admission_rule(d, &owner, &under_a)
                 .await
@@ -742,9 +706,6 @@ pub(crate) mod owner_withdraw {
             1,
             "a hand-off: the previous owner's era ended before the row"
         );
-        // the fixture stamps every owner binding 2026-05-01 — i.e. A's ob3 is
-        // already BACKDATED into B's era; the refusal above is the backdating
-        // witness too (B's binding was in force at the row's instant)
     }
 
     /// The first window a lapsing binding is given, and how many times it is
@@ -754,48 +715,28 @@ pub(crate) mod owner_withdraw {
 
     /// CIRISPersist#1011 — store `owner → node`, expiring a short window after
     /// it is stamped, and return that expiry once `owner_of` has been SEEN to
-    /// name `owner`.
-    ///
-    /// The window starts at the stamp, before the reseal, the put and the
-    /// read. I126 gave it a fixed 300 ms and asserted the binding live
-    /// straight after the put; on a 4-vCPU hosted runner the postgres put
-    /// took longer than that, the binding had legitimately lapsed when
-    /// `owner_of` read it, and the precondition failed with `left: None`. The
-    /// door was right; the test's clock budget was not. Reproduced locally by
-    /// pinning the test to 2 CPUs under 12 busy loops: stamp-to-read
-    /// 325–869 ms, 5/5 red.
-    ///
-    /// So: a `None` read that FINISHED after the expiry is a lapse, not a
-    /// verdict — retry with a fresh binding and twice the window. A `None`
-    /// read that finished before the expiry is still a failure, so the helper
-    /// keeps witnessing that a live binding is read as live.
+    /// name `owner`. A `None` read that FINISHED after the expiry is a lapse,
+    /// not a verdict: retry with a fresh binding and twice the window. A `None`
+    /// read that finished before the expiry is still a failure.
     ///
     /// `stall_first` delays the first attempt's read, standing in for a slow
     /// put (the witness below).
     async fn put_lapsing_owner_binding(
         d: &dyn FederationDirectory,
-        id: &str,
         owner: &str,
         node: &str,
         stall_first: std::time::Duration,
-    ) -> chrono::DateTime<chrono::Utc> {
-        let mut window = chrono::Duration::milliseconds(LAPSE_WINDOW_MS);
+    ) -> DateTime<Utc> {
+        let mut window = Duration::milliseconds(LAPSE_WINDOW_MS);
         for attempt in 0..LAPSE_ATTEMPTS {
-            let mut lapsing =
-                ts::owner_binding_attestation(&format!("{id}-{attempt}"), owner, node);
-            let expires = chrono::Utc::now() + window;
-            lapsing.expires_at = Some(expires);
-            ts::reseal(&mut lapsing);
-            d.put_attestation(SignedAttestation {
-                attestation: lapsing,
-            })
-            .await
-            .expect("stored");
+            let stamped = Utc::now();
+            let expires = stamped + window;
+            bind(d, owner, node, stamped, Some(expires)).await;
             if attempt == 0 {
                 tokio::time::sleep(stall_first).await;
             }
             let read = owner_of(d, node).await.unwrap();
-            let read_done = chrono::Utc::now();
+            let read_done = Utc::now();
             if read.as_deref() == Some(owner) {
                 return expires;
             }
@@ -808,10 +749,9 @@ pub(crate) mod owner_withdraw {
         panic!("{owner}'s binding lapsed before every read ({LAPSE_ATTEMPTS} attempts)");
     }
 
-    /// Sleep until 100 ms past `instant` (the fixed 400 ms this replaced was a
-    /// 300 ms window plus that margin).
-    async fn sleep_past(instant: chrono::DateTime<chrono::Utc>) {
-        let left = instant + chrono::Duration::milliseconds(100) - chrono::Utc::now();
+    /// Sleep until 100 ms past `instant`.
+    async fn sleep_past(instant: DateTime<Utc>) {
+        let left = instant + Duration::milliseconds(100) - Utc::now();
         if let Ok(left) = left.to_std() {
             tokio::time::sleep(left).await;
         }
@@ -827,14 +767,12 @@ pub(crate) mod owner_withdraw {
         let d = crate::store::test_backend::test_backend();
         let d = &d as &dyn FederationDirectory;
         let s = suffix();
-        let (owner, node) = (format!("ow-owner-{s}"), format!("ow-node-{s}"));
-        register(d, &owner, &[it::USER]).await;
-        register(d, &node, &[it::NODE]).await;
+        let owner = e2::put_key(d, &format!("ow-owner-{s}"), &[it::USER]).await;
+        let node = e2::put_key(d, &format!("ow-node-{s}"), &[it::NODE]).await;
         let stall = std::time::Duration::from_millis(LAPSE_WINDOW_MS as u64 + 100);
-        let lapses_at =
-            put_lapsing_owner_binding(d, &format!("ob-{s}"), &owner, &node, stall).await;
+        let lapses_at = put_lapsing_owner_binding(d, &owner, &node, stall).await;
         assert!(
-            lapses_at - chrono::Utc::now() < chrono::Duration::milliseconds(2 * LAPSE_WINDOW_MS),
+            lapses_at - Utc::now() < Duration::milliseconds(2 * LAPSE_WINDOW_MS),
             "the binding returned is the retry's, not one with an unbounded window"
         );
         sleep_past(lapses_at).await;
@@ -1000,6 +938,8 @@ mod custody {
                 use super::*;
                 #[tokio::test]
                 async fn i127() {
+                    // v62.0.0 (JSON cut, E7) — the ladder is kid-keyed (E4) and its room
+                    // lands as voices (E6).
                     let Some((a, b)) = $dsns else { return };
                     i127_the_custody_view(&a, &b, &suffix(), $pick).await
                 }

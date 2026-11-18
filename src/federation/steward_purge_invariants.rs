@@ -205,16 +205,20 @@
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON;
-    use crate::federation::canonical_community_invariants::bodies as cc;
+    use crate::federation::edition2::fixture_genesis;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::fixture_switch::RootedTrustRoot;
+    use crate::federation::edition2::names::RowId;
+    use crate::federation::edition2::typed::{takedown_payload, NoticeText, TAKEDOWN_PREFIX};
     use crate::federation::steward_purge::unauthorised_reason as why;
     use crate::federation::steward_purge::{
         self as sp, token, PurgePlane, PurgeSelection, StewardPurgeNotice,
     };
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{attestation_type, Attestation, SignedAttestation};
+    use crate::federation::types::{attestation_type, Attestation};
     use crate::federation::{Error, FederationDirectory};
     use crate::store::{Backend, TraceEventRow, TraceLlmCallRow};
+    use ciris_verify_core::cde::{self, Value};
 
     /// What a witness needs from a backend beyond the two public traits.
     pub(crate) trait Seams: FederationDirectory + Backend + Sync {
@@ -344,16 +348,16 @@ pub(crate) mod bodies {
 
     // The purge doors read this node's clock (Codex round 2 on PR #1057); a
     // witness pins it through the `cfg(test)` seam, never an argument.
-    /// `sp::purge_rows` with the purge clock pinned at `at`.
+    /// `sp::purge_rows_edition2` with the purge clock pinned at `at`.
     pub(crate) async fn rows_at<F: FederationDirectory + ?Sized>(
         dir: &F,
         selection: &PurgeSelection,
-        notice: &StewardPurgeNotice,
+        notice: &Notice,
         by: &str,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<sp::PurgeReport, Error> {
         sp::test_clock::set(Some(at));
-        sp::purge_rows(dir, selection, notice, by).await
+        sp::purge_rows_edition2(dir, selection, &notice.row, by).await
     }
     /// `sp::purge_status` with the purge clock pinned at `at`.
     pub(crate) async fn status_at<F: FederationDirectory + ?Sized>(
@@ -384,14 +388,44 @@ pub(crate) mod bodies {
         sp::test_clock::set(Some(at));
         sp::apply_replicated_purge(dir, bundle, receiver).await
     }
+
+    // v62.0.0 (E10) — every key below is an edition-2 key E0 minted from the
+    // seed named here (`e2::put_key`); persist stores and compares its
+    // identity-ref, `k(seed)`. The seed is kept only where a fixture signs.
     pub(crate) const AGENT: &str = "mock-agent-a";
     pub(crate) const SCORER: &str = "lens-scorer";
     pub(crate) const BYSTANDER: &str = "bystander-b";
     pub(crate) const HARNESS: &str = "qa-node-7";
+    /// This node's key seed (`root` puts it and seats it as the node).
     pub(crate) const NODE: &str = "canon-node-1";
+    /// The trust root's protocol: `quorum:2/3` among its three founders.
+    pub(crate) const PROTOCOL: &str = "quorum:2/3";
+
+    /// The identity-ref of `seed`'s key.
+    pub(crate) fn k(seed: &str) -> String {
+        e2::kid(seed)
+    }
 
     pub(crate) fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
+    }
+
+    /// A distinct millisecond for each fixture row (an edition-2 row id is
+    /// computed from its payload, so two calls with the same content would
+    /// name one row): this node's clock, truncated to ms, moved back one ms
+    /// per call.
+    fn distinct_instant() -> chrono::DateTime<chrono::Utc> {
+        static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ms = chrono::Utc::now().timestamp_millis() - 1 - n.rem_euclid(50_000);
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).expect("an instant")
+    }
+
+    /// A 64-hex id derived from `name` (an edition-2 `evidence_refs` member
+    /// is a digest, so a trace a score cites is named by one).
+    pub(crate) fn hex_id(name: &str) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(name.as_bytes()))
     }
 
     /// The token and body of a purge refusal, or a panic naming what came back.
@@ -402,60 +436,211 @@ pub(crate) mod bodies {
         }
     }
 
-    /// The trust root rooted on `d`: the genesis accord holders, the three
-    /// human founders the accord conferred, and `ciris-canonical` admitted
-    /// under a 2-of-3 accord co-scrub with `quorum:2/3` among its founders.
-    pub(crate) async fn root<D: Seams>(
-        d: &D,
-    ) -> Vec<crate::federation::accord_test_support::Identity> {
+    /// The ROOTED edition-2 trust root on `d` (W1b's fixture): this node's
+    /// key put and seated, the genesis bundle in force, an `infrastructure`
+    /// community at `kid(ROOT_SEED)` founded by the bundle's three holders
+    /// under `quorum:2/3`, its charter self-edge and this node's acceptance
+    /// edge. The witnesses' actors are put as edition-2 `agent` keys.
+    /// Idempotent (W1.api.md v1.3).
+    pub(crate) async fn root<D: Seams>(d: &D) -> RootedTrustRoot {
         let dir = d.as_dyn_directory();
-        let holders = cc::stand_up(dir).await;
-        dir.put_community(cc::signed(cc::canonical_row(&cc::FOUNDERS), &["A1", "B1"]))
-            .await
-            .expect("the trust root admits");
-        for k in [AGENT, SCORER, BYSTANDER, HARNESS] {
-            ts::register_hybrid_key(dir, k).await;
+        let node = e2::put_key(dir, NODE, &["node"]).await;
+        d.set_node(&node);
+        let r = e2::rooted_trust_root(dir, &fixture_genesis::HOLDER_SEEDS, PROTOCOL).await;
+        for s in [AGENT, SCORER, BYSTANDER, HARNESS] {
+            e2::put_key(dir, s, &["agent"]).await;
         }
-        holders
+        r
     }
 
-    /// A notice completing the dry run's template, cosigned by `signers`.
-    pub(crate) fn notice_for(
+    /// An edition-2 steward purge notice: the founders' voices (CC 2.6.1.9:
+    /// a counted row, every voice the same payload, so one row id).
+    #[derive(Clone, Debug)]
+    pub(crate) struct Notice {
+        /// The notice's row id (= its notice id).
+        pub(crate) row: RowId,
+        /// The voices, in the order signed.
+        pub(crate) voices: Vec<Vec<u8>>,
+    }
+
+    impl Notice {
+        /// The notice id (the row id, lowercase hex).
+        pub(crate) fn id(&self) -> String {
+            self.row.hex()
+        }
+        /// The notice as a replicated bundle carries it (T2.api.md §8): the
+        /// statements, never a cosignature.
+        pub(crate) fn carried(&self) -> StewardPurgeNotice {
+            StewardPurgeNotice {
+                envelope: sp::edition2_notice_envelope(&self.voices),
+                cosignatures: vec![],
+            }
+        }
+    }
+
+    /// The `takedown_notice:steward_purge:v1` payload completing a dry run's
+    /// `template` (its digest, holder list and OPTIONAL `selection_counts`),
+    /// claimant the root, asserted a minute before `now`, live one day.
+    pub(crate) fn notice_payload(
+        r: &RootedTrustRoot,
         template: &serde_json::Value,
-        signers: &[&str],
         now: chrono::DateTime<chrono::Utc>,
-    ) -> StewardPurgeNotice {
-        let mut env = template.clone();
-        let digest = env["content_sha256"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        env["claimant_key_id"] = serde_json::json!(CANON);
-        env["claim_text"] = serde_json::json!("test-harness input in the canonical corpus");
-        env["good_faith_statement"] = serde_json::json!("the selection never belonged");
-        env["jurisdiction"] = serde_json::json!("ZZ");
-        env["evidence_refs"] =
-            serde_json::json!([format!("evidence/purges/2026-10-09-{digest}.tsv")]);
-        env["asserted_at"] =
-            serde_json::json!(crate::federation::admission::render_signed_instant(
-                now - chrono::Duration::seconds(60)
-            ));
-        env["expires_at"] = serde_json::json!(crate::federation::admission::render_signed_instant(
-            now + chrono::Duration::days(1)
-        ));
-        sign(env, signers)
+    ) -> Value {
+        let digest: [u8; 32] = hex::decode(template["content_sha256"].as_str().unwrap_or_default())
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .expect("the template names a SHA-256 digest");
+        let holders: Vec<String> = template["content_holder_key_ids"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let text = NoticeText {
+            claim_text: "test-harness input in the canonical corpus".into(),
+            good_faith_statement: "the selection never belonged".into(),
+            jurisdiction: "ZZ".into(),
+        };
+        let p = takedown_payload(
+            sp::STEWARD_PURGE_BASIS,
+            &r.root,
+            &digest,
+            &holders,
+            &text,
+            e2::ms(now + chrono::Duration::days(1)),
+            e2::ms(now - chrono::Duration::seconds(60)),
+        )
+        .expect("the notice payload");
+        match template.get("selection_counts").and_then(|c| c.as_object()) {
+            None => p,
+            Some(counts) => {
+                let mut c: Vec<(Value, Value)> = counts
+                    .iter()
+                    .map(|(t, n)| {
+                        (
+                            Value::Text(t.clone()),
+                            Value::Uint(n.as_u64().expect("a count")),
+                        )
+                    })
+                    .collect();
+                c.sort_by_key(|(key, _)| cde::encode(key));
+                with_member(p, "selection_counts", Some(Value::Map(c)))
+            }
+        }
     }
 
-    /// Cosign `env` by `signers` (their deterministic hybrid keys).
-    pub(crate) fn sign(env: serde_json::Value, signers: &[&str]) -> StewardPurgeNotice {
-        let bytes = sp::notice_signing_bytes(&env).expect("canonicalizes");
-        StewardPurgeNotice {
-            cosignatures: signers
-                .iter()
-                .map(|s| ts::threshold_sign(s, &bytes))
-                .collect(),
-            envelope: env,
+    /// `payload` with `member` set to `value` (removed on `None`), in
+    /// deterministic key order.
+    pub(crate) fn with_member(payload: Value, member: &str, value: Option<Value>) -> Value {
+        let Value::Map(mut m) = payload else {
+            panic!("a payload is a map")
+        };
+        m.retain(|(key, _)| key.as_text() != Some(member));
+        if let Some(v) = value {
+            m.push((Value::Text(member.to_owned()), v));
         }
+        m.sort_by_key(|(key, _)| cde::encode(key));
+        Value::Map(m)
+    }
+
+    /// Founder `i`'s voice over `payload` (its bundle-placed holder key).
+    pub(crate) fn founder_voice(r: &RootedTrustRoot, i: usize, payload: &Value) -> Vec<u8> {
+        signed_voice(&r.founder_key(i), &r.founders[i], &r.root, payload)
+    }
+
+    /// A voice over `payload` by `key` as `iss`, about `sub`.
+    pub(crate) fn signed_voice(
+        key: &ciris_crypto::composite::CompositeSigningKey,
+        iss: &str,
+        sub: &str,
+        payload: &Value,
+    ) -> Vec<u8> {
+        ciris_verify_core::edition2::sign_row_statement(
+            key,
+            iss,
+            sub,
+            attestation_type::SCORES,
+            &ciris_verify_core::namespace_match::family_id(TAKEDOWN_PREFIX),
+            payload,
+            vec![],
+        )
+        .expect("a voice signs")
+    }
+
+    /// The notice over `payload` voiced by `founders` (indices), NOT put.
+    pub(crate) fn notice_of(r: &RootedTrustRoot, payload: &Value, founders: &[usize]) -> Notice {
+        let voices: Vec<Vec<u8>> = founders
+            .iter()
+            .map(|i| founder_voice(r, *i, payload))
+            .collect();
+        let row = voices
+            .first()
+            .and_then(|v| RowId::of_statement(v))
+            .unwrap_or_else(|| {
+                RowId::of_statement(&founder_voice(r, 0, payload)).expect("a row id")
+            });
+        Notice { row, voices }
+    }
+
+    /// A notice completing `template`, voiced by `founders` and each voice
+    /// put through this node's statement door (a counted row: `Pending`
+    /// until it is counted, T2.api.md §7).
+    pub(crate) async fn notice_for<D: Seams>(
+        d: &D,
+        r: &RootedTrustRoot,
+        template: &serde_json::Value,
+        founders: &[usize],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Notice {
+        let n = notice_of(r, &notice_payload(r, template, now), founders);
+        put_voices(d, &n).await;
+        n
+    }
+
+    /// Put every voice of `n` through this node's statement door.
+    pub(crate) async fn put_voices<D: Seams>(d: &D, n: &Notice) {
+        for v in &n.voices {
+            e2::put_statement(d.as_dyn_directory(), v)
+                .await
+                .unwrap_or_else(|e| panic!("a founder's voice is kept: {e}"));
+        }
+    }
+
+    /// A replicated bundle over `ids` (sorted here) carrying `n`'s voices.
+    pub(crate) fn bundle_of(
+        n: &Notice,
+        mut pairs: Vec<(String, String)>,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> sp::PurgeBundle {
+        pairs.sort();
+        sp::PurgeBundle {
+            notice: n.carried(),
+            record_ids: pairs.iter().map(|(id, _)| id.clone()).collect(),
+            derived_from: pairs.into_iter().map(|(_, from)| from).collect(),
+            admitted_at: t,
+        }
+    }
+
+    /// The notice id an edition-2 bundle carries: its statements' row id.
+    pub(crate) fn bundle_notice_id(b: &sp::PurgeBundle) -> String {
+        let first = b.notice.envelope[sp::EDITION2_STATEMENTS_MEMBER][0]
+            .as_str()
+            .expect("an edition-2 bundle carries its statements");
+        RowId::of_statement(&hex::decode(first).expect("hex"))
+            .expect("a row statement")
+            .hex()
+    }
+
+    /// A template naming `ids` (the digest a peer's bundle carries).
+    pub(crate) fn template_over(ids: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "legal_basis": sp::STEWARD_PURGE_BASIS,
+            "content_sha256": sp::selection_digest(ids),
+            "content_holder_key_ids": [],
+        })
     }
 
     fn event_row(trace_id: &str, signer: &str, attempt: u32) -> TraceEventRow {
@@ -476,7 +661,7 @@ pub(crate) mod bodies {
             cost_tokens: None,
             cost_usd: None,
             signature: "sig-test".to_owned(),
-            signing_key_id: signer.to_owned(),
+            signing_key_id: k(signer),
             signature_verified: true,
             verification_source: crate::store::VerificationSource::Persist,
             schema_version: "2.7.0".to_owned(),
@@ -555,7 +740,7 @@ pub(crate) mod bodies {
         let id = crate::ingest::trace_attestation_id(trace_id);
         let local = crate::federation::types::LocalAttestationInput {
             attestation_id: Some(id.clone()),
-            attesting_key_id: signer.to_owned(),
+            attesting_key_id: k(signer),
             attested_key_id: None,
             attestation_type: attestation_type::SCORES.to_owned(),
             weight: None,
@@ -569,7 +754,7 @@ pub(crate) mod bodies {
                 }),
             )
             .expect("object"),
-            subject_key_ids: vec![signer.to_owned()],
+            subject_key_ids: vec![k(signer)],
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
             scrub_signature_classical: None,
             scrub_signature_pqc: None,
@@ -585,32 +770,46 @@ pub(crate) mod bodies {
         id
     }
 
+    /// An earlier-shaped `scores` literal by `attester` about `attested` on
+    /// `dimension`, citing `refs` (64-hex: an edition-2 `evidence_refs`
+    /// member is a digest), at a distinct millisecond. Unsigned: the caller
+    /// signs it as an edition-2 statement (`e2::put_row` / `statement_of`).
+    pub(crate) fn score_row(
+        attester: &str,
+        attested: &str,
+        dimension: &str,
+        refs: &[&str],
+    ) -> Attestation {
+        let mut env = serde_json::json!({
+            "dimension": dimension,
+            "score": crate::federation::namespace::registry::in_class_score(dimension),
+            "confidence": 0.9,
+        });
+        if !refs.is_empty() {
+            env["evidence_refs"] = serde_json::json!(refs);
+        }
+        let mut row =
+            e2::with_earlier_form(|| ts::bare_attestation("e10", attester, attested, &env));
+        row.attestation_type = attestation_type::SCORES.to_owned();
+        row.asserted_at = distinct_instant();
+        row.scrub_timestamp = row.asserted_at;
+        row
+    }
+
     /// A federation-tier `scores` row by `attester` about `attested`, whose
-    /// `evidence_refs` cite `refs`, really signed and put through the door.
+    /// `evidence_refs` cite `refs`, signed by the attester's key as an
+    /// edition-2 statement and put through the statement door. The row as
+    /// stored (its id is the row id).
     pub(crate) async fn put_score<D: Seams>(
         d: &D,
         attester: &str,
         attested: &str,
         refs: &[&str],
     ) -> Attestation {
-        let id = uuid::Uuid::new_v4().to_string();
-        let env = serde_json::json!({
-            "dimension": "chat:message:v1",
-            "score": 1.0,
-            "confidence": 0.9,
-            "evidence_refs": refs,
-        });
-        let mut row = ts::bare_attestation(&id, attester, attested, &env);
-        row.attestation_type = attestation_type::SCORES.to_owned();
-        ts::reseal(&mut row);
+        let row = score_row(attester, attested, "chat:message:v1", refs);
+        let mapped = e2::put_row(d.as_dyn_directory(), &row, attester).await;
         d.as_dyn_directory()
-            .put_attestation(SignedAttestation {
-                attestation: row.clone(),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("score {id} admits: {e}"));
-        d.as_dyn_directory()
-            .get_attestation(&id)
+            .get_attestation(&e2::rid(&mapped))
             .await
             .unwrap()
             .expect("stored")
@@ -635,14 +834,14 @@ pub(crate) mod bodies {
         }
     }
 
-    async fn assert_nothing_written<D: Seams>(d: &D, notice: &StewardPurgeNotice) {
-        use sha2::Digest as _;
-        let id = hex::encode(sha2::Sha256::digest(
-            sp::notice_signing_bytes(&notice.envelope).expect("canonicalizes"),
-        ));
+    async fn assert_nothing_written<D: Seams>(d: &D, notice: &Notice) {
+        assert_nothing_written_for(d, &notice.id()).await;
+    }
+
+    async fn assert_nothing_written_for<D: Seams>(d: &D, id: &str) {
         assert!(
             d.as_dyn_directory()
-                .purge_execution(&id)
+                .purge_execution(id)
                 .await
                 .unwrap()
                 .is_none(),
@@ -650,7 +849,7 @@ pub(crate) mod bodies {
         );
         assert!(
             d.as_dyn_directory()
-                .purge_tombstones_of(&id)
+                .purge_tombstones_of(id)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -660,11 +859,12 @@ pub(crate) mod bodies {
 
     /// The #1040 world: two mock traces by AGENT, one real trace by BYSTANDER,
     /// a score over a mock trace, a score over the real one. Returns
-    /// `(mock_trace_ids, derived_score_id, unrelated_score_id)`.
+    /// `(mock_trace_ids, derived_score_id, unrelated_score_id)`. The trace
+    /// ids are 64-hex (`hex_id`): a score cites its trace by digest.
     pub(crate) async fn mock_world<D: Seams>(d: &D, tag: &str) -> (Vec<String>, String, String) {
-        let t1 = format!("trace-mock-1-{tag}");
-        let t2 = format!("trace-mock-2-{tag}");
-        let real = format!("trace-real-{tag}");
+        let t1 = hex_id(&format!("trace-mock-1-{tag}"));
+        let t2 = hex_id(&format!("trace-mock-2-{tag}"));
+        let real = hex_id(&format!("trace-real-{tag}"));
         seed_trace(d, &t1, AGENT, sp::MOCK_LLM_MODEL).await;
         seed_trace(d, &t2, AGENT, sp::MOCK_LLM_MODEL).await;
         seed_trace(d, &real, BYSTANDER, "gpt-real").await;
@@ -682,156 +882,234 @@ pub(crate) mod bodies {
     }
 
     // ── I650 ──────────────────────────────────────────────────────────────
+    /// v62.0.0 (E10) — the authorisation is the rooted trust root's own
+    /// `consensus_protocol` counted over the notice's VOICES (T2.api.md §7):
+    /// each founder's statement is one voice, re-admitted by the edition-2
+    /// door. Every refusal is `purge_unauthorised` with its typed reason and
+    /// nothing written; two founders of `quorum:2/3` execute.
     pub(crate) async fn i650_authorisation_is_the_roots_own_protocol<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         mock_world(d, "i650").await;
         let dir = d.as_dyn_directory();
         let t = now();
         let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
         let sel = mock_selection();
-        let ok = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-
-        let mut cases: Vec<(&str, StewardPurgeNotice)> = vec![
-            ("no cosignature", notice_for(&dry.notice_template, &[], t)),
-            (
-                "one of quorum:2/3",
-                notice_for(&dry.notice_template, &[cc::FOUNDERS[0]], t),
-            ),
-            (
-                "an accord holder who holds no seat",
-                notice_for(&dry.notice_template, &[cc::FOUNDERS[0], "A1"], t),
-            ),
-            // A seat the protocol does not count is no refusal, but it is no
-            // vote either: under `infrastructure` only founders are eligible.
-            (
-                "one founder and a non-founder seat",
-                notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::SERVE_NODE], t),
-            ),
-            // A quorum does not launder a stranger's cosignature into the set
-            // the bundle carries, nor does a seat count twice.
-            (
-                "a founder quorum carrying a non-seat's cosignature",
-                notice_for(
-                    &dry.notice_template,
-                    &[cc::FOUNDERS[0], cc::FOUNDERS[1], "A1"],
-                    t,
-                ),
-            ),
-            (
-                "a founder quorum with one founder signing twice",
-                notice_for(
-                    &dry.notice_template,
-                    &[cc::FOUNDERS[0], cc::FOUNDERS[1], cc::FOUNDERS[1]],
-                    t,
-                ),
-            ),
-        ];
-        let mut forged = ok.clone();
-        forged.cosignatures[1] = ts::threshold_sign(cc::FOUNDERS[1], b"other bytes");
-        cases.push(("a forged cosignature", forged));
-        let mut other_basis = dry.notice_template.clone();
-        other_basis["legal_basis"] = serde_json::json!("dmca512");
-        cases.push((
-            "another basis",
-            notice_for(&other_basis, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
-        ));
-        cases.push((
-            "an expired notice",
-            notice_for(
+        // Each case its own payload (a distinct asserted_at), so no case's
+        // voices join another's row.
+        let p = |i: i64| {
+            notice_payload(
+                &r,
                 &dry.notice_template,
-                &[cc::FOUNDERS[0], cc::FOUNDERS[1]],
-                t - chrono::Duration::days(3),
-            ),
-        ));
-        let mut no_holders = ok.envelope.clone();
-        no_holders
-            .as_object_mut()
-            .unwrap()
-            .remove("content_holder_key_ids");
-        cases.push((
-            "a notice without the CC 3.3.2 holder list",
-            sign(no_holders, &[cc::FOUNDERS[0], cc::FOUNDERS[1]]),
-        ));
-        let mut not_root = ok.envelope.clone();
-        not_root["claimant_key_id"] = serde_json::json!("some-room");
+                t - chrono::Duration::milliseconds(10 + i),
+            )
+        };
+        // A key that holds no seat: an edition-2 `user` key.
+        const STRANGER: &str = "i650-no-seat";
+        let stranger = e2::put_key(dir, STRANGER, &["user"]).await;
+        let stranger_voice =
+            |p: &Value| signed_voice(&e2::signing_key(STRANGER), &stranger, &r.root, p);
+
+        let mut cases: Vec<(&str, Notice)> = Vec::new();
+        // Nothing of the notice is held.
+        cases.push(("no voice", notice_of(&r, &p(0), &[])));
+        cases.push(("one of quorum:2/3", notice_of(&r, &p(1), &[0])));
+        // A voice that holds no seat is a refusal, not a discount, alone or
+        // beside a founder quorum.
+        let mut lone = notice_of(&r, &p(2), &[0]);
+        lone.voices.push(stranger_voice(&p(2)));
+        cases.push(("a founder and a key that holds no seat", lone));
+        let mut laundered = notice_of(&r, &p(3), &[0, 1]);
+        laundered.voices.push(stranger_voice(&p(3)));
+        cases.push(("a founder quorum beside a non-seat's voice", laundered));
+        // One founder's two voices are one voice (the statement is the same
+        // row, its issuer one seat): the count is not met.
+        let mut twice = notice_of(&r, &p(4), &[0]);
+        twice.voices.push(founder_voice(&r, 0, &p(4)));
+        cases.push(("one founder voicing twice", twice));
+        // Another basis: an authored dmca notice is no steward purge.
+        let dmca = {
+            let p = takedown_payload(
+                "dmca512",
+                &r.root,
+                &<[u8; 32]>::try_from(hex::decode(&dry.selection_digest).unwrap().as_slice())
+                    .unwrap(),
+                &[],
+                &NoticeText {
+                    claim_text: "c".into(),
+                    good_faith_statement: "g".into(),
+                    jurisdiction: "ZZ".into(),
+                },
+                e2::ms(t + chrono::Duration::days(1)),
+                e2::ms(t - chrono::Duration::seconds(60)),
+            )
+            .unwrap();
+            notice_of(&r, &p, &[0, 1])
+        };
+        cases.push(("another basis", dmca));
+        // A claimant that is no trust root this node holds: an edition-2
+        // user key's identity-ref.
+        // The voices are about that claimant (a notice's `sub` is its
+        // claimant).
+        let room = e2::put_key(dir, "i650-some-room", &["user"]).await;
+        let not_root = with_member(p(5), "claimant", Some(Value::Text(room.clone())));
+        let voices: Vec<Vec<u8>> = (0..2)
+            .map(|i| signed_voice(&r.founder_key(i), &r.founders[i], &room, &not_root))
+            .collect();
         cases.push((
             "a claimant that is not a rooted trust root",
-            sign(not_root, &[cc::FOUNDERS[0], cc::FOUNDERS[1]]),
+            Notice {
+                row: RowId::of_statement(&voices[0]).expect("a row statement"),
+                voices,
+            },
         ));
+
         // Each case is refused BY its own clause: the reason names it, so a
-        // case that an earlier clause happens to refuse cannot stand in.
+        // case an earlier clause happens to refuse cannot stand in.
         let clause = |what: &str| match what {
-            "no cosignature" => "carries no cosignature",
-            "one of quorum:2/3" | "one founder and a non-founder seat" => "consensus_protocol",
-            "a founder quorum with one founder signing twice" => "signed twice",
-            "a forged cosignature" => "does not verify",
-            "another basis" => "does not authorise a steward purge",
-            "an expired notice" => "expired",
+            "no voice" => "no statement of the notice is held",
+            "one of quorum:2/3" | "one founder voicing twice" => "consensus_protocol",
+            "another basis" => "legal_basis",
             "a claimant that is not a rooted trust root" => "no community row",
-            "a notice without the CC 3.3.2 holder list" => "content_holder_key_ids",
             _ => "holds no seat",
         };
         // v55.0.0 (CIRISPersist#1055) — and its typed reason, with the
         // retryable bit the reason implies: only the claimant this node does
         // not hold is an ordering gap here.
         let reason = |what: &str| match what {
-            "no cosignature" => why::NO_COSIGNATURE,
-            "one of quorum:2/3" | "one founder and a non-founder seat" => why::QUORUM_NOT_MET,
-            "a founder quorum with one founder signing twice" => why::DUPLICATE_COSIGNER,
-            "a forged cosignature" => why::SIGNATURE_INVALID,
-            "another basis" => why::WRONG_BASIS,
-            "an expired notice" => why::EXPIRED,
+            "no voice" => why::NO_COSIGNATURE,
+            "one of quorum:2/3" | "one founder voicing twice" => why::QUORUM_NOT_MET,
+            "another basis" => why::NOTICE_MALFORMED,
             "a claimant that is not a rooted trust root" => why::ROOT_NOT_HELD,
-            "a notice without the CC 3.3.2 holder list" => why::NOTICE_MALFORMED,
             _ => why::NOT_A_SEAT,
         };
         for (what, notice) in cases {
-            let e = rows_at(dir, &sel, &notice, NODE, t).await.expect_err(what);
+            for v in &notice.voices {
+                // A dmca notice is authored; its voices may be refused at the
+                // door (`takedown_authority`): then nothing of it is held,
+                // which the purge reads as `no_cosignature`.
+                let _ = e2::put_statement(dir, v).await;
+            }
+            let e = rows_at(dir, &sel, &notice, &k(NODE), t)
+                .await
+                .expect_err(what);
             let (tok, body) = refusal(&e);
             assert_eq!(tok, token::UNAUTHORISED, "I650 {what}: {body}");
-            assert!(
-                body["detail"]
-                    .as_str()
-                    .is_some_and(|r| r.contains(clause(what))),
-                "I650 {what}: refused by another clause: {body}"
-            );
-            assert_eq!(
-                body["reason"].as_str(),
-                Some(reason(what)),
-                "I650 {what}: the typed reason: {body}"
-            );
+            let got = body["reason"].as_str().unwrap_or_default().to_owned();
+            if what == "another basis" && got == why::NO_COSIGNATURE {
+                // Refused at the statement door: still no authorisation.
+            } else {
+                assert!(
+                    body["detail"]
+                        .as_str()
+                        .is_some_and(|r| r.contains(clause(what))),
+                    "I650 {what}: refused by another clause: {body}"
+                );
+                assert_eq!(got, reason(what), "I650 {what}: the typed reason: {body}");
+            }
             assert_eq!(
                 body["retryable"].as_bool(),
-                Some(reason(what) == why::ROOT_NOT_HELD),
+                Some(got == why::ROOT_NOT_HELD),
                 "I650 {what}: retryable is the gap alone: {body}"
             );
             assert_eq!(e.kind(), "purge_unauthorised", "I650 the kind IS the token");
             assert_nothing_written(d, &notice).await;
         }
-        // The quorum executes, and a non-founder SEAT's verifying cosignature
-        // rides along (CC 2.4 rule 0: the signer set is the roster's, the
-        // count is the protocol's).
-        let with_seat = notice_for(
-            &dry.notice_template,
-            &[cc::FOUNDERS[0], cc::FOUNDERS[1], cc::SERVE_NODE],
-            t,
-        );
-        let report = rows_at(dir, &sel, &with_seat, NODE, t)
+
+        // A forged voice never reaches the count: the statement door refuses
+        // it, nothing of it is held, and one founder is short of the quorum.
+        let forged_payload =
+            notice_payload(&r, &dry.notice_template, t - chrono::Duration::seconds(1));
+        let mut forged = notice_of(&r, &forged_payload, &[0, 1]);
+        let last = forged.voices[1].len() - 1;
+        forged.voices[1][last] ^= 0x01;
+        e2::put_statement(dir, &forged.voices[0])
             .await
-            .expect("2-of-3 founders, plus a seat");
-        let mut expect = vec![
-            cc::FOUNDERS[0].to_owned(),
-            cc::FOUNDERS[1].to_owned(),
-            cc::SERVE_NODE.to_owned(),
-        ];
+            .expect("I650: the first voice is kept");
+        assert!(
+            e2::put_statement(dir, &forged.voices[1]).await.is_err(),
+            "I650: a forged voice is refused at the statement door"
+        );
+        let (tok, body) = refusal(
+            &rows_at(dir, &sel, &forged, &k(NODE), t)
+                .await
+                .expect_err("a forged voice"),
+        );
+        assert_eq!(tok, token::UNAUTHORISED, "I650 forged: {body}");
+        assert_eq!(
+            body["reason"].as_str(),
+            Some(why::QUORUM_NOT_MET),
+            "I650: {body}"
+        );
+        assert_nothing_written(d, &forged).await;
+
+        // An expired notice: its window is this node's clock (the purge clock
+        // pinned past `expires_at`).
+        let late = notice_for(
+            d,
+            &r,
+            &dry.notice_template,
+            &[0, 1],
+            t - chrono::Duration::seconds(2),
+        )
+        .await;
+        let (tok, body) = refusal(
+            &rows_at(dir, &sel, &late, &k(NODE), t + chrono::Duration::days(2))
+                .await
+                .expect_err("an expired notice"),
+        );
+        assert_eq!(tok, token::UNAUTHORISED, "I650 expired: {body}");
+        assert_eq!(body["reason"].as_str(), Some(why::EXPIRED), "I650: {body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|r| r.contains("expired")),
+            "I650 expired: {body}"
+        );
+        assert_nothing_written(d, &late).await;
+
+        // A notice without CC 3.3.2's holder list is no notice: the payload is
+        // refused at the door, so nothing of it is held.
+        let bare = notice_of(
+            &r,
+            &with_member(
+                notice_payload(&r, &dry.notice_template, t - chrono::Duration::seconds(3)),
+                "content_holders",
+                None,
+            ),
+            &[0, 1],
+        );
+        for v in &bare.voices {
+            assert!(
+                e2::put_statement(dir, v).await.is_err(),
+                "I650: a notice payload without content_holders is refused"
+            );
+        }
+        let (_, body) = refusal(
+            &rows_at(dir, &sel, &bare, &k(NODE), t)
+                .await
+                .expect_err("no holder list"),
+        );
+        assert_eq!(
+            body["reason"].as_str(),
+            Some(why::NO_COSIGNATURE),
+            "I650: {body}"
+        );
+
+        // Two founders of three execute; the counted voices are theirs.
+        let ok = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
+        let report = rows_at(dir, &sel, &ok, &k(NODE), t)
+            .await
+            .expect("2-of-3 founders");
+        let mut expect = vec![r.founders[0].clone(), r.founders[1].clone()];
         expect.sort();
-        assert_eq!(report.cosigners, expect, "I650");
-        let _ = ok;
+        let mut got = report.cosigners.clone();
+        got.sort();
+        assert_eq!(got, expect, "I650: the counted voices");
     }
 
     // ── I651 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i651_a_digest_naming_other_ids_is_refused<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         mock_world(d, "i651").await;
         let dir = d.as_dyn_directory();
         let t = now();
@@ -843,11 +1121,11 @@ pub(crate) mod bodies {
         // Same counts per table, one id swapped for another on the same plane.
         let last = ids.pop().expect("non-empty");
         let (plane, _) = last.split_once(':').unwrap();
-        ids.push(format!("{plane}:00000000-0000-4000-8000-000000000000"));
+        ids.push(format!("{plane}:{}", "0".repeat(64)));
         let mut tpl = dry.notice_template.clone();
         tpl["content_sha256"] = serde_json::json!(sp::selection_digest(&ids));
-        let notice = notice_for(&tpl, &[cc::FOUNDERS[0], cc::FOUNDERS[2]], t);
-        let e = rows_at(dir, &mock_selection(), &notice, NODE, t)
+        let notice = notice_for(d, &r, &tpl, &[0, 2], t).await;
+        let e = rows_at(dir, &mock_selection(), &notice, &k(NODE), t)
             .await
             .expect_err("digest mismatch");
         let (tok, body) = refusal(&e);
@@ -859,24 +1137,21 @@ pub(crate) mod bodies {
 
     // ── I652 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i652_a_grown_selection_is_a_count_mismatch<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         mock_world(d, "i652").await;
         let dir = d.as_dyn_directory();
         let t = now();
         let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
         // `selection_counts` is OPTIONAL (CC 3.3.2, CIRISConstitution
         // rc8@8c8f536): without it the digest alone binds.
-        let mut bare = notice.envelope.clone();
-        bare.as_object_mut().unwrap().remove("selection_counts");
-        let bare = sign(bare, &[cc::FOUNDERS[0], cc::FOUNDERS[1]]);
-        assert!(sp::notice_terms(&bare.envelope)
-            .expect("a notice without selection_counts is well-formed")
-            .selection_counts
-            .is_none());
+        let mut tpl = dry.notice_template.clone();
+        tpl.as_object_mut().unwrap().remove("selection_counts");
+        let bare = notice_for(d, &r, &tpl, &[0, 1], t - chrono::Duration::seconds(1)).await;
+        assert_ne!(bare.row, notice.row, "I652: two notices");
         // A third mock trace lands after the dry run.
-        seed_trace(d, "trace-mock-3-i652", AGENT, sp::MOCK_LLM_MODEL).await;
-        let e = rows_at(dir, &mock_selection(), &notice, NODE, t)
+        seed_trace(d, &hex_id("trace-mock-3-i652"), AGENT, sp::MOCK_LLM_MODEL).await;
+        let e = rows_at(dir, &mock_selection(), &notice, &k(NODE), t)
             .await
             .expect_err("count mismatch");
         let (tok, body) = refusal(&e);
@@ -886,7 +1161,7 @@ pub(crate) mod bodies {
         assert_eq!(body["found"], 4, "I652: {body}");
         assert_nothing_written(d, &notice).await;
         // The count-less notice: the same drift is the digest's to refuse.
-        let e = rows_at(dir, &mock_selection(), &bare, NODE, t)
+        let e = rows_at(dir, &mock_selection(), &bare, &k(NODE), t)
             .await
             .expect_err("digest mismatch");
         assert_eq!(refusal(&e).0, token::SELECTION_DIGEST_MISMATCH, "I652");
@@ -895,35 +1170,36 @@ pub(crate) mod bodies {
 
     // ── I653 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i653_an_inadmissible_retraction_stops_the_door<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         let target = put_score(d, BYSTANDER, AGENT, &[]).await;
-        ts::put_retraction(
-            dir,
-            BYSTANDER,
-            AGENT,
-            &target.attestation_id,
-            attestation_type::WITHDRAWS,
-        )
-        .await
-        .expect("withdraws admits");
-        let withdraws = dir
-            .list_attestations_referencing(&target.attestation_id)
+        // The withdraws: BYSTANDER's composer naming the target's row id.
+        let withdraws = e2::composer_of(attestation_type::WITHDRAWS, &target, BYSTANDER);
+        e2::put_signed(dir, &withdraws)
             .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("the withdraws");
+            .expect("withdraws admits");
+        let wid_raw = e2::rid(&withdraws);
+        assert_eq!(
+            dir.list_attestations_referencing(&target.attestation_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|a| a.attestation_id)
+                .collect::<Vec<_>>(),
+            vec![wid_raw.clone()],
+            "I653: the withdraws is held, referencing its target"
+        );
         // Two more held records beside the withdraws (held, so the interim
         // no-human-subject gate can read their subjects).
         let before = format!(
             "attestation:{}",
             put_score(d, SCORER, AGENT, &[]).await.attestation_id
         );
-        seed_trace(d, "zzz-i653", AGENT, "gpt-real").await;
-        let trace = "trace:zzz-i653".to_owned();
-        let wid = format!("attestation:{}", withdraws.attestation_id);
+        let tid = hex_id("zzz-i653");
+        seed_trace(d, &tid, AGENT, "gpt-real").await;
+        let trace = format!("trace:{tid}");
+        let wid = format!("attestation:{wid_raw}");
         let ids = vec![before.clone(), wid.clone(), trace.clone()];
         let sel = PurgeSelection::ByIds { ids: ids.clone() };
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
@@ -935,13 +1211,13 @@ pub(crate) mod bodies {
             vec![wid.clone()],
             "I653: the dry run warns, it does not filter an explicit list"
         );
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let notice_id = sp::notice_terms(&notice.envelope).unwrap().notice_id;
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
+        let notice_id = notice.id();
         let mut sorted = ids.clone();
         sorted.sort();
         let index = sorted.iter().position(|i| *i == wid).unwrap();
         for attempt in 0..2 {
-            let e = rows_at(dir, &sel, &notice, NODE, t)
+            let e = rows_at(dir, &sel, &notice, &k(NODE), t)
                 .await
                 .expect_err("inadmissible");
             let (tok, body) = refusal(&e);
@@ -968,15 +1244,11 @@ pub(crate) mod bodies {
         };
         let dry2 = sp::purge_dry_run(dir, &with_target).await.unwrap();
         assert!(dry2.inadmissible.is_empty(), "{:?}", dry2.inadmissible);
-        let n2 = notice_for(
-            &dry2.notice_template,
-            &[cc::FOUNDERS[1], cc::FOUNDERS[2]],
-            t,
-        );
-        let r = rows_at(dir, &with_target, &n2, NODE, t)
+        let n2 = notice_for(d, &r, &dry2.notice_template, &[1, 2], t).await;
+        let rep = rows_at(dir, &with_target, &n2, &k(NODE), t)
             .await
             .expect("admissible");
-        assert_eq!(r.tombstoned.get("attestation"), Some(&2));
+        assert_eq!(rep.tombstoned.get("attestation"), Some(&2));
         // A delegates_to between two keys neither of which is purged is a
         // third party's standing grant: inadmissible.
         let grant = ts::put_delegates_to(dir, SCORER, BYSTANDER, None)
@@ -996,12 +1268,8 @@ pub(crate) mod bodies {
             "I653: a third party's delegates_to is not the purge's to remove"
         );
         assert!(gdry.inadmissible[0].reason.contains("delegates_to"));
-        let gn = notice_for(
-            &gdry.notice_template,
-            &[cc::FOUNDERS[0], cc::FOUNDERS[2]],
-            t,
-        );
-        let e = rows_at(dir, &gsel, &gn, NODE, t)
+        let gn = notice_for(d, &r, &gdry.notice_template, &[0, 2], t).await;
+        let e = rows_at(dir, &gsel, &gn, &k(NODE), t)
             .await
             .expect_err("a third party's grant");
         assert_eq!(refusal(&e).0, token::RETRACTION_INADMISSIBLE, "I653");
@@ -1009,7 +1277,7 @@ pub(crate) mod bodies {
 
     // ── I654 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i654_the_mock_class_end_to_end<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let (mocks, derived, unrelated) = mock_world(d, "i654").await;
         let dir = d.as_dyn_directory();
         let t = now();
@@ -1052,8 +1320,8 @@ pub(crate) mod bodies {
             "I654: the dry run writes nothing"
         );
 
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[2]], t);
-        let report = rows_at(dir, &sel, &notice, NODE, t)
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 2], t).await;
+        let report = rows_at(dir, &sel, &notice, &k(NODE), t)
             .await
             .expect("executes");
         assert_eq!(report.record_count, 5);
@@ -1087,8 +1355,8 @@ pub(crate) mod bodies {
             format!("# selection_digest\t{}", dry.selection_digest),
             format!("# notice_id\t{}", report.notice_id),
             "# record_count\t5".to_owned(),
-            format!("# executed_by\t{NODE}"),
-            format!("# claimant_key_id\t{CANON}"),
+            format!("# executed_by\t{}", k(NODE)),
+            format!("# claimant_key_id\t{}", r.root),
             format!("# executed_at\t{}", report.executed_at.to_rfc3339()),
         ] {
             assert!(
@@ -1096,8 +1364,9 @@ pub(crate) mod bodies {
                 "I654: the ledger carries {header:?}:\n{ledger}"
             );
         }
-        // The notice id re-derives from the ledger's own `notice_jcs`, and the
-        // ledger carries the whole cosignature set.
+        // v62.0.0 (T2.api.md §8) — the ledger keeps the edition-2 notice's
+        // preimages: `notice_jcs` is the held statements' envelope, and
+        // the notice id re-derives as the row id of each of them.
         let header = |k: &str| {
             ledger
                 .lines()
@@ -1105,17 +1374,20 @@ pub(crate) mod bodies {
                 .unwrap_or_else(|| panic!("I654: the ledger has no {k}"))
                 .to_owned()
         };
-        {
-            use sha2::Digest as _;
+        let held: serde_json::Value = serde_json::from_str(&header("notice_jcs"))
+            .expect("I654: notice_jcs is the statements' envelope");
+        let statements = held[sp::EDITION2_STATEMENTS_MEMBER]
+            .as_array()
+            .expect("I654: the envelope carries the statements");
+        assert_eq!(statements.len(), 2, "I654: every held voice");
+        for st in statements {
+            let bytes = hex::decode(st.as_str().unwrap()).unwrap();
             assert_eq!(
-                hex::encode(sha2::Sha256::digest(header("notice_jcs").as_bytes())),
-                report.notice_id,
+                RowId::of_statement(&bytes).map(|id| id.hex()),
+                Some(report.notice_id.clone()),
                 "I654: the notice id re-derives from the ledger"
             );
         }
-        let cosigs: Vec<serde_json::Value> =
-            serde_json::from_str(&header("cosignatures_json")).unwrap();
-        assert_eq!(cosigs.len(), 2, "I654: the whole cosignature set");
         let ids: Vec<String> = ledger
             .lines()
             .filter(|l| !l.starts_with('#') && !l.starts_with("selection_digest\t"))
@@ -1131,26 +1403,32 @@ pub(crate) mod bodies {
             dry.selection_digest,
             "I654: the ledger re-derives"
         );
-        // The stored header carries the whole cosignature set and the notice bytes.
+        // The stored header carries every voice (T2.api.md §8).
         let exec = dir
             .purge_execution(&report.notice_id)
             .await
             .unwrap()
             .unwrap();
-        let cos: Vec<ciris_verify_core::threshold::ThresholdSignature> =
-            serde_json::from_str(&exec.cosignatures_json).unwrap();
+        let hexes = |v: &serde_json::Value| {
+            let mut h: Vec<String> = v[sp::EDITION2_STATEMENTS_MEMBER]
+                .as_array()
+                .expect("statements")
+                .iter()
+                .map(|x| x.as_str().unwrap().to_owned())
+                .collect();
+            h.sort();
+            h
+        };
         assert_eq!(
-            cos, notice.cosignatures,
-            "I654: the whole signature set is carried"
+            hexes(&serde_json::from_str(&exec.notice_jcs).unwrap()),
+            hexes(&sp::edition2_notice_envelope(&notice.voices)),
+            "I654: the whole voice set is carried"
         );
-        assert_eq!(
-            exec.notice_jcs.as_bytes(),
-            sp::notice_signing_bytes(&notice.envelope)
-                .unwrap()
-                .as_slice()
-        );
+        assert_eq!(exec.cosignatures_json, "[]", "I654: no cosignature");
         // Idempotent re-run.
-        let again = rows_at(dir, &sel, &notice, NODE, t).await.expect("re-run");
+        let again = rows_at(dir, &sel, &notice, &k(NODE), t)
+            .await
+            .expect("re-run");
         assert!(again.tombstoned.is_empty());
         assert_eq!(again.already_tombstoned, 5);
         let status = status_at(dir, &report.notice_id, t).await.unwrap();
@@ -1159,14 +1437,14 @@ pub(crate) mod bodies {
 
     // ── I655 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i655_finalize_after_settle_and_the_tombstone_outlives<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let (mocks, derived, unrelated) = mock_world(d, "i655").await;
         let dir = d.as_dyn_directory();
         let t = now();
         let derived_row = dir.get_attestation(&derived).await.unwrap().unwrap();
         let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let report = rows_at(dir, &mock_selection(), &notice, NODE, t)
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
+        let report = rows_at(dir, &mock_selection(), &notice, &k(NODE), t)
             .await
             .unwrap();
         // Settle is W = 72 h after the tombstone (CC 2.6.7, CIRISConstitution
@@ -1214,17 +1492,15 @@ pub(crate) mod bodies {
             "only the selection"
         );
         assert_eq!(
-            dir.purge_trace_row_counts(&["trace-real-i655".to_owned()])
+            dir.purge_trace_row_counts(&[hex_id("trace-real-i655")])
                 .await
                 .unwrap(),
             (2, 1),
             "the real trace is untouched"
         );
-        // The tombstone outlives the row: its return is refused.
-        let e = dir
-            .put_attestation(SignedAttestation {
-                attestation: derived_row,
-            })
+        // The tombstone outlives the row: its return (the same statement,
+        // re-offered) is refused.
+        let e = e2::put_signed(dir, &derived_row)
             .await
             .expect_err("a purged row does not come back");
         let (tok, body) = refusal(&e);
@@ -1245,31 +1521,28 @@ pub(crate) mod bodies {
     // ── I656 ──────────────────────────────────────────────────────────────
     /// **I833 (v55.0.0, CIRISPersist#1055, CIRISEdge's ask) — a retryable
     /// `purge_unauthorised` is one a later row or instant turns into an
-    /// authorisation.** A receiver that does not hold the claimant trust root
-    /// refuses the bundle `root_not_held`, `retryable: true`; once the root
-    /// lands, the SAME bundle is no longer refused as unauthorised. A notice
-    /// asserted in this node's future is `not_yet_valid`, retryable, and
-    /// authorises once the clock reaches it. A forged cosignature on a node
-    /// that holds the root is `signature_invalid`, `retryable: false`.
+    /// authorisation.** A receiver that holds the genesis bundle but not the
+    /// claimant trust root refuses the bundle `root_not_held`,
+    /// `retryable: true`; once the root lands, the SAME bundle is no longer
+    /// refused as unauthorised. A notice asserted in this node's future (the
+    /// purge clock behind it) is `not_yet_valid`, retryable, and authorises
+    /// once the clock reaches it. v62.0.0 (E10): a forged voice is refused by
+    /// the receiver's statement door, a verdict, never the retryable
+    /// key-unknown gap.
     pub(crate) async fn i833_unauthorised_reason_splits_the_gap_from_the_verdict<D: Seams>(
         a: &D,
         c: &D,
     ) {
-        root(a).await;
+        let r = root(a).await;
         mock_world(a, "i833").await;
         let t = now();
         let da = a.as_dyn_directory();
         let dry = sp::purge_dry_run(da, &mock_selection()).await.unwrap();
 
         // A notice from this node's future: the gap is the clock.
-        let ahead = t + chrono::Duration::hours(1);
-        let future = notice_for(
-            &dry.notice_template,
-            &[cc::FOUNDERS[0], cc::FOUNDERS[1]],
-            ahead,
-        );
-        sp::test_clock::set(Some(t));
-        let e = sp::verify_purge_authorisation(da, &future)
+        let notice = notice_for(a, &r, &dry.notice_template, &[0, 1], t).await;
+        sp::test_clock::set(Some(t - chrono::Duration::hours(1)));
+        let e = sp::verify_purge_authorisation_edition2(da, &notice.row)
             .await
             .expect_err("I833: a notice from the future authorises nothing yet");
         let (tok, body) = refusal(&e);
@@ -1280,13 +1553,12 @@ pub(crate) mod bodies {
             "I833: {body}"
         );
         assert_eq!(body["retryable"].as_bool(), Some(true), "I833: {body}");
-        sp::test_clock::set(Some(ahead + chrono::Duration::minutes(1)));
-        sp::verify_purge_authorisation(da, &future)
+        sp::test_clock::set(Some(t));
+        sp::verify_purge_authorisation_edition2(da, &notice.row)
             .await
             .expect("I833: the same notice authorises once the clock reaches it");
 
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        rows_at(da, &mock_selection(), &notice, NODE, t)
+        rows_at(da, &mock_selection(), &notice, &k(NODE), t)
             .await
             .unwrap();
         let bundle = sp::list_purge_bundles_since(da, None, 10)
@@ -1294,8 +1566,14 @@ pub(crate) mod bodies {
             .unwrap()
             .remove(0);
 
-        // The receiver does not hold the root YET.
+        // The receiver holds the genesis bundle (the founders' keys) but not
+        // the root YET.
         let dc = c.as_dyn_directory();
+        let node_c = e2::put_key(dc, NODE, &["node"]).await;
+        c.set_node(&node_c);
+        fixture_genesis::install_v2(dc)
+            .await
+            .expect("C holds the genesis bundle in force");
         let e = apply_at(dc, &bundle, "node-c", t)
             .await
             .expect_err("I833: a rootless receiver refuses");
@@ -1314,18 +1592,25 @@ pub(crate) mod bodies {
             "I833: the prose rides in `detail`: {body}"
         );
 
-        // A forged cosignature is a verdict, on a node that holds the root.
-        let mut forged = bundle.clone();
-        forged.notice.cosignatures[0] = ts::threshold_sign(cc::FOUNDERS[0], b"not the notice");
+        // A forged voice is a verdict, on a node that holds the root.
         root(c).await;
-        let (tok, body) = refusal(&apply_at(dc, &forged, "node-c", t).await.unwrap_err());
-        assert_eq!(tok, token::UNAUTHORISED, "I833 forged: {body}");
-        assert_eq!(
-            body["reason"].as_str(),
-            Some(why::SIGNATURE_INVALID),
-            "I833: {body}"
+        let mut forged_voice = notice.voices[0].clone();
+        let last = forged_voice.len() - 1;
+        forged_voice[last] ^= 0x01;
+        let mut forged = bundle.clone();
+        forged.notice = StewardPurgeNotice {
+            envelope: sp::edition2_notice_envelope(&[forged_voice]),
+            cosignatures: vec![],
+        };
+        let e = apply_at(dc, &forged, "node-c", t)
+            .await
+            .expect_err("I833: a forged voice is refused");
+        assert_ne!(
+            e.kind(),
+            "federation_attester_key_unknown",
+            "I833: a forged voice is a verdict, not the key gap: {e:?}"
         );
-        assert_eq!(body["retryable"].as_bool(), Some(false), "I833: {body}");
+        assert!(dc.purge_execution(&notice.id()).await.unwrap().is_none());
 
         // The root landed: the SAME bundle is no longer an unauthorised one.
         match apply_at(dc, &bundle, "node-c", t).await {
@@ -1342,11 +1627,24 @@ pub(crate) mod bodies {
         for r in why::RETRYABLE {
             assert!(why::ALL.contains(r) && why::is_retryable(r));
         }
-        assert!(!why::is_retryable(why::NOT_A_SEAT));
+        // v62.0.0 (wave GC6; CC 2.7 rc21 X9) — I3880: every reason that reads
+        // another row waits; the notice's own bytes and the clock do not.
+        for r in why::FOLD {
+            assert!(why::is_retryable(r), "I3880: {r} waits");
+        }
+        for r in [
+            why::SIGNATURE_INVALID,
+            why::NOTICE_MALFORMED,
+            why::WRONG_BASIS,
+            why::DUPLICATE_COSIGNER,
+            why::EXPIRED,
+        ] {
+            assert!(!why::is_retryable(r), "I3880: {r} is terminal");
+        }
     }
 
     pub(crate) async fn i656_the_tombstone_replicates_re_verified<D: Seams>(a: &D, b: &D, c: &D) {
-        root(a).await;
+        let r = root(a).await;
         root(b).await;
         let (_, derived, _) = mock_world(a, "i656").await;
         let derived_row = a
@@ -1355,40 +1653,45 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .unwrap();
-        b.as_dyn_directory()
-            .put_attestation(SignedAttestation {
-                attestation: derived_row,
-            })
+        e2::put_signed(b.as_dyn_directory(), &derived_row)
             .await
             .expect("b holds a replica of the score");
         let t = now();
         let (da, db) = (a.as_dyn_directory(), b.as_dyn_directory());
         let dry = sp::purge_dry_run(da, &mock_selection()).await.unwrap();
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[1], cc::FOUNDERS[2]], t);
-        let report = rows_at(da, &mock_selection(), &notice, NODE, t)
+        let notice = notice_for(a, &r, &dry.notice_template, &[1, 2], t).await;
+        let report = rows_at(da, &mock_selection(), &notice, &k(NODE), t)
             .await
             .unwrap();
         let bundles = sp::list_purge_bundles_since(da, None, 10).await.unwrap();
         assert_eq!(bundles.len(), 1);
         let bundle = bundles[0].clone();
-        assert_eq!(
-            bundle.notice, notice,
-            "the WHOLE notice and signature set is served"
-        );
+        let mut served: Vec<String> = bundle.notice.envelope[sp::EDITION2_STATEMENTS_MEMBER]
+            .as_array()
+            .expect("I656: the bundle carries the statements")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        served.sort();
+        let mut voiced: Vec<String> = notice.voices.iter().map(hex::encode).collect();
+        voiced.sort();
+        assert_eq!(served, voiced, "the WHOLE voice set is served");
+        assert!(bundle.notice.cosignatures.is_empty(), "never a cosignature");
         assert_eq!(
             sp::selection_digest(&bundle.record_ids),
             dry.selection_digest
         );
-        // A node not rooted at the same trust root (here: none) refuses the
-        // bundle and records nothing: a purge is not global erasure (CC 3.2
-        // T3, 4.2.1).
-        let e = apply_at(c.as_dyn_directory(), &bundle, "node-c", t)
-            .await
-            .unwrap_err();
+        // A node not rooted at the same trust root (here: none; it holds the
+        // genesis bundle) refuses the bundle and records nothing: a purge is
+        // not global erasure (CC 3.2 T3, 4.2.1).
+        let dc = c.as_dyn_directory();
+        let node_c = e2::put_key(dc, NODE, &["node"]).await;
+        c.set_node(&node_c);
+        fixture_genesis::install_v2(dc).await.expect("C's genesis");
+        let e = apply_at(dc, &bundle, "node-c", t).await.unwrap_err();
         let (tok, body) = refusal(&e);
         assert_eq!(tok, token::UNAUTHORISED, "I656 rootless: {body}");
-        assert!(c
-            .as_dyn_directory()
+        assert!(dc
             .purge_execution(&report.notice_id)
             .await
             .unwrap()
@@ -1402,14 +1705,17 @@ pub(crate) mod bodies {
             tok == token::SELECTION_DIGEST_MISMATCH,
             "I656: a dropped id re-derives another digest ({tok})"
         );
+        let mut forged_voice = notice.voices[0].clone();
+        let last = forged_voice.len() - 1;
+        forged_voice[last] ^= 0x01;
         let mut forged = bundle.clone();
-        forged.notice.cosignatures[0] = ts::threshold_sign(cc::FOUNDERS[1], b"not the notice");
-        let (tok, _) = refusal(&apply_at(db, &forged, "node-b", t).await.unwrap_err());
-        assert_eq!(
-            tok,
-            token::UNAUTHORISED,
-            "I656: B re-verifies the cosignatures"
-        );
+        forged.notice = StewardPurgeNotice {
+            envelope: sp::edition2_notice_envelope(&[forged_voice, notice.voices[1].clone()]),
+            cosignatures: vec![],
+        };
+        apply_at(db, &forged, "node-b", t)
+            .await
+            .expect_err("I656: B re-verifies every voice at its own door");
         let mut unsorted = bundle.clone();
         unsorted.record_ids.swap(0, 1);
         let (tok, _) = refusal(&apply_at(db, &unsorted, "node-b", t).await.unwrap_err());
@@ -1438,7 +1744,7 @@ pub(crate) mod bodies {
 
     // ── I662 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i662_refused_today_is_a_selection_not_a_filter<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         let mut legacy = Vec::new();
@@ -1512,8 +1818,8 @@ pub(crate) mod bodies {
         );
         // Executed on the quorum's notice, they stop being served; the row
         // the class did not select still is.
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[1], cc::FOUNDERS[2]], t);
-        let report = rows_at(dir, &sel, &notice, NODE, t)
+        let notice = notice_for(d, &r, &dry.notice_template, &[1, 2], t).await;
+        let report = rows_at(dir, &sel, &notice, &k(NODE), t)
             .await
             .expect("executes");
         assert_eq!(report.tombstoned.get("attestation"), Some(&5));
@@ -1582,10 +1888,10 @@ pub(crate) mod bodies {
 
     // ── I665 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i665_a_purge_never_touches_a_key<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
-        let key = dir.lookup_public_key(HARNESS).await.unwrap().unwrap();
+        let key = dir.lookup_public_key(&k(HARNESS)).await.unwrap().unwrap();
         let by = put_score(d, HARNESS, BYSTANDER, &[]).await.attestation_id;
         let kept = put_score(d, HARNESS, SCORER, &[]).await;
         let about = put_score(d, BYSTANDER, HARNESS, &[]).await.attestation_id;
@@ -1605,9 +1911,9 @@ pub(crate) mod bodies {
             ids: vec![format!("attestation:{by}")],
         };
         let dry = sp::purge_dry_run(dir, &one).await.unwrap();
-        let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let r = rows_at(dir, &one, &n, NODE, t).await.unwrap();
-        finalize_at(dir, &r.notice_id, later, None).await.unwrap();
+        let n = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
+        let rep = rows_at(dir, &one, &n, &k(NODE), t).await.unwrap();
+        finalize_at(dir, &rep.notice_id, later, None).await.unwrap();
         assert!(dir.get_attestation(&by).await.unwrap().is_none());
         crate::federation::verify_row_hybrid_signature(dir, &kept)
             .await
@@ -1615,9 +1921,7 @@ pub(crate) mod bodies {
 
         // (b) ByActor: exactly what the actor AUTHORED — never its key, never
         // a row another key signed about it.
-        let sel = PurgeSelection::ByActor {
-            key_id: HARNESS.to_owned(),
-        };
+        let sel = PurgeSelection::ByActor { key_id: k(HARNESS) };
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
         let mut expect = vec![
             format!("attestation:{}", kept.attestation_id),
@@ -1632,8 +1936,8 @@ pub(crate) mod bodies {
             "I665: {:?}",
             dry.counts
         );
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[2]], t);
-        let report = rows_at(dir, &sel, &notice, NODE, t)
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 2], t).await;
+        let report = rows_at(dir, &sel, &notice, &k(NODE), t)
             .await
             .expect("executes");
         finalize_at(dir, &report.notice_id, later, None)
@@ -1641,7 +1945,7 @@ pub(crate) mod bodies {
             .expect("finalizes");
         // The key is untouched: still registered, byte-identical, and still
         // the key the rows others signed about the actor resolve against.
-        let after = dir.lookup_public_key(HARNESS).await.unwrap();
+        let after = dir.lookup_public_key(&k(HARNESS)).await.unwrap();
         assert_eq!(
             after.as_ref().map(|k| &k.pubkey_ed25519_base64),
             Some(&key.pubkey_ed25519_base64),
@@ -1653,11 +1957,11 @@ pub(crate) mod bodies {
                 "I665: {id}"
             );
         }
-        dir.put_public_key(crate::federation::SignedKeyRecord {
-            record: key.clone(),
-        })
-        .await
-        .expect("I665: the key's door never refuses it on a purge's account");
+        // The key plane's door never refuses it on a purge's account: a
+        // fresh `key:record` of the same key is kept.
+        e2::put_statement(dir, &e2::key_record(HARNESS, &["agent"]))
+            .await
+            .expect("I665: the key's door never refuses it on a purge's account");
         let fresh = put_score(d, HARNESS, BYSTANDER, &[]).await;
         crate::federation::verify_row_hybrid_signature(dir, &fresh)
             .await
@@ -1668,7 +1972,7 @@ pub(crate) mod bodies {
     pub(crate) async fn i666_a_key_id_is_not_a_purge_record<D: Seams>(d: &D) {
         root(d).await;
         let dir = d.as_dyn_directory();
-        let key = dir.lookup_public_key(HARNESS).await.unwrap().unwrap();
+        let key = dir.lookup_public_key(&k(HARNESS)).await.unwrap().unwrap();
         let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
             &key.pubkey_ed25519_base64,
         )
@@ -1698,8 +2002,8 @@ pub(crate) mod bodies {
     async fn put_local_dimension<D: Seams>(d: &D, attester: &str, dimension: &str) -> String {
         let local = crate::federation::types::LocalAttestationInput {
             attestation_id: None,
-            attesting_key_id: attester.to_owned(),
-            attested_key_id: Some(BYSTANDER.to_owned()),
+            attesting_key_id: k(attester),
+            attested_key_id: Some(k(BYSTANDER)),
             attestation_type: attestation_type::SCORES.to_owned(),
             weight: None,
             expires_at: None,
@@ -1707,7 +2011,7 @@ pub(crate) mod bodies {
                 serde_json::json!({"dimension": dimension, "score": 0.0}),
             )
             .expect("object"),
-            subject_key_ids: vec![BYSTANDER.to_owned()],
+            subject_key_ids: vec![k(BYSTANDER)],
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
             scrub_signature_classical: None,
             scrub_signature_pqc: None,
@@ -1736,23 +2040,37 @@ pub(crate) mod bodies {
             "moderation_track_record:i694:v1",
             "slashing:i694:v1",
         ] {
-            let id = uuid::Uuid::new_v4().to_string();
-            let env = serde_json::json!({"dimension": dimension, "score": 0.0});
-            let mut row = ts::bare_attestation(&id, HARNESS, BYSTANDER, &env);
-            row.attestation_type = attestation_type::SCORES.to_owned();
-            ts::reseal(&mut row);
-            if let Err(e) = dir
-                .put_attestation(SignedAttestation {
-                    attestation: row.clone(),
-                })
-                .await
-            {
-                // A family the write doors refuse cannot reach the reset door
-                // that way; the door's own gate is still asked below.
-                problems.push(format!(
-                    "{dimension}: not admitted ({e}); door asked on the row"
-                ));
-            }
+            // v62.0.0 (E10) — the row as an edition-2 statement by HARNESS.
+            // A family the statement door refuses (or keeps on a typed plane
+            // and not as an attestation row) cannot reach the reset door that
+            // way; the door's own gate is still asked on the literal below.
+            let literal = score_row(HARNESS, BYSTANDER, dimension, &[]);
+            let put = match e2::try_statement_of(&literal, HARNESS) {
+                Err(e) => Err(e),
+                Ok(st) => match e2::put_statement(dir, &st).await {
+                    Ok(_) => Ok(RowId::of_statement(&st).expect("a row statement").hex()),
+                    Err(e) => Err(e.to_string()),
+                },
+            };
+            let (row, id) = match put {
+                Ok(id) => match dir.get_attestation(&id).await.unwrap() {
+                    Some(mapped) => (mapped, id),
+                    None => {
+                        problems.push(format!(
+                            "{dimension}: not admitted (kept off the attestation plane); \
+                                 door asked on the row"
+                        ));
+                        (literal.clone(), id)
+                    }
+                },
+                Err(e) => {
+                    problems.push(format!(
+                        "{dimension}: not admitted ({e}); door asked on the row"
+                    ));
+                    let id = literal.attestation_id.clone();
+                    (literal.clone(), id)
+                }
+            };
             if crate::federation::migration::is_exclusion_bearing(&row).is_none() {
                 problems.push(format!("{dimension}: the reset would PLAN its purge"));
             }
@@ -1779,7 +2097,7 @@ pub(crate) mod bodies {
     }
 
     pub(crate) async fn i667_the_accountability_record_is_unpurgeable<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         let mut ids = Vec::new();
@@ -1812,8 +2130,8 @@ pub(crate) mod bodies {
             }
         }
         assert!(problems.is_empty(), "I667:\n{}", problems.join("\n"));
-        let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let e = rows_at(dir, &sel, &n, NODE, t)
+        let n = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
+        let e = rows_at(dir, &sel, &n, &k(NODE), t)
             .await
             .expect_err("the accountability record is unpurgeable");
         assert_eq!(refusal(&e).0, token::RETRACTION_INADMISSIBLE, "I667");
@@ -1822,9 +2140,7 @@ pub(crate) mod bodies {
         // NAMES: the digest is over the admissible rows only, so executing it
         // tombstones exactly those, and the withheld rows stay untouched.
         let plain = put_score(d, HARNESS, BYSTANDER, &[]).await.attestation_id;
-        let by = PurgeSelection::ByActor {
-            key_id: HARNESS.to_owned(),
-        };
+        let by = PurgeSelection::ByActor { key_id: k(HARNESS) };
         let dry = sp::purge_dry_run(dir, &by).await.unwrap();
         for (dimension, id) in &ids {
             assert!(
@@ -1834,8 +2150,8 @@ pub(crate) mod bodies {
             assert!(!dry.sample.contains(id));
         }
         assert_eq!(dry.sample, vec![format!("attestation:{plain}")], "I667");
-        let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[1], cc::FOUNDERS[2]], t);
-        let r = rows_at(dir, &by, &n, NODE, t).await.expect("executes");
+        let n = notice_for(d, &r, &dry.notice_template, &[1, 2], t).await;
+        let r = rows_at(dir, &by, &n, &k(NODE), t).await.expect("executes");
         let held: Vec<String> = dir
             .purge_tombstones_of(&r.notice_id)
             .await
@@ -1855,31 +2171,168 @@ pub(crate) mod bodies {
     }
 
     // ── I670 ──────────────────────────────────────────────────────────────
-    /// A 2.7.0 trace by `signer` carrying `wire_kind`, hybrid-signed over the
-    /// canonical bytes with `signed_kind` as the top-level `"run_kind"` key —
-    /// built INDEPENDENTLY of persist's reconstruction (the pre-run_kind
-    /// payload plus the key), so the witness is not persist checking itself.
+    // v62.0.0 (E10, on P7's row form; CC: a replicating trace is a
+    // forward-form ROW) — a trace replicates as ONE composite `COSE_Sign1`
+    // statement under the agent's key: a `trace:complete:v1` row in the
+    // MANIFEST form whose `evidence_refs[0]` / `manifest.content_hash` name
+    // the trace content by SHA-256 of its JCS (the trace minus its five
+    // signature members). The batch event carries it as `statement` beside
+    // the trace (P7.md "The calls"). Built INDEPENDENTLY of persist's
+    // binding check, from P7's spec.
+
+    /// The members a trace's content leaves out (P7.md).
+    const TRACE_SIGNATURE_MEMBERS: [&str; 5] = [
+        "signature",
+        "signature_key_id",
+        "signature_ml_dsa_65",
+        "pubkey_ml_dsa_65",
+        "pqc_key_id",
+    ];
+
+    /// Date `trace` now-relative (an agent key's window covers it): it
+    /// completed an hour ago, at a whole millisecond, after 20 s.
+    fn stamp_now(trace: &mut serde_json::Value) {
+        let done = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            (now() - chrono::Duration::hours(1)).timestamp_millis(),
+        )
+        .expect("an instant");
+        let fmt = |t: chrono::DateTime<chrono::Utc>| {
+            t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        trace["started_at"] = serde_json::json!(fmt(done - chrono::Duration::seconds(20)));
+        trace["completed_at"] = serde_json::json!(fmt(done));
+    }
+
+    /// RFC 8785 JCS of `trace` minus its signature members.
+    fn trace_content_bytes(trace: &serde_json::Value) -> Vec<u8> {
+        let mut content = trace.clone();
+        let o = content.as_object_mut().expect("a trace is an object");
+        for m in TRACE_SIGNATURE_MEMBERS {
+            o.remove(m);
+        }
+        // The canonicalizer persist's binding check uses (RFC 8785).
+        crate::verify::canonical::Canonicalizer::canonicalize_value(
+            &crate::verify::canonical::JcsCanonicalizer,
+            &content,
+        )
+        .expect("jcs")
+    }
+
+    /// The run kind the trace signs: its top-level `run_kind`, else its
+    /// profile's.
+    fn signed_kind_of(trace: &serde_json::Value) -> Option<String> {
+        trace
+            .get("run_kind")
+            .or_else(|| {
+                trace
+                    .get("deployment_profile")
+                    .and_then(|p| p.get("run_kind"))
+            })
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }
+
+    /// `signer`'s `trace:complete:v1` statement over `trace` as it stands
+    /// (P7.md's protected header and payload, `sign_row_statement`).
+    fn trace_statement(trace: &serde_json::Value, signer: &str) -> Vec<u8> {
+        use sha2::Digest as _;
+        let kid = k(signer);
+        let content = trace_content_bytes(trace);
+        let digest: [u8; 32] = sha2::Sha256::digest(&content).into();
+        let completed = chrono::DateTime::parse_from_rfc3339(
+            trace["completed_at"].as_str().expect("completed_at"),
+        )
+        .expect("an instant");
+        let text = |s: &str| Value::Text(s.to_owned());
+        let sorted = |mut m: Vec<(Value, Value)>| {
+            m.sort_by_key(|(key, _)| cde::encode(key));
+            Value::Map(m)
+        };
+        let mut manifest = vec![
+            (text("schema"), text("trace_manifest:v1")),
+            (
+                text("content_hash"),
+                text(&format!("sha256:{}", hex::encode(digest))),
+            ),
+            (text("byte_len"), Value::Uint(content.len() as u64)),
+            (
+                text("component_count"),
+                Value::Uint(trace["components"].as_array().map_or(0, |c| c.len() as u64)),
+            ),
+        ];
+        if let Some(kind) = signed_kind_of(trace) {
+            manifest.push((text("run_kind"), text(&kind)));
+        }
+        let payload = sorted(vec![
+            (
+                text("asserted_at"),
+                Value::Uint(u64::try_from(completed.timestamp_millis()).expect("after 1970")),
+            ),
+            (text("author"), text(&kid)),
+            (
+                text("dimension"),
+                text(crate::ingest::TRACE_ATTESTATION_DIMENSION),
+            ),
+            (
+                text("trace_id"),
+                text(trace["trace_id"].as_str().expect("trace_id")),
+            ),
+            (
+                text("agent_id_hash"),
+                text(trace["agent_id_hash"].as_str().expect("agent_id_hash")),
+            ),
+            (text("subject_key_ids"), Value::Array(vec![text(&kid)])),
+            (
+                text("evidence_refs"),
+                Value::Array(vec![ciris_verify_core::edition2::hash_digest_value(
+                    &digest,
+                )]),
+            ),
+            (text("manifest"), sorted(manifest)),
+        ]);
+        ciris_verify_core::edition2::sign_row_statement(
+            &e2::signing_key(signer),
+            &kid,
+            &kid,
+            attestation_type::SCORES,
+            &ciris_verify_core::namespace_match::family_id("trace:{form}:{version}"),
+            &payload,
+            vec![],
+        )
+        .expect("a trace statement signs")
+    }
+
+    /// The row id a statement names (lowercase hex).
+    fn row_id_hex(statement: &[u8]) -> String {
+        RowId::of_statement(statement)
+            .expect("a row statement")
+            .hex()
+    }
+
+    /// `batch_bytes` with its first event carrying `statement` (standard
+    /// base64), P7's batch member.
+    fn with_statement(batch_bytes: &[u8], statement: &[u8]) -> Vec<u8> {
+        use base64::Engine as _;
+        let mut b: serde_json::Value = serde_json::from_slice(batch_bytes).expect("a batch");
+        b["events"][0]["statement"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(statement));
+        b.to_string().into_bytes()
+    }
+
+    /// A 2.7.0 trace by `signer`, dated now, whose statement signs
+    /// `signed_kind` as its run kind (top level); the trace as SENT carries
+    /// `wire_kind`. Returns `(trace, statement)`.
     fn signed_run_kind_trace(
         trace_id: &str,
         signer: &str,
         signed_kind: &str,
         wire_kind: &str,
-    ) -> serde_json::Value {
-        use crate::verify::canonical::Canonicalizer as _;
-        let mut json = trace_json(trace_id, signer, "gpt-real", None);
-        let typed: crate::schema::CompleteTrace = serde_json::from_value(json.clone()).unwrap();
-        let mut canonical = crate::verify::ed25519::canonical_payload_value(&typed);
-        canonical["run_kind"] = serde_json::json!(signed_kind);
-        let bytes = crate::verify::PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&canonical)
-            .unwrap();
-        let sig = ts::threshold_sign(signer, &bytes);
+    ) -> (serde_json::Value, Vec<u8>) {
+        let mut json = trace_json(trace_id, signer, "gpt-real", Some(signed_kind));
+        stamp_now(&mut json);
+        let st = trace_statement(&json, signer);
         json["run_kind"] = serde_json::json!(wire_kind);
-        json["signature"] = serde_json::json!(sig.ed25519_signature_base64);
-        json["signature_ml_dsa_65"] = serde_json::json!(sig.mldsa65_signature_base64);
-        json["pubkey_ml_dsa_65"] = serde_json::json!(ts::hybrid_pubkeys(signer).1);
-        json["pqc_key_id"] = serde_json::json!(signer);
-        json
+        (json, st)
     }
 
     async fn ingest_full<D: Seams>(
@@ -1905,7 +2358,7 @@ pub(crate) mod bodies {
         root(d).await;
         let dir = d.as_dyn_directory();
         // (a) production / qa / battery: admitted and verified, and the
-        // stored trace attestation carries the signed run_kind.
+        // trace's row carries the signed run_kind (its manifest).
         // v56.0.0 (#1089) — the two production values the operator added
         // admit exactly as `production` does.
         for kind in [
@@ -1916,29 +2369,39 @@ pub(crate) mod bodies {
             "battery",
         ] {
             let tid = format!("trace-i670-{kind}");
-            let trace = signed_run_kind_trace(&tid, AGENT, kind, kind);
-            let summary = ingest_full(d, &batch(&trace))
+            let (trace, st) = signed_run_kind_trace(&tid, AGENT, kind, kind);
+            let summary = ingest_full(d, &with_statement(&batch(&trace), &st))
                 .await
                 .unwrap_or_else(|e| panic!("I670: a signed run_kind {kind} trace admits: {e}"));
             assert_eq!(summary.signatures_verified, 1, "I670 {kind}");
             let att = dir
-                .get_attestation(&crate::ingest::trace_attestation_id(&tid))
+                .get_attestation(&row_id_hex(&st))
                 .await
                 .unwrap()
-                .expect("the trace attestation");
+                .expect("I670: the trace's row");
             assert_eq!(
-                att.attestation_envelope["trace"]["run_kind"], kind,
-                "I670: the stored trace keeps its signed run_kind"
+                sp::trace_attestation_run_kind(&att.attestation_envelope),
+                Some(kind),
+                "I670: the row keeps its signed run_kind"
             );
         }
-        // (b) signed one way, sent another: the signature check refuses it.
-        let tampered = signed_run_kind_trace("trace-i670-tampered", AGENT, "mock", "production");
-        let e = ingest_full(d, &batch(&tampered))
+        // (b) signed one way, sent another: the binding refuses it.
+        let (tampered, st) =
+            signed_run_kind_trace("trace-i670-tampered", AGENT, "mock", "production");
+        let e = ingest_full(d, &with_statement(&batch(&tampered), &st))
             .await
             .expect_err("a run_kind edited after signing");
+        assert_eq!(
+            e.kind(),
+            "trace_statement_content_mismatch",
+            "I670: refused by the binding, not a gate: {e}"
+        );
         assert!(
-            !matches!(e, crate::ingest::IngestError::TraceRefused { .. }),
-            "I670: refused by the signature, not a gate: {e}"
+            dir.get_attestation(&row_id_hex(&st))
+                .await
+                .unwrap()
+                .is_none(),
+            "I670: the binding refuses before the door: the row is not held"
         );
         assert_eq!(
             dir.purge_trace_row_counts(&["trace-i670-tampered".to_owned()])
@@ -1947,51 +2410,36 @@ pub(crate) mod bodies {
             (0, 0)
         );
         // (c) outside the closed vocabulary: a schema refusal.
-        let odd = signed_run_kind_trace("trace-i670-odd", AGENT, "staging", "staging");
-        let e = ingest_full(d, &batch(&odd))
+        let (odd, st) = signed_run_kind_trace("trace-i670-odd", AGENT, "staging", "staging");
+        let e = ingest_full(d, &with_statement(&batch(&odd), &st))
             .await
             .expect_err("closed vocabulary");
         assert_eq!(e.kind(), "schema_unknown_run_kind", "I670: {e}");
         // (d) a signed mock run on the canonical: `trace_run_kind_mock`.
         let g = confer_canonical(dir).await;
         d.set_node(&g);
-        let mock = signed_run_kind_trace("trace-i670-mock", AGENT, "mock", "mock");
-        let e = ingest_full(d, &batch(&mock)).await.expect_err("a mock run");
+        let (mock, st) = signed_run_kind_trace("trace-i670-mock", AGENT, "mock", "mock");
+        let e = ingest_full(d, &with_statement(&batch(&mock), &st))
+            .await
+            .expect_err("a mock run");
         assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I670: {e}");
     }
 
-    /// v62.0.0 (CC rc20 4.2.1 / 3.4.7.1, CIRISPersist#1274) — make a node
-    /// CANONICAL the way the standing is now read: by the accord's verified
-    /// co-scrub conferral, never by a `canonical` label (the
-    /// `set_identity_type` seam these witnesses used is now inert, as CC 3.4.7.1
-    /// requires: "A conferral is not a label"). The canonical is the baked
-    /// lineage id (the pre-floor bar) in the forward form: {node} with
-    /// `roles: ["infra:serve"]`, co-scrubbed 2-of-3 by the genesis holders
-    /// under test keys. Returns its key id, which the caller seats as the node.
+    /// v62.0.0 (CC rc20 4.2.1 / 3.4.7.1, CIRISPersist#1274; CC 5.3.4) — make a
+    /// node CANONICAL the way the standing is now read: a `serve_nodes` seat
+    /// of the genesis bundle/2 in force, never a `canonical` label (the
+    /// `set_identity_type` seam these witnesses used is inert, as CC 3.4.7.1
+    /// requires: "A conferral is not a label"). Installs the bundle/2 test
+    /// ceremony through the real import door (idempotent) and returns its
+    /// first seat's identity-ref, which the caller seats as the node.
     pub(crate) async fn confer_canonical(dir: &dyn FederationDirectory) -> String {
-        use crate::federation::operational::test_support as ops;
-        let accord = ops::register_genesis_accord_roster(dir)
+        use crate::federation::edition2::fixture_genesis;
+        fixture_genesis::install_v2(dir)
             .await
-            .expect("genesis accord roster");
-        let g = crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0]
-            .record
-            .key_id
-            .clone();
-        if dir.lookup_public_key(&g).await.unwrap().is_none() {
-            dir.put_public_key(crate::federation::SignedKeyRecord {
-                record: ops::signed_canonical_record_with_roles(
-                    &g,
-                    "node",
-                    ops::PLACEHOLDER_SUBJECT_ED25519_BASE64,
-                    None,
-                    vec!["infra:serve".to_owned()],
-                    serde_json::json!({ "key_id": g }),
-                    &[&accord[0], &accord[1]],
-                ),
-            })
-            .await
-            .expect("the canonical conferral is admitted");
-        }
+            .expect("the bundle/2 test ceremony installs");
+        let g = fixture_genesis::bundle_v2()
+            .serve_node_identity_ref(0)
+            .to_owned();
         assert!(crate::federation::is_canonical_effective(dir, &g)
             .await
             .unwrap());
@@ -2070,32 +2518,20 @@ pub(crate) mod bodies {
                 "data": {"round_number": 0, "thought_depth": 1, "thought_type": "standard"},
             }],
             "signature": "",
-            "signature_key_id": signer,
+            "signature_key_id": k(signer),
         })
     }
 
-    /// Hybrid-sign `json` as its producer would, returning the signed trace
-    /// and the exact bytes signed. Built INDEPENDENTLY of persist's typed
-    /// `DeploymentProfile`: the canonical payload is reconstructed WITHOUT
-    /// the profile, and the RAW wire profile (every member the producer
-    /// signed) is spliced in, then JCS-canonicalised (the `"3.0.0"` epoch).
-    /// A typed struct that dropped a member would reconstruct other bytes.
+    /// `json` dated now and signed as its producer would under P7's row form:
+    /// returns the trace and its `trace:complete:v1` statement, whose
+    /// content hash binds every member the producer sent (the RAW wire
+    /// profile included). Built INDEPENDENTLY of persist's typed
+    /// `DeploymentProfile`: a typed struct that dropped a member would hash
+    /// other bytes, and the batch door's binding check would refuse it.
     fn sign_v28(mut json: serde_json::Value, signer: &str) -> (serde_json::Value, Vec<u8>) {
-        use crate::verify::canonical::Canonicalizer as _;
-        let mut bare = json.clone();
-        bare.as_object_mut().unwrap().remove("deployment_profile");
-        let typed: crate::schema::CompleteTrace = serde_json::from_value(bare).unwrap();
-        let mut canonical = crate::verify::ed25519::canonical_payload_value_v279(&typed);
-        canonical["deployment_profile"] = json["deployment_profile"].clone();
-        let bytes = crate::verify::canonical::JcsCanonicalizer
-            .canonicalize_value(&canonical)
-            .unwrap();
-        let sig = ts::threshold_sign(signer, &bytes);
-        json["signature"] = serde_json::json!(sig.ed25519_signature_base64);
-        json["signature_ml_dsa_65"] = serde_json::json!(sig.mldsa65_signature_base64);
-        json["pubkey_ml_dsa_65"] = serde_json::json!(ts::hybrid_pubkeys(signer).1);
-        json["pqc_key_id"] = serde_json::json!(signer);
-        (json, bytes)
+        stamp_now(&mut json);
+        let st = trace_statement(&json, signer);
+        (json, st)
     }
 
     /// A one-trace batch at `level`, envelope epoch `"3.0.0"`.
@@ -2111,27 +2547,50 @@ pub(crate) mod bodies {
         .into_bytes()
     }
 
+    /// [`v28_batch`] carrying `statement` beside its trace.
+    fn v28_signed_batch(trace: &serde_json::Value, statement: &[u8], level: &str) -> Vec<u8> {
+        with_statement(&v28_batch(trace, level), statement)
+    }
+
+    /// The statement's manifest content hash equals SHA-256 of the JCS of
+    /// `sent` minus its signature members (what the batch door binds).
+    fn assert_binds(statement: &[u8], sent: &serde_json::Value, what: &str) {
+        use sha2::Digest as _;
+        let row = e2::row_of_statement(
+            statement,
+            crate::federation::types::attestation_tier::FEDERATION,
+        );
+        assert_eq!(
+            row.attestation_envelope["manifest"]["content_hash"],
+            serde_json::json!(format!(
+                "sha256:{}",
+                hex::encode(sha2::Sha256::digest(trace_content_bytes(sent)))
+            )),
+            "{what}: the row's manifest names the content sent"
+        );
+    }
+
     pub(crate) async fn i1030_a_v28_mock_run_is_refused_from_the_profile<D: Seams>(d: &D) {
         root(d).await;
         let dir = d.as_dyn_directory();
-        // Production, signed in the profile: admitted, both halves verified,
-        // and the stored row reads the run kind from the profile.
-        let (prod, _) = sign_v28(
+        // Production, signed in the profile: admitted, its statement
+        // verified, and the row reads the run kind from the profile.
+        let (prod, st) = sign_v28(
             v28_trace_json("trace-i1030-prod", AGENT, Some("production"), Some("2.8.0")),
             AGENT,
         );
-        let summary = ingest_full(d, &v28_batch(&prod, "generic"))
+        let summary = ingest_full(d, &v28_signed_batch(&prod, &st, "generic"))
             .await
             .unwrap_or_else(|e| panic!("I1030: a v2.8.0 production trace admits: {e}"));
         assert_eq!(
             summary.signatures_verified, 1,
-            "I1030: its signature verifies"
+            "I1030: its statement verifies"
         );
         let att = dir
-            .get_attestation(&crate::ingest::trace_attestation_id("trace-i1030-prod"))
+            .get_attestation(&row_id_hex(&st))
             .await
             .unwrap()
-            .expect("I1030: the trace attestation");
+            .expect("I1030: the trace's row");
         assert_eq!(
             sp::trace_attestation_run_kind(&att.attestation_envelope),
             Some("production"),
@@ -2140,11 +2599,11 @@ pub(crate) mod bodies {
         // Mock, signed in the profile, on the canonical: `trace_run_kind_mock`.
         let g = confer_canonical(dir).await;
         d.set_node(&g);
-        let (mock, _) = sign_v28(
+        let (mock, st) = sign_v28(
             v28_trace_json("trace-i1030-mock", AGENT, Some("mock"), Some("2.8.0")),
             AGENT,
         );
-        let e = ingest_full(d, &v28_batch(&mock, "generic"))
+        let e = ingest_full(d, &v28_signed_batch(&mock, &st, "generic"))
             .await
             .expect_err("I1030: a v2.8.0 mock run is refused on the canonical");
         assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I1030: {e}");
@@ -2157,17 +2616,21 @@ pub(crate) mod bodies {
         );
     }
 
+    /// v62.0.0 (E10): the earlier leg "re-canonicalised bytes == the bound
+    /// hybrid's signed bytes" is gone with the bound-hybrid preimage; the
+    /// binding is now the statement's content hash over the trace as sent,
+    /// which the batch door re-derives (a typed struct that dropped a member
+    /// is refused there).
     pub(crate) async fn i1031_v28_profile_members_round_trip_byte_identically<D: Seams>(d: &D) {
         use crate::schema::{BatchEnvelope, BatchEvent};
         root(d).await;
-        let dir = d.as_dyn_directory();
-        let (signed, signed_bytes) = sign_v28(
+        let (signed, st) = sign_v28(
             v28_trace_json("trace-i1031", AGENT, Some("qa"), Some("2.8.0")),
             AGENT,
         );
-        let bytes = v28_batch(&signed, "generic");
-        // Pure: the parsed trace keeps both members, typed, and re-canonicalises
-        // to exactly the bytes the producer signed.
+        let bytes = v28_signed_batch(&signed, &st, "generic");
+        // Pure: the parsed trace keeps both members, typed, and serializes
+        // back to the wire profile.
         let env = BatchEnvelope::from_json(&bytes).expect("I1031: a v2.8.0 trace parses");
         let BatchEvent::CompleteTrace { trace, .. } = &env.events[0];
         let profile = trace.deployment_profile.as_ref().expect("profile");
@@ -2183,29 +2646,20 @@ pub(crate) mod bodies {
             signed["deployment_profile"],
             "I1031: the typed profile serializes back to the wire profile"
         );
-        let canon = crate::verify::canonical::canonicalizer_for(
-            crate::verify::ed25519::canon_version_for_trace_schema("3.0.0"),
-        );
-        let re = crate::verify::ed25519::canonical_bytes_for_trace(trace, canon).unwrap();
-        assert!(
-            re == signed_bytes,
-            "I1031: re-canonicalised bytes differ from the signed bytes\n re: {}\nsig: {}",
-            String::from_utf8_lossy(&re),
-            String::from_utf8_lossy(&signed_bytes)
-        );
-        // Through the store: admitted, verified, and the stored trace keeps both.
+        assert_binds(&st, &signed, "I1031");
+        // Through the store: admitted, the statement verified, and the
+        // content bound.
         let summary = ingest_full(d, &bytes)
             .await
             .unwrap_or_else(|e| panic!("I1031: admits: {e}"));
         assert_eq!(summary.signatures_verified, 1, "I1031");
-        let att = dir
-            .get_attestation(&crate::ingest::trace_attestation_id("trace-i1031"))
-            .await
-            .unwrap()
-            .expect("I1031: the trace attestation");
-        assert_eq!(
-            att.attestation_envelope["trace"]["deployment_profile"], signed["deployment_profile"],
-            "I1031: the stored trace keeps every signed profile member"
+        assert!(
+            d.as_dyn_directory()
+                .get_attestation(&row_id_hex(&st))
+                .await
+                .unwrap()
+                .is_some(),
+            "I1031: the trace's row"
         );
     }
 
@@ -2213,11 +2667,10 @@ pub(crate) mod bodies {
     /// signed profile members the re-cut adds, `calibration_version`
     /// (required, nullable) and `pipeline_metadata` (a closed object of
     /// nullable members), are typed: a trace carrying them, with a token or
-    /// with `null`, re-canonicalises to the bytes the producer signed, admits
-    /// with its signature verified, and the stored trace keeps every member.
-    /// Before v60.1.0 both were dropped on parse and the signature failed. A
-    /// `pipeline_metadata` with a member outside the closed set is refused at
-    /// parse, by name, and nothing is written.
+    /// with `null`, parses with every member, serializes back to the wire
+    /// profile, and admits with its statement verified (its content hash
+    /// binding them). A `pipeline_metadata` with a member outside the closed
+    /// set is refused at parse, by name, and nothing is written.
     pub(crate) async fn i1364_the_recut_profile_members_are_typed_and_signed<D: Seams>(d: &D) {
         use crate::schema::{BatchEnvelope, BatchEvent};
         root(d).await;
@@ -2236,8 +2689,8 @@ pub(crate) mod bodies {
             let mut t = v28_trace_json(tid, AGENT, Some("production"), Some("2.8.0"));
             t["deployment_profile"]["calibration_version"] = calibration.clone();
             t["deployment_profile"]["pipeline_metadata"] = metadata.clone();
-            let (signed, signed_bytes) = sign_v28(t, AGENT);
-            let bytes = v28_batch(&signed, "generic");
+            let (signed, st) = sign_v28(t, AGENT);
+            let bytes = v28_signed_batch(&signed, &st, "generic");
             let env = BatchEnvelope::from_json(&bytes).expect("I1364: parses");
             let BatchEvent::CompleteTrace { trace, .. } = &env.events[0];
             let profile = trace.deployment_profile.as_ref().expect("profile");
@@ -2259,27 +2712,17 @@ pub(crate) mod bodies {
                 signed["deployment_profile"],
                 "I1364 ({tid}): the typed profile serializes back to the wire profile"
             );
-            let canon = crate::verify::canonical::canonicalizer_for(
-                crate::verify::ed25519::canon_version_for_trace_schema("3.0.0"),
-            );
-            let re = crate::verify::ed25519::canonical_bytes_for_trace(trace, canon).unwrap();
-            assert!(
-                re == signed_bytes,
-                "I1364 ({tid}): re-canonicalised bytes differ from the signed bytes"
-            );
+            assert_binds(&st, &signed, "I1364");
             let summary = ingest_full(d, &bytes)
                 .await
                 .unwrap_or_else(|e| panic!("I1364 ({tid}): admits: {e}"));
             assert_eq!(summary.signatures_verified, 1, "I1364 ({tid})");
-            let att = dir
-                .get_attestation(&crate::ingest::trace_attestation_id(tid))
-                .await
-                .unwrap()
-                .expect("I1364: the trace attestation");
-            assert_eq!(
-                att.attestation_envelope["trace"]["deployment_profile"],
-                signed["deployment_profile"],
-                "I1364 ({tid}): the stored trace keeps every signed profile member"
+            assert!(
+                dir.get_attestation(&row_id_hex(&st))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "I1364 ({tid}): the trace's row"
             );
         }
         // A v2.7.x-shaped profile (neither member) serializes neither.
@@ -2298,8 +2741,8 @@ pub(crate) mod bodies {
         let mut extra = metadata.clone();
         extra["smuggled"] = serde_json::json!("x");
         t["deployment_profile"]["pipeline_metadata"] = extra;
-        let (signed, _) = sign_v28(t, AGENT);
-        let e = ingest_full(d, &v28_batch(&signed, "generic"))
+        let (signed, st) = sign_v28(t, AGENT);
+        let e = ingest_full(d, &v28_signed_batch(&signed, &st, "generic"))
             .await
             .expect_err("I1364: an unknown pipeline_metadata member is refused");
         assert_eq!(e.kind(), "schema_malformed_json", "I1364: {e}");
@@ -2318,21 +2761,27 @@ pub(crate) mod bodies {
         root(d).await;
         let dir = d.as_dyn_directory();
         // A v2.7.0 trace with a signed top-level run_kind: admitted as before.
-        let trace = signed_run_kind_trace("trace-i1032", AGENT, "production", "production");
-        let summary = ingest_full(d, &batch(&trace))
+        let (trace, st) = signed_run_kind_trace("trace-i1032", AGENT, "production", "production");
+        let summary = ingest_full(d, &with_statement(&batch(&trace), &st))
             .await
             .unwrap_or_else(|e| panic!("I1032: a v2.7.0 trace admits: {e}"));
         assert_eq!(summary.signatures_verified, 1, "I1032");
         let att = dir
-            .get_attestation(&crate::ingest::trace_attestation_id("trace-i1032"))
+            .get_attestation(&row_id_hex(&st))
             .await
             .unwrap()
-            .expect("I1032: the trace attestation");
-        let stored = &att.attestation_envelope["trace"];
-        assert_eq!(stored["run_kind"], "production", "I1032");
+            .expect("I1032: the trace's row");
+        assert_eq!(
+            sp::trace_attestation_run_kind(&att.attestation_envelope),
+            Some("production"),
+            "I1032"
+        );
         assert!(
-            stored.get("deployment_profile").is_none(),
-            "I1032: {stored}"
+            att.attestation_envelope["manifest"]
+                .get("deployment_profile")
+                .is_none(),
+            "I1032: {}",
+            att.attestation_envelope
         );
         // A six-member profile (the 2.7.9 schema): no new member appears, its bytes do
         // not move, and the format gate passes it.
@@ -2344,8 +2793,8 @@ pub(crate) mod bodies {
         assert_eq!(
             serde_json::to_string(&typed).unwrap(),
             "{\"agent_role\":\"ally\",\"agent_template\":\"ally-v3-default\",\
-             \"deployment_domain\":\"general\",\"deployment_type\":\"personal\",\
-             \"deployment_region\":null,\"deployment_trust_mode\":\"federated_peer\"}",
+         \"deployment_domain\":\"general\",\"deployment_type\":\"personal\",\
+         \"deployment_region\":null,\"deployment_trust_mode\":\"federated_peer\"}",
             "I1032: a v2.7.x profile serializes to the same bytes"
         );
         assert_eq!(serde_json::to_value(&typed).unwrap(), six, "I1032");
@@ -2361,11 +2810,11 @@ pub(crate) mod bodies {
         root(d).await;
         let dir = d.as_dyn_directory();
         // Correctly signed, an unvendored format: refused by name, nothing stored.
-        let (t, _) = sign_v28(
+        let (t, st) = sign_v28(
             v28_trace_json("trace-i1033", AGENT, Some("production"), Some("2.9.0")),
             AGENT,
         );
-        let e = ingest_full(d, &v28_batch(&t, "generic"))
+        let e = ingest_full(d, &v28_signed_batch(&t, &st, "generic"))
             .await
             .expect_err("I1033: an unvendored trace_format_version is refused");
         assert_eq!(e.kind(), "schema_unsupported_trace_format", "I1033: {e}");
@@ -2382,13 +2831,15 @@ pub(crate) mod bodies {
             "I1033: nothing written"
         );
         assert!(dir
-            .get_attestation(&crate::ingest::trace_attestation_id("trace-i1033"))
+            .get_attestation(&row_id_hex(&st))
             .await
             .unwrap()
             .is_none());
-        // The neighbouring refusals, each by its own name.
+        // The neighbouring refusals, each by its own name (each correctly
+        // signed: the schema refuses before the statement is read).
         let refused = |t: serde_json::Value| async move {
-            ingest_full(d, &v28_batch(&t, "generic"))
+            let (t, st) = sign_v28(t, AGENT);
+            ingest_full(d, &v28_signed_batch(&t, &st, "generic"))
                 .await
                 .expect_err("refused")
         };
@@ -2488,6 +2939,18 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .expect("I1034: the trace's own attestation");
+        // An unsigned (TrustPreVerified) trace is the LOCAL-ONLY form CC
+        // allows (lead ruling, P7 enforces): kept at the local tier and never
+        // served to a peer.
+        assert_eq!(
+            local.tier,
+            crate::federation::types::attestation_tier::LOCAL,
+            "I1034: an unsigned trace is local-tier"
+        );
+        assert!(
+            !served_ids(d).await.contains(&local.attestation_id),
+            "I1034: an unsigned trace is not served to a peer"
+        );
         let env = &local.attestation_envelope;
         assert!(env.get("trace").is_none(), "I1034: the oversize form");
         assert_eq!(
@@ -2511,7 +2974,7 @@ pub(crate) mod bodies {
 
     // ── I668 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i668_the_receiver_re_asks_admissibility<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         // A quorum-cosigned bundle that no origin door would have produced:
@@ -2530,7 +2993,7 @@ pub(crate) mod bodies {
             "content_holder_key_ids": [],
         });
         let bundle = sp::PurgeBundle {
-            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
+            notice: notice_of(&r, &notice_payload(&r, &template, t), &[0, 1]).carried(),
             record_ids: ids.clone(),
             derived_from: vec![String::new(); ids.len()],
             admitted_at: t,
@@ -2542,7 +3005,7 @@ pub(crate) mod bodies {
         assert_eq!(tok, token::RETRACTION_INADMISSIBLE, "I668: {body}");
         assert_eq!(body["record_id"], format!("attestation:{held}"));
         // Whole or not at all: the plain row is not tombstoned either.
-        let notice_id = sp::notice_terms(&bundle.notice.envelope).unwrap().notice_id;
+        let notice_id = bundle_notice_id(&bundle);
         assert!(dir.purge_execution(&notice_id).await.unwrap().is_none());
         assert!(dir
             .purge_tombstones_of(&notice_id)
@@ -2553,17 +3016,11 @@ pub(crate) mod bodies {
 
     // ── I672 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i672_no_human_subject_until_the_notice_is_a_row<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         const ALICE: &str = "alice-human-i672";
-        ts::register_hybrid_key_as(
-            dir,
-            ALICE,
-            ALICE,
-            crate::federation::types::identity_type::USER,
-        )
-        .await;
+        e2::put_key(dir, ALICE, &["user"]).await;
         // (a) The mock-trace class has no human subject: it passes.
         mock_world(d, "i672").await;
         sp::purge_dry_run(dir, &mock_selection())
@@ -2590,14 +3047,14 @@ pub(crate) mod bodies {
             records[0]["record_id"],
             format!("attestation:{about_alice}")
         );
-        assert_eq!(records[0]["subject"], ALICE);
+        assert_eq!(records[0]["subject"], k(ALICE));
         let template = serde_json::json!({
             "legal_basis": sp::STEWARD_PURGE_BASIS,
             "content_sha256": sp::selection_digest(&ids),
             "content_holder_key_ids": [],
         });
-        let notice = notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let e = rows_at(dir, &sel, &notice, NODE, t)
+        let notice = notice_for(d, &r, &template, &[0, 1], t).await;
+        let e = rows_at(dir, &sel, &notice, &k(NODE), t)
             .await
             .expect_err("and at execution");
         assert_eq!(
@@ -2608,7 +3065,7 @@ pub(crate) mod bodies {
         assert_nothing_written(d, &notice).await;
         // ... and at the replicated apply, on what the receiver holds.
         let bundle = sp::PurgeBundle {
-            notice: notice.clone(),
+            notice: notice.carried(),
             record_ids: ids.clone(),
             derived_from: vec![String::new(); ids.len()],
             admitted_at: t,
@@ -2625,14 +3082,9 @@ pub(crate) mod bodies {
         // (c) A by-actor purge of a person is refused: the actor is the
         // subject of every record it selects.
         put_score(d, ALICE, AGENT, &[]).await;
-        let e = sp::purge_dry_run(
-            dir,
-            &PurgeSelection::ByActor {
-                key_id: ALICE.to_owned(),
-            },
-        )
-        .await
-        .expect_err("a person's by-actor purge");
+        let e = sp::purge_dry_run(dir, &PurgeSelection::ByActor { key_id: k(ALICE) })
+            .await
+            .expect_err("a person's by-actor purge");
         assert_eq!(
             refusal(&e).0,
             token::HUMAN_SUBJECT_PENDING_NOTICE_ROW,
@@ -2644,8 +3096,8 @@ pub(crate) mod bodies {
         let ghost = d
             .attestation_insert_local(crate::federation::types::LocalAttestationInput {
                 attestation_id: None,
-                attesting_key_id: SCORER.to_owned(),
-                attested_key_id: Some(AGENT.to_owned()),
+                attesting_key_id: k(SCORER),
+                attested_key_id: Some(k(AGENT)),
                 attestation_type: attestation_type::SCORES.to_owned(),
                 weight: None,
                 expires_at: None,
@@ -2716,7 +3168,7 @@ pub(crate) mod bodies {
                 },
             ],
             "signature": "",
-            "signature_key_id": signer,
+            "signature_key_id": k(signer),
         });
         if let Some(k) = run_kind {
             t["run_kind"] = serde_json::json!(k);
@@ -2760,31 +3212,33 @@ pub(crate) mod bodies {
         plain: &D,
     ) {
         // (a) the attestation door, federation tier.
-        root(canonical).await;
+        let r = root(canonical).await;
         let dir = canonical.as_dyn_directory();
-        let mut row = ts::bare_attestation(
-            &uuid::Uuid::new_v4().to_string(),
-            AGENT,
-            AGENT,
-            &serde_json::json!({
-                "dimension": crate::ingest::TRACE_ATTESTATION_DIMENSION,
-                "trace_id": "trace-i659-att",
-                "trace": trace_json("trace-i659-att", AGENT, "gpt-real", Some(sp::RUN_KIND_MOCK)),
-            }),
-        );
+        let mut row = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+            ts::bare_attestation(
+                &uuid::Uuid::new_v4().to_string(),
+                AGENT,
+                AGENT,
+                &serde_json::json!({
+                    "dimension": crate::ingest::TRACE_ATTESTATION_DIMENSION,
+                    "trace_id": "trace-i659-att",
+                    "trace": trace_json("trace-i659-att", AGENT, "gpt-real", Some(sp::RUN_KIND_MOCK)),
+                }),
+            )
+        });
         row.attestation_type = attestation_type::SCORES.to_owned();
-        ts::reseal(&mut row);
-        let e = dir
-            .put_attestation(SignedAttestation {
-                attestation: row.clone(),
-            })
+        row.asserted_at = distinct_instant();
+        row.scrub_timestamp = row.asserted_at;
+        // v62.0.0 (E10) — the row as AGENT's edition-2 statement.
+        let e = e2::try_put_row(dir, &row, AGENT)
             .await
             .expect_err("a federation-tier mock trace is refused");
         assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I659(a): {e}");
         assert!(sp::refuse_mock_trace_attestation(&row).is_err());
         // The tier crossing mints a federation-tier row: a local QA trace
         // cannot cross either.
-        let e = crate::federation::admission::check_promotion_admission(dir, &row, None)
+        let mapped = e2::row_of(&row, AGENT);
+        let e = crate::federation::admission::check_promotion_admission(dir, &mapped, None)
             .await
             .expect_err("a mock trace cannot cross");
         assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I659(a) promotion: {e}");
@@ -2821,11 +3275,11 @@ pub(crate) mod bodies {
         }
 
         // (b) ingest: a node holding `canonical` refuses, a plain node keeps.
-        ts::register_hybrid_key(dir, NODE).await;
-        assert!(!crate::federation::is_canonical_effective(dir, NODE)
+        // This node's key (`root` put it and seated it).
+        let node = k(NODE);
+        assert!(!crate::federation::is_canonical_effective(dir, &node)
             .await
             .unwrap());
-        canonical.set_node(NODE);
         // Before the role: this node is not the federation corpus, so it keeps
         // a mock trace like any other node would.
         let early = batch(&trace_json(
@@ -2839,9 +3293,9 @@ pub(crate) mod bodies {
             .expect("a node without `canonical` keeps it");
         // v62.0.0 — the canonical standing is the conferral (CC 3.4.7.1); a
         // `canonical` label on NODE would be inert.
-        canonical.set_identity_type(NODE, "node,canonical").await;
+        canonical.set_identity_type(&node, "node,canonical").await;
         assert!(
-            !crate::federation::is_canonical_effective(dir, NODE)
+            !crate::federation::is_canonical_effective(dir, &node)
                 .await
                 .unwrap(),
             "I659(b): a label alone confers nothing"
@@ -2893,8 +3347,13 @@ pub(crate) mod bodies {
             ids: vec!["trace:trace-i659-real".to_owned()],
         };
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let rep = rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+        let notice = notice_for(canonical, &r, &dry.notice_template, &[0, 1], t).await;
+        // The trust root is rooted in THIS node's acceptance (W1b): the purge
+        // runs under the node key that accepted it, then the canonical seat
+        // is re-seated.
+        canonical.set_node(&node);
+        let rep = rows_at(dir, &sel, &notice, &k(NODE), t).await.unwrap();
+        canonical.set_node(&g);
         finalize_at(
             dir,
             &rep.notice_id,
@@ -2911,16 +3370,16 @@ pub(crate) mod bodies {
 
     // ── I695 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i695_the_header_and_its_tombstones_are_one_write<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let (_, derived, _) = mock_world(d, "i695").await;
         let dir = d.as_dyn_directory();
         let t = now();
         let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
 
         // A failure between the header and the tombstones leaves NEITHER.
         d.hooks().fail_next("purge_put_execution_tombstones", 1);
-        let e = rows_at(dir, &mock_selection(), &notice, NODE, t)
+        let e = rows_at(dir, &mock_selection(), &notice, &k(NODE), t)
             .await
             .expect_err("I695: the armed fault fails the write");
         assert!(
@@ -2934,7 +3393,7 @@ pub(crate) mod bodies {
         );
 
         // The retry executes the whole set.
-        let report = rows_at(dir, &mock_selection(), &notice, NODE, t)
+        let report = rows_at(dir, &mock_selection(), &notice, &k(NODE), t)
             .await
             .expect("I695: the retry executes");
         assert_eq!(report.record_count, dry.record_count);
@@ -3009,7 +3468,7 @@ pub(crate) mod bodies {
         assert_eq!(refusal(&e).0, token::EXECUTION_INCOMPLETE, "I695 serve");
 
         // A re-run of the same notice completes it.
-        let healed = rows_at(dir, &mock_selection(), &notice, NODE, t)
+        let healed = rows_at(dir, &mock_selection(), &notice, &k(NODE), t)
             .await
             .expect("I695: the re-run completes the set");
         assert_eq!(healed.tombstoned.values().sum::<u64>(), 1, "{healed:?}");
@@ -3077,7 +3536,7 @@ pub(crate) mod bodies {
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i696_a_purged_trace_leaves_no_rollup<D: RollupSeams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         // Five hours back: older than the refresh's watermark tail (the
@@ -3109,8 +3568,8 @@ pub(crate) mod bodies {
             ],
         };
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let rep = rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
+        let rep = rows_at(dir, &sel, &notice, &k(NODE), t).await.unwrap();
         let fin = finalize_at(
             dir,
             &rep.notice_id,
@@ -3145,126 +3604,61 @@ pub(crate) mod bodies {
     }
 
     // ── I697 ──────────────────────────────────────────────────────────────
-    /// A federation-tier `scores` row at `id` on `dimension`, really signed.
-    fn fed_row(id: &str, attester: &str, attested: &str, dimension: &str) -> Attestation {
-        let env = serde_json::json!({
-            "dimension": dimension,
-            "score": crate::federation::namespace::registry::in_class_score(dimension),
-            "confidence": 0.9,
-        });
-        let mut row = ts::bare_attestation(id, attester, attested, &env);
-        row.attestation_type = attestation_type::SCORES.to_owned();
-        ts::reseal(&mut row);
-        row
+    /// A federation-tier `scores` row by `attester` on `dimension`, as its
+    /// edition-2 statement (not put), and the row id it will have.
+    fn fed_statement(attester: &str, attested: &str, dimension: &str) -> (Vec<u8>, String) {
+        let st = e2::statement_of(&score_row(attester, attested, dimension, &[]), attester);
+        let id = RowId::of_statement(&st).expect("a row statement").hex();
+        (st, id)
     }
 
+    /// v62.0.0 (E10) — the `key:revocation` arm is gone: an edition-2 key
+    /// revocation is a key-plane statement, never an attestation row, so no
+    /// bundle can name it (J0; `ingest::put_admitted_row`).
     pub(crate) async fn i697_a_tombstone_never_reaches_the_accountability_record<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
-        // v58.0.0 (CIRISPersist#991) — the key-plane revocation is the
-        // canonical `key:revocation:v1` row of a signed self-revocation: its
-        // id is derived from the revocation, so the bundle names that id.
-        let signed_revocation = ts::seal_revocation(crate::federation::Revocation {
-            revocation_id: uuid::Uuid::new_v4().to_string(),
-            revoked_key_id: Some(AGENT.to_owned()),
-            revoked_key_sha256_ed25519_raw: ts::subject_digest_of(AGENT),
-            revoking_key_id: AGENT.to_owned(),
-            reason: Some("i697 self-revocation".to_owned()),
-            revoked_at: t,
-            effective_at: t,
-            revocation_envelope: serde_json::json!({ "revokes": AGENT }),
-            original_content_hash: String::new(),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            scrub_key_id: AGENT.to_owned(),
-            scrub_timestamp: t,
-            pqc_completed_at: None,
-            observed_region: crate::federation::verify_coord::region::US.to_owned(),
-            revoked_after: None,
-            persist_row_hash: String::new(),
-        });
-        let revocation = {
-            let mut planned = signed_revocation.clone();
-            planned.pqc_completed_at = Some(planned.scrub_timestamp);
-            crate::federation::key_plane::revocation_row(&planned)
-                .expect("the revocation's row")
-                .attestation_id
-        };
-        let track = uuid::Uuid::new_v4().to_string();
-        let plain = uuid::Uuid::new_v4().to_string();
-        // A bundle naming three ids this node does not hold yet.
-        let mut ids: Vec<String> = [&revocation, &track, &plain]
+        let (track_st, track) = fed_statement(
+            HARNESS,
+            BYSTANDER,
+            "moderation_track_record:ciris-canonical:v1",
+        );
+        let (plain_st, plain) = fed_statement(SCORER, AGENT, "chat:message:v1");
+        // A bundle naming ids this node does not hold yet.
+        let mut ids: Vec<String> = [&track, &plain]
             .iter()
             .map(|id| format!("attestation:{id}"))
             .collect();
         ids.sort();
-        let template = serde_json::json!({
-            "legal_basis": sp::STEWARD_PURGE_BASIS,
-            "content_sha256": sp::selection_digest(&ids),
-            "content_holder_key_ids": [],
-        });
-        let bundle = sp::PurgeBundle {
-            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
-            record_ids: ids.clone(),
-            derived_from: vec![String::new(); ids.len()],
-            admitted_at: t,
-        };
-        let applied = apply_at(dir, &bundle, NODE, t)
+        let n = notice_of(&r, &notice_payload(&r, &template_over(&ids), t), &[0, 1]);
+        let bundle = bundle_of(
+            &n,
+            ids.iter().map(|id| (id.clone(), String::new())).collect(),
+            t,
+        );
+        let applied = apply_at(dir, &bundle, &k(NODE), t)
             .await
             .expect("I697: a bundle may name rows this node does not hold yet");
-        assert_eq!(applied.tombstoned, 3);
+        assert_eq!(applied.tombstoned, 2);
 
         // The named rows ARRIVE: the accountability record is admitted.
-        // v58.0.0 (CIRISPersist#991) — the `key:revocation:v1` row arrives
-        // through its own door (`put_revocation`), over the tombstone.
-        dir.put_revocation(crate::federation::SignedRevocation {
-            revocation: signed_revocation,
-        })
-        .await
-        .unwrap_or_else(|e| {
-            panic!("I697: a key:revocation:v1 row is admitted over a tombstone: {e:?}")
+        e2::put_statement(dir, &track_st).await.unwrap_or_else(|e| {
+            panic!("I697: a moderation_track_record row is admitted over a tombstone: {e:?}")
         });
-        assert!(
-            dir.get_attestation(&revocation).await.unwrap().is_some(),
-            "I697: the revocation's row is the bundle-named id"
-        );
-        for (id, attester, attested, dimension) in [(
-            &track,
-            HARNESS,
-            BYSTANDER,
-            "moderation_track_record:ciris-canonical:v1",
-        )] {
-            dir.put_attestation(SignedAttestation {
-                attestation: fed_row(id, attester, attested, dimension),
-            })
-            .await
-            .unwrap_or_else(|e| {
-                panic!("I697: a {dimension} row is admitted over a tombstone: {e:?}")
-            });
-        }
         // An ordinary row at a tombstoned id is still refused.
-        let e = dir
-            .put_attestation(SignedAttestation {
-                attestation: fed_row(&plain, SCORER, AGENT, "chat:message:v1"),
-            })
+        let e = e2::put_statement(dir, &plain_st)
             .await
             .expect_err("I697: an ordinary tombstoned row is refused");
         let (tok, body) = refusal(&e);
         assert_eq!(tok, token::TOMBSTONED, "I697: {body}");
 
         let served = served_ids(d).await;
-        for id in [&revocation, &track] {
-            assert!(served.contains(id), "I697: {id} is served");
-        }
+        assert!(served.contains(&track), "I697: {track} is served");
         assert!(!served.contains(&plain));
         let notice_id = applied.notice_id;
         let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
-        let mut voided = vec![
-            format!("attestation:{revocation}"),
-            format!("attestation:{track}"),
-        ];
-        voided.sort();
+        let voided = vec![format!("attestation:{track}")];
         let mut st = status_at(dir, &notice_id, later).await.unwrap();
         st.voided.sort();
         assert_eq!(
@@ -3272,9 +3666,9 @@ pub(crate) mod bodies {
             "I697: the ledger names the void tombstones"
         );
 
-        // The delete door itself never deletes them, and neither does finalize.
+        // The delete door itself never deletes it, and neither does finalize.
         assert!(!dir
-            .purge_delete_tombstoned_attestation(&revocation)
+            .purge_delete_tombstoned_attestation(&track)
             .await
             .unwrap());
         let mut fin = finalize_at(dir, &notice_id, later, None)
@@ -3283,153 +3677,139 @@ pub(crate) mod bodies {
         fin.voided.sort();
         assert_eq!(fin.voided, voided, "I697: {fin:?}");
         assert_eq!(fin.attestations_deleted, 0, "I697: {fin:?}");
-        for id in [&revocation, &track] {
-            assert!(
-                dir.get_attestation(id).await.unwrap().is_some(),
-                "I697: {id} survives finalize"
-            );
-        }
-        let served = served_ids(d).await;
-        for id in [&revocation, &track] {
-            assert!(served.contains(id), "I697: {id} is served after finalize");
-        }
+        assert!(
+            dir.get_attestation(&track).await.unwrap().is_some(),
+            "I697: {track} survives finalize"
+        );
+        assert!(
+            served_ids(d).await.contains(&track),
+            "I697: {track} is served after finalize"
+        );
     }
 
     // ── I1165 ─────────────────────────────────────────────────────────────
-    /// I1165 — a hard_case row crosses on `a`, is delivered to `b` through
-    /// the planes, is held and projected there, and `b`'s purge doors refuse
-    /// it.
+    /// `seed`'s edition-2 `hard_case:*` statement for `event` (P3's recipe:
+    /// the event's envelope, about the emitter itself, asserted at the
+    /// event's instant).
+    fn hard_case_statement(
+        seed: &str,
+        event: &crate::federation::hard_case::HardCaseEvent,
+    ) -> Vec<u8> {
+        let envelope =
+            crate::federation::hard_case::hard_case_envelope(event).expect("the event's envelope");
+        let mut a = e2::with_earlier_form(|| ts::bare_attestation("e10", seed, seed, &envelope));
+        a.attestation_type = attestation_type::SCORES.to_owned();
+        a.asserted_at = event.emitted_at;
+        a.scrub_timestamp = event.emitted_at;
+        e2::statement_of(&a, seed)
+    }
+
+    /// I1165 — a hard_case row A's node signs is delivered to `b` through
+    /// the planes (A's served statements, B's replicated statement door), is
+    /// held and projected there, and `b`'s purge doors refuse it.
+    /// v62.0.0 (E10): the earlier form's local row + tier crossing (an
+    /// actor-resealed custody, `enter_mesh`) and the wire-hash advertisement
+    /// are gone: an edition-2 hard_case row is the node's own statement, and
+    /// replication serves statements (`edition2_statements_since`).
     pub(crate) async fn i1165_hard_case_rows_replicate_and_stay_unpurgeable<D>(a: &D, b: &D)
     where
         D: Seams + crate::federation::attestation_admit::AttestationStore,
     {
-        use crate::federation::attestation_apply::ReplicatedAttestationOutcome as O;
+        use crate::federation::edition2::ingest::{
+            apply_replicated_statement, ReplicatedStatementOutcome,
+        };
         use crate::federation::hard_case::{self, HardCaseEvent};
         use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
-        use crate::federation::types::{attestation_tier, identity_type};
+        use crate::federation::types::attestation_tier;
         const NODE_A: &str = "i1165-node-a";
         // B is rooted (its purge doors re-verify a bundle against its OWN
         // root); A is a node of its own, distinct from B's.
-        root(b).await;
+        let r = root(b).await;
         for d in [a, b] {
-            ts::register_hybrid_key_as(d.as_dyn_directory(), NODE_A, NODE_A, identity_type::NODE)
-                .await;
+            e2::put_key(d.as_dyn_directory(), NODE_A, &["node"]).await;
         }
-        a.set_node(NODE_A);
-        // v61 (CIRISPersist#1148) — a replicated row reaches only its
-        // audience: a hard_case row is placed at `self`, so the node that
-        // receives it is in A's self cohort — here A's own second store.
-        b.set_node(NODE_A);
+        a.set_node(&k(NODE_A));
 
-        // ── A records the event: a local-tier row, deferred signature ──────
+        // ── A signs the event ──────────────────────────────────────────────
         let event = HardCaseEvent {
             event_id: format!("i1165-{}", uuid::Uuid::new_v4()),
             kind: hard_case::kind::CONSENT_SLA_BREACH.to_owned(),
             target_key_id: Some("i1165-target".to_owned()),
             subject_key_id: None,
             detail: serde_json::json!({"sla_days": 30}),
-            emitted_at: crate::federation::admission::truncate_to_substrate_resolution(now()),
+            emitted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                now().timestamp_millis(),
+            )
+            .expect("ms"),
             emitter_key_id: String::new(),
         };
-        a.record_hard_case(event.clone())
+        let st = hard_case_statement(NODE_A, &event);
+        let rid = RowId::of_statement(&st).expect("a row statement");
+        let id = rid.hex();
+        e2::put_statement(a.as_dyn_directory(), &st)
             .await
-            .expect("I1165: A records the event");
-        let id = hard_case::hard_case_attestation_id(&event.event_id);
-        let local = a
-            .get_attestation(&id)
-            .await
-            .unwrap()
-            .expect("I1165: the event is a row on A");
-        assert_eq!(local.tier, attestation_tier::LOCAL);
-        assert_eq!(
-            local.attesting_key_id, NODE_A,
-            "I1165: attester = A's node key"
-        );
-
-        // ── A crosses it: the node signs as the actor ──────────────────────
-        let ci = crate::federation::Audience::of_row(&local)
-            .and_then(|audience| {
-                crate::federation::crossing::describe(
-                    &local,
-                    audience,
-                    crate::federation::CrossingBasis::ProducerAuthority,
-                )
-            })
-            .expect("I1165: describable");
-        let crossed = a
-            .as_dyn_directory()
-            .enter_mesh(&id, &ci, &ts::actor_reseal(&local))
-            .await
-            .unwrap_or_else(|e| panic!("I1165: a hard_case row crosses (v60): {e}"));
-        assert!(
-            matches!(crossed, crate::federation::MeshCrossingOutcome::Crossed(_)),
-            "I1165: {crossed:?}"
-        );
+            .expect("I1165: A's node puts its hard_case row");
         let on_a = a
             .get_attestation(&id)
             .await
             .unwrap()
-            .expect("I1165: held on A");
-        assert_eq!(on_a.tier, attestation_tier::FEDERATION, "I1165: crossed");
+            .expect("I1165: the event is a row on A");
+        assert_eq!(on_a.tier, attestation_tier::FEDERATION);
+        assert_eq!(
+            on_a.attesting_key_id,
+            k(NODE_A),
+            "I1165: attester = A's node key"
+        );
         crate::federation::verify_row_hybrid_signature(a.as_dyn_directory(), &on_a)
             .await
             .expect("I1165: A's signature verifies as a peer will verify it");
-        // A's table still lists the event and is still its rows' rebuild.
         assert!(
             a.list_hard_case_events(hard_case::HardCaseFilter::default())
                 .await
                 .unwrap()
                 .iter()
                 .any(|e| e.event_id == event.event_id),
-            "I1165: A still lists its crossed event"
+            "I1165: A lists its event"
         );
         check_projection_rebuild(a, SiloProjection::HardCaseEvents)
             .await
-            .expect("I1165: A's hard_case_events is its rows' rebuild after the crossing");
+            .expect("I1165: A's hard_case_events is its rows' rebuild");
 
-        // ── B receives it through the planes: advertised hash, point read ──
+        // ── B receives it through the planes: A's served statements ────────
         let mut offered = None;
-        let mut cursor: Option<String> = None;
+        let mut cursor = None;
         'pages: loop {
             let page = a
                 .as_dyn_directory()
-                .list_wire_hashes_since("Attestation", cursor.as_deref(), 256)
+                .edition2_statements_since(cursor.as_ref(), 256)
                 .await
                 .unwrap();
             if page.is_empty() {
                 break;
             }
-            cursor = page.last().cloned();
-            for hash in &page {
-                let bytes = a
-                    .as_dyn_directory()
-                    .lookup_signed_record_by_content_hash("Attestation", hash)
-                    .await
-                    .unwrap()
-                    .unwrap_or_else(|| panic!("I1165: advertised-then-unfetchable: {hash}"));
-                let row: Attestation = serde_json::from_slice(&bytes).unwrap();
-                if row.attestation_id == id {
-                    offered = Some(row);
+            cursor = page.last().map(|s| s.cursor);
+            for served in page {
+                if RowId::of_statement(&served.bytes) == Some(rid) {
+                    offered = Some(served.bytes);
                     break 'pages;
                 }
             }
         }
-        let offered = offered.expect("I1165: A advertises the crossed hard_case row");
-        let applied = b
-            .as_dyn_directory()
-            .apply_replicated_attestation(SignedAttestation {
-                attestation: offered,
-            })
+        let offered = offered.expect("I1165: A serves the hard_case statement");
+        let applied = apply_replicated_statement(b.as_dyn_directory(), &offered, &rid.0)
             .await
-            .unwrap_or_else(|e| panic!("I1165: B admits A's hard_case row (v60): {e}"));
-        assert_eq!(applied, O::Inserted, "I1165: B stores it");
+            .unwrap_or_else(|e| panic!("I1165: B admits A's hard_case row: {e}"));
+        assert!(
+            matches!(applied, ReplicatedStatementOutcome::Admitted(_)),
+            "I1165: B stores it: {applied:?}"
+        );
         let held = b
             .get_attestation(&id)
             .await
             .unwrap()
             .expect("I1165: held on B");
         assert_eq!(held.tier, attestation_tier::FEDERATION);
-        assert_eq!(held.attesting_key_id, NODE_A);
+        assert_eq!(held.attesting_key_id, k(NODE_A));
         assert!(
             b.list_hard_case_events(hard_case::HardCaseFilter::default())
                 .await
@@ -3466,27 +3846,22 @@ pub(crate) mod bodies {
             "I1165 local: the dry run names it inadmissible: {:?}",
             dry.inadmissible
         );
-        let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let e = rows_at(dir, &sel, &n, NODE, t)
+        let n = notice_for(b, &r, &dry.notice_template, &[0, 1], t).await;
+        let e = rows_at(dir, &sel, &n, &k(NODE), t)
             .await
             .expect_err("I1165: B's local purge refuses the accountability record");
         let (tok, body) = refusal(&e);
         assert_eq!(tok, token::RETRACTION_INADMISSIBLE, "I1165 local: {body}");
-        // The replicated door: a quorum-cosigned bundle from elsewhere.
-        let template = serde_json::json!({
-            "legal_basis": sp::STEWARD_PURGE_BASIS,
-            "content_sha256": sp::selection_digest(&ids),
-            "content_holder_key_ids": [],
-        });
-        let bundle = sp::PurgeBundle {
-            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
-            record_ids: ids.clone(),
-            derived_from: vec![String::new(); ids.len()],
-            admitted_at: t,
-        };
-        let e = apply_at(dir, &bundle, NODE, t)
+        // The replicated door: a quorum-voiced bundle from elsewhere.
+        let other = notice_of(
+            &r,
+            &notice_payload(&r, &template_over(&ids), t - chrono::Duration::seconds(1)),
+            &[0, 1],
+        );
+        let bundle = bundle_of(&other, vec![(ids[0].clone(), String::new())], t);
+        let e = apply_at(dir, &bundle, &k(NODE), t)
             .await
-            .expect_err("I1165: a quorum-cosigned bundle cannot lift the accountability rule");
+            .expect_err("I1165: a quorum-voiced bundle cannot lift the accountability rule");
         let (tok, body) = refusal(&e);
         assert_eq!(
             tok,
@@ -3494,7 +3869,7 @@ pub(crate) mod bodies {
             "I1165 replicated: {body}"
         );
         assert_eq!(body["record_id"], format!("attestation:{id}"));
-        let notice_id = sp::notice_terms(&bundle.notice.envelope).unwrap().notice_id;
+        let notice_id = other.id();
         assert!(dir.purge_execution(&notice_id).await.unwrap().is_none());
         assert!(dir
             .purge_tombstones_of(&notice_id)
@@ -3511,23 +3886,22 @@ pub(crate) mod bodies {
         );
 
         // ── B's listing names each event's emitter: the row's signer ──────
-        // The widened read set carries the floor it crosses (v60 ruling): B
-        // records an event of its own, so B's listing holds both nodes'
+        // The widened read set carries the floor it crosses (v60 ruling): B's
+        // node signs an event of its own, so B's listing holds both nodes'
         // events, each naming the key that signed its row.
         const NODE_B: &str = "i1165-node-b";
-        ts::register_hybrid_key_as(b.as_dyn_directory(), NODE_B, NODE_B, identity_type::NODE).await;
-        b.set_node(NODE_B);
+        e2::put_key(dir, NODE_B, &["node"]).await;
         let own = HardCaseEvent {
             event_id: format!("i1165-b-{}", uuid::Uuid::new_v4()),
             target_key_id: Some("i1165-target-b".to_owned()),
             ..event.clone()
         };
-        b.record_hard_case(own.clone())
+        e2::put_statement(dir, &hard_case_statement(NODE_B, &own))
             .await
-            .expect("I1165: B records an event of its own");
-        let listed = |filter: Option<&str>| {
+            .expect("I1165: B's node puts an event of its own");
+        let listed = |filter: Option<String>| {
             let filter = hard_case::HardCaseFilter {
-                emitter_key_id: filter.map(str::to_owned),
+                emitter_key_id: filter,
                 ..hard_case::HardCaseFilter::default()
             };
             async move {
@@ -3543,8 +3917,8 @@ pub(crate) mod bodies {
             }
         };
         let mut both = vec![
-            (event.event_id.clone(), NODE_A.to_owned()),
-            (own.event_id.clone(), NODE_B.to_owned()),
+            (event.event_id.clone(), k(NODE_A)),
+            (own.event_id.clone(), k(NODE_B)),
         ];
         both.sort();
         assert_eq!(
@@ -3553,20 +3927,20 @@ pub(crate) mod bodies {
             "I1165: B lists A's replicated event beside its own, each naming its row's signer"
         );
         assert_eq!(
-            listed(Some(NODE_B)).await,
-            vec![(own.event_id.clone(), NODE_B.to_owned())],
+            listed(Some(k(NODE_B))).await,
+            vec![(own.event_id.clone(), k(NODE_B))],
             "I1165: filtering on B's own key is the node-local view: A's event is excluded"
         );
         assert_eq!(
-            listed(Some(NODE_A)).await,
-            vec![(event.event_id.clone(), NODE_A.to_owned())],
+            listed(Some(k(NODE_A))).await,
+            vec![(event.event_id.clone(), k(NODE_A))],
             "I1165: filtering on A's key returns exactly A's event"
         );
         // The emitter arm composes with the `since` bound, inclusive at the
         // event's own instant and exclusive one second past it.
         let since = |at: chrono::DateTime<chrono::Utc>| hard_case::HardCaseFilter {
             since: Some(at),
-            emitter_key_id: Some(NODE_A.to_owned()),
+            emitter_key_id: Some(k(NODE_A)),
             ..hard_case::HardCaseFilter::default()
         };
         assert_eq!(
@@ -3593,7 +3967,8 @@ pub(crate) mod bodies {
 
     // ── I698 ──────────────────────────────────────────────────────────────
     /// A federation-tier `trace:complete:v1` row in the MANIFEST form, by
-    /// AGENT about itself, really signed; `run_kind` in the manifest when given.
+    /// AGENT about itself (an unsigned literal: `e2::try_put_row` signs it as
+    /// AGENT's edition-2 statement); `run_kind` in the manifest when given.
     fn manifest_row(id: &str, trace_id: &str, run_kind: Option<&str>) -> Attestation {
         let mut manifest = serde_json::json!({
             "schema": "trace_manifest:v1",
@@ -3610,11 +3985,12 @@ pub(crate) mod bodies {
             "agent_id_hash": "deadbeef",
             "manifest": manifest,
         });
-        let mut row = ts::bare_attestation(id, AGENT, AGENT, &env);
+        let mut row = e2::with_earlier_form(|| ts::bare_attestation(id, AGENT, AGENT, &env));
         row.attestation_type = attestation_type::SCORES.to_owned();
         // A trace is self-emitted: its producer is among its subjects.
-        row.subject_key_ids = vec![AGENT.to_owned()];
-        ts::reseal(&mut row);
+        row.subject_key_ids = vec![k(AGENT)];
+        row.asserted_at = distinct_instant();
+        row.scrub_timestamp = row.asserted_at;
         row
     }
 
@@ -3635,6 +4011,18 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .expect("I698: the trace's own attestation");
+        // An unsigned (TrustPreVerified) trace is the LOCAL-ONLY form CC
+        // allows (lead ruling, P7 enforces): kept at the local tier and never
+        // served to a peer.
+        assert_eq!(
+            local.tier,
+            crate::federation::types::attestation_tier::LOCAL,
+            "I698: an unsigned trace is local-tier"
+        );
+        assert!(
+            !served_ids(d).await.contains(&local.attestation_id),
+            "I698: an unsigned trace is not served to a peer"
+        );
         let env = &local.attestation_envelope;
         assert!(env.get("trace").is_none(), "I698: the oversize form: {env}");
         assert_eq!(
@@ -3650,75 +4038,62 @@ pub(crate) mod bodies {
             .expect_err("I698: a manifest-form mock trace cannot cross");
         assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I698 promotion: {e}");
         // A federation-tier put of the manifest form.
-        let e = dir
-            .put_attestation(SignedAttestation {
-                attestation: manifest_row(
-                    &uuid::Uuid::new_v4().to_string(),
-                    "trace-i698-mock",
-                    Some(sp::RUN_KIND_MOCK),
-                ),
-            })
-            .await
-            .expect_err("I698: a manifest-form mock trace is refused at the put");
+        let e = e2::try_put_row(
+            dir,
+            &manifest_row("e10", "trace-i698-mock", Some(sp::RUN_KIND_MOCK)),
+            AGENT,
+        )
+        .await
+        .expect_err("I698: a manifest-form mock trace is refused at the put");
         assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I698 put: {e}");
         for kind in ["production", "qa"] {
-            dir.put_attestation(SignedAttestation {
-                attestation: manifest_row(
-                    &uuid::Uuid::new_v4().to_string(),
-                    &format!("trace-i698-{kind}"),
-                    Some(kind),
-                ),
-            })
+            e2::try_put_row(
+                dir,
+                &manifest_row("e10", &format!("trace-i698-{kind}"), Some(kind)),
+                AGENT,
+            )
             .await
             .unwrap_or_else(|e| panic!("I698: a {kind} manifest row is admitted: {e:?}"));
         }
-        // The legacy manifest (no run_kind) is admitted and stored as signed.
-        let legacy_id = uuid::Uuid::new_v4().to_string();
-        let legacy = manifest_row(&legacy_id, "trace-i698-legacy", None);
-        dir.put_attestation(SignedAttestation {
-            attestation: legacy.clone(),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("I698: a legacy manifest row is admitted: {e:?}"));
-        let stored = dir.get_attestation(&legacy_id).await.unwrap().unwrap();
-        let jcs = |v: &serde_json::Value| ciris_verify_core::jcs::canonicalize(v).expect("jcs");
-        assert_eq!(
-            jcs(&stored.attestation_envelope),
-            jcs(&legacy.attestation_envelope),
-            "I698: the legacy manifest row's signed bytes are stored unchanged"
-        );
+        // The legacy manifest (no run_kind) is admitted, and the stored row
+        // carries no run_kind. (v62.0.0, E10: the earlier form's "stored
+        // byte for byte" leg compared JCS envelopes; an edition-2 row is
+        // its statement, which the door keeps as received.)
+        let legacy = e2::try_put_row(dir, &manifest_row("e10", "trace-i698-legacy", None), AGENT)
+            .await
+            .unwrap_or_else(|e| panic!("I698: a legacy manifest row is admitted: {e:?}"));
+        let stored = dir
+            .get_attestation(&e2::rid(&legacy))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(stored.attestation_envelope["manifest"]
             .get("run_kind")
             .is_none());
         // Outside the vocabulary, in either shape.
-        let bad = manifest_row(
-            &uuid::Uuid::new_v4().to_string(),
-            "trace-i698-bad",
-            Some("simulation"),
-        );
-        let e = dir
-            .put_attestation(SignedAttestation { attestation: bad })
+        let bad = manifest_row("e10", "trace-i698-bad", Some("simulation"));
+        let e = e2::try_put_row(dir, &bad, AGENT)
             .await
             .expect_err("I698: an unknown manifest run_kind is refused");
         assert_eq!(e.kind(), "federation_trace_dimension_invalid", "I698: {e}");
-        let mut inline = ts::bare_attestation(
-            &uuid::Uuid::new_v4().to_string(),
-            AGENT,
-            AGENT,
-            &serde_json::json!({
-                "dimension": crate::ingest::TRACE_ATTESTATION_DIMENSION,
-                "trace_id": "trace-i698-inline",
-                "agent_id_hash": "deadbeef",
-                "trace": {"trace_id": "trace-i698-inline", "run_kind": 7},
-            }),
-        );
+        let mut inline = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+            ts::bare_attestation(
+                &uuid::Uuid::new_v4().to_string(),
+                AGENT,
+                AGENT,
+                &serde_json::json!({
+                    "dimension": crate::ingest::TRACE_ATTESTATION_DIMENSION,
+                    "trace_id": "trace-i698-inline",
+                    "agent_id_hash": "deadbeef",
+                    "trace": {"trace_id": "trace-i698-inline", "run_kind": 7},
+                }),
+            )
+        });
         inline.attestation_type = attestation_type::SCORES.to_owned();
-        inline.subject_key_ids = vec![AGENT.to_owned()];
-        ts::reseal(&mut inline);
-        let e = dir
-            .put_attestation(SignedAttestation {
-                attestation: inline,
-            })
+        inline.subject_key_ids = vec![k(AGENT)];
+        inline.asserted_at = distinct_instant();
+        inline.scrub_timestamp = inline.asserted_at;
+        let e = e2::try_put_row(dir, &inline, AGENT)
             .await
             .expect_err("I698: a non-string inline run_kind is refused");
         assert_eq!(e.kind(), "federation_trace_dimension_invalid", "I698: {e}");
@@ -3726,22 +4101,19 @@ pub(crate) mod bodies {
 
     // ── I820 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i820_derivatives_leave_with_a_withheld_parent<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         // A refused-today accountability row (inadmissible) and a refused-
         // today plain row (admissible).
-        let parent = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(SignedAttestation {
-            attestation: fed_row(
-                &parent,
-                HARNESS,
-                BYSTANDER,
-                "moderation_track_record:ciris-canonical:v1",
-            ),
-        })
-        .await
-        .expect("the accountability row admits");
+        let (parent_st, parent) = fed_statement(
+            HARNESS,
+            BYSTANDER,
+            "moderation_track_record:ciris-canonical:v1",
+        );
+        e2::put_statement(dir, &parent_st)
+            .await
+            .expect("the accountability row admits");
         let plain = put_score(d, BYSTANDER, AGENT, &[]).await.attestation_id;
         for id in [&parent, &plain] {
             let row = dir.get_attestation(id).await.unwrap().unwrap();
@@ -3782,8 +4154,8 @@ pub(crate) mod bodies {
             sp::selection_digest(&expect),
             "I820: the digest is the reduced set's"
         );
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let rep = rows_at(dir, &sel, &notice, NODE, t)
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
+        let rep = rows_at(dir, &sel, &notice, &k(NODE), t)
             .await
             .expect("I820: the reduced selection executes");
         assert_eq!(rep.record_count, 3);
@@ -3797,36 +4169,22 @@ pub(crate) mod bodies {
     /// A quorum-cosigned bundle over `ids` (sorted here), with `derived_from`
     /// as given per id.
     fn bundle_over(
-        mut pairs: Vec<(String, String)>,
+        r: &RootedTrustRoot,
+        pairs: Vec<(String, String)>,
         t: chrono::DateTime<chrono::Utc>,
     ) -> sp::PurgeBundle {
-        pairs.sort();
-        let ids: Vec<String> = pairs.iter().map(|(id, _)| id.clone()).collect();
-        let template = serde_json::json!({
-            "legal_basis": sp::STEWARD_PURGE_BASIS,
-            "content_sha256": sp::selection_digest(&ids),
-            "content_holder_key_ids": [],
-        });
-        sp::PurgeBundle {
-            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
-            record_ids: ids,
-            derived_from: pairs.into_iter().map(|(_, d)| d).collect(),
-            admitted_at: t,
-        }
+        let mut ids: Vec<String> = pairs.iter().map(|(id, _)| id.clone()).collect();
+        ids.sort();
+        let n = notice_of(r, &notice_payload(r, &template_over(&ids), t), &[0, 1]);
+        bundle_of(&n, pairs, t)
     }
 
     pub(crate) async fn i821_a_blobs_subject_is_resolved_locally<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         const ALICE: &str = "alice-human-i821";
-        ts::register_hybrid_key_as(
-            dir,
-            ALICE,
-            ALICE,
-            crate::federation::types::identity_type::USER,
-        )
-        .await;
+        e2::put_key(dir, ALICE, &["user"]).await;
         let (personal, unbound, plain) = ("a1".repeat(32), "b2".repeat(32), "c3".repeat(32));
         // Alice's blob: a row about her binds it. A harmless row elsewhere.
         put_score(d, SCORER, ALICE, &[&personal]).await;
@@ -3835,6 +4193,7 @@ pub(crate) mod bodies {
 
         // The peer points Alice's blob at the harmless row.
         let forged = bundle_over(
+            &r,
             vec![
                 (format!("attestation:{harmless}"), String::new()),
                 (
@@ -3844,11 +4203,12 @@ pub(crate) mod bodies {
             ],
             t,
         );
-        let e = apply_at(dir, &forged, NODE, t)
+        let e = apply_at(dir, &forged, &k(NODE), t)
             .await
             .expect_err("I821: the bundle's provenance is not trusted");
         let (tok, body) = refusal(&e);
         assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I821: {body}");
+        let alice = k(ALICE);
         let named: Vec<(&str, &str)> = body["records"]
             .as_array()
             .unwrap()
@@ -3862,38 +4222,27 @@ pub(crate) mod bodies {
             .collect();
         let blob_id = format!("blob:{personal}");
         assert!(
-            named.contains(&(blob_id.as_str(), ALICE)),
+            named.contains(&(blob_id.as_str(), alice.as_str())),
             "I821: names Alice's blob and Alice: {body}"
         );
-        assert_nothing_written(d, &forged.notice).await;
+        assert_nothing_written_for(d, &bundle_notice_id(&forged)).await;
 
         // A person's device holds bytes: its holding claim (v55.0.0:
         // `custody:ack:v1` `here`; the holder attests itself) is a local
         // holding row too.
         const BOB: &str = "bob-human-holder-i821";
-        ts::register_hybrid_key_as(dir, BOB, BOB, crate::federation::types::identity_type::USER)
-            .await;
+        e2::put_key(dir, BOB, &["user"]).await;
         let held = [0xd4u8; 32];
-        let mut claim = ts::bare_attestation(
-            &uuid::Uuid::new_v4().to_string(),
-            BOB,
-            BOB,
-            &serde_json::json!({
-                "dimension": crate::federation::custody_ack::CUSTODY_ACK_DIMENSION,
-                "custody_state": "here",
-                "evidence_refs": [hex::encode(held)],
-                "size": 12,
-                "score": 1.0,
-                "confidence": 1.0,
-            }),
-        );
-        claim.attestation_type = "scores".into();
-        claim.weight = None;
-        ts::reseal(&mut claim);
-        dir.put_attestation(SignedAttestation { attestation: claim })
-            .await
-            .expect("the holder claim admits");
+        // v62.0.0 (T2) — the holding claim is Bob's edition-2
+        // `custody:ack:v1` statement, kept as an attestation row.
+        e2::put_statement(
+            dir,
+            &e2::custody_statement(BOB, &held, Some(12), "federation", None, e2::ms(now())),
+        )
+        .await
+        .expect("the holder claim admits");
         let device = bundle_over(
+            &r,
             vec![(
                 format!("blob:{}", hex::encode(held)),
                 format!("attestation:{harmless}"),
@@ -3901,26 +4250,26 @@ pub(crate) mod bodies {
             t,
         );
         let (tok, body) = refusal(
-            &apply_at(dir, &device, NODE, t)
+            &apply_at(dir, &device, &k(NODE), t)
                 .await
                 .expect_err("I821: a person's holding claim is read locally"),
         );
         assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I821: {body}");
-        assert!(body.to_string().contains(BOB), "I821 holder: {body}");
+        assert!(body.to_string().contains(&k(BOB)), "I821 holder: {body}");
 
         // A blob nothing here holds or binds: not proven non-human.
-        let blind = bundle_over(vec![(format!("blob:{unbound}"), String::new())], t);
+        let blind = bundle_over(&r, vec![(format!("blob:{unbound}"), String::new())], t);
         let (tok, body) = refusal(
-            &apply_at(dir, &blind, NODE, t)
+            &apply_at(dir, &blind, &k(NODE), t)
                 .await
                 .expect_err("I821: an unknown holding fails closed"),
         );
         assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I821: {body}");
-        assert_nothing_written(d, &blind.notice).await;
+        assert_nothing_written_for(d, &bundle_notice_id(&blind)).await;
 
         // A blob bound only by a row about a non-person applies.
-        let fine = bundle_over(vec![(format!("blob:{plain}"), String::new())], t);
-        apply_at(dir, &fine, NODE, t)
+        let fine = bundle_over(&r, vec![(format!("blob:{plain}"), String::new())], t);
+        apply_at(dir, &fine, &k(NODE), t)
             .await
             .expect("I821: a non-person's blob applies");
 
@@ -3934,21 +4283,21 @@ pub(crate) mod bodies {
                 .expect_err("I821: the local dry run refuses Alice's blob"),
         );
         assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I821: {body}");
-        assert!(body.to_string().contains(ALICE), "I821 local: {body}");
+        assert!(body.to_string().contains(&k(ALICE)), "I821 local: {body}");
     }
 
     // ── I822 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i822_the_dwell_is_this_nodes_clock<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         mock_world(d, "i822").await;
         let dir = d.as_dyn_directory();
         let t = now();
         let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
         // The system clock: no seam, no argument.
         sp::test_clock::set(None);
         let before = chrono::Utc::now();
-        let rep = sp::purge_rows(dir, &mock_selection(), &notice, NODE)
+        let rep = sp::purge_rows_edition2(dir, &mock_selection(), &notice.row, &k(NODE))
             .await
             .expect("executes");
         let after = chrono::Utc::now();
@@ -3973,15 +4322,15 @@ pub(crate) mod bodies {
 
     // ── I825 / I826 ───────────────────────────────────────────────────────
     /// Execute and finalize a by-ids purge of one trace.
-    async fn purge_trace<D: Seams>(d: &D, trace_id: &str) {
+    async fn purge_trace<D: Seams>(d: &D, r: &RootedTrustRoot, trace_id: &str) {
         let dir = d.as_dyn_directory();
         let t = now();
         let sel = PurgeSelection::ByIds {
             ids: vec![format!("trace:{trace_id}")],
         };
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let rep = rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+        let notice = notice_for(d, r, &dry.notice_template, &[0, 1], t).await;
+        let rep = rows_at(dir, &sel, &notice, &k(NODE), t).await.unwrap();
         finalize_at(
             dir,
             &rep.notice_id,
@@ -4007,7 +4356,7 @@ pub(crate) mod bodies {
             canonical_bytes: canonical.to_vec(),
             ed25519_sig: vec![1u8; 64],
             ml_dsa_65_sig: vec![2u8; 3309],
-            signing_key_id: "key-lens".to_owned(),
+            signing_key_id: k("key-lens"),
             ts: crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now()),
         }
     }
@@ -4029,16 +4378,15 @@ pub(crate) mod bodies {
         d: &D,
     ) {
         use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
-        root(d).await;
+        let r = root(d).await;
         seed_trace(d, "trace-i825", AGENT, "gpt-real").await;
         seed_trace(d, "trace-i825-other", BYSTANDER, "gpt-real").await;
         // v57.0.0 (#988 item 3) — a detection row's attester is a held
         // lenscore_detector key.
-        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+        e2::put_key(
             d.as_dyn_directory(),
             "key-lens",
-            "key-lens",
-            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+            &e2::identity_types_of(crate::federation::types::identity_type::LENSCORE_DETECTOR),
         )
         .await;
         let purged = detection("trace-i825", b"purged-body");
@@ -4053,9 +4401,7 @@ pub(crate) mod bodies {
         // through its evidence (the trace).
         let dir = d.as_dyn_directory();
         let t = now();
-        let sel = PurgeSelection::ByActor {
-            key_id: AGENT.to_owned(),
-        };
+        let sel = PurgeSelection::ByActor { key_id: k(AGENT) };
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
         assert!(
             dry.ledger_tsv
@@ -4063,8 +4409,8 @@ pub(crate) mod bodies {
             "I825: the purge door derives the detection row from its trace:\n{}",
             dry.ledger_tsv
         );
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let rep = rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
+        let rep = rows_at(dir, &sel, &notice, &k(NODE), t).await.unwrap();
 
         // The window: the row is tombstoned, its projection row is the V080
         // tombstone, and the table is its rows' rebuild.
@@ -4143,12 +4489,12 @@ pub(crate) mod bodies {
     }
 
     pub(crate) async fn i826_a_reused_thought_reads_its_own_signature<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let signed = |trace: &str, attempt: u32, sig: &str| {
             let mut r = event_row(trace, AGENT, attempt);
             r.thought_id = "th-i826".to_owned();
             r.agent_id_hash = "agent-i826".to_owned();
-            r.pqc_key_id = Some(AGENT.to_owned());
+            r.pqc_key_id = Some(k(AGENT));
             r.signature_ml_dsa_65 = Some(sig.to_owned());
             r
         };
@@ -4167,7 +4513,7 @@ pub(crate) mod bodies {
         let mut shared = event_row("trace-i826-live", AGENT, 5);
         shared.thought_id = "th-i826-shared".to_owned();
         shared.agent_id_hash = "agent-i826".to_owned();
-        shared.pqc_key_id = Some(AGENT.to_owned());
+        shared.pqc_key_id = Some(k(AGENT));
         shared.signature_ml_dsa_65 = Some("sig-shared".to_owned());
         let mut shared_purged = shared.clone();
         shared_purged.trace_id = "trace-i826-old".to_owned();
@@ -4176,7 +4522,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
 
-        purge_trace(d, "trace-i826-old").await;
+        purge_trace(d, &r, "trace-i826-old").await;
         d.insert_trace_events_batch(&[signed("trace-i826-new", 0, "sig-new")])
             .await
             .unwrap();
@@ -4204,20 +4550,17 @@ pub(crate) mod bodies {
 
     // ── I828 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i828_a_person_subject_arrival_voids_the_tombstone<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         const ALICE: &str = "alice-human-i828";
-        ts::register_hybrid_key_as(
-            dir,
-            ALICE,
-            ALICE,
-            crate::federation::types::identity_type::USER,
-        )
-        .await;
-        let about_alice = uuid::Uuid::new_v4().to_string();
-        let ordinary = uuid::Uuid::new_v4().to_string();
-        let unknown = uuid::Uuid::new_v4().to_string();
+        e2::put_key(dir, ALICE, &["user"]).await;
+        // The rows that will arrive, signed now (an edition-2 id is the
+        // statement's), so the bundle can name them first.
+        let (alice_st, about_alice) = fed_statement(SCORER, ALICE, "chat:message:v1");
+        let (ordinary_st, ordinary) = fed_statement(SCORER, AGENT, "chat:message:v1");
+        let (unknown_st, unknown) =
+            fed_statement(SCORER, "nobody-knows-me-i828", "chat:message:v1");
         let trace_id = "trace-i828-alice";
         let mut ids: Vec<String> = [&about_alice, &ordinary, &unknown]
             .iter()
@@ -4231,35 +4574,27 @@ pub(crate) mod bodies {
             "content_holder_key_ids": [],
         });
         let bundle = sp::PurgeBundle {
-            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
+            notice: notice_of(&r, &notice_payload(&r, &template, t), &[0, 1]).carried(),
             record_ids: ids.clone(),
             derived_from: vec![String::new(); ids.len()],
             admitted_at: t,
         };
-        let applied = apply_at(dir, &bundle, NODE, t)
+        let applied = apply_at(dir, &bundle, &k(NODE), t)
             .await
             .expect("I828: a bundle may name rows this node does not hold yet");
         assert_eq!(applied.tombstoned, 4);
 
         // A row about a person arrives at a tombstoned id: admitted.
-        dir.put_attestation(SignedAttestation {
-            attestation: fed_row(&about_alice, SCORER, ALICE, "chat:message:v1"),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("I828: a row about a person is admitted: {e:?}"));
+        e2::put_statement(dir, &alice_st)
+            .await
+            .unwrap_or_else(|e| panic!("I828: a row about a person is admitted: {e:?}"));
         // An ordinary row stays refused; one whose subject key does not
         // resolve here is refused RETRYABLY (I832 walks the key landing).
-        let e = dir
-            .put_attestation(SignedAttestation {
-                attestation: fed_row(&ordinary, SCORER, AGENT, "chat:message:v1"),
-            })
+        let e = e2::put_statement(dir, &ordinary_st)
             .await
             .expect_err("I828: a non-person row at a tombstoned id is refused");
         assert_eq!(refusal(&e).0, token::TOMBSTONED, "I828: {e:?}");
-        let e = dir
-            .put_attestation(SignedAttestation {
-                attestation: fed_row(&unknown, SCORER, "nobody-knows-me-i828", "chat:message:v1"),
-            })
+        let e = e2::put_statement(dir, &unknown_st)
             .await
             .expect_err("I828: an unresolved subject is not admitted");
         assert_eq!(e.kind(), "federation_attester_key_unknown", "I828: {e:?}");
@@ -4312,15 +4647,14 @@ pub(crate) mod bodies {
 
     /// **I832** — the subject's key arrives AFTER the row.
     pub(crate) async fn i832_an_unresolved_subject_is_retryable<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
         const BOB: &str = "bob-late-key-i832";
         const CAROL: &str = "carol-late-agent-i832";
-        let (about_bob, about_carol) = (
-            uuid::Uuid::new_v4().to_string(),
-            uuid::Uuid::new_v4().to_string(),
-        );
+        // The rows, signed now: the bundle names their row ids first.
+        let (bob_st, about_bob) = fed_statement(SCORER, BOB, "chat:message:v1");
+        let (carol_st, about_carol) = fed_statement(SCORER, CAROL, "chat:message:v1");
         let trace_id = "trace-i832-bob";
         let mut ids: Vec<String> = [&about_bob, &about_carol]
             .iter()
@@ -4334,20 +4668,15 @@ pub(crate) mod bodies {
             "content_holder_key_ids": [],
         });
         let bundle = sp::PurgeBundle {
-            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
+            notice: notice_of(&r, &notice_payload(&r, &template, t), &[0, 1]).carried(),
             record_ids: ids.clone(),
             derived_from: vec![String::new(); ids.len()],
             admitted_at: t,
         };
-        let applied = apply_at(dir, &bundle, NODE, t).await.unwrap();
-        let offer = |id: &str, subject: &str| {
-            dir.put_attestation(SignedAttestation {
-                attestation: fed_row(id, SCORER, subject, "chat:message:v1"),
-            })
-        };
+        let applied = apply_at(dir, &bundle, &k(NODE), t).await.unwrap();
         // Row first, key later: retryable, nothing stored.
-        for (id, subject) in [(&about_bob, BOB), (&about_carol, CAROL)] {
-            let e = offer(id, subject)
+        for (st, id, subject) in [(&bob_st, &about_bob, BOB), (&carol_st, &about_carol, CAROL)] {
+            let e = e2::put_statement(dir, st)
                 .await
                 .expect_err("I832: an unresolved subject is not admitted");
             assert_eq!(
@@ -4357,7 +4686,7 @@ pub(crate) mod bodies {
             );
             assert!(
                 matches!(&e, Error::AttesterKeyUnknown { attesting_key_id, plane }
-                    if attesting_key_id == subject && *plane == sp::PURGE_TOMBSTONE_SUBJECT_PLANE),
+                    if *attesting_key_id == k(subject) && *plane == sp::PURGE_TOMBSTONE_SUBJECT_PLANE),
                 "I832: names the subject and the plane: {e:?}"
             );
             assert!(dir.get_attestation(id).await.unwrap().is_none());
@@ -4367,19 +4696,12 @@ pub(crate) mod bodies {
             .expect_err("I832: a trace whose signer is not held yet is not admitted");
         assert_eq!(e.kind(), "verify_unknown_key", "I832 trace: {e}");
         // The keys land.
-        ts::register_hybrid_key_as(dir, BOB, BOB, crate::federation::types::identity_type::USER)
-            .await;
-        ts::register_hybrid_key_as(
-            dir,
-            CAROL,
-            CAROL,
-            crate::federation::types::identity_type::AGENT,
-        )
-        .await;
-        offer(&about_bob, BOB)
+        e2::put_key(dir, BOB, &["user"]).await;
+        e2::put_key(dir, CAROL, &["agent"]).await;
+        e2::put_statement(dir, &bob_st)
             .await
             .expect("I832: once the key lands as a person, the re-offer is admitted");
-        let e = offer(&about_carol, CAROL)
+        let e = e2::put_statement(dir, &carol_st)
             .await
             .expect_err("I832: once the key lands as a non-person, the tombstone stands");
         assert_eq!(refusal(&e).0, token::TOMBSTONED, "I832: {e:?}");
@@ -4400,7 +4722,7 @@ pub(crate) mod bodies {
     /// **I828b** — the serve-by-hash reload withholds a tombstoned row during
     /// the dwell, exactly as the cursor serve does (the round-4 sweep).
     pub(crate) async fn i828b_serve_by_hash_withholds_during_the_dwell<D: Seams>(d: &D) {
-        root(d).await;
+        let r = root(d).await;
         let dir = d.as_dyn_directory();
         let row = put_score(d, SCORER, AGENT, &[]).await;
         let hash = crate::federation::wire_index::content_hash_of(&row).unwrap();
@@ -4425,8 +4747,8 @@ pub(crate) mod bodies {
             ids: vec![format!("attestation:{}", row.attestation_id)],
         };
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
+        rows_at(dir, &sel, &notice, &k(NODE), t).await.unwrap();
         assert!(
             crate::federation::wire_index::reload_record_bytes(dir, "Attestation", &rk)
                 .await
@@ -4459,7 +4781,7 @@ pub(crate) mod bodies {
             let mut r = event_row(trace, AGENT, 0);
             r.thought_id = "th-i831".to_owned();
             r.agent_id_hash = agent.to_owned();
-            r.pqc_key_id = Some(AGENT.to_owned());
+            r.pqc_key_id = Some(k(AGENT));
             r.signature_ml_dsa_65 = Some(sig.to_owned());
             r
         };
@@ -4518,7 +4840,11 @@ pub(crate) mod bodies {
                 .unwrap(),
             (2, 1)
         );
-        assert!(dir.lookup_public_key(BYSTANDER).await.unwrap().is_some());
+        assert!(dir
+            .lookup_public_key(&k(BYSTANDER))
+            .await
+            .unwrap()
+            .is_some());
         // The plane gates the attestation and trace refusal at the door too.
         assert!(
             sp::refuse_if_tombstoned(dir, PurgePlane::Trace, "trace-i660")
@@ -4581,6 +4907,7 @@ mod run {
                 }
                 #[tokio::test]
                 async fn i670() {
+                    // DEPENDS ON P7's trace row form (P7.md update 2).
                     let Some(d) = $fresh.await else { return };
                     b::i670_run_kind_is_a_signed_member(&d).await
                 }
@@ -4596,21 +4923,25 @@ mod run {
                 }
                 #[tokio::test]
                 async fn i1030() {
+                    // DEPENDS ON P7's trace row form (P7.md update 2).
                     let Some(d) = $fresh.await else { return };
                     b::i1030_a_v28_mock_run_is_refused_from_the_profile(&d).await
                 }
                 #[tokio::test]
                 async fn i1031() {
+                    // DEPENDS ON P7's trace row form (P7.md update 2).
                     let Some(d) = $fresh.await else { return };
                     b::i1031_v28_profile_members_round_trip_byte_identically(&d).await
                 }
                 #[tokio::test]
                 async fn i1032() {
+                    // DEPENDS ON P7's trace row form (P7.md update 2).
                     let Some(d) = $fresh.await else { return };
                     b::i1032_a_v27_trace_is_unchanged(&d).await
                 }
                 #[tokio::test]
                 async fn i1033() {
+                    // DEPENDS ON P7's trace row form (P7.md update 2).
                     let Some(d) = $fresh.await else { return };
                     b::i1033_an_unvendored_format_is_refused_by_name(&d).await
                 }
@@ -4621,6 +4952,7 @@ mod run {
                 }
                 #[tokio::test]
                 async fn i1364() {
+                    // DEPENDS ON P7's trace row form (P7.md update 2).
                     let Some(d) = $fresh.await else { return };
                     b::i1364_the_recut_profile_members_are_typed_and_signed(&d).await
                 }
@@ -4763,7 +5095,11 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
+        // v62.0.0 (E10) — this node's edition-2 key, seated (`root` re-seats
+        // the witnesses' rooted node).
+        let node =
+            crate::federation::edition2::fixture_switch::put_key(&b, "inv-node", &["node"]).await;
+        b.set_node_key_id(node);
         Some(b)
     });
 
@@ -4775,7 +5111,11 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
+        // v62.0.0 (E10) — this node's edition-2 key, seated (`root` re-seats
+        // the witnesses' rooted node).
+        let node =
+            crate::federation::edition2::fixture_switch::put_key(&b, "inv-node", &["node"]).await;
+        b.set_node_key_id(node);
         Some(b)
     });
 
@@ -4786,7 +5126,11 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
+        // v62.0.0 (E10) — this node's edition-2 key, seated (`root` re-seats
+        // the witnesses' rooted node).
+        let node =
+            crate::federation::edition2::fixture_switch::put_key(&b, "inv-node", &["node"]).await;
+        b.set_node_key_id(node);
         Some(b)
     });
 
@@ -4798,7 +5142,11 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
+        // v62.0.0 (E10) — this node's edition-2 key, seated (`root` re-seats
+        // the witnesses' rooted node).
+        let node =
+            crate::federation::edition2::fixture_switch::put_key(&b, "inv-node", &["node"]).await;
+        b.set_node_key_id(node);
         Some(b)
     });
 

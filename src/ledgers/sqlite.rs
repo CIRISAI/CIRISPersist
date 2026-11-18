@@ -19,7 +19,10 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::service::LedgerService;
-use super::standard::{derive_ledger_id, fork_evidence_id, ForkEvidence};
+use super::standard::{
+    contest_evidence_id, contest_evidence_json, derive_ledger_id, fork_evidence_id, ForkEvidence,
+    LEDGER_TRIPLE_CONTESTED,
+};
 use super::types::{
     AdvanceOutcome, ForkEvidenceRow, LedgerCheckpointRow, LedgerEntryRangeRow, LedgerHeadRow,
     RegisterOutcome,
@@ -116,6 +119,35 @@ fn decode_head_row(row: &rusqlite::Row<'_>) -> Result<LedgerHeadRow, Error> {
 
 const HEAD_COLUMNS: &str = "ledger_id, owner_key_id, unit, standard_version, seq, head_hash, \
                             witness_anchor_ref, source_envelope_ref, created_at, updated_at";
+
+/// v62.0.0 (wave GC6; CC 2.7 rc21 X4) — keep one contested head: a
+/// `double_head` fork-evidence row keyed by
+/// [`contest_evidence_id`](super::standard::contest_evidence_id) (idempotent).
+fn keep_contender(
+    tx: &rusqlite::Transaction<'_>,
+    ledger_id: &str,
+    seq: u64,
+    head_hash: &str,
+    now: &str,
+) -> Result<(), Error> {
+    let seq_i = validate::seq_as_i64(seq, "seq")?;
+    let evidence = serde_json::to_string(&contest_evidence_json(head_hash))
+        .map_err(|e| Error::Internal(format!("contest encode: {e}")))?;
+    tx.execute(
+        "INSERT OR IGNORE INTO cirislens_ledger_fork_evidence (\
+            evidence_id, ledger_id, seq, fork_kind, evidence_json, detected_at\
+         ) VALUES (?1, ?2, ?3, 'double_head', ?4, ?5)",
+        params![
+            contest_evidence_id(ledger_id, seq, head_hash),
+            ledger_id,
+            seq_i,
+            evidence,
+            now
+        ],
+    )
+    .map_err(|e| map_sqlite_error(e, "advance_head contest keep"))?;
+    Ok(())
+}
 
 impl LedgerService for SqliteLedgerBackend {
     async fn register_ledger(
@@ -237,17 +269,55 @@ impl LedgerService for SqliteLedgerBackend {
             let Some((cur_seq, cur_hash, cur_anchor)) = current else {
                 return Err(Error::NotFound(format!("ledger {lid} is not registered")));
             };
+            // v62.0.0 (wave GC6; CC 2.7 rc21 X4) — a contested ledger
+            // concludes no head while both stand: every advance answers
+            // `Contested`, and a head offered AT a contested seq is kept as
+            // one more contender.
+            let contested: Vec<i64> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT DISTINCT seq FROM cirislens_ledger_fork_evidence \
+                         WHERE ledger_id = ?1 AND fork_kind = 'double_head' \
+                           AND json_extract(evidence_json, '$.reason') = ?2",
+                    )
+                    .map_err(|e| map_sqlite_error(e, "advance_head contest prepare"))?;
+                let rows = stmt
+                    .query_map(params![lid, LEDGER_TRIPLE_CONTESTED], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .map_err(|e| map_sqlite_error(e, "advance_head contest read"))?;
+                rows.collect::<Result<Vec<i64>, _>>()
+                    .map_err(|e| map_sqlite_error(e, "advance_head contest row"))?
+            };
+            if !contested.is_empty() {
+                if contested.contains(&seq_i) {
+                    keep_contender(&tx, &lid, seq, &hash, &now)?;
+                }
+                tx.commit()
+                    .map_err(|e| map_sqlite_error(e, "advance_head commit"))?;
+                return Ok(AdvanceOutcome::Contested);
+            }
             let outcome = match (cur_seq, cur_hash) {
                 (None, _) => AdvanceOutcome::Advanced,
                 (Some(c), _) if seq_i > c => AdvanceOutcome::Advanced,
                 (Some(c), Some(h)) if seq_i == c && h == hash => AdvanceOutcome::Unchanged,
                 (Some(c), Some(h)) if seq_i == c => {
-                    // Fork-shaped: same seq, different hash. The door
-                    // refuses and never overwrites — the caller assembles
-                    // ForkEvidence from both heads (L8).
-                    return Err(Error::Conflict(format!(
-                        "fork-shaped head for {lid} at seq {seq}: stored {h}, offered {hash}"
-                    )));
+                    // Fork-shaped: same seq, different hash. v62.0.0 (wave
+                    // GC6; CC 2.7 rc21 X4) — CONTESTED, not first-wins: both
+                    // heads are kept as evidence, and the stored head is
+                    // cleared, so neither concludes, in either arrival order.
+                    keep_contender(&tx, &lid, seq, &h, &now)?;
+                    keep_contender(&tx, &lid, seq, &hash, &now)?;
+                    tx.execute(
+                        "UPDATE cirislens_ledger_heads SET \
+                            seq = NULL, head_hash = NULL, updated_at = ?2 \
+                         WHERE ledger_id = ?1",
+                        params![lid, now],
+                    )
+                    .map_err(|e| map_sqlite_error(e, "advance_head contest clear"))?;
+                    tx.commit()
+                        .map_err(|e| map_sqlite_error(e, "advance_head commit"))?;
+                    return Ok(AdvanceOutcome::Contested);
                 }
                 (Some(_), _) => AdvanceOutcome::Stale,
             };
@@ -277,7 +347,7 @@ impl LedgerService for SqliteLedgerBackend {
                         .map_err(|e| map_sqlite_error(e, "advance_head anchor fill"))?;
                     }
                 }
-                AdvanceOutcome::Stale => {}
+                AdvanceOutcome::Stale | AdvanceOutcome::Contested => {}
             }
             tx.commit()
                 .map_err(|e| map_sqlite_error(e, "advance_head commit"))?;
@@ -790,16 +860,23 @@ mod tests {
         assert_eq!(row.seq, Some(7));
         assert_eq!(row.head_hash.as_deref(), Some("h7"));
 
-        // Same seq, DIFFERENT hash: the fork shape. Refused, never chosen.
-        let err = svc
-            .advance_head(&id, 7, "h7-other", None, None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind(), "ledgers_conflict");
-        assert!(err.to_string().contains("fork-shaped"), "{err}");
-        // And the stored head did not move — the refusal is the protection.
+        // v62.0.0 (wave GC6; CC 2.7 rc21 X4, I3885) — same seq, DIFFERENT
+        // hash: CONTESTED, never chosen and never refused. Neither concludes.
+        assert_eq!(
+            svc.advance_head(&id, 7, "h7-other", None, None)
+                .await
+                .unwrap(),
+            AdvanceOutcome::Contested
+        );
         let row = svc.get_ledger(&id).await.unwrap().unwrap();
-        assert_eq!(row.head_hash.as_deref(), Some("h7"));
+        assert_eq!((row.seq, row.head_hash.as_deref()), (None, None));
+    }
+
+    /// I3885 (wave GC6) — contested in either arrival order (sqlite).
+    #[tokio::test]
+    async fn i3885_two_heads_at_one_seq_are_contested_either_order() {
+        let (_b, svc) = fresh().await;
+        crate::ledgers::service::contest_either_order_body(&svc, "i3885-sq").await;
     }
 
     #[tokio::test]
@@ -987,9 +1064,9 @@ mod tests {
     /// door. Exactly one registration happens; every loser sees the
     /// idempotent no-op; nobody errors; one row exists. Then eight tasks
     /// race one sequence number with TWO different hashes — the fork shape
-    /// under contention: the stored head is exactly ONE of the offered
-    /// hashes (never a blend, never a flip-flop), and every task got
-    /// Advanced, Unchanged, or the fork Conflict — no fourth outcome.
+    /// under contention: v62.0.0 (CC 2.7 rc21 X4) the ledger ends
+    /// CONTESTED (no stored head), and every task got Advanced, Unchanged
+    /// or Contested — no refusal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn acid_isolation_concurrent_doors_never_blend() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
@@ -1030,25 +1107,22 @@ mod tests {
                 svc.advance_head(&id, 3, hash, None, None).await
             }));
         }
-        let mut conflicts = 0;
+        // v62.0.0 (wave GC6; CC 2.7 rc21 X4, I3885) — the two camps meet:
+        // CONTESTED, never a refusal, never a winner.
+        let mut contested = 0;
         for a in advances {
-            match a.await.unwrap() {
-                Ok(AdvanceOutcome::Advanced | AdvanceOutcome::Unchanged) => {}
-                Ok(AdvanceOutcome::Stale) => panic!("nothing here is stale"),
-                Err(e) => {
-                    assert_eq!(e.kind(), "ledgers_conflict", "{e}");
-                    conflicts += 1;
-                }
+            match a.await.unwrap().expect("I3885: no racer is refused") {
+                AdvanceOutcome::Advanced | AdvanceOutcome::Unchanged => {}
+                AdvanceOutcome::Stale => panic!("nothing here is stale"),
+                AdvanceOutcome::Contested => contested += 1,
             }
         }
-        assert!(conflicts >= 1, "the two camps must have collided");
+        assert!(contested >= 1, "the two camps must have collided");
         let row = svc.get_ledger(&id).await.unwrap().unwrap();
-        assert_eq!(row.seq, Some(3));
-        assert!(
-            row.head_hash.as_deref() == Some("hash-a")
-                || row.head_hash.as_deref() == Some("hash-b"),
-            "the stored head is one of the offered hashes, never a blend: {:?}",
-            row.head_hash
+        assert_eq!(
+            (row.seq, row.head_hash.as_deref()),
+            (None, None),
+            "I3885: neither head concludes"
         );
         // CONSISTENCY under the storm: the schema's pairing invariant holds
         // on what the surface returns.

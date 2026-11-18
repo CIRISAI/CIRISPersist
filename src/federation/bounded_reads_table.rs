@@ -154,6 +154,13 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Open("one group's full version chain: grows with every supersede"),
     ),
     (
+        "list_group_tips",
+        Bound::Open(
+            "one group's held tips (CC 2.7.8): grows with every version naming another than the \
+             head, until one becomes the head",
+        ),
+    ),
+    (
         "list_hard_case_events",
         Bound::Open("every hard-case event of a kind since an instant, no page size"),
     ),

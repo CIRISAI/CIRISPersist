@@ -35,9 +35,9 @@ pub mod bodies {
     use crate::federation::admission::{
         moderation_reach_of, moderation_reach_of_at, DELEGATION_SCOPE_MODERATE, MEMBER_ROLE_FOUNDER,
     };
-    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+    use crate::federation::edition2::fixture_switch as fx;
     use crate::federation::tier_ingest::test_support::{
-        moderate_delegation_attestation, reseal, sign_community,
+        moderate_delegation_attestation, sign_community,
     };
     use crate::federation::types::{attestation_type, identity_type, Community, CommunityMember};
     use crate::federation::{Attestation, FederationDirectory};
@@ -60,19 +60,24 @@ pub mod bodies {
         if let Some(c) = community_id {
             envelope["community_id"] = serde_json::Value::String(c.to_owned());
         }
-        let mut row = signed_row(granter, recipient, attestation_type::DELEGATES_TO, envelope);
+        // The skeleton (switch off), then ONE edition-2 signing step after
+        // the subject and the end are set.
+        let mut row = fx::with_earlier_form(|| {
+            signed_row(granter, recipient, attestation_type::DELEGATES_TO, envelope)
+        });
         // The rc3 shape: the binding names the key it is about, which is what
         // lets the RECIPIENT resign it (CEG §3.2.3 rule 2).
         row.subject_key_ids = vec![recipient.to_owned()];
         row.expires_at = expires_at;
-        reseal(&mut row);
-        row
+        fx::row_of(&row, granter)
     }
 
     /// A `founder_only` room whose single founder is `founder`.
     async fn room(dir: &dyn FederationDirectory, room: &str, founder: &str) {
         let now = Utc::now();
-        dir.put_community(sign_community(
+        // Wave 2 (T1): the founding roster's voice through the edition-2
+        // door; the room lands under `fx::kid(room)`.
+        let signed = sign_community(
             founder,
             Community {
                 prev_head_digest: String::new(),
@@ -89,9 +94,10 @@ pub mod bodies {
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("room {room}: {e}"));
+        );
+        fx::put_voices(dir, &fx::community_voices(&signed, 1, None, fx::ms(now)))
+            .await
+            .unwrap_or_else(|e| panic!("room {room}: {e}"));
     }
 
     /// Store `row` and return it AS STORED (the instants the walk will read).
@@ -121,13 +127,14 @@ pub mod bodies {
         room: &str,
         t: DateTime<Utc>,
     ) -> Vec<String> {
-        moderation_reach_of_at(dir, root, room, t)
+        // Edition 2: the walk names keys by identity-ref; `root` is a seed.
+        moderation_reach_of_at(dir, &fx::kid(root), room, t)
             .await
             .expect("moderation_reach_of_at")
     }
 
     async fn unset(dir: &dyn FederationDirectory, root: &str) -> Vec<String> {
-        moderation_reach_of(dir, root)
+        moderation_reach_of(dir, &fx::kid(root))
             .await
             .expect("moderation_reach_of")
     }
@@ -171,33 +178,39 @@ pub mod bodies {
         let (t0, t2) = (e.asserted_at, w.asserted_at);
         let t1 = mid(t0, t2);
         assert!(
-            at(dir, &alice, &here, t1).await.contains(&mo),
+            at(dir, &alice, &fx::kid(&here), t1)
+                .await
+                .contains(&fx::kid(&mo)),
             "[{tag}] gate (a): mo is a moderator between appointment ({t0}) and the granter's \
              retraction ({t2}) — a later retraction does not reach back (CC 2.4.1)"
         );
         assert!(
-            at(dir, &alice, &here, t0).await.contains(&mo),
+            at(dir, &alice, &fx::kid(&here), t0)
+                .await
+                .contains(&fx::kid(&mo)),
             "[{tag}] the appointment counts AT its own instant (asserted_at <= t)"
         );
         assert!(
-            !at(dir, &alice, &here, t2).await.contains(&mo),
+            !at(dir, &alice, &fx::kid(&here), t2)
+                .await
+                .contains(&fx::kid(&mo)),
             "[{tag}] gate (a): the retraction counts AT its own instant"
         );
         assert!(
-            !at(dir, &alice, &here, t2 + Duration::seconds(1))
+            !at(dir, &alice, &fx::kid(&here), t2 + Duration::seconds(1))
                 .await
-                .contains(&mo),
+                .contains(&fx::kid(&mo)),
             "[{tag}] gate (a): after the retraction mo has no standing"
         );
         assert!(
-            !at(dir, &alice, &here, t0 - Duration::seconds(1))
+            !at(dir, &alice, &fx::kid(&here), t0 - Duration::seconds(1))
                 .await
-                .contains(&mo),
+                .contains(&fx::kid(&mo)),
             "[{tag}] before the appointment mo had no standing — an edge not yet asserted did \
              not exist"
         );
         assert!(
-            !unset(dir, &alice).await.contains(&mo),
+            !unset(dir, &alice).await.contains(&fx::kid(&mo)),
             "[{tag}] the unset walk is unchanged: a retracted edge confers nothing"
         );
 
@@ -218,17 +231,24 @@ pub mod bodies {
         );
         let t1b = mid(e2.asserted_at, w2.asserted_at);
         assert!(
-            at(dir, &alice, &here, t1b).await.contains(&mo2),
+            at(dir, &alice, &fx::kid(&here), t1b)
+                .await
+                .contains(&fx::kid(&mo2)),
             "[{tag}] gate (b): mo2 is a moderator between appointment and resignation"
         );
         assert!(
-            !at(dir, &alice, &here, w2.asserted_at + Duration::seconds(1))
-                .await
-                .contains(&mo2),
+            !at(
+                dir,
+                &alice,
+                &fx::kid(&here),
+                w2.asserted_at + Duration::seconds(1)
+            )
+            .await
+            .contains(&fx::kid(&mo2)),
             "[{tag}] gate (b): after the resignation mo2 has no standing"
         );
         assert!(
-            !unset(dir, &alice).await.contains(&mo2),
+            !unset(dir, &alice).await.contains(&fx::kid(&mo2)),
             "[{tag}] the unset walk is unchanged on gate (b)"
         );
 
@@ -241,74 +261,186 @@ pub mod bodies {
         .await;
         let x = e3.expires_at.expect("stored expiry");
         assert!(
-            at(dir, &alice, &here, e3.asserted_at).await.contains(&mo3),
+            at(dir, &alice, &fx::kid(&here), e3.asserted_at)
+                .await
+                .contains(&fx::kid(&mo3)),
             "[{tag}] an unexpired appointment counts"
         );
         assert!(
-            !at(dir, &alice, &here, x).await.contains(&mo3),
+            !at(dir, &alice, &fx::kid(&here), x)
+                .await
+                .contains(&fx::kid(&mo3)),
             "[{tag}] an appointment has expired AT its expires_at"
         );
         assert!(
-            !at(dir, &alice, &here, x + Duration::seconds(1))
+            !at(dir, &alice, &fx::kid(&here), x + Duration::seconds(1))
                 .await
-                .contains(&mo3),
+                .contains(&fx::kid(&mo3)),
             "[{tag}] an expired appointment is not reached"
         );
         assert!(
-            unset(dir, &alice).await.contains(&mo3),
+            unset(dir, &alice).await.contains(&fx::kid(&mo3)),
             "[{tag}] the unset walk does not consult expires_at (byte-identical pre-v49)"
         );
 
         // ── community scoping (CC 4.5.4) ──
         put(
             dir,
-            &appointment(&alice, &mo_here, Some(&here), None),
+            &appointment(&alice, &mo_here, Some(&fx::kid(&here)), None),
             "appoint mo-here for this room",
         )
         .await;
         put(
             dir,
-            &appointment(&alice, &mo_there, Some(&there), None),
+            &appointment(&alice, &mo_there, Some(&fx::kid(&there)), None),
             "appoint mo-there for the other room",
         )
         .await;
         let later = Utc::now() + Duration::minutes(1);
-        let in_here = at(dir, &alice, &here, later).await;
+        let in_here = at(dir, &alice, &fx::kid(&here), later).await;
         assert!(
-            in_here.contains(&mo_here),
+            in_here.contains(&fx::kid(&mo_here)),
             "[{tag}] an appointment naming this room is followed: {in_here:?}"
         );
         assert!(
-            !in_here.contains(&mo_there),
+            !in_here.contains(&fx::kid(&mo_there)),
             "[{tag}] an appointment naming ANOTHER room is not followed: {in_here:?}"
         );
         assert!(
-            in_here.contains(&mo3),
+            in_here.contains(&fx::kid(&mo3)),
             "[{tag}] an appointment naming no room is followed (compatibility): {in_here:?}"
         );
-        let in_there = at(dir, &alice, &there, later).await;
+        let in_there = at(dir, &alice, &fx::kid(&there), later).await;
         assert!(
-            in_there.contains(&mo_there) && !in_there.contains(&mo_here),
+            in_there.contains(&fx::kid(&mo_there)) && !in_there.contains(&fx::kid(&mo_here)),
             "[{tag}] the other room sees only its own appointee: {in_there:?}"
         );
         let all = unset(dir, &alice).await;
         assert!(
-            all.contains(&mo_here) && all.contains(&mo_there),
+            all.contains(&fx::kid(&mo_here)) && all.contains(&fx::kid(&mo_there)),
             "[{tag}] the unset walk follows every room, as before: {all:?}"
         );
+    }
+
+    /// Did the voice land the typed row (not `Pending`, not refused)?
+    fn landed(
+        r: &Result<crate::federation::edition2::ingest::StatementOutcome, crate::federation::Error>,
+    ) -> bool {
+        matches!(
+            r,
+            Ok(crate::federation::edition2::ingest::StatementOutcome::Row { .. })
+        )
+    }
+
+    /// The held roster head of room `here` (a seed).
+    async fn head(
+        dir: &dyn FederationDirectory,
+        here: &str,
+    ) -> crate::federation::edition2::names::RowId {
+        fx::held_head(dir, &fx::kid(here))
+            .await
+            .expect("the room's roster head is held")
+            .0
+    }
+
+    /// Wave 2 (T1 "partly"): **a widening through the edition-2 door.** The
+    /// member's consent first, as edition-2 rows: `proposer`'s proposal
+    /// naming the room by its identity-ref, then `member`'s acceptance of it
+    /// (both `put_signed`); then `signer`'s widening voice over the held
+    /// roster head. Returns the widening's outcome.
+    async fn widen_e2(
+        dir: &dyn FederationDirectory,
+        here: &str,
+        proposer: &str,
+        signer: &str,
+        member: &str,
+        role: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, crate::federation::Error>
+    {
+        use crate::federation::membership_acceptance::test_support::{
+            acceptance_row, proposal_row,
+        };
+        use crate::federation::tier_ingest::test_support::sign_community_membership_widening;
+        use crate::federation::types::{cohort_scope, CommunityMembershipWidening};
+        let p = proposal_row(
+            proposer,
+            cohort_scope::COMMUNITY,
+            &fx::kid(here),
+            member,
+            role,
+            at,
+        );
+        fx::put_signed(dir, &p)
+            .await
+            .unwrap_or_else(|e| panic!("the proposal for {member}: {e}"));
+        fx::put_signed(dir, &acceptance_row(member, &p, at))
+            .await
+            .unwrap_or_else(|e| panic!("{member}'s acceptance: {e}"));
+        let w = sign_community_membership_widening(
+            signer,
+            CommunityMembershipWidening {
+                community_key_id: here.to_owned(),
+                member_key_id: member.to_owned(),
+                joined_at: at,
+                effective_at: at,
+                role: role.map(str::to_owned),
+                persist_row_hash: String::new(),
+            },
+        );
+        let h = head(dir, here).await;
+        fx::put_voices(dir, &fx::community_widening_voices(&w, Some(&h))).await
+    }
+
+    /// Wave 2 (T1): `signer`'s voice on the removal of `member` from room
+    /// `here`, over the held roster head.
+    async fn remove_e2(
+        dir: &dyn FederationDirectory,
+        here: &str,
+        signer: &str,
+        member: &str,
+        reason: Option<&str>,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, crate::federation::Error>
+    {
+        use crate::federation::tier_ingest::test_support::sign_community_membership_revocation;
+        use crate::federation::types::CommunityMembershipRevocation;
+        let at = Utc::now();
+        let r = sign_community_membership_revocation(
+            signer,
+            CommunityMembershipRevocation {
+                community_key_id: here.to_owned(),
+                removed_identity_key_id: member.to_owned(),
+                removed_at: at,
+                effective_at: at,
+                reason: reason.map(str::to_owned),
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        );
+        let h = head(dir, here).await;
+        fx::put_voices(dir, &fx::community_revocation_voices(&r, Some(&h))).await
+    }
+
+    /// The room's active roster, as identity-refs.
+    async fn roster(dir: &dyn FederationDirectory, here: &str) -> Vec<String> {
+        dir.active_community_members(&fx::kid(here))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect()
     }
 
     /// **I175 — a moderator's roster change belongs to its instant** (FSD §2,
     /// operator ruling; CC 4.2 liveness at the act, CC 2.4.1 not retroactive).
     /// Founder alice appoints mo (`moderate`, this room); mo widens hank while
     /// the appointment is live; alice withdraws it; hank STAYS; a widening by
-    /// mo after the withdrawal, or dated before the appointment, is refused.
+    /// mo after the withdrawal, or dated before the appointment, does not
+    /// land (wave 2: refused, or held `Pending` short of standing).
     pub async fn exercise_moderator_change_belongs_to_its_instant(
         dir: &dyn FederationDirectory,
         tag: &str,
     ) {
-        use crate::federation::tier_ingest::test_support::sign_community_membership_widening;
-        use crate::federation::types::CommunityMembershipWidening;
         let alice = format!("{tag}-alice");
         let here = format!("{tag}-room");
         register(dir, &alice, &[identity_type::USER]).await;
@@ -319,33 +451,33 @@ pub mod bodies {
             register(dir, k, &[identity_type::USER]).await;
         }
         room(dir, &here, &alice).await;
-        let widen = |member: &str, at: DateTime<Utc>| {
-            sign_community_membership_widening(
-                &mo,
-                CommunityMembershipWidening {
-                    community_key_id: here.clone(),
-                    member_key_id: member.to_owned(),
-                    joined_at: at,
-                    effective_at: at,
-                    role: None,
-                    persist_row_hash: String::new(),
-                },
-            )
-        };
         let e = put(
             dir,
-            &appointment(&alice, &mo, Some(&here), None),
+            &appointment(&alice, &mo, Some(&fx::kid(&here)), None),
             "appoint mo",
         )
         .await;
         let t0 = e.asserted_at;
         tick().await;
-        dir.put_community_membership_widening_consented(widen(&hank, Utc::now()))
-            .await
-            .unwrap_or_else(|err| panic!("[{tag}] I175: mo widens hank while appointed: {err}"));
-        dir.put_community_membership_widening_consented(widen(&jay, t0 - Duration::seconds(5)))
-            .await
-            .expect_err("a widening dated before the appointment has no moderator standing");
+        let r = widen_e2(dir, &here, &alice, &mo, &hank, None, Utc::now()).await;
+        assert!(
+            landed(&r),
+            "[{tag}] I175: mo widens hank while appointed: {r:?}"
+        );
+        let r = widen_e2(
+            dir,
+            &here,
+            &alice,
+            &mo,
+            &jay,
+            None,
+            t0 - Duration::seconds(5),
+        )
+        .await;
+        assert!(
+            !landed(&r),
+            "[{tag}] I175: a widening dated before the appointment has no moderator standing: {r:?}"
+        );
         tick().await;
         put(
             dir,
@@ -354,37 +486,27 @@ pub mod bodies {
         )
         .await;
         tick().await;
-        dir.put_community_membership_widening_consented(widen(&ivy, Utc::now()))
-            .await
-            .expect_err("after the withdrawal mo has no standing");
-        let roster: Vec<String> = dir
-            .active_community_members(&here)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key_id)
-            .collect();
+        let r = widen_e2(dir, &here, &alice, &mo, &ivy, None, Utc::now()).await;
         assert!(
-            roster.contains(&hank),
+            !landed(&r),
+            "[{tag}] I175: after the withdrawal mo has no standing: {r:?}"
+        );
+        let roster = roster(dir, &here).await;
+        assert!(
+            roster.contains(&fx::kid(&hank)),
             "[{tag}] I175: hank, widened while mo was appointed, stays after the withdrawal"
         );
         assert!(
-            !roster.contains(&ivy) && !roster.contains(&jay),
+            !roster.contains(&fx::kid(&ivy)) && !roster.contains(&fx::kid(&jay)),
             "[{tag}] I175: {roster:?}"
         );
     }
 
     /// **I1524 (CIRISPersist#1200, CC 4.5.13) — a moderator removes nobody.**
-    /// Founder alice appoints mo, and mo may still widen; mo's own signature on
-    /// a removal is refused and the member stays; the protocol's signature
+    /// Founder alice appoints mo, and mo may still widen; mo's own voice on
+    /// a removal does not land and the member stays; the protocol's voice
     /// removes.
     pub async fn exercise_a_moderator_removes_nobody(dir: &dyn FederationDirectory, tag: &str) {
-        use crate::federation::tier_ingest::test_support::{
-            sign_community_membership_revocation, sign_community_membership_widening,
-        };
-        use crate::federation::types::{
-            CommunityMembershipRevocation, CommunityMembershipWidening,
-        };
         let [alice, mo, hank] = ["alice", "mo", "hank"].map(|k| format!("{tag}-{k}"));
         let here = format!("{tag}-room");
         register(dir, &alice, &[identity_type::USER]).await;
@@ -393,54 +515,28 @@ pub mod bodies {
         room(dir, &here, &alice).await;
         put(
             dir,
-            &appointment(&alice, &mo, Some(&here), None),
+            &appointment(&alice, &mo, Some(&fx::kid(&here)), None),
             "appoint mo",
         )
         .await;
         tick().await;
-        let at = Utc::now();
-        dir.put_community_membership_widening_consented(sign_community_membership_widening(
-            &mo,
-            CommunityMembershipWidening {
-                community_key_id: here.clone(),
-                member_key_id: hank.clone(),
-                joined_at: at,
-                effective_at: at,
-                role: None,
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] I1524: mo widens hank: {e}"));
+        let r = widen_e2(dir, &here, &alice, &mo, &hank, None, Utc::now()).await;
+        assert!(landed(&r), "[{tag}] I1524: mo widens hank: {r:?}");
         tick().await;
-        let revoke = |signer: &str| {
-            sign_community_membership_revocation(
-                signer,
-                CommunityMembershipRevocation {
-                    community_key_id: here.clone(),
-                    removed_identity_key_id: hank.clone(),
-                    removed_at: Utc::now(),
-                    effective_at: Utc::now(),
-                    reason: None,
-                    witness_set: Vec::new(),
-                    persist_row_hash: String::new(),
-                },
-            )
-        };
-        dir.put_community_membership_revocation(revoke(&mo))
-            .await
-            .expect_err("I1524: a moderator's signature alone removes nobody");
-        let held = |roster: Vec<CommunityMember>| roster.iter().any(|m| m.key_id == hank);
+        let r = remove_e2(dir, &here, &mo, &hank, None).await;
         assert!(
-            held(dir.active_community_members(&here).await.unwrap()),
-            "[{tag}] I1524: hank stays after mo's refused removal"
+            !landed(&r),
+            "[{tag}] I1524: a moderator's voice alone removes nobody: {r:?}"
+        );
+        assert!(
+            roster(dir, &here).await.contains(&fx::kid(&hank)),
+            "[{tag}] I1524: hank stays after mo's removal does not land"
         );
         tick().await;
-        dir.put_community_membership_revocation(revoke(&alice))
-            .await
-            .unwrap_or_else(|e| panic!("[{tag}] I1524: the protocol removes: {e}"));
+        let r = remove_e2(dir, &here, &alice, &hank, None).await;
+        assert!(landed(&r), "[{tag}] I1524: the protocol removes: {r:?}");
         assert!(
-            !held(dir.active_community_members(&here).await.unwrap()),
+            !roster(dir, &here).await.contains(&fx::kid(&hank)),
             "[{tag}] I1524: hank is gone after the protocol's removal"
         );
     }
@@ -456,12 +552,6 @@ pub mod bodies {
         dir: &dyn FederationDirectory,
         tag: &str,
     ) {
-        use crate::federation::tier_ingest::test_support::{
-            sign_community_membership_revocation, sign_community_membership_widening,
-        };
-        use crate::federation::types::{
-            CommunityMembershipRevocation, CommunityMembershipWidening,
-        };
         let [alice, bob, carol] = ["alice", "bob", "carol"].map(|k| format!("{tag}-{k}"));
         let [mo, mo2] = ["mo", "mo2"].map(|k| format!("{tag}-{k}"));
         let [hank, ivy] = ["hank", "ivy"].map(|k| format!("{tag}-{k}"));
@@ -478,7 +568,9 @@ pub mod bodies {
             joined_at: now,
             role: founder.then(|| MEMBER_ROLE_FOUNDER.to_owned()),
         };
-        dir.put_community(sign_community(
+        // Wave 2 (T1): the founding roster's voices (alice, then bob and
+        // carol through `founding_cosignatures`) through the edition-2 door.
+        let founding = sign_community(
             &alice,
             Community {
                 prev_head_digest: String::new(),
@@ -491,82 +583,58 @@ pub mod bodies {
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("room: {e}"));
-        let widen = |signer: &str, member: &str, role: Option<&str>| {
-            let at = Utc::now();
-            sign_community_membership_widening(
-                signer,
-                CommunityMembershipWidening {
-                    community_key_id: here.clone(),
-                    member_key_id: member.to_owned(),
-                    joined_at: at,
-                    effective_at: at,
-                    role: role.map(str::to_owned),
-                    persist_row_hash: String::new(),
-                },
-            )
-        };
+        );
+        fx::put_voices(dir, &fx::community_voices(&founding, 1, None, fx::ms(now)))
+            .await
+            .unwrap_or_else(|e| panic!("room: {e}"));
         // (1) alice appoints mo, then leaves.
         put(
             dir,
-            &appointment(&alice, &mo, Some(&here), None),
+            &appointment(&alice, &mo, Some(&fx::kid(&here)), None),
             "appoint mo",
         )
         .await;
         tick().await;
-        let at = Utc::now();
-        dir.put_community_membership_revocation(sign_community_membership_revocation(
-            &alice,
-            CommunityMembershipRevocation {
-                community_key_id: here.clone(),
-                removed_identity_key_id: alice.clone(),
-                removed_at: at,
-                effective_at: at,
-                reason: Some("left".into()),
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] alice leaves (bob remains a founder): {e}"));
+        let r = remove_e2(dir, &here, &alice, &alice, Some("left")).await;
+        assert!(
+            landed(&r),
+            "[{tag}] alice leaves (bob remains a founder): {r:?}"
+        );
         tick().await;
-        dir.put_community_membership_widening_consented(widen(&mo, &hank, None))
-            .await
-            .unwrap_or_else(|e| {
-                panic!("[{tag}] I175b: alice left, mo's appointment stands — mo widens hank: {e}")
-            });
+        let r = widen_e2(dir, &here, &bob, &mo, &hank, None, Utc::now()).await;
+        assert!(
+            landed(&r),
+            "[{tag}] I175b: alice left, mo's appointment stands — mo widens hank: {r:?}"
+        );
         // (2) carol appoints mo2 BEFORE she is a founder; bob then makes her one.
         put(
             dir,
-            &appointment(&carol, &mo2, Some(&here), None),
+            &appointment(&carol, &mo2, Some(&fx::kid(&here)), None),
             "carol appoints mo2",
         )
         .await;
         tick().await;
-        dir.put_community_membership_widening_consented(widen(
+        let r = widen_e2(
+            dir,
+            &here,
+            &bob,
             &bob,
             &carol,
             Some(MEMBER_ROLE_FOUNDER),
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] bob makes carol a founder: {e}"));
+            Utc::now(),
+        )
+        .await;
+        assert!(landed(&r), "[{tag}] bob makes carol a founder: {r:?}");
         tick().await;
-        dir.put_community_membership_widening_consented(widen(&mo2, &ivy, None))
-            .await
-            .expect_err(
-                "an appointment issued while carol had no authority never conferred the duty",
-            );
-        let roster: Vec<String> = dir
-            .active_community_members(&here)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key_id)
-            .collect();
+        let r = widen_e2(dir, &here, &bob, &mo2, &ivy, None, Utc::now()).await;
         assert!(
-            roster.contains(&hank) && !roster.contains(&ivy),
+            !landed(&r),
+            "[{tag}] I175b: an appointment issued while carol had no authority never \
+             conferred the duty: {r:?}"
+        );
+        let roster = roster(dir, &here).await;
+        assert!(
+            roster.contains(&fx::kid(&hank)) && !roster.contains(&fx::kid(&ivy)),
             "[{tag}] I175b: {roster:?}"
         );
     }

@@ -295,6 +295,9 @@ pub mod membership_acceptance;
 /// v52.0.0 (CIRISPersist#955) — I210–I219.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod membership_acceptance_invariants;
+/// v62.0.0 (wave GC6; CC 2.7.3) — I3871–I3872: the membership replies fold.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod membership_fold_invariants;
 /// v49.0.0 (CIRISPersist#908) — the moderation walk read at an instant, in one room.
 #[cfg(test)]
 pub mod moderation_walk_asof_invariants;
@@ -379,17 +382,11 @@ pub(crate) mod rc20_rules_invariants;
 /// v50.0.0 (CIRISPersist#925/#927/#928) — the CC rc5 adopts, every backend.
 #[cfg(test)]
 pub mod rc5_adopts_invariants;
-/// v51.0.0 — the rc6 trust-root security set (I191–I196).
-#[cfg(test)]
-pub(crate) mod rc6_invariants;
 /// v53.0.0 (CC rc7, CIRISConstitution#139) — I430–I439: commitments bind key
 /// material, the accord commits a recovery key per holder, no steward backstop,
 /// acceptance edges rotate as grants do, a keyless family confers at its quorum.
 #[cfg(test)]
 pub(crate) mod rc7_accord_invariants;
-/// CIRISPersist#973 — I345–I349, the community boot leg and the re-bake path.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-mod remint_invariants;
 /// v53.0.0 (CIRISEdge#763) — I415c–I415f: repair after eviction, and the
 /// custody report under the data a DAG was sealed with.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -544,16 +541,6 @@ mod key_grant_rows_invariants;
 // LocalSigner exists, so peers admit it at the federation-tier gate.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod claim_signing_invariants;
-// CIRISPersist#864 (`FSD/KEY_RECORD_REBIND.md`) — I99–I103: the same-key rebind.
-// v44.7.0 (#864) — the witnesses drive the key plan, which exists only with a
-// backend feature; a no-backend axis has nothing to witness here.
-#[cfg(all(
-    any(test, feature = "test-anchor"),
-    any(feature = "postgres", feature = "sqlite")
-))]
-// v62.0.0 (P13) — every item inside is test-gated; so is the module.
-#[cfg(test)]
-pub mod key_rebind_invariants;
 // v61 (CC 2.6.2) — the open-time pass over non-canonical signed instants.
 pub mod instant_form;
 #[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
@@ -745,10 +732,6 @@ impl ConsentSweepReport {
     }
 }
 
-/// I1783 — the accord lineage cross-implementation vector (CIRISVerify).
-#[cfg(test)]
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
-mod accord_lineage_vector;
 /// v53.0.0 (CC 4.2.6) — I450e–I450h, the accord's roster change.
 #[cfg(test)]
 mod accord_roster_invariants;
@@ -973,6 +956,9 @@ pub mod sth_form;
 // v62.0.0 (slice D) — I1850/I1851: CIRISVerify 23's vectors, pinned as files.
 #[cfg(test)]
 mod verify_v23_vectors;
+// v62.0.0 (wave GC7) — I3911–I3915: the converted gates mark the fold.
+#[cfg(test)]
+mod gc7_fold_invariants;
 // v62.0.0 (slice D) — I1853–I1855, I1857: the composite cut, by form.
 #[cfg(test)]
 mod sth_form_invariants;
@@ -2969,6 +2955,19 @@ async fn check_roster_authority_over<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC7; CC 2.7.3) — the standing below is a FOLD over the
+    // group's other rows (its record, its roster events, moderator
+    // delegations, the incoming member's acceptance, the signers' seats).
+    // Declare them, so a held row re-folds when any of them changes.
+    {
+        use edition2::fold::{reads, Dep};
+        reads(Dep::key(group_key_id));
+        reads(Dep::key(&incoming.key_id));
+        reads(Dep::key(primary));
+        for s in signers {
+            reads(Dep::key(s));
+        }
+    }
     let is_this_row = |e: &RosterEvent| {
         e.is_add == !is_revocation
             && e.effective_at == effective_at
@@ -3032,11 +3031,19 @@ where
         StandingVerdict::ConsensusShort { detail, shortfall } => {
             Some(refusal(ROSTER_CONSENSUS_INSUFFICIENT, &detail, shortfall))
         }
+        // v62.0.0 (wave GC7; CC 2.7.3) — every Refuse rule reads the held
+        // roster, not the row's bytes: the row is HELD with the rule as its
+        // reason (a plain refusal outside a fold attempt).
         StandingVerdict::Refuse {
             rule,
             detail,
             shortfall,
-        } => return Err(refusal(rule, &detail, shortfall)),
+        } => {
+            return Err(edition2::fold::hold(
+                rule,
+                refusal(rule, &detail, shortfall),
+            ))
+        }
     };
     // v52.0.0 (CIRISPersist#955) — a GROWTH (a key not active before this
     // instant) needs the member's own acceptance, under every protocol. The
@@ -3056,7 +3063,14 @@ where
         )
         .await;
         if let Err(err) = accepted {
-            return Err(short.unwrap_or(err));
+            // v62.0.0 (wave GC7) — the member's acceptance is another row:
+            // held under the acceptance rule's own token (the shortfall's
+            // when the count is short too). A mark already made inside the
+            // acceptance gate wins (the first mark is kept).
+            return Err(match short {
+                Some(s) => edition2::fold::hold(edition2::fold::reason::COUNT_SHORT, s),
+                None => hold_by_own_rule(err),
+            });
         }
     }
     Ok(match short {
@@ -3085,10 +3099,15 @@ impl RosterAuthority {
     /// # Errors
     ///
     /// The carried shortfall refusal.
+    ///
+    /// v62.0.0 (wave GC7; CC 2.7.3) — under a fold attempt the shortfall
+    /// HOLDS the row (`count_short`); outside one it is the refusal it was.
     pub fn into_result(self) -> Result<(), Error> {
         match self {
             Self::Admitted => Ok(()),
-            Self::ConsensusShort(e) => Err(e),
+            Self::ConsensusShort(e) => {
+                Err(edition2::fold::hold(edition2::fold::reason::COUNT_SHORT, e))
+            }
         }
     }
 
@@ -3100,6 +3119,22 @@ impl RosterAuthority {
             Self::ConsensusShort(e) => Some(e),
         }
     }
+}
+
+/// v62.0.0 (wave GC7; CC 2.7.3) — mark the running fold attempt held with
+/// the refusal's OWN rule token, for the typed refusals that read other rows
+/// and carry one (`RosterAuthorityUnauthorized`, `MembershipAcceptanceRefused`;
+/// `group_dissolved` for [`Error::GroupDissolved`]). Any other error (a
+/// storage failure, a bytes refusal) is returned unmarked. Returns `err`
+/// unchanged either way (a plain refusal outside an attempt).
+pub(crate) fn hold_by_own_rule(err: Error) -> Error {
+    let reason = match &err {
+        Error::RosterAuthorityUnauthorized { rule, .. }
+        | Error::MembershipAcceptanceRefused { rule, .. } => *rule,
+        Error::GroupDissolved { .. } => edition2::fold::reason::GROUP_DISSOLVED,
+        _ => return err,
+    };
+    edition2::fold::hold(reason, err)
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD §4) — the door's standing check for one
@@ -3147,6 +3182,12 @@ pub async fn check_community_roster_authority_verdict<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC7; CC 2.7.3) — every check below reads the room's
+    // held rows: declared (so a held row re-folds when they change), and a
+    // dissolution holds under a fold attempt. The delegated gates mark their
+    // own reasons (their owners' conversions); a typed refusal they leave
+    // unmarked is held under its own rule token here.
+    edition2::fold::reads(edition2::fold::Dep::key(community_key_id));
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(RosterAuthority::Admitted);
     };
@@ -3156,7 +3197,8 @@ where
         directory,
         community_key_id,
     ))
-    .await?;
+    .await
+    .map_err(hold_by_own_rule)?;
     // v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — an act against a member
     // of a one-voice affiliation needs a countersign from outside the seat.
     if is_revocation && !signers.contains(&incoming.key_id) {
@@ -3262,6 +3304,9 @@ pub async fn check_family_roster_authority_verdict<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC7; CC 2.7.3) — the family's held rows: declared; a
+    // dissolution holds under a fold attempt (`refuse_if_dissolved`).
+    edition2::fold::reads(edition2::fold::Dep::key(family_key_id));
     let Some(family) = directory.lookup_family(family_key_id).await? else {
         return Ok(RosterAuthority::Admitted);
     };
@@ -3911,11 +3956,35 @@ pub trait FederationDirectory: Send + Sync {
         Ok(None)
     }
 
+    /// v62.0.0 (wave G0 fix4) — set ONLY the reason of a row's fold state
+    /// (`reason`, `detail`, `since_us`; `None` = concluded), keeping its
+    /// reads, arrival, plane and slot: the re-fold's `refolding` marker and
+    /// its restore. `false` when the row has no fold state. A directory with
+    /// no fold store refuses.
+    async fn put_fold_reason(
+        &self,
+        row_id: &edition2::names::RowId,
+        held: Option<(String, String)>,
+    ) -> Result<bool, Error> {
+        let _ = (row_id, held);
+        Err(Error::Unsupported {
+            method: "put_fold_reason",
+        })
+    }
+
     /// v62.0.0 (wave G0 v4) — the CONCLUDED rows of one projection slot
     /// (`ceg_fold_state.slot`), in row-id order. Empty by default.
     async fn fold_slot_rows(&self, slot: &str) -> Result<Vec<edition2::names::RowId>, Error> {
         let _ = slot;
         Ok(Vec::new())
+    }
+
+    /// v62.0.0 (wave G0 v4) — does any HELD row (one that concludes
+    /// nothing) sit in projection slot `slot`? The kept-but-not-served
+    /// bytes consult (`edition2::fold::bytes_servable`). `false` by default.
+    async fn fold_slot_held(&self, slot: &str) -> Result<bool, Error> {
+        let _ = slot;
+        Ok(false)
     }
 
     /// v62.0.0 (wave G0 v4) — is any row left `refolding` (an interrupted
@@ -8915,7 +8984,21 @@ pub trait FederationDirectory: Send + Sync {
                 "verify_membership_quorum: membership change not authorized: {detail}"
             ))
         };
-        let prior_envelope = self.group_prior_envelope(cohort, group_key_id).await?;
+        // v62.0.0 (wave GC7; CC 2.7.3) — everything below but the change
+        // envelope's own shape reads OTHER rows (the prior head, its roster
+        // fold, the members' key records): under a fold attempt a failure
+        // holds the row (re-folded when the group or a member key changes);
+        // outside one it is the refusal it was.
+        let held = |reason: &'static str, e: Error| edition2::fold::hold(reason, e);
+        edition2::fold::reads(edition2::fold::Dep::key(group_key_id));
+        let prior_envelope = match self.group_prior_envelope(cohort, group_key_id).await {
+            Ok(p) => p,
+            // An unknown group: the row names it, so it WAITS for it.
+            Err(e @ Error::InvalidArgument(_)) if cohort != cohort::Cohort::SelfId => {
+                return Err(held(edition2::fold::reason::LINK_UNHELD, e))
+            }
+            Err(e) => return Err(e),
+        };
         // The group's protocol inputs and its ACTIVE roster with roles — the
         // roster the evaluator judges. `group_prior_envelope` has already
         // refused an unknown group and the `self` cohort.
@@ -8993,6 +9076,7 @@ pub trait FederationDirectory: Send + Sync {
         }
         let mut directory: Vec<ThresholdMember> = Vec::with_capacity(key_ids.len());
         for k in key_ids {
+            edition2::fold::reads(edition2::fold::Dep::key(&k));
             if let Some(rec) = self.lookup_public_key(&k).await? {
                 directory.push(ThresholdMember {
                     member_id: rec.key_id,
@@ -9006,21 +9090,30 @@ pub trait FederationDirectory: Send + Sync {
         // 1. Structure.
         let prior_entrenched = prior_envelope.get("consensus_protocol_entrenched")
             == Some(&serde_json::Value::Bool(true));
+        let unauthorized = edition2::fold::reason::MEMBERSHIP_CHANGE_UNAUTHORIZED;
         let new_roster = if prior_entrenched {
+            // CC rc21 X6 — an amendment to an entrenched family that its
+            // structure gate refuses concludes nothing.
             group_membership_change::validate_membership_change_structure(
                 &prior_envelope,
                 change_envelope,
                 &directory,
             )
-            .map_err(|e| refuse(e.to_string()))?;
+            .map_err(|e| {
+                held(
+                    edition2::fold::reason::AMENDMENT_ENTRENCHED,
+                    refuse(e.to_string()),
+                )
+            })?;
             ag::roster_from_envelope(change_envelope, &directory)
-                .map_err(|e| refuse(e.to_string()))?
+                .map_err(|e| held(unauthorized, refuse(e.to_string())))?
         } else {
             let new_roster = ag::roster_from_envelope(change_envelope, &directory)
-                .map_err(|e| refuse(e.to_string()))?;
+                .map_err(|e| held(unauthorized, refuse(e.to_string())))?;
             if change_envelope.get("family_key_id") != prior_envelope.get("family_key_id") {
-                return Err(refuse(
-                    "membership change must keep the same family_key_id".to_string(),
+                return Err(held(
+                    unauthorized,
+                    refuse("membership change must keep the same family_key_id".to_string()),
                 ));
             }
             let new_protocol = change_envelope
@@ -9036,7 +9129,7 @@ pub trait FederationDirectory: Send + Sync {
         };
         // 2. One seat on the prior roster (verify's derivation).
         let prior_roster = ag::roster_from_envelope(&prior_envelope, &directory)
-            .map_err(|e| refuse(e.to_string()))?;
+            .map_err(|e| held(unauthorized, refuse(e.to_string())))?;
         if !prior_entrenched {
             // Anti-replay (verify's structural gate does this for the
             // entrenched arm): the change names the roster it supersedes.
@@ -9049,8 +9142,12 @@ pub trait FederationDirectory: Send + Sync {
             let actual_prior: Vec<&str> =
                 prior_roster.iter().map(|m| m.member_id.as_str()).collect();
             if claimed_prior != actual_prior {
-                return Err(refuse(
-                    "supersedes.prior_member_key_ids does not match the prior group".to_string(),
+                return Err(held(
+                    edition2::fold::reason::PRIOR_ROSTER_MISMATCH,
+                    refuse(
+                        "supersedes.prior_member_key_ids does not match the prior group"
+                            .to_string(),
+                    ),
                 ));
             }
         }
@@ -9135,9 +9232,12 @@ pub trait FederationDirectory: Send + Sync {
                     )));
                 }
                 consensus::Verdict::Unevaluable { reason } => {
-                    return Err(refuse(format!(
-                        "consensus_protocol {protocol:?} cannot be evaluated: {reason}"
-                    )))
+                    return Err(held(
+                        edition2::fold::reason::ROSTER_CONSENSUS_UNEVALUABLE,
+                        refuse(format!(
+                            "consensus_protocol {protocol:?} cannot be evaluated: {reason}"
+                        )),
+                    ))
                 }
             }
         }
@@ -9285,18 +9385,25 @@ pub trait FederationDirectory: Send + Sync {
             &new.family.consensus_protocol,
             &change_envelope,
         )?;
+        // v62.0.0 (wave GC7; CC 2.7.3) — the prior head is another row: an
+        // absent one WAITS (held, `group_not_held`), and every check against
+        // it below holds rather than refuses under a fold attempt.
+        edition2::fold::reads(edition2::fold::Dep::key(&new.family.family_key_id));
         let prior = self
             .lookup_family(&new.family.family_key_id)
             .await?
             .ok_or_else(|| {
-                // v62.0.0 (CC 2.7) — the group is not held (yet): the wait
-                // the executor's verdict answers for the same fact
-                // (`group_supersede_admit::unheld_group`).
-                Error::link_not_held(
-                    "family",
-                    format!(
+                edition2::fold::hold(
+                    edition2::fold::reason::LINK_UNHELD,
+                    // v62.0.0 (CC 2.7) — the group is not held (yet): the wait
+                    // the executor's verdict answers for the same fact
+                    // (`group_supersede_admit::unheld_group`).
+                    Error::link_not_held(
+                        "family",
+                        format!(
                         "supersede: family group {:?} is unheld here (nothing to supersede yet)",
                         new.family.family_key_id
+                    ),
                     ),
                 )
             })?;
@@ -9307,7 +9414,10 @@ pub trait FederationDirectory: Send + Sync {
             prior.consensus_protocol_entrenched,
             new.family.consensus_protocol_entrenched,
             &change_envelope,
-        )?;
+        )
+        // CC rc21 X6 — "any amendment to an entrenched family concludes
+        // nothing": the entrenched flag is read from the held head.
+        .map_err(|e| edition2::fold::hold(edition2::fold::reason::AMENDMENT_ENTRENCHED, e))?;
         // v52.0.0 (CIRISPersist#956) — a dissolved family admits no change; a
         // dissolution changes nothing but `dissolved_at`, and is the one the
         // quorum signed; a self-leave is admitted on the leaver's signature.
@@ -9377,6 +9487,10 @@ pub trait FederationDirectory: Send + Sync {
         // before any write): the one predicate the replicated door runs. The
         // folded roster would re-apply a resignation the record has since
         // cleared by re-seating the key, so the two doors would disagree.
+        // v62.0.0 (wave GC7; CC 2.7.3) — which quorum applies is read from
+        // held rows (the founders' link): declared, so the row re-folds when
+        // the community's rows change.
+        edition2::fold::reads(edition2::fold::Dep::key(&new.community.community_key_id));
         let founders_link_is_the_quorum =
             canonical_community::founders_link_is_the_quorum(self, &new.community.community_key_id)
                 .await?;
@@ -9558,6 +9672,16 @@ pub trait FederationDirectory: Send + Sync {
                 writer_occurrence_key_id,
             )
             .await?;
+            // v62.0.0 (wave GC7; CC 2.7.3) — the target's record and roster
+            // fold, and the writer's occurrence / owner-binding axes, are
+            // other rows: a refusal on them HOLDS the row under a fold attempt
+            // (re-folded when any of them changes), and is the refusal it was
+            // outside one.
+            edition2::fold::reads(edition2::fold::Dep::key(writer_occurrence_key_id));
+            edition2::fold::reads(edition2::fold::Dep::key(&identity));
+            if let Some(target) = claimed_target_id {
+                edition2::fold::reads(edition2::fold::Dep::key(target));
+            }
             // ACTIVE membership, not raw containment — the roster is
             // append-only, so raw `members` counts a revoked member as a
             // member. See `active_community_key_ids_for` for the full
@@ -9599,7 +9723,14 @@ pub trait FederationDirectory: Send + Sync {
                         Some(held) => {
                             if let Ok(addressed) = cohort::Cohort::from_token(claimed_cohort_scope)
                             {
-                                affiliation_config::check_record_is(&held, addressed)?;
+                                affiliation_config::check_record_is(&held, addressed).map_err(
+                                    |e| {
+                                        edition2::fold::hold(
+                                            edition2::fold::reason::WRITE_SCOPE_REFUSED,
+                                            e,
+                                        )
+                                    },
+                                )?;
                             }
                             true
                         }
@@ -9617,7 +9748,11 @@ pub trait FederationDirectory: Send + Sync {
                         "ciris-persist: write-path cohort_scope refused (AV-45): the claimed \
                          cohort's roster is not held here yet — retryable"
                     );
-                    return Err(Error::WriteScopeRefused(reason));
+                    // The row names the target: it WAITS for it.
+                    return Err(edition2::fold::hold(
+                        edition2::fold::reason::LINK_UNHELD,
+                        Error::WriteScopeRefused(reason),
+                    ));
                 }
                 match plane {
                     TargetPlane::Family => {
@@ -9673,7 +9808,17 @@ pub trait FederationDirectory: Send + Sync {
                 target = ?claimed_target_id,
                 "ciris-persist: write-path cohort_scope refused (AV-45)"
             );
-            Error::WriteScopeRefused(reason)
+            // v62.0.0 (wave GC7) — a targeted scope's refusal reads the
+            // roster fold (held); the self / commons arms read only the
+            // writer and the row (refused).
+            if plane.is_some() {
+                edition2::fold::hold(
+                    edition2::fold::reason::WRITE_SCOPE_REFUSED,
+                    Error::WriteScopeRefused(reason),
+                )
+            } else {
+                Error::WriteScopeRefused(reason)
+            }
         })
     }
 
@@ -9770,15 +9915,27 @@ pub trait FederationDirectory: Send + Sync {
         ci: &crossing::ContextualIntegrity,
         signed: SignedAttestation,
     ) -> Result<crossing::MeshCrossingOutcome, Error> {
+        // v62.0.0 (wave GC7; CC 2.7.3) — the prior is the row this one
+        // names: absent, the widening WAITS for it; present, the widening is
+        // compared with its bytes (another row), so a mismatch holds under a
+        // fold attempt. Outside one both are the refusals they were.
+        edition2::fold::reads(
+            edition2::fold::Dep::row_hex(prior_attestation_id)
+                .unwrap_or_else(|| edition2::fold::Dep::key(prior_attestation_id)),
+        );
         let prior = self
             .get_attestation(prior_attestation_id)
             .await?
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "widen_audience: prior row {prior_attestation_id} does not exist"
-                ))
+                edition2::fold::hold(
+                    edition2::fold::reason::LINK_UNHELD,
+                    Error::InvalidArgument(format!(
+                        "widen_audience: prior row {prior_attestation_id} does not exist"
+                    )),
+                )
             })?;
-        crossing::check_widening(&prior, &signed.attestation)?;
+        crossing::check_widening(&prior, &signed.attestation)
+            .map_err(|e| edition2::fold::hold(edition2::fold::reason::WIDENING_NOT_OF_PRIOR, e))?;
         let now = crate::host::clock::now();
         crossing::check_contextual_integrity(
             self,
@@ -12235,28 +12392,21 @@ pub enum Error {
     },
 
     /// v37.0.0 (CIRISPersist#734). A [`SignedLocationProof`] was REFUSED
-    /// because its `authority_key_id` is neither the subject itself nor a
-    /// LIVE delegate of the subject. Location is self-knowledge: a third
-    /// party has no source for where a subject is, so their valid signature
-    /// proves only that they signed it. E4 closed "no signature at all";
-    /// this closes "which identity may assert a location for this subject".
-    /// The admissible set is exactly `{subject} ∪ {live delegates of subject}`.
-    /// The row is not stored (verify-before-mutation, AV-9). Stable `kind()`
-    /// token `federation_location_authority_unauthorized`.
-    ///
-    /// `rule` names WHICH clause refused, and the distinction is
-    /// operationally load-bearing: `location_authority_no_delegation_edge`
-    /// may be an out-of-order replication artifact (the `delegates_to` has
-    /// not arrived yet) and is safe to RETRY; the retracted/expired tokens
-    /// are substantive verdicts that retrying will not change. See
-    /// [`tier_ingest::LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE`].
+    /// because its `authority_key_id` is not the subject itself. Location is
+    /// self-knowledge: a third party has no source for where a subject is, so
+    /// their valid signature proves only that they signed it. v62.0.0 (CC
+    /// 4.5.9.1 rc21, ruling 10): "no delegation mints one" — the admissible
+    /// set is exactly `{subject}`, read from the row's own bytes (a DOOR
+    /// refusal; the delegate arm is removed). The row is not stored
+    /// (verify-before-mutation, AV-9). Stable `kind()` token
+    /// `federation_location_authority_unauthorized`; `rule` is
+    /// [`tier_ingest::LOCATION_AUTHORITY_RULE_NOT_SUBJECT`], never retryable.
     #[error(
         "location proof for subject {subject_key_id:?} offers authority \
-         {offered_authority_key_id:?}, which is neither the subject itself nor a live \
-         delegates_to delegate of it ({rule}): location is SELF-KNOWLEDGE, so a third \
-         party's valid signature proves only that they signed it, never where the \
-         subject is. Admissible authority is exactly the subject plus its live \
-         delegates (CIRISPersist#734)"
+         {offered_authority_key_id:?}, which is not the subject itself ({rule}): location \
+         is SELF-KNOWLEDGE and no delegation mints one, so a third party's valid \
+         signature proves only that they signed it, never where the subject is \
+         (CIRISPersist#734; CC 4.5.9.1)"
     )]
     LocationAuthorityUnauthorized {
         /// `location_proof.subject_key_id` — whose location was asserted.
@@ -12265,8 +12415,7 @@ pub enum Error {
         /// DID verify against its registered pubkeys. The refusal is about
         /// standing, never about the signature.
         offered_authority_key_id: String,
-        /// Which clause refused; one of the `tier_ingest::LOCATION_AUTHORITY_RULE_*`
-        /// tokens. `..._no_delegation_edge` is the retryable one.
+        /// Which clause refused: `tier_ingest::LOCATION_AUTHORITY_RULE_NOT_SUBJECT`.
         rule: &'static str,
     },
 
@@ -14242,6 +14391,11 @@ pub mod malformed_row {
     /// v62.0.0 (wave P1e; CC 2.7.11) — a signer whose key record's
     /// `identity_type` holds neither `user` nor `accord_holder`.
     pub const ADMISSION_ISSUER_NOT_PERSON: &str = "admission_issuer_not_person";
+    /// v62.0.0 (wave P1e; CC ruling, free-form body numbers) — a number in
+    /// a free-form body whose exact decimal cannot be stated: its mantissa
+    /// (or an integral value) lies outside the CBOR integer range persist
+    /// states (`edition2::payloads::body_number`).
+    pub const BODY_NUMBER_UNREPRESENTABLE: &str = "body_number_unrepresentable";
     /// v62.0.0 (wave O1; CC 3.3.6, the rc21 second voice) — a statement over
     /// an `identity:occurrence` row in the occurrence key's role (`iss` =
     /// `sub` = `occurrence_key_id`) not signed by that key itself: it proves
@@ -14349,6 +14503,7 @@ pub mod malformed_row {
         ADMISSION_LEASE_OUT_OF_WINDOW,
         ADMISSION_EFFECT_NEEDS_COUNT,
         ADMISSION_ISSUER_NOT_PERSON,
+        BODY_NUMBER_UNREPRESENTABLE,
         OCCURRENCE_VOICE_NOT_OWN_KEY,
         RECOVERY_KEY_IS_NOT_A_SIGNER,
         OCCURRENCE_BINDS_MACHINE_TO_PERSON,
@@ -14597,9 +14752,9 @@ impl Error {
                     crate::scope::ScopeRefusalReason::MembershipUnresolved
                 )
             }
-            Error::LocationAuthorityUnauthorized { rule, .. } => {
-                *rule == tier_ingest::LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE
-            }
+            // GC8: the delegation clauses are fold holds now; the one refusal
+            // left (`not_subject`) is never a wait.
+            Error::LocationAuthorityUnauthorized { .. } => false,
             Error::RosterAuthorityUnauthorized { rule, .. } => {
                 *rule == ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED
             }

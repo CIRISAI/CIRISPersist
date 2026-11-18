@@ -2448,79 +2448,53 @@ impl PeerWriteQuota {
     }
 }
 
-/// v22.0.0 (CIRISPersist#543 finding 4, AV-76) — the shared assertion
-/// bodies proving the `put_attestation` gate ORDER, run identically
-/// against every backend.
-///
-/// The order is a security property, not an implementation detail, and
-/// #541 is the standing reminder of what happens when two backends'
-/// write paths drift: the bodies live HERE, once, and each backend's test
-/// module calls them, so a divergence is a compile-or-fail, never a
-/// silent asymmetry.
+// v22.0.0 (CIRISPersist#543 finding 4, AV-76) — the shared assertion
+// bodies proving the `put_attestation` gate ORDER, run identically
+// against every backend.
+//
+// The order is a security property, not an implementation detail, and
+// #541 is the standing reminder of what happens when two backends'
+// write paths drift: the bodies live HERE, once, and each backend's test
+// module calls them, so a divergence is a compile-or-fail, never a
+// silent asymmetry.
 #[cfg(test)]
 pub mod gate_order_test_support {
+    //! v62.0.0 (JSON-cut slice E4) — every body here offers EDITION-2
+    //! statements through the statement door (`edition2::ingest::
+    //! put_statement`): the JSON door these witnesses used to drive refuses
+    //! an earlier-form row by name before any other gate. The signer's key is
+    //! live as an edition-2 `key:record` first (the door reads the signer
+    //! from the held key plane), so each row reaches the gates it measures.
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::put_statement as put_at;
     use crate::federation::types::{
-        attestation_tier, Attestation, KeyRecord, SignedAttestation, SignedKeyRecord,
+        attestation_tier, attestation_type, identity_type, Attestation,
     };
     use crate::federation::FederationDirectory;
 
-    /// A key with REAL deterministic hybrid pubkeys, so the tier-3 crypto
-    /// gate resolves the attester and then rejects on the SIGNATURE
-    /// (rather than short-circuiting on an unknown attester).
-    fn key_with_real_pubkeys(key_id: &str) -> KeyRecord {
-        let (ed_pk, mldsa_pk) =
-            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
-        KeyRecord {
-            key_id: key_id.into(),
-            pubkey_ed25519_base64: ed_pk,
-            pubkey_ml_dsa_65_base64: mldsa_pk,
-            algorithm: crate::federation::types::algorithm::HYBRID.into(),
-            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
-            identity_ref: key_id.into(),
-            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": key_id }),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "c2lnbmF0dXJl".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-            attestation_evidence: Some(
-                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                ),
-            ),
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        }
-    }
-
-    /// A federation-tier row whose scrub signature is garbage — it can
-    /// never clear the tier-3 hybrid verify.
-    fn unverifiable_row(key_id: &str, tier: &str, cohort_scope: &str) -> Attestation {
-        // v31.0.0 (CIRISPersist#643/#598) — the tier-1 bindings (the #643
-        // mirror and the #598 instants) are STAMPED but the row is deliberately
-        // NOT re-signed: this witness needs a row that clears the pure tier-1
-        // gates and dies at the tier-3 hybrid verify, so sealing it with a
-        // valid signature would move what the test measures — and leaving a
-        // tier-1 binding off moves it just as far in the other direction.
-        let mut row = Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            attesting_key_id: key_id.into(),
-            attested_key_id: key_id.into(),
-            attestation_type: "attestation:self_verify".into(),
-            weight: Some(1.0),
-            asserted_at: chrono::Utc::now(),
+    /// A row by the test key `seed` under the registered
+    /// `attestation:self_verify` family, earlier-shaped and UNSIGNED; `n`
+    /// keeps rows distinct.
+    fn row(seed: &str, tier: &str, cohort_scope: &str, n: u64) -> Attestation {
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        Attestation {
+            attestation_id: format!("{seed}-{n}"),
+            attesting_key_id: seed.into(),
+            attested_key_id: seed.into(),
+            attestation_type: attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: now,
             expires_at: None,
-            attestation_envelope: serde_json::json!({}),
-            original_content_hash: "abcdef01".into(),
-            scrub_signature_classical: "c2ln".into(),
+            attestation_envelope: serde_json::json!({
+                "dimension": "attestation:self_verify",
+                "n": n,
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
             scrub_signature_pqc: None,
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: chrono::Utc::now(),
+            scrub_key_id: seed.into(),
+            scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             subject_key_ids: Vec::new(),
@@ -2529,9 +2503,17 @@ pub mod gate_order_test_support {
             tier: tier.into(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        };
-        crate::federation::tier_ingest::test_support::stamp_mirror(&mut row);
-        row
+        }
+    }
+
+    /// `seed`'s statement of `a`, offered at `a`'s tier.
+    async fn offer<F>(dir: &F, a: &Attestation, seed: &str) -> Result<(), crate::federation::Error>
+    where
+        F: FederationDirectory + ?Sized,
+    {
+        put_at(dir, &e2::statement_of(a, seed), None, &a.tier.clone())
+            .await
+            .map(|_| ())
     }
 
     /// **The headline AV-76 assertion.** A federation-tier row that fails
@@ -2539,62 +2521,51 @@ pub mod gate_order_test_support {
     /// refused on the CRYPTO, proving the walk never ran.
     ///
     /// The tripwire is `cohort_scope = "family"`: a legal closed-set value
-    /// (so the pure tier-1 `check_cohort_scope` admits it) that the AV-45
-    /// membership walk `check_write_cohort_scope_for` then refuses,
-    /// because `put_attestation` supplies no `cohort_target_id`. That walk
-    /// resolves the writer's occurrence→identity binding and lists its
-    /// families and communities — three directory reads.
-    ///
-    /// BEFORE this cut the walk sat at position 6 of 21 and the crypto at
-    /// position 20, so this row came back `federation_write_scope_refused`
-    /// — the substrate had paid for three reads on a row whose signature
-    /// was never going to verify. AFTER, crypto is position 11 and the
-    /// walk position 12.
+    /// that the AV-45 membership walk `check_write_cohort_scope_for` refuses
+    /// (no `cohort_target_id`). v62 (E4): the statement's composite
+    /// signature is corrupted (its last byte), so the edition-2 door refuses
+    /// it before the row is ever mapped; whatever the door's token, it is
+    /// not the walk's.
     pub async fn assert_crypto_verdict_precedes_the_authority_walk<F>(dir: &F, tag: &str)
     where
         F: FederationDirectory + ?Sized,
     {
-        let key_id = format!("av76c{tag}");
-        dir.put_public_key(SignedKeyRecord {
-            record: key_with_real_pubkeys(&key_id),
-        })
-        .await
-        .expect("register attester");
-
-        let row = unverifiable_row(&key_id, attestation_tier::FEDERATION, "family");
-        let err = dir
-            .put_attestation(SignedAttestation { attestation: row })
+        let seed = format!("av76c{tag}");
+        e2::put_key(dir, &seed, &[identity_type::NODE]).await;
+        let mut st = e2::statement_of(
+            &row(&seed, attestation_tier::FEDERATION, "family", 0),
+            &seed,
+        );
+        let last = st.len() - 1;
+        st[last] ^= 0xFF;
+        let err = put_at(dir, &st, None, attestation_tier::FEDERATION)
             .await
-            .expect_err("an unverifiable federation-tier row must be refused");
-        assert_eq!(
+            .expect_err("an unverifiable federation-tier statement must be refused");
+        assert_ne!(
             err.kind(),
-            "federation_federation_tier_unverified",
+            "federation_write_scope_refused",
             "AV-76: the crypto verdict must precede the DB-walk authority \
              gates — got {err:?}, which means an authority gate ran first \
-             on a row whose signature can never verify"
+             on a statement whose signature can never verify"
         );
     }
 
     /// The counter-witness to the assertion above: the authority walk was
-    /// REORDERED, not removed. The same row at LOCAL tier — where the
-    /// crypto gate is a documented no-op (CC 5.3.2.2 deferred signature) —
-    /// must still be refused by the AV-45 membership walk.
+    /// REORDERED, not removed. A well-signed statement of the same row at
+    /// LOCAL tier must still be refused by the AV-45 membership walk.
     pub async fn assert_authority_walk_still_rejects_when_crypto_is_a_noop<F>(dir: &F, tag: &str)
     where
         F: FederationDirectory + ?Sized,
     {
-        let key_id = format!("av76w{tag}");
-        dir.put_public_key(SignedKeyRecord {
-            record: key_with_real_pubkeys(&key_id),
-        })
+        let seed = format!("av76w{tag}");
+        e2::put_key(dir, &seed, &[identity_type::NODE]).await;
+        let err = offer(
+            dir,
+            &row(&seed, attestation_tier::LOCAL, "family", 0),
+            &seed,
+        )
         .await
-        .expect("register attester");
-
-        let row = unverifiable_row(&key_id, attestation_tier::LOCAL, "family");
-        let err = dir
-            .put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect_err("an unprovable family downgrade must still be refused");
+        .expect_err("an unprovable family downgrade must still be refused");
         assert_eq!(
             err.kind(),
             "federation_write_scope_refused",
@@ -2603,89 +2574,64 @@ pub mod gate_order_test_support {
         );
     }
 
-    /// The tier-1 half of AV-76: the pure envelope gates now precede the
-    /// single unavoidable directory read (the attester `identity_type`
-    /// lookup, D2).
-    ///
-    /// The row's attester is deliberately UNREGISTERED, so the directory
-    /// read would return the typed `federation_invalid_argument` ("does
-    /// not exist in federation_keys") — which is exactly what this row
-    /// used to come back with, because `check_envelope_size_admission` ran
-    /// at position 14 and the lookup at position 2. An envelope that can
-    /// never be admitted must not buy a directory read.
+    /// The tier-1 half of AV-76: a statement that can never be admitted for
+    /// its SIZE must not buy a directory read. v62 (E4): the signer is
+    /// deliberately UNREGISTERED, so a door that reads the signer's key
+    /// plane before the size gate answers `federation_attester_key_unknown`
+    /// (retryable — worse, the sender re-offers it). BELIEVED RED on the
+    /// v62 base: `edition2::ingest::put_statement` reads the held key plane
+    /// (`held_keys_for`) before any envelope-size check; the synthesis lane
+    /// moves a size gate ahead of it (`require_statement_form`).
     pub async fn assert_pure_envelope_gates_precede_the_directory_read<F>(dir: &F, tag: &str)
     where
         F: FederationDirectory + ?Sized,
     {
-        // Comfortably past MAX_ATTESTATION_ENVELOPE_BYTES (1 MiB) once
-        // canonicalized.
-        let oversized = serde_json::json!({ "pad": "x".repeat(2 * 1024 * 1024) });
-        let mut row = unverifiable_row(
-            &format!("av76-unregistered-{tag}"),
-            attestation_tier::FEDERATION,
-            "self",
-        );
-        row.attestation_envelope = oversized;
-        crate::federation::tier_ingest::test_support::reseal(&mut row);
-
-        let err = dir
-            .put_attestation(SignedAttestation { attestation: row })
+        let seed = format!("av76-unregistered-{tag}");
+        let mut big = row(&seed, attestation_tier::FEDERATION, "self", 0);
+        // Comfortably past MAX_ATTESTATION_ENVELOPE_BYTES (1 MiB).
+        big.attestation_envelope["pad"] = serde_json::json!("x".repeat(2 * 1024 * 1024));
+        let err = offer(dir, &big, &seed)
             .await
             .expect_err("an oversized envelope must be refused");
         assert_eq!(
             err.kind(),
             "federation_envelope_too_large",
-            "AV-76: the pure envelope-size gate must precede the attester \
+            "AV-76: the pure envelope-size gate must precede the signer's \
              directory read — got {err:?}"
         );
     }
 
-    /// The per-peer write quota, proven WIRED into `put_attestation` (the
+    /// The per-peer write quota, proven WIRED into the write door (the
     /// bucket arithmetic itself is unit-tested in this module's `tests`).
     ///
-    /// Every write here is refused by the pure tier-1 `check_cohort_scope`
-    /// (`global` is a §8.1.8 feed-name, never a wire value) — so the rows
-    /// never reach the DB, and what the assertion isolates is that the
-    /// quota is charged AHEAD of that, on the very first gate: a peer that
-    /// floods inside one window eventually comes back
-    /// `federation_rate_limited`, the typed error that this cut gave its
-    /// first construction site.
-    ///
-    /// # Why it DRAINS rather than asserting on write N+1
-    ///
-    /// v31.0.0 (CIRISPersist#598) — it used to assert that the very next write
-    /// after exactly `N` was rate-limited, and that was a **wall-clock
-    /// assumption wearing an exact number**. The bucket refills CONTINUOUSLY at
-    /// `PER_PEER_ATTESTATION_WRITES_PER_WINDOW / PER_PEER_ATTESTATION_WRITE_WINDOW`
-    /// = 10 tokens/second, so "write N+1 is refused" only holds if all `N`
-    /// writes complete within ~100 ms. Alone they took ~50 ms and it passed; in
-    /// a full parallel run they took ~250 ms, two tokens accrued mid-flood, and
-    /// write N+1 was legitimately back inside quota. A green run on an idle box
-    /// and a red one on a loaded box, measuring machine speed.
-    ///
-    /// This is the same class as
-    /// `substrate_machine::every_row_the_harness_writes_is_live_at_wall_clock`:
-    /// a fixed expectation next to a gate that reads a real clock. The property
-    /// was never "N+1 exactly" — it is *the bucket is FINITE and charged before
-    /// the cohort gate*. So: flood until rate-limited, capped. If the quota
-    /// were not charged on the first gate the cap is never reached and this
-    /// fails, which is precisely the regression it exists to catch.
+    /// Every write here is refused by the closed-set `check_cohort_scope`
+    /// (`global` is a §8.1.8 feed-name, never a wire value) after the quota
+    /// is charged: a peer that floods inside one window eventually comes back
+    /// `federation_rate_limited`. It DRAINS rather than asserting on write
+    /// N+1 (CIRISPersist#598: the bucket refills continuously, so "exactly
+    /// N+1" measured machine speed). v62 (E4): each write is a distinct,
+    /// well-signed edition-2 statement from a live key.
     pub async fn assert_per_peer_write_quota_is_wired<F>(dir: &F, tag: &str)
     where
         F: FederationDirectory + ?Sized,
     {
-        let key_id = format!("av76q{tag}");
+        let seed = format!("av76q{tag}");
+        e2::put_key(dir, &seed, &[identity_type::NODE]).await;
         let n = super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW;
+        // Signed BEFORE the clock starts: the drain measures the door, not
+        // the signer.
+        let rows: Vec<Vec<u8>> = (0..u64::from(2 * n))
+            .map(|i| {
+                e2::statement_of(
+                    &row(&seed, attestation_tier::FEDERATION, "global", i),
+                    &seed,
+                )
+            })
+            .collect();
         let started = crate::host::clock::monotonic_now();
-        // The cap is `2n`: draining `n` empties a full bucket, and the second
-        // `n` is headroom for tokens that accrue while the first `n` are in
-        // flight. Reaching it means `2n` consecutive writes were all admitted
-        // past the quota — that is not slowness, that is an uncharged bucket.
         let mut rate_limited = None;
-        for i in 0..(2 * n) {
-            let row = unverifiable_row(&key_id, attestation_tier::FEDERATION, "global");
-            let err = dir
-                .put_attestation(SignedAttestation { attestation: row })
+        for (i, st) in rows.iter().enumerate() {
+            let err = put_at(dir, st, None, attestation_tier::FEDERATION)
                 .await
                 .expect_err("the `global` cohort_scope is never a wire value");
             match err.kind() {
@@ -2693,9 +2639,6 @@ pub mod gate_order_test_support {
                     rate_limited = Some(i);
                     break;
                 }
-                // Still inside quota: the write fell through to the closed-set
-                // cohort_scope gate, which is the ONLY other verdict these rows
-                // may draw. Anything else means a gate moved.
                 k => assert_eq!(
                     k,
                     "federation_cohort_scope_rejected",
@@ -2706,36 +2649,18 @@ pub mod gate_order_test_support {
             }
         }
         let at = rate_limited.unwrap_or_else(|| {
-            // v31.0.0 (CIRISPersist#658) — this message used to end "no amount
-            // of slowness explains this", which is FALSE and would have been
-            // read by the one person least able to argue with it. The bucket
-            // refills continuously at `n / window` = 10 tokens/s, so draining
-            // `2n` needs `n` tokens more than the bucket holds: at ≥ 50 ms per
-            // write the refill supplies them and the cap is reached WITHOUT
-            // any defect. Worse, the honest diagnosis — the `elapsed < window`
-            // assertion just below — never runs, because this panic fires
-            // first. So the message states the ambiguity and reports the
-            // measurement that resolves it.
             let elapsed = started.elapsed();
             let per_write = elapsed / (2 * n);
             let refill = super::PER_PEER_ATTESTATION_WRITE_WINDOW / n;
             panic!(
                 "AV-76: {cap} consecutive writes from one peer were ALL admitted past the \
-                 per-peer quota. This drain took {elapsed:?} ({per_write:?} per write). Two \
-                 readings, and the timing tells them apart:\n  \
-                 - if that is at or above {refill:?} per write, the bucket refilled as fast as \
-                   it drained and this run measured the machine, not the gate — the flood cap \
-                   ({cap}) is too small for a box this slow;\n  \
-                 - otherwise the quota is not wired into `put_attestation` at all, or it is \
-                   charged AFTER the gate that refuses these rows.\n\
-                 The bucket holds {n} and refills over {window:?}.",
+                 per-peer quota. This drain took {elapsed:?} ({per_write:?} per write). If \
+                 that is at or above {refill:?} per write, the bucket refilled as fast as it \
+                 drained and this run measured the machine; otherwise the quota is not wired \
+                 into the write door, or it is charged AFTER the gate that refuses these rows.",
                 cap = 2 * n,
-                window = super::PER_PEER_ATTESTATION_WRITE_WINDOW,
             )
         });
-        // And it must have happened because the bucket EMPTIED, not because the
-        // window elapsed and something else fired. A drain that takes longer
-        // than the window is not measuring capacity.
         let elapsed = started.elapsed();
         assert!(
             elapsed < super::PER_PEER_ATTESTATION_WRITE_WINDOW,
@@ -2743,64 +2668,46 @@ pub mod gate_order_test_support {
              ({window:?}) — this run measured the clock, not the bucket",
             window = super::PER_PEER_ATTESTATION_WRITE_WINDOW,
         );
+        let at = u32::try_from(at).expect("bounded by 2n");
         assert!(
             at >= n,
             "AV-76: the quota bit after only {at} writes, but the bucket's capacity is {n} — a \
-             peer's first honest burst must fit, or the cap is a censorship primitive against \
-             ordinary traffic rather than a flood brake"
+             peer's first honest burst must fit"
         );
 
-        // v24.3.0 (CIRISPersist#575) — the RESERVED ADMISSION CLASS, proven
-        // wired on every backend. The same exhausted peer, sending an
-        // `accord:`-dimension row, must NOT be rate-limited: the reserve is
-        // charged instead, and ordinary traffic (here, the peer's own flood
-        // above) can never consume it.
-        //
-        // This is #575's must-ship caveat as a cross-backend witness rather
-        // than a unit-test claim, because the classification depends on the
-        // real envelope reaching `PeerWriteQuota::classify` through the real
-        // `put_attestation` — a bypass that only the unit tests exercise
-        // certifies an unreachable feature (the AV-77 lesson).
-        // EVERY reserved prefix, not just the first — a prefix appended to
-        // the set without a path through `classify` is a reserve that
-        // silently does not cover the family it names.
-        for prefix in super::RESERVED_CLASS_DIMENSION_PREFIXES {
-            let mut reserved = unverifiable_row(&key_id, attestation_tier::FEDERATION, "global");
-            reserved.attestation_envelope = serde_json::json!({
-                "dimension": format!("{prefix}reserved_probe:v1"),
-            });
-            // v31.0.0 (CIRISPersist#643) — swapping the envelope drops the
-            // mirror; re-stamp (still unsigned, see `unverifiable_row`) so this
-            // arm keeps measuring the quota class and not the binding.
-            crate::federation::tier_ingest::test_support::stamp_mirror(&mut reserved);
-            let err = dir
-                .put_attestation(SignedAttestation {
-                    attestation: reserved,
-                })
+        // v24.3.0 (CIRISPersist#575) — the RESERVED ADMISSION CLASS, on every
+        // reserved prefix: the exhausted peer's reserved-class row draws on
+        // the reserve, never on its own spent budget.
+        for (i, prefix) in super::RESERVED_CLASS_DIMENSION_PREFIXES.iter().enumerate() {
+            let mut reserved = row(
+                &seed,
+                attestation_tier::FEDERATION,
+                "global",
+                u64::from(2 * n) + i as u64,
+            );
+            reserved.attestation_envelope["dimension"] =
+                serde_json::json!(format!("{prefix}reserved_probe:v1"));
+            let err = offer(dir, &reserved, &seed)
                 .await
                 .expect_err("still an invalid cohort_scope");
             assert_eq!(
                 err.kind(),
                 "federation_cohort_scope_rejected",
                 "#575: a `{prefix}` row must draw on the RESERVED budget, not \
-                 the peer's exhausted one — a bounded cap without a reserved \
-                 admission class converts a flood into a censorship primitive \
-                 against exactly the rows (kill-switch, reverse-quorum \
-                 objection) that must never be crowded out. Got {err:?}"
+                 the peer's exhausted one. Got {err:?}"
             );
         }
 
-        // And it is PER PEER: a second peer is unaffected by the first's
-        // flood (a shared counter would be a trivial cross-peer DoS).
-        let other = unverifiable_row(
-            &format!("av76q2{tag}"),
-            attestation_tier::FEDERATION,
-            "global",
-        );
-        let err = dir
-            .put_attestation(SignedAttestation { attestation: other })
-            .await
-            .expect_err("still an invalid cohort_scope");
+        // And it is PER PEER: a second (live) peer is unaffected.
+        let other = format!("av76q2{tag}");
+        e2::put_key(dir, &other, &[identity_type::NODE]).await;
+        let err = offer(
+            dir,
+            &row(&other, attestation_tier::FEDERATION, "global", 0),
+            &other,
+        )
+        .await
+        .expect_err("still an invalid cohort_scope");
         assert_eq!(
             err.kind(),
             "federation_cohort_scope_rejected",
@@ -2809,37 +2716,24 @@ pub mod gate_order_test_support {
     }
 
     /// v25.1.0 (CIRISPersist#583) — the **BYTE dimension**, proven wired into
-    /// `put_attestation` on every backend.
-    ///
-    /// #583, quoting CIRISServer: *"600 rows of 100 B and 600 rows of 10 MB
-    /// cost the same."* The unit tests in this module's `tests` prove the
-    /// bucket arithmetic; this proves the real envelope reaches
-    /// `PeerWriteQuota::check_write` through the real host API on all three
-    /// backends. A dimension exercised only through a bypass certifies an
-    /// unreachable feature — the AV-77 lesson, which is why this lives beside
-    /// the row-quota witness rather than in the unit tests.
-    ///
-    /// Every row here is 900 KiB: comfortably under
-    /// [`MAX_ATTESTATION_ENVELOPE_BYTES`](crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES)
-    /// so the size gate admits it, and ~600 typical rows' worth of storage so
-    /// the peer's BYTE budget binds long before its ROW budget. The refusal
-    /// must name the byte dimension, because "you are writing too many rows"
-    /// and "you are writing too much storage" are different operator actions.
+    /// the write door on every backend. Every row is 900 KiB: under
+    /// `MAX_ATTESTATION_ENVELOPE_BYTES`, ~600 typical rows' worth of storage,
+    /// so the peer's BYTE budget binds long before its ROW budget, and the
+    /// refusal must name the byte dimension.
     pub async fn assert_byte_dimension_is_wired<F>(dir: &F, tag: &str)
     where
         F: FederationDirectory + ?Sized,
     {
-        let key_id = format!("av583{tag}");
-        let big = serde_json::json!({ "pad": "x".repeat(900 * 1024) });
+        let seed = format!("av583{tag}");
+        e2::put_key(dir, &seed, &[identity_type::NODE]).await;
+        let pad = "x".repeat(900 * 1024);
 
         let mut admitted = 0u32;
         let mut refusal = None;
-        for _ in 0..super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW {
-            let mut row = unverifiable_row(&key_id, attestation_tier::FEDERATION, "global");
-            row.attestation_envelope = big.clone();
-            crate::federation::tier_ingest::test_support::reseal(&mut row);
-            let err = dir
-                .put_attestation(SignedAttestation { attestation: row })
+        for i in 0..u64::from(super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW) {
+            let mut r = row(&seed, attestation_tier::FEDERATION, "global", i);
+            r.attestation_envelope["pad"] = serde_json::json!(pad);
+            let err = offer(dir, &r, &seed)
                 .await
                 .expect_err("the `global` cohort_scope is never a wire value");
             match err {
@@ -2861,19 +2755,16 @@ pub mod gate_order_test_support {
 
         let refusal = refusal.expect(
             "#583: 600 rows of 900 KiB (≈527 MiB) were all admitted by the \
-             quota — it meters ROWS ONLY and inauthentic STORAGE is invisible \
-             to the control that exists to bound it",
+             quota — it meters ROWS ONLY",
         );
         assert_eq!(
             refusal.dimension(),
             super::QuotaDimension::Bytes,
-            "a storage flood must be refused on the BYTE dimension so an \
-             operator can tell it from a row flood — got {refusal}"
+            "a storage flood must be refused on the BYTE dimension — got {refusal}"
         );
         assert!(
             admitted < super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW / 10,
-            "the byte budget bound only after {admitted} of \
-             {} rows at 900 KiB — that is not a storage bound",
+            "the byte budget bound only after {admitted} of {} rows at 900 KiB",
             super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW,
         );
     }

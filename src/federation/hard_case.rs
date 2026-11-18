@@ -1099,48 +1099,19 @@ pub fn hard_case_emit_input(
             "asserted_at".to_owned(),
             serde_json::Value::String(super::admission::render_signed_instant(asserted_at)),
         );
-        // An edition-2 payload carries no floats (CC 2.6.1.5): a real in the
-        // body (its `detail`) is stated as a fixed-scale integer, at any depth.
-        if let Some(body) = members.get_mut(BODY_MEMBER) {
-            *body = edition2_reals(std::mem::take(body));
-        }
+        // A real in the body (its open-vocabulary `detail`) rides as the
+        // plain JSON number it is: the payload encoder states it (CC ruling,
+        // free-form bodies): an integral value as an integer, a non-integral
+        // one as a CBOR tag-4 decimal fraction, exact and normalised
+        // (`edition2::payloads::body_number`, inside `payload_from_envelope`:
+        // `hard_case` is a registered body member). It is never
+        // scaled here: x 10^6 belongs to the fixed-scale members alone.
     }
     Ok(super::EmitAttestationInput::with_envelope(
         super::types::attestation_type::SCORES,
         super::envelope::EnvelopeCore::from_value(envelope)?,
         super::types::cohort_scope::FEDERATION,
     ))
-}
-
-/// v62.0.0 (v62 P3) — **the reals of a hard_case body, stated without
-/// floats** (CC 2.6.1.5: an edition-2 payload carries integers; a real is an
-/// integer at the fixed scale of 10^6). `detail` is open vocabulary, so a
-/// real can appear at any depth: every one, whatever member it stands under,
-/// becomes the integer `round(x × 10^6)`, the fixed-scale form the door
-/// type-checks (never a string). Integers, text, booleans and nulls are
-/// unchanged. Applied on the edition-2 producer only; the node-local row
-/// keeps the event as built.
-#[must_use]
-pub fn edition2_reals(value: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value as J;
-    match value {
-        J::Number(n) if n.as_u64().is_none() && n.as_i64().is_none() => match n.as_f64() {
-            Some(x) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let fixed = (x * 1_000_000.0).round() as i64;
-                J::from(fixed)
-            }
-            None => J::Number(n),
-        },
-        J::Array(items) => J::Array(items.into_iter().map(edition2_reals).collect()),
-        J::Object(members) => J::Object(
-            members
-                .into_iter()
-                .map(|(k, v)| (k, edition2_reals(v)))
-                .collect(),
-        ),
-        other => other,
-    }
 }
 
 /// v62.0.0 (v62 P3, JSON-cut slice B) — **the hard_case producer on the
@@ -1420,7 +1391,13 @@ mod tests {
             emitter_key_id: String::new(),
         };
         let row = |id: &str, envelope: serde_json::Value| {
-            let mut r = ts::bare_attestation(id, "i1165-node", "", &envelope);
+            // v62.0.0 — a pure projection over the typed row, built in the
+            // earlier shape on purpose: the projection's id fence reads a
+            // peer-chosen id (`hard_case_attestation_id`), which an edition-2
+            // row (node-computed id) never carries.
+            let mut r = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+                ts::bare_attestation(id, "i1165-node", "", &envelope)
+            });
             r.attestation_type = super::super::types::attestation_type::SCORES.to_owned();
             r
         };
@@ -1475,7 +1452,10 @@ mod tests {
         );
         let id = hard_case_attestation_id(&event.event_id);
         let row = |envelope: &serde_json::Value| {
-            let mut r = ts::bare_attestation(&id, "i1165-signer", "", envelope);
+            // v62.0.0 — the earlier shape on purpose (see I1165 above).
+            let mut r = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+                ts::bare_attestation(&id, "i1165-signer", "", envelope)
+            });
             r.attestation_type = super::super::types::attestation_type::SCORES.to_owned();
             r
         };

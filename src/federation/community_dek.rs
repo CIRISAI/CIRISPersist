@@ -1938,6 +1938,49 @@ mod tests {
 pub mod lifecycle_support {
     use crate::federation::{BlobStorage, FederationDirectory};
 
+    /// v62.0.0 (JSON cut, wave 3, E5) — the id the directory keys a seeded key
+    /// by: its identity-ref under the switch (the rosters enter as edition-2
+    /// voices keyed by identity-refs, T1.api §3), the seed itself when held.
+    /// An id that is already an identity-ref is kept.
+    pub fn id_of(k: &str) -> String {
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            crate::federation::edition2::fixture_switch::kid_or_keep(k)
+        } else {
+            k.to_owned()
+        }
+    }
+
+    /// v62.0.0 (wave 3, E5) — put a signed roster: its edition-2 voices
+    /// (`community_voices` / `family_voices`, version 1, asserted now) under
+    /// the switch, the JSON door when held.
+    async fn put_roster<B>(
+        backend: &B,
+        community: Option<crate::federation::types::SignedCommunity>,
+        family: Option<crate::federation::types::SignedFamily>,
+        what: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::group_fixtures as gf;
+        let r = if e2::emit_edition2() {
+            let at = e2::ms(crate::host::clock::now());
+            let voices = match (&community, &family) {
+                (Some(c), _) => gf::community_voices(c, 1, None, at),
+                (None, Some(f)) => gf::family_voices(f, 1, None, at),
+                (None, None) => unreachable!("put_roster of nothing"),
+            };
+            gf::put_voices(backend, &voices).await.map(|_| ())
+        } else {
+            match (community, family) {
+                (Some(c), _) => backend.put_community(c).await.map(|_| ()),
+                (None, Some(f)) => backend.put_family(f).await,
+                (None, None) => unreachable!("put_roster of nothing"),
+            }
+        };
+        r.unwrap_or_else(|e| panic!("seed {what}: {e}"));
+    }
+
     /// Register a key, its occurrence, and give the occurrence real
     /// content-KEM pubkeys — without which the member is **excluded
     /// fail-secure** from the DEK fan-out and the harness would be asserting
@@ -1957,8 +2000,8 @@ pub mod lifecycle_support {
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
         backend
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: identity_key_id.to_owned(),
-                occurrence_key_id: occurrence_key_id.to_owned(),
+                identity_key_id: id_of(identity_key_id),
+                occurrence_key_id: id_of(occurrence_key_id),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: crate::host::clock::now(),
@@ -2093,30 +2136,33 @@ pub mod lifecycle_support {
             })
             .collect();
         ts::register_fixture_infrastructure_founder(backend).await;
-        backend
-            .put_community(ts::sign_community(
-                community_key_id,
-                crate::federation::types::Community {
-                    prev_head_digest: String::new(),
-                    charter_digest: String::new(),
-                    community_key_id: community_key_id.to_owned(),
-                    community_name: "Lifecycle Co-op".into(),
-                    members: crate::federation::tier_ingest::test_support::fixture_members(
-                        policy_blob.as_ref(),
-                        roster,
-                    ),
-                    founded_at: crate::host::clock::now(),
-                    consensus_protocol:
-                        crate::federation::tier_ingest::test_support::fixture_protocol(
-                            policy_blob.as_ref(),
-                            crate::federation::types::consensus_protocol::MAJORITY,
-                        ),
-                    policy_blob,
-                    persist_row_hash: String::new(),
-                },
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("seed community {community_key_id}: {e}"));
+        let signed = ts::sign_community(
+            community_key_id,
+            crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: community_key_id.to_owned(),
+                community_name: "Lifecycle Co-op".into(),
+                members: crate::federation::tier_ingest::test_support::fixture_members(
+                    policy_blob.as_ref(),
+                    roster,
+                ),
+                founded_at: crate::host::clock::now(),
+                consensus_protocol: crate::federation::tier_ingest::test_support::fixture_protocol(
+                    policy_blob.as_ref(),
+                    crate::federation::types::consensus_protocol::MAJORITY,
+                ),
+                policy_blob,
+                persist_row_hash: String::new(),
+            },
+        );
+        put_roster(
+            backend,
+            Some(signed),
+            None,
+            &format!("community {community_key_id}"),
+        )
+        .await;
     }
 
     /// #843 — seed one roster member in the SHAPE a fixture names: the
@@ -2163,8 +2209,8 @@ pub mod lifecycle_support {
             };
             backend
                 .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                    identity_key_id: identity_key_id.to_owned(),
-                    occurrence_key_id: (*occurrence_key_id).to_owned(),
+                    identity_key_id: id_of(identity_key_id),
+                    occurrence_key_id: id_of(occurrence_key_id),
                     device_class: crate::federation::types::device_class::LAPTOP.into(),
                     hardware_attestation: None,
                     asserted_at: crate::host::clock::now(),
@@ -2207,24 +2253,28 @@ pub mod lifecycle_support {
                 role: None,
             })
             .collect();
-        backend
-            .put_community(ts::sign_community(
-                community_key_id,
-                crate::federation::types::Community {
-                    prev_head_digest: String::new(),
-                    charter_digest: String::new(),
-                    community_key_id: community_key_id.to_owned(),
-                    community_name: "Shaped Co-op".into(),
-                    members: roster,
-                    founded_at: crate::host::clock::now(),
-                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
-                        .to_owned(),
-                    policy_blob: None,
-                    persist_row_hash: String::new(),
-                },
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("seed community {community_key_id}: {e}"));
+        let signed = ts::sign_community(
+            community_key_id,
+            crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: community_key_id.to_owned(),
+                community_name: "Shaped Co-op".into(),
+                members: roster,
+                founded_at: crate::host::clock::now(),
+                consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                    .to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        put_roster(
+            backend,
+            Some(signed),
+            None,
+            &format!("community {community_key_id}"),
+        )
+        .await;
     }
 
     /// #843 — the family twin of [`seed_community_shaped`]: the self/family
@@ -2257,25 +2307,29 @@ pub mod lifecycle_support {
                 role: None,
             })
             .collect();
-        backend
-            .put_family(ts::sign_family(
-                family_key_id,
-                crate::federation::types::Family {
-                    prev_head_digest: String::new(),
-                    charter_digest: String::new(),
-                    family_key_id: family_key_id.to_owned(),
-                    family_name: "Shaped Household".into(),
-                    members: roster,
-                    founded_at: crate::host::clock::now(),
-                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
-                        .to_owned(),
-                    consensus_protocol_entrenched: false,
-                    dissolved_at: None,
-                    persist_row_hash: String::new(),
-                },
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("seed family {family_key_id}: {e}"));
+        let signed = ts::sign_family(
+            family_key_id,
+            crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                family_key_id: family_key_id.to_owned(),
+                family_name: "Shaped Household".into(),
+                members: roster,
+                founded_at: crate::host::clock::now(),
+                consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                    .to_owned(),
+                consensus_protocol_entrenched: false,
+                dissolved_at: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        put_roster(
+            backend,
+            None,
+            Some(signed),
+            &format!("family {family_key_id}"),
+        )
+        .await;
     }
 
     /// Revoke a member. The community DEK epoch bump rides this write
@@ -2316,8 +2370,7 @@ pub mod lifecycle_support {
             },
         )
         .await;
-        backend
-            .put_community_membership_revocation(signed.clone())
+        repeat_revocation_result(backend, &signed)
             .await
             .unwrap_or_else(|e| panic!("revoke {removed_identity} from {community_key_id}: {e}"));
         signed
@@ -2332,6 +2385,16 @@ pub mod lifecycle_support {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        // v62.0.0 (wave 3, E5) — under the switch the removal enters as its
+        // `membership:removal` voices naming the room's held roster head
+        // (T1.api §3; a repeat is the same row id); the JSON door when held.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            use crate::federation::edition2::group_fixtures as gf;
+            let group = id_of(&signed.community_membership_revocation.community_key_id);
+            let head = gf::held_head(backend, &group).await.map(|(h, _)| h);
+            let voices = gf::community_revocation_voices(signed, head.as_ref());
+            return gf::put_voices(backend, &voices).await.map(|_| ());
+        }
         backend
             .put_community_membership_revocation(signed.clone())
             .await
@@ -2399,6 +2462,25 @@ pub mod lifecycle_harness {
             ],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — named by the ids the directory keys them
+        // by; a removal enters as its `membership:removal` voices naming
+        // the held roster head under the switch (T1.api §3), the JSON door
+        // when held.
+        use super::lifecycle_support::id_of;
+        let (fam, bob) = (id_of(&fam), id_of(&bob));
+        let put_removal = |signed: crate::federation::types::SignedFamilyMembershipRevocation| {
+            let fam = fam.clone();
+            async move {
+                if crate::federation::edition2::fixture_switch::emit_edition2() {
+                    use crate::federation::edition2::group_fixtures as gf;
+                    let head = gf::held_head(backend, &fam).await.map(|(h, _)| h);
+                    let voices = gf::family_revocation_voices(&signed, head.as_ref());
+                    gf::put_voices(backend, &voices).await.map(|_| ())
+                } else {
+                    backend.put_family_membership_revocation(signed).await
+                }
+            }
+        };
         let removal = |effective_at: chrono::DateTime<chrono::Utc>| {
             // v49.0.0 (#910): bob leaves on his own signature.
             ts::sign_family_membership_revocation(
@@ -2433,8 +2515,7 @@ pub mod lifecycle_harness {
         // (1) A scheduled removal — bob stays active until it takes effect.
         let scheduled = crate::host::clock::now() + chrono::Duration::days(30);
         let first = removal(scheduled);
-        backend
-            .put_family_membership_revocation(first.clone())
+        put_removal(first.clone())
             .await
             .unwrap_or_else(|e| panic!("{tag}: a scheduled family removal lands: {e}"));
         assert!(
@@ -2444,12 +2525,9 @@ pub mod lifecycle_harness {
 
         // (2) THE #861 RETRY — the exact row again is Ok and changes nothing
         // (sqlite and postgres returned UNIQUE here before v47.1).
-        backend
-            .put_family_membership_revocation(first)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("{tag}: #861 — a repeated family removal is a no-op, got {e}")
-            });
+        put_removal(first).await.unwrap_or_else(|e| {
+            panic!("{tag}: #861 — a repeated family removal is a no-op, got {e}")
+        });
         assert_eq!(
             stored_rows().await,
             1,
@@ -2459,8 +2537,7 @@ pub mod lifecycle_harness {
         // (3) ACCELERATION — fail-secure: a guardian who scheduled the
         // removal and now needs it immediately gets it: an earlier removal is
         // another event, and the fold honours it now.
-        backend
-            .put_family_membership_revocation(removal(crate::host::clock::now()))
+        put_removal(removal(crate::host::clock::now()))
             .await
             .unwrap_or_else(|e| panic!("{tag}: an earlier removal accelerates: {e}"));
         assert_eq!(
@@ -2508,6 +2585,15 @@ pub mod lifecycle_harness {
             &[(&alice, &alice_occ), (&bob, &bob_occ)],
         )
         .await;
+        // v62.0.0 (wave 3, E5) — the ids the directory keys them by
+        // (identity-refs under the switch, the seeds when held).
+        use super::lifecycle_support::id_of;
+        let (comm, alice_occ, bob, bob_occ) = (
+            id_of(&comm),
+            id_of(&alice_occ),
+            id_of(&bob),
+            id_of(&bob_occ),
+        );
 
         // ── 2. ENCRYPT (epoch 0) ─────────────────────────────────────────
         let before = encrypt_and_cascade_community(

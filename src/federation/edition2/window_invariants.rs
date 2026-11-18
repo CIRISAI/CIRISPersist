@@ -14,6 +14,7 @@
 
 use super::door_invariants::fixture::*;
 use super::ingest::{put_statement, INGEST_TIER};
+use super::liveness::Liveness;
 use crate::federation::{malformed_row, Error, FederationDirectory};
 
 fn reason(e: &Error) -> String {
@@ -76,6 +77,30 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
     )
     .await
     .unwrap_or_else(|e| panic!("I2820: the record: {e:?}"));
+    // The store's key plane, read back: the boundary on the held record
+    // itself, before any statement is judged through it.
+    let held = super::ingest::held_keys_for_kid(d, &kid(&k))
+        .await
+        .expect("I2820: the key plane reads");
+    for (at, live) in [
+        (1_000, true),
+        (9_999, true),
+        (10_000, false),
+        (10_001, false),
+    ] {
+        let l = held.liveness(&kid(&k), at);
+        if live {
+            assert!(
+                matches!(l, Liveness::Live(_)),
+                "I2820 at {at}: the stored record covers it: {l:?}"
+            );
+        } else {
+            assert!(
+                matches!(l, Liveness::NotCovered),
+                "I2820 at {at}: no record covers it (retryable): {l:?}"
+            );
+        }
+    }
     for at in [10_000, 10_001] {
         let e = put_statement(d, &signed_at(&k, at), None, INGEST_TIER)
             .await

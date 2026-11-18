@@ -3525,43 +3525,24 @@ mod recipient_set_tests {
     use crate::federation::FederationDirectory;
     use crate::store::sqlite::SqliteBackend;
 
-    /// Register `key_id` as a plain `node` with its deterministic hybrid
-    /// pubkeys — the ordinary, unprivileged publisher/peer of these witnesses.
-    /// Nothing here confers a role: a `node` is descriptive and unlocks
-    /// nothing (`AUTHORITY_CONFERRING_IDENTITY_TYPES` deliberately omits it).
-    async fn register_node(dir: &dyn FederationDirectory, key_id: &str) {
-        let (ed_pk, mldsa_pk) =
-            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
-        let now = chrono::Utc::now();
-        let rec = crate::federation::types::KeyRecord {
-            key_id: key_id.to_owned(),
-            pubkey_ed25519_base64: ed_pk,
-            pubkey_ml_dsa_65_base64: mldsa_pk,
-            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-            identity_type: crate::federation::types::identity_type::NODE.to_owned(),
-            identity_ref: key_id.to_owned(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": key_id }),
-            original_content_hash: "deadbeef".to_owned(),
-            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.to_owned(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-            attestation_evidence: Some(
-                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                ),
-            ),
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        dir.put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
-            .await
-            .expect("a plain node registration is admissible");
+    /// Register the key of `seed` as a plain `node` — v62.0.0: its edition-2
+    /// `key:record` through the statement door (`fixture_switch::put_key`),
+    /// so the key is `kid(seed)`. The ordinary, unprivileged publisher/peer
+    /// of these witnesses. Nothing here confers a role: a `node` is
+    /// descriptive and unlocks nothing (`AUTHORITY_CONFERRING_IDENTITY_TYPES`
+    /// deliberately omits it).
+    async fn register_node(dir: &dyn FederationDirectory, seed: &str) {
+        let _ = crate::federation::edition2::fixture_switch::put_key(
+            dir,
+            seed,
+            &[crate::federation::types::identity_type::NODE],
+        )
+        .await;
+    }
+
+    /// The key (identity-ref) of a fixture seed.
+    fn k(seed: &str) -> String {
+        crate::federation::edition2::fixture_switch::kid(seed)
     }
 
     /// The #744 fixture: a family whose roster seats exactly `PUBLISHER` and
@@ -3575,7 +3556,7 @@ mod recipient_set_tests {
         crate::federation::operational::test_support::seed_test_family(
             &backend,
             FAMILY,
-            &[PUBLISHER.to_owned(), SEATED.to_owned()],
+            &[k(PUBLISHER), k(SEATED)],
             "quorum:2/3",
         )
         .await
@@ -3584,6 +3565,7 @@ mod recipient_set_tests {
     }
 
     const FAMILY: &str = "recipients-744-family";
+    // Seeds: each key is `k(SEED)`.
     const PUBLISHER: &str = "recipients-744-publisher";
     const SEATED: &str = "recipients-744-seated";
     const STRANGER: &str = "recipients-744-stranger";
@@ -3604,7 +3586,7 @@ mod recipient_set_tests {
             AuthorityClass::ProducerSteward,
             false,
             FAMILY,
-            SEATED,
+            &k(SEATED),
         )
         .await
         .expect("the verb never returns Err today");
@@ -3649,7 +3631,7 @@ mod recipient_set_tests {
             AuthorityClass::ProducerSteward,
             false,
             FAMILY,
-            PUBLISHER,
+            &k(PUBLISHER),
         )
         .await
         .expect("no Err");
@@ -3666,7 +3648,7 @@ mod recipient_set_tests {
             AuthorityClass::ProducerSteward,
             false,
             FAMILY,
-            STRANGER,
+            &k(STRANGER),
         )
         .await
         .expect("no Err");
@@ -3704,7 +3686,7 @@ mod recipient_set_tests {
             AuthorityClass::ProducerSteward,
             false,
             "recipients-744-family-this-node-never-heard-of",
-            SEATED,
+            &k(SEATED),
         )
         .await
         .expect("no Err");
@@ -3722,7 +3704,7 @@ mod recipient_set_tests {
             AuthorityClass::ProducerSteward,
             false,
             FAMILY,
-            STRANGER,
+            &k(STRANGER),
         )
         .await
         .expect("no Err");
@@ -3755,7 +3737,7 @@ mod recipient_set_tests {
             AuthorityClass::ProducerSteward,
             false,
             "recipients-744-never-registered",
-            SEATED,
+            &k(SEATED),
         )
         .await
         .expect("no Err");
@@ -3784,7 +3766,7 @@ mod recipient_set_tests {
                 AuthorityClass::ProducerSteward,
                 false,
                 FAMILY,
-                SEATED,
+                &k(SEATED),
             )
             .await
             .expect("no Err");
@@ -3816,7 +3798,7 @@ mod recipient_set_tests {
             AuthorityClass::AccordCoScrub,
             false,
             FAMILY,
-            STRANGER,
+            &k(STRANGER),
         )
         .await
         .expect("no Err");
@@ -3847,7 +3829,7 @@ mod recipient_set_tests {
                 AuthorityClass::ProducerSteward,
                 false,
                 &table_id,
-                SEATED,
+                &k(SEATED),
             )
             .await
             .expect("no Err");
@@ -3871,7 +3853,7 @@ mod recipient_set_tests {
             AuthorityClass::AccordCoScrub,
             false,
             FAMILY,
-            STRANGER,
+            &k(STRANGER),
         )
         .await
         .expect("no Err");
@@ -3895,7 +3877,7 @@ mod recipient_set_tests {
                 AuthorityClass::ProducerSteward,
                 false,
                 FAMILY,
-                SEATED,
+                &k(SEATED),
             )
             .await
             .expect("no Err");
@@ -3921,22 +3903,18 @@ mod holdings_authority_tests {
     use crate::federation::FederationDirectory;
     use crate::store::sqlite::SqliteBackend;
 
-    /// The baked genesis canonical — an accord-co-scrubbed trust root that
-    /// admits through the ordinary `check_canonical_role_admission` gate, so
-    /// nothing here fabricates conferral.
+    /// The genesis canonical — v62.0.0: a `serve_nodes` seat of the bundle/2
+    /// test ceremony in force, placed through the real import door
+    /// (`fixture_genesis::install_v2`), so nothing here fabricates conferral.
     async fn seeded_canonical() -> (SqliteBackend, String) {
+        use crate::federation::edition2::fixture_genesis;
         let backend = crate::store::test_backend::test_backend();
-        backend
-            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+        fixture_genesis::install_v2(&backend)
             .await
-            .expect("holders seed");
-        crate::federation::genesis::seed_family_and_canonical(&backend)
-            .await
-            .expect("a fresh node seeds the baked plane");
-        let canonical = crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0]
-            .record
-            .key_id
-            .clone();
+            .expect("the bundle/2 test ceremony installs");
+        let canonical = fixture_genesis::bundle_v2()
+            .serve_node_identity_ref(0)
+            .to_owned();
         (backend, canonical)
     }
 

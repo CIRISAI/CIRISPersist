@@ -1054,7 +1054,7 @@ class Engine:
         """
 
     def ledger_advance_head(self, ledger_id: str, seq: int, head_hash: str, witness_anchor_ref: str | None = None, source_envelope_ref: str | None = None) -> str:
-        """(derived) deontic — CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome ("advanced" / "unchanged" / "stale"); a DIFFERENT hash at the stored seq raises... [build-conditional: #[cfg(feature = "ledgers")]]"""
+        """(derived) deontic — CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome ("advanced" / "unchanged" / "stale" / "contested"); a DIFFERENT hash at the stored seq is "contested"... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
     def ledger_register(self, owner_key_id: str, unit: str, standard_version: str) -> str:
         """(derived) deontic — CC 3.3.10.1 L1 — register (or idempotently re-register) the ledger for (owner_key_id, unit, standard_version). Returns JSON {"ledger_id": .., "outc... [build-conditional: #[cfg(feature = "ledgers")]]"""

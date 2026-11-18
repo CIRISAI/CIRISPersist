@@ -26,12 +26,17 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::composer_rank_invariants::bodies::{place, self_row};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::membership_acceptance_invariants::bodies::{found_community, reg};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, cohort_scope, identity_type};
     use crate::federation::{Attestation, Error, FederationDirectory, SignedAttestation};
 
+    /// A `scores` act by the key `by` (a seed, or a kid `fixture_switch`
+    /// minted) at `room`'s community scope naming `flagged` (`refs.target`):
+    /// v62.0.0, an edition-2 row.
     fn act(by: &str, dimension: &str, flagged: &Attestation, room: &str) -> Attestation {
+        let room = e2::kid_or_keep(room);
         let env = serde_json::json!({
             "dimension": dimension,
             "score": crate::federation::namespace::registry::in_class_score(dimension),
@@ -40,12 +45,13 @@ pub(crate) mod bodies {
             "community_key_id": room,
             "references_attestation_id": flagged.attestation_id,
         });
-        let mut r = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), by, by, &env);
+        let mut r = e2::with_earlier_form(|| {
+            ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), by, by, &env)
+        });
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.cohort_scope = cohort_scope::COMMUNITY.into();
-        ts::seal_row_in_place(by, &mut r);
-        r
+        e2::row_of(&r, by)
     }
 
     async fn put(d: &dyn FederationDirectory, r: &Attestation) -> Result<(), Error> {
@@ -62,7 +68,7 @@ pub(crate) mod bodies {
         let (moderator, author, member, stranger, room) =
             (k("mod"), k("author"), k("member"), k("stranger"), k("room"));
         for u in [&moderator, &author, &member, &stranger] {
-            ts::register_hybrid_key_as(d, u, u, identity_type::USER).await;
+            e2::put_key(d, u, &[identity_type::USER]).await;
         }
         reg(d, &[&room]).await;
         // The moderator founds the room (a founder holds `moderate` zero-hop);
@@ -86,11 +92,12 @@ pub(crate) mod bodies {
         for r in [&flag, &mod_act] {
             let held = d.get_attestation(&r.attestation_id).await.unwrap().unwrap();
             assert_eq!(
-                held.attested_key_id, moderator,
+                held.attested_key_id,
+                e2::kid(&moderator),
                 "I1512: attested = the moderator"
             );
             assert!(
-                !held.subject_key_ids.contains(&author),
+                !held.subject_key_ids.contains(&e2::kid(&author)),
                 "I1512: the author is not a subject"
             );
         }
@@ -204,14 +211,14 @@ pub(crate) mod bodies {
                 "community_key_id": room,
                 "content_type": "text/plain",
             });
-            let mut r =
-                ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env);
+            let mut r = e2::with_earlier_form(|| {
+                ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env)
+            });
             r.attestation_type = attestation_type::SCORES.into();
             r.weight = None;
             r.cohort_scope = cohort_scope::COMMUNITY.into();
             r.subject_key_ids = vec![author.clone()];
-            ts::seal_row_in_place(author, &mut r);
-            r
+            e2::row_of(&r, author)
         };
         let (sha, sha_deputy) = (sha_hex(&format!("{tag}-a")), sha_hex(&format!("{tag}-b")));
         for sha in [&sha, &sha_deputy] {
@@ -283,15 +290,17 @@ pub(crate) mod bodies {
     }
 
     /// A `scores` row by `by` at the room's `community` scope naming
-    /// `subject`, optionally cosigned by `cosigner` (an actor's scrub over
-    /// the same envelope, not a tier-crossing co-scrub).
+    /// `subject`: v62.0.0, an edition-2 row, plus the further voice of
+    /// `cosigner` over the same statement when given (a cosigned act is
+    /// counted voices in edition 2, never an `additional_scrubs` entry).
     fn about(
         by: &str,
         dimension: &str,
         subject: &str,
         room: &str,
         cosigner: Option<&str>,
-    ) -> Attestation {
+    ) -> (Attestation, Option<Vec<u8>>) {
+        let room = e2::kid_or_keep(room);
         let env = serde_json::json!({
             "dimension": dimension,
             "score": crate::federation::namespace::registry::in_class_score(dimension),
@@ -299,36 +308,35 @@ pub(crate) mod bodies {
             "community_id": room,
             "community_key_id": room,
         });
-        let mut r = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), by, by, &env);
+        let mut r = e2::with_earlier_form(|| {
+            ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), by, by, &env)
+        });
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.cohort_scope = cohort_scope::COMMUNITY.into();
-        r.subject_key_ids = vec![subject.to_owned()];
-        ts::seal_row_in_place(by, &mut r);
-        if let Some(c) = cosigner {
-            let (_h, classical, pqc) = ts::sign_envelope(c, &r.attestation_envelope);
-            r.additional_scrubs
-                .push(crate::federation::types::ScrubSig {
-                    scrub_key_id: c.to_owned(),
-                    scrub_signature_classical: classical,
-                    scrub_signature_pqc: pqc,
-                    cosigned_at: None,
-                });
-        }
-        r
+        r.subject_key_ids = vec![e2::kid_or_keep(subject)];
+        let r = e2::row_of(&r, by);
+        let voice = cosigner
+            .map(|c| e2::voice_of(&e2::carried_statement(&r).expect("an edition-2 row"), c));
+        (r, voice)
     }
 
-    /// `issuer`'s `withdraws` of `target`.
+    /// Put `about`'s row, then its further voice if any.
+    async fn put_about(
+        d: &dyn FederationDirectory,
+        a: &(Attestation, Option<Vec<u8>>),
+    ) -> Result<(), Error> {
+        put(d, &a.0).await?;
+        if let Some(v) = &a.1 {
+            e2::put_statement(d, v).await.map(|_| ())?;
+        }
+        Ok(())
+    }
+
+    /// `issuer`'s `withdraws` of `target` (`refs.target`, the target's
+    /// family): v62.0.0, an edition-2 composer.
     fn withdraws(issuer: &str, target: &Attestation) -> Attestation {
-        let env = serde_json::json!({
-            "references_attestation_id": target.attestation_id,
-            "withdrawal_reason": "I1516",
-        });
-        let mut w = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), issuer, issuer, &env);
-        w.attestation_type = attestation_type::WITHDRAWS.into();
-        w.weight = None;
-        ts::seal_row_in_place(issuer, &mut w);
-        w
+        e2::composer_of(attestation_type::WITHDRAWS, target, issuer)
     }
 
     /// **I1516** (v61 S2, CIRISPersist#1161; CC rc15 2.1 and the standing
@@ -351,7 +359,7 @@ pub(crate) mod bodies {
         let (moderator, author, member, outsider, room) =
             (k("mod"), k("author"), k("member"), k("outsider"), k("room"));
         for u in [&moderator, &author, &member, &outsider] {
-            ts::register_hybrid_key_as(d, u, u, identity_type::USER).await;
+            e2::put_key(d, u, &[identity_type::USER]).await;
         }
         reg(d, &[&room]).await;
         found_community(d, &room, "quorum:1/1", &[&moderator, &author, &member], &[])
@@ -359,10 +367,10 @@ pub(crate) mod bodies {
             .unwrap();
         const PLAIN: &str = "expertise:cardiology:en:v1";
         let peer_row = about(&member, PLAIN, &author, &room, None);
-        put(d, &peer_row)
+        put_about(d, &peer_row)
             .await
             .expect("I1516: a row naming a member of its room");
-        let e = put(d, &about(&member, PLAIN, &outsider, &room, None))
+        let e = put_about(d, &about(&member, PLAIN, &outsider, &room, None))
             .await
             .expect_err("I1516: a row naming a key outside its room");
         assert!(
@@ -376,26 +384,26 @@ pub(crate) mod bodies {
             ),
             "I1516: subject_outside_audience: {e:?}"
         );
-        put(d, &withdraws(&author, &peer_row))
+        put(d, &withdraws(&author, &peer_row.0))
             .await
             .expect("I1516: the named person withdraws a peer's row about them");
         let mod_act = about(&moderator, "moderation:rogue_vote:v1", &author, &room, None);
-        put(d, &mod_act)
+        put_about(d, &mod_act)
             .await
             .expect("I1516: the moderator's act naming the author");
-        let e = put(d, &withdraws(&author, &mod_act))
+        let e = put(d, &withdraws(&author, &mod_act.0))
             .await
             .expect_err("I1516: the named person does not withdraw a moderation act");
         assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I1516: {e}");
         let cosigned = about(&member, PLAIN, &author, &room, Some(&moderator));
-        put(d, &cosigned)
+        put_about(d, &cosigned)
             .await
             .expect("I1516: a cosigned row naming a member");
-        let e = put(d, &withdraws(&author, &cosigned))
+        let e = put(d, &withdraws(&author, &cosigned.0))
             .await
             .expect_err("I1516: the named person does not withdraw a cosigned act");
         assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I1516: {e}");
-        put(d, &withdraws(&moderator, &mod_act))
+        put(d, &withdraws(&moderator, &mod_act.0))
             .await
             .expect("I1516: the act's signer withdraws it (rule 1)");
     }

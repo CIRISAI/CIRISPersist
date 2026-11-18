@@ -696,6 +696,11 @@ where
     let group = read.event.group_key_id().to_owned();
     let signed_at = read.event.signed_instant();
     let now = super::self_roster::roster_clock();
+    // v62.0.0 (wave GC5; CC 2.7.3) — the group's roster and its open holds
+    // are other rows: declared, and each check below that reads them holds
+    // the row (concluding nothing) instead of refusing it. Outside a fold
+    // attempt (the earlier-form JSON door) each is the refusal it was.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&group));
     let members = active_members_at(dir, read.event.kind(), &group, signed_at).await?;
     let signer = match &read.cosignature {
         Some(c) => c.authority_key_id.clone(),
@@ -710,16 +715,22 @@ where
             .await?
             .contains(&signer)
     {
-        return Err(Error::AssertedAtStale {
-            author: signer,
-            standing_for: group,
-            plane: "cosign",
-            asserted_at: signed_at,
-            w_secs: super::self_roster::PAST_FRESHNESS_W_SECS,
-        });
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::COSIGN_SIGNER_NOT_MEMBER,
+            Error::AssertedAtStale {
+                author: signer,
+                standing_for: group,
+                plane: "cosign",
+                asserted_at: signed_at,
+                w_secs: super::self_roster::PAST_FRESHNESS_W_SECS,
+            },
+        ));
     }
     if !members.contains(&signer) {
-        return Err(not_member(&group, &signer));
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::COSIGN_SIGNER_NOT_MEMBER,
+            not_member(&group, &signer),
+        ));
     }
     match read.kind {
         CosignRow::Pending => {
@@ -748,10 +759,13 @@ where
                     && r.proposer_key_id == signer
                     && r.quorum_key != read.quorum_key
             }) {
-                return Err(Error::InvalidArgument(format!(
-                    "{COSIGN_OPEN_PENDING_EXISTS}: {signer} already holds an open cosign hold in \
-                     {group} — one open proposal per proposer (CIRISPersist#1252)"
-                )));
+                return Err(super::edition2::fold::hold(
+                    super::edition2::fold::reason::COSIGN_OPEN_PENDING_EXISTS,
+                    Error::InvalidArgument(format!(
+                        "{COSIGN_OPEN_PENDING_EXISTS}: {signer} already holds an open cosign hold \
+                         in {group} — one open proposal per proposer (CIRISPersist#1252)"
+                    )),
+                ));
             }
         }
         CosignRow::Signature => {
@@ -785,16 +799,6 @@ tokio::task_local! {
 #[must_use]
 pub(crate) fn executing_received_at() -> Option<DateTime<Utc>> {
     EXECUTING.try_with(|t| *t).ok()
-}
-
-/// Test-only: run `f` as the executor runs a held event's door (its hold
-/// first received at `received_at`).
-#[cfg(test)]
-pub(crate) async fn test_executing<F: std::future::Future>(
-    received_at: DateTime<Utc>,
-    f: F,
-) -> F::Output {
-    EXECUTING.scope(received_at, f).await
 }
 
 /// The window of a group's holds, in seconds (CC 3.3.4, 4.5.13).
@@ -1254,11 +1258,18 @@ where
 /// [`Error::InvalidArgument`] ([`COSIGN_SIGNATURE_IRREVOCABLE`]).
 pub(crate) fn check_withdraws_target(target: &Attestation) -> Result<(), Error> {
     if cosign_row_kind(target) == Some(CosignRow::Signature) {
-        return Err(Error::InvalidArgument(format!(
-            "{COSIGN_SIGNATURE_IRREVOCABLE}: withdraws names the cosignature row {} — a \
-             cosignature already sent is irrevocable (CIRISPersist#1252, CC 3.1.3)",
-            target.attestation_id
-        )));
+        // v62.0.0 (wave GC5; CC 2.7.3) — the named target's kind is another
+        // row's content: the `withdraws` is held, concluding nothing (it
+        // withdraws nothing), never refused. Outside a fold attempt it is
+        // the refusal it was.
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::COSIGN_SIGNATURE_IRREVOCABLE,
+            Error::InvalidArgument(format!(
+                "{COSIGN_SIGNATURE_IRREVOCABLE}: withdraws names the cosignature row {} — a \
+                 cosignature already sent is irrevocable (CIRISPersist#1252, CC 3.1.3)",
+                target.attestation_id
+            )),
+        ));
     }
     Ok(())
 }
@@ -1525,10 +1536,6 @@ pub(crate) mod test_hook {
     use std::cell::Cell;
     thread_local! {
         static OFF: Cell<bool> = const { Cell::new(false) };
-    }
-    /// Suppress (`true`) or restore the hook on this thread.
-    pub(crate) fn suppress(off: bool) {
-        OFF.with(|c| c.set(off));
     }
     pub(super) fn suppressed() -> bool {
         OFF.with(Cell::get)

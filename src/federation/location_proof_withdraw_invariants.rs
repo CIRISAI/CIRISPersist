@@ -82,10 +82,12 @@ pub(crate) mod bodies {
         let r = d
             .withdraw_location_proof(ts::sign_location_proof(&delegate, proof(Some(t1))))
             .await;
+        // v62.0.0 (GC8; CC 4.5.9.1 ruling 10) — no delegation mints a
+        // location authority: the delegate is refused at the door, by its
+        // bytes (attester != subject), before the attester leg.
         assert!(
-            r.as_ref().is_err_and(|e| e
-                .to_string()
-                .contains("location_proof_withdraw_not_the_attester")),
+            matches!(&r, Err(Error::LocationAuthorityUnauthorized { rule, .. })
+                if *rule == crate::federation::tier_ingest::LOCATION_AUTHORITY_RULE_NOT_SUBJECT),
             "I519 a delegate who did not attest the proof cannot end it: {r:?}"
         );
         assert!(in_force().await, "I519 the delegate ended nothing");
@@ -537,10 +539,11 @@ pub(crate) mod peer_bodies {
         let r = b
             .put_location_proof(ts::sign_location_proof(&delegate, proof(at2, Some(t1))))
             .await;
+        // v62.0.0 (GC8; CC 4.5.9.1 ruling 10) — refused at the door: not the
+        // subject.
         assert!(
-            r.as_ref().is_err_and(|e| e
-                .to_string()
-                .contains("location_proof_withdraw_not_the_attester")),
+            matches!(&r, Err(Error::LocationAuthorityUnauthorized { rule, .. })
+                if *rule == crate::federation::tier_ingest::LOCATION_AUTHORITY_RULE_NOT_SUBJECT),
             "I522 a delegate who did not attest the proof cannot end it through replication: {r:?}"
         );
         assert!(in_force!(b).await, "I522 the second proof stands");

@@ -161,14 +161,24 @@ where
              counted over"
         )));
     };
+    // v62.0.0 (wave GC5; CC 2.7.3) — the bundle it names is an input (the
+    // re-bind plane is FINAL: it reads the row's NAMED past only).
+    super::fold::reads(super::fold::Dep::Row(head));
     let in_force = genesis_in_force(dir).await?;
     if !in_force.tips().iter().any(|t| t.object_id == head.0) {
         if in_force.valid.iter().any(|p| p.object_id == head.0) {
-            return Err(invalid(format!(
-                "{REBIND_FAMILY}: `refs.head` names bundle {}, which is not in force: a re-bind \
-                 is counted over the bundle in force",
-                head.hex()
-            )));
+            // v62.0.0 (wave GC5; CC 2.7.3) — whether a LATER bundle
+            // superseded the named one is another statement's word: the
+            // voice is HELD (`rebind_head_not_in_force`), concluding
+            // nothing, never refused.
+            return Err(super::fold::hold(
+                super::fold::reason::REBIND_HEAD_NOT_IN_FORCE,
+                invalid(format!(
+                    "{REBIND_FAMILY}: `refs.head` names bundle {}, which is not in force: a \
+                     re-bind is counted over the bundle in force",
+                    head.hex()
+                )),
+            ));
         }
         return Err(waiting_on_bundle(&head));
     }

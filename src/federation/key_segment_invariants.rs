@@ -19,27 +19,26 @@
 //!   normal unclaimed-dimension answer, at both doors), it names no authority,
 //!   and it is not the board's licensure.
 //!
-//! Earlier-form (JSON) rows, as the rest of the suite until the fixture flip;
-//! the dimension's spelling is the same in edition 2.
+//! Edition-2 rows (the fixture switch): seeds sign, the stored ids are their
+//! identity-refs, and a key in a dimension is its bare segment.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::admission::steward_liveness_test_support::{
-        register, signed_row, store,
-    };
+    use crate::federation::admission::steward_liveness_test_support::signed_row;
     use crate::federation::admission::DELEGATION_SCOPE_LICENSE;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::apply_replicated_statement;
+    use crate::federation::edition2::names::RowId;
     use crate::federation::licensure::{licensure_stem_of, status_set_for, LicensureStatus};
-    use crate::federation::namespace::key_segment::tests::{kid, segment};
-    use crate::federation::tier_ingest::test_support::reseal;
+    use crate::federation::namespace::key_segment::tests::segment;
     use crate::federation::types::{attestation_type, identity_type};
-    use crate::federation::{
-        malformed_row, Attestation, Error, FederationDirectory, SignedAttestation,
-    };
+    use crate::federation::{malformed_row, Attestation, Error, FederationDirectory};
     use std::collections::BTreeSet;
 
     const REFUSAL: &str = "licensure_delegator_not_authority";
 
-    /// A licence on `holder` whose dimension is `{stem}:v1`, verbatim.
+    /// A licence by `issuer` (a SEED) on `holder` (a seed) whose dimension is
+    /// `{stem}:v1`, verbatim, as an edition-2 statement (the fixture switch).
     fn licence(issuer: &str, holder: &str, stem: &str, delegation_id: Option<&str>) -> Attestation {
         let mut envelope = serde_json::json!({
             "id": uuid::Uuid::new_v4().to_string(),
@@ -51,9 +50,7 @@ pub(crate) mod bodies {
         if let Some(d) = delegation_id {
             envelope["delegation_id"] = serde_json::Value::String(d.to_owned());
         }
-        let mut row = signed_row(issuer, holder, attestation_type::SCORES, envelope);
-        reseal(&mut row);
-        row
+        signed_row(issuer, holder, attestation_type::SCORES, envelope)
     }
 
     fn assert_malformed(e: &Error, what: &str) {
@@ -70,26 +67,22 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        // The test signer seeds from the first 32 bytes of a key id and every
-        // identity-ref shares its first 34, so exactly ONE identity-ref key
-        // is registered here.
-        let board = kid('Q');
+        // Seeds sign; the stored ids are their identity-refs (E0).
+        let board_seed = format!("{tag}-brd");
+        let holder_seed = format!("{tag}-hld");
+        let holder2_seed = format!("{tag}-hl2");
+        let clerk_seed = format!("{tag}-clk");
+        let stranger_seed = format!("{tag}-str");
+        let board = e2::put_key(d, &board_seed, &[identity_type::USER]).await;
+        let holder = e2::put_key(d, &holder_seed, &[identity_type::USER]).await;
+        let holder2 = e2::put_key(d, &holder2_seed, &[identity_type::USER]).await;
+        let _ = e2::put_key(d, &clerk_seed, &[identity_type::PRIMITIVE]).await;
+        let _ = e2::put_key(d, &stranger_seed, &[identity_type::PRIMITIVE]).await;
         let stem = licensure_stem_of(&board);
-        assert_eq!(stem, format!("licensure:{}", segment('Q')));
-        let holder = format!("{tag}-holder");
-        let holder2 = format!("{tag}-holder2");
-        let clerk = format!("{tag}-clerk");
-        let stranger = format!("{tag}-stranger");
-        register(d, &board, &[identity_type::USER]).await;
-        for k in [&holder, &holder2] {
-            register(d, k, &[identity_type::USER]).await;
-        }
-        for k in [&clerk, &stranger] {
-            register(d, k, &[identity_type::PRIMITIVE]).await;
-        }
+        assert_eq!(stem, format!("licensure:{}", e2::kid_thumb(&board_seed)));
 
         // (a) The board's own licence, its key written bare.
-        store(d, &licence(&board, &holder, &stem, None))
+        e2::put_signed(d, &licence(&board_seed, &holder_seed, &stem, None))
             .await
             .unwrap_or_else(|e| panic!("I2965 (a): the board's own licence admits: {e}"));
         assert_eq!(
@@ -100,31 +93,35 @@ pub(crate) mod bodies {
             "I2965 (a): asked by the board's key id, the fold reads its licence"
         );
 
-        // (b) The board's licensing officer.
-        let mut edge = signed_row(
-            &board,
-            &clerk,
+        // (b) The board's licensing officer: the edge lands with the
+        // delegate's own voice (`self:delegates_to`'s second signer).
+        let edge = signed_row(
+            &board_seed,
+            &clerk_seed,
             attestation_type::DELEGATES_TO,
             serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "scope": [DELEGATION_SCOPE_LICENSE],
             }),
         );
-        edge.subject_key_ids = vec![clerk.clone()];
-        reseal(&mut edge);
-        store(d, &edge)
+        e2::put_signed(d, &edge)
             .await
             .unwrap_or_else(|e| panic!("I2965 (b): the board appoints its officer: {e}"));
-        store(
+        let st = e2::carried_statement(&edge).expect("the edge's statement");
+        e2::put_statement(d, &e2::voice_of(&st, &clerk_seed))
+            .await
+            .unwrap_or_else(|e| panic!("I2965 (b): the officer's voice over its edge: {e}"));
+        let edge_id = e2::rid(&edge);
+        e2::put_signed(
             d,
-            &licence(&clerk, &holder2, &stem, Some(&edge.attestation_id)),
+            &licence(&clerk_seed, &holder2_seed, &stem, Some(&edge_id)),
         )
         .await
         .unwrap_or_else(|e| panic!("I2965 (b): the officer's licence admits: {e}"));
 
         // (c) A key with no edge from the board.
-        let forged = licence(&stranger, &holder, &stem, Some(&edge.attestation_id));
-        let err = store(d, &forged)
+        let forged = licence(&stranger_seed, &holder_seed, &stem, Some(&edge_id));
+        let err = e2::put_signed(d, &forged)
             .await
             .expect_err("I2965 (c): a stranger's licence for the board is refused");
         assert!(
@@ -132,7 +129,7 @@ pub(crate) mod bodies {
             "I2965 (c): refused by the licensure gate, got {err}"
         );
         assert!(d
-            .get_attestation(&forged.attestation_id)
+            .get_attestation(&e2::rid(&forged))
             .await
             .expect("read")
             .is_none());
@@ -151,31 +148,34 @@ pub(crate) mod bodies {
         let mut bits = segment('Q');
         bits.pop();
         bits.push('B');
-        let row = licence(&board, &holder, &format!("licensure:{bits}"), None);
+        let row = licence(
+            &board_seed,
+            &holder_seed,
+            &format!("licensure:{bits}"),
+            None,
+        );
         assert_malformed(
-            &store(d, &row).await.expect_err("trailing bits"),
+            &e2::put_signed(d, &row).await.expect_err("trailing bits"),
             "I2966 (direct): trailing bits",
         );
-        let e = d
-            .apply_replicated_attestation(SignedAttestation {
-                attestation: row.clone(),
-            })
+        let st = e2::carried_statement(&row).expect("the row's statement");
+        let e = apply_replicated_statement(d, &st, &e2::rid_digest(&row))
             .await
             .expect_err("trailing bits");
         assert_malformed(&e, "I2966 (replicated): trailing bits");
         assert!(d
-            .get_attestation(&row.attestation_id)
+            .get_attestation(&e2::rid(&row))
             .await
             .expect("read")
             .is_none());
 
         // I2966 — CC rc21: the board's URN written where the authority goes
-        // matches NO family. The key-segment gate does not refuse it; the door
-        // gives its normal answer for a dimension no family claims (whatever
-        // that is on this door), and nothing is admitted AS the board's
+        // matches NO family. The key-segment gate does not refuse it; the
+        // door gives its normal answer for a dimension no family claims (the
+        // edition-2 door: the dimension does not resolve to the family the
+        // statement declares), and nothing is admitted as the board's
         // licensure.
-        let urn_stem = format!("licensure:{board}");
-        let urn_dim = format!("{urn_stem}:v1");
+        let urn_dim = format!("licensure:{board}:v1");
         assert_eq!(
             crate::federation::namespace::matcher::match_family(&urn_dim).family,
             None,
@@ -186,18 +186,31 @@ pub(crate) mod bodies {
             None,
             "I2966: a URN names no authority"
         );
-        let direct = licence(&board, &holder, &urn_stem, None);
-        let wired = licence(&board, &holder, &urn_stem, None);
-        let outcomes = [
-            ("direct", store(d, &direct).await.err()),
-            (
-                "replicated",
-                d.apply_replicated_attestation(SignedAttestation { attestation: wired })
-                    .await
-                    .err(),
-            ),
-        ];
-        for (door, err) in outcomes {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut shape = crate::federation::tier_ingest::test_support::bare_attestation(
+            &id,
+            &board_seed,
+            &holder_seed,
+            &serde_json::json!({
+                "id": id,
+                "dimension": urn_dim,
+                "status": "issued",
+                "score": 1.0,
+                "confidence": 0.9,
+            }),
+        );
+        shape.attestation_type = attestation_type::SCORES.to_owned();
+        let urn_st = e2::statement_of_family(
+            &shape,
+            &board_seed,
+            &ciris_verify_core::namespace_match::family_id("licensure:{authority_id}"),
+        );
+        let urn_id = RowId::of_statement(&urn_st).expect("a row statement");
+        let direct = e2::put_statement(d, &urn_st).await.err();
+        let wired = apply_replicated_statement(d, &urn_st, &urn_id.0)
+            .await
+            .err();
+        for (door, err) in [("direct", direct), ("replicated", wired)] {
             if let Some(Error::MalformedRow { reason, .. }) = &err {
                 assert_ne!(
                     *reason,

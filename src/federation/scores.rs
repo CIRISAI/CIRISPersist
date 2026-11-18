@@ -685,12 +685,13 @@ mod tests {
         );
     }
 
+    /// v62.0.0 (JSON cut, E5) — a composer over the typed struct, as the fold
+    /// reads it. The earlier-form re-seal is gone: the fold is pure (no door,
+    /// no signature), and an edition-2 seal would name its target by row id.
     fn composer(id: &str, attester: &str, ty: &str, upstream: &str, ts: i64) -> Attestation {
         let mut r = scores_row(id, attester, 0.0, 1.0, ts);
         r.attestation_type = ty.into();
-        crate::federation::tier_ingest::test_support::reseal(&mut r);
         r.attestation_envelope = serde_json::json!({ "references_attestation_id": upstream });
-        crate::federation::tier_ingest::test_support::reseal(&mut r);
         r
     }
 

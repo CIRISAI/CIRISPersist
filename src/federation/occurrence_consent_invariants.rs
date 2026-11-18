@@ -17,91 +17,159 @@
 //! - **I382** (sqlite, postgres) — the issue's shape end to end: provision the
 //!   engine occurrence, run `self_at_login` with `app` = the engine key, and
 //!   the owner is still the node's principal.
+//!
+//! v62.0.0 (flip wave 2, slice E6) — I381 runs on O1's edition-2
+//! `identity:occurrence` door (two voices per bind); I382 runs the Engine's
+//! own producers (`publish_signed_content_only_occurrence`, `self_at_login`),
+//! edition 2 since cut B.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::tier_ingest::test_support as ts;
+    //! v62.0.0 (flip wave 2, slice E6; O1's `identity:occurrence` door) — an
+    //! occurrence bind is two voices over one payload: the occurrence key's
+    //! OWN statement first, then the identity's (the author's). Keys are
+    //! edition-2 `key:record`s named by kid; rows are now-relative.
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::types::identity_type as it;
     use crate::federation::FederationDirectory;
+    use ciris_verify_core::cde::{self, Value};
 
-    fn ago(secs: i64) -> chrono::DateTime<chrono::Utc> {
-        let t = chrono::Utc::now() - chrono::Duration::seconds(secs);
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis()).expect("ms")
+    fn now_ms() -> u64 {
+        u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after the epoch")
     }
 
-    /// **I381** — the identity re-signing does not demote the binding.
+    /// A CDE map of text keys, in encoding order.
+    fn map(mut m: Vec<(&str, Value)>) -> Value {
+        m.sort_by_key(|(k, _)| cde::encode(&Value::Text((*k).to_owned())));
+        Value::Map(
+            m.into_iter()
+                .map(|(k, v)| (Value::Text(k.to_owned()), v))
+                .collect(),
+        )
+    }
+
+    /// The two voices of an `identity:occurrence` bind of the key of
+    /// `occurrence_seed` to the identity of `identity_seed` (O1, CC 3.3.6):
+    /// `[the occurrence key's own statement, the identity's statement]`,
+    /// in the order a node admits them.
+    pub(crate) fn bind_voices(
+        identity_seed: &str,
+        occurrence_seed: &str,
+        device_class: &str,
+        asserted_at_ms: u64,
+    ) -> [Vec<u8>; 2] {
+        let (identity, occurrence) = (e2::kid(identity_seed), e2::kid(occurrence_seed));
+        let payload = map(vec![
+            ("asserted_at", Value::Uint(asserted_at_ms)),
+            ("author", Value::Text(identity.clone())),
+            ("identity_key_id", Value::Text(identity.clone())),
+            ("occurrence_key_id", Value::Text(occurrence.clone())),
+            ("device_class", Value::Text(device_class.to_owned())),
+        ]);
+        let voice = |seed: &str, iss: &str| {
+            ciris_verify_core::edition2::sign_row_statement(
+                &e2::signing_key(seed),
+                iss,
+                &occurrence,
+                "scores",
+                crate::federation::edition2::occurrence::OCCURRENCE_FAMILY,
+                &payload,
+                vec![],
+            )
+            .expect("an occurrence bind voice signs")
+        };
+        [
+            voice(occurrence_seed, &occurrence),
+            voice(identity_seed, &identity),
+        ]
+    }
+
+    /// Put both voices of a bind, in order.
+    pub(crate) async fn put_bind(
+        d: &dyn FederationDirectory,
+        identity_seed: &str,
+        occurrence_seed: &str,
+        device_class: &str,
+        asserted_at_ms: u64,
+    ) {
+        for v in bind_voices(identity_seed, occurrence_seed, device_class, asserted_at_ms) {
+            Box::pin(e2::put_statement(d, &v))
+                .await
+                .expect("an occurrence bind voice is admitted");
+        }
+    }
+
+    /// **I381** — the identity re-asserting the pair does not demote the
+    /// binding. v62.0.0: every bind carries the occurrence's own voice, so
+    /// the re-assertion is a second two-voice bind; the principal stands.
     pub(crate) async fn i381_re_signing_keeps_the_principal(
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let owner = format!("owner-{tag}");
-        let node = format!("node-{tag}");
-        ts::register_hybrid_key_as(d, &owner, &owner, it::USER).await;
-        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
-        // The provisioning shape: the owner binds the node, claims it, and the
-        // occurrence agrees (a node signs its own occurrence through the lift).
-        d.put_attestation(crate::federation::SignedAttestation {
-            attestation: ts::owner_binding_attestation(&format!("bind-{tag}"), &owner, &node),
-        })
-        .await
-        .expect("I381 the owner-binding is admitted");
-        d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(&owner, &owner, &node, ago(30)).await,
-        )
-        .await
-        .expect("I381 the identity's claim is admitted");
-        d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(&node, &owner, &node, ago(20)).await,
-        )
-        .await
-        .expect("I381 the occurrence's agreement is admitted");
+        let (owner_s, node_s) = (format!("owner-{tag}"), format!("node-{tag}"));
+        let owner = e2::put_key(d, &owner_s, &[it::USER]).await;
+        let node = e2::put_key(d, &node_s, &[it::NODE]).await;
+        // The provisioning shape: the owner binds the node (with the node's
+        // own voice, `ownership:*`'s second signer), and the pair is bound.
+        let ob = crate::federation::tier_ingest::test_support::owner_binding_attestation(
+            &format!("bind-{tag}"),
+            &owner_s,
+            &node_s,
+        );
+        let ob_st = e2::carried_statement(&ob).expect("an edition-2 owner binding");
+        e2::put_signed(d, &ob)
+            .await
+            .expect("I381 the owner-binding is admitted");
+        e2::put_statement(d, &e2::voice_of(&ob_st, &node_s))
+            .await
+            .expect("I381 the node's voice on its owner binding");
+        let t = now_ms();
+        put_bind(d, &owner_s, &node_s, "server", t - 30_000).await;
         assert_eq!(
             d.active_identities_for_occurrence(&node).await.unwrap(),
             vec![owner.clone()],
-            "I381 precondition — the occurrence's consent resolves the owner"
+            "I381 precondition — the bound occurrence resolves the owner"
         );
 
-        // The identity re-signs the pair: the current row is now its own, the
-        // occurrence's row is history.
-        d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(&owner, &owner, &node, ago(10)).await,
-        )
-        .await
-        .expect("I381 the identity's re-signing is admitted (I271)");
-        let current = d
-            .list_signed_identity_occurrences_for(&owner)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.identity_occurrence.occurrence_key_id == node)
-            .expect("I381 the pair's current row");
-        assert_eq!(
-            current.attesting_key_id, owner,
-            "I381 precondition — the current row is the identity's"
+        // The identity re-asserts the pair.
+        put_bind(d, &owner_s, &node_s, "server", t - 10_000).await;
+        assert!(
+            d.list_identity_occurrences_for(&owner)
+                .await
+                .unwrap()
+                .iter()
+                .any(|o| o.occurrence_key_id == node),
+            "I381 the pair is held"
         );
         assert_eq!(
             d.active_identities_for_occurrence(&node).await.unwrap(),
             vec![owner.clone()],
-            "I381 the occurrence's agreement survives the identity's re-signing"
+            "I381 the re-assertion keeps the principal"
         );
     }
 
-    /// The control (#932 kept): an identity's claims the occurrence never
-    /// agreed to resolve nothing, however many times the identity re-signs.
+    /// The control (#932 kept): an identity's claim the occurrence never
+    /// agreed to resolves nothing. v62.0.0: the identity's statement with no
+    /// statement of the occurrence key's own is refused (retryable, O1 I3022)
+    /// and binds nothing, however many times it is offered.
     pub(crate) async fn i381_an_unagreed_claim_still_resolves_nothing(
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let owner = format!("owner-{tag}");
-        let phone = format!("phone-{tag}");
-        ts::register_hybrid_key_as(d, &owner, &owner, it::USER).await;
-        ts::register_hybrid_key_as(d, &phone, &phone, it::USER).await;
-        for t in [ago(20), ago(10)] {
-            d.put_identity_occurrence(
-                ts::signed_content_only_occurrence(&owner, &owner, &phone, t).await,
-            )
-            .await
-            .expect("I381 control — the identity's claim is admitted");
+        let (owner_s, phone_s) = (format!("owner-{tag}"), format!("phone-{tag}"));
+        e2::put_key(d, &owner_s, &[it::USER]).await;
+        let phone = e2::put_key(d, &phone_s, &[it::USER]).await;
+        let t = now_ms();
+        for at in [t - 20_000, t - 10_000] {
+            let [_own, by_owner] = bind_voices(&owner_s, &phone_s, "phone", at);
+            let e = Box::pin(e2::put_statement(d, &by_owner))
+                .await
+                .expect_err("I381 control — the identity's claim alone binds nothing");
+            assert_eq!(
+                e.kind(),
+                "federation_attester_key_unknown",
+                "I381 control — retryable, waiting on the occurrence's own voice: {e}"
+            );
         }
         assert!(
             d.active_identities_for_occurrence(&phone)
@@ -152,31 +220,32 @@ pub(crate) mod engine_bodies {
             .expect("register the engine key");
         let n = engine.local_derived_key_id().await.unwrap();
         let b = pick(&engine);
-        let o_signer = ts::local_signer(&format!("o382-the-owner-of-the-engine-node-{tag}"));
-        let o = o_signer.derived_key_id();
-        ts::register_hybrid_key_as(
+        // v62.0.0 — edition-2 keys (`kid(seed)`); each LocalSigner signs as
+        // the kid of its alias.
+        let o_alias = format!("o382-the-owner-of-the-engine-node-{tag}");
+        let o_signer = ts::local_signer(&o_alias);
+        let o =
+            crate::federation::edition2::fixture_switch::put_key(b.as_ref(), &o_alias, &[it::USER])
+                .await;
+        let agent = crate::federation::edition2::fixture_switch::put_key(
             b.as_ref(),
-            &o,
-            &format!("o382-the-owner-of-the-engine-node-{tag}"),
-            it::USER,
-        )
-        .await;
-        let agent =
-            ts::local_signer(&format!("ag382-the-agent-occurrence-key-{tag}")).derived_key_id();
-        ts::register_hybrid_key_as(
-            b.as_ref(),
-            &agent,
             &format!("ag382-the-agent-occurrence-key-{tag}"),
-            it::AGENT,
+            &[it::AGENT],
         )
         .await;
 
         // provision_engine_occurrence: the owner binds N, claims it, N agrees.
-        b.put_attestation(crate::federation::SignedAttestation {
-            attestation: ts::owner_binding_attestation(&format!("bind382-{tag}"), &o, &n),
-        })
-        .await
-        .expect("I382 the owner-binding is admitted");
+        {
+            use crate::federation::edition2::fixture_switch as e2;
+            let ob = ts::owner_binding_attestation(&format!("bind382-{tag}"), &o_alias, &n);
+            let st = e2::carried_statement(&ob).expect("an edition-2 owner binding");
+            e2::put_signed(b.as_ref(), &ob)
+                .await
+                .expect("I382 the owner-binding is admitted");
+            e2::put_statement(b.as_ref(), &e2::voice_of(&st, &alias_n))
+                .await
+                .expect("I382 the node's voice on its owner binding");
+        }
         let kem = b.load_or_init_content_kem_identity().await.unwrap();
         let enc = EncryptionPubkeys {
             x25519_base64: kem.x25519_pubkey_b64,
@@ -244,6 +313,9 @@ pub(crate) mod engine_bodies {
             outcome.occurrences_published.contains(&n),
             "I382 the ceremony published the app occurrence: {outcome:?}"
         );
+        // v62.0.0 — O1's signed listing serves edition-2 binds (carrying
+        // their statements; O1 I3034): the pair's current row is the
+        // identity's, and the occurrence's agreement lives in the history.
         let stored = b
             .list_signed_identity_occurrences_for(&o)
             .await
@@ -313,13 +385,15 @@ mod runners {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i382_self_at_login_sqlite() {
-        super::engine_bodies::i382_self_at_login_keeps_the_engine_occurrence(
-            "sqlite::memory:",
-            &suffix(),
-            (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
-                as crate::federation::epoch_minter_invariants::bodies::Pick<
-                    crate::store::sqlite::SqliteBackend,
-                >,
+        Box::pin(
+            super::engine_bodies::i382_self_at_login_keeps_the_engine_occurrence(
+                "sqlite::memory:",
+                &suffix(),
+                (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                    as crate::federation::epoch_minter_invariants::bodies::Pick<
+                        crate::store::sqlite::SqliteBackend,
+                    >,
+            ),
         )
         .await;
     }
@@ -330,13 +404,15 @@ mod runners {
         let Some(dsn) = crate::test_pg::empty_dsn() else {
             return;
         };
-        super::engine_bodies::i382_self_at_login_keeps_the_engine_occurrence(
-            &dsn,
-            &suffix(),
-            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
-                as crate::federation::epoch_minter_invariants::bodies::Pick<
-                    crate::store::postgres::PostgresBackend,
-                >,
+        Box::pin(
+            super::engine_bodies::i382_self_at_login_keeps_the_engine_occurrence(
+                &dsn,
+                &suffix(),
+                (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                    as crate::federation::epoch_minter_invariants::bodies::Pick<
+                        crate::store::postgres::PostgresBackend,
+                    >,
+            ),
         )
         .await;
     }

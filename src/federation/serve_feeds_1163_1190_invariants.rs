@@ -70,6 +70,7 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_query::Dialect;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::read_plan::{SERVE_LIMIT_OUT_OF_RANGE, SERVE_PREFIXES_REFUSED};
     use crate::federation::row_type::{with_enforcement, RowTypeEnforcement};
     use crate::federation::steward_purge::{self as sp, PurgePlane};
@@ -79,7 +80,7 @@ pub(crate) mod bodies {
         attestation_type, cohort_scope, delegation_scope as ds, identity_type as it, owner_binding,
         AnnouncedOwnerState, OwnerBindingChange, ServePage, ServePosition, ServedAttestation,
     };
-    use crate::federation::{Error, FederationDirectory, SignedAttestation};
+    use crate::federation::{Error, FederationDirectory};
     use chrono::{DateTime, Utc};
 
     /// A serve position.
@@ -246,38 +247,38 @@ pub(crate) mod bodies {
         tag: &str,
     ) {
         let (a, k) = attester(d, tag).await;
-        let a1 = put_dim(d, &a, &k, "i1570a:x:v1").await;
-        let b1 = put_dim(d, &a, &k, "i1570b:z:v1").await;
-        let c1 = put_dim(d, &a, &k, "i1570c:w:v1").await;
+        let a1 = put_dim(d, &a, &k, "need:i1570a:x:v1").await;
+        let b1 = put_dim(d, &a, &k, "need:i1570b:z:v1").await;
+        let c1 = put_dim(d, &a, &k, "need:i1570c:w:v1").await;
         // Case is kept: an upper-case dimension, planted as stored state (the
         // door's own dimension rules are not what this measures), is not
-        // under "i1570a:".
-        let upper = put_dim(d, &a, &k, "i1570q:x:v1").await;
+        // under "need:i1570a:".
+        let upper = put_dim(d, &a, &k, "need:i1570q:x:v1").await;
         raw.exec(&format!(
             "UPDATE {} SET attestation_envelope = \
-             replace(attestation_envelope, 'i1570q:x:v1', 'i1570A:x:v1') \
+             replace(attestation_envelope, 'need:i1570q:x:v1', 'need:i1570A:x:v1') \
              WHERE attestation_id = '{upper}'",
             raw.attestations_table()
         ))
         .await;
-        let a2 = put_dim(d, &a, &k, "i1570a:y:v1").await;
+        let a2 = put_dim(d, &a, &k, "need:i1570a:y:v1").await;
         // A binding: the only `delegates_to` here.
         let (owner, node) = owner_and_node(d, &format!("{tag}-1570")).await;
         let binding = bind(d, &owner, &node, cohort_scope::FEDERATION).await;
 
         let all = |p: &ServePage<ServedAttestation>| -> Vec<String> { ids(p) };
         assert_eq!(
-            all(&page(d, None, &["i1570a:"], 100).await),
+            all(&page(d, None, &["need:i1570a:"], 100).await),
             vec![a1.clone(), a2.clone()],
             "I1570 {tag}: one family prefix, serve order"
         );
         assert_eq!(
-            all(&page(d, None, &["i1570a:", "i1570b:"], 100).await),
+            all(&page(d, None, &["need:i1570a:", "need:i1570b:"], 100).await),
             vec![a1.clone(), b1.clone(), a2.clone()],
             "I1570 {tag}: two prefixes are an OR"
         );
         assert_eq!(
-            all(&page(d, None, &["i1570A:"], 100).await),
+            all(&page(d, None, &["need:i1570A:"], 100).await),
             vec![upper.clone()],
             "I1570 {tag}: a prefix is case-sensitive"
         );
@@ -299,21 +300,21 @@ pub(crate) mod bodies {
             !all(&page(d, None, &["ownership:"], 100).await).contains(&binding),
             "I1570 {tag}: a `delegates_to` is not selected by the dimension it carries"
         );
-        let both = all(&page(d, None, &["i1570c:", "delegates_to"], 100).await);
+        let both = all(&page(d, None, &["need:i1570c:", "delegates_to"], 100).await);
         assert!(
             both.contains(&c1) && both.contains(&binding) && !both.contains(&a1),
             "I1570 {tag}: a dimension family OR a type family: {both:?}"
         );
         // `LIKE` wildcards are ordinary bytes: under `LIKE 'i1570_%'` every
         // row above would match, under a byte prefix none does.
-        for wild in ["i1570_", "i1570%", "i1570_:", "%"] {
+        for wild in ["need:i1570_", "need:i1570%", "need:i1570_:", "%"] {
             assert!(
                 page(d, None, &[wild], 100).await.items.is_empty(),
                 "I1570 {tag}: {wild:?} is a literal prefix, not a pattern"
             );
         }
         assert!(
-            page(d, None, &["i1570z:"], 100).await.items.is_empty(),
+            page(d, None, &["need:i1570z:"], 100).await.items.is_empty(),
             "I1570 {tag}: a prefix nothing has"
         );
     }
@@ -326,11 +327,11 @@ pub(crate) mod bodies {
         tag: &str,
     ) {
         let (a, k) = attester(d, tag).await;
-        let scored = put_dim(d, &a, &k, "i1670a:x:v1").await;
+        let scored = put_dim(d, &a, &k, "need:i1670a:x:v1").await;
         // A row retyped to a type-slot family, still carrying a `dimension`
         // under another family (stored state; the door's type rules are not
         // what this measures).
-        let typed = put_dim(d, &a, &k, "i1670a:typed:v1").await;
+        let typed = put_dim(d, &a, &k, "need:i1670a:typed:v1").await;
         raw.exec(&format!(
             "UPDATE {} SET attestation_type = 'i1670t:typed' WHERE attestation_id = '{typed}'",
             raw.attestations_table()
@@ -346,13 +347,13 @@ pub(crate) mod bodies {
             .await
             .expect("the stream");
         for prefixes in [
-            vec!["i1670a:"],
+            vec!["need:i1670a:"],
             vec!["i1670t:"],
             vec!["ownership:"],
             vec!["withdraws"],
-            vec!["delegates_to", "i1670a:x:"],
+            vec!["delegates_to", "need:i1670a:x:"],
             vec!["scores"],
-            vec!["i1670"],
+            vec!["need:i1670"],
         ] {
             let want: Vec<String> = held
                 .iter()
@@ -367,7 +368,7 @@ pub(crate) mod bodies {
         }
         // Not vacuous: each shape is selected by its own family and not by
         // the other one it carries.
-        let by_dimension = walk(d, None, &["i1670a:"], 100).await.0;
+        let by_dimension = walk(d, None, &["need:i1670a:"], 100).await.0;
         assert!(
             by_dimension.contains(&scored) && !by_dimension.contains(&typed),
             "I1670 {tag}: a retyped row is not selected by the dimension it carries"
@@ -403,10 +404,10 @@ pub(crate) mod bodies {
         let (a, k) = attester(d, tag).await;
         let mut want = Vec::new();
         for i in 0..5 {
-            want.push(put_dim(d, &a, &k, &format!("i1571:{i}:v1")).await);
+            want.push(put_dim(d, &a, &k, &format!("need:i1571:{i}:v1")).await);
         }
-        put_dim(d, &a, &k, "i1571x:other:v1").await;
-        let dims = ["i1571:"];
+        put_dim(d, &a, &k, "need:i1571x:other:v1").await;
+        let dims = ["need:i1571:"];
         let (all, shape, _) = walk(d, None, &dims, 100).await;
         assert_eq!(all, want, "I1571 {tag}: every row, admission order");
         assert_eq!(shape, vec![(5, false)], "I1571 {tag}");
@@ -486,25 +487,25 @@ pub(crate) mod bodies {
         // keep their type inside a family the read asks for: otherwise their
         // exclusion would be the family's, not the serve filter's, and the
         // legs would pass vacuously.
-        let dims = ["i1572:", "holds_bytes:sha256:5a5a5a5a"];
-        let kept = put_dim(d, &a, &k, "i1572:k:v1").await;
-        let doomed = put_dim(d, &a, &k, "i1572:d:v1").await;
+        let dims = ["need:i1572:", "holds_bytes:sha256:5a5a5a5a"];
+        let kept = put_dim(d, &a, &k, "need:i1572:k:v1").await;
+        let doomed = put_dim(d, &a, &k, "need:i1572:d:v1").await;
         // Names a PERSON: a tombstone is void for it.
-        let void = n::put_naming(d, &a, &[&k, &person], "i1572:p:v1", n::at(10), None).await;
-        let unregistered = put_dim(d, &a, &k, "i1572:u:v1").await;
-        let retired = put_dim(d, &a, &k, "i1572:r:v1").await;
+        let void = n::put_naming(d, &a, &[&k, &person], "need:i1572:p:v1", n::at(10), None).await;
+        let unregistered = put_dim(d, &a, &k, "need:i1572:u:v1").await;
+        let retired = put_dim(d, &a, &k, "need:i1572:r:v1").await;
         d.attestation_insert_local(crate::federation::types::LocalAttestationInput {
             attestation_id: None,
-            attesting_key_id: a.clone(),
+            attesting_key_id: e2::kid(&a),
             attested_key_id: None,
             attestation_type: attestation_type::SCORES.to_owned(),
             weight: None,
             expires_at: None,
             attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                serde_json::json!({ "dimension": "i1572:l:v1", "n": "local" }),
+                serde_json::json!({ "dimension": "need:i1572:l:v1", "n": "local" }),
             )
             .expect("object"),
-            subject_key_ids: vec![k.clone()],
+            subject_key_ids: vec![e2::kid(&k)],
             cohort_scope: cohort_scope::SELF.to_owned(),
             scrub_signature_classical: None,
             scrub_signature_pqc: None,
@@ -596,8 +597,8 @@ pub(crate) mod bodies {
     /// each refusal is led by its stable token.
     pub(crate) async fn i1573_malformed_input_is_refused(d: &dyn FederationDirectory, tag: &str) {
         let (a, k) = attester(d, tag).await;
-        put_dim(d, &a, &k, "i1573:x:v1").await;
-        let one = v(&["i1573:"]);
+        put_dim(d, &a, &k, "need:i1573:x:v1").await;
+        let one = v(&["need:i1573:"]);
         for bad in [0, -1, 10_001] {
             let e = d
                 .list_attestations_since_by_prefixes(None, &one, bad)
@@ -611,9 +612,9 @@ pub(crate) mod bodies {
         for (bad, what) in [
             (Vec::new(), "no prefix at all"),
             (v(&[""]), "an empty prefix"),
-            (v(&["i1573:", ""]), "an empty prefix among others"),
+            (v(&["need:i1573:", ""]), "an empty prefix among others"),
             (
-                (0..65).map(|i| format!("i1573:{i}:")).collect(),
+                (0..65).map(|i| format!("need:i1573:{i}:")).collect(),
                 "65 prefixes",
             ),
         ] {
@@ -623,7 +624,7 @@ pub(crate) mod bodies {
                 .expect_err("I1573: refused");
             refused_with(&e, SERVE_PREFIXES_REFUSED, &format!("I1573 {what}"));
         }
-        let many: Vec<String> = (0..64).map(|i| format!("i1573:{i}:")).collect();
+        let many: Vec<String> = (0..64).map(|i| format!("need:i1573:{i}:")).collect();
         let page = d
             .list_attestations_since_by_prefixes(None, &many, 10)
             .await
@@ -638,11 +639,11 @@ pub(crate) mod bodies {
         tag: &str,
     ) {
         let (a, k) = attester(d, tag).await;
-        let dims = ["i1574:"];
-        let first = put_dim(d, &a, &k, "i1574:a:v1").await;
+        let dims = ["need:i1574:"];
+        let first = put_dim(d, &a, &k, "need:i1574:a:v1").await;
         let mut others = Vec::new();
         for i in 0..3 {
-            others.push(put_dim(d, &a, &k, &format!("i1574x:{i}:v1")).await);
+            others.push(put_dim(d, &a, &k, &format!("need:i1574x:{i}:v1")).await);
         }
         // Past postgres's commit-safe watermark (I1671 is the clamp itself).
         raw.settle_every_position().await;
@@ -670,7 +671,7 @@ pub(crate) mod bodies {
             resumed.high_water, p.high_water,
             "I1574 {tag}: an idle resume stays where it was"
         );
-        let second = put_dim(d, &a, &k, "i1574:b:v1").await;
+        let second = put_dim(d, &a, &k, "need:i1574:b:v1").await;
         let found = page(d, Some(p.high_water.clone()), &dims, 100).await;
         assert_eq!(
             ids(&found),
@@ -690,20 +691,22 @@ pub(crate) mod bodies {
         (owner, node)
     }
 
-    /// `owner`'s owner binding of `node` at `scope`, put through the door. Its id.
+    /// `owner`'s owner binding of `node` at `scope`, put through the door. Its
+    /// id (v62, E3: the node-computed row id). The node's own voice is the
+    /// second statement an owner binding counts (RULINGS, C557).
     pub(crate) async fn bind(
         d: &dyn FederationDirectory,
         owner: &str,
         node: &str,
         scope: &str,
     ) -> String {
-        let id = uuid::Uuid::new_v4().to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
         let mut row = ts::bare_attestation(
-            &id,
+            &nonce,
             owner,
             node,
             &serde_json::json!({
-                "id": id,
+                "id": nonce,
                 "kind": "delegates_to",
                 "dimension": owner_binding::DIMENSION,
                 "delegation_purpose": owner_binding::PURPOSE,
@@ -713,9 +716,14 @@ pub(crate) mod bodies {
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         row.cohort_scope = scope.to_owned();
         ts::seal_row_in_place(owner, &mut row);
-        d.put_attestation(SignedAttestation { attestation: row })
+        let id = row.attestation_id.clone();
+        let statement = e2::carried_statement(&row).expect("I1575 fixture: an edition-2 row");
+        crate::federation::edition2::fixture_switch::put_signed(d, &row)
             .await
             .unwrap_or_else(|e| panic!("I1575 fixture: {owner} binds {node} at {scope}: {e}"));
+        e2::put_statement(d, &e2::voice_of(&statement, node))
+            .await
+            .unwrap_or_else(|e| panic!("I1575 fixture: {node}'s voice on its binding: {e}"));
         id
     }
 
@@ -726,9 +734,9 @@ pub(crate) mod bodies {
         node: &str,
         binding_id: &str,
     ) -> String {
-        let id = uuid::Uuid::new_v4().to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
         let mut w = ts::bare_attestation(
-            &id,
+            &nonce,
             owner,
             node,
             &serde_json::json!({
@@ -739,7 +747,8 @@ pub(crate) mod bodies {
         );
         w.attestation_type = attestation_type::WITHDRAWS.to_owned();
         let w = ts::seal_row(owner, w);
-        d.put_attestation(SignedAttestation { attestation: w })
+        let id = w.attestation_id.clone();
+        crate::federation::edition2::fixture_switch::put_signed(d, &w)
             .await
             .expect("I1576 the owner withdraws its binding");
         id
@@ -790,7 +799,7 @@ pub(crate) mod bodies {
         let refresh = bind(d, &o1, &n1, cohort_scope::FEDERATION).await;
         // A `scores` row naming N1: not a candidate row.
         let (a, _) = attester(d, tag).await;
-        let unrelated = put_dim(d, &a, &n1, "i1575:s:v1").await;
+        let unrelated = put_dim(d, &a, &n1, "need:i1575:s:v1").await;
 
         let p = d
             .list_owner_bindings_since(None, 100)
@@ -799,19 +808,19 @@ pub(crate) mod bodies {
         let mine: Vec<&OwnerBindingChange> = p
             .items
             .iter()
-            .filter(|c| c.node_key_id == n1 || c.node_key_id == n2)
+            .filter(|c| c.node_key_id == e2::kid(&n1) || c.node_key_id == e2::kid(&n2))
             .collect();
         assert_eq!(
             mine.iter()
                 .map(|c| c.node_key_id.as_str())
                 .collect::<Vec<_>>(),
-            vec![n2.as_str(), n1.as_str()],
+            vec![e2::kid(&n2).as_str(), e2::kid(&n1).as_str()],
             "I1575 {tag}: one item per node, ordered by its last row"
         );
         assert_eq!(
             mine[1].state,
             AnnouncedOwnerState::Announced {
-                owner_key_id: o1.clone()
+                owner_key_id: e2::kid(&o1)
             },
             "I1575 {tag}: a live binding at federation is announced, with its owner"
         );
@@ -850,14 +859,14 @@ pub(crate) mod bodies {
         bind(d, &o2, &n2, cohort_scope::SELF).await;
         let (seen, _, cursor) = feed(d, None, 2).await;
         assert_eq!(
-            of(&seen, &n1).last().map(|c| c.state.clone()),
+            of(&seen, &e2::kid(&n1)).last().map(|c| c.state.clone()),
             Some(AnnouncedOwnerState::Announced {
-                owner_key_id: o1.clone()
+                owner_key_id: e2::kid(&o1)
             }),
             "I1576 {tag}: the walk saw N1 announced"
         );
         assert_eq!(
-            of(&seen, &n2).last().map(|c| c.state.clone()),
+            of(&seen, &e2::kid(&n2)).last().map(|c| c.state.clone()),
             Some(AnnouncedOwnerState::NotAnnounced),
             "I1576 {tag}: the walk saw N2 not announced"
         );
@@ -882,11 +891,11 @@ pub(crate) mod bodies {
                 })
                 .collect::<Vec<_>>(),
             vec![
-                (n1.clone(), AnnouncedOwnerState::NotAnnounced, w),
+                (e2::kid(&n1), AnnouncedOwnerState::NotAnnounced, w),
                 (
-                    n2.clone(),
+                    e2::kid(&n2),
                     AnnouncedOwnerState::Announced {
-                        owner_key_id: o2.clone()
+                        owner_key_id: e2::kid(&o2)
                     },
                     announce
                 ),
@@ -895,7 +904,7 @@ pub(crate) mod bodies {
              announcement as announced"
         );
         assert_eq!(
-            crate::federation::admission::announced_owner_state(d, &n1)
+            crate::federation::admission::announced_owner_state(d, &e2::kid(&n1))
                 .await
                 .expect("fold"),
             AnnouncedOwnerState::NotAnnounced,
@@ -909,7 +918,7 @@ pub(crate) mod bodies {
         for i in 0..3 {
             let (o, nd) = owner_and_node(d, &format!("{tag}{i}")).await;
             bind(d, &o, &nd, cohort_scope::FEDERATION).await;
-            nodes.push(nd);
+            nodes.push(e2::kid(&nd));
         }
         let (all, _, _) = feed(d, None, 100).await;
         let order: Vec<String> = all
@@ -967,13 +976,13 @@ pub(crate) mod bodies {
         let (granter, grantee) = (format!("i1671-g-{tag}"), format!("i1671-e-{tag}"));
         ts::register_hybrid_key_as(d, &granter, &granter, it::AGENT).await;
         ts::register_hybrid_key_as(d, &grantee, &grantee, it::AGENT).await;
-        let families = ["i1671:", attestation_type::DELEGATES_TO];
-        let old = put_dim(d, &a, &k, "i1671:old:v1").await;
+        let families = ["need:i1671:", attestation_type::DELEGATES_TO];
+        let old = put_dim(d, &a, &k, "need:i1671:old:v1").await;
         let (held, during) =
             tokio::join!(ts::put_delegates_to(d, &granter, &grantee, None), async {
                 pause.reached().await;
                 // Assigned after the held row's position, committed before it.
-                put_dim(d, &a, &k, "i1671x:later:v1").await;
+                put_dim(d, &a, &k, "need:i1671x:later:v1").await;
                 let p = page(d, None, &families, 100).await;
                 pause.resume();
                 p
@@ -1041,7 +1050,7 @@ pub(crate) mod bodies {
             }
             serde_json::json!([s]).to_string()
         };
-        let cosigned = scrub("i1673-cosigner", None);
+        let cosigned = scrub(&e2::kid("i1673-cosigner"), None);
         // (what, the target's dimension, its additional_scrubs, carved out)
         let mut cases: Vec<(String, String, String, bool)> = SUBJECT_WITHDRAWS_CARVE_OUT
             .iter()
@@ -1057,13 +1066,13 @@ pub(crate) mod bodies {
         cases.extend([
             (
                 "plain".to_owned(),
-                "i1673:plain:v1".to_owned(),
+                "need:i1673:plain:v1".to_owned(),
                 "[]".to_owned(),
                 false,
             ),
             (
                 "cosigned act".to_owned(),
-                "i1673:cosigned:v1".to_owned(),
+                "need:i1673:cosigned:v1".to_owned(),
                 cosigned.clone(),
                 true,
             ),
@@ -1075,14 +1084,14 @@ pub(crate) mod bodies {
             ),
             (
                 "tier-crossing co-scrub".to_owned(),
-                "i1673:coscrub:v1".to_owned(),
+                "need:i1673:coscrub:v1".to_owned(),
                 scrub("i1673-node", Some("2026-01-01T00:00:00.000Z")),
                 false,
             ),
             (
                 "the attester's own scrub".to_owned(),
-                "i1673:own:v1".to_owned(),
-                scrub(&a, None),
+                "need:i1673:own:v1".to_owned(),
+                scrub(&e2::kid(&a), None),
                 false,
             ),
             (
@@ -1095,23 +1104,19 @@ pub(crate) mod bodies {
         let table = raw.attestations_table();
         let live = live_predicate(raw.dialect());
         for (i, (what, dimension, scrubs, carved)) in cases.iter().enumerate() {
-            let seed = format!("i1673:seed{i}:v1");
+            let seed = format!("need:i1673:seed{i}:v1");
             let target = put_dim(d, &a, &k, &seed).await;
             // The producer's own withdrawal, admitted while the target is
             // plain; re-signed below as a stranger's, as stored state.
-            let wid = uuid::Uuid::new_v4().to_string();
-            let mut w = ts::bare_attestation(
-                &wid,
-                &a,
-                &a,
-                &serde_json::json!({
-                    "references_attestation_id": target,
-                    "withdrawal_reason": "i1673",
-                }),
-            );
-            w.attestation_type = attestation_type::WITHDRAWS.to_owned();
-            let w = ts::seal_row(&a, w);
-            d.put_attestation(SignedAttestation { attestation: w })
+            // v62 (E3): a composer carries its target's family (RULINGS).
+            let target_row = d
+                .get_attestation(&target)
+                .await
+                .expect("read")
+                .expect("the target is held");
+            let w = e2::composer_of("withdraws", &target_row, &a);
+            let wid = w.attestation_id.clone();
+            crate::federation::edition2::fixture_switch::put_signed(d, &w)
                 .await
                 .unwrap_or_else(|e| panic!("I1673 {what}: the producer withdraws: {e}"));
             raw.exec(&format!(
@@ -1122,8 +1127,9 @@ pub(crate) mod bodies {
             .await;
             for rule in [None, Some(1), Some(2), Some(3), Some(4), Some(5)] {
                 raw.exec(&format!(
-                    "UPDATE {table} SET attesting_key_id = '{stranger}', \
+                    "UPDATE {table} SET attesting_key_id = '{}', \
                      withdraws_admission_rule = {} WHERE attestation_id = '{wid}'",
+                    e2::kid(&stranger),
                     rule.map_or_else(|| "NULL".to_owned(), |r: i32| r.to_string())
                 ))
                 .await;
@@ -1176,7 +1182,7 @@ pub(crate) mod bodies {
     ) {
         use serde_json::json;
         let (a, k) = attester(d, tag).await;
-        let id = put_dim(d, &a, &k, "i1674:x:v1").await;
+        let id = put_dim(d, &a, &k, "need:i1674:x:v1").await;
         let table = raw.attestations_table();
         let marker = crate::federation::read_plan::owner_binding_marker_sql(raw.dialect(), "fa");
         let dim = owner_binding::DIMENSION;
@@ -1331,13 +1337,32 @@ mod plan_units {
     }
 
     fn served(id: &str, node: &str, secs: i64) -> ServedAttestation {
-        let mut row = crate::federation::tier_ingest::test_support::bare_attestation(
-            id,
-            "i1672-attester",
-            node,
-            &serde_json::json!({ "n": id }),
-        );
-        row.attested_key_id = node.to_owned();
+        // v62 (E3): an unsigned in-memory row (a pure plan function reads
+        // it), not a fixture builder's signed one: its id is the test's.
+        let now = at(secs);
+        let row = crate::federation::Attestation {
+            attestation_id: id.to_owned(),
+            attesting_key_id: "i1672-attester".to_owned(),
+            attested_key_id: node.to_owned(),
+            attestation_type: String::new(),
+            weight: Some(1.0),
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({ "n": id }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "i1672-attester".to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
         ServedAttestation {
             attestation: row,
             admitted_at: at(secs),

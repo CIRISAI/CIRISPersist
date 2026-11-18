@@ -27,13 +27,14 @@
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::membership_acceptance_invariants::bodies::{
         found_community, found_family, reg,
     };
     use crate::federation::replication_audience::may_receive;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_tier, cohort_scope, identity_type};
-    use crate::federation::{Attestation, Error, FederationDirectory, SignedAttestation};
+    use crate::federation::{Attestation, Error, FederationDirectory};
 
     fn binding_at(
         owner: &str,
@@ -55,12 +56,10 @@ pub(crate) mod bodies {
         b
     }
 
+    /// v62.0.0 (JSON cut, flip wave 2, E5) — the sealed row's edition-2
+    /// statement through the one entry (every attestation gate runs).
     async fn put(d: &dyn FederationDirectory, r: &Attestation) -> Result<(), Error> {
-        d.put_attestation(SignedAttestation {
-            attestation: r.clone(),
-        })
-        .await
-        .map(|_| ())
+        e2::put_signed(d, r).await.map(|_| ())
     }
 
     /// **I1511** — the binding at the group's scope.
@@ -88,6 +87,16 @@ pub(crate) mod bodies {
         found_family(d, &fam, "founder_only", &[&owner], &[])
             .await
             .unwrap();
+        // v62.0.0 (flip wave 2, E5) — every key and group is named by its
+        // identity-ref from here on (the rosters entered as edition-2 voices).
+        let (owner, node, peer, other, room, fam) = (
+            e2::kid(&owner),
+            e2::kid(&node),
+            e2::kid(&peer),
+            e2::kid(&other),
+            e2::kid(&room),
+            e2::kid(&fam),
+        );
         // Written at self.
         let at_self = binding_at(&owner, &node, cohort_scope::SELF, None);
         put(d, &at_self).await.expect("I1511: the self binding");
@@ -103,10 +112,7 @@ pub(crate) mod bodies {
             .expect("I1511: the owner re-signs the binding at the room's scope");
         for r in [&at_self, &at_room] {
             assert!(
-                d.get_attestation(&r.attestation_id)
-                    .await
-                    .unwrap()
-                    .is_some(),
+                d.get_attestation(&e2::rid(r)).await.unwrap().is_some(),
                 "I1511: both bindings stand"
             );
         }
@@ -122,6 +128,7 @@ pub(crate) mod bodies {
         // never a non-member's node.
         let outsider_node = k("outsider-node");
         ts::register_hybrid_key_as(d, &outsider_node, &outsider_node, identity_type::NODE).await;
+        let outsider_node = e2::kid(&outsider_node);
         put(
             d,
             &binding_at(&other, &outsider_node, cohort_scope::SELF, None),
@@ -167,6 +174,7 @@ pub(crate) mod bodies {
         // refused by that gate's name, and no affiliation is read off it.
         let bonded = k("bond-node");
         ts::register_hybrid_key_as(d, &bonded, &bonded, identity_type::NODE).await;
+        let bonded = e2::kid(&bonded);
         let bond = binding_at(
             &owner,
             &bonded,
@@ -181,10 +189,7 @@ pub(crate) mod bodies {
             other => panic!("I1511: the bond at federation must meet #1062's gate: {other:?}"),
         }
         assert!(
-            d.get_attestation(&bond.attestation_id)
-                .await
-                .unwrap()
-                .is_none(),
+            d.get_attestation(&e2::rid(&bond)).await.unwrap().is_none(),
             "I1511: the refused bond stores nothing"
         );
         // v62.0.0 (kernel pass 2, I2844; KERNEL_SEAMS B1 / C557) — a different

@@ -302,6 +302,7 @@ mod pure {
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod dyn_bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::membership_acceptance::test_support::{acceptance_row, proposal_row};
     use crate::federation::membership_acceptance::{
         check_growth_accepted, RULE_OPEN_PROPOSAL_NOT_OPEN,
@@ -313,9 +314,7 @@ pub(crate) mod dyn_bodies {
     use crate::federation::types::cohort_scope as cs;
     use crate::federation::types::identity_type::USER;
     use crate::federation::types::{Community, CommunityMember};
-    use crate::federation::{
-        attestation_emit, EmitAttestationInput, Error, FederationDirectory, SignedAttestation,
-    };
+    use crate::federation::{attestation_emit, EmitAttestationInput, Error, FederationDirectory};
     use chrono::{Duration, Utc};
 
     /// A key whose derived id shares its first 32 bytes with its alias, so the
@@ -325,13 +324,9 @@ pub(crate) mod dyn_bodies {
         let alias = format!("{role}-key-{tag}-0123456789abcdef")
             .replace('_', "-")
             .to_lowercase();
-        let k = ts::local_signer(&alias).derived_key_id();
-        assert_eq!(
-            &k.as_bytes()[..32],
-            &alias.as_bytes()[..32],
-            "seed-sharing id"
-        );
-        ts::register_hybrid_key_as(d, &k, &alias, USER).await;
+        // v62 (E4, flip wave 2): the key is an edition-2 `user` key; its id
+        // is the identity-ref, which every seed-taking fixture accepts back.
+        let k = e2::put_key(d, &alias, &[USER]).await;
         (k, alias)
     }
 
@@ -370,12 +365,19 @@ pub(crate) mod dyn_bodies {
         }
     }
 
+    /// v62 (E4, flip wave 2): the room's founding `group:roster` voices
+    /// (T1); the room id the tests pass is already an identity-ref
+    /// (`e2::kid`), the key the typed row is held under. The rows are
+    /// now-relative (the room is founded a day ago).
     async fn put_room(d: &dyn FederationDirectory, c: Community) -> Result<(), Error> {
         let founder = c.members[0].key_id.clone();
-        ts::register_hybrid_key_as(d, &c.community_key_id, &c.community_key_id, USER).await;
-        d.put_community(ts::sign_community(&founder, c))
-            .await
-            .map(|_| ())
+        let at = u64::try_from(c.founded_at.timestamp_millis()).expect("ms");
+        e2::put_voices(
+            d,
+            &e2::community_voices(&ts::sign_community(&founder, c), 1, None, at),
+        )
+        .await
+        .map(|_| ())
     }
 
     fn rule_of(e: &Error) -> String {
@@ -431,23 +433,28 @@ pub(crate) mod dyn_bodies {
             crate::federation::public_room::PUBLIC_RULE_ADMISSION_MEMBER_RETIRED,
             "I712 {e}"
         );
-        let id = format!("i712-pub-{tag}");
+        let id = e2::kid(&format!("i712-pub-{tag}"));
         put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .expect("I712 an open public room is admitted");
         // A later version that leaves the `public` side is refused, before
         // anything about the amendment itself is asked.
-        let mut private = room(&id, &founder, None, serde_json::json!({}), CLOSED);
-        private.prev_head_digest = d
-            .lookup_community(&id)
-            .await
-            .unwrap()
-            .unwrap()
-            .persist_row_hash;
-        let e = d
-            .put_community(ts::sign_community(&founder, private))
-            .await
-            .unwrap_err();
+        // v62 (E4): a later version is the roster's own next version
+        // naming the held head (T1: no supersede proof).
+        let private = room(&id, &founder, None, serde_json::json!({}), CLOSED);
+        let (head, v) = e2::held_head(d, &id).await.expect("I712 the room's head");
+        let at = u64::try_from(Utc::now().timestamp_millis()).expect("ms");
+        let e = e2::put_voices(
+            d,
+            &e2::community_voices(
+                &ts::sign_community(&founder, private),
+                v + 1,
+                Some(&head),
+                at,
+            ),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             rule_of(&e),
             crate::federation::public_room::PUBLIC_RULE_SUBKIND_CROSSES_PUBLIC,
@@ -463,11 +470,11 @@ pub(crate) mod dyn_bodies {
         let (founder, _) = key(d, "i713f", tag).await;
         let (stranger, _) = key(d, "i713s", tag).await;
         let (joiner, _) = key(d, "i713j", tag).await;
-        let id = format!("i713-pub-{tag}");
+        let id = e2::kid(&format!("i713-pub-{tag}"));
         put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .unwrap();
-        let shut = format!("i713-shut-{tag}");
+        let shut = e2::kid(&format!("i713-shut-{tag}"));
         put_room(
             d,
             room(
@@ -487,38 +494,28 @@ pub(crate) mod dyn_bodies {
             ts::seal_row_in_place(by, &mut p);
             p
         };
-        let e = d
-            .put_attestation(SignedAttestation {
-                attestation: standing(&founder, &shut),
-            })
+        let e = e2::put_signed(d, &standing(&founder, &shut))
             .await
             .unwrap_err();
         assert_eq!(
             rule_of(&e),
             RULE_OPEN_PROPOSAL_NOT_OPEN,
-            "I713 a public room that is not open takes no standing proposal: {e}"
+            "I713 a public room that is not open: its standing proposal is held: {e}"
         );
-        let e = d
-            .put_attestation(SignedAttestation {
-                attestation: standing(&stranger, &id),
-            })
+        let e = e2::put_signed(d, &standing(&stranger, &id))
             .await
             .unwrap_err();
         assert!(
-            rule_of(&e) == RULE_OPEN_PROPOSAL_NOT_OPEN || !e.to_string().is_empty(),
-            "I713 a non-member's standing proposal is refused: {e}"
+            !e.to_string().is_empty(),
+            "I713 a non-member's standing proposal is held (out of scope): {e}"
         );
         let p = standing(&founder, &id);
-        d.put_attestation(SignedAttestation {
-            attestation: p.clone(),
-        })
-        .await
-        .expect("I713 the founder's standing proposal is admitted");
-        d.put_attestation(SignedAttestation {
-            attestation: acceptance_row(&joiner, &p, at + Duration::minutes(1)),
-        })
-        .await
-        .expect("I713 any requester's own acceptance is admitted");
+        e2::put_signed(d, &p)
+            .await
+            .expect("I713 the founder's standing proposal is admitted");
+        e2::put_signed(d, &acceptance_row(&joiner, &p, at + Duration::minutes(1)))
+            .await
+            .expect("I713 any requester's own acceptance is admitted");
         check_growth_accepted(
             d,
             cs::COMMUNITY,
@@ -544,11 +541,11 @@ pub(crate) mod dyn_bodies {
         use crate::federation::replication_audience::{is_public_group, may_receive};
         let (founder, _) = key(d, "i775f", tag).await;
         let (outsider, _) = key(d, "i775o", tag).await;
-        let id = format!("i775-pub-{tag}");
+        let id = e2::kid(&format!("i775-pub-{tag}"));
         put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .unwrap();
-        let private = format!("i775-priv-{tag}");
+        let private = e2::kid(&format!("i775-priv-{tag}"));
         put_room(
             d,
             room(&private, &founder, None, serde_json::json!({}), CLOSED),
@@ -567,11 +564,9 @@ pub(crate) mod dyn_bodies {
         let mut p = proposal_row(&founder, cs::COMMUNITY, &id, "", None, at);
         p.subject_key_ids.clear();
         ts::seal_row_in_place(&founder, &mut p);
-        d.put_attestation(SignedAttestation {
-            attestation: p.clone(),
-        })
-        .await
-        .expect("I775 the founder's standing proposal");
+        e2::put_signed(d, &p)
+            .await
+            .expect("I775 the founder's standing proposal");
         assert!(
             may_receive(d, &outsider, &p).await.unwrap().allowed(),
             "I775 the standing proposal reaches a non-member"
@@ -609,7 +604,7 @@ pub(crate) mod dyn_bodies {
     /// after the record lands, is admitted.
     pub(crate) async fn i724_a_listing_waits_for_its_room(d: &dyn FederationDirectory, tag: &str) {
         let (founder, _) = key(d, "i724f", tag).await;
-        let id = format!("i724-pub-{tag}");
+        let id = e2::kid(&format!("i724-pub-{tag}"));
         let env = serde_json::json!({
             "dimension": LISTING_DIMENSION, "score": 1.0, "confidence": 1.0,
             "community_key_id": id, "cohort_subkind": COHORT_SUBKIND_PUBLIC,
@@ -621,34 +616,24 @@ pub(crate) mod dyn_bodies {
         row.attestation_type = crate::federation::types::attestation_type::SCORES.into();
         row.cohort_scope = cs::FEDERATION.into();
         ts::seal_row_in_place(&founder, &mut row);
-        let e = d
-            .put_attestation(SignedAttestation {
-                attestation: row.clone(),
-            })
-            .await
-            .unwrap_err();
+        let e = e2::put_signed(d, &row).await.unwrap_err();
         assert!(
-            matches!(
-                e,
-                Error::WriteScopeRefused(crate::scope::ScopeRefusalReason::MembershipUnresolved)
-            ),
-            "I724 a listing ahead of its room is the retryable ordering gap: {e}"
+            e.to_string().contains("held scope_membership_unresolved"),
+            "I724 a listing ahead of its room waits, held: {e}"
         );
         assert!(
             d.get_attestation(&row.attestation_id)
                 .await
                 .unwrap()
                 .is_none(),
-            "I724 nothing stored"
+            "I724 it concludes nothing"
         );
         put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .unwrap();
-        d.put_attestation(SignedAttestation {
-            attestation: row.clone(),
-        })
-        .await
-        .expect("I724 the same listing, re-offered after the record, is admitted");
+        e2::put_signed(d, &row)
+            .await
+            .expect("I724 the same listing, re-offered after the record, is admitted");
         assert_eq!(
             live_listing(d, &id)
                 .await
@@ -667,7 +652,7 @@ pub(crate) mod dyn_bodies {
         tag: &str,
     ) {
         let (founder, _) = key(d, "i776f", tag).await;
-        let id = format!("i776-pub-{tag}");
+        let id = e2::kid(&format!("i776-pub-{tag}"));
         put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .unwrap();
@@ -699,11 +684,7 @@ pub(crate) mod dyn_bodies {
             now + Duration::seconds(5),
         );
         for r in [&older, &newer] {
-            d.put_attestation(SignedAttestation {
-                attestation: r.clone(),
-            })
-            .await
-            .expect("I776 a listing");
+            e2::put_signed(d, r).await.expect("I776 a listing");
         }
         let live = || async {
             live_listing(d, &id)
@@ -743,14 +724,14 @@ pub(crate) mod dyn_bodies {
     pub(crate) async fn i714_the_listing_door(d: &dyn FederationDirectory, tag: &str) {
         let (founder, founder_alias) = key(d, "i714f", tag).await;
         let (other, other_alias) = key(d, "i714o", tag).await;
-        let pubroom = format!("i714-pub-{tag}");
+        let pubroom = e2::kid(&format!("i714-pub-{tag}"));
         put_room(
             d,
             room(&pubroom, &founder, Some(&other), open_policy(), OPEN),
         )
         .await
         .unwrap();
-        let private = format!("i714-priv-{tag}");
+        let private = e2::kid(&format!("i714-priv-{tag}"));
         put_room(
             d,
             room(&private, &founder, None, serde_json::json!({}), CLOSED),
@@ -991,7 +972,7 @@ pub(crate) mod blob_bodies {
             NODE,
         )
         .await;
-        let comm = format!("i716-comm-{s}");
+        let comm = crate::federation::edition2::fixture_switch::kid(&format!("i716-comm-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         let (alice, bob) = (format!("i716-alice-{s}"), format!("i716-bob-{s}"));
         seed_community_everywhere(
             &[&na, &nb],
@@ -1070,7 +1051,7 @@ pub(crate) mod blob_bodies {
         )
         .await;
         // B's only cohort is a room A has no seat in.
-        let comm = format!("i723-comm-{s}");
+        let comm = crate::federation::edition2::fixture_switch::kid(&format!("i723-comm-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         let bob = format!("i723-bob-{s}");
         seed_community_everywhere(&[&nb], &comm, &[(&bob, Some(&nb))]).await;
         let bytes = format!("i723 commons bytes {s}").into_bytes();
@@ -1768,7 +1749,7 @@ pub(crate) mod blob_bodies {
     {
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
         let n = node_as(b, &format!("i717-a-{s}"), NODE).await;
-        let comm = format!("i717-comm-{s}");
+        let comm = crate::federation::edition2::fixture_switch::kid(&format!("i717-comm-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         let alice = format!("i717-alice-{s}");
         seed_community_everywhere(&[&n], &comm, &[(&alice, Some(&n))]).await;
         let put = put_blob_scoped(b, &n.signer, cs::COMMUNITY, Some(&comm), b"x", None, None)
@@ -2001,25 +1982,30 @@ pub(crate) mod blob_bodies {
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
         use crate::federation::tier_ingest::test_support as ts;
         let n = node_as(b, &format!("i720-node-{s}"), NODE).await;
-        let comm = format!("i720-pub-{s}");
+        let comm = crate::federation::edition2::fixture_switch::kid(&format!("i720-pub-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         let alice = format!("i720-alice-{s}");
         seed_community_everywhere(&[&n], &comm, &[(&alice, Some(&n))]).await;
         // make the seeded room public (a fresh room: nothing crosses)
-        let mut c = b.lookup_community(&comm).await.unwrap().unwrap();
-        let comm2 = format!("{comm}-2");
-        ts::register_hybrid_key_as(
+        // v62 (E4, flip wave 2): the typed rows are keyed by identity-ref;
+        // the fresh room is founded by its `group:roster` voices (T1), now.
+        use crate::federation::edition2::fixture_switch as e2;
+        let mut c = b.lookup_community(&e2::kid(&comm)).await.unwrap().unwrap();
+        let comm2 = e2::put_key(
             b,
-            &comm2,
-            &comm2,
-            crate::federation::types::identity_type::USER,
+            &format!("i720-pub2-{s}"), // a fresh seed: a kid is no seed prefix
+            &[crate::federation::types::identity_type::USER],
         )
         .await;
         c.community_key_id = comm2.clone();
         c.policy_blob = Some(serde_json::json!({"cohort_subkind": "public"}));
         c.prev_head_digest = String::new();
-        b.put_community(ts::sign_community(&comm2, c))
-            .await
-            .unwrap();
+        let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("ms");
+        e2::put_voices(
+            b,
+            &e2::community_voices(&ts::sign_community(&comm2, c), 1, None, now_ms),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             crate::federation::at_rest_cascade::resolve_write_tier(b, cs::COMMUNITY, Some(&comm2))
                 .await
@@ -2292,7 +2278,7 @@ mod runners {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i722_the_self_door_claims_within_self_sqlite() {
-        super::engine_bodies::i722_the_self_door_claims_within_self(
+        Box::pin(super::engine_bodies::i722_the_self_door_claims_within_self(
             "sqlite::memory:",
             "sqlite::memory:",
             &suffix(),
@@ -2300,7 +2286,7 @@ mod runners {
                 as crate::federation::epoch_minter_invariants::bodies::Pick<
                     crate::store::sqlite::SqliteBackend,
                 >,
-        )
+        ))
         .await;
     }
 
@@ -2310,7 +2296,7 @@ mod runners {
         let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
             return;
         };
-        super::engine_bodies::i722_the_self_door_claims_within_self(
+        Box::pin(super::engine_bodies::i722_the_self_door_claims_within_self(
             &a,
             &b,
             &suffix(),
@@ -2318,7 +2304,7 @@ mod runners {
                 as crate::federation::epoch_minter_invariants::bodies::Pick<
                     crate::store::postgres::PostgresBackend,
                 >,
-        )
+        ))
         .await;
     }
 

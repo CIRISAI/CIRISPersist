@@ -10,9 +10,11 @@
 //!   (E4's I1488 shape).
 //! - **I3008** a removal is served to the removed member (the member it
 //!   names) and to a member, and not to a stranger.
-//! - **I3011** an INVITEE is served its own invitation (a
-//!   `membership:proposal` row naming it in `subject_key_ids`), though it is
-//!   no member of the group; a stranger is not.
+//! - **I3011** an INVITEE is served its own invitation: the proposal is
+//!   DELIVERED to its key, so it is in the audience before it joins (CC 2.1);
+//!   the founder is served it, a stranger is not. And there is no blanket
+//!   "about the requester" rule: a moderation row at the family's scope naming
+//!   a non-member subject is not served to that subject.
 //! - **I3010** a statement-only row is served by the `cohort_scope` its
 //!   payload states (CC: `admission:unit` like any scores row): `self` to
 //!   its author only (not another key, not anonymous), `federation` to
@@ -328,6 +330,41 @@ pub(crate) async fn invitee_body(d: &dyn FederationDirectory) {
     assert!(served_to(joiner.clone()).await, "I3011 the invitee");
     assert!(served_to(founder.clone()).await, "I3011 a member");
     assert!(!served_to(stranger.clone()).await, "I3011 a stranger");
+
+    // CC 2.1: no blanket "served to anyone it names". A moderation row at the
+    // family's scope naming a NON-member subject (outside its audience; the
+    // admission rule holds it `subject_outside_audience`, so it is never
+    // put here) is not served to that subject: the delivered key is an
+    // invitee's, a grant recipient's or an owner-binding's node, never a
+    // subject's.
+    let moderation = super::door_invariants::fixture::map(vec![
+        ("asserted_at", Value::Uint(7_000)),
+        ("author", Value::Text(founder.clone())),
+        ("cohort_scope", Value::Text("family".into())),
+        ("family_id", Value::Text(gid.clone())),
+        (
+            "subject_key_ids",
+            Value::Array(vec![Value::Text(stranger.clone())]),
+        ),
+    ]);
+    let mst = ciris_verify_core::edition2::sign_row_statement(
+        &kf,
+        &founder,
+        &stranger,
+        "scores",
+        "moderation:.action",
+        &moderation,
+        vec![],
+    )
+    .unwrap();
+    assert!(
+        !servable_to(d, &mst, Some(&stranger)).await.unwrap(),
+        "I3011 a moderation row is not served to a non-member subject"
+    );
+    assert!(
+        !servable_to(d, &mst, None).await.unwrap(),
+        "I3011 nor to an anonymous read"
+    );
 }
 
 #[cfg(feature = "sqlite")]

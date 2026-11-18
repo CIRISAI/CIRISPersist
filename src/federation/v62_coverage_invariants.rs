@@ -1323,7 +1323,9 @@ pub(crate) async fn i3250_a_conferred_room_is_reached(d: &dyn FederationDirector
 
 /// **I3251** (W1b; ruling C, CC 2.6.1.11) — `resolve_serve_tier`'s canonical
 /// rung is a seat of the genesis bundle in force: a listed serve node is
-/// `Canonical`; a node key the bundle does not list is not.
+/// `Canonical`; a node key the bundle does not list is not. v62 P5-fix1 — and
+/// the seat serves only once its owner announced it (the v62 security
+/// ruling, CC rc20 5.4.6): an unannounced seat is not `Canonical`.
 pub(crate) async fn i3251_canonical_is_a_bundle_seat(d: &dyn FederationDirectory) {
     use crate::federation::trust_root::{resolve_serve_tier, ServeTier};
     fixture_genesis::install_v2(d)
@@ -1333,10 +1335,17 @@ pub(crate) async fn i3251_canonical_is_a_bundle_seat(d: &dyn FederationDirectory
     let seat = fixture_genesis::bundle_v2()
         .serve_node_identity_ref(0)
         .to_owned();
+    assert_ne!(
+        resolve_serve_tier(d, &seat, &resolver).await.unwrap(),
+        ServeTier::Canonical,
+        "I3251: a seat whose owner never announced it does not serve under it"
+    );
+    crate::federation::serve_seat_owner_invariants::bodies::announce_seat(d, 0, "w1b-seat-owner")
+        .await;
     assert_eq!(
         resolve_serve_tier(d, &seat, &resolver).await.unwrap(),
         ServeTier::Canonical,
-        "I3251: a serve node of the bundle in force is canonical"
+        "I3251: a serve node of the bundle in force, owner announced, is canonical"
     );
     let unlisted = e2::put_key(d, "w1b-unlisted-node", &["node"]).await;
     assert_ne!(
@@ -1609,13 +1618,19 @@ async fn i3234_postgres() {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn i3235_i3237_sqlite() {
-    Box::pin(i3235_i3237_the_trust_root_liveness_margin(&sqlite().await)).await;
+    // The stalled/restored declarations are hard_case rows this node attests
+    // (`attestation_admit::hard_case_attester`): no node key, nothing is
+    // recorded (`record_observation` drops it with a warning).
+    Box::pin(i3235_i3237_the_trust_root_liveness_margin(
+        &sqlite_with_node().await,
+    ))
+    .await;
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn i3235_i3237_postgres() {
-    let Some(b) = postgres().await else {
+    let Some(b) = postgres_with_node().await else {
         return;
     };
     Box::pin(i3235_i3237_the_trust_root_liveness_margin(&b)).await;

@@ -23,7 +23,7 @@
 - a new family, `admission:unit` (wire `admission:unit:v1`, row type `scores`), the code scope. An owner-alone (authored) row is at `cohort_scope: self`; a counted row may be at any scope its signers choose (CC ruling). Its verifier's rules are refused with their own tokens (`admission_unit_malformed`, `admission_capability_unknown`, `admission_lease_out_of_window`, `admission_effect_needs_count`, `admission_issuer_not_person`). The host's tokens (`admission_issuer_not_reached`, `admission_count_unmet`, `admission_none`, `admission_capability_not_admitted`, `admission_capability_not_held`, `admission_halted`) are the loader's, and no row is refused for them;
 - `identity_amendment` gains `refs.prev`, the link it follows (the profile scope; the link with no `prev` is the base);
 - `deferral:response:approved` gains `call_fingerprint` (the action scope), beside `amendment_digest`.
-- **rc21 member homes:** an `identity_amendment`'s approval stands under `refs.also.cites` (exactly one; no `authorized_by` member, no `evidence_refs`). A `deferral:response:*` names its request under `refs.answers` (never `refs.target`) and carries `deferral_id` (REQUIRED: it correlates on it) and never `reason_digest`. A `deferral:request` REQUIRES `deferral_id` and `reason_digest` (FINAL, CC ruling). The routing room rides `community_id` (pending CC's confirmation). No payload carries Server's envelope uuid `id`: the row id is computed.
+- **rc21 member homes:** an `identity_amendment`'s approval stands under `refs.also.cites` (exactly one; no `authorized_by` member, no `evidence_refs`). A `deferral:response:*` names its request under `refs.answers` (never `refs.target`) and carries `deferral_id` (REQUIRED: it correlates on it) and never `reason_digest`. A `deferral:request` REQUIRES `deferral_id` and `reason_digest` (FINAL, CC ruling). Both route by `community_id`, the pair room (a two-person community record); there is no `room` member (FINAL, CC). No payload carries Server's envelope uuid `id`: the row id is computed.
 - **The self-roster head (CC 2.7 rulings item 2):** `identity:occurrence` and `identity:occurrence_revocation` REQUIRE `refs.head`, the identity's last landed self-roster row (a new identity's first bind names its genesis key's own `key:record` row), and take an optional `refs.further_heads`.
 
 The action review record is node-local (carried in the trace) and is no row, so it has no table here.
@@ -54,6 +54,7 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
   - `persist_row_hash`, `original_content_hash`, the `scrub_*` members, `scrub_key_id`, `scrub_timestamp`, `pqc_completed_at` and `observed_region` are gone: the row id and the statements replace them.
 - **`bool`** (`consensus_protocol_entrenched`) is the one member outside uint / bstr / tstr / identity-ref / row-ref. Absent reads as `false`.
 - **`ceg-value`** marks a member whose type the text leaves OPEN (`perceptual_hash`).
+- **Numbers in free-form bodies** (CC ruling): an integral value is a plain CBOR integer; a non-integral value is CBOR tag 4 `[exponent, mantissa]`, normalised (negative exponent, mantissa not divisible by 10), from the EXACT decimal of the source text (`payloads::body_number`). A mantissa outside i64 is refused `body_number_unrepresentable`, and a non-normalised tag 4 anywhere in a payload is refused `edition2_payload_invalid` at the door. Fixed-scale members stay fixed6 integers.
 
 ## Families
 
@@ -362,7 +363,7 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 - **Replaces:** the deferral:request:v1 envelope (CC 3.1.5; rc21 CC ruling)
 - **Authorship:** authored (the deferring agent's occurrence key)
 - **`sub`:** the agent identity's identity-ref
-- **Lands in:** federation_attestations (answered by a deferral:response)
+- **Lands in:** federation_attestations (answered by a deferral:response; routed by community_id, the pair room: a two-person community record, CC FINAL)
 
 | member | CBOR type | presence | maps from |
 |---|---|---|---|
@@ -386,7 +387,7 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 | `amendment_digest` | `hash-digest [-16, bstr .size 32]` | optional | approved only: the digest of the exact text approved (CIRISServer#1365) |
 | `call_fingerprint` | `hash-digest [-16, bstr .size 32]` | optional | approved only: the call approved, SHA-256(CDE(["CEG-call/2", verb, tool, arguments, channel])) (rc21, CC 2.7.11) |
 | `deferral_id` | `tstr` | required | deferral_id (rc21, CC ruling): the deferral answered, as the agent named it; the response correlates on it |
-| `refs.answers` | `row-ref` | required | the deferral:request answered (rc21; earlier references_attestation_id, never refs.target). The routing room rides community_id (TODO pending CC: CC has not confirmed the routing member) |
+| `refs.answers` | `row-ref` | required | the deferral:request answered (rc21; earlier references_attestation_id, never refs.target). The pair room rides community_id (FINAL, CC: a two-person community record; no room member) |
 
 Rules beyond the list (refused `edition2_payload_invalid`):
 
@@ -397,6 +398,27 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 | earlier-form co-signature (not a payload member) | now |
 |---|---|
 | scrub_signature_* under the WA's key | the Wise Authority's statement |
+
+### `location_proof:{version}`
+
+- **Replaces:** the location_proof subject_kind (CC 3.3.3; wire location_proof:v1, a scores row)
+- **Authorship:** authored by the subject alone (subject-only: iss = sub, CC 4.5.9)
+- **`sub`:** the subject's identity-ref (earlier subject_key_id; equals iss)
+- **Lands in:** federation_attestations (read by a geographic roster version that cites it, CC 3.2)
+
+| member | CBOR type | presence | maps from |
+|---|---|---|---|
+| `cell_id` | `tstr` | required | cell_id: the H3 cell, lowercase hex (CC 2.6.6) |
+| `cell_resolution` | `uint` | required | cell_resolution: at most 7, rough-only (CC 2.6.6.1) |
+| `attestation_evidence` | `bstr` | optional | attestation_evidence (earlier base64): a hardware-attested location claim |
+
+Rules beyond the list (refused `edition2_payload_invalid`):
+
+- `cell_resolution` is at most 7 (rough-only, CC 2.6.6.1); `cell_id` is lowercase hex
+
+| earlier-form co-signature (not a payload member) | now |
+|---|---|
+| scrub_signature_* under the subject's key | the subject's statement |
 ### `transport:canonical_rebind`
 
 - **Replaces:** the transport:canonical_rebind:v1 scores row (its additional_scrubs, and the carried SignedTransportDestination under transport_destination)

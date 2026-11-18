@@ -17,17 +17,26 @@
 //!
 //! Everything here is `#[cfg(feature = "test-anchor")]`-gated in the library, so
 //! this file asserts the *test-only* contract, not a production one.
+//!
+//! v62.0.0 (the JSON cut, slice E): the surface a consumer reaches is the
+//! edition-2 fixture switch, `federation::edition2::fixture_switch`. A key
+//! becomes live by its `key:record` statement (`put_key`), and a row is a
+//! signed statement (`statement_of` / `row_of`). The earlier-form helpers
+//! (`register_hybrid_key`, `hybrid_pubkeys`, `sign_envelope`) are gone with the
+//! JSON doors.
 
 #![cfg(all(feature = "test-anchor", feature = "sqlite"))]
 
+use ciris_persist::federation::edition2::fixture_switch as e2;
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::store::{Backend as _, SqliteBackend};
 
-/// **The #664 witness: register, then sign, then admit — all from outside.**
+/// **The #664 witness, edition 2: register, then sign, then admit — all from
+/// outside.**
 ///
-/// If `tier_ingest::test_support` ever narrows back to `pub(crate)`, this file
-/// stops COMPILING rather than failing an assertion, which is the loudest
-/// available signal and the right one: a visibility regression is not a runtime
+/// If `fixture_switch` ever narrows back to `pub(crate)`, this file stops
+/// COMPILING rather than failing an assertion, which is the loudest available
+/// signal and the right one: a visibility regression is not a runtime
 /// condition.
 #[tokio::test]
 async fn a_consumer_can_register_the_authority_it_signs_with_664() {
@@ -35,54 +44,63 @@ async fn a_consumer_can_register_the_authority_it_signs_with_664() {
     backend.run_migrations().await.expect("migrations");
 
     // THE CALL #664 IS ABOUT. `pub(crate)` here and this file does not build.
-    ciris_persist::federation::tier_ingest::test_support::register_hybrid_key(
-        &backend,
-        "downstream-authority-664",
-    )
-    .await;
+    let kid = e2::put_key(&backend, "downstream-authority-664", &["user"]).await;
+    assert_eq!(kid, e2::kid("downstream-authority-664"));
 
-    let got = FederationDirectory::lookup_public_key(&backend, "downstream-authority-664")
+    let got = FederationDirectory::lookup_public_key(&backend, &kid)
         .await
         .expect("read")
         .expect("the authority a downstream fixture registered must be resolvable");
-    assert_eq!(got.key_id, "downstream-authority-664");
+    assert_eq!(got.key_id, kid);
     assert!(
         !got.pubkey_ed25519_base64.is_empty(),
-        "a registered authority must carry a real Ed25519 pubkey — a fixture \
-         signs against these bytes"
+        "a registered authority must carry the composite's Ed25519 half"
     );
     assert!(
         got.pubkey_ml_dsa_65_base64.is_some(),
-        "register_hybrid_key must register the PQC leg too, or every hybrid \
-         verify a downstream fixture drives fails for the wrong reason"
+        "and its ML-DSA-65 half: a composite key is both or nothing"
     );
 }
 
-/// The row-building helpers a consumer needs beside registration.
-///
-/// `seal_row_in_place` is the one that matters most: it stamps the signed
-/// instants (#598) AND the seven-member row mirror (#643) AND signs, as ONE
-/// step. Persist's own fixtures broke twice this release by hand-rolling the
-/// half that omits both, so a consumer reaching for it is reaching for the right
-/// thing — and it was unreachable.
+/// The row-building helpers a consumer needs beside registration: a signed
+/// statement whose row the door admits, and whose id the node computes.
 #[tokio::test]
-async fn a_consumer_can_reach_the_row_sealing_helpers_664() {
-    use ciris_persist::federation::tier_ingest::test_support as ts;
+async fn a_consumer_can_reach_the_row_signing_helpers_664() {
+    let backend = SqliteBackend::open_in_memory().await.expect("open");
+    backend.run_migrations().await.expect("migrations");
+    let signer = "downstream-signer-664";
+    let _ = e2::put_key(&backend, signer, &["user"]).await;
 
-    let (ed, pqc) = ts::hybrid_pubkeys("downstream-signer-664");
-    assert!(!ed.is_empty(), "deterministic Ed25519 pubkey");
-    assert!(pqc.is_some(), "deterministic ML-DSA-65 pubkey");
-
-    // Signing an envelope is the other half of what a fixture needs: a consumer
-    // that can register a key but not produce a signature it verifies is no
-    // better off than before.
-    let envelope = serde_json::json!({ "dimension": "trust:accepts", "id": "dsx-664" });
-    let (content_hash, sig_classical, sig_pqc) =
-        ts::sign_envelope("downstream-signer-664", &envelope);
-    assert!(!content_hash.is_empty(), "content hash");
-    assert!(!sig_classical.is_empty(), "classical signature");
+    let _key = e2::signing_key(signer);
+    // The earlier-form-shaped row the codec reads (built with the switch off,
+    // so the builder hands back the shape, not a mapped row).
+    let mut earlier = e2::with_earlier_form(|| {
+        ciris_persist::federation::tier_ingest::test_support::bare_attestation(
+            "dsx-664",
+            signer,
+            signer,
+            &serde_json::json!({
+                "dimension": "evidence:safety_battery:capture:a:b:v1",
+                "score": 0.75,
+                "confidence": 0.9,
+            }),
+        )
+    });
+    earlier.attestation_type = "scores".to_owned();
+    let statement = e2::statement_of(&earlier, signer);
+    assert!(!statement.is_empty(), "a signed statement");
+    let stored = e2::put_row(&backend, &earlier, signer).await;
+    assert_eq!(stored.attesting_key_id, e2::kid(signer));
+    assert_eq!(
+        stored.attestation_id,
+        e2::rid(&stored),
+        "the node computes the id"
+    );
     assert!(
-        sig_pqc.is_some(),
-        "PQC signature — the hybrid pair, not half of it"
+        FederationDirectory::get_attestation(&backend, &stored.attestation_id)
+            .await
+            .expect("read")
+            .is_some(),
+        "the admitted row is readable by its node-computed id"
     );
 }

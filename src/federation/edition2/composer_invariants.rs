@@ -5,9 +5,12 @@
 //!   mapped row's `references_attestation_id` is the target's node-computed
 //!   row id (from `refs.target`, never a peer string).
 //! - A composer whose family is not its target's is
-//!   `composer_family_mismatch`.
-//! - A composer naming a row this node does not hold waits: the retryable
-//!   `federation_withdraws_target_unheld`.
+//!   `composer_family_mismatch`: (v62.0.0, wave GC6, **I3870**) HELD,
+//!   concluding nothing, with that reason (a key-plane family too: G0 v4
+//!   holds it back from the key plane), and held again whichever of
+//!   composer and target arrived first.
+//! - A composer naming a row this node does not hold waits: HELD,
+//!   `link_unheld` (G0 v5.1), re-folded when the target lands.
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::Value;
@@ -54,42 +57,124 @@ pub(crate) async fn body(d: &dyn crate::federation::FederationDirectory) {
         other => other.kind().to_owned(),
     };
     let k = key(130);
-    put_statement(d, &key_record(&k, &["user"], 0, None), None, INGEST_TIER)
-        .await
-        .unwrap();
+    let record = key_record(&k, &["user"], 0, None);
+    put_statement(d, &record, None, INGEST_TIER).await.unwrap();
     let target = score(&k, 5_000);
     let StatementOutcome::Row { row_id: t, .. } =
         put_statement(d, &target, None, INGEST_TIER).await.unwrap()
     else {
         panic!("I2105 target");
     };
-    // Unheld target: waits.
-    let e = put_statement(
+    // Unheld target: waits (G0 v5.1: HELD, reason `link_unheld`, re-folded
+    // when the target lands).
+    let out = put_statement(
         d,
         &withdraws(&k, SCORE_FAM, &RowId([0x77; 32]), 6_000),
         None,
         INGEST_TIER,
     )
     .await
-    .unwrap_err();
+    .unwrap_or_else(|e| panic!("I2105 unheld is held: {}", reason(&e)));
+    let StatementOutcome::Pending { row_id: u, .. } = out else {
+        panic!("I2105 unheld: {out:?}");
+    };
     assert_eq!(
-        e.kind(),
-        "federation_withdraws_target_unheld",
+        super::fold::why_held(d, &u)
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(super::fold::reason::LINK_UNHELD.to_owned()),
         "I2105 unheld"
     );
-    // Another family than the target's.
-    let e = put_statement(
+    // Another family than the target's (a key-plane family, `key:revocation`):
+    // v62.0.0 (wave GC6, G0 v4) — HELD with reason `composer_family_mismatch`,
+    // never refused, and (held back) never read as key plane.
+    let out = put_statement(
         d,
         &withdraws(&k, "key:revocation", &t, 6_000),
         None,
         INGEST_TIER,
     )
     .await
-    .unwrap_err();
+    .unwrap_or_else(|e| panic!("I2105/I3870 mismatch is held: {}", reason(&e)));
+    let StatementOutcome::Pending { row_id: km, .. } = out else {
+        panic!("I2105/I3870 mismatch held: {out:?}");
+    };
     assert_eq!(
-        reason(&e),
-        malformed_row::COMPOSER_FAMILY_MISMATCH,
+        super::fold::why_held(d, &km)
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(malformed_row::COMPOSER_FAMILY_MISMATCH.to_owned()),
         "I2105 mismatch"
+    );
+    // I3870 (wave GC6; CC 2.7.3) — a composer of a non-key family whose
+    // target (here the signer's own key record) is of another family is
+    // HELD, concluding nothing, with reason `composer_family_mismatch`.
+    let record_id = RowId::of_statement(&record).expect("I3870: the record's row id");
+    let mismatched = withdraws(&k, SCORE_FAM, &record_id, 6_500);
+    let out = put_statement(d, &mismatched, None, INGEST_TIER)
+        .await
+        .unwrap_or_else(|e| panic!("I3870: held, never refused: {e:?}"));
+    let StatementOutcome::Pending { row_id: m, new } = out else {
+        panic!("I3870: held: {out:?}");
+    };
+    assert!(new, "I3870: the statement is kept");
+    assert!(
+        d.get_attestation(&m.hex()).await.unwrap().is_none(),
+        "I3870: no typed row: it concludes nothing"
+    );
+    let why = super::fold::why_held(d, &m)
+        .await
+        .unwrap()
+        .expect("I3870: a held reason");
+    assert_eq!(
+        why.reason,
+        super::fold::reason::COMPOSER_FAMILY_MISMATCH,
+        "I3870: the reason is the refusal token it replaces"
+    );
+    // A re-offer (a re-fold) holds it again, unchanged.
+    let again = put_statement(d, &mismatched, None, INGEST_TIER)
+        .await
+        .unwrap_or_else(|e| panic!("I3870: re-offer: {e:?}"));
+    assert!(
+        matches!(again, StatementOutcome::Pending { new: false, .. }),
+        "I3870: still held: {again:?}"
+    );
+    // Composer FIRST (another key's record as the target): held while its
+    // target is unheld (`link_unheld`), and RE-FOLDED when the target lands,
+    // to the same held answer as target first (`composer_family_mismatch`).
+    let k3 = key(132);
+    let record3 = key_record(&k3, &["user"], 0, None);
+    let record3_id = RowId::of_statement(&record3).expect("I3870: row id");
+    let early = withdraws(&k, SCORE_FAM, &record3_id, 6_600);
+    let out = put_statement(d, &early, None, INGEST_TIER)
+        .await
+        .unwrap_or_else(|e| panic!("I3870: held while its target is unheld: {e:?}"));
+    let StatementOutcome::Pending { row_id: m3, .. } = out else {
+        panic!("I3870: held: {out:?}");
+    };
+    assert_eq!(
+        super::fold::why_held(d, &m3)
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(super::fold::reason::LINK_UNHELD.to_owned()),
+        "I3870: the composer waits for its target"
+    );
+    put_statement(d, &record3, None, INGEST_TIER).await.unwrap();
+    assert_eq!(
+        super::fold::why_held(d, &m3)
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(super::fold::reason::COMPOSER_FAMILY_MISMATCH.to_owned()),
+        "I3870: re-folded on the target's arrival: either arrival order ends held, \
+         with the same reason"
+    );
+    assert!(
+        d.get_attestation(&m3.hex()).await.unwrap().is_none(),
+        "I3870: it concludes nothing"
     );
     // The target's family: admitted, naming the target by its row id.
     let StatementOutcome::Row { row_id: w, .. } =

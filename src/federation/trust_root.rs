@@ -47,6 +47,8 @@
 //! signed an edge to it; it gains NO standing in the accord role plane.
 
 use super::attestation_query::{AttestationQuery, FOLD_PAGE};
+use super::edition2::fold::{self, reason, Dep};
+use super::membership_acceptance::hold_unless_storage;
 use super::precedence;
 use super::types::{attestation_type, Attestation};
 use super::{Error, FederationDirectory};
@@ -3754,6 +3756,29 @@ where
     let refuse = |detail: String| Err(Error::CharterInvalid { detail });
     check_charter_witness_quorum(&row.attestation_envelope)?;
 
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    // v62.0.0 (wave GC6; CC 2.7, G2 finding 7) — the DOOR part ahead of the
+    // fold. A charter whose subject IS the accord family is a family charter
+    // by its own bytes, so its own-bytes rules (the pre-rotation commitment,
+    // the recovery commitments' shape) refuse before the family is read: a
+    // malformed accord charter about an unheld accord is refused, not held.
+    if row.attested_key_id == accord {
+        if !charter_commitment_well_formed(&row.attestation_envelope) {
+            return refuse(format!(
+                "family charter for {accord} must carry a well-formed \
+                 \"{CHARTER_PRE_ROTATION_FIELD}\" (64 lowercase hex — sha256 of the \
+                 pre-committed successor key set)"
+            ));
+        }
+        accord_recovery_commitments_of(&row.attestation_envelope)?;
+    }
+
+    // v62.0.0 (wave GC6; CC 2.7.3) — everything below reads the family this
+    // charter names (its record, roster, protocol): declared on every path,
+    // the "not a family" one too, so the charter re-folds when the family
+    // lands, and the verdict does not depend on which arrived first.
+    fold::reads(Dep::key(&row.attested_key_id));
+
     // Not a family ⇒ a MISLABELED key-plane row. Stored and inert, per #551
     // item 2 — see the type-level doc.
     let Some(family) = resolve_family_root(directory, &row.attested_key_id).await? else {
@@ -3781,28 +3806,45 @@ where
         // ceremony seats the roster, then confers; demanding the family row
         // would refuse the ceremony). This gate's authority genuinely IS the
         // family row, so its absence is its own refusal.
-        if row.attested_key_id == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID {
-            return Err(Error::NoConstitutionalRootYet {
-                operation: super::genesis::posture::FAMILY_CHARTER_ADMISSION,
-                leg: super::genesis::GenesisLeg::Family,
-                fault_kind: "absent",
-                detail: format!(
-                    "a `{TRUST_CHARTER_DIMENSION}` naming {} cannot be judged: this node holds \
-                     no such family, so the quorum it must carry cannot be re-derived",
-                    row.attested_key_id
-                ),
-            });
+        //
+        // v62.0.0 (wave GC6; CC 2.7.3) — the family the charter names is not
+        // held YET: the charter WAITS for it (held, re-folded when the
+        // family lands), never refused.
+        if row.attested_key_id == accord {
+            return Err(fold::hold(
+                reason::NO_CONSTITUTIONAL_ROOT_YET,
+                Error::NoConstitutionalRootYet {
+                    operation: super::genesis::posture::FAMILY_CHARTER_ADMISSION,
+                    leg: super::genesis::GenesisLeg::Family,
+                    fault_kind: "absent",
+                    detail: format!(
+                        "a `{TRUST_CHARTER_DIMENSION}` naming {} cannot be judged: this node \
+                         holds no such family, so the quorum it must carry cannot be re-derived",
+                        row.attested_key_id
+                    ),
+                },
+            ));
         }
         return Ok(());
     };
+    fold::reads(Dep::key(&family.family_key_id));
 
+    // v62.0.0 (wave GC6) — whether this rule applies at all was decided by a
+    // read of another row (the family), so a miss is a fold condition: held,
+    // and the same held answer whichever of the charter and the family came
+    // first (the accord's own case was refused by its bytes above).
     if !charter_commitment_well_formed(&row.attestation_envelope) {
-        return refuse(format!(
-            "family charter for {} must carry a well-formed \
-             \"{CHARTER_PRE_ROTATION_FIELD}\" (64 lowercase hex — sha256 of the \
-             pre-committed successor key set); a quorum-rooted family survives losing \
-             a seat, but the seats themselves still rotate",
-            family.family_key_id
+        return Err(fold::hold(
+            reason::FAMILY_CHARTER_COMMITMENT_MALFORMED,
+            Error::CharterInvalid {
+                detail: format!(
+                    "family charter for {} must carry a well-formed \
+                     \"{CHARTER_PRE_ROTATION_FIELD}\" (64 lowercase hex — sha256 of the \
+                     pre-committed successor key set); a quorum-rooted family survives losing \
+                     a seat, but the seats themselves still rotate",
+                    family.family_key_id
+                ),
+            },
         ));
     }
 
@@ -3821,7 +3863,7 @@ where
             family.consensus_protocol
         ));
     }
-    if family.family_key_id == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID {
+    if family.family_key_id == accord {
         check_accord_recovery_commitments(directory, &row.attestation_envelope, &family).await?;
     }
     Ok(())
@@ -3866,6 +3908,57 @@ async fn check_accord_recovery_commitments<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let commitments = accord_recovery_commitments_of(envelope)?;
+    // Apart from every signing key the charter names (its own holders): judged
+    // on the charter alone, so it holds whatever roster a version later puts
+    // it in force for.
+    //
+    // v62.0.0 (wave GC6; CC 2.7.2/2.7.3) — this reads OTHER rows (each named
+    // holder's key record), so it is a fold: each holder's record is a
+    // declared read, and a collision HOLDS the charter. A holder whose record
+    // is not held yet decides nothing NOW, and its arrival re-folds the
+    // charter: before, an unheld record was skipped and a charter admitted
+    // early stayed admitted when the colliding record landed (admit early,
+    // refuse late: an order-dependent verdict).
+    for holder in commitments.keys() {
+        fold::reads(Dep::key(holder));
+        let Some(record) = directory.lookup_public_key(holder).await? else {
+            continue;
+        };
+        // A record that cannot form an element cannot be the key a commitment
+        // names, so it cannot collide either.
+        let Ok(signing) = CommittedKey::from_record(&record) else {
+            continue;
+        };
+        let signing = recovery_commitment(&signing)?;
+        if let Some((owner, _)) = commitments.iter().find(|(_, c)| **c == signing) {
+            return Err(fold::hold(
+                reason::ACCORD_RECOVERY_KEY_NOT_APART,
+                Error::CharterInvalid {
+                    detail: format!(
+                        "accord_recovery_key_not_apart: the recovery commitment for {owner} is \
+                         the signing key of standing holder {holder}; a recovery key is held \
+                         apart from every signing key"
+                    ),
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// v62.0.0 (wave GC6) — **the accord charter's recovery commitments, by its
+/// own bytes** (the DOOR part of [`check_accord_recovery_commitments`]): the
+/// member is present, an object of 64-lowercase-hex values, no two holders
+/// committing to the same key. Reads nothing.
+///
+/// # Errors
+///
+/// [`Error::CharterInvalid`] `accord_recovery_commitment_missing` /
+/// `accord_recovery_key_not_apart`.
+fn accord_recovery_commitments_of(
+    envelope: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, String>, Error> {
     use super::envelope::paths::RECOVERY_COMMITMENTS;
     let refuse = |token: &str, detail: String| {
         Err(Error::CharterInvalid {
@@ -3908,30 +4001,7 @@ where
             format!("two holders commit to the same recovery key (commitment {dup})"),
         );
     }
-    // Apart from every signing key the charter names (its own holders): judged
-    // on the charter alone, so it holds whatever roster a version later puts
-    // it in force for.
-    for holder in commitments.keys() {
-        let Some(record) = directory.lookup_public_key(holder).await? else {
-            continue;
-        };
-        // A record that cannot form an element cannot be the key a commitment
-        // names, so it cannot collide either.
-        let Ok(signing) = CommittedKey::from_record(&record) else {
-            continue;
-        };
-        let signing = recovery_commitment(&signing)?;
-        if let Some((owner, _)) = commitments.iter().find(|(_, c)| **c == signing) {
-            return refuse(
-                "accord_recovery_key_not_apart",
-                format!(
-                    "the recovery commitment for {owner} is the signing key of standing \
-                     holder {holder}; a recovery key is held apart from every signing key"
-                ),
-            );
-        }
-    }
-    Ok(())
+    Ok(commitments)
 }
 
 /// v19.0.0 (CIRISPersist#488 delta 1, CRITICAL — the KERI lesson) — the
@@ -4034,16 +4104,35 @@ where
             // under its id. Id membership is not the check: a record that
             // matches the id but carries other keys reproduces a different
             // digest and is refused below.
+            // v62.0.0 (wave GC6; CC 2.7.3) — from here the gate reads OTHER
+            // rows (the successors' key records, the old root's charters):
+            // a fold. A successor whose record is not held yet WAITS (held,
+            // re-folded when it lands), never refused; an unbound
+            // declaration is held and re-folded when the old root's rows
+            // change.
             let mut presented = Vec::with_capacity(successor_keys.len());
             for key_id in &successor_keys {
+                fold::reads(Dep::key(key_id));
+            }
+            fold::reads(Dep::key(old_root));
+            for key_id in &successor_keys {
                 let Some(record) = directory.lookup_public_key(key_id).await? else {
-                    return refuse(format!(
-                        "recovery declaration names successor {key_id}, but this node holds \
-                         no key record for it: the commitment binds public key material, so \
-                         an unregistered successor cannot be checked against it"
+                    return Err(fold::hold(
+                        reason::CHARTER_SUCCESSOR_UNHELD,
+                        Error::CharterInvalid {
+                            detail: format!(
+                                "recovery declaration names successor {key_id}, but this node \
+                                 holds no key record for it: the commitment binds public key \
+                                 material, so an unregistered successor cannot be checked \
+                                 against it"
+                            ),
+                        },
                     ));
                 };
-                presented.push(CommittedKey::from_record(&record)?);
+                presented.push(
+                    CommittedKey::from_record(&record)
+                        .map_err(|e| hold_unless_storage(reason::CHARTER_RECOVERY_UNBOUND, e))?,
+                );
             }
             // The predecessor's live charter commitment must equal the hash
             // of THIS successor set (the pre-commitment binding).
@@ -4070,11 +4159,16 @@ where
                         == Some(claimed.as_str())
             });
             if !bound {
-                return refuse(format!(
-                    "recovery declaration does not bind: no live charter of {old_root} \
-                     pre-committed to the public keys these successor records carry \
-                     (computed commitment {claimed}); a record under a committed id with \
-                     other keys does not satisfy the commitment"
+                return Err(fold::hold(
+                    reason::CHARTER_RECOVERY_UNBOUND,
+                    Error::CharterInvalid {
+                        detail: format!(
+                            "recovery declaration does not bind: no live charter of {old_root} \
+                             pre-committed to the public keys these successor records carry \
+                             (computed commitment {claimed}); a record under a committed id \
+                             with other keys does not satisfy the commitment"
+                        ),
+                    },
                 ));
             }
             Ok(())
@@ -4319,10 +4413,11 @@ where
     // v62.0.0 (wave W1b; ruling C, CC 2.6.1.11 / 4.4.3.4) — canonical
     // standing is a seat of the genesis bundle in force: an identity-ref in
     // its `serve_nodes` (C1's reader), a conferral counted by the accord's
-    // holders, never a key type.
-    if super::edition2::genesis::is_canonical_by_bundle(directory, subject_key_id).await? {
-        return Ok(ServeTier::Canonical);
-    }
+    // holders, never a key type. v62 P5-fix1 — that rung is the edition-2
+    // rung ABOVE (`serves_under_seat`): the seat AND its announced owner
+    // (the v62 security ruling, CC rc20 5.4.6). A raw seat rung here
+    // (`is_canonical_by_bundle` alone) granted `Canonical` to a seat whose
+    // owner never announced it, and is removed.
     // The earlier form's ceremony plane (an accord co-scrub on a JSON key
     // record), only while the earlier-form doors are open (CC 2.6.1.12).
     if !super::edition2::door::earlier_form_doors_shut()

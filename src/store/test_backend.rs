@@ -216,78 +216,12 @@ impl SqliteBackend {
         planted.expect("fixture: plant an attestation row");
     }
 
-    /// Fixture: hold a key row past every `put_public_key` gate, as a node
-    /// that admitted it under an older rule does (CIRISPersist#1044, I621).
-    pub(crate) fn seed_key_row_unchecked_for_test(&self, mut row: crate::federation::KeyRecord) {
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)
-            .expect("seeded key row hashes");
-        let admitted_at = on_own_runtime(|| block_on(self.next_key_admission_position()))
-            .expect("fixture: key admission position")
-            .to_rfc3339();
-        let json = |v: &serde_json::Value| v.to_string();
-        self.conn_handle()
-            .lock()
-            .execute(
-                "INSERT OR REPLACE INTO federation_keys (key_id, pubkey_ed25519_base64, \
-                    pubkey_ml_dsa_65_base64, algorithm, identity_type, identity_ref, valid_from, \
-                    valid_until, registration_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
-                    pqc_completed_at, persist_row_hash, roles, attestation_evidence, consent_role, \
-                    additional_scrubs, admitted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                    ?17, ?18, ?19, ?20, ?21)",
-                rusqlite::params![
-                    row.key_id,
-                    row.pubkey_ed25519_base64,
-                    row.pubkey_ml_dsa_65_base64,
-                    row.algorithm,
-                    row.identity_type,
-                    row.identity_ref,
-                    row.valid_from.to_rfc3339(),
-                    row.valid_until.map(|t| t.to_rfc3339()),
-                    json(&row.registration_envelope),
-                    hex::decode(&row.original_content_hash).unwrap_or_default(),
-                    row.scrub_signature_classical,
-                    row.scrub_signature_pqc,
-                    row.scrub_key_id,
-                    row.scrub_timestamp.to_rfc3339(),
-                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                    row.persist_row_hash,
-                    (!row.capability_roles.is_empty())
-                        .then(|| serde_json::to_string(&row.capability_roles).expect("roles")),
-                    row.attestation_evidence.as_ref().map(json),
-                    row.consent_role.clone().unwrap_or_else(|| {
-                        crate::federation::types::consent_role::UNREGISTERED.to_owned()
-                    }),
-                    serde_json::to_string(&row.additional_scrubs).expect("additional_scrubs"),
-                    admitted_at,
-                ],
-            )
-            .expect("fixture: seed a key row");
-    }
-
     /// Fixture read: the single integer `sql` selects (a count, usually).
     pub(crate) fn test_query_i64(&self, sql: &str) -> i64 {
         self.conn_handle()
             .lock()
             .query_row(sql, [], |r| r.get(0))
             .expect("fixture: test_query_i64")
-    }
-
-    /// Fixture read: the highest community DEK epoch any minter holds for
-    /// `community_key_id` (0 when none was ever minted).
-    pub(crate) fn community_dek_epoch(&self, community_key_id: &str) -> u64 {
-        let e: i64 = self
-            .conn_handle()
-            .lock()
-            .query_row(
-                "SELECT COALESCE(MAX(epoch), 0) FROM federation_community_dek_epoch \
-                  WHERE community_key_id = ?1",
-                [community_key_id],
-                |r| r.get(0),
-            )
-            .expect("fixture: community_dek_epoch");
-        u64::try_from(e).unwrap_or(0)
     }
 
     /// Fixture read: every stored LLM-call row, in insertion order.

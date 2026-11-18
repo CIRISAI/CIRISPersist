@@ -35,6 +35,7 @@
 
 use super::canonical_community::{charter_in_force, HeadCharter};
 use super::cohort::Cohort;
+use super::edition2::fold::reason as held_reason;
 use super::trust_root::{recovery_commitment, CommittedKey};
 use super::types::{Family, FamilyMember, SignedFamily};
 use super::{Error, FederationDirectory};
@@ -57,6 +58,21 @@ fn refuse<T>(token: &str, detail: impl std::fmt::Display) -> Result<T, Error> {
     Err(Error::CharterInvalid {
         detail: format!("{token}: {detail}"),
     })
+}
+
+/// v62.0.0 (wave GC3; CC 2.7.3) — [`refuse`] for a check that read OTHER
+/// rows (the held accord, its seats, its recovery lineage, a key record):
+/// inside a fold attempt the recovery is HELD with `token` as its reason
+/// (a [`fold::reason`](super::edition2::fold::reason) token, the same text
+/// the refusal leads with), and re-folds when the rows it read change.
+/// Outside an attempt it is exactly [`refuse`].
+fn hold_on<T>(token: &'static str, detail: impl std::fmt::Display) -> Result<T, Error> {
+    Err(super::edition2::fold::hold(
+        token,
+        Error::CharterInvalid {
+            detail: format!("{token}: {detail}"),
+        },
+    ))
 }
 
 fn well_formed_commitment(h: &str) -> bool {
@@ -566,18 +582,43 @@ where
         field("recovery_key_id"),
         field("next_recovery_commitment"),
     );
-    let Some(held) = directory.lookup_family(&offered.family_key_id).await? else {
-        return refuse("accord_recovery_no_held_accord", &offered.family_key_id);
-    };
-    // The statement names this family, this held head and this version.
+    // v62.0.0 (wave GC3; CC 2.7.3) — every check below that reads the held
+    // accord, its lineage or a key record is a FOLD condition: declared here,
+    // and held (`hold_on`) rather than refused. The checks on the statement's
+    // own bytes stay refusals.
+    {
+        use super::edition2::fold::{reads, Dep};
+        reads(Dep::key(&offered.family_key_id));
+        for k in [old, new, recovery_key_id] {
+            if !k.is_empty() {
+                reads(Dep::key(k));
+            }
+        }
+    }
+    // The statement's own bytes: it names this family and the offered
+    // version's content hash.
     if field("family_key_id") != offered.family_key_id
-        || field("prior_persist_row_hash") != held.persist_row_hash
-        || proof.prior_persist_row_hash != held.persist_row_hash
-        || offered.prev_head_digest != held.persist_row_hash
         || field("next_persist_row_hash") != super::types::compute_persist_row_hash(offered)?
     {
         return refuse(
             "accord_recovery_statement_unbound",
+            "the statement must name this family, the held head it replaces and the offered \
+             version's content hash, and the version must name the held head",
+        );
+    }
+    let Some(held) = directory.lookup_family(&offered.family_key_id).await? else {
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_NO_HELD_ACCORD,
+            &offered.family_key_id,
+        );
+    };
+    // The statement and the version name the held head (another row).
+    if field("prior_persist_row_hash") != held.persist_row_hash
+        || proof.prior_persist_row_hash != held.persist_row_hash
+        || offered.prev_head_digest != held.persist_row_hash
+    {
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_STATEMENT_UNBOUND,
             "the statement must name this family, the held head it replaces and the offered \
              version's content hash, and the version must name the held head",
         );
@@ -587,8 +628,8 @@ where
     expected.persist_row_hash = String::new();
     expected.prev_head_digest = held.persist_row_hash.clone();
     let Some(seat) = expected.members.iter_mut().find(|m| m.key_id == old) else {
-        return refuse(
-            "accord_recovery_not_a_holder",
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_NOT_A_HOLDER,
             format!("{old} holds no seat"),
         );
     };
@@ -608,16 +649,22 @@ where
             format!("the recovery seats its own recovery key {recovery_key_id} (CC 4.2.6)"),
         );
     }
-    if held.members.iter().any(|m| m.key_id == new) || new.is_empty() {
+    if new.is_empty() {
         return refuse(
             "accord_recovery_seat_taken",
             format!("{new} already holds a seat"),
         );
     }
+    if held.members.iter().any(|m| m.key_id == new) {
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_SEAT_TAKEN,
+            format!("{new} already holds a seat"),
+        );
+    }
     // v53.0.0 (CC 4.2.6) — the key taking the seat is an accord holder's key.
     if !super::accord_roster::is_accord_holder_key(directory, new).await? {
-        return refuse(
-            "accord_recovery_not_a_holder_key",
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_NOT_A_HOLDER_KEY,
             format!("{new} is not an accord_holder key record (CC 4.2.6)"),
         );
     }
@@ -635,8 +682,8 @@ where
     let mut bare = offered.clone();
     bare.persist_row_hash = String::new();
     if bare != expected {
-        return refuse(
-            "accord_recovery_changes_more_than_its_seat",
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_CHANGES_MORE_THAN_ITS_SEAT,
             "a recovery swaps the holder's own seat and changes nothing else (CC 4.2.6)",
         );
     }
@@ -660,21 +707,26 @@ where
     // commitment in force, it has not rotated a seat before, and it signed.
     let Some(in_force) = recovery_commitment_in_force(directory, &held.family_key_id, old).await?
     else {
-        return refuse(
-            "accord_recovery_commitment_missing",
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_COMMITMENT_MISSING,
             format!("no recovery commitment is in force for {old}"),
         );
     };
     let Some(record) = directory.lookup_public_key(recovery_key_id).await? else {
-        return refuse(
-            "accord_recovery_key_unregistered",
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_KEY_UNREGISTERED,
             format!("recovery key {recovery_key_id} is not registered"),
         );
     };
     let presented = CommittedKey::from_record(&record)
         .and_then(|k| recovery_commitment(&k))
-        .map_err(|e| Error::CharterInvalid {
-            detail: format!("accord_recovery_key_mismatch: {e}"),
+        .map_err(|e| {
+            super::edition2::fold::hold(
+                held_reason::ACCORD_RECOVERY_KEY_MISMATCH,
+                Error::CharterInvalid {
+                    detail: format!("accord_recovery_key_mismatch: {e}"),
+                },
+            )
         })?;
     // v62.0.0 (CC rc20 4.2.6) — the lineage, walked in link order.
     let walk = walk_commitments(directory, &held.family_key_id).await?;
@@ -691,14 +743,14 @@ where
         .iter()
         .any(|s| s.get("recovery_key_id").and_then(|v| v.as_str()) == Some(recovery_key_id));
     if spent_by_id || walk.is_spent(&presented) {
-        return refuse(
-            "accord_recovery_key_spent",
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_KEY_SPENT,
             format!("{recovery_key_id} already rotated a seat"),
         );
     }
     if presented != in_force {
-        return refuse(
-            "accord_recovery_key_mismatch",
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_KEY_MISMATCH,
             format!(
                 "the stored keys of {recovery_key_id} do not reproduce {old}'s recovery \
                  commitment (an id that matches with other keys is not the committed key)"
@@ -709,8 +761,8 @@ where
     // "a spent commitment never returns": neither the one in force nor one a
     // recovery already spent.
     if next_commitment == in_force || walk.is_spent(next_commitment) {
-        return refuse(
-            "accord_recovery_next_commitment_not_fresh",
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_NEXT_COMMITMENT_NOT_FRESH,
             "the new key's recovery commitment repeats the one it spends or one already spent",
         );
     }
@@ -719,8 +771,8 @@ where
     // the public key material, not the id." The new key's material is neither
     // this recovery key's nor any recovery key the lineage spent.
     let Some(new_record) = directory.lookup_public_key(new).await? else {
-        return refuse(
-            "accord_recovery_not_a_holder_key",
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_NOT_A_HOLDER_KEY,
             format!("{new} is not registered"),
         );
     };
@@ -738,8 +790,8 @@ where
                 && a.pubkey_ml_dsa_65_base64 == b.pubkey_ml_dsa_65_base64)
     };
     if let Some(r) = recovery_keys.iter().find(|r| same_material(&new_record, r)) {
-        return refuse(
-            ACCORD_RECOVERY_KEY_AS_SIGNING_KEY,
+        return hold_on(
+            held_reason::ACCORD_RECOVERY_KEY_AS_SIGNING_KEY,
             format!(
                 "{new} carries the public key material of recovery key {} (CC 4.2.6: a \
                  recovery key never becomes a seat's signing key, under any id)",
@@ -776,10 +828,10 @@ where
     Ok(Some(new.to_owned()))
 }
 
-#[cfg(all(test, feature = "sqlite"))]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod codex_978 {
     use super::*;
-    use crate::federation::accord_test_support as ops;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::genesis::accord_family_genesis_record_for;
     use crate::federation::types::identity_type;
 
@@ -789,12 +841,13 @@ mod codex_978 {
     /// already-verified supersede. The family is unchanged.
     async fn non_accord_family_is_refused(d: &dyn FederationDirectory, tag: &str) {
         let fid = format!("i504-family-{tag}");
+        // v62.0.0: the founders are live by their edition-2 `key:record`s and
+        // named by kid.
         let (a, b) = (format!("i504-a-{tag}"), format!("i504-b-{tag}"));
         for k in [&a, &b] {
-            ops::register_typed_key(d, k, identity_type::USER)
-                .await
-                .unwrap();
+            let _ = e2::put_key(d, k, &[identity_type::USER]).await;
         }
+        let (a, b) = (e2::kid(&a), e2::kid(&b));
         let family =
             accord_family_genesis_record_for(&fid, "quorum:2/2", [a.as_str(), b.as_str()], "");
         d.put_family_local(family).await.unwrap();
@@ -832,6 +885,7 @@ mod codex_978 {
         assert_eq!(after.family_name, held.family_name, "{tag} I504: unchanged");
     }
 
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i504_sqlite() {
         use crate::store::Backend as _;
@@ -840,5 +894,19 @@ mod codex_978 {
             .unwrap();
         d.run_migrations().await.unwrap();
         non_accord_family_is_refused(&d, "sqlite").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i504_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let d = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        non_accord_family_is_refused(&d, &uuid::Uuid::new_v4().simple().to_string()).await;
     }
 }

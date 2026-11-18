@@ -776,14 +776,16 @@ mod runners {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i415b_a_dag_is_here_only_with_every_chunk_sqlite() {
-        super::engine_bodies::i415b_a_dag_is_here_only_with_every_chunk(
-            "sqlite::memory:",
-            "sqlite::memory:",
-            &suffix(),
-            (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
-                as crate::federation::epoch_minter_invariants::bodies::Pick<
-                    crate::store::sqlite::SqliteBackend,
-                >,
+        Box::pin(
+            super::engine_bodies::i415b_a_dag_is_here_only_with_every_chunk(
+                "sqlite::memory:",
+                "sqlite::memory:",
+                &suffix(),
+                (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                    as crate::federation::epoch_minter_invariants::bodies::Pick<
+                        crate::store::sqlite::SqliteBackend,
+                    >,
+            ),
         )
         .await;
     }
@@ -794,14 +796,16 @@ mod runners {
         let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
             return;
         };
-        super::engine_bodies::i415b_a_dag_is_here_only_with_every_chunk(
-            &a,
-            &b,
-            &suffix(),
-            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
-                as crate::federation::epoch_minter_invariants::bodies::Pick<
-                    crate::store::postgres::PostgresBackend,
-                >,
+        Box::pin(
+            super::engine_bodies::i415b_a_dag_is_here_only_with_every_chunk(
+                &a,
+                &b,
+                &suffix(),
+                (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                    as crate::federation::epoch_minter_invariants::bodies::Pick<
+                        crate::store::postgres::PostgresBackend,
+                    >,
+            ),
         )
         .await;
     }

@@ -12,17 +12,13 @@
 //! - **I1872 / I1873** (CC 3.3.6.2) — the X-Wing keys `transit_xwing_pubkey`
 //!   and `onion_hop_xwing_pubkey`: 1216 bytes, typed accessors, and the
 //!   per-half reuse refusals (`self_at_login::test_support::run_xwing_matrix`).
-//! - **I1874 / I1875** — the earlier-form re-bind witness and THE RULE (a
-//!   seat-published X-Wing key is not live): `tests/xwing_rebind_1274.rs`,
-//!   deleted in v62.0.0 (json-cut C5) with the bundle/1 software ceremony it
-//!   booted from. THE RULE needs an edition-2 witness (E slice).
-//! - **I1878 / I1879** (CC 4.2.1 / 3.4.7.1 / 8.11.27) — the canonical standing
-//!   is the accord's conferral: a v61 earlier-form `canonical,node` record
-//!   resolves by its verifying co-scrub; a `canonical` label whose co-scrub
-//!   does not verify is inert; the forward form ({node}, `infra:serve`, the
-//!   co-scrub) resolves; one anchor scrub is no conferral; a forged forward
-//!   co-scrub confers nothing.
-//! - **I1887** — the key-record store path's conflicts are typed.
+//! - **I1874 / I1875** — the re-bind witness and THE RULE (a seat-published
+//!   X-Wing key is not live): `tests/xwing_rebind_1274.rs`.
+//! - **I1878 / I1879 / I1887** (deleted v62.0.0, slice E6): the co-scrub
+//!   canonical conferral and the earlier-form key-record conflict typing.
+//!   Canonical standing is the `serve_nodes` of the bundle/2 in force; an
+//!   edition-2 key id is its thumbprint, so a pubkey change under one id
+//!   cannot be expressed.
 //! - **I1880** (CC 2.4 / 2.6.1.9) — a licensure row short of its quorum
 //!   authority waits (`affiliation_licence_invariants::i1214`).
 //! - **I1881–I1885** (CC 3.2 / 4.4.3.4 / 6.1.8 N1 / 5.4.6) — the infrastructure
@@ -46,6 +42,16 @@ mod pure {
     /// MUST NOT cohabit: `node` with `agent`, and `user` or `accord_holder` with
     /// `node` or `agent`. … Cohabitation is general; those exclusions are its
     /// only exceptions."
+    /// The rule's input: a record of `set` as a struct. v62.0.0: built in
+    /// the earlier form on purpose (`with_earlier_form`), because the
+    /// edition-2 builder admits its record and a mixed set never admits; the
+    /// rule reads only `identity_type`.
+    fn rule_input(set: &str) -> crate::federation::KeyRecord {
+        crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+            ts::replicated_key_record("i1870-k", set, "i1870-k", "i1870-k", "n")
+        })
+    }
+
     #[test]
     fn i1870_the_identity_set_rule_names_every_pair() {
         let person = [it::USER, it::ACCORD_HOLDER];
@@ -56,7 +62,7 @@ mod pure {
                     continue;
                 }
                 let set = it::join_set([*a, *b]);
-                let rec = ts::replicated_key_record("i1870-k", &set, "i1870-k", "i1870-k", "n");
+                let rec = rule_input(&set);
                 let node_case = (*a == it::NODE || *b == it::NODE)
                     && [*a, *b].iter().any(|t| *t == it::AGENT || *t == it::USER);
                 let mixed = [*a, *b].iter().any(|t| person.contains(t))
@@ -85,7 +91,7 @@ mod pure {
             it::join_set([it::ACCORD_HOLDER, it::NODE]),
             it::join_set([it::ACCORD_HOLDER, it::AGENT]),
         ] {
-            let rec = ts::replicated_key_record("i1870-k", &set, "i1870-k", "i1870-k", "n");
+            let rec = rule_input(&set);
             let err = check_node_identity_exclusive(&rec).expect_err("refused");
             assert_eq!(
                 err.kind(),
@@ -184,216 +190,45 @@ mod pure_1871 {
 /// The backend-agnostic witness bodies; `runners` instantiates them.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::register::{KeyRefusalReason, ReplicatedKeyOutcome};
-    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::canonical_community_invariants::bodies::{
+        rooted_infrastructure_room_e2, SetNodeKey,
+    };
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::types::identity_type as it;
-    use crate::federation::{Error, FederationDirectory, SignedKeyRecord};
-
-    /// The accord roster (production ids, deterministic TEST keys: safe only
-    /// on a fresh backend of this test's own) and the baked lineage id, which
-    /// keeps the pre-floor bar.
-    async fn canonical_fixture(
-        d: &dyn FederationDirectory,
-    ) -> (
-        Vec<crate::federation::operational::test_support::Identity>,
-        String,
-    ) {
-        use crate::federation::operational::test_support as ops;
-        let accord: Vec<ops::Identity> =
-            crate::federation::admission::accord_holder_roster_key_ids()
-                .iter()
-                .map(|k| ops::Identity::new(k))
-                .collect();
-        for a in &accord {
-            ops::register_accord_holder(d, a).await.unwrap();
-        }
-        let g = crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0]
-            .record
-            .key_id
-            .clone();
-        (accord, g)
-    }
-
-    /// **I1878 (part 1)** — a v61 canonical (the earlier-form envelope
-    /// `"identity_type": "canonical,node"`, `infra:serve`, the accord's 2-of-3
-    /// co-scrub) is admitted and resolves by its conferral. Returns the record
-    /// the runner plants through the genesis seed door (which runs no
-    /// conferral gate, as a row stored before the gate would be): a
-    /// `canonical,node` label whose co-scrub does not verify.
-    pub(crate) async fn i1878_earlier_form_resolves(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) -> crate::federation::KeyRecord {
-        use crate::federation::operational::test_support as ops;
-        let (accord, g) = canonical_fixture(d).await;
-        let v61 = ops::signed_canonical_record_with_roles(
-            &g,
-            "canonical,node",
-            ops::PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            vec!["infra:serve".to_owned()],
-            serde_json::json!({ "key_id": g }),
-            &[&accord[0], &accord[1]],
-        );
-        d.put_public_key(SignedKeyRecord { record: v61 })
-            .await
-            .expect("I1878: the v61-shaped canonical is admitted");
-        assert!(
-            crate::federation::is_canonical(d, &g).await.unwrap(),
-            "I1878: a v61 canonical resolves by its verifying co-scrub (CC 8.11.27)"
-        );
-        // The inert label: a `canonical,node` record whose second scrub is
-        // forged (it names a real accord key but is another key's signature).
-        let inert_id = format!("i1878-inert-{tag}");
-        let mut inert = ops::signed_canonical_record(
-            &inert_id,
-            "canonical,node",
-            ops::PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            serde_json::json!({ "key_id": inert_id }),
-            &[&accord[0], &accord[1]],
-        );
-        let forged = ops::signed_canonical_record(
-            &inert_id,
-            "canonical,node",
-            ops::PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            serde_json::json!({ "key_id": inert_id, "other": true }),
-            &[&accord[1]],
-        );
-        inert.additional_scrubs[0].scrub_signature_classical = forged.scrub_signature_classical;
-        inert.additional_scrubs[0].scrub_signature_pqc = forged.scrub_signature_pqc;
-        assert!(
-            d.put_public_key(SignedKeyRecord {
-                record: inert.clone()
-            })
-            .await
-            .is_err(),
-            "I1878: the door refuses the forged co-scrub"
-        );
-        inert
-    }
-
-    /// **I1878 (part 2)** — after the runner planted `inert_id`: the label is
-    /// inert. CC 3.4.7.1: "A conferral is not a label."
-    pub(crate) async fn i1878_the_label_is_inert(d: &dyn FederationDirectory, inert_id: &str) {
-        assert!(
-            d.lookup_public_key(inert_id).await.unwrap().is_some(),
-            "I1878: the planted row is held"
-        );
-        assert!(
-            !crate::federation::is_canonical(d, inert_id).await.unwrap(),
-            "I1878: `canonical` in a stored identity_type confers nothing without its co-scrub"
-        );
-    }
-
-    /// **I1879** — the forward form: identity_type {node}, `infra:serve`, the
-    /// accord's co-scrub, resolves canonical (CC 4.2.1: "That co-scrub is the
-    /// key's canonical standing"). One anchor scrub alone is recognition, not a
-    /// conferral; a forged forward co-scrub is admitted and inert. Returns the
-    /// canonical's key id and the one-scrub node's, for the runner's listing.
-    pub(crate) async fn i1879_forward_form_resolves(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) -> (String, String) {
-        use crate::federation::operational::test_support as ops;
-        let (accord, g) = canonical_fixture(d).await;
-        // A forged forward co-scrub, on another key: the forward form is READ,
-        // not gated, so it is admitted as an ordinary node record and is
-        // never canonical (its co-scrub does not verify).
-        let forged_id = format!("i1879-forged-{tag}");
-        let mut forged = ops::signed_canonical_record_with_roles(
-            &forged_id,
-            "node",
-            ops::PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            vec!["infra:serve".to_owned()],
-            serde_json::json!({ "key_id": forged_id }),
-            &[&accord[0], &accord[1]],
-        );
-        forged.additional_scrubs[0].scrub_signature_classical =
-            forged.scrub_signature_classical.clone();
-        assert!(crate::federation::admission::presents_canonical_conferral(
-            &forged
-        ));
-        d.put_public_key(SignedKeyRecord { record: forged })
-            .await
-            .expect("I1879: a forward-form record is not refused at the door");
-        assert!(
-            !crate::federation::is_canonical(d, &forged_id)
-                .await
-                .unwrap(),
-            "I1879: a forged forward co-scrub confers nothing"
-        );
-        let fwd = ops::signed_canonical_record_with_roles(
-            &g,
-            "node",
-            ops::PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            vec!["infra:serve".to_owned()],
-            serde_json::json!({ "key_id": g }),
-            &[&accord[0], &accord[1]],
-        );
-        assert!(crate::federation::admission::presents_canonical_conferral(
-            &fwd
-        ));
-        d.put_public_key(SignedKeyRecord { record: fwd })
-            .await
-            .expect("I1879: the forward-form canonical is admitted");
-        assert!(
-            crate::federation::is_canonical(d, &g).await.unwrap(),
-            "I1879: {{node}} + infra:serve + the accord's co-scrub is canonical"
-        );
-        assert!(
-            it::parse_set(
-                &d.lookup_public_key(&g)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .identity_type
-            ) == [it::NODE]
-        );
-        // One anchor scrub alone: admitted (recognition), never canonical.
-        let one = format!("i1879-one-{tag}");
-        let rec = ops::signed_canonical_record_with_roles(
-            &one,
-            "node",
-            ops::PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            vec!["infra:serve".to_owned()],
-            serde_json::json!({ "key_id": one }),
-            &[&accord[0]],
-        );
-        assert!(!crate::federation::admission::presents_canonical_conferral(
-            &rec
-        ));
-        d.put_public_key(SignedKeyRecord { record: rec })
-            .await
-            .expect("I1879: a one-scrub node is admitted");
-        assert!(
-            !crate::federation::is_canonical(d, &one).await.unwrap(),
-            "I1879: one anchor scrub is no conferral"
-        );
-        (g, one)
-    }
+    use crate::federation::{Error, FederationDirectory};
 
     /// **I1881** — a CONFORMANT, ROOTED infrastructure community (the CC 3.2
-    /// worked example: `quorum:2/3`, three human founders, the accord's 2-of-3
-    /// co-scrub) is authorized: its node member needs no steward binding, and
-    /// it needs no moderator. CC 3.2: "With no owner, a key MAY trust and serve
-    /// `infrastructure` communities and does nothing more."
-    pub(crate) async fn i1881_a_conformant_rooted_community_is_authorized(
-        d: &dyn FederationDirectory,
-    ) {
-        use crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON;
-        use crate::federation::canonical_community_invariants::bodies as cci;
-        cci::stand_up(d).await;
-        let row = cci::canonical_row(&cci::FOUNDERS);
-        d.put_community(cci::signed(row.clone(), &["A1", "B1"]))
+    /// worked example: `quorum:2/3`, three human founders, rooted in this
+    /// node's trust set) is authorized: its node member needs no steward
+    /// binding, and it needs no moderator. CC 3.2: "With no owner, a key MAY
+    /// trust and serve `infrastructure` communities and does nothing more."
+    ///
+    /// v62.0.0 (wave 4, slice E6) — the room is E5's
+    /// `rooted_infrastructure_room_e2` (T1 voices, W1's rooted root), no
+    /// longer the earlier canonical trust-root community (lead ruling 1).
+    /// Green once W1's `infrastructure_rooted_here` fix lands (E5).
+    pub(crate) async fn i1881_a_conformant_rooted_community_is_authorized<B>(
+        b: &B,
+        tag: &str,
+    ) -> String
+    where
+        B: FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + SetNodeKey
+            + Sync,
+    {
+        let d: &dyn FederationDirectory = b;
+        let node = format!("i1881-node-{tag}");
+        e2::put_key(d, &node, &[it::NODE]).await;
+        let room =
+            rooted_infrastructure_room_e2(b, &format!("i1881-room-{tag}"), &[&node], tag).await;
+        let row = d
+            .lookup_community(&room)
             .await
-            .expect("I1881: the rooted trust-root community is admitted");
+            .unwrap()
+            .expect("I1881: the rooted infrastructure room is held");
         assert!(
-            crate::federation::canonical_community::is_rooted(d, CANON)
+            crate::federation::canonical_community::is_rooted(d, &room)
                 .await
                 .unwrap(),
             "I1881: rooted"
@@ -416,20 +251,31 @@ pub(crate) mod bodies {
         crate::federation::admission::check_no_moderator_federate_admission(d, &row)
             .await
             .expect("I1881: an authorized infrastructure community needs no moderator");
+        room
     }
 
     /// **I1882** — an AGENT member of the same rooted infrastructure
     /// community, with no live steward binding, is refused. Agents are never
     /// exempt (CC 3.2: "Authority MUST root in an accountable human, never in a
     /// bare node").
-    pub(crate) async fn i1882_an_agent_is_never_exempt(d: &dyn FederationDirectory) {
-        use crate::federation::canonical_community_invariants::bodies as cci;
-        i1881_a_conformant_rooted_community_is_authorized(d).await;
-        let agent = "i1882-agent";
-        ts::register_hybrid_key_as(d, agent, agent, it::AGENT).await;
-        let mut row = cci::canonical_row(&cci::FOUNDERS);
+    pub(crate) async fn i1882_an_agent_is_never_exempt<B>(b: &B, tag: &str)
+    where
+        B: FederationDirectory
+            + crate::federation::attestation_query::AttestationQueryExec
+            + SetNodeKey
+            + Sync,
+    {
+        let d: &dyn FederationDirectory = b;
+        let room = i1881_a_conformant_rooted_community_is_authorized(b, tag).await;
+        // v62.0.0 — an edition-2 agent key (`key:record` through the door).
+        let agent = e2::put_key(d, &format!("i1882-agent-{tag}"), &[it::AGENT]).await;
+        let mut row = d
+            .lookup_community(&room)
+            .await
+            .unwrap()
+            .expect("I1882: the room is held");
         row.members.push(crate::federation::types::CommunityMember {
-            key_id: agent.to_owned(),
+            key_id: agent.clone(),
             joined_at: row.founded_at,
             role: Some("member".to_owned()),
         });
@@ -441,7 +287,7 @@ pub(crate) mod bodies {
                 member_role,
                 ..
             }) => {
-                assert_eq!(member_key_id, agent, "I1882");
+                assert_eq!(member_key_id, agent, "I1882 (the agent's kid)");
                 assert_eq!(member_role, it::AGENT, "I1882");
             }
             other => panic!("I1882: an unstewarded agent must be refused, got {other:?}"),
@@ -455,12 +301,10 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) -> crate::federation::types::Community {
-        let room = format!("i1883-room-{tag}");
-        let founder = format!("i1883-founder-{tag}");
-        let node = format!("i1883-node-{tag}");
-        ts::register_hybrid_key_as(d, &room, &room, it::SUBSTRATE_PERSIST).await;
-        ts::register_hybrid_key_as(d, &founder, &founder, it::USER).await;
-        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
+        // v62.0.0 — edition-2 keys: each is the kid of its seed.
+        let room = e2::put_key(d, &format!("i1883-room-{tag}"), &[it::SUBSTRATE_PERSIST]).await;
+        let founder = e2::put_key(d, &format!("i1883-founder-{tag}"), &[it::USER]).await;
+        let node = e2::put_key(d, &format!("i1883-node-{tag}"), &[it::NODE]).await;
         let at: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
         crate::federation::types::Community {
             prev_head_digest: String::new(),
@@ -544,8 +388,7 @@ pub(crate) mod bodies {
             assert!(!conformant(c).await, "I1884: {p} is not conformant");
         }
         for (n, t) in [it::NODE, it::AGENT].into_iter().enumerate() {
-            let k = format!("i1884-founder-{n}-{tag}");
-            ts::register_hybrid_key_as(d, &k, &k, t).await;
+            let k = e2::put_key(d, &format!("i1884-founder-{n}-{tag}"), &[t]).await;
             let mut c = base.clone();
             c.members[0].key_id = k;
             assert!(
@@ -561,53 +404,6 @@ pub(crate) mod bodies {
         assert!(!conformant(c).await, "I1884: not labelled infrastructure");
     }
 
-    /// **I1887** (CIRISPersist#1274 item 8) — the key-record store path's
-    /// conflicts are TYPED: the same key registered again with another record
-    /// is `same_key_different_record`, and other pubkeys under the key id are
-    /// `pubkey_change`. Until v62 both were one untyped `Conflict`.
-    pub(crate) async fn i1887_key_record_conflicts_are_typed(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        use crate::federation::register::KeyRecordConflictReason as R;
-        let k = format!("i1887-k-{tag}");
-        d.put_public_key(SignedKeyRecord {
-            record: ts::replicated_key_record(&k, it::USER, &k, &k, "n1"),
-        })
-        .await
-        .expect("I1887: the first record");
-        let mut same_key = ts::replicated_key_record(&k, it::USER, &k, &k, "n1");
-        same_key.identity_ref = format!("elsewhere-{tag}");
-        match d.put_public_key(SignedKeyRecord { record: same_key }).await {
-            Err(Error::KeyRecordConflict {
-                reason: R::SameKeyDifferentRecord,
-                ..
-            }) => {}
-            other => panic!("I1887: the same key, another record: {other:?}"),
-        }
-        let mut swapped = ts::replicated_key_record(&k, it::USER, &k, &k, "n1");
-        swapped.pubkey_ed25519_base64 = ts::hybrid_pubkeys(&format!("other-{tag}")).0;
-        let err = d
-            .put_public_key(SignedKeyRecord { record: swapped })
-            .await
-            .expect_err("I1887: a pubkey swap is refused");
-        assert!(
-            matches!(
-                err,
-                Error::KeyRecordConflict {
-                    reason: R::PubkeyChange,
-                    ..
-                }
-            ),
-            "I1887: other pubkeys under the key id: {err:?}"
-        );
-        assert_eq!(err.kind(), "federation_key_record_conflict_pubkey_change");
-        assert!(
-            err.is_duplicate_key(),
-            "I1887: still a conflict to its callers"
-        );
-    }
-
     /// **I1871** — a `substrate_persist` key is asserted by a store under its
     /// own key: a self-signed registration is admitted with no co-scrub, and
     /// it carries no conferral (it is not canonical, and the privileged-type
@@ -621,14 +417,17 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let k = format!("i1871-store-{tag}");
-        let rec = ts::replicated_key_record(&k, it::SUBSTRATE_PERSIST, &k, &k, "n1");
+        // v62.0.0 — the store's self-signed `key:record` (edition 2): its
+        // own key signs it, no co-signer.
+        let seed = format!("i1871-store-{tag}");
+        let rec = e2::key_row(&seed, &[it::SUBSTRATE_PERSIST]);
         crate::federation::admission::check_privileged_identity_type_admission(d, &rec)
             .await
             .expect("I1871: the privileged-type gate demands nothing of it");
-        d.put_public_key(SignedKeyRecord { record: rec })
+        e2::put_statement(d, &e2::key_record(&seed, &[it::SUBSTRATE_PERSIST]))
             .await
             .expect("I1871: a store asserts it under its own key, no ceremony");
+        let k = e2::kid(&seed);
         assert!(
             !crate::federation::is_canonical(d, &k).await.unwrap(),
             "I1871: it carries no conferral"
@@ -656,96 +455,74 @@ pub(crate) mod bodies {
         );
     }
 
-    /// **I1870** — the identity set rule on BOTH key-record doors (CC 3.4.7.1,
+    /// **I1870** — the identity set rule at the key-plane door (CC 3.4.7.1,
     /// CC 2.4.1.1: "A set that holds `user` or `accord_holder` together with
-    /// `node` or `agent` is malformed and refused"). The local mint refuses
-    /// with the error; the replicated insert refuses TYPED (so the cursor
-    /// advances) and stores nothing. A single-role key passes both doors.
+    /// `node` or `agent` is malformed and refused"). v62.0.0: a key is its
+    /// `key:record` statement, and the replicated apply is the local door
+    /// (`edition2::ingest::apply_replicated_statement` runs `put_statement`
+    /// under the offered id), so a mixed set is refused at `put_statement`
+    /// and nothing is projected; a single-role key passes both doors. (The
+    /// replicated leg of a mixed set is not offered: its offered id cannot be
+    /// computed without admitting the record, and an arbitrary id would be
+    /// refused `row_id_mismatch`, a leg that could not fail.)
     pub(crate) async fn i1870_the_identity_set_rule_holds_on_every_door(
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let cases: [(&str, String, KeyRefusalReason); 5] = [
-            (
-                "node+agent",
-                it::join_set([it::NODE, it::AGENT]),
-                KeyRefusalReason::NodeIdentityFused,
-            ),
-            (
-                "node+user",
-                it::join_set([it::NODE, it::USER]),
-                KeyRefusalReason::NodeIdentityFused,
-            ),
-            (
-                "user+agent",
-                it::join_set([it::USER, it::AGENT]),
-                KeyRefusalReason::IdentitySetMixed,
-            ),
-            (
-                "accord_holder+node",
-                it::join_set([it::ACCORD_HOLDER, it::NODE]),
-                KeyRefusalReason::IdentitySetMixed,
-            ),
-            (
-                "accord_holder+agent",
-                it::join_set([it::ACCORD_HOLDER, it::AGENT]),
-                KeyRefusalReason::IdentitySetMixed,
-            ),
+        use crate::federation::edition2::ingest::{
+            apply_replicated_statement, ReplicatedStatementOutcome,
+        };
+        // DEPENDS ON THE CUT-A IDENTITY-SET FIX: the `node+agent` case is red
+        // until `put_statement`'s `key:record` arm runs persist's `node` rule
+        // (Verify refuses only a person+machine mix).
+        // (what, the set, does persist's `node` rule name it)
+        let cases: [(&str, [&str; 2], bool); 5] = [
+            ("node+agent", [it::NODE, it::AGENT], true),
+            ("node+user", [it::NODE, it::USER], true),
+            ("user+agent", [it::USER, it::AGENT], false),
+            ("accord_holder+node", [it::ACCORD_HOLDER, it::NODE], false),
+            ("accord_holder+agent", [it::ACCORD_HOLDER, it::AGENT], false),
         ];
-        for (n, (what, set, reason)) in cases.into_iter().enumerate() {
+        let refused_under_its_token = |err: &Error, node_rule: bool| match err {
+            // Verify's end rule refuses a person+machine set first
+            // (`key_record_mixed_roles`), `node+user` included.
+            Error::IdentitySetMixesPersonAndMachine { .. } => true,
+            // `node+agent` is no person+machine mix: only persist's `node`
+            // rule refuses it.
+            Error::NodeIdentityNotExclusive { .. } => node_rule,
+            _ => false,
+        };
+        for (n, (what, set, node_rule)) in cases.into_iter().enumerate() {
             let local = format!("i1870-local-{n}-{tag}");
-            let err = d
-                .put_public_key(SignedKeyRecord {
-                    record: ts::replicated_key_record(&local, &set, &local, &local, "n1"),
-                })
+            let err = e2::put_statement(d, &e2::key_record(&local, &set))
                 .await
                 .expect_err("I1870: a local mint of a mixed set is refused");
-            let want_node = reason == KeyRefusalReason::NodeIdentityFused;
             assert!(
-                if want_node {
-                    matches!(err, Error::NodeIdentityNotExclusive { .. })
-                } else {
-                    matches!(err, Error::IdentitySetMixesPersonAndMachine { .. })
-                },
+                refused_under_its_token(&err, node_rule),
                 "I1870 {what}: local mint refused under its token, got {err}"
             );
             assert!(
-                d.lookup_public_key(&local).await.unwrap().is_none(),
-                "I1870 {what}: nothing stored locally"
-            );
-            let remote = format!("i1870-remote-{n}-{tag}");
-            let out = d
-                .apply_replicated_key_record(SignedKeyRecord {
-                    record: ts::replicated_key_record(&remote, &set, &remote, &remote, "n1"),
-                })
-                .await
-                .unwrap_or_else(|e| panic!("I1870 {what}: the replicated refusal is typed: {e}"));
-            assert_eq!(
-                out,
-                ReplicatedKeyOutcome::Refused { reason },
-                "I1870 {what}: the replicated insert refuses (CC rc20 removed the carve-out)"
-            );
-            assert!(
-                d.lookup_public_key(&remote).await.unwrap().is_none(),
-                "I1870 {what}: nothing stored from the replicated door"
+                d.lookup_public_key(&e2::kid(&local))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "I1870 {what}: nothing projected locally"
             );
         }
         // The controls: a single role passes both doors.
         for (n, role) in [it::USER, it::AGENT, it::NODE].into_iter().enumerate() {
-            let local = format!("i1870-ok-local-{n}-{tag}");
-            d.put_public_key(SignedKeyRecord {
-                record: ts::replicated_key_record(&local, role, &local, &local, "n1"),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("I1870 control {role}: admitted locally: {e}"));
-            let remote = format!("i1870-ok-remote-{n}-{tag}");
-            assert_eq!(
-                d.apply_replicated_key_record(SignedKeyRecord {
-                    record: ts::replicated_key_record(&remote, role, &remote, &remote, "n1"),
-                })
-                .await
-                .unwrap(),
-                ReplicatedKeyOutcome::Inserted,
+            let local = e2::put_key(d, &format!("i1870-ok-local-{n}-{tag}"), &[role]).await;
+            assert!(
+                d.lookup_public_key(&local).await.unwrap().is_some(),
+                "I1870 control {role}: admitted locally"
+            );
+            let st = e2::key_record(&format!("i1870-ok-remote-{n}-{tag}"), &[role]);
+            let offered = e2::admit(&st).row_id.0;
+            assert!(
+                matches!(
+                    apply_replicated_statement(d, &st, &offered).await,
+                    Ok(ReplicatedStatementOutcome::Admitted(_))
+                ),
                 "I1870 control {role}: admitted from the replicated door"
             );
         }
@@ -778,19 +555,21 @@ mod runners {
                 }
                 case!(i1870_the_identity_set_rule_holds_on_every_door);
                 case!(i1871_substrate_persist_confers_nothing);
-                case!(i1887_key_record_conflicts_are_typed);
                 case!(i1883_a_self_declared_community_gets_nothing);
                 case!(i1884_conformance_is_the_record);
                 #[tokio::test]
                 async fn i1881_a_conformant_rooted_community_is_authorized() {
                     let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i1881_a_conformant_rooted_community_is_authorized(&d)
-                        .await
+                    super::super::bodies::i1881_a_conformant_rooted_community_is_authorized(
+                        &d,
+                        &suffix(),
+                    )
+                    .await;
                 }
                 #[tokio::test]
                 async fn i1882_an_agent_is_never_exempt() {
                     let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i1882_an_agent_is_never_exempt(&d).await
+                    super::super::bodies::i1882_an_agent_is_never_exempt(&d, &suffix()).await
                 }
                 #[tokio::test]
                 async fn i1872_i1873_xwing_matrix() {
@@ -817,91 +596,6 @@ mod runners {
 
     #[cfg(feature = "postgres")]
     dyn_runners!(postgres_dyn, async {
-        use crate::store::Backend as _;
-        let dsn = crate::test_pg::empty_dsn()?;
-        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        Some(b)
-    });
-
-    macro_rules! canonical_runners {
-        ($modname:ident, $fresh:expr) => {
-            mod $modname {
-                use super::suffix;
-                use crate::federation::FederationDirectory;
-                #[tokio::test]
-                async fn i1878_a_v61_canonical_resolves_and_a_label_is_inert() {
-                    let Some(b) = $fresh.await else { return };
-                    let tag = suffix();
-                    let inert = super::super::bodies::i1878_earlier_form_resolves(
-                        &b as &dyn FederationDirectory,
-                        &tag,
-                    )
-                    .await;
-                    let inert_id = inert.key_id.clone();
-                    b.seed_genesis_accord_holders(&[crate::federation::SignedKeyRecord {
-                        record: inert,
-                    }])
-                    .await
-                    .expect("plant the pre-gate row");
-                    super::super::bodies::i1878_the_label_is_inert(
-                        &b as &dyn FederationDirectory,
-                        &inert_id,
-                    )
-                    .await;
-                    let listed: Vec<String> = b
-                        .list_canonical_servers()
-                        .await
-                        .unwrap()
-                        .into_iter()
-                        .map(|r| r.key_id)
-                        .collect();
-                    let g = crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0]
-                        .record
-                        .key_id
-                        .clone();
-                    assert_eq!(
-                        listed,
-                        vec![g],
-                        "I1878: listed by conferral, the label inert"
-                    );
-                }
-                #[tokio::test]
-                async fn i1879_the_forward_form_resolves() {
-                    let Some(b) = $fresh.await else { return };
-                    let (g, one) = super::super::bodies::i1879_forward_form_resolves(
-                        &b as &dyn FederationDirectory,
-                        &suffix(),
-                    )
-                    .await;
-                    let listed: Vec<String> = b
-                        .list_canonical_servers()
-                        .await
-                        .unwrap()
-                        .into_iter()
-                        .map(|r| r.key_id)
-                        .collect();
-                    assert!(listed.contains(&g), "I1879: the forward form is listed");
-                    assert!(!listed.contains(&one), "I1879: a one-scrub node is not");
-                }
-            }
-        };
-    }
-
-    #[cfg(feature = "sqlite")]
-    canonical_runners!(sqlite_canonical, async {
-        use crate::store::Backend as _;
-        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        Some(b)
-    });
-
-    #[cfg(feature = "postgres")]
-    canonical_runners!(postgres_canonical, async {
         use crate::store::Backend as _;
         let dsn = crate::test_pg::empty_dsn()?;
         let b = crate::store::postgres::PostgresBackend::connect(&dsn)

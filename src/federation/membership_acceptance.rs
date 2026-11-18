@@ -29,8 +29,29 @@
 //! no longer open ([`RULE_OPEN_PROPOSAL_NOT_OPEN`]).
 
 use super::attestation_query::{AttestationQuery, FOLD_PAGE};
+use super::edition2::fold::{self, reason, Dep};
 use super::types::{attestation_tier, attestation_type, cohort_scope};
 use super::{Attestation, Error, FederationDirectory};
+
+/// v62.0.0 (wave GC6; CC 2.7.3) — **a fold condition is unmet**: hold the
+/// running fold attempt with `reason` ([`fold::hold`]) unless `e` is a
+/// storage failure (a backend error, an unsupported directory, a write race),
+/// which is never a reason to keep a row concluding nothing. Outside an
+/// attempt (the earlier-form JSON door) it is the plain refusal.
+pub(crate) fn hold_unless_storage(reason: &'static str, e: Error) -> Error {
+    match e {
+        Error::Backend(_) | Error::Unsupported { .. } | Error::Conflict(_) => e,
+        other => fold::hold(reason, other),
+    }
+}
+
+/// v62.0.0 (wave GC6) — the dependency of a row named by its attestation id,
+/// when the id is an edition-2 row id (64 hex): `row:<hex>`.
+pub(crate) fn row_dep(attestation_id: &str) -> Option<Dep> {
+    let bytes = hex::decode(attestation_id).ok()?;
+    let d: [u8; 32] = bytes.try_into().ok()?;
+    Some(Dep::Row(super::edition2::names::RowId(d)))
+}
 
 /// The inviter's offer.
 pub const PROPOSAL_DIMENSION: &str = "membership:proposal:v1";
@@ -63,6 +84,10 @@ pub const RULE_SUPERSEDE_CANNOT_ADD: &str = "membership_supersede_cannot_add";
 /// a group that is not an open `public` room, or not from its founder; or an
 /// acceptance of one whose room is no longer open at the growth.
 pub const RULE_OPEN_PROPOSAL_NOT_OPEN: &str = "membership_open_proposal_not_open";
+/// v62.0.0 (wave GC6; CC 2.7 rc21 X14) — a public room joiner's acceptance
+/// from a key with no live federation-scope owner binding: it does not count
+/// (held, never refused, on the edition-2 door).
+pub const RULE_JOINER_OWNER_UNBOUND: &str = "joiner_owner_unbound";
 
 /// The retryable rules: rows arrive out of order and persist holds no
 /// deferral queue, so the caller re-submits. v61 (CIRISPersist#1101): an
@@ -72,6 +97,7 @@ pub fn is_retryable_rule(rule: &str) -> bool {
     rule == RULE_ACCEPTANCE_UNRESOLVED
         || rule == RULE_PROPOSAL_UNRESOLVED
         || rule == super::admission::SERVE_SEAT_OWNER_UNANNOUNCED
+        || rule == RULE_JOINER_OWNER_UNBOUND
 }
 
 fn refuse(group: &str, member: &str, rule: &'static str) -> Error {
@@ -435,6 +461,14 @@ where
     }
     match kind {
         MembershipRow::Proposal => {
+            // v62.0.0 (wave GC6; CC 2.7.3) — every rule below reads the
+            // group's record and roster and the proposer's person binding:
+            // declared on every path (the not-held one too), so the proposal
+            // re-folds when the group, a seat or a binding arrives or is
+            // withdrawn, and the concluded set does not depend on which came
+            // first.
+            fold::reads(Dep::key(&group));
+            fold::reads(Dep::key(&row.attesting_key_id));
             if !group_is_held(dir, &row.cohort_scope, &group).await? {
                 return Ok(());
             }
@@ -444,7 +478,8 @@ where
                 &row.cohort_scope,
                 Some(&group),
             )
-            .await?;
+            .await
+            .map_err(|e| hold_unless_storage(reason::MEMBERSHIP_PROPOSER_OUT_OF_SCOPE, e))?;
             if is_standing_proposal(row) {
                 return check_standing_proposal(dir, row, &group).await;
             }
@@ -453,6 +488,14 @@ where
         MembershipRow::Acceptance | MembershipRow::Decline => {
             let member = row.attested_key_id.as_str();
             let proposal_id = env_str(row, "references_attestation_id").unwrap_or_default();
+            // v62.0.0 (wave GC6; CC 2.7.3) — the reply reads the proposal it
+            // names, the member's other replies, and the person bindings of
+            // its signer and the invitee: each arrival re-folds it.
+            fold::reads(Dep::key(member));
+            fold::reads(Dep::key(&row.attesting_key_id));
+            if let Some(d) = row_dep(proposal_id) {
+                fold::reads(d);
+            }
             let referenced = dir
                 .get_attestation(proposal_id)
                 .await?
@@ -467,27 +510,63 @@ where
             {
                 return check_officer_reply(dir, row, kind, &group, appointment).await;
             }
+            // A reply naming a proposal not held here WAITS for it (held,
+            // re-folded when it lands), never refused.
             let Some(p) = referenced.and_then(as_proposal) else {
-                return Err(refuse(&group, member, RULE_PROPOSAL_UNRESOLVED));
+                return Err(fold::hold(
+                    reason::MEMBERSHIP_PROPOSAL_UNRESOLVED,
+                    refuse(&group, member, RULE_PROPOSAL_UNRESOLVED),
+                ));
             };
             let signer =
                 super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
             // v55.0.0 (CIRISPersist#1053) — a standing proposal's invitee is
             // resolved at acceptance: whoever the reply is attested to.
             let invitee_key = p.invitee.as_deref().unwrap_or(member);
+            fold::reads(Dep::key(invitee_key));
             let invitee = super::admission::admission_identity_for_writer(dir, invitee_key).await?;
             if signer != invitee || !reply_matches(row, &p) {
-                return Err(refuse(&group, member, RULE_ACCEPTANCE_MISMATCH));
+                return Err(fold::hold(
+                    reason::MEMBERSHIP_ACCEPTANCE_MISMATCH,
+                    refuse(&group, member, RULE_ACCEPTANCE_MISMATCH),
+                ));
+            }
+            // v62.0.0 (wave GC6; CC 2.7 rc21 X14, CC 4.4.3.17 corrected:
+            // "That signature counts only from a key with a live
+            // federation-scope owner-binding") — a joiner's acceptance of a
+            // public room's STANDING proposal concludes nothing until the
+            // joiner's key holds one (`public_room::joiner_owner_bound`, a
+            // fold: held, re-folded when the binding lands or is withdrawn).
+            // Applied on the edition-2 door (a fold attempt); the earlier-form
+            // JSON door is shut in v62 and keeps its v61 answer until F0
+            // deletes it.
+            if fold::in_attempt()
+                && p.invitee.is_none()
+                && kind == MembershipRow::Acceptance
+                && !super::public_room::joiner_owner_bound(dir, &row.attesting_key_id).await?
+            {
+                return Err(fold::hold(
+                    reason::JOINER_OWNER_UNBOUND,
+                    refuse(&group, member, RULE_JOINER_OWNER_UNBOUND),
+                ));
             }
             let held = replies_of(dir, member).await?;
             let opposite = match kind {
                 MembershipRow::Acceptance => MembershipRow::Decline,
                 _ => MembershipRow::Acceptance,
             };
-            if replies_to(&held, &p.row.attestation_id).iter().any(|r| {
-                r.attestation_id != row.attestation_id && membership_row(r) == Some(opposite)
-            }) {
-                return Err(refuse(&group, member, RULE_REPLY_CONFLICT));
+            if opposite_reply_stands(
+                dir,
+                row,
+                &replies_to(&held, &p.row.attestation_id),
+                opposite,
+            )
+            .await?
+            {
+                return Err(fold::hold(
+                    reason::MEMBERSHIP_REPLY_CONFLICT,
+                    refuse(&group, member, RULE_REPLY_CONFLICT),
+                ));
             }
             Ok(())
         }
@@ -510,6 +589,8 @@ where
     F: FederationDirectory + ?Sized,
 {
     let member = row.attested_key_id.as_str();
+    // v62.0.0 (wave GC6) — the person bindings of the signer and the officer.
+    fold::reads(Dep::key(&appointment.attested_key_id));
     let signer =
         super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
     let officer =
@@ -520,20 +601,103 @@ where
         || names != Some(group)
         || env_str(row, "proposal_hash") != Some(appointment.original_content_hash.as_str())
     {
-        return Err(refuse(group, member, RULE_ACCEPTANCE_MISMATCH));
+        return Err(fold::hold(
+            reason::MEMBERSHIP_ACCEPTANCE_MISMATCH,
+            refuse(group, member, RULE_ACCEPTANCE_MISMATCH),
+        ));
     }
     let held = replies_of(dir, member).await?;
     let opposite = match kind {
         MembershipRow::Acceptance => MembershipRow::Decline,
         _ => MembershipRow::Acceptance,
     };
-    if replies_to(&held, &appointment.attestation_id)
-        .iter()
-        .any(|r| r.attestation_id != row.attestation_id && membership_row(r) == Some(opposite))
+    if opposite_reply_stands(
+        dir,
+        row,
+        &replies_to(&held, &appointment.attestation_id),
+        opposite,
+    )
+    .await?
     {
-        return Err(refuse(group, member, RULE_REPLY_CONFLICT));
+        return Err(fold::hold(
+            reason::MEMBERSHIP_REPLY_CONFLICT,
+            refuse(group, member, RULE_REPLY_CONFLICT),
+        ));
     }
     Ok(())
+}
+
+/// v62.0.0 (wave GC6; CC 2.7.2 "one voice orders its own rows by signed
+/// instant") — **does the held reply `r` conflict with `row`?** `r` is
+/// another reply of the opposite kind to the same proposal.
+///
+/// - Inside a fold attempt (the edition-2 door, a re-fold), only an opposite
+///   reply signed NO LATER than `row` conflicts: the earlier-signed reply
+///   stands and the later one is held, whichever arrived first. A later
+///   reply that concluded first is re-folded (it read `key:<member>`) and
+///   un-concluded when the earlier one lands. Equal instants keep the held
+///   (concluded) reply: an exact tie is the one order-dependent case.
+/// - Outside an attempt (the earlier-form JSON door) any opposite reply
+///   conflicts, as before.
+fn conflicts_with(row: &Attestation, r: &Attestation, opposite: MembershipRow) -> bool {
+    r.attestation_id != row.attestation_id
+        && membership_row(r) == Some(opposite)
+        && (!fold::in_attempt() || r.asserted_at <= row.asserted_at)
+}
+
+/// v62.0.0 (wave GC6) — **does an opposite reply stand against `row`?** One
+/// of `replies` [`conflicts_with`] it and, inside a fold attempt, has not
+/// been withdrawn by its own signer (by person). Each opposite reply is a
+/// declared read (`row:<its id>`), so its withdrawal (which touches that
+/// row) re-folds `row`: a reply held for a conflict concludes when the
+/// earlier opposite reply is withdrawn. Outside an attempt a withdrawn reply
+/// still conflicts, as before.
+async fn opposite_reply_stands<F>(
+    dir: &F,
+    row: &Attestation,
+    replies: &[&Attestation],
+    opposite: MembershipRow,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    for r in replies.iter().copied() {
+        if !conflicts_with(row, r, opposite) {
+            continue;
+        }
+        if !fold::in_attempt() {
+            return Ok(true);
+        }
+        if let Some(d) = row_dep(&r.attestation_id) {
+            fold::reads(d);
+        }
+        if !reply_withdrawn(dir, r).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// v62.0.0 (wave GC6) — has `reply`'s signer (by person) withdrawn it? The
+/// same rule [`proposal_withdrawn`] reads for a proposal.
+async fn reply_withdrawn<F>(dir: &F, reply: &Attestation) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let signer =
+        super::admission::admission_identity_for_writer(dir, &reply.attesting_key_id).await?;
+    for w in dir
+        .list_attestations_referencing(&reply.attestation_id)
+        .await?
+    {
+        if w.attestation_type == attestation_type::WITHDRAWS
+            && super::admission::admission_identity_for_writer(dir, &w.attesting_key_id).await?
+                == signer
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// v62.0.0 (wave V1b; CC 4.4.3.12 "two consents") — **has the officer
@@ -590,32 +754,41 @@ async fn check_standing_proposal<F>(dir: &F, row: &Attestation, group: &str) -> 
 where
     F: FederationDirectory + ?Sized,
 {
-    let open = membership_plane(&row.cohort_scope) == Some(cohort_scope::TargetPlane::Room)
-        && match dir.lookup_community(group).await? {
-            Some(c) => {
-                super::public_room::is_public_community(&c)
-                    && super::public_room::is_open_admission(&c)
-                    && {
-                        let proposer = super::admission::admission_identity_for_writer(
-                            dir,
-                            &row.attesting_key_id,
-                        )
-                        .await?;
-                        dir.active_community_members(group).await?.iter().any(|m| {
-                            m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER)
-                                && (m.key_id == proposer || m.key_id == row.attesting_key_id)
-                        })
-                    }
-            }
-            None => false,
-        };
-    if open {
-        Ok(())
-    } else {
-        Err(refuse(
+    // v62.0.0 (wave GC6) — the DOOR part, the row's own bytes: a standing
+    // proposal is placed at a room. Refused, nothing kept.
+    if membership_plane(&row.cohort_scope) != Some(cohort_scope::TargetPlane::Room) {
+        return Err(refuse(
             group,
             &row.attesting_key_id,
             RULE_OPEN_PROPOSAL_NOT_OPEN,
+        ));
+    }
+    // The FOLD part: the room's record, its founders, the proposer's
+    // binding. Held, re-folded when any of them changes.
+    fold::reads(Dep::key(group));
+    fold::reads(Dep::key(&row.attesting_key_id));
+    let open = match dir.lookup_community(group).await? {
+        Some(c) => {
+            super::public_room::is_public_community(&c)
+                && super::public_room::is_open_admission(&c)
+                && {
+                    let proposer =
+                        super::admission::admission_identity_for_writer(dir, &row.attesting_key_id)
+                            .await?;
+                    dir.active_community_members(group).await?.iter().any(|m| {
+                        m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER)
+                            && (m.key_id == proposer || m.key_id == row.attesting_key_id)
+                    })
+                }
+        }
+        None => false,
+    };
+    if open {
+        Ok(())
+    } else {
+        Err(fold::hold(
+            reason::MEMBERSHIP_OPEN_PROPOSAL_NOT_OPEN,
+            refuse(group, &row.attesting_key_id, RULE_OPEN_PROPOSAL_NOT_OPEN),
         ))
     }
 }
@@ -628,6 +801,10 @@ async fn check_proposer_under_founder_only<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC6) — the group's record (protocol), its founders and
+    // the proposer's binding: a fold (the reads are the proposal arm's).
+    fold::reads(Dep::key(group));
+    fold::reads(Dep::key(&row.attesting_key_id));
     let proposer =
         super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
     let founder = Some(super::admission::MEMBER_ROLE_FOUNDER);
@@ -655,9 +832,12 @@ where
     if ok {
         Ok(())
     } else {
-        Err(Error::InvalidArgument(format!(
-            "{PROPOSAL_DIMENSION}: under founder_only or open:self_admit only a founder of {group} proposes"
-        )))
+        Err(fold::hold(
+            reason::MEMBERSHIP_PROPOSER_NOT_FOUNDER,
+            Error::InvalidArgument(format!(
+                "{PROPOSAL_DIMENSION}: under founder_only or open:self_admit only a founder of {group} proposes"
+            )),
+        ))
     }
 }
 
@@ -713,6 +893,13 @@ pub async fn check_growth_accepted<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC6; CC 2.7.5 "a seat is two consents, whichever was
+    // signed first") — the growth reads the member's replies, the proposals
+    // they name, the room record and the member's owner binding: a fold.
+    // Every refusal below is held with its own token as the reason, so the
+    // growth concludes when the missing consent lands, in either order.
+    fold::reads(Dep::key(member));
+    fold::reads(Dep::key(group));
     // #972 — a node of an infrastructure community is seated by the founders'
     // quorum (the caller's standing check, already passed) and gives no
     // acceptance.
@@ -724,6 +911,10 @@ where
                 // binding at `cohort_scope: federation`, judged now. A later
                 // announcement satisfies it, so the refusal is retryable.
                 if !super::admission::serve_seat_owner_announced(dir, member).await? {
+                    // v62.0.0 (CC 2.7 rc21 rulings, "local acts, already
+                    // right": `serve_seat_owner_unannounced`, part_5 l.1091)
+                    // — a node's own act, kept as the retryable refusal it
+                    // was; NOT a fold hold.
                     return Err(refuse(
                         group,
                         member,
@@ -757,6 +948,9 @@ where
             continue;
         }
         let pid = env_str(a, "references_attestation_id").unwrap_or_default();
+        if let Some(d) = row_dep(pid) {
+            fold::reads(d);
+        }
         let Some(p) = dir
             .get_attestation(pid)
             .await?
@@ -811,11 +1005,10 @@ where
     {
         note(RULE_DECLINED);
     }
-    Err(refuse(
-        group,
-        member,
-        worst.unwrap_or(RULE_ACCEPTANCE_UNRESOLVED),
-    ))
+    // Every rule `worst` can name is a registered fold reason (the RULE_*
+    // tokens are `fold::reason`'s membership tokens, spelled the same).
+    let rule = worst.unwrap_or(RULE_ACCEPTANCE_UNRESOLVED);
+    Err(fold::hold(rule, refuse(group, member, rule)))
 }
 
 /// Is `group` (at `scope`) an open `public` room held here?
@@ -889,8 +1082,17 @@ pub fn check_supersede_adds_no_member(
     offered: &[&str],
     allowed: &std::collections::BTreeSet<String>,
 ) -> Result<(), Error> {
+    // v62.0.0 (wave GC6) — `allowed` is read from the held record and
+    // roster ([`supersede_allowed_members`] declares the group): a member
+    // they lack is a fold condition, re-folded when the seat lands.
     match offered.iter().find(|m| !allowed.contains(**m)) {
-        Some(m) => Err(refuse(group, m, RULE_SUPERSEDE_CANNOT_ADD)),
+        Some(m) => {
+            fold::reads(Dep::key(m));
+            Err(fold::hold(
+                reason::MEMBERSHIP_SUPERSEDE_CANNOT_ADD,
+                refuse(group, m, RULE_SUPERSEDE_CANNOT_ADD),
+            ))
+        }
         None => Ok(()),
     }
 }
@@ -905,6 +1107,7 @@ pub async fn supersede_allowed_members<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    fold::reads(Dep::key(group));
     let mut out = std::collections::BTreeSet::new();
     match cohort {
         super::Cohort::Family => {

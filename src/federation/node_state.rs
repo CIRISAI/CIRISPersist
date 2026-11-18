@@ -953,41 +953,11 @@ fn resolve_peer_quota_signal(directory: &dyn FederationDirectory) -> PeerQuotaSi
 #[cfg(test)]
 pub mod parity_test_support {
     use super::*;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::HardCaseFilter;
-    use crate::federation::tier_ingest::test_support::hybrid_pubkeys;
-    use crate::federation::types::{cohort_scope, identity_type, KeyRecord, SignedKeyRecord};
-
-    /// A registerable key with REAL deterministic hybrid pubkeys, so the
-    /// consent fixture's local-tier admission resolves the attester.
-    fn key(key_id: &str) -> KeyRecord {
-        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
-        KeyRecord {
-            key_id: key_id.into(),
-            pubkey_ed25519_base64: ed_pk,
-            pubkey_ml_dsa_65_base64: mldsa_pk,
-            algorithm: crate::federation::types::algorithm::HYBRID.into(),
-            identity_type: identity_type::PRIMITIVE.into(),
-            identity_ref: key_id.into(),
-            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": key_id }),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "c2lnbmF0dXJl".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-            attestation_evidence: Some(
-                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                ),
-            ),
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        }
-    }
+    use crate::federation::types::{
+        attestation_tier, attestation_type, cohort_scope, identity_type,
+    };
 
     async fn hard_case_count(dir: &dyn FederationDirectory) -> usize {
         dir.list_hard_case_events(HardCaseFilter::default())
@@ -1071,10 +1041,9 @@ pub mod parity_test_support {
     /// is a RED with its own token — materially different from the UNKNOWN
     /// above, and the two must not be reachable from one another by accident.
     pub async fn assert_declared_but_rootless(dir: &dyn FederationDirectory, tag: &str) {
-        let me = format!("{tag}-ns-self");
-        dir.put_public_key(SignedKeyRecord { record: key(&me) })
-            .await
-            .expect("register self key");
+        // v62 (E4): the self key goes live as an edition-2 `key:record`; the
+        // node names itself by the identity-ref.
+        let me = e2::put_key(dir, &format!("{tag}-ns-self"), &[identity_type::NODE]).await;
         let opts = NodeStateOptions {
             self_key_id: Some(&me),
             root_key_id: None,
@@ -1129,31 +1098,51 @@ pub mod parity_test_support {
     /// BOTH methods, because the emitting one is idempotent. The zero is what
     /// separates them.
     pub async fn assert_overdue_readonly_writes_nothing(dir: &dyn FederationDirectory, tag: &str) {
-        let subject = format!("{tag}-ns-subj");
-        let target = format!("{tag}-ns-tgt");
-        for k in [&subject, &target] {
-            dir.put_public_key(SignedKeyRecord { record: key(k) })
-                .await
-                .expect("register");
-        }
-        // v31.0.0 (CIRISPersist#598) — the signed instant; the local write
-        // door stamps the `asserted_at` column FROM it.
-        // v31.0.0 (CIRISPersist#656) — and the signed MIRROR: the transit door
-        // is a RECEIVING door, so the producer binds the typed columns and
-        // persist checks them. That is why the id is stated rather than minted.
-        dir.attestation_upsert_local(
-            crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
-                &format!("{tag}-ns-rev"),
-                &subject,
-                &target,
-                vec![subject.clone()],
-                cohort_scope::SELF,
-                chrono::Utc::now(),
-                serde_json::json!({ "id": format!("{tag}-ns-rev") }),
-            ),
+        // v62 (E4): both keys go live as edition-2 `key:record`s; the store
+        // names them by identity-ref.
+        let subject_seed = format!("{tag}-ns-subj");
+        let subject = e2::put_key(dir, &subject_seed, &[identity_type::USER]).await;
+        let target = e2::put_key(dir, &format!("{tag}-ns-tgt"), &[identity_type::USER]).await;
+        // v62 (E4): the local-tier consent revocation is the subject's
+        // edition-2 statement, put through the statement door at tier
+        // `local` (the earlier caller-signed transit input is an earlier-form
+        // object). Its id is computed by the node.
+        let asserted = crate::federation::admission::truncate_to_substrate_resolution(Utc::now());
+        let row = crate::federation::types::Attestation {
+            attestation_id: String::new(),
+            attesting_key_id: subject.clone(),
+            attested_key_id: target.clone(),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: asserted,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "consent:state:revoked:v1",
+                "score": 1.0,
+                "confidence": 0.9,
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: subject.clone(),
+            scrub_timestamp: asserted,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![subject.clone()],
+            withdraws_admission_rule: None,
+            cohort_scope: cohort_scope::SELF.to_owned(),
+            tier: attestation_tier::LOCAL.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        crate::federation::edition2::ingest::put_statement(
+            dir,
+            &e2::statement_of(&row, &subject_seed),
+            None,
+            attestation_tier::LOCAL,
         )
         .await
-        .expect("transit local-tier revocation admits");
+        .expect("the local-tier revocation statement admits");
 
         let revoked_at = dir
             .list_consent_revocations(None)
@@ -1264,7 +1253,7 @@ pub mod parity_test_support {
             .expect("revocations");
         let Some(action_id) = rows
             .iter()
-            .find(|r| r.attesting_key_id == format!("{tag}-ns-subj"))
+            .find(|r| r.attesting_key_id == e2::kid(&format!("{tag}-ns-subj")))
             .map(|r| r.attestation_id.clone())
         else {
             panic!("({tag}) the overdue fixture must have left a row to fold over");

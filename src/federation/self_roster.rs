@@ -727,8 +727,10 @@ pub enum Carried {
         asserted_at: DateTime<Utc>,
         /// The roster row it names by `refs.head` (CC 3.3.6.4: the
         /// thresholds count over the roster the proposal names,
-        /// [`roster_at_head`]).
+        /// [`roster_at_heads`]).
         head: super::edition2::names::RowId,
+        /// The other tips it merges, `refs.further_heads` (CC rc21).
+        further_heads: Vec<super::edition2::names::RowId>,
     },
     /// v62.0.0 (wave O1, S1b) — an eviction by an edition-2
     /// `identity:occurrence_revocation` (T2's family): its voices are held in
@@ -745,8 +747,10 @@ pub enum Carried {
         proposer: String,
         /// The revocation's `asserted_at`.
         asserted_at: DateTime<Utc>,
-        /// The roster row it names by `refs.head` ([`roster_at_head`]).
+        /// The roster row it names by `refs.head` ([`roster_at_heads`]).
         head: super::edition2::names::RowId,
+        /// The other tips it merges, `refs.further_heads` (CC rc21).
+        further_heads: Vec<super::edition2::names::RowId>,
     },
 }
 
@@ -1283,25 +1287,56 @@ where
     // ([`roster_at_head`]); the earlier form's over the roster now. One
     // decision per roster: the earlier form's, and one per named head.
     let mut decided: Vec<(String, TwoPathDecision)> = Vec::new();
-    let mut by_head: std::collections::BTreeMap<
-        Option<super::edition2::names::RowId>,
-        Vec<(&Proposal, &Answers)>,
-    > = std::collections::BTreeMap::new();
+    type ByHead<'a> = std::collections::BTreeMap<
+        Option<Vec<super::edition2::names::RowId>>,
+        Vec<(
+            &'a Proposal,
+            &'a Answers,
+            Option<super::edition2::names::RowId>,
+        )>,
+    >;
+    let mut by_head: ByHead<'_> = std::collections::BTreeMap::new();
     for (p, a, c) in &with_answers {
-        by_head.entry(head_of(c)).or_default().push((p, a));
+        let row = match c {
+            Carried::Edition2Occurrence { row_id, .. }
+            | Carried::Edition2Eviction { row_id, .. } => Some(*row_id),
+            Carried::Occurrence(_) | Carried::Withdraws { .. } => None,
+        };
+        by_head.entry(head_of(c)).or_default().push((p, a, row));
     }
-    for (head, refs) in by_head {
-        let at_head = match head {
-            None => roster.clone(),
-            Some(h) => match roster_at_head(dir, identity, &h).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // The named head is not held or not landed yet: these
-                    // proposals are not decided this round.
-                    tracing::debug!(head = %h.hex(), error = %e, "self-roster head not readable");
-                    continue;
+    for (head, entries) in by_head {
+        let (at_head, refs) = match head {
+            None => (
+                roster.clone(),
+                entries.iter().map(|(p, a, _)| (*p, *a)).collect::<Vec<_>>(),
+            ),
+            Some(heads) => {
+                let (at_head, reach) = match roster_reading(dir, identity, &heads).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // A named head is not held or not landed yet: these
+                        // proposals wait (the fold re-plans them when it
+                        // lands).
+                        tracing::debug!(error = %e, "self-roster heads not readable");
+                        continue;
+                    }
+                };
+                // CC 2.7.8: a row VOID for this reader is never decided
+                // (the gate settles it on its next fold).
+                let mut refs = Vec::new();
+                for (p, a, row) in &entries {
+                    let void = match row {
+                        Some(r) => void_for_reader(dir, identity, r, &heads, &reach)
+                            .await?
+                            .is_some(),
+                        None => false,
+                    };
+                    if !void {
+                        refs.push((*p, *a));
+                    }
                 }
-            },
+                (at_head, refs)
+            }
         };
         decided.extend(
             two_path::decide_all(&at_head, &refs, now, policy)
@@ -1465,8 +1500,13 @@ where
         } | TwoPathDecision::Cancelled { .. }
     );
     if !refused_for_good && dir.get_attestation(&id).await?.is_none() {
-        dir.put_attestation(super::SignedAttestation { attestation: row })
-            .await?;
+        // v62.0.0 (wave GC2; G0 v4.1) — a NESTED write for another row: run
+        // outside the caller's fold attempt, so the proposal row's own gates
+        // never mark the withdrawal that carried it.
+        super::edition2::fold::isolated(
+            dir.put_attestation(super::SignedAttestation { attestation: row }),
+        )
+        .await?;
     }
     if !refused_for_good {
         dir.note_self_roster_proposal(&id, &identity, now).await?;
@@ -1544,15 +1584,37 @@ where
     D: FederationDirectory + ?Sized,
 {
     let identity = carried.identity_key_id().to_owned();
-    let (Carried::Edition2Occurrence { row_id, head, .. }
-    | Carried::Edition2Eviction { row_id, head, .. }) = &carried
+    let (Carried::Edition2Occurrence { row_id, .. } | Carried::Edition2Eviction { row_id, .. }) =
+        &carried
     else {
         return Err(Error::InvalidArgument(
             "gate_edition2: not an edition-2 proposal".into(),
         ));
     };
-    let (id, head) = (row_id.hex(), *head);
+    let id = row_id.hex();
+    let heads = head_of(&carried).unwrap_or_default();
     let now = roster_clock();
+    // A settled landing or voiding is final for this reader (a re-fold that
+    // re-runs a concluded row's door must not re-read it against its own
+    // successors).
+    let settled = match dir.edition2_roster_proposal(&id).await {
+        Ok(r) => r.and_then(|r| r.outcome),
+        Err(Error::Unsupported { .. }) => None,
+        Err(e) => return Err(e),
+    };
+    match settled.as_deref() {
+        Some(o)
+            if o == landed_outcome(LandingPath::Quorum)
+                || o == landed_outcome(LandingPath::Lone) =>
+        {
+            return Ok(true);
+        }
+        Some(VOID_OUTCOME) => {
+            super::edition2::fold::note(REASON_ROSTER_HEAD_SUPERSEDED);
+            return Ok(false);
+        }
+        _ => {}
+    }
     // Every landing is recorded (a receipt settled `lands_*`): the next
     // roster row names it as its head, and the genesis key's eviction is
     // read from it.
@@ -1560,8 +1622,33 @@ where
         record_landed(dir, &id, &identity, LandingPath::Quorum, now).await?;
         return Ok(true);
     }
-    // CC 3.3.6.4 (the CC 2.7 ruling): counted over the roster the row names.
-    let roster = roster_at_head(dir, &identity, &head).await?;
+    // CC 3.3.6.4 (the CC 2.7 ruling): counted over the roster the row names
+    // (its head and further heads). A named row this node does not hold, or
+    // that has not landed here, makes the proposal WAIT (CC 2.7.3: a row
+    // waits for what it names): its receipt is noted and it stays open; the
+    // fold re-plans it when the row lands (`roster_at_heads` declared the
+    // reads).
+    let (roster, reach) = match roster_reading(dir, &identity, &heads).await {
+        Ok(r) => r,
+        Err(Error::AttesterKeyUnknown { .. }) => {
+            dir.note_edition2_roster_proposal(&id, &identity, now)
+                .await?;
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    // CC 2.7.8: a stale sibling is VOID for this reader — held (its
+    // statements kept), concluding nothing, under a fold reason; never a
+    // door refusal. Settled so it is not re-planned.
+    if let Some(detail) = void_for_reader(dir, &identity, row_id, &heads, &reach).await? {
+        tracing::debug!(%detail, "self-roster row void for this reader");
+        super::edition2::fold::note(REASON_ROSTER_HEAD_SUPERSEDED);
+        dir.note_edition2_roster_proposal(&id, &identity, now)
+            .await?;
+        dir.settle_edition2_roster_proposal(&id, VOID_OUTCOME, now)
+            .await?;
+        return Ok(false);
+    }
     if !is_roster_change(dir, &carried, &roster).await? {
         record_landed(dir, &id, &identity, LandingPath::Quorum, now).await?;
         return Ok(true);
@@ -1620,134 +1707,319 @@ where
         .await
 }
 
-/// The head an edition-2 proposal names; `None` for the earlier form's.
-fn head_of(c: &Carried) -> Option<super::edition2::names::RowId> {
+/// The heads an edition-2 proposal names (`refs.head`, then
+/// `refs.further_heads` in order); `None` for the earlier form's.
+fn head_of(c: &Carried) -> Option<Vec<super::edition2::names::RowId>> {
     match c {
-        Carried::Edition2Occurrence { head, .. } | Carried::Edition2Eviction { head, .. } => {
-            Some(*head)
+        Carried::Edition2Occurrence {
+            head,
+            further_heads,
+            ..
+        }
+        | Carried::Edition2Eviction {
+            head,
+            further_heads,
+            ..
+        } => {
+            let mut v = vec![*head];
+            v.extend(further_heads.iter().copied());
+            Some(v)
         }
         Carried::Occurrence(_) | Carried::Withdraws { .. } => None,
     }
 }
 
-/// How far [`roster_at_head`] follows a chain of roster rows.
+/// How many roster rows [`roster_at_heads`] loads for one reading.
 const MAX_ROSTER_CHAIN: usize = 4096;
 
-/// v62.0.0 (wave O1; CC 3.3.6.4, the CC 2.7 ruling) — **the self's roster
-/// at the head a row names**, read from content alone (the same on every
-/// node that holds the chain):
-///
-/// - the chain is followed by `refs.head` from `head` back to its root, the
-///   genesis key's own `key:record` row (every self's first roster row names
-///   it);
-/// - each step is a LANDED (this node's receipt settled `lands_*`) edition-2
-///   `identity:occurrence` bind of `identity` (a `user`-role key joins) or
-///   `identity:occurrence_revocation` of it (the key leaves; the genesis
-///   key too, when another key evicted it);
-/// - folded forward from `{genesis}`; a member whose occurrence has ended by
-///   now (the half-open window) is not counted (as [`roster_now`]).
-///
-/// A head superseded by a later roster row is read as it names (the
-/// kernel's superseded-head rule: the reader decides, the door does not
-/// refuse).
-///
-/// # Errors
-/// The retryable unknown signer naming `row:<hex>` while a row of the chain
-/// is not held or has not landed here (the row waits); a malformed chain
-/// (`edition2_payload_invalid`: a row of another self or family, no
-/// `refs.head`, a root that is not the genesis key's record); directory
-/// failures.
-pub async fn roster_at_head<D>(
+/// One landed roster row of a self, as the fold reads it.
+#[derive(Clone, Debug)]
+enum RosterStep {
+    /// The genesis key's own `key:record` row: the root.
+    Root,
+    /// A landed bind adding this key.
+    Add(String),
+    /// A landed eviction of this key (or a VOID sibling's, which a merge
+    /// names: an eviction on any merged branch stands); `effective` is false
+    /// for the genesis key's own revocation of its pair (it evicts nothing).
+    Evict(String, bool),
+    /// A VOID sibling's addition: read for its parents only.
+    Void,
+}
+
+/// v62.0.0 (wave O1; CC 2.7.8) — the settled outcome of a roster row that
+/// is VOID for this reader: a sibling of a head this node has acknowledged
+/// a successor of, or a row whose heads do not reach every tip this node
+/// has acknowledged. Kept (its statements are held), concluding nothing.
+pub const VOID_OUTCOME: &str = "void_superseded";
+
+/// v62.0.0 (wave O1; CC 2.7.8) — the fold reason a VOID roster row is held
+/// under (G0's `fold::note`; to append to `fold::reason::ALL`).
+pub const REASON_ROSTER_HEAD_SUPERSEDED: &str = "roster_head_superseded";
+
+/// The landed roster rows a reading loaded, with the rows each names.
+type RosterGraph = std::collections::BTreeMap<
+    super::edition2::names::RowId,
+    (RosterStep, Vec<super::edition2::names::RowId>),
+>;
+
+/// Why a roster row could not be read.
+enum RosterLoad {
+    /// Not held, or not landed here: the reading waits on it.
+    Wait(super::edition2::names::RowId),
+    /// A malformed chain.
+    Bad(Error),
+}
+
+/// Load `row` as a landed roster row of `identity` (declaring the read).
+async fn roster_step<D>(
     dir: &D,
     identity: &str,
-    head: &super::edition2::names::RowId,
-) -> Result<BTreeSet<String>, Error>
+    genesis: &ciris_verify_core::edition2::Digest32,
+    row: &super::edition2::names::RowId,
+) -> Result<Result<(RosterStep, Vec<super::edition2::names::RowId>), RosterLoad>, Error>
 where
     D: FederationDirectory + ?Sized,
 {
     use super::edition2::liveness::{recorded_kid, statement_parts};
-    use super::edition2::occurrence::{OCCURRENCE_FAMILY, OCCURRENCE_REVOCATION_FAMILY};
     use ciris_verify_core::cde::Value;
+    super::edition2::fold::reads(super::edition2::fold::Dep::Row(*row));
     let bad = |why: String| {
-        Error::malformed_row(
+        RosterLoad::Bad(Error::malformed_row(
             "self_roster",
             super::malformed_row::EDITION2_PAYLOAD_INVALID,
-            format!("the roster chain of {identity}: {why}"),
-        )
+            format!("the roster of {identity}: {why}"),
+        ))
     };
+    let voices = dir.edition2_voices(row).await?;
+    let Some((protected, _)) = voices.first().and_then(|v| statement_parts(v)) else {
+        return Ok(Err(RosterLoad::Wait(*row)));
+    };
+    if protected.get_int(-70002).and_then(Value::as_text)
+        == Some(ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY)
+    {
+        if recorded_kid(&voices[0]) != Some(*genesis) {
+            return Ok(Err(bad(format!(
+                "{} is not the genesis key's own key:record",
+                row.hex()
+            ))));
+        }
+        return Ok(Ok((RosterStep::Root, Vec::new())));
+    }
+    let Some(carried) = super::edition2::occurrence::carried_of_bind(dir, &row.hex()).await? else {
+        return Ok(Err(bad(format!("{} is not a roster row", row.hex()))));
+    };
+    if carried.identity_key_id() != identity {
+        return Ok(Err(bad(format!("{} is another self's row", row.hex()))));
+    }
     let landed = [
         landed_outcome(LandingPath::Quorum),
         landed_outcome(LandingPath::Lone),
     ];
-    let genesis = super::edition2::ingest::kid_of_identity_ref(identity)
-        .ok_or_else(|| bad("the self is not an identity-ref".into()))?;
-    let mut steps: Vec<(bool, String)> = Vec::new();
-    let mut cur = *head;
-    let mut rooted = false;
-    for _ in 0..MAX_ROSTER_CHAIN {
-        let voices = dir.edition2_voices(&cur).await?;
-        let Some((protected, payload)) = voices.first().and_then(|v| statement_parts(v)) else {
+    let receipt = match dir.edition2_roster_proposal(&row.hex()).await {
+        Ok(r) => r,
+        Err(Error::Unsupported { .. }) => None,
+        Err(e) => return Err(e),
+    };
+    let outcome = receipt.and_then(|r| r.outcome);
+    let void = outcome.as_deref() == Some(VOID_OUTCOME);
+    if !void && !outcome.as_deref().is_some_and(|o| landed.contains(&o)) {
+        return Ok(Err(RosterLoad::Wait(*row)));
+    }
+    let target = carried.target_key_id().to_owned();
+    let (step, head, further) = match &carried {
+        // A VOID sibling (CC 2.7.8) a merge names: its parents are read,
+        // its addition is not (it never landed here).
+        Carried::Edition2Occurrence {
+            head,
+            further_heads,
+            ..
+        } if void => (RosterStep::Void, *head, further_heads.clone()),
+        Carried::Edition2Occurrence {
+            head,
+            further_heads,
+            ..
+        } => (RosterStep::Add(target), *head, further_heads.clone()),
+        Carried::Edition2Eviction {
+            head,
+            further_heads,
+            proposer,
+            ..
+        } => {
+            let effective = !(target == identity && proposer == identity);
+            (
+                RosterStep::Evict(target, effective),
+                *head,
+                further_heads.clone(),
+            )
+        }
+        Carried::Occurrence(_) | Carried::Withdraws { .. } => {
+            return Ok(Err(bad(format!("{} is not an edition-2 row", row.hex()))));
+        }
+    };
+    let mut parents = vec![head];
+    parents.extend(further);
+    Ok(Ok((step, parents)))
+}
+
+/// Load every row reachable from `from` into `graph`. `Err` carries the
+/// first row that waits, or a malformed chain.
+async fn load_roster_graph<D>(
+    dir: &D,
+    identity: &str,
+    genesis: &ciris_verify_core::edition2::Digest32,
+    from: &[super::edition2::names::RowId],
+    graph: &mut RosterGraph,
+) -> Result<Result<(), RosterLoad>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut work: Vec<super::edition2::names::RowId> = from.to_vec();
+    while let Some(row) = work.pop() {
+        if graph.contains_key(&row) {
+            continue;
+        }
+        if graph.len() >= MAX_ROSTER_CHAIN {
+            return Ok(Err(RosterLoad::Bad(Error::malformed_row(
+                "self_roster",
+                super::malformed_row::EDITION2_PAYLOAD_INVALID,
+                format!("the roster of {identity} is beyond the chain bound"),
+            ))));
+        }
+        match roster_step(dir, identity, genesis, &row).await? {
+            Ok((step, parents)) => {
+                work.extend(parents.iter().copied());
+                graph.insert(row, (step, parents));
+            }
+            Err(e) => return Ok(Err(e)),
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// Every row `row` reaches through the rows it names (itself included).
+fn ancestors(
+    graph: &RosterGraph,
+    row: &super::edition2::names::RowId,
+) -> BTreeSet<super::edition2::names::RowId> {
+    let mut seen = BTreeSet::new();
+    let mut work = vec![*row];
+    while let Some(r) = work.pop() {
+        if !seen.insert(r) {
+            continue;
+        }
+        if let Some((_, parents)) = graph.get(&r) {
+            work.extend(parents.iter().copied());
+        }
+    }
+    seen
+}
+
+/// v62.0.0 (wave O1; CC 3.3.6.4, the CC 2.7 ruling, CC rc21's
+/// `refs.further_heads`) — **the self's roster at the heads a row names**
+/// (`refs.head` and every `refs.further_heads`), read from content (the same
+/// on every node that holds the rows), order-independent:
+///
+/// - every landed roster row reachable from the named heads (by `refs.head`
+///   and `refs.further_heads`) back to the genesis key's own `key:record`
+///   row, the root; each a LANDED (this node's receipt settled `lands_*`)
+///   `identity:occurrence` bind or `identity:occurrence_revocation` of the
+///   self;
+/// - a `user`-role key is a member when some bind of it is reachable that
+///   EVERY reachable eviction of it is an ancestor of. So an eviction on any
+///   merged branch stands (a VOID sibling's too, CC 2.7.8: its addition is
+///   not read): merging never revives an evicted key, and a re-bind made
+///   after the eviction restores it;
+/// - the genesis key is a member unless an eviction of it by another key is
+///   reachable or held (never re-established);
+/// - a member whose occurrence has ended by now (the half-open window) is
+///   not counted (as [`roster_now`]).
+///
+/// Every row read is declared to the fold (`fold::reads`), with the self
+/// (`Dep::Key`), so a waiting reading re-folds when what it waits on lands.
+///
+/// # Errors
+/// The retryable unknown signer naming `row:<hex>` while a named or
+/// reachable row is not held or has not landed here (the row naming it
+/// waits); `edition2_payload_invalid` for a malformed chain; directory
+/// failures.
+pub async fn roster_at_heads<D>(
+    dir: &D,
+    identity: &str,
+    heads: &[super::edition2::names::RowId],
+) -> Result<BTreeSet<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(roster_reading(dir, identity, heads).await?.0)
+}
+
+/// [`roster_at_heads`], with every roster row the named heads reach.
+async fn roster_reading<D>(
+    dir: &D,
+    identity: &str,
+    heads: &[super::edition2::names::RowId],
+) -> Result<(BTreeSet<String>, BTreeSet<super::edition2::names::RowId>), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(identity));
+    let genesis = super::edition2::ingest::kid_of_identity_ref(identity).ok_or_else(|| {
+        Error::malformed_row(
+            "self_roster",
+            super::malformed_row::EDITION2_PAYLOAD_INVALID,
+            format!("{identity} is not an identity-ref"),
+        )
+    })?;
+    let mut graph = RosterGraph::new();
+    match load_roster_graph(dir, identity, &genesis, heads, &mut graph).await? {
+        Ok(()) => {}
+        Err(RosterLoad::Wait(r)) => {
             return Err(Error::unknown_signer(
-                &format!("row:{}", cur.hex()),
+                &format!("row:{}", r.hex()),
                 "self_roster",
             ));
-        };
-        let family = protected
-            .get_int(-70002)
-            .and_then(Value::as_text)
-            .unwrap_or_default()
-            .to_owned();
-        if family == ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY {
-            if recorded_kid(&voices[0]) != Some(genesis) {
-                return Err(bad(format!(
-                    "its root {} is not the genesis key's own key:record",
-                    cur.hex()
-                )));
-            }
-            rooted = true;
-            break;
         }
-        let add = family == OCCURRENCE_FAMILY;
-        if !add && family != OCCURRENCE_REVOCATION_FAMILY {
-            return Err(bad(format!("{} is a {family} row", cur.hex())));
-        }
-        let text = |m: &str| payload.get_text(m).and_then(Value::as_text);
-        if text("identity_key_id") != Some(identity) {
-            return Err(bad(format!("{} is another self's row", cur.hex())));
-        }
-        let receipt = match dir.edition2_roster_proposal(&cur.hex()).await {
-            Ok(r) => r,
-            Err(Error::Unsupported { .. }) => None,
-            Err(e) => return Err(e),
-        };
-        if !receipt.is_some_and(|r| r.outcome.as_deref().is_some_and(|o| landed.contains(&o))) {
-            return Err(Error::unknown_signer(
-                &format!("row:{}", cur.hex()),
-                "self_roster",
-            ));
-        }
-        let Some(target) = text("occurrence_key_id") else {
-            return Err(bad(format!("{} names no occurrence", cur.hex())));
-        };
-        steps.push((add, target.to_owned()));
-        let names = super::edition2::names::names_of(&payload)
-            .map_err(|e| bad(format!("{}: refs: {e:?}", cur.hex())))?;
-        let Some(next) = super::edition2::names::single(&names, "head") else {
-            return Err(bad(format!("{} names no refs.head", cur.hex())));
-        };
-        cur = next;
+        Err(RosterLoad::Bad(e)) => return Err(e),
     }
-    if !rooted {
-        return Err(bad("longer than the chain bound".into()));
+    let mut reach: BTreeSet<super::edition2::names::RowId> = BTreeSet::new();
+    for h in heads {
+        reach.extend(ancestors(&graph, h));
     }
-    let mut roster = BTreeSet::from([identity.to_owned()]);
-    for (add, target) in steps.into_iter().rev() {
-        if add {
-            if target != identity && is_user_key(dir, &target).await? {
-                roster.insert(target);
-            }
-        } else {
-            roster.remove(&target);
+    let evictions: Vec<(&super::edition2::names::RowId, &String, bool)> = reach
+        .iter()
+        .filter_map(|r| match graph.get(r) {
+            Some((RosterStep::Evict(k, effective), _)) => Some((r, k, *effective)),
+            _ => None,
+        })
+        .collect();
+    let mut roster = BTreeSet::new();
+    if !evictions
+        .iter()
+        .any(|(_, k, effective)| *effective && k.as_str() == identity)
+    {
+        roster.insert(identity.to_owned());
+    }
+    let mut adds: std::collections::BTreeMap<&String, Vec<&super::edition2::names::RowId>> =
+        std::collections::BTreeMap::new();
+    for r in &reach {
+        if let Some((RosterStep::Add(k), _)) = graph.get(r) {
+            adds.entry(k).or_default().push(r);
+        }
+    }
+    for (k, rows) in adds {
+        if k.as_str() == identity || !is_user_key(dir, k).await? {
+            continue;
+        }
+        let member = rows.iter().any(|a| {
+            let anc = ancestors(&graph, a);
+            evictions
+                .iter()
+                .filter(|(_, ek, _)| *ek == k)
+                .all(|(e, _, _)| anc.contains(*e))
+        });
+        if member {
+            roster.insert(k.clone());
         }
     }
     // The end rule (I3043): an occurrence past its `valid_until` is not a
@@ -1776,7 +2048,115 @@ where
             kept.insert(k);
         }
     }
-    Ok(kept)
+    Ok((kept, reach))
+}
+
+/// v62.0.0 (wave O1; CC 2.7.8) — **THE stale-head rule**, the one place it
+/// lives. A roster row `row` of `identity` naming `heads` (whose readable
+/// chain reaches `reach`) is VOID for this reader when:
+/// - this node has ACKNOWLEDGED (a landed receipt) another roster row that
+///   names one of `heads`: `row` is a sibling of a head with an
+///   acknowledged successor; or
+/// - some tip this node has acknowledged is not in `reach`: a merge must
+///   name every acknowledged tip, and a change never counts over a head
+///   whose successor is acknowledged.
+///
+/// A reader that has acknowledged neither reads `row` as a tip. Order-
+/// independent for a reader: acknowledgements are this node's own landings,
+/// never "a later row this node holds". `Some(detail)` when void.
+///
+/// # Errors
+/// Directory read failures.
+async fn void_for_reader<D>(
+    dir: &D,
+    identity: &str,
+    row: &super::edition2::names::RowId,
+    heads: &[super::edition2::names::RowId],
+    reach: &BTreeSet<super::edition2::names::RowId>,
+) -> Result<Option<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let settled = match dir.list_settled_edition2_roster_proposals(identity).await {
+        Ok(r) => r,
+        Err(Error::Unsupported { .. }) => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let landed = [
+        landed_outcome(LandingPath::Quorum),
+        landed_outcome(LandingPath::Lone),
+    ];
+    for r in settled {
+        if r.proposal_id == row.hex() || !r.outcome.as_deref().is_some_and(|o| landed.contains(&o))
+        {
+            continue;
+        }
+        let Some(c) = super::edition2::occurrence::carried_of_bind(dir, &r.proposal_id).await?
+        else {
+            continue;
+        };
+        if let Some(named) = head_of(&c) {
+            if let Some(h) = named.iter().find(|h| heads.contains(h)) {
+                return Ok(Some(format!(
+                    "{} names {}, whose successor {} this node acknowledged",
+                    row.hex(),
+                    h.hex(),
+                    r.proposal_id
+                )));
+            }
+        }
+    }
+    if let Some((tip, further)) =
+        super::edition2::occurrence::current_roster_heads(dir, identity).await?
+    {
+        if let Some(t) = std::iter::once(tip)
+            .chain(further)
+            .find(|t| !reach.contains(t))
+        {
+            return Ok(Some(format!(
+                "{} does not reach the acknowledged tip {}",
+                row.hex(),
+                t.hex()
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// [`roster_at_heads`] at one named head.
+///
+/// # Errors
+/// As [`roster_at_heads`].
+pub async fn roster_at_head<D>(
+    dir: &D,
+    identity: &str,
+    head: &super::edition2::names::RowId,
+) -> Result<BTreeSet<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    roster_at_heads(dir, identity, std::slice::from_ref(head)).await
+}
+
+/// v62.0.0 (wave O1; the CC 2.7 ruling) — **the head a new roster row of
+/// `identity` names** (`refs.head`): this node's latest landed roster tip,
+/// else the genesis key's own `key:record` row
+/// ([`super::edition2::occurrence::current_roster_heads`] gives every tip,
+/// for `refs.further_heads`).
+///
+/// # Errors
+/// The retryable unknown signer naming the self when neither is held;
+/// directory failures.
+pub async fn current_head<D>(
+    dir: &D,
+    identity: &str,
+) -> Result<super::edition2::names::RowId, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    super::edition2::occurrence::current_roster_head(dir, identity)
+        .await?
+        .ok_or_else(|| Error::unknown_signer(identity, "self_roster"))
 }
 
 /// v62.0.0 (wave O1, S1) — this node's open edition-2 receipts; none from a

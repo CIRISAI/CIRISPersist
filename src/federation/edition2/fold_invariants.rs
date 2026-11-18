@@ -31,6 +31,19 @@
 //! - **I3559** (v4) the steward-binding exemplar concludes when a witness
 //!   proves the person a minor, and un-concludes when a later witness proves
 //!   an adult.
+//! - **I3561** (v5) which declared reads are outside the row's named past
+//!   (`fold::named_past_violations`).
+//! - **I3565** (v5.1) the enforced FINAL-plane rule: a hold that declares
+//!   no input beyond its own row is untriggered (it panics in test builds);
+//!   a count, a named row, or a declared input is a trigger.
+//! - **I3566** (v5.1) a group row held on a missing steward binding (a
+//!   DECLARED, monotone read) concludes when the binding arrives, in either
+//!   order.
+//! - **I3562–I3564** (v5) one witness per FINAL plane (group, rebind,
+//!   typed_final): the same rows in two arrival orders, on two fresh stores,
+//!   each CONCLUDE, with one verdict.
+//! - **I3560** (v4) kept-but-not-served bytes (`fold::bytes_servable`,
+//!   `hold_bytes`, `release_bytes`).
 //! - **I3557** (v2) an ambiguous owner (`AmbiguousNodeOwner`) holds the
 //!   row that read it, reason `owner_ambiguous`, and the withdrawal of one
 //!   binding concludes it by re-fold.
@@ -60,8 +73,43 @@ fn i3550_reason_tokens_and_read_keys_are_pinned() {
             "refold_refused",
             "refolding",
             "owner_ambiguous",
+            "link_unheld",
+            "group_dissolved",
+            "self_roster_not_landed",
+            "signer_not_acting_for",
+            "bytes_held_back",
+            "withdraws_not_admitted",
+            "asserted_at_stale",
+            "composer_family_mismatch",
         ],
-        "I3550: the reason tokens are appended, never reordered"
+        "I3550: the core reason tokens are appended, never reordered"
+    );
+    // v4 — the registry: every slice is internally unique, every token is
+    // a snake_case ASCII word, and the core is the first slice.
+    assert_eq!(reason::SLICES[0], reason::ALL, "I3550: the core leads");
+    for slice in reason::SLICES {
+        let set: BTreeSet<&str> = slice.iter().copied().collect();
+        assert_eq!(
+            set.len(),
+            slice.len(),
+            "I3550: a slice repeats a token: {slice:?}"
+        );
+        for t in *slice {
+            assert!(
+                !t.is_empty()
+                    && t.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "I3550: {t:?} is not a snake_case token"
+            );
+        }
+    }
+    assert!(
+        reason::ALL.iter().all(|t| reason::is_registered(t)),
+        "I3550: the core is registered"
+    );
+    assert!(
+        reason::registry().len() >= reason::ALL.len(),
+        "I3550: the registry is the union"
     );
     assert_eq!(
         Dep::Row(rid(0xab)).read_key(),
@@ -293,13 +341,33 @@ fn id_of(row: &Attestation) -> RowId {
     super::voices::carried_row_id(row).expect("G0: the row carries its statement")
 }
 
-/// The owner binding of `owner` over `node` (the owner's statement).
+/// The owner binding of `owner` over `node` (the owner's statement),
+/// asserted a minute ago.
+///
+/// fix1: built here rather than from `test_support::owner_binding_attestation`.
+/// That fixture is asserted at the FIXED instant 2026-05-01, but E0 gives a
+/// node key a default window that opens `NODE_DEFAULT_BACK_DAYS` (180) days
+/// before today. The node, the binding's second party, was therefore not
+/// live at the binding's instant, and the door waited on it
+/// (`AttesterKeyUnknown`).
 fn owner_binding(owner: &str, node: &str) -> Attestation {
-    crate::federation::tier_ingest::test_support::owner_binding_attestation(
+    use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
+    let mut a = crate::federation::genesis::ordinary_scores_row(
         &uuid::Uuid::new_v4().to_string(),
-        owner,
-        node,
-    )
+        &e2::kid(owner),
+    );
+    a.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+    a.attested_key_id = e2::kid(node);
+    a.asserted_at = crate::host::clock::now() - chrono::Duration::minutes(1);
+    a.scrub_timestamp = a.asserted_at;
+    a.attestation_envelope = serde_json::json!({
+        "id": a.attestation_id,
+        "kind": "delegates_to",
+        "dimension": owner_binding::DIMENSION,
+        "delegation_purpose": owner_binding::PURPOSE,
+        "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+    });
+    e2::row_of(&a, owner)
 }
 
 /// The owner's `config:*` report about its node, as the owner's statement.
@@ -740,6 +808,437 @@ pub(crate) async fn steward_conclude_unconclude_body(d: &dyn FederationDirectory
     );
 }
 
+/// I3560 (v4): kept-but-not-served bytes. A byte executor's row held for
+/// a blob makes its bytes unservable; the row's release makes them
+/// servable; bytes no folded row names are servable (an earlier-form blob);
+/// a concluded claim in the slot outweighs a held one.
+pub(crate) async fn bytes_kept_not_served_body(d: &dyn FederationDirectory) {
+    let sha = [0x5a; 32];
+    let other = [0x5b; 32];
+    assert!(
+        fold::bytes_servable(d, &other).await.unwrap(),
+        "I3560: bytes no folded row names are servable"
+    );
+    fold::hold_bytes(
+        d,
+        rid(0x31),
+        &sha,
+        reason::BYTES_HELD_BACK,
+        "the chunk's stream is not held",
+        BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !fold::bytes_servable(d, &sha).await.unwrap(),
+        "I3560: held back: not served"
+    );
+    assert_eq!(
+        fold::why_held(d, &rid(0x31))
+            .await
+            .unwrap()
+            .map(|h| (h.reason, h.plane)),
+        Some((
+            reason::BYTES_HELD_BACK.to_owned(),
+            super::fold::plane::BYTES.to_owned()
+        )),
+        "I3560: the reason and the bytes plane"
+    );
+    // A second carrying row concludes: served, though the first is held.
+    fold::release_bytes(d, rid(0x32), &sha, BTreeSet::new())
+        .await
+        .unwrap();
+    assert!(
+        fold::bytes_servable(d, &sha).await.unwrap(),
+        "I3560: one concluded carrier serves the bytes"
+    );
+    assert!(
+        fold::refold_rows(d, [rid(0x31)].into_iter().collect())
+            .await
+            .unwrap()
+            .still_held
+            .contains(&rid(0x31)),
+        "I3560: the fold never re-runs a byte row; its door releases it"
+    );
+}
+
+/// I3561 (v5): the named-past rule. A read of the row itself or a row its
+/// `refs` name is allowed; any other read (a key, a family, an unnamed row)
+/// is reported.
+#[test]
+fn i3561_named_past_violations() {
+    let st = super::fixture_switch::key_record("g0-np", &["user"]);
+    let a = e2::admit(&st);
+    let mut reads: BTreeSet<String> = [Dep::Row(a.row_id).read_key()].into_iter().collect();
+    for n in &a.names {
+        reads.insert(Dep::Row(n.row).read_key());
+    }
+    assert!(
+        fold::named_past_violations(&a, &reads).is_empty(),
+        "I3561: the row and its named rows are its past"
+    );
+    reads.insert(Dep::key("someone").read_key());
+    reads.insert(Dep::Row(rid(0x77)).read_key());
+    assert_eq!(
+        fold::named_past_violations(&a, &reads),
+        vec![
+            Dep::Row(rid(0x77)).read_key(),
+            Dep::key("someone").read_key()
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>(),
+        "I3561: a key read and an unnamed row are outside it"
+    );
+}
+
+/// I3565 (v5.1): the enforced FINAL-plane rule.
+#[test]
+fn i3565_a_final_hold_must_declare_its_trigger() {
+    let st = super::fixture_switch::key_record("g0-ft", &["user"]);
+    let a = e2::admit(&st);
+    let own: BTreeSet<String> = [Dep::Row(a.row_id).read_key()].into_iter().collect();
+    assert!(
+        fold::final_hold_untriggered(&a, reason::STEWARD_UNPROVEN, &own),
+        "I3565: held on nothing declared: untriggered"
+    );
+    assert!(
+        !fold::final_hold_untriggered(&a, reason::COUNT_SHORT, &own),
+        "I3565: a count waits on its own voices"
+    );
+    let mut declared = own.clone();
+    declared.insert(Dep::key("the-member").read_key());
+    assert!(
+        !fold::final_hold_untriggered(&a, reason::STEWARD_UNPROVEN, &declared),
+        "I3565: a declared input is a trigger"
+    );
+}
+
+/// I3566 (v5.1, FINAL plane `group`): a community founded with an AGENT
+/// member is held until the agent's steward (owner) binding lands, and
+/// concludes when it does, whichever arrives first. The steward read is a
+/// declared, monotone input of a FINAL-plane gate (the ruling).
+pub(crate) async fn group_steward_order_body(
+    d: &dyn FederationDirectory,
+    reversed: bool,
+) -> Verdicts {
+    use crate::federation::types::{Community, CommunityMember};
+    let (user, agent, steward) = ("g0-gs-u", "g0-gs-a", "g0-gs-s");
+    let _ = e2::put_key(d, user, &[identity_type::USER]).await;
+    let _ = e2::put_key(d, steward, &[identity_type::USER]).await;
+    let _ = e2::put_key(d, agent, &[identity_type::AGENT]).await;
+    let at = |ms: i64| {
+        use chrono::TimeZone as _;
+        chrono::Utc
+            .timestamp_millis_opt(ms)
+            .single()
+            .expect("instant")
+    };
+    let gid = e2::kid("g0-gs-g");
+    let rec = super::group::GroupRecord::Community(Community {
+        community_key_id: gid.clone(),
+        community_name: "g0 steward".to_owned(),
+        members: [user, agent]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| CommunityMember {
+                key_id: e2::kid(s),
+                joined_at: at(1_000),
+                role: (i == 0).then(|| "founder".to_owned()),
+            })
+            .collect(),
+        founded_at: at(1_000),
+        consensus_protocol: "majority".to_owned(),
+        policy_blob: None,
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
+        persist_row_hash: String::new(),
+    });
+    let keys = [e2::signing_key(user), e2::signing_key(agent)];
+    let signers: Vec<&_> = keys.iter().collect();
+    let founding = super::group_fixtures::roster_voices(&rec, 1, None, 2_000, &signers);
+    let row = RowId::of_statement(&founding[0]).expect("I3566: row");
+    let binding = owner_binding(steward, agent);
+    if reversed {
+        for v in &founding {
+            e2::put_statement(d, v)
+                .await
+                .expect("I3566: a founding voice");
+        }
+        assert!(
+            d.fold_state(&row)
+                .await
+                .unwrap()
+                .is_some_and(|s| s.held.is_some()),
+            "I3566: an unstewarded agent member holds the founding"
+        );
+        land_binding(d, &binding, agent).await;
+    } else {
+        land_binding(d, &binding, agent).await;
+        for v in &founding {
+            e2::put_statement(d, v)
+                .await
+                .expect("I3566: a founding voice");
+        }
+    }
+    let mut out = verdicts(d, &[row]).await;
+    out.push((
+        "community".to_owned(),
+        d.lookup_community(&gid)
+            .await
+            .unwrap()
+            .map(|c| c.members.len().to_string()),
+    ));
+    out
+}
+
+/// What a FINAL-plane two-order witness compares: per row id, concluded or
+/// the held reason.
+type Verdicts = Vec<(String, Option<String>)>;
+
+async fn verdicts(d: &dyn FederationDirectory, rows: &[RowId]) -> Verdicts {
+    let mut out = Vec::new();
+    // Labelled by position, not id: the two runs mint their rows at their
+    // own instants.
+    for (i, r) in rows.iter().enumerate() {
+        let st = d.fold_state(r).await.unwrap();
+        out.push((
+            format!("row {i}"),
+            st.map(|s| s.held.map_or_else(|| "concluded".to_owned(), |h| h.reason)),
+        ));
+    }
+    out
+}
+
+/// I3562 (v5, FINAL plane `group`): a counted membership change's two
+/// voices in either order give the same verdict and the same typed row.
+pub(crate) async fn group_order_body(d: &dyn FederationDirectory, reversed: bool) -> Verdicts {
+    use super::group::MembershipRecord;
+    use crate::federation::membership_acceptance::test_support::{acceptance_row, proposal_row};
+    use crate::federation::types::FamilyMembershipWidening;
+    let (m1, m2, m3, joiner) = ("g0-go-m1", "g0-go-m2", "g0-go-m3", "g0-go-j");
+    for s in [m1, m2, m3, joiner] {
+        let _ = e2::put_key(d, s, &[identity_type::USER]).await;
+    }
+    let family =
+        super::voices_invariants::found_family(d, "g0-go-g", &[m1, m2, m3], "majority").await;
+    let gid = family.family_key_id.clone();
+    let (head, _) = super::group_fixtures::held_head(d, &gid)
+        .await
+        .expect("I3562: head");
+    let t = crate::host::clock::now() - chrono::Duration::minutes(1);
+    let p = proposal_row(m1, "family", &gid, &e2::kid(joiner), None, t);
+    e2::put_signed(d, &p).await.expect("I3562: proposal");
+    e2::put_signed(d, &acceptance_row(joiner, &p, t))
+        .await
+        .expect("I3562: acceptance");
+    let record = MembershipRecord::FamilyWidening(FamilyMembershipWidening {
+        family_key_id: gid.clone(),
+        member_key_id: e2::kid(joiner),
+        joined_at: t,
+        effective_at: t,
+        role: None,
+        persist_row_hash: String::new(),
+    });
+    let (k1, k2) = (e2::signing_key(m1), e2::signing_key(m2));
+    let mut voices = super::group_fixtures::membership_voices(&record, Some(&head), &[&k1, &k2]);
+    if reversed {
+        voices.reverse();
+    }
+    let row = RowId::of_statement(&voices[0]).expect("I3562: row");
+    for v in &voices {
+        e2::put_statement(d, v).await.expect("I3562: a voice");
+    }
+    let mut out = verdicts(d, &[row]).await;
+    out.push((
+        "widenings".to_owned(),
+        Some(
+            d.list_family_membership_widenings_for(&gid)
+                .await
+                .unwrap()
+                .len()
+                .to_string(),
+        ),
+    ));
+    out
+}
+
+/// One `transport:canonical_rebind` voice (W1's shape, I3238).
+fn rebind_voice(
+    key: &ciris_crypto::composite::CompositeSigningKey,
+    iss: &str,
+    seat: &str,
+    transit: &[u8],
+    asserted_at_ms: u64,
+    head: &ciris_verify_core::edition2::Digest32,
+) -> Vec<u8> {
+    use super::transport_rebind::{REBIND_FAMILY, REBIND_ROW_TYPE, TRANSIT_MEMBER};
+    use ciris_verify_core::cde::Value;
+    let mut members = vec![
+        (
+            Value::Text("asserted_at".into()),
+            Value::Uint(asserted_at_ms),
+        ),
+        (
+            Value::Text(TRANSIT_MEMBER.into()),
+            Value::Bytes(transit.to_vec()),
+        ),
+        (
+            Value::Text("refs".into()),
+            Value::Map(vec![(
+                Value::Text("head".into()),
+                ciris_verify_core::edition2::row_ref(head),
+            )]),
+        ),
+    ];
+    members.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+    ciris_verify_core::edition2::sign_row_statement(
+        key,
+        iss,
+        seat,
+        REBIND_ROW_TYPE,
+        REBIND_FAMILY,
+        &Value::Map(members),
+        vec![],
+    )
+    .expect("I3563: a holder signs a re-bind")
+}
+
+/// I3563 (v5, FINAL plane `rebind`): two holders' voices in either order
+/// give the same verdict and the same live transit key.
+pub(crate) async fn rebind_order_body(d: &dyn FederationDirectory, reversed: bool) -> Verdicts {
+    use super::fixture_genesis;
+    fixture_genesis::install_v2(d)
+        .await
+        .expect("I3563: the test ceremony installs");
+    let c = fixture_genesis::bundle_v2();
+    let seat = &c.seats[0];
+    let mut rebound = seat.transit_xwing_pubkey.to_vec();
+    rebound[0] ^= 0x5a;
+    rebound[1200] ^= 0x5a;
+    let at = e2::ms(crate::host::clock::now());
+    let mut voices: Vec<Vec<u8>> = (0..2)
+        .map(|i| {
+            rebind_voice(
+                &c.holder_key(i),
+                c.holder_identity_ref(i),
+                &seat.identity_ref,
+                &rebound,
+                at,
+                &c.object_id,
+            )
+        })
+        .collect();
+    if reversed {
+        voices.reverse();
+    }
+    let row = RowId::of_statement(&voices[0]).expect("I3563: row");
+    for v in &voices {
+        e2::put_statement(d, v)
+            .await
+            .expect("I3563: a holder's voice");
+    }
+    let mut out = verdicts(d, &[row]).await;
+    let live = crate::federation::self_at_login::transit_xwing_pubkey_for(d, &seat.identity_ref)
+        .await
+        .unwrap()
+        .map(|k| hex::encode(k.as_bytes()));
+    out.push(("transit".to_owned(), live));
+    out
+}
+
+/// I3564 (v5, FINAL plane `typed_final`): a revocation and the key record
+/// of the key it names, in either order, give the same verdict.
+pub(crate) async fn revocation_order_body(d: &dyn FederationDirectory, reversed: bool) -> Verdicts {
+    let (revoker, subject) = ("g0-rv-r", "g0-rv-s");
+    let _ = e2::put_key(d, revoker, &[identity_type::USER]).await;
+    let t = crate::host::clock::now() - chrono::Duration::minutes(1);
+    let st = super::typed_fixtures::revocation_statement(
+        revoker,
+        subject,
+        "key",
+        "compromised",
+        t,
+        t,
+        None,
+        e2::ms(t),
+    );
+    let row = RowId::of_statement(&st).expect("I3564: row");
+    if reversed {
+        let _ = e2::put_statement(d, &st).await;
+        let _ = e2::put_key(d, subject, &[identity_type::USER]).await;
+    } else {
+        let _ = e2::put_key(d, subject, &[identity_type::USER]).await;
+        let _ = e2::put_statement(d, &st).await;
+    }
+    verdicts(d, &[row]).await
+}
+
+/// I3567 (fix4): a re-fold that cannot decide leaves the fold state as it
+/// was. A concluded occurrence-plane row whose held voice cannot be
+/// re-admitted now (its signer's key is not held here) is re-folded: it
+/// stays concluded, with its plane, slot and reads, and no row is left
+/// `refolding`. And a row is never its own fold dependent.
+pub(crate) async fn refold_never_strands_body(d: &dyn FederationDirectory) {
+    let a = crate::federation::genesis::ordinary_scores_row(
+        &uuid::Uuid::new_v4().to_string(),
+        &e2::kid("g0-ns-x"),
+    );
+    let st = e2::statement_of(&a, "g0-ns-x");
+    let admitted = e2::try_admit(&st, &e2::held_keys(&[("g0-ns-x", &["user"])]))
+        .expect("I3567: admitted under a fixture key set (not stored)");
+    d.put_edition2_statement(&admitted)
+        .await
+        .expect("I3567: the statement is held; its signer's key is not");
+    let row = admitted.row_id;
+    let reads: BTreeSet<String> = [Dep::Row(row).read_key(), Dep::key("g0-ns-input").read_key()]
+        .into_iter()
+        .collect();
+    d.put_fold_record(&FoldRecord {
+        row_id: row,
+        family: admitted.family.clone(),
+        tier: "federation".to_owned(),
+        replicated: false,
+        plane: super::fold::plane::OCCURRENCE.to_owned(),
+        slot: "occurrence:ns|ns".to_owned(),
+        held: None,
+        reads: reads.clone(),
+    })
+    .await
+    .unwrap();
+    let before = d.fold_state(&row).await.unwrap();
+
+    let report = fold::refold_rows(d, [row].into_iter().collect())
+        .await
+        .unwrap();
+    assert!(
+        report.unconcluded.is_empty(),
+        "I3567: nothing un-concluded: {report:?}"
+    );
+    assert_eq!(
+        d.fold_state(&row).await.unwrap(),
+        before,
+        "I3567: the state is exactly as it was"
+    );
+    assert!(
+        !d.fold_any_refolding().await.unwrap(),
+        "I3567: no row is left refolding"
+    );
+    assert_eq!(
+        d.fold_dependents(&["key:g0-ns-input".to_owned()])
+            .await
+            .unwrap(),
+        vec![row],
+        "I3567: its reads are kept"
+    );
+    // A touch of its own row id never re-folds it.
+    let r = fold::refold_touched_excluding(d, reads, &[row].into_iter().collect())
+        .await
+        .unwrap();
+    assert_eq!(r.steps, 0, "I3567: a row is never its own fold dependent");
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite() -> crate::store::sqlite::SqliteBackend {
     use crate::store::Backend as _;
@@ -847,3 +1346,79 @@ async fn i3559_steward_binding_concludes_and_unconcludes_postgres() {
     };
     Box::pin(steward_conclude_unconclude_body(&b)).await;
 }
+both!(
+    i3560_bytes_kept_not_served_sqlite,
+    i3560_bytes_kept_not_served_postgres,
+    bytes_kept_not_served_body
+);
+
+macro_rules! both_orders {
+    ($sq:ident, $pg:ident, $body:path, $what:literal) => {
+        #[cfg(feature = "sqlite")]
+        #[tokio::test]
+        async fn $sq() {
+            let a = Box::pin($body(&sqlite().await, false)).await;
+            let b = Box::pin($body(&sqlite().await, true)).await;
+            for (order, v) in [("forward", &a), ("reversed", &b)] {
+                assert_eq!(
+                    v.first().and_then(|(_, r)| r.as_deref()),
+                    Some("concluded"),
+                    "{}: the row CONCLUDES in the {order} order (agreeing on a refusal proves \
+                     nothing): {v:?}",
+                    $what
+                );
+            }
+            assert_eq!(a, b, "{}: the same rows in two orders, one verdict", $what);
+        }
+
+        #[cfg(feature = "postgres")]
+        #[tokio::test]
+        async fn $pg() {
+            let (Some(x), Some(y)) = (postgres().await, postgres().await) else {
+                return;
+            };
+            let a = Box::pin($body(&x, false)).await;
+            let b = Box::pin($body(&y, true)).await;
+            for (order, v) in [("forward", &a), ("reversed", &b)] {
+                assert_eq!(
+                    v.first().and_then(|(_, r)| r.as_deref()),
+                    Some("concluded"),
+                    "{}: the row CONCLUDES in the {order} order (agreeing on a refusal proves \
+                     nothing): {v:?}",
+                    $what
+                );
+            }
+            assert_eq!(a, b, "{}: the same rows in two orders, one verdict", $what);
+        }
+    };
+}
+
+both_orders!(
+    i3562_group_plane_order_independent_sqlite,
+    i3562_group_plane_order_independent_postgres,
+    group_order_body,
+    "I3562"
+);
+both_orders!(
+    i3563_rebind_plane_order_independent_sqlite,
+    i3563_rebind_plane_order_independent_postgres,
+    rebind_order_body,
+    "I3563"
+);
+both_orders!(
+    i3564_typed_final_plane_order_independent_sqlite,
+    i3564_typed_final_plane_order_independent_postgres,
+    revocation_order_body,
+    "I3564"
+);
+both_orders!(
+    i3566_group_steward_binding_either_order_sqlite,
+    i3566_group_steward_binding_either_order_postgres,
+    group_steward_order_body,
+    "I3566"
+);
+both!(
+    i3567_a_waiting_refold_never_strands_sqlite,
+    i3567_a_waiting_refold_never_strands_postgres,
+    refold_never_strands_body
+);

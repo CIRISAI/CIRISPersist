@@ -264,7 +264,6 @@
 pub mod test_support {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use chrono::{DateTime, Duration, Utc};
 
     use crate::federation::tier_ingest::test_support as ts;
@@ -334,7 +333,8 @@ pub mod test_support {
     /// `tag` — see [`SELF_PRINCIPAL`] and [`run_sequence`].
     #[must_use]
     pub fn self_key_id_for(tag: &str) -> String {
-        SELF_PRINCIPAL.key_id_in(tag)
+        // v62 (E3): the node's key is stored and compared as an identity-ref.
+        crate::federation::edition2::fixture_switch::kid(&SELF_PRINCIPAL.key_id_in(tag))
     }
 
     /// A key id that is deliberately NEVER registered. Used by I4 as a
@@ -385,8 +385,11 @@ pub mod test_support {
         #[must_use]
         pub fn dimension(self) -> &'static str {
             match self {
-                Family::Identity => "identity:handle:v1",
-                Family::Reputation => "reputation:helpfulness:v1",
+                // v62 (E3): registered (`need:{domain}:{kind}`), so an
+                // edition-2 statement on them reaches persist's gates; the
+                // earlier open-vocabulary names are refused at the door.
+                Family::Identity => "need:identity:handle:v1",
+                Family::Reputation => "need:reputation:helpfulness:v1",
                 Family::Capacity => "capacity:core_identity:v1",
                 Family::Trace => "trace:complete:v1",
                 Family::Reserved => "system:machine:v1",
@@ -487,17 +490,18 @@ pub mod test_support {
     /// on `Put` / `Withdraw` / `Supersede` / `Recant`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     pub enum SigState {
-        /// A REAL hybrid signature over the REAL canonical envelope bytes.
+        /// v62 (E3): a REAL edition-2 statement, signed by the cast member's
+        /// composite key through the fixture codec (`e2::row_of`).
         Valid,
-        /// A real signature with one byte flipped — must never verify.
-        Corrupt,
         /// No signature at all (the empty-sentinel shape a local row uses).
         Absent,
     }
 
     impl SigState {
-        /// Every state, in shrink order.
-        pub const ALL: [SigState; 3] = [SigState::Valid, SigState::Corrupt, SigState::Absent];
+        /// Every state, in shrink order. v62 (E3): the earlier `Corrupt`
+        /// (a hybrid signature with a flipped byte) is deleted: composite
+        /// statements only, and a statement that fails the door is never a row.
+        pub const ALL: [SigState; 2] = [SigState::Valid, SigState::Absent];
     }
 
     /// v24.0.0 (CIRISPersist#556) — how many CO-SIGNATURES a signed-plane row
@@ -519,24 +523,18 @@ pub mod test_support {
     pub enum CoSign {
         /// No co-signatures — the pre-v24 shape, and the shrink target.
         None,
-        /// One REAL hybrid co-signature over the SAME canonical envelope, by a
-        /// different registered principal.
+        /// v62 (E3): one further edition-2 voice over the SAME statement, by a
+        /// different registered principal, put after the row.
         One,
-        /// Two REAL co-signatures, by the other two principals — a row whose
-        /// scrub set is a genuine 3-of-3.
+        /// Two further voices, by the other two principals.
         Two,
-        /// One co-signature with a flipped byte. Must be REFUSED at
-        /// federation-tier ingest exactly as a corrupt BASE signature is: a
-        /// co-signature the verifier does not check is a co-signature a writer
-        /// may forge.
-        Corrupt,
     }
 
     impl CoSign {
         /// Every variant, in shrink order. Read by the meta-coverage assertion,
         /// so adding a variant without teaching the generator fails loudly
         /// instead of silently under-testing.
-        pub const ALL: [CoSign; 4] = [CoSign::None, CoSign::One, CoSign::Two, CoSign::Corrupt];
+        pub const ALL: [CoSign; 3] = [CoSign::None, CoSign::One, CoSign::Two];
 
         /// The extra principals that co-sign, given the row's base attester.
         fn co_signers(self, attester: Principal) -> Vec<Principal> {
@@ -546,7 +544,7 @@ pub mod test_support {
                 .collect();
             match self {
                 CoSign::None => Vec::new(),
-                CoSign::One | CoSign::Corrupt => others.into_iter().take(1).collect(),
+                CoSign::One => others.into_iter().take(1).collect(),
                 CoSign::Two => others,
             }
         }
@@ -850,7 +848,8 @@ pub mod test_support {
         /// `p`'s key id in THIS run.
         #[must_use]
         pub fn kid(&self, p: Principal) -> String {
-            p.key_id_in(&self.tag)
+            // v62 (E3): the identity-ref of the cast member's seed.
+            crate::federation::edition2::fixture_switch::kid(&p.key_id_in(&self.tag))
         }
 
         /// Apply `op` at sequence slot `seq` and instant `at`.
@@ -992,7 +991,24 @@ pub mod test_support {
             at: DateTime<Utc>,
         ) -> OpOutcome {
             let target = self.target_for(op, seq);
-            let row = self.row_for(op, id.clone(), tier, structural, at, &target);
+            let target_row = if structural.is_some() {
+                self.dir.get_attestation(&target).await.ok().flatten()
+            } else {
+                None
+            };
+            let (row, voices) = self.row_for(
+                op,
+                id,
+                tier,
+                structural,
+                at,
+                &target,
+                target_row.as_ref(),
+                None,
+            );
+            // v62 (E3): the stored id is the row's own (node-computed for an
+            // edition-2 statement).
+            let id = row.attestation_id.clone();
             // Read the coordinate off the ROW rather than off `op.family`: a
             // `Deadmit` overrides both the attester and the dimension, and a
             // model that recomputed them from the op would be a second list
@@ -1010,6 +1026,12 @@ pub mod test_support {
                 .await;
             match res {
                 Ok(_) => {
+                    // The further voices (CoSign) land after the row.
+                    for v in &voices {
+                        let _ =
+                            crate::federation::edition2::fixture_switch::put_statement(self.dir, v)
+                                .await;
+                    }
                     self.remember(&id);
                     self.occupy(occupied);
                     OpOutcome {
@@ -1252,6 +1274,16 @@ pub mod test_support {
             }
         }
 
+        /// The ONE row builder. v62 (E3): a `Valid` op is an edition-2
+        /// statement signed by the attester's composite key through the
+        /// fixture codec, and its co-signers are further voices over the same
+        /// statement (returned, put after the row); a composer carries its
+        /// held target's family and names it by row id. An `Absent` op, a
+        /// composer whose target is not a held edition-2 row, and a payload the
+        /// codec cannot state are the UNSIGNED row (refused at the door, on
+        /// every backend alike). `narrowing` is I4's added precondition, applied
+        /// BEFORE signing so the probe is the same op plus one constraint.
+        #[allow(clippy::too_many_arguments)]
         fn row_for(
             &self,
             op: &Op,
@@ -1260,13 +1292,10 @@ pub mod test_support {
             structural: Option<&'static str>,
             at: DateTime<Utc>,
             target: &str,
-        ) -> Attestation {
-            // A `Deadmit` names its own author, type and dimension — the gate
-            // folds over `list_attestations_by(self_key_id)` filtered on
-            // `attestation_type == scores` and the de-admission dimension, so a
-            // row missing any of the three is stored and INERT. Built here, in
-            // the ONE row builder, so I4's narrowing probes narrow the same row
-            // the sequence submitted rather than a lookalike.
+            target_row: Option<&Attestation>,
+            narrowing: Option<Narrowing>,
+        ) -> (Attestation, Vec<Vec<u8>>) {
+            use crate::federation::edition2::fixture_switch as e2;
             let attester = if op.kind == OpKind::Deadmit {
                 SELF_PRINCIPAL
             } else {
@@ -1278,48 +1307,12 @@ pub mod test_support {
                 envelope_for(op.family, attester, op.subject)
             };
             if structural.is_some() {
-                // A structural revocation names its target in the envelope —
-                // the field the §3.2.3 authority resolver reads. The target is
-                // resolved by the CALLER and memoized per slot (see
-                // `resolved_targets`) so a replay is byte-identical.
-                let target = target.to_owned();
                 envelope
                     .as_object_mut()
                     .expect("harness envelopes are objects")
-                    .insert("references_attestation_id".into(), target.into());
+                    .insert("references_attestation_id".into(), target.to_owned().into());
             }
-            // v31.0.0 (CIRISPersist#598) — THE SIGNED INSTANTS, stamped BEFORE
-            // the signature, from the very expressions the struct literal below
-            // assigns to the columns.
-            //
-            // This is a WELL-FORMEDNESS stamp, and stamping it does not blunt a
-            // single property. `check_instant_binding` is a TIER-1 gate: an
-            // unstamped row is refused there, BEFORE the hybrid verify, before
-            // the §6.1 dedup short-circuit, before the AV-77 fold. Leaving the
-            // instants off would therefore have made every one of this module's
-            // properties measure the same trivial refusal — including
-            // `dedup_short_circuit_never_accepts_an_unverified_row`, whose
-            // whole subject is a row that reaches the CRYPTO gate. The
-            // deliberately-broken axes stay exactly where they were and where
-            // the generator can reason about them: [`SigState`] (the signature),
-            // [`CoSign`] (the co-signature set), and [`Narrowing`] (the I4
-            // probes). None of them is the instant binding, and none of them is
-            // reached by a row this substrate refuses at the door.
-            //
-            // Neither instant needs truncating: the harness clock is a
-            // whole-second walk from a fixed RFC-3339 constant and
-            // [`harness_expires_at`] is another, so both already sit on the
-            // microsecond substrate floor. That is asserted, not assumed —
-            // `harness_instants_are_writable` pins it, so a future clock drawn
-            // with sub-microsecond precision fails as a NAMED claim rather than
-            // as every property at once.
             let expires_at = if op.kind == OpKind::Deadmit {
-                // A de-admission carries NO expiry: the constant's contract is
-                // "live unless the node `withdraws` it", and an expiring
-                // sanction would be lifted by the calendar rather than by a
-                // decision anybody made. Everything else gets
-                // [`HARNESS_EXPIRES_AT`] — see there for why it is not a
-                // relative offset.
                 None
             } else {
                 Some(harness_expires_at())
@@ -1332,8 +1325,6 @@ pub mod test_support {
                     crate::federation::envelope::paths::ASSERTED_AT.into(),
                     crate::federation::admission::render_signed_instant(at).into(),
                 );
-                // Bound in BOTH directions, so the absent case is an ABSENT
-                // key, not a null.
                 match expires_at {
                     None => {
                         obj.remove(crate::federation::envelope::paths::EXPIRES_AT);
@@ -1345,79 +1336,30 @@ pub mod test_support {
                         );
                     }
                 }
+                if narrowing == Some(Narrowing::OversizedEnvelope) {
+                    obj.insert("sm_pad".into(), oversize_pad());
+                }
             }
-            // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN MIRROR, stamped
-            // into the envelope BEFORE it is signed. Built here for the same
-            // reason everything else is: this is the ONE row builder, so the
-            // mirror the harness signs is the mirror of the row the harness
-            // submits — a mirror assembled anywhere else would drift from the
-            // row and the differential would measure the drift, not the gate.
-            //
-            // v31.0.0 (CIRISPersist#658) — built as a `RowMirror`, not as a
-            // `json!` literal with the same member names. `RowMirror` is
-            // `deny_unknown_fields` over a CLOSED set, so a hand-written twin
-            // is a second definition of the projection the gate checks — the
-            // exact defect class the paragraph above argues against, one layer
-            // down. As a struct literal an eighth member is a compile error
-            // here; as a `json!` it was a mirror the gate silently refused.
-            // (The same shape was found and fixed in `blobs.rs` this release.)
-            crate::federation::envelope::RowMirror {
-                attestation_id: id.clone(),
-                attesting_key_id: self.kid(attester),
-                attestation_type: structural
-                    .map_or_else(|| op.att_type_str(), std::borrow::ToOwned::to_owned),
-                attested_key_id: self.kid(op.subject),
-                subject_key_ids: vec![self.kid(op.subject)],
-                cohort_scope: op.cohort_scope.as_str().to_owned(),
-                // Mirrors the `weight: None` this builder stamps on the row
-                // below; absent ⇔ the column is NULL.
-                weight: None,
-            }
-            .insert_into(&mut envelope, &id)
-            .expect("harness envelopes are objects");
-            let (hash, classical, pqc) =
-                signature_for_key(op.signature, &self.kid(attester), &envelope);
-            // v24.0.0 (CIRISPersist#556) — the co-signature set, over the SAME
-            // canonical envelope bytes the base scrub signed. Built in the ONE
-            // row builder so every signed-plane op can carry it and I1 re-runs
-            // the real verifier over it.
-            let additional_scrubs: Vec<crate::federation::types::ScrubSig> = op
-                .cosign
-                .co_signers(attester)
-                .into_iter()
-                .map(|p| {
-                    let state = if op.cosign == CoSign::Corrupt {
-                        SigState::Corrupt
-                    } else {
-                        SigState::Valid
-                    };
-                    let (_, c, q) = signature_for_key(state, &self.kid(p), &envelope);
-                    crate::federation::types::ScrubSig {
-                        cosigned_at: None,
-                        scrub_key_id: self.kid(p),
-                        scrub_signature_classical: c,
-                        scrub_signature_pqc: q,
-                    }
-                })
-                .collect();
-            Attestation {
+            let unregistered = narrowing == Some(Narrowing::UnregisteredAttester);
+            let (signer_seed, attesting) = if unregistered {
+                (UNREGISTERED_KEY_ID.to_owned(), e2::kid(UNREGISTERED_KEY_ID))
+            } else {
+                (attester.key_id_in(&self.tag), self.kid(attester))
+            };
+            let unsigned = Attestation {
                 attestation_id: id,
-                attesting_key_id: self.kid(attester),
+                attesting_key_id: attesting.clone(),
                 attested_key_id: self.kid(op.subject),
                 attestation_type: structural
                     .map_or_else(|| op.att_type_str(), std::borrow::ToOwned::to_owned),
                 weight: None,
                 asserted_at: at,
-                // Decided ABOVE, where it is stamped into the signed envelope:
-                // the column and its signed twin come from one expression, so
-                // the #598 binding holds by construction rather than by two
-                // sites agreeing.
                 expires_at,
                 attestation_envelope: envelope,
-                original_content_hash: hash,
-                scrub_signature_classical: classical,
-                scrub_signature_pqc: pqc,
-                scrub_key_id: self.kid(attester),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: attesting,
                 scrub_timestamp: at,
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
@@ -1426,8 +1368,50 @@ pub mod test_support {
                 cohort_scope: op.cohort_scope.as_str().to_owned(),
                 tier: tier.as_str().to_owned(),
                 promoted_at: None,
-                additional_scrubs,
+                additional_scrubs: Vec::new(),
+            };
+            if op.signature != SigState::Valid {
+                return (unsigned, Vec::new());
             }
+            let statement = if structural.is_some() {
+                let Some(t) = target_row
+                    .filter(|t| is_row_id(&t.attestation_id) && e2::carried_statement(t).is_some())
+                else {
+                    return (unsigned, Vec::new());
+                };
+                let mut a = unsigned.clone();
+                let obj = a
+                    .attestation_envelope
+                    .as_object_mut()
+                    .expect("harness envelopes are objects");
+                match t.attestation_envelope.get("dimension") {
+                    Some(d) => {
+                        obj.insert("dimension".into(), d.clone());
+                    }
+                    None => {
+                        obj.remove("dimension");
+                    }
+                }
+                e2::statement_of_family(&a, &signer_seed, &e2::family_of(t))
+            } else {
+                match e2::try_statement_of(&unsigned, &signer_seed) {
+                    Ok(st) => st,
+                    Err(_) => return (unsigned, Vec::new()),
+                }
+            };
+            let Ok(row) = e2::try_row_of_statement(&statement, tier.as_str()) else {
+                return (unsigned, Vec::new());
+            };
+            let voices = if unregistered {
+                Vec::new()
+            } else {
+                op.cosign
+                    .co_signers(attester)
+                    .into_iter()
+                    .map(|p| e2::voice_of(&statement, &p.key_id_in(&self.tag)))
+                    .collect()
+            };
+            (row, voices)
         }
 
         // ── model bookkeeping ────────────────────────────────────────
@@ -1710,15 +1694,15 @@ pub mod test_support {
             verified
         }
 
-        /// How many federation-tier rows currently carry a real (non-empty)
-        /// hybrid signature. The meta-coverage signal.
+        /// How many federation-tier rows currently carry their edition-2
+        /// statement. The meta-coverage signal. v62 (E3).
         pub async fn signed_federation_row_count(&self) -> usize {
             let mut n = 0;
             for id in self.corpus_ids().await {
                 if let Ok(Some(row)) = self.dir.get_attestation(&id).await {
                     if row.tier == attestation_tier::FEDERATION
-                        && !row.scrub_signature_classical.is_empty()
-                        && row.scrub_signature_pqc.is_some()
+                        && crate::federation::edition2::fixture_switch::carried_statement(&row)
+                            .is_some()
                     {
                         n += 1;
                     }
@@ -1826,49 +1810,6 @@ pub mod test_support {
         })
     }
 
-    /// `(original_content_hash, classical_b64, pqc_b64)` for `state`.
-    ///
-    /// [`SigState::Valid`] runs the REAL hybrid signer over the REAL canonical
-    /// bytes; [`SigState::Corrupt`] flips one byte of that real signature (so
-    /// the corruption is indistinguishable from a wire fault, not a shape
-    /// error); [`SigState::Absent`] is the empty-sentinel shape a local row
-    /// carries.
-    #[must_use]
-    pub fn signature_for(
-        state: SigState,
-        attester: Principal,
-        envelope: &serde_json::Value,
-    ) -> (String, String, Option<String>) {
-        signature_for_key(state, attester.key_id(), envelope)
-    }
-
-    /// [`signature_for`] over an explicit signing key id.
-    ///
-    /// The machine signs with the TAGGED cast id ([`Principal::key_id_in`]),
-    /// because that is the id `register_cast` registered and therefore the one
-    /// whose pubkeys the ingest gate will resolve. The `Principal`-taking form
-    /// above is kept for callers outside this module that use the untagged
-    /// cast.
-    #[must_use]
-    pub fn signature_for_key(
-        state: SigState,
-        signing_key_id: &str,
-        envelope: &serde_json::Value,
-    ) -> (String, String, Option<String>) {
-        match state {
-            SigState::Valid => ts::sign_envelope(signing_key_id, envelope),
-            SigState::Corrupt => {
-                let (hash, classical, pqc) = ts::sign_envelope(signing_key_id, envelope);
-                let mut bytes = B64.decode(&classical).expect("our own signature is base64");
-                if let Some(b) = bytes.first_mut() {
-                    *b ^= 0xff;
-                }
-                (hash, B64.encode(&bytes), pqc)
-            }
-            SigState::Absent => (String::new(), String::new(), None),
-        }
-    }
-
     impl Op {
         /// The wire `attestation_type` this op writes. The three structural
         /// revocation kinds override it in [`Machine::revocation_put`].
@@ -1911,19 +1852,6 @@ pub mod test_support {
     /// only ADDS a precondition.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Narrowing {
-        /// **+ a failing crypto check.** The identical row with one byte of its
-        /// real signature flipped. Every gate the original faced is still
-        /// faced, plus hybrid-verify.
-        ///
-        /// Applicable only where the signature is actually consulted: a
-        /// federation-tier `Put` and the three structural revocations. A
-        /// `tier = local` row is EXEMPT from the signature check by design
-        /// (CC 5.3.2.2 deferred signature), so corrupting its signature adds
-        /// nothing. That exemption is SAFE only because AV-78 made the stored
-        /// tier equal the declared one; while `put_attestation` was dropping
-        /// the `tier` column it was the hole itself, which is what
-        /// `put_attestation_preserves_the_caller_declared_tier` now guards.
-        CorruptSignature,
         /// **+ the attester-resolution precondition.** The identical row from
         /// [`UNREGISTERED_KEY_ID`]. Every write path resolves the attester
         /// against `federation_keys` (FK and/or pubkey lookup), so this adds a
@@ -1939,8 +1867,7 @@ pub mod test_support {
 
     impl Narrowing {
         /// Every narrowing, in application order.
-        pub const ALL: [Narrowing; 3] = [
-            Narrowing::CorruptSignature,
+        pub const ALL: [Narrowing; 2] = [
             Narrowing::UnregisteredAttester,
             Narrowing::OversizedEnvelope,
         ];
@@ -1952,19 +1879,6 @@ pub mod test_support {
         #[must_use]
         pub fn applies_to(self, op: &Op) -> bool {
             match self {
-                Narrowing::CorruptSignature => {
-                    op.signature == SigState::Valid
-                        && matches!(
-                            op.kind,
-                            // `Deadmit` belongs here for the same reason the
-                            // structural composers do: it is ALWAYS federation
-                            // tier, so its signature is always consulted.
-                            OpKind::Withdraw | OpKind::Supersede | OpKind::Recant | OpKind::Deadmit
-                        )
-                        || (op.kind == OpKind::Put
-                            && op.tier == Tier::Federation
-                            && op.signature == SigState::Valid)
-                }
                 Narrowing::UnregisteredAttester | Narrowing::OversizedEnvelope => matches!(
                     op.kind,
                     OpKind::InsertLocal
@@ -1987,12 +1901,46 @@ pub mod test_support {
         )
     }
 
-    /// Register the whole cast with REAL deterministic hybrid pubkeys, so every
-    /// signature this harness produces verifies against a real registered key.
+    /// Register the whole cast as live edition-2 `agent` keys (their
+    /// `key:record` statements), so every statement this harness signs is by a
+    /// key the door holds. v62 (E3).
     pub async fn register_cast(dir: &dyn FederationDirectory, tag: &str) {
         for p in Principal::ALL {
-            ts::register_hybrid_key(dir, &p.key_id_in(tag)).await;
+            crate::federation::edition2::fixture_switch::put_key(
+                dir,
+                &p.key_id_in(tag),
+                &[crate::federation::types::identity_type::AGENT],
+            )
+            .await;
         }
+    }
+
+    /// Is `id` a node-computed row id (64 lowercase hex)?
+    fn is_row_id(id: &str) -> bool {
+        id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// **The harness's model-clock start: now-relative, fixed per process.**
+    ///
+    /// v62 (E3; CC 2.4.1.1): the cast are agent keys, and an agent key's rows
+    /// lapse when its record ends (365 days at most). A row is judged at its
+    /// own `asserted_at`, so a model clock pinned to a calendar date would
+    /// leave the cast's key window on a date and every row would lapse with
+    /// it. The start is today 00:00 UTC minus 30 days, inside the default
+    /// agent window, and computed ONCE per process so I3's replay and I5's
+    /// differential still stamp byte-identical instants within a run (two
+    /// runs straddling midnight read the same value).
+    #[must_use]
+    pub fn harness_clock_start() -> DateTime<Utc> {
+        static START: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
+        *START.get_or_init(|| {
+            let today = Utc::now()
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight")
+                .and_utc();
+            today - Duration::days(30)
+        })
     }
 
     /// **The AV-77 lifecycle, as an op SEQUENCE.**
@@ -2175,9 +2123,7 @@ pub mod test_support {
     pub async fn run_sequence(dir: &dyn FederationDirectory, ops: &[Op], tag: &str) -> Transcript {
         register_cast(dir, tag).await;
         let mut m = Machine::new(dir, tag);
-        let mut clock: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .expect("fixed instant")
-            .with_timezone(&Utc);
+        let mut clock: DateTime<Utc> = harness_clock_start();
         let mut outcomes = Vec::with_capacity(ops.len());
         let mut states = Vec::with_capacity(ops.len());
 
@@ -2349,9 +2295,6 @@ pub mod test_support {
                                 .extra
                                 .insert("sm_pad".into(), oversize_pad());
                         }
-                        // The local tier defers its signature; nothing to
-                        // corrupt. `applies_to` already filtered this out.
-                        Narrowing::CorruptSignature => {}
                     }
                     let res = if op.kind == OpKind::InsertLocal {
                         self.dir.attestation_insert_local(input).await
@@ -2388,39 +2331,24 @@ pub mod test_support {
                     // different §6.1 dedup triple, and therefore a different op.
                     // "The same op plus one constraint" has to mean it.
                     let target = self.target_for(op, origin_seq);
-                    let mut row = self.row_for(op, id.clone(), tier, structural, at, &target);
-                    match narrowing {
-                        Narrowing::UnregisteredAttester => {
-                            row.attesting_key_id = UNREGISTERED_KEY_ID.to_owned();
-                            crate::federation::tier_ingest::test_support::reseal(&mut row);
-                            row.scrub_key_id = UNREGISTERED_KEY_ID.to_owned();
-                        }
-                        Narrowing::CorruptSignature => {
-                            // Re-sign CORRUPTLY over the row's own envelope with
-                            // the ROW's own attester, so the only difference
-                            // from the original is a failing crypto check — not
-                            // a shape error and not a different signer.
-                            // `row.attesting_key_id` rather than
-                            // `op.attester`: a `Deadmit` row is authored by the
-                            // NODE, so signing with the op's drawn attester
-                            // would have swapped the signer as well and the
-                            // probe would no longer be "the same op plus one
-                            // constraint".
-                            let (hash, classical, pqc) = signature_for_key(
-                                SigState::Corrupt,
-                                &row.attesting_key_id,
-                                &row.attestation_envelope,
-                            );
-                            row.original_content_hash = hash;
-                            row.scrub_signature_classical = classical;
-                            row.scrub_signature_pqc = pqc;
-                        }
-                        Narrowing::OversizedEnvelope => {
-                            if let Some(o) = row.attestation_envelope.as_object_mut() {
-                                o.insert("sm_pad".into(), oversize_pad());
-                            }
-                        }
-                    }
+                    let target_row = if structural.is_some() {
+                        self.dir.get_attestation(&target).await.ok().flatten()
+                    } else {
+                        None
+                    };
+                    // v62 (E3): the narrowing is applied BEFORE signing (an
+                    // unregistered signer; an oversized payload).
+                    let (row, _voices) = self.row_for(
+                        op,
+                        id,
+                        tier,
+                        structural,
+                        at,
+                        &target,
+                        target_row.as_ref(),
+                        Some(narrowing),
+                    );
+                    let id = row.attestation_id.clone();
                     match self
                         .dir
                         .put_attestation(SignedAttestation { attestation: row })
@@ -2844,7 +2772,6 @@ mod proptests {
     fn arb_sig() -> impl Strategy<Value = SigState> {
         prop_oneof![
             6 => Just(SigState::Valid),
-            1 => Just(SigState::Corrupt),
             1 => Just(SigState::Absent),
         ]
     }
@@ -2864,15 +2791,14 @@ mod proptests {
     /// **The #556 axis.** `None` dominates so the ordinary single-scrub shape
     /// stays the common case (and the shrink target), while every sequence still
     /// has a real chance of putting a co-signed row through the storage
-    /// round-trip, the differential and I1's real verifier. `Corrupt` is drawn
-    /// as often as `Two` because "a co-signature the verifier does not check"
-    /// is the failure this axis exists to make impossible.
+    /// round-trip, the differential and I1's real verifier. v62 (E3): the
+    /// co-signers are further edition-2 voices; the earlier `Corrupt` (a hybrid
+    /// co-scrub with a flipped byte) is deleted.
     fn arb_cosign() -> impl Strategy<Value = CoSign> {
         prop_oneof![
             6 => Just(CoSign::None),
             2 => Just(CoSign::One),
             1 => Just(CoSign::Two),
-            1 => Just(CoSign::Corrupt),
         ]
     }
 
@@ -3212,7 +3138,11 @@ mod proptests {
         sig: super::test_support::SigState,
         references: Option<&str>,
     ) -> crate::federation::Attestation {
-        use super::test_support::{envelope_for, signature_for_key, Principal};
+        // v62 (E3): a `Valid` witness is an edition-2 statement by the cast's A
+        // through the fixture codec (its id is node-computed: read it off the
+        // row); `Absent` is the unsigned shape.
+        use super::test_support::{envelope_for, Principal, SigState};
+        use crate::federation::edition2::fixture_switch as e2;
         let mut envelope = envelope_for(family, Principal::A, Principal::A);
         if let Some(r) = references {
             envelope
@@ -3220,39 +3150,7 @@ mod proptests {
                 .expect("harness envelopes are objects")
                 .insert("references_attestation_id".into(), r.into());
         }
-        // v31.0.0 (CIRISPersist#643) — the mirror rides the SIGNED bytes.
-        //
-        // v31.0.0 (CIRISPersist#658) — and it is a `RowMirror`, not a `json!`
-        // twin of one. `Machine::row_for`'s comment argues that a mirror
-        // assembled anywhere else drifts from the row; this builder WAS that
-        // second assembly. Both now place the same closed-set type, so the
-        // next member added to it is a compile error in both rather than a
-        // silently short mirror in both.
-        crate::federation::envelope::RowMirror {
-            attestation_id: id.to_owned(),
-            attesting_key_id: Principal::A.key_id_in(tag),
-            attestation_type: att_type.to_owned(),
-            attested_key_id: Principal::A.key_id_in(tag),
-            subject_key_ids: Vec::new(),
-            cohort_scope: cohort.to_owned(),
-            // Mirrors the `weight: None` this builder stamps on the row below.
-            weight: None,
-        }
-        .insert_into(&mut envelope, id)
-        .expect("harness envelopes are objects");
-        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .expect("fixed instant")
-            .with_timezone(&chrono::Utc);
-        // v31.0.0 (CIRISPersist#598) — the SIGNED INSTANTS, stamped before the
-        // signature, exactly as `Machine::row_for` does for the generated
-        // corpus. `expires_at` is `None` on every witness this builder makes,
-        // and the gate binds that in both directions, so the key is REMOVED
-        // rather than written as null.
-        //
-        // The teeth of every caller live on the [`SigState`] argument above,
-        // not here: the binding is a TIER-1 gate, so an unstamped row never
-        // reaches the crypto check that `dedup_short_circuit_never_accepts_an_
-        // unverified_row` and the AV-78 tier witness are both about.
+        let now = super::test_support::harness_clock_start();
         {
             let obj = envelope
                 .as_object_mut()
@@ -3263,21 +3161,20 @@ mod proptests {
             );
             obj.remove(crate::federation::envelope::paths::EXPIRES_AT);
         }
-        let (original_content_hash, classical, pqc) =
-            signature_for_key(sig, &Principal::A.key_id_in(tag), &envelope);
-        crate::federation::Attestation {
+        let seed = Principal::A.key_id_in(tag);
+        let unsigned = crate::federation::Attestation {
             attestation_id: id.to_owned(),
-            attesting_key_id: Principal::A.key_id_in(tag),
-            attested_key_id: Principal::A.key_id_in(tag),
+            attesting_key_id: e2::kid(&seed),
+            attested_key_id: e2::kid(&seed),
             attestation_type: att_type.to_owned(),
             weight: None,
             asserted_at: now,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-            scrub_key_id: Principal::A.key_id_in(tag),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: e2::kid(&seed),
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
@@ -3287,6 +3184,10 @@ mod proptests {
             tier: tier.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
+        };
+        match sig {
+            SigState::Valid => e2::row_of(&unsigned, &seed),
+            SigState::Absent => unsigned,
         }
     }
 
@@ -3314,7 +3215,6 @@ mod proptests {
         use crate::federation::{FederationDirectory, SignedAttestation};
 
         const VALID_ID: &str = "77777777-7777-5777-9777-777777777777";
-        const CORRUPT_ID: &str = "88888888-8888-5888-9888-888888888888";
         let row = |id, sig| {
             witness_row(
                 TAG,
@@ -3332,289 +3232,38 @@ mod proptests {
         sq.run_migrations().await.expect("migrations");
         register_cast(&sq, TAG).await;
 
-        sq.put_attestation(SignedAttestation {
-            attestation: row(VALID_ID, SigState::Valid),
-        })
-        .await
-        .expect("a tier=local put is admitted");
+        // v62 (E3): an edition-2 statement mapped at tier local; its id is
+        // the node-computed one.
+        let valid = row(VALID_ID, SigState::Valid);
+        let valid_id = valid.attestation_id.clone();
+        sq.put_attestation(SignedAttestation { attestation: valid })
+            .await
+            .expect("a tier=local put is admitted");
         assert_eq!(
-            sq.get_attestation(VALID_ID)
+            sq.get_attestation(&valid_id)
                 .await
                 .expect("get")
                 .expect("row")
                 .tier,
             attestation_tier::LOCAL,
             "AV-78: the STORED tier must equal the DECLARED tier — the INSERT must carry the \
-             `tier` column rather than falling through to the schema default"
+         `tier` column rather than falling through to the schema default"
         );
 
-        // The corrupt-signature row rides the SAME deferred-signature exemption.
-        // That exemption is sound ONLY while the row genuinely stays local.
-        sq.put_attestation(SignedAttestation {
-            attestation: row(CORRUPT_ID, SigState::Corrupt),
-        })
-        .await
-        .expect("the local tier defers its signature, so this is admitted by design");
-        assert_eq!(
-            sq.get_attestation(CORRUPT_ID)
-                .await
-                .expect("get")
-                .expect("row")
-                .tier,
-            attestation_tier::LOCAL,
-            "AV-78: a row admitted under the local-tier exemption must STAY local"
-        );
+        // v62 (E3): the earlier corrupt-hybrid-signature leg is deleted (no
+        // hybrid signature exists in v62).
         assert!(
-            sq.all_attestations_for(Principal::A.key_id_in(TAG).as_str())
-                .await
-                .expect("list")
-                .is_empty(),
-            "AV-78: neither local row is federation-visible, so neither replicates. THIS is \
-             what makes the CC 5.3.2.2 signature exemption safe — an unverified row that \
-             becomes federation-visible is refused by every peer that receives it"
-        );
-    }
-
-    /// **AV-76 tier-4b REGRESSION GUARD** — successor to the retired
-    /// `KNOWN_DIVERGENCE_DEDUP_BEFORE_VERIFY` pin.
-    ///
-    /// The rule the finding produced, now substrate-wide: **a dedup
-    /// short-circuit may return early to REFUSE, never to ACCEPT.** The §6.1
-    /// replay short-circuit sat ahead of the crypto gate, where its bare
-    /// `Ok(())` skipped hybrid verify AND the AV-45 write-scope gate, so a
-    /// composer matching an existing `(type, attester, references_id)` triple
-    /// was acknowledged without either gate running.
-    ///
-    /// BOTH legs are asserted, because a "fix" that simply deleted the dedup
-    /// would pass the first one and silently destroy §6.1 idempotence.
-    ///
-    /// v61 (CIRISPersist#1157) — the replay key is the ROW, `(attestation_id,
-    /// original_content_hash)`, not the triple. So the unverified probe that
-    /// matters is a corrupt-signature copy of a HELD composer under its own id
-    /// and content hash (the exact key the short-circuit answers for), and the
-    /// counter-witness is an exact re-put of that row; a distinct valid row on
-    /// the same triple is stored. Run on sqlite and postgres.
-    async fn dedup_short_circuit_body(sq: &dyn crate::federation::FederationDirectory) {
-        const TAG: &str = "dedup_short_";
-        use super::test_support::{register_cast, Family, SigState};
-        use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
-        use crate::federation::SignedAttestation;
-
-        const TARGET: &str = "99999999-9999-5999-9999-999999999999";
-        const FIRST: &str = "aaaaaaaa-aaaa-5aaa-9aaa-aaaaaaaaaaaa";
-        const FORGED: &str = "bbbbbbbb-bbbb-5bbb-9bbb-bbbbbbbbbbbb";
-        const REPLAY: &str = "cccccccc-cccc-5ccc-9ccc-cccccccccccc";
-        let composer = |id, sig| {
-            witness_row(
-                TAG,
-                id,
-                attestation_type::SUPERSEDES,
-                attestation_tier::FEDERATION,
-                cohort_scope::FEDERATION,
-                Family::Identity,
-                sig,
-                Some(TARGET),
+            sq.all_attestations_for(
+                crate::federation::edition2::fixture_switch::kid(&Principal::A.key_id_in(TAG))
+                    .as_str()
             )
-        };
-
-        register_cast(sq, TAG).await;
-        sq.put_attestation(SignedAttestation {
-            attestation: composer(FIRST, SigState::Valid),
-        })
-        .await
-        .expect("the genuine composer is admitted");
-
-        // (1) THE RULE: early-return to REFUSE, never to ACCEPT — a corrupt
-        // composer on the held triple.
-        let err = sq
-            .put_attestation(SignedAttestation {
-                attestation: composer(FORGED, SigState::Corrupt),
-            })
             .await
-            .expect_err(
-                "AV-76: a corrupt-signature composer on a held triple must be REFUSED — the \
-                 short-circuit must not return Ok ahead of the crypto gate",
-            );
-        assert_eq!(
-            err.kind(),
-            "federation_federation_tier_unverified",
-            "and refused ON THE SIGNATURE — the gate the short-circuit used to outrun"
+            .expect("list")
+            .is_empty(),
+            "AV-78: the local row is not federation-visible, so it does not replicate. THIS is \
+         what makes the CC 5.3.2.2 signature exemption safe — an unverified row that \
+         becomes federation-visible is refused by every peer that receives it"
         );
-        assert!(
-            sq.get_attestation(FORGED).await.expect("get").is_none(),
-            "and nothing is stored"
-        );
-
-        // (2) #1157 — a corrupt copy of the HELD row under its own id and
-        // content hash: the very key the row-keyed short-circuit answers
-        // `ComposerReplay` for. It still meets the crypto gate first.
-        let forged_replay = composer(FIRST, SigState::Corrupt);
-        let held = sq
-            .get_attestation(FIRST)
-            .await
-            .expect("get")
-            .expect("FIRST is held");
-        assert_eq!(
-            forged_replay.original_content_hash, held.original_content_hash,
-            "the probe carries the held row's replay key (id, content hash)"
-        );
-        let err = sq
-            .put_attestation(SignedAttestation {
-                attestation: forged_replay,
-            })
-            .await
-            .expect_err(
-                "AV-76 under #1157: a corrupt-signature copy of a HELD composer (same id, same \
-                 content hash) is refused, never acknowledged as a replay",
-            );
-        assert_eq!(
-            err.kind(),
-            "federation_federation_tier_unverified",
-            "refused ON THE SIGNATURE"
-        );
-        let after = sq
-            .get_attestation(FIRST)
-            .await
-            .expect("get")
-            .expect("FIRST is still held");
-        assert_eq!(
-            after.scrub_signature_classical, held.scrub_signature_classical,
-            "the held row keeps its genuine signature"
-        );
-
-        // (3) THE COUNTER-WITNESS: §6.1 idempotence still works, on the row.
-        sq.put_attestation(SignedAttestation {
-            attestation: composer(FIRST, SigState::Valid),
-        })
-        .await
-        .expect("an exact VALID replay of a held composer is an idempotent no-op (§6.1, #1157)");
-
-        // (4) A DISTINCT valid row on the same triple is not a replay: it is
-        // stored and ranked at read time (#1157, CC rc14 3.1.9.4).
-        sq.put_attestation(SignedAttestation {
-            attestation: composer(REPLAY, SigState::Valid),
-        })
-        .await
-        .expect("a distinct valid composer on the held triple is admitted (#1157)");
-        assert!(
-            sq.get_attestation(REPLAY).await.expect("get").is_some(),
-            "the distinct row is stored, not swallowed as a replay"
-        );
-    }
-
-    #[tokio::test]
-    async fn dedup_short_circuit_never_accepts_an_unverified_row() {
-        let sq = SqliteBackend::open_in_memory().await.expect("open sqlite");
-        sq.run_migrations().await.expect("migrations");
-        dedup_short_circuit_body(&sq).await;
-    }
-
-    /// The postgres leg of [`dedup_short_circuit_body`], on a database of its
-    /// own (the witness's ids are constants).
-    #[cfg(feature = "postgres")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn dedup_short_circuit_never_accepts_an_unverified_row_postgres() {
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            eprintln!("dedup_short_circuit postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
-            return;
-        };
-        let pg = crate::store::PostgresBackend::connect(&dsn)
-            .await
-            .expect("connect postgres");
-        pg.run_migrations().await.expect("migrations");
-        dedup_short_circuit_body(&pg).await;
-        eprintln!("dedup_short_circuit postgres: RAN");
-    }
-
-    /// **ATTESTATION-ID UNIQUENESS REGRESSION GUARD** — successor to the
-    /// retired `memory_admits_a_duplicate_attestation_id` witness.
-    ///
-    /// The memory backend had no primary-key uniqueness: a second
-    /// `put_attestation` with the same `attestation_id` and DIFFERENT content
-    /// was ACCEPTED and pushed as a second row, while sqlite refused it on the
-    /// PK. `get_attestation` then kept answering with whichever landed FIRST,
-    /// so the accepted write was silently shadowed — worse than a refusal,
-    /// because the writer believes it landed — and `list_attestations_by`
-    /// double-counted. The #541 audit's own class ("memory silently accepting
-    /// rows sqlite rejects") on the identity axis.
-    ///
-    /// The differential could not catch it alone: `snapshot_normalized` keys
-    /// the corpus BY id, so a duplicate collapses in the snapshot exactly as it
-    /// does in `get_attestation`. It was witnessed directly, and is now
-    /// asserted directly on BOTH backends.
-    #[tokio::test]
-    async fn attestation_id_uniqueness_is_enforced_on_every_backend() {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        const TAG: &str = "idunique";
-        use super::test_support::{register_cast, Family, Principal, SigState};
-        use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
-        use crate::federation::{FederationDirectory, SignedAttestation};
-
-        const ID: &str = "22222222-2222-5222-9222-222222222222";
-        let row = |family| {
-            witness_row(
-                TAG,
-                ID,
-                attestation_type::SCORES,
-                attestation_tier::FEDERATION,
-                cohort_scope::FEDERATION,
-                family,
-                SigState::Valid,
-                None,
-            )
-        };
-        // Two DIFFERENT rows sharing one id. `scores` is deliberately NOT a
-        // structural composer, so §6.1 replay dedup does not apply and the only
-        // thing standing between them is identity uniqueness.
-        let first = row(Family::Identity);
-        let second = row(Family::Reputation);
-        assert_ne!(first.attestation_envelope, second.attestation_envelope);
-
-        let sq = SqliteBackend::open_in_memory().await.expect("open sqlite");
-        sq.run_migrations().await.expect("migrations");
-        register_cast(&sq, TAG).await;
-
-        for (name, dir) in [("sqlite", &sq as &dyn FederationDirectory)] {
-            dir.put_attestation(SignedAttestation {
-                attestation: first.clone(),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("({name}) the first row is admitted: {e}"));
-            dir.put_attestation(SignedAttestation {
-                attestation: second.clone(),
-            })
-            .await
-            .expect_err(&format!(
-                "({name}) a second row under the SAME attestation_id must be REFUSED. \
-                 Accepting it is worse than refusing: the write is shadowed by the first row, \
-                 so the writer believes it landed and never retries"
-            ));
-            // v31.0.0 (#647) — the stored envelope is the CANONICAL form of
-            // what was submitted (`put_*` canonicalizes at ingest), so the
-            // "intact" comparison is against that. The claim is unchanged:
-            // the refused second write must not have overwritten the first.
-            let mut expected_first = first.attestation_envelope.clone();
-            crate::federation::canonical_at_rest::canonicalize_in_place(&mut expected_first)
-                .expect("the fixture envelope canonicalizes");
-            assert_eq!(
-                dir.get_attestation(ID)
-                    .await
-                    .expect("get")
-                    .expect("row")
-                    .attestation_envelope,
-                expected_first,
-                "({name}) the original row is intact"
-            );
-            assert_eq!(
-                dir.all_attestations_by(&Principal::A.key_id_in(TAG))
-                    .await
-                    .expect("list")
-                    .len(),
-                1,
-                "({name}) and exactly ONE row exists under that id — a duplicate would also \
-                 double-count on every read that does not go through `get_attestation`"
-            );
-        }
     }
 
     /// **AV-77 — THE FULL DE-ADMISSION LIFECYCLE, AS AN OP SEQUENCE**, on both
@@ -3689,14 +3338,14 @@ mod proptests {
                 &uuid::Uuid::new_v4().to_string(),
                 &c,
                 &c,
-                "identity:handle:v1",
+                "need:identity:handle:v1",
             ))
             .await
             .unwrap_or_else(|e| {
                 panic!(
                     "({name}) AV-77: a de-admission authored by a PEER must not bind this node — \
-                     one admitted peer evicting another from every node it can reach is the \
-                     federation-wide ban this design refuses to build: {e}"
+                 one admitted peer evicting another from every node it can reach is the \
+                 federation-wide ban this design refuses to build: {e}"
                 )
             });
 
@@ -3715,7 +3364,7 @@ mod proptests {
                 &uuid::Uuid::new_v4().to_string(),
                 &c,
                 &c,
-                "identity:handle:v1",
+                "need:identity:handle:v1",
             ))
             .await
             .expect_err(&format!(
@@ -3763,9 +3412,7 @@ mod proptests {
         );
         // And the model clock must sit BEFORE that horizon, or a row would
         // declare an expiry earlier than its own assertion.
-        let clock_start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .expect("fixed instant")
-            .with_timezone(&chrono::Utc);
+        let clock_start = super::test_support::harness_clock_start();
         assert!(
             clock_start < harness_expires_at(),
             "EXPIRY HORIZON: the model clock start must precede the declared expiry"
@@ -3802,9 +3449,7 @@ mod proptests {
 
         // The LATEST instant any sequence can reach: the pinned clock start
         // plus the largest advance `arb_clock` can draw, at every op.
-        let clock_start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .expect("fixed instant")
-            .with_timezone(&chrono::Utc);
+        let clock_start = super::test_support::harness_clock_start();
         let latest = clock_start + chrono::Duration::seconds(3600 * MAX_OPS as i64);
 
         for (label, at, expires) in [
@@ -4087,7 +3732,7 @@ mod proptests {
         eprintln!(
             "META-COVERAGE: {} op kinds over {DRAWS} draws; {EXECUTED} sequences executed \
              ({admitted} ops admitted / {refused} refused); {with_signed}/{EXECUTED} \
-             ({fraction:.2}) left a hybrid-signed federation-tier row; {with_deadmit}/{EXECUTED} \
+             ({fraction:.2}) left a statement-carrying federation-tier row; {with_deadmit}/{EXECUTED} \
              ({dead_fraction:.3}) reached the AV-77 de-admission gate ({deadmitted} writes \
              refused by it)",
             seen_kinds.len(),

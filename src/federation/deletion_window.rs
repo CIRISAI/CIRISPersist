@@ -697,13 +697,11 @@ pub(crate) mod watch_witness {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use super::*;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    use crate::federation::edition2::fixture_switch as e2;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::hard_case::{HardCaseEvent, HardCaseFilter};
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    use crate::federation::tier_ingest::test_support as ts;
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::types::{attestation_tier, attestation_type};
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    use crate::federation::SignedAttestation;
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     use crate::store::Backend as _;
 
@@ -732,17 +730,13 @@ pub(crate) mod watch_witness {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     const LATER_SWEEP_AT: &str = "2026-09-01T00:00:00Z";
 
-    /// A deterministic, per-run attestation id. A UUIDv5 because postgres
-    /// types the column as `uuid`; per-`tag` because the postgres arm runs
-    /// against a SHARED database.
+    /// The row ids this run's published rows were stored under, by label.
+    /// v62 (E4): an edition-2 row id is computed by the node from the
+    /// statement (`e2::rid`), so the fixture records what [`publish`]
+    /// returned rather than choosing one. Per-`tag` keys stay distinct on the
+    /// SHARED postgres database because each `tag` signs with its own keys.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    fn row_id(tag: &str, label: &str) -> String {
-        uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_OID,
-            format!("ciris-persist/deletion_window/{tag}/{label}").as_bytes(),
-        )
-        .to_string()
-    }
+    type Ids = std::collections::BTreeMap<&'static str, String>;
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn producer_key(tag: &str) -> String {
@@ -754,12 +748,14 @@ pub(crate) mod watch_witness {
     }
 
     /// A published (federation-tier) row, optionally committing a
-    /// `deletion_window`. Signed LAST, over the final envelope, so the
+    /// `deletion_window`. v62 (E4): under `chat:*`, a family Verify's
+    /// matcher registers (`identity_binding:v1` is not one, and the door
+    /// refuses an unregistered dimension). Signed LAST, over the final envelope, so the
     /// mandatory federation-tier ingest gate admits it.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn published(tag: &str, label: &str, window: Option<&str>) -> Attestation {
         let mut envelope = serde_json::json!({
-            "dimension": "identity_binding:v1",
+            "dimension": "chat:dw_report:v1",
             "score": 1.0,
             "confidence": 0.9,
         });
@@ -785,7 +781,7 @@ pub(crate) mod watch_witness {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn withdraws(tag: &str, label: &str, issuer: &str, target_id: &str) -> Attestation {
         let envelope = serde_json::json!({
-            "dimension": "identity_binding:v1",
+            "dimension": "chat:dw_report:v1",
             "score": 1.0,
             "confidence": 0.9,
             "references_attestation_id": target_id,
@@ -800,6 +796,8 @@ pub(crate) mod watch_witness {
         )
     }
 
+    /// The earlier-shaped literal; [`publish`] offers it as `attesting`'s
+    /// edition-2 statement. `label` names it in a failure message only.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn row(
         tag: &str,
@@ -809,9 +807,8 @@ pub(crate) mod watch_witness {
         envelope: serde_json::Value,
         at: DateTime<Utc>,
     ) -> Attestation {
-        let (hash, classical, pqc) = ts::sign_envelope(attesting, &envelope);
-        let mut sealed_row_ = Attestation {
-            attestation_id: row_id(tag, label),
+        Attestation {
+            attestation_id: format!("dw-{tag}-{label}"),
             attesting_key_id: attesting.to_owned(),
             attested_key_id: subject_key(tag),
             attestation_type: att_type.to_owned(),
@@ -819,9 +816,9 @@ pub(crate) mod watch_witness {
             asserted_at: at,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: hash,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: attesting.to_owned(),
             scrub_timestamp: at,
             pqc_completed_at: None,
@@ -832,21 +829,27 @@ pub(crate) mod watch_witness {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(
-            attesting,
-            &mut sealed_row_,
-        );
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+        }
     }
 
+    /// Put `row` as its attester's edition-2 statement; the stored row id.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn publish(dir: &dyn FederationDirectory, row: Attestation) {
-        let id = row.attestation_id.clone();
-        dir.put_attestation(SignedAttestation { attestation: row })
+    async fn publish(dir: &dyn FederationDirectory, row: Attestation) -> String {
+        let label = row.attestation_id.clone();
+        let stored = e2::try_put_row(dir, &row, &row.attesting_key_id.clone())
             .await
-            .unwrap_or_else(|e| panic!("put_attestation {id}: {e}"));
+            .unwrap_or_else(|e| panic!("put {label}: {e}"));
+        e2::rid(&stored)
+    }
+
+    /// The producer and subject keys, live as edition-2 `key:record`s.
+    /// `user` records carry no end, so the fixed 2026 instants stay inside
+    /// the keys' liveness.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn keys(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::types::identity_type::USER;
+        e2::put_key(dir, &producer_key(tag), &[USER]).await;
+        e2::put_key(dir, &subject_key(tag), &[USER]).await;
     }
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -864,18 +867,15 @@ pub(crate) mod watch_witness {
     /// a database with every other test, so a global count proves nothing;
     /// tag-scoping is what makes the assertion honest there.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn mine(dir: &dyn FederationDirectory, kind: &str, tag: &str) -> Vec<HardCaseEvent> {
-        let ids: Vec<String> = ["breached", "future", "deleted", "plain", "malformed"]
-            .iter()
-            .map(|l| row_id(tag, l))
-            .collect();
+    async fn mine(dir: &dyn FederationDirectory, kind: &str, ids: &Ids) -> Vec<HardCaseEvent> {
+        let ids: Vec<&String> = ids.values().collect();
         breach_events(dir, kind)
             .await
             .into_iter()
             .filter(|e| {
                 e.target_key_id
                     .as_deref()
-                    .is_some_and(|t| ids.iter().any(|i| i == t))
+                    .is_some_and(|t| ids.iter().any(|i| i.as_str() == t))
             })
             .collect()
     }
@@ -887,42 +887,37 @@ pub(crate) mod watch_witness {
     /// a database and only the tag-scoped facts are its to assert.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn exercise(dir: &dyn FederationDirectory, tag: &str, fresh: bool) {
-        ts::register_hybrid_key(dir, &producer_key(tag)).await;
-        ts::register_hybrid_key(dir, &subject_key(tag)).await;
+        keys(dir, tag).await;
+        let mut ids = Ids::new();
 
         // The breach: published with a deletion window, the SUBJECT revoked,
         // the window passed, and the producer never deleted.
-        publish(dir, published(tag, "breached", Some(PAST_WINDOW))).await;
-        // Negative 1 — the window has not passed yet.
-        publish(dir, published(tag, "future", Some(FUTURE_WINDOW))).await;
-        // Negative 2 — window passed, but the PRODUCER retracted the row.
-        publish(dir, published(tag, "deleted", Some(PAST_WINDOW))).await;
-        // Negative 3 — no commitment at all; the lifecycle rule does not apply.
-        publish(dir, published(tag, "plain", None)).await;
-        // A producer defect: a deadline that enforces nothing.
-        publish(dir, published(tag, "malformed", Some("whenever"))).await;
+        for (label, window) in [
+            ("breached", Some(PAST_WINDOW)),
+            // Negative 1 — the window has not passed yet.
+            ("future", Some(FUTURE_WINDOW)),
+            // Negative 2 — window passed, but the PRODUCER retracted the row.
+            ("deleted", Some(PAST_WINDOW)),
+            // Negative 3 — no commitment at all; the lifecycle rule does not apply.
+            ("plain", None),
+            // A producer defect: a deadline that enforces nothing.
+            ("malformed", Some("whenever")),
+        ] {
+            ids.insert(label, publish(dir, published(tag, label, window)).await);
+        }
+        let row_id = |label: &str| ids[label].clone();
 
         // The subject's revocation is the DEMAND, not the proof — it must NOT
         // clear the breach (admission rule 2: subject named in subject_key_ids).
         publish(
             dir,
-            withdraws(
-                tag,
-                "w-subject",
-                &subject_key(tag),
-                &row_id(tag, "breached"),
-            ),
+            withdraws(tag, "w-subject", &subject_key(tag), &row_id("breached")),
         )
         .await;
         // The producer's own retraction IS the proof (admission rule 1).
         publish(
             dir,
-            withdraws(
-                tag,
-                "w-producer",
-                &producer_key(tag),
-                &row_id(tag, "deleted"),
-            ),
+            withdraws(tag, "w-producer", &producer_key(tag), &row_id("deleted")),
         )
         .await;
 
@@ -931,7 +926,7 @@ pub(crate) mod watch_witness {
             .await
             .expect("watch runs");
 
-        let breaches = mine(dir, kind::DELETION_WINDOW_BREACH, tag).await;
+        let breaches = mine(dir, kind::DELETION_WINDOW_BREACH, &ids).await;
         assert_eq!(
             breaches.len(),
             1,
@@ -941,21 +936,21 @@ pub(crate) mod watch_witness {
         let ev = &breaches[0];
         assert_eq!(
             ev.target_key_id.as_deref(),
-            Some(row_id(tag, "breached").as_str())
+            Some(row_id("breached").as_str())
         );
         assert_eq!(
             ev.subject_key_id.as_deref(),
-            Some(producer_key(tag).as_str()),
+            Some(e2::kid(&producer_key(tag)).as_str()),
             "the breaching producer is named"
         );
         assert_eq!(ev.detail["deletion_window"], t(PAST_WINDOW).to_rfc3339());
-        assert_eq!(ev.detail["producer_key_id"], producer_key(tag));
-        assert_eq!(ev.detail["attestation_id"], row_id(tag, "breached"));
+        assert_eq!(ev.detail["producer_key_id"], e2::kid(&producer_key(tag)));
+        assert_eq!(ev.detail["attestation_id"], row_id("breached"));
         assert_eq!(ev.detail["observed_at"], now.to_rfc3339());
         assert_eq!(ev.emitted_at, now);
 
         // The malformed window is flagged, under its own suffix.
-        let malformed = mine(dir, kind::DELETION_WINDOW_MALFORMED, tag).await;
+        let malformed = mine(dir, kind::DELETION_WINDOW_MALFORMED, &ids).await;
         assert_eq!(
             malformed.len(),
             1,
@@ -963,13 +958,13 @@ pub(crate) mod watch_witness {
         );
         assert_eq!(
             malformed[0].target_key_id.as_deref(),
-            Some(row_id(tag, "malformed").as_str())
+            Some(row_id("malformed").as_str())
         );
 
         // The negatives: no signal for a live window, a deleted row, or a row
         // that never committed one.
         for label in ["future", "deleted", "plain"] {
-            let id = row_id(tag, label);
+            let id = row_id(label);
             assert!(
                 !breaches
                     .iter()
@@ -1013,7 +1008,7 @@ pub(crate) mod watch_witness {
             .await
             .expect("later tick");
         assert_eq!(later.breaches, report.breaches);
-        let after = mine(dir, kind::DELETION_WINDOW_BREACH, tag).await;
+        let after = mine(dir, kind::DELETION_WINDOW_BREACH, &ids).await;
         assert_eq!(after.len(), 1, "no duplicate evidence after three passes");
         assert_eq!(
             after[0].emitted_at, now,
@@ -1034,10 +1029,9 @@ pub(crate) mod watch_witness {
         dir: &dyn FederationDirectory,
         tag: &str,
     ) -> (String, DateTime<Utc>) {
-        ts::register_hybrid_key(dir, &producer_key(tag)).await;
-        ts::register_hybrid_key(dir, &subject_key(tag)).await;
-        publish(dir, published(tag, "breached", Some(PAST_WINDOW))).await;
-        (row_id(tag, "breached"), t(SWEEP_AT))
+        keys(dir, tag).await;
+        let id = publish(dir, published(tag, "breached", Some(PAST_WINDOW))).await;
+        (id, t(SWEEP_AT))
     }
 
     #[cfg(feature = "sqlite")]

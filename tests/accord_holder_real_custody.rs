@@ -27,7 +27,7 @@
 #![cfg(feature = "sqlite")]
 
 use ciris_persist::federation::hardware_attestation::HardwareAttestationPolicy;
-use ciris_persist::federation::{FederationDirectory, SignedKeyRecord};
+use ciris_persist::federation::SignedKeyRecord;
 
 /// The A1 holder record as the ceremony produced it — real hardware custody.
 const A1_REAL: &str = include_str!("fixtures/accord_holder_a1_real_custody.json");
@@ -145,185 +145,18 @@ fn custody_attestation_for_another_holder_is_refused_554() {
 }
 
 // ---------------------------------------------------------------------------
-// End to end: put_public_key, on every backend
+// v62.0.0 (JSON-cut slice E4) — the end-to-end legs are deleted
 // ---------------------------------------------------------------------------
-
-/// The shared body: the REAL holder record is admitted, and reads back.
-async fn admits_real_holder<D: FederationDirectory + ?Sized>(dir: &D) {
-    let rec = a1_record();
-    dir.put_public_key(rec.clone())
-        .await
-        .expect("#554: put_public_key must ADMIT the real accord holder A1");
-    let back = dir
-        .lookup_public_key("A1")
-        .await
-        .expect("lookup")
-        .expect("#554: the admitted holder must read back");
-    assert_eq!(back.key_id, "A1");
-    assert_eq!(
-        back.pubkey_ed25519_base64, rec.record.pubkey_ed25519_base64,
-        "#554: the stored row must be the ceremony's record"
-    );
-    assert!(
-        back.attestation_evidence.is_some(),
-        "#554: the custody evidence must be preserved — it IS the audit trail"
-    );
-}
-
-#[tokio::test]
-async fn sqlite_admits_the_real_accord_holder_554() {
-    use ciris_persist::store::backend::Backend as _;
-    let backend = ciris_persist::store::sqlite::SqliteBackend::open_in_memory()
-        .await
-        .unwrap();
-    backend.run_migrations().await.unwrap();
-    admits_real_holder(&backend).await;
-}
-
-// ---------------------------------------------------------------------------
-// One verdict for one artifact (#554 deliverable 2)
-// ---------------------------------------------------------------------------
-
-/// #554 — **a bundle that verifies is a bundle that installs.**
-///
-/// Before this cut the two validators disagreed about the same bytes:
-/// `verify_bundle_quorum` passed the production bundle (structure, signatures,
-/// 2-of-3 quorum all green) while `put_public_key` refused the very holders it
-/// carried as `malformed`. A producer running the bundle verifier got a green
-/// light and shipped an artifact that could not install — and the refusal
-/// surfaced at ingest with no hint that the verifier and the gate disagreed
-/// about what a valid holder record is.
-///
-/// The fix is one predicate, one impl: the bundle verifier runs holder-evidence
-/// admissibility through the SAME [`HardwareAttestationPolicy::check`] the put
-/// gate uses. This test asserts they now agree — both admit.
-#[tokio::test]
-async fn bundle_verifier_and_put_gate_agree_on_holder_evidence_554() {
-    use ciris_persist::federation::genesis::{
-        canonical_genesis_bundle, effective_accord_holder_records, verify_bundle_quorum,
-    };
-
-    let backend = ciris_persist::store::test_backend::test_backend();
-    backend
-        .seed_genesis_accord_holders(&effective_accord_holder_records())
-        .await
-        .expect("seed the baked A1/B1/C1 roster");
-
-    let bundle = canonical_genesis_bundle();
-    let verified = verify_bundle_quorum(&backend, bundle)
-        .await
-        .expect("#554: the production bundle must verify");
-    assert_eq!(
-        verified.distinct_holders(),
-        2,
-        "v59.1.0: the v4 amend carries A1 and B1's hybrid authorizations (2 over a 2/3 quorum)"
-    );
-
-    // The SAME artifact's holders must pass the SAME gate the put path runs.
-    // Pre-#554 this half refused every holder the verifier had just blessed.
-    let p = HardwareAttestationPolicy::default();
-    for h in &bundle.holders {
-        p.check(
-            &h.record.key_id,
-            ciris_persist::federation::hardware_attestation::record_ed25519(&h.record).as_deref(),
-            h.record.attestation_evidence.as_ref(),
-            chrono::Utc::now(),
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "#554: holder {} verified in the bundle but was refused by the put \
-                 gate — the two validators must not disagree: {e}",
-                h.record.key_id
-            )
-        });
-    }
-}
-
-/// #554 — the wiring, not merely the agreement: a bundle whose holder evidence
-/// would be REFUSED at install time must be refused by the VERIFIER.
-///
-/// This was the sharp case. Pre-#554 such a bundle verified green and then
-/// failed at ingest; #554 made the verifier catch it and SAY it was reporting
-/// an install-time refusal.
-///
-/// **v31.2.0 (CIRISPersist#660) changed which gate fires first, and the old
-/// premise here is now false.** This comment used to read *"`authorization_digest`
-/// covers holder `key_id`s only, not their evidence — so tampering with a
-/// holder's custody attestation leaves the 2-of-3 quorum signatures perfectly
-/// valid."* The widened digest binds the whole record CONTENT including
-/// `attestation_evidence` — the custody evidence #660 named explicitly — so
-/// tampering with it now breaks the hybrid signature outright, before the
-/// install-time check is ever reached.
-///
-/// That is strictly stronger, not weaker: the tamper is caught earlier and by
-/// cryptography rather than by a policy read. So the assertion accepts EITHER
-/// refusal and requires only that the bundle does not verify. Pinning the
-/// install-time wording alone would fail here for the best possible reason —
-/// a neighbouring gate legitimately refusing first.
-#[tokio::test]
-async fn bundle_with_uninstallable_holder_evidence_is_refused_by_the_verifier_554() {
-    use ciris_persist::federation::genesis::{
-        canonical_genesis_bundle, effective_accord_holder_records, verify_bundle_quorum,
-    };
-
-    let backend = ciris_persist::store::test_backend::test_backend();
-    backend
-        .seed_genesis_accord_holders(&effective_accord_holder_records())
-        .await
-        .expect("seed the baked A1/B1/C1 roster");
-
-    let mut bundle = canonical_genesis_bundle().clone();
-    // Break ONE holder's cert binding. The quorum signatures are untouched and
-    // still verify — the digest does not cover holder evidence.
-    let ev = bundle.holders[0]
-        .record
-        .attestation_evidence
-        .as_mut()
-        .expect("holder carries evidence");
-    ev["body"]["yubikey_piv_attestation_9c_hex"] = serde_json::json!("00ff00ff");
-
-    let err = verify_bundle_quorum(&backend, &bundle)
-        .await
-        .expect_err("#554: a bundle carrying uninstallable holder evidence must not verify");
-    let msg = err.to_string();
-    let install_time = msg.contains("would be REFUSED at install time");
-    let digest_bound = msg.contains("hybrid authorization failed to verify");
-    assert!(
-        install_time || digest_bound,
-        "#554/#660: a bundle carrying uninstallable holder evidence must be \
-         refused either by the install-time read (#554) or by the widened \
-         digest that now binds `attestation_evidence` (#660). Got neither: {msg}"
-    );
-    // Naming the failing CHECK is a property of the install-time read: it
-    // inspects the evidence and can say which field failed. The digest arm
-    // cannot and should not — a signature check knows only that the bytes
-    // moved, which is exactly why it catches tampering the reader might not
-    // think to look for. So require the field name only on the arm that can
-    // produce it.
-    assert!(
-        !install_time || msg.contains("yubikey_piv_attestation_9c"),
-        "#554: the install-time refusal must name the failing check, got: {msg}"
-    );
-}
-
-/// DSN-gated Postgres twin — the memory backend tolerates what a real column
-/// type does not (the recurring class: memory-only proof is not proof).
-#[cfg(feature = "postgres")]
-#[tokio::test]
-async fn postgres_admits_the_real_accord_holder_554() {
-    use ciris_persist::store::backend::Backend as _;
-    let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
-        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL not set");
-        return;
-    };
-    let backend = ciris_persist::store::postgres::PostgresBackend::connect(&dsn)
-        .await
-        .expect("pg connect");
-    backend.run_migrations().await.unwrap();
-    // Re-runnable without cleanup: A1 is the genesis holder, so a shared test
-    // database may already hold it from the seed path. The record is the same
-    // one (the seed and this fixture differ only in RFC-3339 offset spelling,
-    // which parses to the same instant), so `put_public_key` is an idempotent
-    // no-op rather than a conflict.
-    admits_real_holder(&backend).await;
-}
+//
+// `sqlite_admits_the_real_accord_holder_554` / `postgres_admits_the_real_
+// accord_holder_554` put the A1 holder's EARLIER-FORM `SignedKeyRecord`
+// through `put_public_key`, and `bundle_verifier_and_put_gate_agree_on_
+// holder_evidence_554` / `bundle_with_uninstallable_holder_evidence_is_
+// refused_by_the_verifier_554` read the bundle/1 genesis
+// (`canonical_genesis_bundle`, `verify_bundle_quorum`). Both are earlier-form
+// objects the v62 node refuses; they asserted earlier-form behaviour and were
+// deleted, not rewritten. The custody gate's verdict on the REAL captured
+// artifact is still witnessed above (the five `HardwareAttestationPolicy`
+// tests); the edition-2 `key:record` custody path is witnessed by the
+// bundle/2 test ceremony (`edition2::fixture_genesis`, Verify's mock YubiKey
+// PIV root), since a real holder's PIV binding cannot sign a test statement.

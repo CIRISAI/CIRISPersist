@@ -14,7 +14,10 @@
 //! which is exactly what these doors exist to refuse.
 
 use super::service::LedgerService;
-use super::standard::{derive_ledger_id, fork_evidence_id, ForkEvidence};
+use super::standard::{
+    contest_evidence_id, contest_evidence_json, derive_ledger_id, fork_evidence_id, ForkEvidence,
+    LEDGER_TRIPLE_CONTESTED,
+};
 use super::types::{
     AdvanceOutcome, ForkEvidenceRow, LedgerCheckpointRow, LedgerEntryRangeRow, LedgerHeadRow,
     RegisterOutcome,
@@ -79,6 +82,37 @@ fn decode_head_row(row: &tokio_postgres::Row) -> Result<LedgerHeadRow, Error> {
 
 const HEAD_COLUMNS: &str = "ledger_id, owner_key_id, unit, standard_version, seq, head_hash, \
                             witness_anchor_ref, source_envelope_ref, created_at, updated_at";
+
+/// v62.0.0 (wave GC6; CC 2.7 rc21 X4) — keep one contested head: a
+/// `double_head` fork-evidence row keyed by
+/// [`contest_evidence_id`](super::standard::contest_evidence_id) (idempotent).
+async fn keep_contender(
+    client: &tokio_postgres::Client,
+    ledger_id: &str,
+    seq: u64,
+    head_hash: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    let seq_i = validate::seq_as_i64(seq, "seq")?;
+    let evidence = contest_evidence_json(head_hash);
+    client
+        .execute(
+            "INSERT INTO cirislens.ledger_fork_evidence (\
+                evidence_id, ledger_id, seq, fork_kind, evidence_json, detected_at\
+             ) VALUES ($1, $2, $3, 'double_head', $4, $5) \
+             ON CONFLICT DO NOTHING",
+            &[
+                &contest_evidence_id(ledger_id, seq, head_hash),
+                &ledger_id,
+                &seq_i,
+                &evidence,
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| map_pg_error(e, "advance_head contest keep"))?;
+    Ok(())
+}
 
 impl LedgerService for PostgresBackend {
     async fn register_ledger(
@@ -176,6 +210,30 @@ impl LedgerService for PostgresBackend {
             .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        // v62.0.0 (wave GC6; CC 2.7 rc21 X4) — a contested ledger concludes
+        // no head while both stand: every advance answers `Contested`, and a
+        // head offered AT a contested seq is kept as one more contender.
+        // Asked BEFORE the guarded move: a contest clears the stored head,
+        // which the guard below would otherwise read as "no head yet".
+        let contested: Vec<i64> = client
+            .query(
+                "SELECT DISTINCT seq FROM cirislens.ledger_fork_evidence \
+                 WHERE ledger_id = $1 AND fork_kind = 'double_head' \
+                   AND evidence_json->>'reason' = $2",
+                &[&ledger_id, &LEDGER_TRIPLE_CONTESTED],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "advance_head contest read"))?
+            .iter()
+            .map(|r| r.try_get::<_, i64>(0))
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        if !contested.is_empty() {
+            if contested.contains(&seq_i) {
+                keep_contender(&client, ledger_id, seq, head_hash, now).await?;
+            }
+            return Ok(AdvanceOutcome::Contested);
+        }
         // Guarded forward move: only a strictly-later head (or the first)
         // lands. A zero-row result is then classified by re-read.
         let moved = client
@@ -183,7 +241,10 @@ impl LedgerService for PostgresBackend {
                 "UPDATE cirislens.ledger_heads SET \
                     seq = $2, head_hash = $3, witness_anchor_ref = $4, \
                     source_envelope_ref = $5, updated_at = $6 \
-                 WHERE ledger_id = $1 AND (seq IS NULL OR seq < $2)",
+                 WHERE ledger_id = $1 AND (seq IS NULL OR seq < $2) \
+                   AND NOT EXISTS (SELECT 1 FROM cirislens.ledger_fork_evidence f \
+                       WHERE f.ledger_id = $1 AND f.fork_kind = 'double_head' \
+                         AND f.evidence_json->>'reason' = $7)",
                 &[
                     &ledger_id,
                     &seq_i,
@@ -191,6 +252,7 @@ impl LedgerService for PostgresBackend {
                     &witness_anchor_ref,
                     &source_envelope_ref,
                     &now,
+                    &LEDGER_TRIPLE_CONTESTED,
                 ],
             )
             .await
@@ -235,9 +297,25 @@ impl LedgerService for PostgresBackend {
                 }
                 Ok(AdvanceOutcome::Unchanged)
             }
-            (Some(c), Some(h)) if seq_i == c => Err(Error::Conflict(format!(
-                "fork-shaped head for {ledger_id} at seq {seq}: stored {h}, offered {head_hash}"
-            ))),
+            (Some(c), Some(h)) if seq_i == c => {
+                // Fork-shaped: same seq, different hash. v62.0.0 (wave GC6;
+                // CC 2.7 rc21 X4) — CONTESTED, not first-wins: both heads are
+                // kept as evidence and the stored head is cleared (re-keyed on
+                // the head we read, so a racing advance is not erased), so
+                // neither concludes, in either arrival order.
+                keep_contender(&client, ledger_id, seq, &h, now).await?;
+                keep_contender(&client, ledger_id, seq, head_hash, now).await?;
+                client
+                    .execute(
+                        "UPDATE cirislens.ledger_heads SET \
+                            seq = NULL, head_hash = NULL, updated_at = $2 \
+                         WHERE ledger_id = $1 AND seq = $3 AND head_hash = $4",
+                        &[&ledger_id, &now, &seq_i, &h],
+                    )
+                    .await
+                    .map_err(|e| map_pg_error(e, "advance_head contest clear"))?;
+                Ok(AdvanceOutcome::Contested)
+            }
             (Some(c), _) if seq_i < c => Ok(AdvanceOutcome::Stale),
             // seq > current or current NULL, yet the guarded UPDATE moved
             // nothing: a concurrent writer advanced past us between the two
@@ -644,21 +722,36 @@ mod tests {
             svc.advance_head(&id, 5, "h5", None, None).await.unwrap(),
             AdvanceOutcome::Stale
         );
-        let err = svc
-            .advance_head(&id, 7, "h7-other", None, None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind(), "ledgers_conflict");
-        assert!(err.to_string().contains("fork-shaped"), "{err}");
+        // v62.0.0 (wave GC6; CC 2.7 rc21 X4, I3885) — same seq, DIFFERENT
+        // hash: CONTESTED. Both kept, neither concludes.
+        assert_eq!(
+            svc.advance_head(&id, 7, "h7-other", None, None)
+                .await
+                .unwrap(),
+            AdvanceOutcome::Contested
+        );
         let row = svc.get_ledger(&id).await.unwrap().unwrap();
-        assert_eq!(row.head_hash.as_deref(), Some("h7"));
-        assert_eq!(row.witness_anchor_ref.as_deref(), Some("anchor-7"));
+        assert_eq!((row.seq, row.head_hash.as_deref()), (None, None));
+        assert_eq!(
+            svc.advance_head(&id, 8, "h8", None, None).await.unwrap(),
+            AdvanceOutcome::Contested,
+            "I3885: nothing advances a contested ledger"
+        );
 
         let err = svc
             .advance_head(&unique("ledger-nope"), 0, "h", None, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "ledgers_not_found");
+    }
+
+    /// I3885 (wave GC6) — contested in either arrival order (postgres).
+    #[tokio::test]
+    async fn i3885_two_heads_at_one_seq_are_contested_either_order_pg() {
+        let Some(svc) = svc().await else {
+            return;
+        };
+        crate::ledgers::service::contest_either_order_body(&svc, &unique("i3885-pg")).await;
     }
 
     #[tokio::test]
@@ -739,20 +832,25 @@ mod tests {
             }));
         }
         for a in advances {
-            match a.await.unwrap() {
-                Ok(_) => {}
-                Err(e) => assert_eq!(e.kind(), "ledgers_conflict", "{e}"),
-            }
+            // v62.0.0 (wave GC6; CC 2.7 rc21 X4) — no refusal: every racer
+            // answers an outcome.
+            a.await.unwrap().expect("I3885: a fork race refuses nobody");
         }
+        // Both camps met: the ledger is contested, neither head concludes,
+        // and both are kept.
         let row = svc.get_ledger(&id).await.unwrap().unwrap();
-        assert_eq!(row.seq, Some(3));
+        assert_eq!((row.seq, row.head_hash.as_deref()), (None, None));
+        let kept: std::collections::BTreeSet<String> = svc
+            .list_fork_evidence(&id)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|f| f.evidence_json["head_hash"].as_str().map(str::to_owned))
+            .collect();
         assert!(
-            row.head_hash.as_deref() == Some("hash-a")
-                || row.head_hash.as_deref() == Some("hash-b"),
-            "one of the offered hashes, never a blend: {:?}",
-            row.head_hash
+            kept.contains("hash-a") && kept.contains("hash-b"),
+            "{kept:?}"
         );
-        assert_eq!(row.seq.is_some(), row.head_hash.is_some());
 
         // ATOMICITY under contention — eight DIFFERENT checkpoints at one
         // seq: exactly one lands (Ok(true)), the rest refuse Conflict, and

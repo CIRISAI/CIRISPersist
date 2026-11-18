@@ -109,6 +109,7 @@
 
 use sha2::{Digest, Sha256};
 
+use super::edition2::fold::{self, Dep};
 use super::types::{algorithm, KeyRecord};
 use super::{Error, FederationDirectory};
 use crate::verify::canonical::ceg_produce_canonicalize;
@@ -762,9 +763,20 @@ async fn plan_same_pubkey_transition(
     // owner-binding attestation, a doubly-owned one needs a duplicate
     // ownership claim resolved. Collapsing them would mislabel the common
     // case (unowned) as the anomaly.
+    //
+    // v62.0.0 (wave GC3; CC 2.7.3) — who owns the key is read from OTHER rows
+    // (the owner binding and the node's voice over it; `owner_of` declares
+    // `key:<key_id>`): an unseated owner HOLDS the upgrade (`owner_unseated`;
+    // an ambiguous one `owner_ambiguous`, marked by `owner_of`) inside a fold
+    // attempt, re-folded when a binding
+    // lands or is withdrawn. Outside an attempt the plan is unchanged.
     match super::admission::owner_of(directory, &record.key_id).await {
         Ok(Some(_)) => Ok(ReplicatedKeyPlan::Upgrade),
-        Ok(None) => Ok(refused(KeyRefusalReason::OwnerAbsent)),
+        Ok(None) => {
+            fold::note(fold::reason::OWNER_UNSEATED);
+            Ok(refused(KeyRefusalReason::OwnerAbsent))
+        }
+        // G0 v3: `owner_of` has already marked `owner_ambiguous` itself.
         Err(Error::AmbiguousNodeOwner { .. }) => Ok(refused(KeyRefusalReason::OwnerAmbiguous)),
         Err(e) => Err(e),
     }
@@ -1198,54 +1210,40 @@ where
     Admit: std::future::Future<Output = Result<(), Error>>,
     Held: std::future::Future<Output = Result<bool, Error>>,
 {
+    // The precheck reads the record's own bytes and the key's own held row
+    // (the signer's key plane): a door refusal, not a fold.
     let arm = match supersede_precheck(existing, record) {
         SupersedePrecheck::Refuse => return Ok(false),
         arm => arm,
     };
+    // v62.0.0 (wave GC3; CC 2.7.3) — the quorum and the withdrawal are OTHER
+    // rows (the accord roster's co-scrubs, the withdrawal tombstone): a
+    // `false` from them HOLDS the supersede inside a fold attempt, reading
+    // the key, so a conferral or withdrawal of it re-folds the record.
+    fold::reads(Dep::key(&record.key_id));
     // m-of-n quorum re-verified from persist's own state (+ withdrawal-wins):
     // nothing reaches the canonical row without the live quorum, on either arm.
     match admit_incoming.await {
         Ok(()) => {}
         Err(Error::CanonicalRoleNotAccordConferred { .. })
-        | Err(Error::CanonicalRoleWithdrawn { .. }) => return Ok(false),
+        | Err(Error::CanonicalRoleWithdrawn { .. }) => {
+            fold::note(fold::reason::RE_SCRUB);
+            return Ok(false);
+        }
         Err(e) => return Err(e),
     }
     match arm {
         SupersedePrecheck::Newer => Ok(true),
         // v53.1.4 — a repair replaces only a held row the quorum never signed.
-        SupersedePrecheck::EqualInstant => Ok(!existing_carries_quorum.await?),
+        SupersedePrecheck::EqualInstant => {
+            let held_carries = existing_carries_quorum.await?;
+            if held_carries {
+                fold::note(fold::reason::ALREADY_ANCHORED_IDENTICAL);
+            }
+            Ok(!held_carries)
+        }
         SupersedePrecheck::Refuse => Ok(false),
     }
-}
-
-/// [`verify_canonical_supersede`] with an EXPLICIT accord-holder roster — the
-/// testable core (tests co-scrub against a distinct test roster; the production
-/// wrapper pins the genesis A1/B1/C1). Mirrors
-/// [`check_canonical_role_admission_over_roster`](super::admission::check_canonical_role_admission_over_roster).
-/// Test-only: the production apply path always resolves the genesis roster via
-/// [`verify_canonical_supersede`].
-#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
-pub(crate) async fn verify_canonical_supersede_over_roster(
-    directory: &dyn FederationDirectory,
-    existing: &KeyRecord,
-    record: &KeyRecord,
-    roster_key_ids: &[String],
-) -> Result<bool, Error> {
-    decide_canonical_supersede(
-        existing,
-        record,
-        super::admission::check_canonical_role_admission_over_roster_legacy(
-            directory,
-            record,
-            roster_key_ids,
-        ),
-        super::admission::record_carries_accord_scrub_over_roster(
-            directory,
-            existing,
-            roster_key_ids,
-        ),
-    )
-    .await
 }
 
 /// The arm the quorum-independent half of the #405 supersede policy selects
@@ -1640,16 +1638,28 @@ where
         // Not 32 raw bytes: the registration gate refuses it on its own terms.
         return Ok(());
     };
-    if record.key_id.ends_with(&format!("-{fp}")) || fingerprint_exempt(directory, record).await? {
+    if record.key_id.ends_with(&format!("-{fp}")) {
         return Ok(());
     }
-    Err(Error::malformed_row(
-        "key_registration",
-        super::malformed_row::KEY_ID_FINGERPRINT_MISMATCH,
-        format!(
-            "key_id {:?} does not end in -{fp}, the fingerprint of its own Ed25519 key (CC \
-             2.6.8, CLM-key-id-fingerprint-verified)",
-            record.key_id
+    // v62.0.0 (wave GC3; CC 2.7.3) — the suffix is the record's own bytes,
+    // but the family exemption reads OTHER rows (a held family of this id):
+    // a mismatch HOLDS the record inside a fold attempt
+    // (`key_id_fingerprint_mismatch`), reading the id, so a family's arrival
+    // re-folds it. Outside an attempt it is the refusal it was.
+    fold::reads(Dep::key(&record.key_id));
+    if fingerprint_exempt(directory, record).await? {
+        return Ok(());
+    }
+    Err(fold::hold(
+        fold::reason::KEY_ID_FINGERPRINT_MISMATCH,
+        Error::malformed_row(
+            "key_registration",
+            super::malformed_row::KEY_ID_FINGERPRINT_MISMATCH,
+            format!(
+                "key_id {:?} does not end in -{fp}, the fingerprint of its own Ed25519 key (CC \
+                 2.6.8, CLM-key-id-fingerprint-verified)",
+                record.key_id
+            ),
         ),
     ))
 }
@@ -2028,7 +2038,31 @@ pub fn check_revocation_bound(
 /// A lower bound, an equal one, or a revoke-all is admitted and supersedes by
 /// the minimum fold. `held` is every revocation this node holds for the
 /// subject; the first revocation of a subject is unconstrained.
+///
+/// v62.0.0 (wave GC3; CC 2.7.3) — `held` is OTHER rows: the subject is
+/// declared as a fold read, and a raised bound HOLDS the revocation inside a
+/// fold attempt (`bound_raised`), so the held set's minimum is re-asked when
+/// another revocation of the subject lands. Outside an attempt the refusal is
+/// unchanged.
 pub fn check_revocation_bound_lowers(
+    held: &[super::types::Revocation],
+    incoming: &super::types::Revocation,
+) -> Result<(), RevocationBoundRefusal> {
+    fold::reads(Dep::key(
+        incoming
+            .revoked_key_id
+            .as_deref()
+            .unwrap_or(incoming.revoked_key_sha256_ed25519_raw.as_str()),
+    ));
+    let raised = bound_raised(held, incoming);
+    if raised.is_err() {
+        fold::note(fold::reason::BOUND_RAISED);
+    }
+    raised
+}
+
+/// [`check_revocation_bound_lowers`]'s comparison, pure.
+fn bound_raised(
     held: &[super::types::Revocation],
     incoming: &super::types::Revocation,
 ) -> Result<(), RevocationBoundRefusal> {
@@ -3013,6 +3047,80 @@ mod bound_tests {
         );
         let _ = Duration::seconds(1);
     }
+
+    /// **I3765** (wave GC3; CC 2.7.3) — `revoked_after only lowers` reads
+    /// OTHER rows (the subject's held revocations), so under a fold attempt a
+    /// raised bound HOLDS the revocation (`bound_raised`) instead of refusing
+    /// it, reading `key:<subject>`: the revocation concludes while no lower
+    /// bound is held, is held once one arrives, and concludes again when that
+    /// one is gone. Whichever order the two arrive in, the held set's minimum
+    /// (the bound the node folds) is the same. Outside an attempt the
+    /// refusal is unchanged.
+    #[tokio::test]
+    async fn i3765_a_raised_bound_is_held_not_refused() {
+        use crate::federation::edition2::fold::{self, reason, Dep};
+        use crate::federation::edition2::names::RowId;
+        let low = rev(
+            "r-low",
+            "k-sub",
+            "2026-03-01T00:00:00Z",
+            Some("2026-01-01T00:00:00Z"),
+        );
+        let high = rev(
+            "r-high",
+            "k-sub",
+            "2026-03-01T00:00:00Z",
+            Some("2026-02-01T00:00:00Z"),
+        );
+        let attempt = |held: Vec<super::super::types::Revocation>| {
+            let high = high.clone();
+            async move {
+                fold::attempt(RowId([0x65; 32]), None, async move {
+                    check_revocation_bound_lowers(&held, &high)
+                })
+                .await
+            }
+        };
+        // Nothing lower held: concludes, and the subject is read.
+        let (out, att) = attempt(Vec::new()).await;
+        assert!(out.is_ok() && att.held.is_none(), "I3765: concludes alone");
+        assert!(
+            att.reads.contains(&Dep::key("k-sub").read_key()),
+            "I3765: the subject is a fold read: {:?}",
+            att.reads
+        );
+        // The lower bound arrives: held, by its reason, never refused.
+        let (out, att) = attempt(vec![low.clone()]).await;
+        assert_eq!(
+            out,
+            Err(RevocationBoundRefusal::BoundRaised),
+            "I3765: the gate's verdict"
+        );
+        assert_eq!(
+            att.held.as_ref().map(|(r, _)| r.as_str()),
+            Some(reason::BOUND_RAISED),
+            "I3765: held with `bound_raised`"
+        );
+        // The lower bound is gone again: concludes again.
+        let (out, att) = attempt(Vec::new()).await;
+        assert!(out.is_ok() && att.held.is_none(), "I3765: concludes again");
+        // Either arrival order folds to the same bound: the minimum.
+        let min = |set: &[&super::super::types::Revocation]| {
+            set.iter().map(|r| r.revoked_after).min().flatten()
+        };
+        assert_eq!(
+            min(&[&low, &high][..]),
+            min(&[&high, &low][..]),
+            "I3765: order-free"
+        );
+        // Outside an attempt: the plain refusal, nothing marked.
+        assert!(!fold::in_attempt());
+        assert_eq!(
+            check_revocation_bound_lowers(&[low], &high),
+            Err(RevocationBoundRefusal::BoundRaised),
+            "I3765: outside an attempt the refusal is unchanged"
+        );
+    }
 }
 
 /// The #570 ask-4 behavioural witness, run by the sqlite / postgres / memory
@@ -3284,17 +3392,13 @@ pub(crate) mod bound_test_support {
 
 #[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
 mod tests {
-    //! v8.8.0 (CIRISPersist#234) — the §5.6.8.15 admission-gate matrix,
-    //! run identically against sqlite and (when `CIRIS_PERSIST_TEST_PG_URL`
-    //! is set) postgres via [`run_register_matrix`]. Test (b) — bad/missing
-    //! signature ⇒ REJECTED + NOT stored — is the load-bearing fail-secure
-    //! guard.
+    //! v62 (E3): the earlier-form registration matrix, the replicated
+    //! key-record matrix and the baked-seed re-offer are deleted (an
+    //! edition-2 `key:record` is admitted by `edition2::door`, witnessed
+    //! there). What stays is the outcome/refusal vocabulary and the
+    //! node-identity predicate.
 
     use super::*;
-    use crate::engine::Engine;
-    use crate::federation::types::{algorithm, identity_type};
-    use crate::federation::{KeyRecord, SignedKeyRecord};
-    use crate::signing::LocalSigner;
 
     /// v36.0.0 (CIRISPersist#718) — every outcome must survive the FFI's
     /// encoder, INCLUDING the refusal arm.
@@ -3342,863 +3446,6 @@ mod tests {
                 "Refused renders as an object, not a bare token — the #718 defect"
             );
         }
-    }
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use ciris_keyring::PqcSigner as _;
-    use ed25519_dalek::{Signer as _, SigningKey};
-    use std::sync::Arc;
-
-    /// Engine scrub-signer for tests — deterministic seed; the engine's
-    /// own signing identity is independent of the peer keys being
-    /// registered.
-    fn test_signer() -> Arc<LocalSigner> {
-        let signing_key = SigningKey::from_bytes(&[0x7Au8; 32]);
-        Arc::new(LocalSigner::from_parts(
-            signing_key,
-            "register-test-steward".to_string(),
-            None,
-            None,
-        ))
-    }
-
-    /// Build a fully hybrid-signed (Ed25519 + ML-DSA-65) self-attested
-    /// `KeyRecord` — `scrub_key_id == key_id`, proof-of-possession over
-    /// the registration envelope. Returns the record; the seeds make
-    /// it deterministic. `tamper` mutates the envelope AFTER signing
-    /// (for the tampered-envelope test); `drop_pqc` strips the PQC
-    /// signature (for the hybrid-pending rejection test); `corrupt_ed`
-    /// flips the classical signature.
-    ///
-    /// v31.0.0 (CIRISPersist#659) — the envelope is subject-BOUND through the
-    /// one shared [`crate::federation::admission::bind_subject_into_envelope`],
-    /// so a record this helper builds is conformant by construction. Each
-    /// mutation knob keeps the binding intact for the row it finally produces,
-    /// so each still fails at the gate it was written to exercise rather than
-    /// tripping the binding first: `drop_pqc` binds `null` (matching the row it
-    /// makes hybrid-pending) and `tamper` rewrites only `purpose`.
-    async fn signed_self_record(
-        key_id: &str,
-        identity_type: &str,
-        attestation_evidence: Option<serde_json::Value>,
-        tamper: bool,
-        drop_pqc: bool,
-        corrupt_ed: bool,
-    ) -> KeyRecord {
-        // Deterministic-per-key seeds (first 8 bytes from the key_id).
-        let mut seed = [0x11u8; 32];
-        for (i, b) in key_id.bytes().take(32).enumerate() {
-            seed[i] = b;
-        }
-        let ed_sk = SigningKey::from_bytes(&seed);
-        let ed_pk = ed_sk.verifying_key().to_bytes();
-
-        let mldsa = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&seed, "reg-test-mldsa")
-            .expect("seed length checked");
-        let mldsa_pk = mldsa.public_key().await.expect("ml-dsa pk");
-
-        // The pubkeys THIS record will carry — decided before the envelope is
-        // formed, because the #659 binding must name them. A `drop_pqc` row is
-        // hybrid-pending and carries no ML-DSA key, so it binds `null`: the
-        // binding asserts the absence, and the row still reaches (and fails at)
-        // the Strict hybrid-pending gate the knob exists to exercise.
-        let ed_pk_b64 = B64.encode(ed_pk);
-        let mldsa_pk_b64 = if drop_pqc {
-            None
-        } else {
-            Some(B64.encode(&mldsa_pk))
-        };
-
-        let mut envelope = serde_json::json!({
-            "key_id": key_id,
-            "purpose": "federation-peering",
-        });
-        crate::federation::admission::bind_subject_into_envelope(
-            &mut envelope,
-            key_id,
-            identity_type,
-            &ed_pk_b64,
-            mldsa_pk_b64.as_deref(),
-            None,
-        )
-        .expect("bind the #659 subject into the registration envelope");
-        let canonical = ceg_produce_canonicalize(&envelope).expect("canonicalize");
-        let original_content_hash = hex::encode(Sha256::digest(&canonical));
-
-        // Ed25519 over canonical.
-        let ed_sig = ed_sk.sign(&canonical).to_bytes();
-        // ML-DSA-65 over the BOUND input (canonical || classical_sig).
-        let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
-        bound.extend_from_slice(&canonical);
-        bound.extend_from_slice(&ed_sig);
-        let pqc_sig = mldsa.sign(&bound).await.expect("ml-dsa sign");
-
-        let mut classical_b64 = B64.encode(ed_sig);
-        if corrupt_ed {
-            // Flip to a valid-length-but-wrong signature: sign a
-            // DIFFERENT message so length is right but verify fails.
-            let other = ed_sk.sign(b"not-the-registration-envelope").to_bytes();
-            classical_b64 = B64.encode(other);
-        }
-
-        let now = chrono::Utc::now();
-        let mut record = KeyRecord {
-            key_id: key_id.to_owned(),
-            pubkey_ed25519_base64: ed_pk_b64,
-            pubkey_ml_dsa_65_base64: mldsa_pk_b64,
-            algorithm: algorithm::HYBRID.to_owned(),
-            identity_type: identity_type.to_owned(),
-            identity_ref: key_id.to_owned(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: envelope,
-            original_content_hash,
-            scrub_signature_classical: classical_b64,
-            scrub_signature_pqc: if drop_pqc {
-                None
-            } else {
-                Some(B64.encode(&pqc_sig))
-            },
-            scrub_key_id: key_id.to_owned(),
-            scrub_timestamp: now,
-            pqc_completed_at: if drop_pqc { None } else { Some(now) },
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            attestation_evidence,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        if tamper {
-            // Mutate the envelope AFTER signing — the signature now
-            // covers a different envelope than the one stored. The
-            // original_content_hash still matches the NEW envelope so
-            // the hash-cross-check passes and the failure surfaces as
-            // a signature mismatch (the stronger guard).
-            //
-            // #659: rewrite ONLY `purpose`, leaving the subject binding in
-            // place. A tamper that also dropped the binding would be refused
-            // by the #659 gate first and this fixture would stop measuring
-            // the signature check it exists for.
-            record.registration_envelope["purpose"] = serde_json::json!("TAMPERED");
-            let new_canonical =
-                ceg_produce_canonicalize(&record.registration_envelope).expect("canonicalize");
-            record.original_content_hash = hex::encode(Sha256::digest(&new_canonical));
-        }
-        record
-    }
-
-    /// #275 hardening — `validate_registration_pubkey` enforces the
-    /// 32-byte Ed25519 invariant: accepts a real 32-byte key, rejects a
-    /// 65-byte P-256 point, rejects non-base64. Backend-free unit coverage
-    /// of the admission backstop (the matrix exercises it end-to-end on both
-    /// backends via put_public_key).
-    #[tokio::test]
-    async fn validate_registration_pubkey_enforces_32_byte_ed25519() {
-        let mut rec =
-            signed_self_record("vrp-key", identity_type::AGENT, None, false, false, false).await;
-        // Valid 32-byte Ed25519 (the builder uses a real key) — accepted.
-        validate_registration_pubkey(&rec).expect("32-byte Ed25519 key must be accepted");
-
-        // 65-byte uncompressed P-256 point — rejected, naming the invariant.
-        rec.pubkey_ed25519_base64 = B64.encode([0x04u8; 65]);
-        let err = validate_registration_pubkey(&rec).unwrap_err();
-        assert_eq!(err.kind(), "federation_invalid_argument");
-        assert!(
-            format!("{err}").contains("32-byte"),
-            "must name the invariant: {err}"
-        );
-
-        // Not valid base64 — rejected.
-        rec.pubkey_ed25519_base64 = "!!! not base64 !!!".into();
-        assert!(
-            validate_registration_pubkey(&rec).is_err(),
-            "non-base64 must be rejected"
-        );
-    }
-
-    /// The full §5.6.8.15 admission-gate matrix, backend-agnostic.
-    async fn run_register_matrix(engine: &Engine, run_tag: &str) {
-        let directory = engine.federation_directory();
-
-        // (a) valid hybrid-signed registration → ADMITTED + stored.
-        // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — the id names its own key.
-        let valid_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
-            "peer-valid-{run_tag}"
-        ));
-        let rec =
-            signed_self_record(&valid_id, identity_type::AGENT, None, false, false, false).await;
-        engine
-            .register_federation_key(SignedKeyRecord { record: rec })
-            .await
-            .expect("(a) valid registration must be admitted");
-        let read = directory
-            .lookup_public_key(&valid_id)
-            .await
-            .expect("lookup");
-        assert!(
-            read.is_some(),
-            "(a) admitted key must be readable via lookup_public_key"
-        );
-
-        // (a') #275 hardening — a row whose pubkey_ed25519_base64 is NOT a
-        // 32-byte Ed25519 key (here a 65-byte P-256 point) is REJECTED at the
-        // put_public_key write chokepoint, on BOTH backends, before any
-        // INSERT. This is the admission backstop the #275 saga proved was
-        // missing (a wrong-curve key was stored unchallenged and only failed
-        // at read). Self-signed (scrub_key_id == key_id) so it reaches the
-        // store path directly.
-        let wrongcurve_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
-            "peer-wrongcurve-{run_tag}"
-        ));
-        let mut wrongcurve = signed_self_record(
-            &wrongcurve_id,
-            identity_type::AGENT,
-            None,
-            false,
-            false,
-            false,
-        )
-        .await;
-        wrongcurve.pubkey_ed25519_base64 = B64.encode([0x04u8; 65]); // uncompressed P-256 point
-        let err = directory
-            .put_public_key(SignedKeyRecord { record: wrongcurve })
-            .await
-            .expect_err("(a') a non-32-byte pubkey must be rejected at put_public_key");
-        assert_eq!(err.kind(), "federation_invalid_argument");
-        assert!(
-            format!("{err}").contains("32-byte"),
-            "(a') rejection must name the 32-byte Ed25519 invariant: {err}"
-        );
-        assert!(
-            directory
-                .lookup_public_key(&wrongcurve_id)
-                .await
-                .expect("lookup")
-                .is_none(),
-            "(a') a rejected wrong-curve key must leave NO row"
-        );
-
-        // (b) bad/missing ML-DSA-65 (hybrid-pending under Strict) →
-        // REJECTED, NOT stored. THE load-bearing fail-secure guard.
-        let pending_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
-            "peer-pending-{run_tag}"
-        ));
-        let pending = signed_self_record(
-            &pending_id,
-            identity_type::AGENT,
-            None,
-            false,
-            true, // drop_pqc
-            false,
-        )
-        .await;
-        let err = engine
-            .register_federation_key(SignedKeyRecord { record: pending })
-            .await
-            .expect_err("(b) hybrid-pending registration must be rejected under Strict");
-        assert_eq!(
-            err.kind(),
-            "federation_signature_invalid",
-            "(b) rejection must be a signature/verification failure"
-        );
-        assert!(
-            directory
-                .lookup_public_key(&pending_id)
-                .await
-                .expect("lookup")
-                .is_none(),
-            "(b) rejected key must NOT be queryable (fail-secure: not stored)"
-        );
-
-        // (b') bad Ed25519 signature → REJECTED, NOT stored.
-        let bad_ed_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
-            "peer-bad-ed-{run_tag}"
-        ));
-        let bad_ed = signed_self_record(
-            &bad_ed_id,
-            identity_type::AGENT,
-            None,
-            false,
-            false,
-            true, // corrupt_ed
-        )
-        .await;
-        let err = engine
-            .register_federation_key(SignedKeyRecord { record: bad_ed })
-            .await
-            .expect_err("(b') bad Ed25519 signature must be rejected");
-        assert_eq!(err.kind(), "federation_signature_invalid");
-        assert!(
-            directory
-                .lookup_public_key(&bad_ed_id)
-                .await
-                .expect("lookup")
-                .is_none(),
-            "(b') rejected key must NOT be queryable"
-        );
-
-        // (c) tampered registration_envelope (sig doesn't match) →
-        // REJECTED.
-        let tampered_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
-            "peer-tampered-{run_tag}"
-        ));
-        let tampered = signed_self_record(
-            &tampered_id,
-            identity_type::AGENT,
-            None,
-            true, // tamper
-            false,
-            false,
-        )
-        .await;
-        let err = engine
-            .register_federation_key(SignedKeyRecord { record: tampered })
-            .await
-            .expect_err("(c) tampered envelope must be rejected");
-        assert_eq!(err.kind(), "federation_signature_invalid");
-        assert!(
-            directory
-                .lookup_public_key(&tampered_id)
-                .await
-                .expect("lookup")
-                .is_none(),
-            "(c) tampered key must NOT be queryable"
-        );
-
-        // (d) §7 reserved-identity violation: accord_holder with NO
-        // hardware attestation → REJECTED (existing accord-holder gate
-        // in put_public_key is preserved — the registration is
-        // hybrid-valid but the accord_holder gate refuses it).
-        let accord_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
-            "peer-accord-{run_tag}"
-        ));
-        let accord = signed_self_record(
-            &accord_id,
-            identity_type::ACCORD_HOLDER,
-            None, // no attestation_evidence
-            false,
-            false,
-            false,
-        )
-        .await;
-        engine
-            .register_federation_key(SignedKeyRecord { record: accord })
-            .await
-            .expect_err("(d) accord_holder without hardware attestation must be rejected");
-        assert!(
-            directory
-                .lookup_public_key(&accord_id)
-                .await
-                .expect("lookup")
-                .is_none(),
-            "(d) rejected accord_holder must NOT be queryable"
-        );
-
-        // (f) non-hybrid algorithm → REJECTED (existing check preserved;
-        // caught by the registration gate's fail-fast).
-        let nonhybrid_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
-            "peer-nonhybrid-{run_tag}"
-        ));
-        let mut nonhybrid = signed_self_record(
-            &nonhybrid_id,
-            identity_type::AGENT,
-            None,
-            false,
-            false,
-            false,
-        )
-        .await;
-        nonhybrid.algorithm = "ed25519-only".to_owned();
-        let err = engine
-            .register_federation_key(SignedKeyRecord { record: nonhybrid })
-            .await
-            .expect_err("(f) non-hybrid algorithm must be rejected");
-        assert_eq!(err.kind(), "federation_invalid_argument");
-        assert!(
-            directory
-                .lookup_public_key(&nonhybrid_id)
-                .await
-                .expect("lookup")
-                .is_none(),
-            "(f) non-hybrid key must NOT be queryable"
-        );
-
-        // (e) deregister/expire → the key is no longer admit-valid. We
-        // register a fresh peer then deregister it via a revocation;
-        // a revocation row is then queryable for the key (the consumer
-        // applies its policy on read and ceases admitting).
-        let dereg_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
-            "peer-dereg-{run_tag}"
-        ));
-        let dereg =
-            signed_self_record(&dereg_id, identity_type::AGENT, None, false, false, false).await;
-        engine
-            .register_federation_key(SignedKeyRecord {
-                record: dereg.clone(),
-            })
-            .await
-            .expect("(e) register the peer to be deregistered");
-        // Build a self-signed revocation (revoking_key_id empty skips
-        // the trust gate; scrub_key_id = the revoked key, self-revoke).
-        let now = chrono::Utc::now();
-        // v21.0.0 (#502 E1) — sign the revocation envelope with the
-        // revoking key's registered hybrid key so admission verifies it.
-        // v31.0.0 (#659) — over bytes that BIND the typed columns.
-        let revocation = crate::federation::tier_ingest::test_support::seal_revocation(
-            crate::federation::Revocation {
-                revocation_id: uuid::Uuid::new_v4().to_string(),
-                revoked_key_id: Some(dereg_id.clone()),
-                revoked_key_sha256_ed25519_raw:
-                    crate::federation::tier_ingest::test_support::subject_digest_of(&dereg_id),
-                revoking_key_id: dereg_id.clone(),
-                reason: Some("consent:replication withdrawn".to_owned()),
-                revoked_at: now,
-                effective_at: now,
-                revocation_envelope: serde_json::json!({"revokes": dereg_id}),
-                original_content_hash: String::new(),
-                scrub_signature_classical: String::new(),
-                scrub_signature_pqc: None,
-                scrub_key_id: dereg_id.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                observed_region: crate::federation::verify_coord::region::US.to_owned(),
-                // #570 ask 4 — unbounded: this fixture revokes the whole history.
-                revoked_after: None,
-                persist_row_hash: String::new(),
-            },
-        );
-        engine
-            .deregister_federation_key(crate::federation::SignedRevocation { revocation })
-            .await
-            .expect("(e) deregister must store the revocation");
-        let revs = directory
-            .revocations_for(&dereg_id)
-            .await
-            .expect("revocations_for");
-        assert_eq!(
-            revs.len(),
-            1,
-            "(e) deregistered key must carry a revocation the consumer honors on read"
-        );
-        assert_eq!(revs[0].revoked_key_id.as_deref(), Some(dereg_id.as_str()));
-
-        // (g) v31.0.0 (CIRISPersist#659, one plane wider) — THE HEADLINE, at
-        // the REAL production door. A granting authority's signature over ONE
-        // envelope must not lift onto a DIFFERENT row. The full leg matrix runs
-        // on all three backends through
-        // `test_support::exercise_registration_subject_binding`; this pins the
-        // same refusal at `Engine::register_federation_key` — the entry
-        // CIRISServer / CIRISStatus call — and proves the refused row leaves no
-        // trace, which the verify-only exercise cannot say.
-        {
-            use crate::federation::tier_ingest::test_support as ts;
-            let authority = format!("gauth-{run_tag}");
-            let victim = format!("gvict-{run_tag}");
-            let attacker = format!("gatk-{run_tag}");
-            let (v_ed, v_pqc) = ts::hybrid_pubkeys(&victim);
-            let (a_ed, a_pqc) = ts::hybrid_pubkeys(&attacker);
-            assert_ne!(v_ed, a_ed, "(g) the two subjects must differ");
-            ts::register_hybrid_key(directory.as_ref(), &authority).await;
-
-            let ceremony = test_support::authority_signed_record(
-                &victim,
-                identity_type::NODE,
-                &v_ed,
-                v_pqc.as_deref(),
-                &authority,
-            );
-            let mut lifted = test_support::authority_signed_record(
-                &attacker,
-                identity_type::NODE,
-                &a_ed,
-                a_pqc.as_deref(),
-                &authority,
-            );
-            lifted.registration_envelope = ceremony.registration_envelope.clone();
-            lifted.original_content_hash = ceremony.original_content_hash.clone();
-            lifted.scrub_key_id = ceremony.scrub_key_id.clone();
-            lifted.scrub_signature_classical = ceremony.scrub_signature_classical.clone();
-            lifted.scrub_signature_pqc = ceremony.scrub_signature_pqc.clone();
-
-            let err = engine
-                .register_federation_key(SignedKeyRecord { record: lifted })
-                .await
-                .expect_err(
-                    "(g) an authority's signature over one envelope must not register a DIFFERENT \
-                     key — CIRISPersist#659 on the registration plane",
-                );
-            let msg = format!("{err}");
-            assert!(
-                msg.contains(&victim) && msg.contains("CIRISPersist#659"),
-                "(g) the refusal must name the subject the authority actually signed for and the \
-                 gate: {msg}"
-            );
-            assert!(
-                directory
-                    .lookup_public_key(&attacker)
-                    .await
-                    .expect("lookup")
-                    .is_none(),
-                "(g) the lifted registration must leave no row"
-            );
-        }
-
-        // (h) v31.0.0 (CIRISPersist#659) — THE NODE'S OWN BOOTSTRAP ROW must
-        // satisfy the binding it will be judged against elsewhere.
-        // `register_self_federation_key` writes straight through
-        // `put_public_key` and is deliberately NOT gated here — but that row
-        // REPLICATES, and at every peer it lands on the `Insert` branch of
-        // `apply_replicated_key_record`, which does run the gate. A producer
-        // that skips the binding therefore registers fine locally and is
-        // refused by the entire mesh: fail-closed on the far side of the wire,
-        // invisible until peering. This asserts the binding itself rather than
-        // the whole Strict gate, so the leg cannot be confused with the
-        // hybrid-pending refusal an engine without a PQC identity would earn.
-        {
-            let self_id = engine
-                .register_self_federation_key(identity_type::NODE, None, None)
-                .await
-                .expect("(h) register_self_federation_key must succeed");
-            let row = directory
-                .lookup_public_key(&self_id)
-                .await
-                .expect("lookup")
-                .expect("(h) the self-registered row must be readable");
-            crate::federation::admission::verify_envelope_binds_subject(&row).unwrap_or_else(|e| {
-                panic!(
-                    "(h) the node's own bootstrap row must bind its own subject, or every peer \
-                     refuses it on replication: {e}"
-                )
-            });
-            assert_eq!(
-                row.registration_envelope["purpose"],
-                serde_json::json!("self-bootstrap"),
-                "(h) binding the subject must leave the caller's own envelope fields intact"
-            );
-        }
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn register_matrix_sqlite() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct sqlite engine");
-        run_register_matrix(&engine, "sqlite").await;
-    }
-
-    /// **I1153 at the registration door** (CIRISPersist#1103, CC 2.6.8):
-    /// `Engine::register_federation_key` refuses an id that does not name its
-    /// own key and admits one that does.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn i1153_registration_door(engine: &Engine, run_tag: &str) {
-        let bad = format!("i1153-reg-bad-{run_tag}");
-        let rec = signed_self_record(&bad, identity_type::AGENT, None, false, false, false).await;
-        match engine
-            .register_federation_key(SignedKeyRecord { record: rec })
-            .await
-        {
-            Err(Error::MalformedRow {
-                reason: "key_id_fingerprint_mismatch",
-                ..
-            }) => {}
-            other => panic!("I1153: a mismatched id registered: {other:?}"),
-        }
-        let good = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
-            "i1153-reg-{run_tag}"
-        ));
-        let rec = signed_self_record(&good, identity_type::AGENT, None, false, false, false).await;
-        engine
-            .register_federation_key(SignedKeyRecord { record: rec })
-            .await
-            .expect("I1153: a matching id registers");
-        let dir = engine.federation_directory();
-        assert!(dir.lookup_public_key(&good).await.unwrap().is_some());
-        assert!(dir.lookup_public_key(&bad).await.unwrap().is_none());
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i1153_registration_door_sqlite() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct sqlite engine");
-        i1153_registration_door(&engine, "sqlite").await;
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn i1153_registration_door_postgres() {
-        let Some(dsn) = crate::test_pg::dsn() else {
-            return;
-        };
-        let engine = Engine::with_signer(test_signer(), &dsn)
-            .await
-            .expect("construct postgres engine");
-        i1153_registration_door(&engine, &format!("pg-{}", uuid::Uuid::new_v4().simple())).await;
-        eprintln!("i1153_registration_door_postgres: RAN");
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn register_matrix_postgres() {
-        let Some(dsn) = crate::test_pg::dsn() else {
-            eprintln!("skipping register_matrix_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let engine = Engine::with_signer(test_signer(), &dsn)
-            .await
-            .expect("construct postgres engine");
-        // Run-scoped unique tag so parallel/repeat runs don't collide on
-        // the federation_keys PK (key_id is TEXT; uuid-suffix it).
-        let tag = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        run_register_matrix(&engine, &tag).await;
-    }
-
-    // ─── v13.0.0 (CIRISPersist#371) — apply_replicated_key_record ───
-    //
-    // The upgrade-aware replicated Key-plane apply decision table, run
-    // identically against sqlite and (when CIRIS_PERSIST_TEST_PG_URL is
-    // set) postgres through the Engine wrapper, mirroring
-    // `run_register_matrix`. The ambiguous-owner (pre-gate anomaly) row
-    // needs raw SQL and lives with the backend siblings
-    // (`src/store/{sqlite,postgres}.rs`).
-
-    /// Apply one replicated record through the Engine wrapper.
-    async fn apply_one(engine: &Engine, record: KeyRecord) -> ReplicatedKeyOutcome {
-        // v59.0.0: the Engine's framed door is retired; the trait method is
-        // the `key:record:v1` row door's executor, and this table is its.
-        engine
-            .federation_directory()
-            .apply_replicated_key_record(SignedKeyRecord { record })
-            .await
-            .expect("apply_replicated_key_record")
-    }
-
-    /// The `scrub_key_id` of `key_id`'s current directory row (the
-    /// self-signed vs anchor-scrubbed discriminator the matrix asserts on).
-    async fn row_scrub(engine: &Engine, key_id: &str) -> String {
-        engine
-            .federation_directory()
-            .lookup_public_key(key_id)
-            .await
-            .expect("lookup")
-            .expect("row exists")
-            .scrub_key_id
-    }
-
-    /// The #371 decision table: fresh insert (self-signed AND
-    /// anchor-scrubbed); idempotent re-apply; conflicting second version;
-    /// unverifiable scrub; pubkey swap (Ed25519 AND ML-DSA-65 halves);
-    /// absent owner; self→anchored upgrade happy path; anchored→self
-    /// downgrade; anchor-A→anchor-B re-scrub; already-anchored-identical.
-    ///
-    /// v24.2.0 (CIRISPersist#565) — every refusal row now asserts the EXACT
-    /// [`KeyRefusalReason`], not merely that something refused. That is the
-    /// deliverable: a matrix that only checks "Refused" is precisely the
-    /// instrument that let five distinct branches share one indistinguishable
-    /// verdict all the way out to a production canonical.
-    async fn run_apply_replicated_matrix(engine: &Engine, tag: &str) {
-        use crate::federation::register::KeyRefusalReason as R;
-        use crate::federation::register::ReplicatedKeyOutcome as O;
-        use crate::federation::tier_ingest::test_support as ts;
-        let directory = engine.federation_directory();
-        let dir = directory.as_ref();
-
-        let scrubber = format!("apply-anchor-a-{tag}");
-        let scrubber_b = format!("apply-anchor-b-{tag}");
-        let owner = format!("apply-owner-{tag}");
-        let node = format!("apply-node-{tag}");
-        // The scrubbers must exist as directory rows (the Strict gate
-        // resolves a granting-authority signer's pubkeys from the
-        // directory — the seeded accord-anchor shape) and the owner must
-        // be a live `user`-role granter for `owner_of`.
-        ts::register_hybrid_key(dir, &scrubber).await;
-        ts::register_hybrid_key(dir, &scrubber_b).await;
-        ts::register_identity_key(dir, &owner, identity_type::USER).await;
-
-        // (1) fresh insert — new key_id, self-signed (the boot state).
-        let self_rec = ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "v1");
-        assert_eq!(
-            apply_one(engine, self_rec.clone()).await,
-            O::Inserted,
-            "(1) fresh insert"
-        );
-
-        // (2) byte-identical re-apply ⇒ Unchanged (idempotent).
-        assert_eq!(
-            apply_one(engine, self_rec.clone()).await,
-            O::Unchanged,
-            "(2) idempotent"
-        );
-
-        // (3) a conflicting second self-signed version ⇒ Refused
-        // (first-seen/duplicity; put_public_key's direct path stays
-        // untouched by this apply).
-        let self_v2 = ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "v2");
-        assert_eq!(
-            apply_one(engine, self_v2).await,
-            O::Refused {
-                reason: R::ConflictingVersion
-            },
-            "(3) conflicting version"
-        );
-
-        // (4) verifiable anchor-scrubbed record but NO owner-binding ⇒
-        // Refused — the row is not inside any single-owner node set
-        // (owner_of = None, fail-closed), so replication may not upgrade it.
-        let scrubbed =
-            ts::replicated_key_record(&node, identity_type::NODE, &scrubber, &scrubber, "v1");
-        assert_eq!(
-            apply_one(engine, scrubbed.clone()).await,
-            O::Refused {
-                reason: R::OwnerAbsent
-            },
-            "(4) absent owner"
-        );
-        assert_eq!(
-            row_scrub(engine, &node).await,
-            node,
-            "(4) refused apply must leave the self-signed row untouched"
-        );
-
-        // Seed the owner-binding: delegates_to(owner → node) on the
-        // ownership dimension (the v12.6.0 single-owner relation).
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: ts::owner_binding_attestation(
-                    &uuid::Uuid::new_v4().to_string(),
-                    &owner,
-                    &node,
-                ),
-            })
-            .await
-            .expect("owner-binding admitted");
-
-        // (5) unverifiable scrub — claims `scrubber`, signed by
-        // `scrubber_b` ⇒ Refused (Strict gate), row untouched.
-        let bad_sig =
-            ts::replicated_key_record(&node, identity_type::NODE, &scrubber, &scrubber_b, "v1");
-        assert_eq!(
-            apply_one(engine, bad_sig).await,
-            O::Refused {
-                reason: R::UnverifiableSignature
-            },
-            "(5) unverifiable scrub"
-        );
-        assert_eq!(row_scrub(engine, &node).await, node, "(5) row untouched");
-
-        // (6) pubkey swap ⇒ Refused — EITHER hybrid half. Never an
-        // identity swap on the replication plane, whatever the scrub says.
-        let (other_ed, other_mldsa) = ts::hybrid_pubkeys(&format!("someone-else-{tag}"));
-        let mut ed_swap = scrubbed.clone();
-        ed_swap.pubkey_ed25519_base64 = other_ed;
-        assert_eq!(
-            apply_one(engine, ed_swap).await,
-            O::Refused {
-                reason: R::PubkeySwap
-            },
-            "(6) Ed25519 swap"
-        );
-        let mut mldsa_swap = scrubbed.clone();
-        mldsa_swap.pubkey_ml_dsa_65_base64 = other_mldsa;
-        assert_eq!(
-            apply_one(engine, mldsa_swap).await,
-            O::Refused {
-                reason: R::PubkeySwap
-            },
-            "(6) ML-DSA-65 swap"
-        );
-        assert_eq!(row_scrub(engine, &node).await, node, "(6) row untouched");
-
-        // (7) the happy path: same key_id + same hybrid pubkeys, scrub
-        // Strict-verifies against the directory-resolved scrubber, owner_of
-        // resolves exactly one live owner ⇒ Upgraded (the #351 adopt path
-        // riding replication).
-        assert_eq!(
-            apply_one(engine, scrubbed.clone()).await,
-            O::Upgraded,
-            "(7) upgrade"
-        );
-        assert_eq!(
-            row_scrub(engine, &node).await,
-            scrubber,
-            "(7) row is now anchor-scrubbed"
-        );
-
-        // (8) re-apply of the exact anchored record ⇒ Unchanged.
-        assert_eq!(
-            apply_one(engine, scrubbed.clone()).await,
-            O::Unchanged,
-            "(8) idempotent anchored"
-        );
-
-        // (9) anchored→self downgrade ⇒ Refused (monotonic).
-        assert_eq!(
-            apply_one(engine, self_rec).await,
-            O::Refused {
-                reason: R::Downgrade
-            },
-            "(9) downgrade"
-        );
-        assert_eq!(
-            row_scrub(engine, &node).await,
-            scrubber,
-            "(9) still anchored"
-        );
-
-        // (10) anchor-A→anchor-B re-scrub ⇒ Refused (duplicity/first-seen),
-        // even though the record itself verifies.
-        let rescrub =
-            ts::replicated_key_record(&node, identity_type::NODE, &scrubber_b, &scrubber_b, "v1");
-        assert_eq!(
-            apply_one(engine, rescrub).await,
-            O::Refused { reason: R::ReScrub },
-            "(10) re-scrub hijack"
-        );
-        assert_eq!(
-            row_scrub(engine, &node).await,
-            scrubber,
-            "(10) still anchor A"
-        );
-
-        // (11) fresh insert of an anchor-scrubbed record for an UNKNOWN
-        // key_id ⇒ Inserted — new-key inserts are exactly put_public_key
-        // "as today" (no owner gate on the insert path).
-        let node2 = format!("apply-node2-{tag}");
-        let fresh_scrubbed =
-            ts::replicated_key_record(&node2, identity_type::NODE, &scrubber, &scrubber, "v1");
-        assert_eq!(
-            apply_one(engine, fresh_scrubbed).await,
-            O::Inserted,
-            "(11) fresh scrubbed insert"
-        );
-        assert_eq!(row_scrub(engine, &node2).await, scrubber);
-
-        // (12) v24.2.0 (CIRISPersist#565) — the DUPLICATE, not a rejection.
-        // Same anchoring the node already holds (identical
-        // `registration_envelope`, identical `scrub_key_id`) but not
-        // byte-identical: only the unsigned `valid_until` differs, so the
-        // `persist_row_hash` fast-path misses and the record falls through to
-        // the anchor→anchor arm. Before #565 this reported as a re-scrub
-        // hijack — the shape a baked-seed fleet produces every time the
-        // canonical replicates the record every node already ships.
-        let mut same_anchoring = scrubbed.clone();
-        same_anchoring.valid_until = Some("2030-01-01T00:00:00Z".parse().expect("valid_until"));
-        assert_eq!(
-            apply_one(engine, same_anchoring).await,
-            O::Refused {
-                reason: R::AlreadyAnchoredIdentical
-            },
-            "(12) already anchored to this exact assertion"
-        );
-        assert_eq!(
-            row_scrub(engine, &node).await,
-            scrubber,
-            "(12) duplicate leaves the row untouched"
-        );
     }
 
     /// v24.2.0 (CIRISPersist#565) — the two spellings of a reason are ONE
@@ -4267,421 +3514,6 @@ mod tests {
             distinct.len(),
             KeyRefusalReason::ALL.len(),
             "reason tokens must be distinct"
-        );
-    }
-
-    /// v24.2.0 (CIRISPersist#565) — the OUTCOME's wire shape, pinned.
-    ///
-    /// `Refused` carries `{"refused":{"reason":"<token>"}}` — the same
-    /// externally-tagged struct-variant shape the sibling route plane's
-    /// `TransportDestinationApplyOutcome::Refused { reason }` already puts
-    /// across the directory capsule, so a downstream deserializer meets a
-    /// shape it already implements. The non-refusal variants keep their bare
-    /// snake_case tokens exactly as before.
-    #[test]
-    fn replicated_key_outcome_wire_shape_is_pinned() {
-        assert_eq!(
-            serde_json::to_string(&ReplicatedKeyOutcome::Inserted).expect("inserted"),
-            "\"inserted\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ReplicatedKeyOutcome::Unchanged).expect("unchanged"),
-            "\"unchanged\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ReplicatedKeyOutcome::Superseded).expect("superseded"),
-            "\"superseded\""
-        );
-        // v54.0.0 (#995 row 2) — appended.
-        assert_eq!(
-            serde_json::to_string(&ReplicatedKeyOutcome::ScrubsRehydrated).expect("rehydrated"),
-            "\"scrubs_rehydrated\""
-        );
-        for reason in KeyRefusalReason::ALL {
-            let outcome = ReplicatedKeyOutcome::Refused { reason: *reason };
-            let json = serde_json::to_string(&outcome).expect("serialize outcome");
-            assert_eq!(
-                json,
-                format!("{{\"refused\":{{\"reason\":\"{}\"}}}}", reason.as_str())
-            );
-            assert_eq!(
-                serde_json::from_str::<ReplicatedKeyOutcome>(&json).expect("round-trip"),
-                outcome
-            );
-        }
-    }
-
-    /// v24.2.0 (CIRISPersist#565) — **THE PRODUCTION CASE, on the REAL baked
-    /// seed**: re-offering the canonical record every node already ships reads
-    /// `AlreadyAnchoredIdentical`, NOT a re-scrub hijack and NOT `Unchanged`.
-    ///
-    /// This is the one #565 was actually filed about, and it is asserted
-    /// against the vendored production `canonical_seed.json` through the real
-    /// genesis boot — no fixture, because a fixture is exactly what would have
-    /// let this stay wrong (the #545/#554 lesson: evidence written to pass your
-    /// own gate proves nothing).
-    ///
-    /// **Why it is not `Unchanged`.** `lift_envelope_attested_roles` runs at
-    /// write time (`put_public_key` / `adopt_scrub_upgrade`) and lifts the
-    /// envelope's attested roles into the STORED row's `capability_roles`
-    /// before `persist_row_hash` is computed. The pristine seed record on the
-    /// wire carries them only inside the envelope. So the stored row and the
-    /// record it was built from hash DIFFERENTLY, the byte-identical fast path
-    /// misses, and the record falls through to the anchor→anchor arm — while
-    /// `original_content_hash` (over the envelope) is unchanged, which is
-    /// precisely the reported symptom: many refusals of a SINGLE content hash.
-    ///
-    /// The verdict is correct and unchanged (not applied, row untouched); what
-    /// #565 fixes is that it used to report as duplicity. `genesis::
-    /// seed_canonical_servers` walks this exact path on every boot after the
-    /// first, so a fleet running the baked seed logged a hijack-shaped warning
-    /// forever, benignly.
-    async fn baked_seed_reoffer_reads_as_duplicate(engine: &Engine) {
-        let sr = crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0].clone();
-        let dir = engine.federation_directory();
-        let existing = dir
-            .lookup_public_key(&sr.record.key_id)
-            .await
-            .expect("lookup")
-            .expect("the baked canonical row is present after the genesis seed");
-
-        // The precondition that makes this the interesting case rather than a
-        // trivial one: the SIGNED assertion is identical, the row bytes are not.
-        assert_eq!(
-            existing.registration_envelope, sr.record.registration_envelope,
-            "same signed envelope"
-        );
-        assert_eq!(existing.scrub_key_id, sr.record.scrub_key_id, "same anchor");
-        assert_eq!(
-            existing.original_content_hash, sr.record.original_content_hash,
-            "same content hash — the very thing the refusals were reported against"
-        );
-        // v31.1.0 — this was `assert_ne!` on the premise that the write-time
-        // role lift always changes the row bytes, so `Unchanged` could not
-        // catch a re-offer and the DUPLICATE path had to. That premise was an
-        // artifact of the PRE-v31 seed, whose holder records arrived without
-        // their roles materialized. The v31 ceremony emits complete records,
-        // so the lift is a no-op and the bytes match — a better outcome, and
-        // one this assertion would have called a failure.
-        //
-        // What the test is NAMED for is that a re-offer reads as a duplicate.
-        // That is asserted below and is unaffected by which path detects it,
-        // so the mechanism is no longer pinned.
-        let _lift_changed_bytes = existing.persist_row_hash
-            != super::super::types::compute_persist_row_hash(&sr.record).expect("row hash");
-        assert_eq!(
-            existing.original_content_hash, sr.record.original_content_hash,
-            "the re-offer is the same signed assertion"
-        );
-
-        // v31.1.0 — assert the PROPERTY, not the mechanism. Two outcomes mean
-        // "this is a duplicate": `Unchanged` (the byte-identical short-circuit)
-        // and `Refused { AlreadyAnchoredIdentical }` (the anchor comparison).
-        // Which one fires depends on whether the write-time role lift altered
-        // the row bytes, and the v31 ceremony emits records whose roles are
-        // already materialized — so the bytes now match and `Unchanged` catches
-        // it first. That is a better outcome, and pinning the old mechanism
-        // would have reported it as a regression.
-        //
-        // What must NOT happen is any outcome that MUTATES: an `Upgraded`,
-        // `Superseded` or `Inserted` here would be the canonical's own baked
-        // record re-scrubbing itself — the hijack this test is named for.
-        let outcome = engine
-            .federation_directory()
-            .apply_replicated_key_record(sr.clone())
-            .await
-            .expect("apply");
-        assert!(
-            matches!(
-                outcome,
-                ReplicatedKeyOutcome::Unchanged
-                    | ReplicatedKeyOutcome::Refused {
-                        reason: KeyRefusalReason::AlreadyAnchoredIdentical
-                    }
-            ),
-            "the canonical's own baked record must read as a DUPLICATE, not a re-scrub \
-             hijack — got {outcome:?}"
-        );
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn baked_seed_reoffer_reads_as_duplicate_sqlite() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct sqlite engine");
-        baked_seed_reoffer_reads_as_duplicate(&engine).await;
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn baked_seed_reoffer_reads_as_duplicate_postgres() {
-        let Some(dsn) = crate::test_pg::dsn() else {
-            eprintln!("skipping baked_seed_reoffer_reads_as_duplicate_postgres: DSN unset");
-            return;
-        };
-        let engine = Engine::with_signer(test_signer(), &dsn)
-            .await
-            .expect("construct postgres engine");
-        baked_seed_reoffer_reads_as_duplicate(&engine).await;
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn apply_replicated_matrix_sqlite() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct sqlite engine");
-        run_apply_replicated_matrix(&engine, "sqlite").await;
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn apply_replicated_matrix_postgres() {
-        let Some(dsn) = crate::test_pg::dsn() else {
-            eprintln!("skipping apply_replicated_matrix_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let engine = Engine::with_signer(test_signer(), &dsn)
-            .await
-            .expect("construct postgres engine");
-        let tag = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        run_apply_replicated_matrix(&engine, &tag).await;
-    }
-}
-
-/// v13.7.0 (CIRISPersist#405) — adversarial unit tests for [`supersede_precheck`],
-/// the quorum-independent security half of the canonical-supersede policy
-/// (canonical-scope + strictly-newer SIGNED-envelope `valid_from`). Crypto-free
-/// so the monotonicity / replay-spoof / scope decisions are proven in isolation.
-#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
-mod supersede_precheck_tests {
-    use super::{supersede_precheck, SupersedePrecheck as P};
-    use crate::federation::types::{algorithm, KeyRecord};
-
-    const T0: &str = "2026-07-10T00:00:00+00:00";
-    const T1: &str = "2026-07-11T00:00:00+00:00"; // strictly newer than T0
-
-    /// Build a KeyRecord whose only meaningful fields for the precheck are the
-    /// `identity_type` and the ENVELOPE `valid_from`. `top_valid_from` sets the
-    /// UNSIGNED top-level field independently (for the spoof test).
-    fn mk(
-        identity_type: &str,
-        envelope_vf: &str,
-        top_valid_from: chrono::DateTime<chrono::Utc>,
-    ) -> KeyRecord {
-        KeyRecord {
-            key_id: "ciris-canonical-1".to_owned(),
-            pubkey_ed25519_base64: "AA".to_owned(),
-            pubkey_ml_dsa_65_base64: None,
-            algorithm: algorithm::HYBRID.to_owned(),
-            identity_type: identity_type.to_owned(),
-            identity_ref: "ciris-canonical-1".to_owned(),
-            valid_from: top_valid_from,
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "valid_from": envelope_vf }),
-            original_content_hash: String::new(),
-            scrub_signature_classical: "AA".to_owned(),
-            scrub_signature_pqc: None,
-            scrub_key_id: "A1".to_owned(),
-            scrub_timestamp: chrono::Utc::now(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-            attestation_evidence: Some(
-                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                ),
-            ),
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        }
-    }
-    fn canonical(envelope_vf: &str) -> KeyRecord {
-        mk("canonical,node", envelope_vf, chrono::Utc::now())
-    }
-
-    #[test]
-    fn newer_canonical_envelope_passes() {
-        assert_eq!(supersede_precheck(&canonical(T0), &canonical(T1)), P::Newer);
-    }
-
-    /// v53.1.4 — an equal SIGNED instant is the repair arm, not a refusal:
-    /// the quorum checks decide it (I528).
-    #[test]
-    fn equal_envelope_valid_from_is_the_repair_arm() {
-        assert_eq!(
-            supersede_precheck(&canonical(T0), &canonical(T0)),
-            P::EqualInstant
-        );
-    }
-
-    /// **I571** (#995 row 3, settled on the issue) — the equal-instant arm
-    /// admits only the SAME record: the canonical's live shape (role ORDER
-    /// differs) is the repair arm; a different `transport_hints` or a
-    /// different role SET at the same instant is refused.
-    #[test]
-    fn i571_equal_instant_admits_only_the_same_record() {
-        let with = |roles: serde_json::Value, hints: &str| {
-            let mut r = canonical(T0);
-            r.registration_envelope = serde_json::json!({
-                "valid_from": T0, "roles": roles, "transport_hints": [hints],
-            });
-            r
-        };
-        let live = with(
-            serde_json::json!([
-                "infra:serve",
-                "infra:attest",
-                "infra:store",
-                "infra:transport"
-            ]),
-            "tcp://a",
-        );
-        let bundle = with(
-            serde_json::json!([
-                "infra:attest",
-                "infra:serve",
-                "infra:store",
-                "infra:transport"
-            ]),
-            "tcp://a",
-        );
-        assert_eq!(
-            supersede_precheck(&live, &bundle),
-            P::EqualInstant,
-            "I571: the live canonical's shape (role order differs) is repaired"
-        );
-        assert_eq!(
-            supersede_precheck(
-                &live,
-                &with(
-                    serde_json::json!([
-                        "infra:attest",
-                        "infra:serve",
-                        "infra:store",
-                        "infra:transport"
-                    ]),
-                    "tcp://b",
-                )
-            ),
-            P::Refuse,
-            "I571: a different transport_hints at the same instant is refused"
-        );
-        assert_eq!(
-            supersede_precheck(
-                &live,
-                &with(
-                    serde_json::json!(["infra:attest", "infra:serve", "infra:store"]),
-                    "tcp://a",
-                )
-            ),
-            P::Refuse,
-            "I571: a different role SET at the same instant is refused"
-        );
-        assert_eq!(
-            supersede_precheck(
-                &live,
-                &with(
-                    serde_json::json!([
-                        "infra:attest",
-                        "infra:serve",
-                        "infra:store",
-                        "infra:store"
-                    ]),
-                    "tcp://a",
-                )
-            ),
-            P::Refuse,
-            "I571: a duplicated role is not the same set"
-        );
-        // Newer is not narrowed: a different record at a later instant is
-        // still the address move.
-        let mut newer = with(serde_json::json!(["infra:serve"]), "tcp://c");
-        newer.registration_envelope["valid_from"] = serde_json::json!(T1);
-        assert_eq!(supersede_precheck(&live, &newer), P::Newer);
-    }
-
-    #[test]
-    fn older_envelope_valid_from_refused() {
-        // incoming T0 is OLDER than existing T1 — downgrade refused.
-        assert_eq!(
-            supersede_precheck(&canonical(T1), &canonical(T0)),
-            P::Refuse
-        );
-    }
-
-    #[test]
-    fn non_canonical_incoming_refused_even_if_newer() {
-        // A non-canonical anchor→anchor re-scrub must NOT reach the quorum.
-        let incoming = mk("node", T1, chrono::Utc::now());
-        assert_eq!(supersede_precheck(&canonical(T0), &incoming), P::Refuse);
-        // Nor the repair arm.
-        let equal = mk("node", T0, chrono::Utc::now());
-        assert_eq!(supersede_precheck(&canonical(T0), &equal), P::Refuse);
-    }
-
-    #[test]
-    fn missing_envelope_valid_from_refused() {
-        let mut incoming = canonical(T1);
-        incoming.registration_envelope = serde_json::json!({});
-        assert_eq!(supersede_precheck(&canonical(T0), &incoming), P::Refuse);
-    }
-
-    /// THE downgrade attack: replay the OLD record (envelope `valid_from` == the
-    /// stored one) but bump the UNSIGNED top-level `valid_from` far into the
-    /// future. The precheck reads the SIGNED envelope timestamp, so recency
-    /// cannot be forged: never `Newer`. v53.1.4 — it is the equal-instant arm,
-    /// where a replayed record over a held row the quorum signed is refused by
-    /// the held row's own quorum (I528(c)).
-    #[test]
-    fn toplevel_valid_from_spoof_cannot_forge_recency() {
-        let existing = canonical(T0);
-        let spoof = mk(
-            "canonical,node",
-            T0,
-            chrono::Utc::now() + chrono::Duration::days(3650),
-        );
-        assert_eq!(
-            supersede_precheck(&existing, &spoof),
-            P::EqualInstant,
-            "unsigned top-level valid_from must not override the signed envelope timestamp"
-        );
-    }
-
-    /// v53.1.4 — the live canonical's signed instant carries a 9-digit
-    /// fraction (`2026-07-31T13:58:22.147317128Z`). The arm is decided on the
-    /// PARSED instants: the same nanosecond in two spellings is equal, a
-    /// microsecond-truncated copy is 128 ns OLDER (refused), and the
-    /// nanosecond-exact record over the truncated one is NEWER.
-    #[test]
-    fn equal_instant_is_compared_at_nanosecond_precision() {
-        const T_NS: &str = "2026-07-31T13:58:22.147317128+00:00";
-        const T_NS_Z: &str = "2026-07-31T13:58:22.147317128Z";
-        const T_US: &str = "2026-07-31T13:58:22.147317+00:00";
-        assert_eq!(
-            supersede_precheck(&canonical(T_NS), &canonical(T_NS)),
-            P::EqualInstant
-        );
-        // v54.0.0 (#995 row 3) — two spellings of one nanosecond are one
-        // INSTANT, but two different signed envelopes: the repair arm admits
-        // only the same record (roles compared as a set, every other member
-        // byte-equal), so this is refused.
-        assert_eq!(
-            supersede_precheck(&canonical(T_NS), &canonical(T_NS_Z)),
-            P::Refuse,
-            "two spellings of one nanosecond are equal instants but different records"
-        );
-        assert_eq!(
-            supersede_precheck(&canonical(T_NS), &canonical(T_US)),
-            P::Refuse,
-            "a microsecond-truncated copy is older by 128 ns, never equal"
-        );
-        assert_eq!(
-            supersede_precheck(&canonical(T_US), &canonical(T_NS)),
-            P::Newer
         );
     }
 }

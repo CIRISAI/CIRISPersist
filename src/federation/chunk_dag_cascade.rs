@@ -4384,6 +4384,7 @@ pub mod invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        let comm = crate::federation::community_dek::lifecycle_support::id_of(&comm);
         let sealed =
             encrypt_and_cascade_community(backend, &comm, b"segment 0", None, Some(&minter))
                 .await
@@ -4435,13 +4436,14 @@ pub mod invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        let comm = crate::federation::community_dek::lifecycle_support::id_of(&comm);
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
-        let minter = signer.derived_key_id();
+        let minter = signer.federation_id().await;
 
-        let owner = signer.derived_key_id();
+        let owner = signer.federation_id().await;
         // (Before #837 this witness also staged a mixed stream through the
         // commons door; the chunk floor now refuses that append — I41.)
 
@@ -4636,6 +4638,7 @@ pub mod invariants {
             let alice = format!("{tag}-alice-{run}");
             let alice_occ = format!("{tag}-alice-occ-{run}");
             seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+            let comm = crate::federation::community_dek::lifecycle_support::id_of(&comm);
             let stream = format!("{tag}-stream-{run}");
             let (manifest, chunks, _) = sealed_community_stream(
                 backend,
@@ -4731,6 +4734,10 @@ pub mod invariants {
             let alice = format!("{tag}-alice-{run}");
             let alice_occ = format!("{tag}-alice-occ-{run}");
             seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+            let (comm, alice_occ) = (
+                crate::federation::community_dek::lifecycle_support::id_of(&comm),
+                crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+            );
             let stream = format!("{tag}-stream-{run}");
             let segs = [segment(7, 5000), segment(8, 3000), segment(9, 7000)];
             let (manifest, _, plain) =
@@ -4810,6 +4817,10 @@ pub mod invariants {
         let owner = format!("{tag}-owner-{run}");
         let occ = format!("{tag}-owner-occ-{run}");
         seed_member(backend, &owner, &occ).await;
+        let (owner, occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&owner),
+            crate::federation::community_dek::lifecycle_support::id_of(&occ),
+        );
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
@@ -4872,7 +4883,7 @@ pub mod invariants {
                 "{tag} I34b: a stream-keyed chunk row carries no per-chunk grant (#969)"
             );
         }
-        let writer = signer.derived_key_id();
+        let writer = signer.federation_id().await;
         assert!(
             backend
                 .stream_dek_grants(&stream, 0, &writer)
@@ -4962,6 +4973,7 @@ pub mod invariants {
             .unwrap();
             let later_occ = format!("{tag}-owner-later-occ-{run}");
             seed_occurrence(backend, &owner, &later_occ).await;
+            let later_occ = crate::federation::community_dek::lifecycle_support::id_of(&later_occ);
             let sealed2 =
                 seal_stream_scoped(backend, &signer, SELF, Some(&owner), &stream2, None, None)
                     .await
@@ -4972,7 +4984,7 @@ pub mod invariants {
             );
             assert!(
                 backend
-                    .stream_dek_grants(&stream2, 0, &signer.derived_key_id())
+                    .stream_dek_grants(&stream2, 0, &signer.federation_id().await)
                     .await
                     .unwrap()
                     .iter()
@@ -5099,6 +5111,10 @@ pub mod invariants {
             let alice = format!("{tag}-alice-{run}");
             let alice_occ = format!("{tag}-alice-occ-{run}");
             seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+            let (comm, alice_occ) = (
+                crate::federation::community_dek::lifecycle_support::id_of(&comm),
+                crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+            );
             let stream = format!("{tag}-stream-{run}");
             let (manifest, _, plain) = sealed_community_stream(
                 backend,
@@ -5161,6 +5177,10 @@ pub mod invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        let (comm, alice_occ) = (
+            crate::federation::community_dek::lifecycle_support::id_of(&comm),
+            crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+        );
         let writer_local = crate::federation::at_rest_cascade::blob_invariants::node_signer(
             backend,
             &format!("{tag}-writer-{run}"),
@@ -5223,8 +5243,7 @@ pub mod invariants {
             assert_eq!(c.cohort_scope, COMMUNITY);
         }
         // A producer-signed STH over the first chunk: the listing reports it.
-        let producer = format!("{tag}-producer-{run}");
-        let hybrid = register_hybrid_producer(backend, &producer).await;
+        let (hybrid, producer) = register_hybrid_producer(backend).await;
         let sth = sign_stream_sth(&hybrid, &stream, &shas, 1);
         backend
             .put_stream_sth(sth, &producer)
@@ -5273,16 +5292,17 @@ pub mod invariants {
         let bob = format!("{tag}-bob-{run}");
         let bob_occ = format!("{tag}-bob-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ), (&bob, &bob_occ)]).await;
+        let (comm, alice_occ, bob, bob_occ) = (crate::federation::community_dek::lifecycle_support::id_of(&comm), crate::federation::community_dek::lifecycle_support::id_of(&alice_occ), crate::federation::community_dek::lifecycle_support::id_of(&bob), crate::federation::community_dek::lifecycle_support::id_of(&bob_occ));
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
-        let minter = signer.derived_key_id();
+        let minter = signer.federation_id().await;
         let stream = format!("{tag}-stream-{run}");
         let seg0 = segment(21, 900);
         let seg1 = segment(22, 600);
 
-        let owner = signer.derived_key_id();
+        let owner = signer.federation_id().await;
         let c0 = put_blob_chunk_scoped(
             backend,
             &adapter,
@@ -5491,10 +5511,15 @@ pub mod invariants {
             let alice = format!("{tag}-alice-{run}");
             let alice_occ = format!("{tag}-alice-occ-{run}");
             seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+            let (comm, alice) = (
+                crate::federation::community_dek::lifecycle_support::id_of(&comm),
+                crate::federation::community_dek::lifecycle_support::id_of(&alice),
+            );
             let other = format!("{tag}-other-{run}");
             let bob = format!("{tag}-bob-{run}");
             let bob_occ = format!("{tag}-bob-occ-{run}");
             seed_community(backend, &other, &[(&bob, &bob_occ)]).await;
+            let other = crate::federation::community_dek::lifecycle_support::id_of(&other);
             // Two writers, each a registered node key.
             let writer_a_local = crate::federation::at_rest_cascade::blob_invariants::node_signer(
                 backend,
@@ -5896,6 +5921,10 @@ pub mod invariants {
             let alice = format!("{tag}-alice-{run}");
             let alice_occ = format!("{tag}-alice-occ-{run}");
             seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+            let (comm, alice_occ) = (
+                crate::federation::community_dek::lifecycle_support::id_of(&comm),
+                crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
+            );
             let stranger = format!("{tag}-stranger-{run}");
             let writer_local = crate::federation::at_rest_cascade::blob_invariants::node_signer(
                 backend,
@@ -6220,8 +6249,12 @@ pub mod invariants {
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
         backend
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: identity_key_id.to_owned(),
-                occurrence_key_id: occurrence_key_id.to_owned(),
+                identity_key_id: crate::federation::community_dek::lifecycle_support::id_of(
+                    identity_key_id,
+                ),
+                occurrence_key_id: crate::federation::community_dek::lifecycle_support::id_of(
+                    occurrence_key_id,
+                ),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: crate::host::clock::now(),
@@ -6238,59 +6271,29 @@ pub mod invariants {
     }
 
     // ── fixtures for the STH leg of I37 ─────────────────────────────────
-    /// A registered hybrid producer key (the same shape as the sqlite STH
-    /// tests' `register_hybrid_producer`, generic over the backend). BOXED
+    /// A registered hybrid producer key (the same composite as the sqlite
+    /// STH tests' `register_hybrid_producer`, generic over the backend):
+    /// v62.0.0, its self-signed edition-2 `key:record` (E0
+    /// `put_key_for_composite`; the composite is no E0 seed, so it is a
+    /// "foreign" key). Returns the key and its kid, the producer's id. BOXED
     /// and built before the await: the multi-KiB ML-DSA-65 signer must not
     /// live across an await on a 2 MiB test-thread stack.
     async fn register_hybrid_producer<B>(
         backend: &B,
-        key_id: &str,
-    ) -> Box<ciris_crypto::composite::CompositeSigningKey>
+    ) -> (Box<ciris_crypto::composite::CompositeSigningKey>, String)
     where
         B: FederationDirectory + Sync,
     {
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x51; 32]).unwrap();
-        let mldsa = ciris_crypto::MlDsa65Signer::from_seed(&[0x52; 32]).unwrap();
-        let ed_pub_b64 = {
-            use ciris_crypto::ClassicalSigner as _;
-            B64.encode(ed.public_key().unwrap())
-        };
-        let mldsa_pub_b64 = {
-            use ciris_crypto::PqcSigner as _;
-            B64.encode(mldsa.public_key().unwrap())
-        };
         let signer = Box::new(crate::federation::sth_form::test_support::composite(
             [0x52; 32], [0x51; 32],
         ));
-        let record = crate::federation::KeyRecord {
-            key_id: key_id.into(),
-            pubkey_ed25519_base64: ed_pub_b64,
-            pubkey_ml_dsa_65_base64: Some(mldsa_pub_b64),
-            algorithm: crate::federation::types::algorithm::HYBRID.into(),
-            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
-            identity_ref: key_id.into(),
-            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": key_id }),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "c2lnbmF0dXJl".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            attestation_evidence: None,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        backend
-            .put_public_key(crate::federation::SignedKeyRecord { record })
-            .await
-            .unwrap();
-        signer
+        let kid = crate::federation::edition2::fixture_switch::put_key_for_composite(
+            backend,
+            &signer,
+            &[crate::federation::types::identity_type::PRIMITIVE],
+        )
+        .await;
+        (signer, kid)
     }
 
     fn sign_stream_sth(

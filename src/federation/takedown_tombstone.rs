@@ -420,6 +420,13 @@ pub async fn check_takedown_notice_row_admission(
             serde_json::json!({"notice_id": row.attestation_id, "reason": reason}),
         )
     })?;
+    // v62.0.0 (wave GC2; CC 2.7.3) — everything above is the row's own
+    // bytes (a door refusal). The authority below reads OTHER rows (the rows
+    // binding the content, the duty seats, the takedown chains): a notice it
+    // does not admit is HELD with the refusal's token as its reason and
+    // concludes nothing; it re-folds when a binding, a seat or a chain lands
+    // or is withdrawn (the reads `takedown_authority` declares). Outside a
+    // fold attempt (the earlier-form door) `hold` is the plain refusal.
     takedown_authority(
         directory,
         &row.attesting_key_id,
@@ -430,10 +437,33 @@ pub async fn check_takedown_notice_row_admission(
     .map_err(|e| match e {
         Error::PurgeRefused { token, mut body } => {
             body["notice_id"] = serde_json::json!(row.attestation_id);
-            Error::PurgeRefused { token, body }
+            let held = Error::PurgeRefused { token, body };
+            match fold_reason_of(token) {
+                Some(reason) => super::edition2::fold::hold(reason, held),
+                None => held,
+            }
         }
         other => other,
     })
+}
+
+/// v62.0.0 (wave GC2) — the fold reason of a takedown authority refusal: its
+/// own token. `None` for a token that is no fold condition.
+fn fold_reason_of(t: &str) -> Option<&'static str> {
+    use super::edition2::fold::reason;
+    match t {
+        token::CONTENT_UNBOUND => Some(reason::TAKEDOWN_CONTENT_UNBOUND),
+        token::UNAUTHORISED => Some(reason::TAKEDOWN_UNAUTHORISED),
+        _ => None,
+    }
+}
+
+/// v62.0.0 (wave GC2) — the fold read of "the rows binding `content_sha256`":
+/// `key:content:<digest>`, which every row whose `evidence_refs` names the
+/// digest touches (`edition2::fold::touches_of_attestation`).
+#[must_use]
+pub fn content_dep(content_sha256: &str) -> super::edition2::fold::Dep {
+    super::edition2::fold::Dep::key(&format!("content:{content_sha256}"))
 }
 
 /// Parse and VERIFY a takedown notice ROW: its shape ([`notice_row_shape`])
@@ -689,6 +719,16 @@ pub async fn takedown_authority(
     content_sha256: &str,
     _legal_basis: &str,
 ) -> Result<(), Error> {
+    // v62.0.0 (wave GC2; CC 2.7.3) — the decision's reads, declared for the
+    // fold (no-ops outside an attempt): the binding rows, the signer (the
+    // last edge of any chain to it names it), each holder (the first edge
+    // names it) and each bound community's seats. (G0 v4: no `family:`
+    // read keys; a chain's MIDDLE edge is a known gap, GC2.md.)
+    {
+        use super::edition2::fold::{reads, Dep};
+        reads(content_dep(content_sha256));
+        reads(Dep::key(signer));
+    }
     let Some(binding) = content_binding(directory, content_sha256).await? else {
         return Err(refused(
             token::CONTENT_UNBOUND,
@@ -702,7 +742,11 @@ pub async fn takedown_authority(
     };
     let duty = super::admission::DELEGATION_SCOPE_TAKEDOWN;
     let mut holders: std::collections::HashSet<String> = binding.subjects.iter().cloned().collect();
+    for h in &binding.subjects {
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(h));
+    }
     for community in &binding.communities {
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(community));
         holders.extend(super::admission::community_duty_roots(directory, community, duty).await?);
     }
     match super::admission::check_moderation_admission(
@@ -793,6 +837,38 @@ pub(crate) async fn review_holders_of_content(
         );
     }
     Ok(Some((binding, holders)))
+}
+
+/// v62.0.0 (wave GC2; CC rc21 ruling 8, CC 4.5.3) — **the notice whose
+/// tombstone still stands over `(plane, record_ref)`**: the first notice, in
+/// id order, that tombstoned it and that no admitted reversal lifted
+/// ([`takedown_reversal`]). `None` when nothing tombstoned it, when every
+/// tombstone of it is reversed, or when this backend has no purge plane.
+///
+/// While one stands, a node does not keep the record and never serves it
+/// (reason `purge_tombstoned`): a deletion duty, the node's own act and never
+/// a verdict on the row. A reversal lifts it, so a re-offered record is
+/// taken again.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn standing_tombstone(
+    directory: &dyn FederationDirectory,
+    plane: &str,
+    record_ref: &str,
+) -> Result<Option<String>, Error> {
+    let notices = match directory.purge_tombstone_notices(plane, record_ref).await {
+        Ok(n) => n,
+        Err(Error::Unsupported { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for notice_id in notices {
+        if takedown_reversal(directory, &notice_id).await?.is_none() {
+            return Ok(Some(notice_id));
+        }
+    }
+    Ok(None)
 }
 
 /// v60.1.0 (CIRISPersist#1113; CC 4.5.3, rc10) — **has an admitted

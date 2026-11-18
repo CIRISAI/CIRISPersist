@@ -101,8 +101,9 @@ pub const DEFERRAL_REJECTED_DIMENSION: &str = "deferral:response:rejected:v1";
 
 /// The amendment's digest member: lowercase hex SHA-256 of the change.
 pub const AMENDMENT_DIGEST_MEMBER: &str = "amendment_digest";
-/// The amendment's authority member: the `attestation_id` (a uuid) of the
-/// `deferral:response:approved:v1` it rests on.
+/// The amendment's authority member: the `attestation_id` of the
+/// `deferral:response:approved:v1` it rests on: an edition-2 row id (64
+/// lowercase hex, projected from `refs.also.cites`) or an earlier-form uuid.
 pub const AUTHORIZED_BY_MEMBER: &str = "authorized_by";
 /// The member that cites the response as evidence.
 pub const EVIDENCE_REFS_MEMBER: &str = "evidence_refs";
@@ -318,11 +319,15 @@ fn amendment_members(row: &Attestation) -> Result<(&str, &str), Error> {
                 format!("`{AUTHORIZED_BY_MEMBER}` is required"),
             ))
         }
-        Some(Some(id)) if uuid::Uuid::parse_str(id).is_ok() => id,
+        // v62 (rc21) — an edition-2 amendment names its approval under
+        // `refs.also.cites`, which the mapping projects here as the approval's
+        // node-computed row id (64 lowercase hex); an earlier-form one by
+        // its uuid.
+        Some(Some(id)) if is_hex64(id) || uuid::Uuid::parse_str(id).is_ok() => id,
         Some(_) => {
             return Err(malformed(
                 malformed_row::ENVELOPE_MEMBER_INVALID,
-                format!("`{AUTHORIZED_BY_MEMBER}` is not a uuid"),
+                format!("`{AUTHORIZED_BY_MEMBER}` is neither a row id nor a uuid"),
             ))
         }
     };
@@ -433,6 +438,7 @@ pub async fn amendment_standing(
             format!("no admitted row {authorized_by} on this node"),
         );
     };
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&response.attesting_key_id));
     // (2) Its outcome is approved.
     let approved = response.attestation_type == attestation_type::SCORES
         && envelope_dimension(&response.attestation_envelope) == Some(DEFERRAL_APPROVED_DIMENSION);

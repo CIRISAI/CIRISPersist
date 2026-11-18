@@ -257,6 +257,13 @@ where
     D: FederationDirectory + ?Sized,
 {
     let identity = framed.revocation()?.identity_key_id;
+    // v62.0.0 (wave GC2; CC 2.7.3) — (A) and (B) read the SUBJECT identity's
+    // key record and its live self roster, OTHER rows than the carrier's own
+    // bytes and its signer's key plane: a fold. The carrier re-folds when the
+    // identity's record or roster changes, and one short of the majority is
+    // HELD (reason `carrier_without_roster_quorum`), not refused. A
+    // cosignature that does not verify stays a refusal (the row's own bytes).
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&identity));
     if is_single_signer_identity(dir, &identity).await? {
         return Ok(());
     }
@@ -281,13 +288,16 @@ where
     }
     let count = roster_majority(dir, &identity, &offered).await?;
     if !count.met() {
-        return Err(malformed(
-            super::malformed_row::CARRIER_WITHOUT_ROSTER_QUORUM,
-            format!(
-                "occurrence revocation carrier for {identity:?}: a user self's carrier needs a \
-                 strict majority of its current live roster ({} of {}); {} signed — re-propose \
-                 the revocation through the two-path door (CC 3.1.5, 3.3.6.3)",
-                count.need, count.roster, count.signed
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::CARRIER_WITHOUT_ROSTER_QUORUM,
+            malformed(
+                super::malformed_row::CARRIER_WITHOUT_ROSTER_QUORUM,
+                format!(
+                    "occurrence revocation carrier for {identity:?}: a user self's carrier needs \
+                     a strict majority of its current live roster ({} of {}); {} signed — \
+                     re-propose the revocation through the two-path door (CC 3.1.5, 3.3.6.3)",
+                    count.need, count.roster, count.signed
+                ),
             ),
         ));
     }
@@ -301,15 +311,103 @@ where
 /// decides both.
 ///
 /// # Errors
-/// Directory reads.
+/// Directory reads; an edition-2 identity whose genesis `key:record` is not
+/// held is held (`link_unheld`, the retryable unknown signer), and one with
+/// rival genesis records is held (`genesis_record_rivals`).
 pub(crate) async fn is_single_signer_identity<D>(dir: &D, identity: &str) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC2; lead ruling (a) on G0 v5's `enforce_named_past`) —
+    // an edition-2 identity's type is read from its NAMED past: the
+    // identity's GENESIS `key:record` (the self-recorded record of its own
+    // kid that names no predecessor, where the row's `refs.head` chain
+    // starts), a named, immutable row, declared as `Dep::Row(genesis)`.
+    // Never the current projection. Not held yet: the row WAITS for it.
+    if let Some(kid) = super::edition2::ingest::kid_of_identity_ref(identity) {
+        let rows = genesis_records(dir, &kid).await?;
+        for row in rows.keys() {
+            super::edition2::fold::reads(super::edition2::fold::Dep::Row(*row));
+        }
+        let mut it = rows.into_values();
+        return match (it.next(), it.next()) {
+            (None, _) => Err(super::edition2::fold::hold(
+                super::edition2::fold::reason::LINK_UNHELD,
+                Error::unknown_signer(identity, "occurrence_revocation_genesis_record"),
+            )),
+            // Two self-recorded genesis records of one key are rivals: the
+            // row waits and concludes nothing. No tie-break (a signer-chosen
+            // instant is not a selection axis).
+            (Some(_), Some(_)) => Err(super::edition2::fold::hold(
+                super::edition2::fold::reason::GENESIS_RECORD_RIVALS,
+                Error::InvalidArgument(format!(
+                    "{GENESIS_RECORD_RIVALS_TOKEN}: identity {identity:?} has rival genesis \
+                     key:records; its type is not read until one is withdrawn"
+                )),
+            )),
+            (Some(types), None) => Ok(types
+                .iter()
+                .any(|t| t == identity_type::NODE || t == identity_type::AGENT)),
+        };
+    }
+    // An earlier-form identity (the JSON carrier, never inside a fold
+    // attempt): its stored key row, declared as `key:<identity>`.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(identity));
     Ok(dir.lookup_public_key(identity).await?.is_some_and(|k| {
         identity_type::set_contains(&k.identity_type, identity_type::NODE)
             || identity_type::set_contains(&k.identity_type, identity_type::AGENT)
     }))
+}
+
+/// v62.0.0 (wave GC2) — the refusal-detail token for rival genesis records
+/// (the fold reason `reason::GENESIS_RECORD_RIVALS`).
+const GENESIS_RECORD_RIVALS_TOKEN: &str = "genesis_record_rivals";
+
+/// v62.0.0 (wave GC2) — **the GENESIS `key:record`s of the identity whose
+/// thumbprint is `kid`**: the identity-ref NAMES its genesis key, so these are
+/// the held self-recorded `key:record` statements of `kid` itself that name
+/// no predecessor (`refs.target`). By row id, each with its `identity_type`.
+/// Unique by key: one is the genesis; none waits; two or more are rivals
+/// (the caller selects none of them, by any instant).
+///
+/// # Errors
+/// Directory reads.
+async fn genesis_records<D>(
+    dir: &D,
+    kid: &ciris_verify_core::edition2::Digest32,
+) -> Result<std::collections::BTreeMap<super::edition2::names::RowId, Vec<String>>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::edition2::names::{names_of, single, RowId};
+    let subject = ciris_verify_core::edition2::identity_ref(kid);
+    let mut out = std::collections::BTreeMap::new();
+    for st in dir
+        .edition2_statements_about(
+            ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY,
+            &subject,
+        )
+        .await?
+    {
+        let Some((_, payload)) = super::edition2::liveness::statement_parts(&st) else {
+            continue;
+        };
+        let Ok(rec) = ciris_verify_core::edition2::keys::check_key_record(&payload) else {
+            continue;
+        };
+        if rec.kid != *kid {
+            continue;
+        }
+        let names = names_of(&payload).unwrap_or_default();
+        if single(&names, "target").is_some() {
+            continue; // a rotation names its predecessor; not the genesis
+        }
+        let Some(row) = RowId::of_statement(&st) else {
+            continue;
+        };
+        out.entry(row).or_insert(rec.identity_type);
+    }
+    Ok(out)
 }
 
 /// v62.0.0 (wave T2) — what [`roster_majority`] counted.

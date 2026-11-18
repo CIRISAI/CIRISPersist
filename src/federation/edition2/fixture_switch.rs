@@ -496,7 +496,9 @@ fn roster_members_value(v: &serde_json::Value) -> Value {
             det_map(e)
         })
         .collect();
-    out.sort_by_key(|m| m.get_text("key").map(cde::encode).unwrap_or_default());
+    // P1's set rule: a roster is sorted by each member entry's FULL
+    // deterministic encoding (an entry with a `role` sorts by its bytes).
+    out.sort_by_key(cde::encode);
     Value::Array(out)
 }
 
@@ -1612,7 +1614,8 @@ pub fn roster_statement(
             det_map(e)
         })
         .collect();
-    ms_.sort_by_key(|m| m.get_text("key").map(cde::encode).unwrap_or_default());
+    // Sorted by each entry's full encoding (P1's set rule), not by `key`.
+    ms_.sort_by_key(cde::encode);
     let mut p = vec![
         (text("asserted_at"), Value::Uint(founded_at_ms)),
         (text("group_kind"), text(group_kind)),
@@ -2025,10 +2028,19 @@ mod tests {
             }
             let reaches = |b: &str| seal.iter().any(|s| b.contains(s));
             // Directly, or through one helper of the same file it calls.
+            // Every identifier written directly before a `(`: a call such as
+            // `sealed(member, ..)` on one line is a callee as much as one whose
+            // arguments start on the next line.
             let callees = body
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '('))
-                .filter_map(|t| t.strip_suffix('('))
-                .filter(|t| !t.is_empty() && *t != name)
+                .match_indices('(')
+                .filter_map(|(i, _)| {
+                    let head = &body[..i];
+                    let start = head
+                        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .map_or(0, |j| j + 1);
+                    let ident = &head[start..];
+                    (!ident.is_empty() && ident != name).then_some(ident)
+                })
                 .filter_map(|t| body_of(&src, t))
                 .any(|b| reaches(&b));
             assert!(

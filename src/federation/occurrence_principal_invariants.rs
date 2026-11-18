@@ -70,10 +70,18 @@ pub(crate) mod bodies {
     }
 
     /// A community founded by `founder` with `members` on its roster.
+    ///
+    /// v62.0.0 (JSON cut, flip wave 2, E5) — under the switch the roster
+    /// enters as its edition-2 `group:roster` voices (T1.api §3,
+    /// `community_voices`, asserted now), keyed by identity-refs; the held
+    /// (earlier-form) I141 path keeps `put_community`. Returns the room's id
+    /// as the directory keys it.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn room(d: &dyn FederationDirectory, comm: &str, members: &[&str]) {
+    async fn room(d: &dyn FederationDirectory, comm: &str, members: &[&str]) -> String {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::group_fixtures as gf;
         ts::register_identity_key(d, comm, USER).await;
-        d.put_community(ts::sign_community(
+        let signed = ts::sign_community(
             comm,
             Community {
                 prev_head_digest: String::new(),
@@ -94,9 +102,27 @@ pub(crate) mod bodies {
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("room {comm}: {e}"));
+        );
+        if e2::emit_edition2() {
+            let voices = gf::community_voices(&signed, 1, None, e2::ms(chrono::Utc::now()));
+            gf::put_voices(d, &voices)
+                .await
+                .unwrap_or_else(|e| panic!("room {comm}: {e}"));
+            e2::kid(comm)
+        } else {
+            d.put_community(signed)
+                .await
+                .unwrap_or_else(|e| panic!("room {comm}: {e}"));
+            comm.to_owned()
+        }
+    }
+
+    /// v62.0.0 (flip wave 2, E5) — the keys registered by seed are named by
+    /// their identity-refs from here on (`register_identity_key` puts
+    /// `e2::kid(seed)`'s record).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn kid(seed: &str) -> String {
+        crate::federation::edition2::fixture_switch::kid(seed)
     }
 
     /// `would_hold` on `node` for community content of `comm` authored by a
@@ -136,6 +162,7 @@ pub(crate) mod bodies {
         let (node, owner) = (format!("i121-node-{s}"), format!("i121-owner-{s}"));
         ts::register_identity_key(d, &node, NODE).await;
         ts::register_identity_key(d, &owner, USER).await;
+        let (node, owner) = (kid(&node), kid(&owner));
         bind(d, &node, &node, "2026-06-01T00:00:00Z").await; // boot
         bind(d, &owner, &node, "2026-06-02T00:00:00Z").await; // claim
         assert_eq!(
@@ -161,6 +188,7 @@ pub(crate) mod bodies {
         let (node2, owner2) = (format!("i121-node2-{s}"), format!("i121-owner2-{s}"));
         ts::register_identity_key(d, &node2, NODE).await;
         ts::register_identity_key(d, &owner2, USER).await;
+        let (node2, owner2) = (kid(&node2), kid(&owner2));
         bind(d, &owner2, &node2, "2026-06-02T00:00:00Z").await;
         bind(d, &node2, &node2, "2026-06-03T00:00:00Z").await; // singleton asserted LATER
         assert_eq!(
@@ -179,6 +207,7 @@ pub(crate) mod bodies {
         // An unbound key is its own principal; a singleton-only key too.
         let lone = format!("i121-lone-{s}");
         ts::register_identity_key(d, &lone, NODE).await;
+        let lone = kid(&lone);
         assert_eq!(d.active_identity_for_occurrence(&lone).await.unwrap(), lone);
         assert!(d
             .active_identities_for_occurrence(&lone)
@@ -226,6 +255,15 @@ pub(crate) mod bodies {
         ] {
             ts::register_identity_key(d, k, t).await;
         }
+        // v62.0.0 (JSON cut, E5) — named by identity-ref from here on.
+        let (node, owner, device, node_c, stranger, other) = (
+            kid(&node),
+            kid(&owner),
+            kid(&device),
+            kid(&node_c),
+            kid(&stranger),
+            kid(&other),
+        );
         // The node's own self rows, written UNCLAIMED (singleton): the CC 3.4.5
         // self-or-owner stamping — attester == attested == node, target = node.
         let dims = [
@@ -243,7 +281,7 @@ pub(crate) mod bodies {
             row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
             row.subject_key_ids = vec![node.clone()];
             ts::seal_row_in_place(&node, &mut row);
-            d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            crate::federation::edition2::fixture_switch::put_signed(d, &row)
                 .await
                 .unwrap_or_else(|e| panic!("I141: the node writes its own self row: {e}"));
         }
@@ -335,19 +373,20 @@ pub(crate) mod bodies {
         // other members WRITE about themselves. The device is an occurrence
         // that owns no node (the occurrence union is the only path to it);
         // node C is an owned node bound as no occurrence (`nodes_owned_by`
-        // is the only path to it). One self row each, under `profile:`.
+        // is the only path to it). One self row each, under `device:` (v62.0.0, E5: `profile:*` is
+        // open vocabulary, which the edition-2 door refuses).
         for (i, writer) in [&device, &node_c].iter().enumerate() {
             let mut row = ts::bare_attestation(
                 &format!("i141-peer-row-{i}-{s}"),
                 writer,
                 writer,
-                &serde_json::json!({"cohort_scope": "self", "dimension": format!("profile:display_name:v{i}")}),
+                &serde_json::json!({"cohort_scope": "self", "dimension": format!("device:label:v{i}")}),
             );
             row.attestation_type = "scores".into();
             row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
             row.subject_key_ids = vec![(*writer).clone()];
             ts::seal_row_in_place(writer, &mut row);
-            d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            crate::federation::edition2::fixture_switch::put_signed(d, &row)
                 .await
                 .unwrap_or_else(|e| {
                     panic!("I141: a collective member writes its own self row: {e}")
@@ -392,9 +431,8 @@ pub(crate) mod bodies {
                 (rust_twin, rows)
             }
         };
-        let reads_of = |caller: &str, writer: &str| {
-            reads_dim(caller, writer, "profile:", "profile:display_name:v1")
-        };
+        let reads_of =
+            |caller: &str, writer: &str| reads_dim(caller, writer, "device:", "device:label:v1");
         expect(
             reads_of(&node, &device).await,
             true,
@@ -519,7 +557,7 @@ pub(crate) mod bodies {
         row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
         row.subject_key_ids = vec![node.clone()];
         ts::seal_row_in_place(&node, &mut row);
-        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+        crate::federation::edition2::fixture_switch::put_signed(d, &row)
             .await
             .unwrap_or_else(|e| panic!("I141: the node writes its sensitive leaf at self: {e}"));
         expect(
@@ -600,9 +638,10 @@ pub(crate) mod bodies {
         for (k, t) in [(&node, NODE), (&owner, USER), (&other, USER)] {
             ts::register_identity_key(d, k, t).await;
         }
+        let (node, owner, other) = (kid(&node), kid(&owner), kid(&other));
         bind(d, &node, &node, "2026-06-01T00:00:00Z").await;
         bind(d, &owner, &node, "2026-06-02T00:00:00Z").await;
-        room(d, &comm, &[&owner, &other]).await;
+        let comm = room(d, &comm, &[&owner, &other]).await;
         let memberships = crate::federation::replication::hold::audience_memberships(
             d,
             &node,
@@ -621,7 +660,7 @@ pub(crate) mod bodies {
         // lists the node itself (an infrastructure co-op) is in its audience
         // with no principal involved.
         let own_room = format!("i122-own-{s}");
-        room(d, &own_room, &[&node, &other]).await;
+        let own_room = room(d, &own_room, &[&node, &other]).await;
         let memberships = crate::federation::replication::hold::audience_memberships(
             d,
             &node,
@@ -638,7 +677,7 @@ pub(crate) mod bodies {
             .expect("I122: party in its own right");
         // A room the owner is NOT in stays refused: the fix widened nothing.
         let stranger_room = format!("i122-elsewhere-{s}");
-        room(d, &stranger_room, &[&other]).await;
+        let stranger_room = room(d, &stranger_room, &[&other]).await;
         let err = holds(d, &node, &stranger_room, &other)
             .await
             .expect_err("I122: not party to a room the owner is not in");
@@ -662,9 +701,10 @@ pub(crate) mod bodies {
         for (k, t) in [(&node, NODE), (&owner, USER), (&other, USER)] {
             ts::register_identity_key(d, k, t).await;
         }
+        let (node, owner, other) = (kid(&node), kid(&owner), kid(&other));
         bind(d, &node, &node, "2026-06-01T00:00:00Z").await;
         bind(d, &owner, &node, "2026-06-02T00:00:00Z").await;
-        room(d, &comm, &[&owner, &other]).await;
+        let comm = room(d, &comm, &[&owner, &other]).await;
         holds(d, &node, &comm, &other)
             .await
             .expect("I123: party while the anchor is live");
@@ -712,6 +752,7 @@ pub(crate) mod bodies {
         ] {
             ts::register_identity_key(d, k, t).await;
         }
+        let (node, first, second, other) = (kid(&node), kid(&first), kid(&second), kid(&other));
         bind(d, &node, &node, "2026-06-01T00:00:00Z").await;
         bind(d, &first, &node, "2026-06-02T00:00:00Z").await;
         bind(d, &second, &node, "2026-06-03T00:00:00Z").await; // logged in later
@@ -726,8 +767,8 @@ pub(crate) mod bodies {
             "I124: the single-valued answer is the newest binding (FSD §2)"
         );
         let (room_a, room_b) = (format!("i124-room-a-{s}"), format!("i124-room-b-{s}"));
-        room(d, &room_a, &[&first, &other]).await;
-        room(d, &room_b, &[&second, &other]).await;
+        let room_a = room(d, &room_a, &[&first, &other]).await;
+        let room_b = room(d, &room_b, &[&second, &other]).await;
         let memberships = crate::federation::replication::hold::audience_memberships(
             d,
             &node,

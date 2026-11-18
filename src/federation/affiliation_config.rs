@@ -121,6 +121,10 @@ where
     if declared_cohort(community)? != Cohort::Affiliations {
         return Ok(());
     }
+    // v62.0.0 (wave GC5; CC 2.7.3) — the roster, the officials' and the
+    // seats' person records are other rows: declared, so the act re-folds
+    // when one changes.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&community.community_key_id));
     let roster = Box::pin(super::authorized_community_roster_at(dir, community, at)).await?;
     let founders: BTreeSet<String> = roster
         .iter()
@@ -141,6 +145,9 @@ where
         .into_iter()
         .map(|o| o.key_id)
         .collect();
+    for k in seats.iter().chain(&officials) {
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(k));
+    }
     let selves = super::key_person::KeySelves::read(
         dir,
         seats
@@ -167,12 +174,19 @@ where
     // `count_short` in the fold) and the official's later voice lands it.
     // Outside the door's attempt this is a no-op and the refusal stands.
     super::edition2::group::note_short();
-    Err(Error::RosterAuthorityUnauthorized {
-        group_key_id: community.community_key_id.clone(),
-        offered_authority_key_id: primary.to_owned(),
-        rule: AFFILIATION_COUNTERSIGN_MISSING,
-        shortfall: None,
-    })
+    // v62.0.0 (wave GC5; CC 2.7.3, 4.4.3.12) — a countersign not yet held is
+    // a voice short: the act is HELD, concluding nothing, and re-folds when
+    // a further voice of it (or a roster / person change) lands. Outside a
+    // fold attempt (the earlier-form door) it is the refusal it was.
+    Err(super::edition2::fold::hold(
+        super::edition2::fold::reason::AFFILIATION_COUNTERSIGN_MISSING,
+        Error::RosterAuthorityUnauthorized {
+            group_key_id: community.community_key_id.clone(),
+            offered_authority_key_id: primary.to_owned(),
+            rule: AFFILIATION_COUNTERSIGN_MISSING,
+            shortfall: None,
+        },
+    ))
 }
 
 /// The refusal rules of [`Error::AffiliationConfigInvalid`]. Stable tokens;
@@ -784,8 +798,29 @@ where
     if !matches!(cohort, Cohort::Community | Cohort::Affiliations) {
         return Ok(());
     }
+    // v62.0.0 (wave GC5; CC 2.7.3) — the held record is another row: its
+    // cohort is an input (declared), and a mismatch holds the row,
+    // concluding nothing, never refused.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(group_key_id));
     match dir.lookup_community(group_key_id).await? {
-        Some(held) => check_record_is(&held, cohort),
+        Some(held) => check_record_is(&held, cohort).map_err(hold_cohort_mismatch),
         None => Ok(()),
+    }
+}
+
+/// v62.0.0 (wave GC5; CC 2.7.3) — a HELD record's cohort that is not the one
+/// the row addresses is a fold condition: [`Error::AffiliationCohortMismatch`]
+/// is marked held ([`affiliation_cohort_mismatch`]); any other refusal (a
+/// held record whose cohort does not parse) passes through unmarked.
+///
+/// [`affiliation_cohort_mismatch`]: super::edition2::fold::reason::AFFILIATION_COHORT_MISMATCH
+pub(crate) fn hold_cohort_mismatch(e: Error) -> Error {
+    if matches!(e, Error::AffiliationCohortMismatch { .. }) {
+        super::edition2::fold::hold(
+            super::edition2::fold::reason::AFFILIATION_COHORT_MISMATCH,
+            e,
+        )
+    } else {
+        e
     }
 }

@@ -13,6 +13,7 @@ pub(crate) mod bodies {
     use crate::federation::admission::ConsentGatedFamily;
     use crate::federation::consent_by_humans as cbh;
     use crate::federation::consent_scope_invariants::bodies::{at, put, row, stance};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::ConsentState;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{AGENT, NODE, USER};
@@ -28,24 +29,25 @@ pub(crate) mod bodies {
         sibling: String,
     }
 
+    /// v62.0.0 (JSON cut, E5) — each party is an edition-2 `key:record`
+    /// (`e2::put_key`, default windows), named by its identity-ref from here
+    /// on. The node/agent rows are NOW-relative (`shift`), as CC 2.4.1.1's
+    /// bounded node/agent record requires; nothing depends on the run date.
     async fn parties(d: &dyn FederationDirectory, tag: &str) -> Parties {
         let p = Parties {
-            canonical: format!("i548-canon-{tag}"),
-            agent: format!("i548-agent-{tag}"),
-            steward: format!("i548-steward-{tag}"),
-            sibling: format!("i548-sib-{tag}"),
+            canonical: e2::put_key(d, &format!("i548-canon-{tag}"), &[NODE]).await,
+            agent: e2::put_key(d, &format!("i548-agent-{tag}"), &[AGENT]).await,
+            steward: e2::put_key(d, &format!("i548-steward-{tag}"), &[USER]).await,
+            sibling: e2::put_key(d, &format!("i548-sib-{tag}"), &[AGENT]).await,
         };
-        ts::register_identity_key(d, &p.canonical, NODE).await;
-        ts::register_identity_key(d, &p.agent, AGENT).await;
-        ts::register_identity_key(d, &p.steward, USER).await;
-        ts::register_identity_key(d, &p.sibling, AGENT).await;
         for machine in [&p.agent, &p.sibling] {
             d.put_identity_occurrence_local(IdentityOccurrence {
                 identity_key_id: p.steward.clone(),
                 occurrence_key_id: machine.clone(),
                 device_class: "agent".to_owned(),
                 hardware_attestation: None,
-                asserted_at: chrono::Utc::now(),
+                // v62.0.0 (E5) — the fixtures' base instant (now-relative).
+                asserted_at: base(),
                 valid_until: None,
                 encryption_pubkeys: None,
                 transport_binding: None,
@@ -62,6 +64,27 @@ pub(crate) mod bodies {
             "I548 precondition: the steward stands behind the agent"
         );
         p
+    }
+
+    /// v62.0.0 (JSON cut, E5) — the fixtures' base instant, standing for the
+    /// cases' written `2026-08-01`: today 00:00 UTC less 60 days.
+    fn base() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc()
+            - chrono::Duration::days(60)
+    }
+
+    /// A case's written instant, moved onto `base()` with its spacing kept
+    /// (`2026-08-15` is `base + 14 days`, `2026-01-01` is `base - 212 days`),
+    /// so node/agent rows are now-relative (CC 2.4.1.1) and the cases read as
+    /// written.
+    fn shift(written: &str) -> String {
+        let anchor: chrono::DateTime<chrono::Utc> = "2026-08-01T00:00:00Z".parse().unwrap();
+        let t: chrono::DateTime<chrono::Utc> = written.parse().expect("rfc3339");
+        (base() + (t - anchor)).to_rfc3339()
     }
 
     /// A `consent:state:<stance>:v1` row by `author` covering `attester`,
@@ -88,15 +111,15 @@ pub(crate) mod bodies {
             state,
             serde_json::json!(scope),
             extras,
-            asserted,
-            expires,
+            &shift(asserted),
+            expires.map(shift).as_deref(),
         )
     }
 
     /// A third-party `capacity:*` score by `attester` about `subject` — the
     /// row the canonical's scorer emits.
     fn capacity_score(id: &str, attester: &str, subject: &str) -> Attestation {
-        let asserted = at("2026-09-01T00:00:00Z");
+        let asserted = at(&shift("2026-09-01T00:00:00Z"));
         let env = serde_json::json!({"id": id, "dimension": "capacity:sustained_coherence:v1",
             "score": 0.8, "confidence": 0.9,
             crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(asserted)});
@@ -413,7 +436,9 @@ pub(crate) mod bodies {
         .expect("I548f: the steward's (since lapsed) grant admits");
         let alias = format!("i548f-node-{s}");
         let node = ts::local_signer(&alias);
-        ts::register_hybrid_key_as(d, &node.derived_key_id(), &alias, NODE).await;
+        // v62.0.0 (E5) — the node's key is an edition-2 `key:record`; the
+        // composite `local_signer(alias)` signs with is `e2::signing_key(alias)`.
+        let node_kid = e2::put_key(d, &alias, &[NODE]).await;
         let report = run_consent_expiry_sweep(d, chrono::Utc::now(), |input| {
             let node = node.clone();
             async move {
@@ -434,7 +459,7 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .into_iter()
-            .filter(|a| a.attesting_key_id == node.derived_key_id())
+            .filter(|a| a.attesting_key_id == node_kid)
             .collect();
         assert_eq!(expired.len(), 1, "I548f precondition: one substrate record");
         assert_eq!(

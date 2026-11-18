@@ -338,14 +338,31 @@ pub async fn check_custody_ack_admission(
         return Ok(());
     }
     let target = super::admission::envelope_cohort_target(&row.attestation_envelope)?;
+    // v62.0.0 (wave GC3; CC 2.7.3) — the cohort is OTHER rows (the family or
+    // community roster and its revocations, the device's occurrence claims,
+    // its owner's allow-list grants): declared for the fold, and a device not
+    // (yet) in it HOLDS the report (`custody_ack_outside_cohort`) inside a
+    // fold attempt, re-folded when the roster or a claim changes. The two
+    // checks above (self-report, shape) are the row's own bytes and stay
+    // refusals.
+    {
+        use super::edition2::fold::{reads, Dep};
+        reads(Dep::key(&row.attesting_key_id));
+        if let Some(t) = target {
+            reads(Dep::key(t));
+        }
+    }
     if !device_in_cohort(directory, row, target).await? {
-        return Err(Error::InvalidArgument(format!(
-            "custody_ack_outside_cohort: device {:?} is not in the {} cohort {:?} its report is \
-             placed at (CC 3.1.3.3: a custody report stays within the blob's own cohort)",
-            row.attesting_key_id,
-            row.cohort_scope,
-            target.unwrap_or("")
-        )));
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::CUSTODY_ACK_OUTSIDE_COHORT,
+            Error::InvalidArgument(format!(
+                "custody_ack_outside_cohort: device {:?} is not in the {} cohort {:?} its report \
+                 is placed at (CC 3.1.3.3: a custody report stays within the blob's own cohort)",
+                row.attesting_key_id,
+                row.cohort_scope,
+                target.unwrap_or("")
+            )),
+        ));
     }
     Ok(())
 }
@@ -373,22 +390,35 @@ pub const CUSTODY_ACK_WITHDRAWS_NOT_THE_HOLDER: &str = "custody_ack_withdraws_no
 /// # Errors
 ///
 /// `custody_ack_withdraws_not_the_holder`.
+///
+/// v62.0.0 (wave GC3; CC 2.7.3) — the target's signer is another row's
+/// content: the target is declared as a fold read, and a retraction by
+/// another device is HELD (`custody_ack_withdraws_not_the_holder`) inside a
+/// fold attempt — it concludes nothing, which is what the read-side fold
+/// already makes of it. Outside an attempt it is the refusal it was.
 pub fn check_custody_withdraws_signer(
     retraction: &Attestation,
     target: &Attestation,
 ) -> Result<(), Error> {
+    super::edition2::fold::reads(
+        super::edition2::fold::Dep::row_hex(&target.attestation_id)
+            .unwrap_or_else(|| super::edition2::fold::Dep::key(&target.attestation_id)),
+    );
     if !is_custody_row(target) || retraction.attesting_key_id == target.attesting_key_id {
         return Ok(());
     }
-    Err(Error::InvalidArgument(format!(
-        "{CUSTODY_ACK_WITHDRAWS_NOT_THE_HOLDER}: {} is not the device {} whose holding claim {} \
-         this {} names — a holding claim is retracted by its signer alone, and a takedown is the \
-         CC 2.3 tombstone path (CC 3.1.3.3 rule 4)",
-        retraction.attesting_key_id,
-        target.attesting_key_id,
-        target.attestation_id,
-        retraction.attestation_type
-    )))
+    Err(super::edition2::fold::hold(
+        super::edition2::fold::reason::CUSTODY_ACK_WITHDRAWS_NOT_THE_HOLDER,
+        Error::InvalidArgument(format!(
+            "{CUSTODY_ACK_WITHDRAWS_NOT_THE_HOLDER}: {} is not the device {} whose holding claim \
+             {} this {} names — a holding claim is retracted by its signer alone, and a takedown \
+             is the CC 2.3 tombstone path (CC 3.1.3.3 rule 4)",
+            retraction.attesting_key_id,
+            target.attesting_key_id,
+            target.attestation_id,
+            retraction.attestation_type
+        )),
+    ))
 }
 
 /// **The envelope of a custody report** for `blob` — what a device signs.

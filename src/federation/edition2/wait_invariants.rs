@@ -69,9 +69,7 @@ fn score_row(k: &ciris_crypto::composite::CompositeSigningKey, at: u64) -> Vec<u
 /// I3600 — the one classification, arm by arm.
 #[test]
 fn i3600_is_wait_classifies_every_wait_arm() {
-    use crate::federation::tier_ingest::{
-        LOCATION_AUTHORITY_RULE_DELEGATION_RETRACTED, LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE,
-    };
+    use crate::federation::tier_ingest::LOCATION_AUTHORITY_RULE_NOT_SUBJECT;
     let s = |x: &str| x.to_owned();
     let waits: Vec<Error> = vec![
         Error::AttesterKeyUnknown {
@@ -111,11 +109,6 @@ fn i3600_is_wait_classifies_every_wait_arm() {
             needs: 1,
         },
         Error::WriteScopeRefused(crate::scope::ScopeRefusalReason::MembershipUnresolved),
-        Error::LocationAuthorityUnauthorized {
-            subject_key_id: s("s"),
-            offered_authority_key_id: s("a"),
-            rule: LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE,
-        },
         Error::RosterAuthorityUnauthorized {
             group_key_id: s("g"),
             offered_authority_key_id: s("a"),
@@ -156,7 +149,7 @@ fn i3600_is_wait_classifies_every_wait_arm() {
         Error::LocationAuthorityUnauthorized {
             subject_key_id: s("s"),
             offered_authority_key_id: s("a"),
-            rule: LOCATION_AUTHORITY_RULE_DELEGATION_RETRACTED,
+            rule: LOCATION_AUTHORITY_RULE_NOT_SUBJECT,
         },
         Error::malformed_row(
             "attestation",

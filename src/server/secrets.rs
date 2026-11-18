@@ -405,7 +405,9 @@ where
                 .to_owned(),
         ));
     };
-    let owner = match admission::owner_of(directory, &node).await {
+    // v62.0.0 (wave GC2; G0 v3) — this request catches the ambiguity and
+    // answers it itself, so it reads the seat unmarked (no fold mark leaks).
+    let owner = match admission::owner_of_unmarked(directory, &node).await {
         Ok(Some(owner)) => owner,
         Ok(None) => {
             return Err(error_response(

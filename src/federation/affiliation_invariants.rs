@@ -11,9 +11,9 @@
 //! - **I593** (memory, sqlite, postgres) — the discriminator. A record declares
 //!   its cohort at founding (`policy_blob.cohort_scope`); every door that addresses a
 //!   held record under the other cohort is refused
-//!   `federation_affiliation_cohort_mismatch`: both supersede doors (both
-//!   directions), a supersession that flips the declared cohort, the membership
-//!   write doors, and an attestation placed at the wrong `cohort_scope`. An
+//!   `federation_affiliation_cohort_mismatch`: a version declaring the other
+//!   cohort (both directions; v62: the one roster door, the held record
+//!   decides), and an attestation placed at the wrong `cohort_scope`. An
 //!   unknown cohort value and a config on a plain community are refused at
 //!   founding.
 //! - **I594** (pure, and at the door on all three backends) — the typed config
@@ -39,6 +39,12 @@
 pub mod bodies {
     use crate::federation::affiliation_config::{self as ac, rule};
     use crate::federation::cohort::Cohort;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::group::GroupRecord;
+    use crate::federation::edition2::ingest::{
+        apply_replicated_statement, ReplicatedStatementOutcome, StatementOutcome,
+    };
+    use crate::federation::edition2::names::RowId;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         attestation_tier, attestation_type, cohort_scope, consensus_protocol, identity_type,
@@ -90,17 +96,44 @@ pub mod bodies {
         }
     }
 
-    /// Found `c`, signed by its first member.
+    /// Found `c`, signed by its first member (wave 2, T1): the founding
+    /// roster's voices (the founder's and every listed member's) through the
+    /// edition-2 door. The record lands under `e2::kid(id)`, its members
+    /// under `e2::kid(member)`.
     pub async fn found(d: &dyn FederationDirectory, c: Community) -> Result<(), Error> {
         let signer = c.members[0].key_id.clone();
-        d.put_community(ts::sign_community(&signer, c))
-            .await
-            .map(|_| ())
+        let signed = ts::sign_community(&signer, c);
+        e2::put_voices(
+            d,
+            &e2::community_voices(&signed, 1, None, e2::ms(chrono::Utc::now())),
+        )
+        .await
+        .map(|_| ())
     }
 
-    /// The held record renamed, naming the held head (a valid next version).
+    /// A later version of the held record (wave 2, T1): the roster's own row
+    /// at the version after the held head, naming it by `refs.head`, with
+    /// the voices of `next`'s listed members.
+    pub async fn supersede(d: &dyn FederationDirectory, next: &Community) -> Result<(), Error> {
+        let voices =
+            e2::community_voices_naming_held(d, &signed(next), e2::ms(chrono::Utc::now())).await;
+        e2::put_voices(d, &voices).await.map(|_| ())
+    }
+
+    /// The held record (under `e2::kid(id)`) renamed, as seeds again (the
+    /// builders sign with the seed; the twin maps to identity-refs), naming
+    /// the held head (a valid next version).
     pub async fn next_version(d: &dyn FederationDirectory, id: &str, name: &str) -> Community {
-        let held = d.lookup_community(id).await.unwrap().expect("held");
+        let held = d
+            .lookup_community(&e2::kid(id))
+            .await
+            .unwrap()
+            .expect("held");
+        let mut held = held;
+        held.community_key_id = e2::seed_of(&held.community_key_id);
+        for m in &mut held.members {
+            m.key_id = e2::seed_of(&m.key_id);
+        }
         let mut next = held.clone();
         next.community_name = name.to_owned();
         next.prev_head_digest = held.persist_row_hash.clone();
@@ -141,8 +174,8 @@ pub mod bodies {
 
     /// A member's own chat row placed at `scope` naming `group`.
     fn placed_row(producer: &str, scope: &str, group: &str) -> crate::federation::Attestation {
-        let mut r = crate::federation::Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
+        let r = crate::federation::Attestation {
+            attestation_id: String::new(),
             attesting_key_id: producer.to_owned(),
             attested_key_id: producer.to_owned(),
             attestation_type: attestation_type::SCORES.to_owned(),
@@ -167,8 +200,9 @@ pub mod bodies {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        ts::seal_row_in_place(producer, &mut r);
-        r
+        // Edition 2: the literal is the payload; the row is the door's
+        // mapping of the producer's statement over it.
+        crate::federation::edition2::fixture_switch::row_of(&r, producer)
     }
 
     async fn place(
@@ -183,13 +217,15 @@ pub mod bodies {
     /// Found the plain community `{tag}-c` and supersede it once, so the
     /// history table holds a `community` row; returns the id.
     pub async fn seed_community_history(d: &dyn FederationDirectory, tag: &str) -> String {
-        let (c, f) = (format!("{tag}-c"), format!("{tag}-cf"));
+        // Wave 2: the distinguishing part of an id LEADS (a test key seeds
+        // from its first 32 bytes, and so does its identity-ref).
+        let (c, f) = (format!("c-{tag}"), format!("cf-{tag}"));
         users(d, &[&f]).await;
         found(d, record(&c, &[&f], None))
             .await
             .expect("seed: community founds");
         let next = next_version(d, &c, "seeded").await;
-        d.supersede_community(signed(&next), None)
+        supersede(d, &next)
             .await
             .expect("seed: a community supersedes at any version");
         c
@@ -201,12 +237,14 @@ pub mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) -> Result<(), Error> {
-        let (aff, f) = (format!("{tag}-aff"), format!("{tag}-founder"));
+        let (aff, f) = (format!("aff-{tag}"), format!("founder-{tag}"));
         users(d, &[&f]).await;
         found(d, record(&aff, &[&f], Some(affiliation_blob(None)))).await?;
         let next = next_version(d, &aff, "renamed").await;
-        d.supersede_affiliations(signed(&next), None).await?;
-        let history = d.list_group_versions(Cohort::Affiliations, &aff).await?;
+        supersede(d, &next).await?;
+        let history = d
+            .list_group_versions(Cohort::Affiliations, &e2::kid(&aff))
+            .await?;
         assert!(
             history.iter().any(|v| v.version == 1),
             "{tag} I592: the prior version is recorded under `affiliations`: {history:?}"
@@ -216,8 +254,8 @@ pub mod bodies {
 
     /// **I606** — see the module doc.
     pub async fn i606_the_uniform_reads_are_cohort_checked(d: &dyn FederationDirectory, tag: &str) {
-        let (plain, aff) = (format!("{tag}-plain"), format!("{tag}-aff"));
-        let (f, m) = (format!("{tag}-founder"), format!("{tag}-member"));
+        let (plain, aff) = (format!("plain-{tag}"), format!("aff-{tag}"));
+        let (f, m) = (format!("founder-{tag}"), format!("member-{tag}"));
         users(d, &[&f, &m]).await;
         found(d, record(&plain, &[&f, &m], None))
             .await
@@ -225,6 +263,8 @@ pub mod bodies {
         found(d, record(&aff, &[&f, &m], Some(affiliation_blob(None))))
             .await
             .expect("I606: an affiliation founds");
+        // The records are held under their identity-refs.
+        let (plain, aff, f) = (e2::kid(&plain), e2::kid(&aff), e2::kid(&f));
 
         // The point reads refuse the other cohort, both directions.
         for (id, declared, addressed, cohort) in [
@@ -286,34 +326,24 @@ pub mod bodies {
                 cohort.as_str()
             );
         }
-        // reverse_quorum's cohort_state: an objection labelled as an
-        // affiliation's, naming the plain community, is refused.
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut objection = ts::bare_attestation(
-            &id,
-            &m,
-            &f,
-            &crate::federation::reverse_quorum::objection_envelope(
-                Cohort::Affiliations,
-                &plain,
-                "i606-some-action",
-                "i606 grounds",
-            ),
-        );
-        objection.attestation_type = attestation_type::SCORES.to_owned();
-        ts::seal_row_in_place(&m, &mut objection);
-        expect_mismatch(
-            crate::federation::reverse_quorum::record_objection(d, &objection).await,
-            "community",
-            "affiliations",
-            "I606: an objection labelled as an affiliation's, naming a community",
-        );
+        // v62 (E3): the reverse_quorum objection leg is deleted
+        // (`reverse_quorum` is refused in v62; RULINGS "Kernel departures").
     }
 
     /// **I593** — see the module doc.
+    ///
+    /// v62.0.0 (E3b) — edition 2 has ONE roster door (`group:roster` →
+    /// `put_community`): a version addresses the cohort it declares, and the
+    /// held record decides. The earlier pair of supersede doors collapses to
+    /// a version labelled for the other cohort, both directions. The
+    /// membership write-door legs (`add_member` / `revoke_member` addressed
+    /// to the other cohort) are DELETED: a `membership:{stage}` row names its
+    /// group and carries no cohort, so there is no wrong cohort to address.
     pub async fn i593_the_cohort_is_declared(d: &dyn FederationDirectory, tag: &str) {
-        let (plain, aff) = (format!("{tag}-plain"), format!("{tag}-aff"));
-        let (f, m) = (format!("{tag}-founder"), format!("{tag}-member"));
+        // The distinguishing part of an id LEADS (a test key, and its
+        // identity-ref, seeds from its first 32 bytes).
+        let (plain, aff) = (format!("plain-{tag}"), format!("aff-{tag}"));
+        let (f, m) = (format!("founder-{tag}"), format!("member-{tag}"));
         users(d, &[&f, &m]).await;
         found(d, record(&plain, &[&f, &m], None))
             .await
@@ -322,104 +352,58 @@ pub mod bodies {
             .await
             .expect("I593: an affiliation founds");
 
-        // Both supersede doors, both directions.
-        let p2 = next_version(d, &plain, "p2").await;
+        // A plain community's version declaring `affiliations`.
+        let mut p2 = next_version(d, &plain, "p2").await;
+        p2.policy_blob = Some(affiliation_blob(None));
         expect_mismatch(
-            d.supersede_affiliations(signed(&p2), None).await,
+            supersede(d, &p2).await,
             "community",
             "affiliations",
-            "I593: supersede_affiliations on a plain community",
+            "I593: a plain community's version declaring `affiliations`",
         );
-        let a2 = next_version(d, &aff, "a2").await;
-        expect_mismatch(
-            d.supersede_community(signed(&a2), None).await,
-            "affiliations",
-            "community",
-            "I593: supersede_community on an affiliation",
-        );
-        // A supersession that flips the declared cohort.
-        let mut flipped = next_version(d, &aff, "flipped").await;
-        flipped.policy_blob = None;
-        expect_mismatch(
-            d.supersede_affiliations(signed(&flipped), None).await,
-            "community",
-            "affiliations",
-            "I593: an affiliation cannot supersede itself into a community",
-        );
-        // Control: the right door admits.
-        d.supersede_affiliations(signed(&a2), None)
-            .await
-            .expect("I593: supersede_affiliations on an affiliation admits");
-        // The held record decides, not the new version's label: a version
-        // declaring `community` offered at the community door over a held
-        // affiliation.
+        // An affiliation's version declaring `community`: the held record
+        // decides, not the new version's label.
         let mut relabel = next_version(d, &aff, "relabel").await;
         relabel.policy_blob = None;
         expect_mismatch(
-            d.supersede_community(signed(&relabel), None).await,
+            supersede(d, &relabel).await,
             "affiliations",
             "community",
-            "I593: the community door over a held affiliation, relabelled",
+            "I593: an affiliation's version relabelled as a community",
         );
-
-        // The membership write doors refuse before any signature is read.
-        let spec = crate::federation::cohort::AdmitSpec {
-            authority_key_id: f.clone(),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            cosignatures: Vec::new(),
-        };
-        let member = crate::federation::cohort::RosterMember {
-            key_id: format!("{tag}-joiner"),
-            joined_at: chrono::Utc::now(),
-            role: None,
-        };
-        expect_mismatch(
-            d.add_member(Cohort::Affiliations, &plain, member.clone(), &spec)
-                .await,
-            "community",
-            "affiliations",
-            "I593: add_member(affiliations) on a plain community",
-        );
-        expect_mismatch(
-            d.add_member(Cohort::Community, &aff, member, &spec).await,
-            "affiliations",
-            "community",
-            "I593: add_member(community) on an affiliation",
-        );
-        let revoke = ts::sign_revoke_spec(
-            Cohort::Community,
-            &m,
-            &aff,
-            &m,
-            chrono::Utc::now(),
-            None,
-            vec![],
-        );
-        expect_mismatch(
-            d.revoke_member(Cohort::Community, &aff, &m, revoke).await,
-            "affiliations",
-            "community",
-            "I593: revoke_member(community) on an affiliation",
+        // Control: an affiliation's own version admits, and stays one.
+        let a2 = next_version(d, &aff, "a2").await;
+        supersede(d, &a2)
+            .await
+            .expect("I593: an affiliation's version declaring `affiliations` admits");
+        let (plain_id, aff_id) = (e2::kid(&plain), e2::kid(&aff));
+        assert_eq!(
+            d.lookup_group(Cohort::Affiliations, &aff_id)
+                .await
+                .expect("I593: the affiliation reads under its cohort")
+                .expect("I593: held")
+                .cohort,
+            Cohort::Affiliations,
+            "I593: the superseded record still declares `affiliations`"
         );
 
         // An attestation placed at the wrong cohort_scope.
         expect_mismatch(
-            place(d, placed_row(&m, cohort_scope::AFFILIATIONS, &plain)).await,
+            place(d, placed_row(&m, cohort_scope::AFFILIATIONS, &plain_id)).await,
             "community",
             "affiliations",
             "I593: an affiliations-scoped row naming a plain community",
         );
         expect_mismatch(
-            place(d, placed_row(&m, cohort_scope::COMMUNITY, &aff)).await,
+            place(d, placed_row(&m, cohort_scope::COMMUNITY, &aff_id)).await,
             "affiliations",
             "community",
             "I593: a community-scoped row naming an affiliation",
         );
-        place(d, placed_row(&m, cohort_scope::AFFILIATIONS, &aff))
+        place(d, placed_row(&m, cohort_scope::AFFILIATIONS, &aff_id))
             .await
             .expect("I593: a member's affiliations-scoped row naming the affiliation admits");
-        place(d, placed_row(&m, cohort_scope::COMMUNITY, &plain))
+        place(d, placed_row(&m, cohort_scope::COMMUNITY, &plain_id))
             .await
             .expect("I593: a member's community-scoped row naming the community admits");
 
@@ -428,7 +412,7 @@ pub mod bodies {
             found(
                 d,
                 record(
-                    &format!("{tag}-bogus"),
+                    &format!("bogus-{tag}"),
                     &[&f],
                     Some(serde_json::json!({ ac::POLICY_COHORT_FIELD: "guild" })),
                 ),
@@ -441,7 +425,7 @@ pub mod bodies {
             found(
                 d,
                 record(
-                    &format!("{tag}-cfg"),
+                    &format!("cfg-{tag}"),
                     &[&f],
                     Some(serde_json::json!({ "affiliation_config": { "affiliation_archetype": "informal_adhoc" } })),
                 ),
@@ -452,10 +436,84 @@ pub mod bodies {
         );
     }
 
+    /// v62.0.0 (E3b, E13's pattern) — **what `from` serves `requester`** of
+    /// the rows `rows`: every statement (each voice) of those rows on the
+    /// FILTERED serve path (`edition2::serve::statements_served_to`; the
+    /// store's raw since-read is never a serve surface), in `from`'s
+    /// admission order.
+    async fn served(
+        from: &dyn FederationDirectory,
+        requester: &str,
+        rows: &[RowId],
+    ) -> Vec<(Vec<u8>, RowId)> {
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = crate::federation::edition2::serve::statements_served_to(
+                from,
+                cursor.as_ref(),
+                1000,
+                Some(requester),
+            )
+            .await
+            .expect("serve statements");
+            for st in page.statements {
+                if let Some(id) = RowId::of_statement(&st.bytes) {
+                    if rows.contains(&id) {
+                        out.push((st.bytes, id));
+                    }
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert!(
+            !out.is_empty(),
+            "{requester} is served the rows it asked for"
+        );
+        out
+    }
+
+    /// Each served statement through `to`'s replicated statement door
+    /// (`apply_replicated_statement`), under the id it names.
+    async fn deliver(
+        to: &dyn FederationDirectory,
+        statements: &[(Vec<u8>, RowId)],
+    ) -> Vec<ReplicatedStatementOutcome> {
+        let mut out = Vec::new();
+        for (bytes, id) in statements {
+            out.push(
+                apply_replicated_statement(to, bytes, &id.0)
+                    .await
+                    .unwrap_or_else(|e| panic!("a replicated statement: {e}")),
+            );
+        }
+        out
+    }
+
+    /// `voices` through `to`'s replicated statement door, in order; the
+    /// first refusal (`Ok(())` when every voice was kept).
+    async fn first_refusal(to: &dyn FederationDirectory, voices: &[Vec<u8>]) -> Result<(), Error> {
+        for v in voices {
+            apply_replicated_statement(to, v, &e2::row_id_of(v).0).await?;
+        }
+        Ok(())
+    }
+
     /// **I595** — the replicated amendment path. A amends an affiliation by
-    /// quorum; B applies A's served record and records the prior version under
-    /// `affiliations` (it always wrote `community`). A version that relabels
-    /// the held affiliation as a community is refused on the replicated door.
+    /// quorum; B applies A's served version and records the prior version
+    /// under `affiliations` (it always wrote `community`). A version that
+    /// relabels the held affiliation as a community is refused on the
+    /// replicated door.
+    ///
+    /// v62.0.0 (E3b) — the amendment is an edition-2 roster version (T1.api
+    /// §6): version 2 naming the founding by `refs.head`, one voice per
+    /// signer of the prior roster. Short of the held `majority` it is
+    /// `Pending` and the head does not move; the second voice lands it.
+    /// Replication is A's statements served to B (requester: B's node key,
+    /// else a member's identity-ref) into B's replicated statement door.
     pub async fn i595_a_replicated_affiliation_amendment(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -468,63 +526,93 @@ pub mod bodies {
             .map(|n| format!("{n}-{tag}"))
             .collect();
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let id = format!("{tag}-aff");
+        let id = format!("aff-{tag}");
+        let gid = e2::kid(&id);
         let mut founding = record(&id, &refs, Some(affiliation_blob(None)));
         founding.consensus_protocol = consensus_protocol::MAJORITY.to_owned();
         for d in [a, b] {
             users(d, &refs).await;
-            found(d, founding.clone())
-                .await
-                .unwrap_or_else(|e| panic!("{tag} I595: founding: {e}"));
         }
-        let change = a
-            .build_membership_change_envelope(
-                Cohort::Affiliations,
-                &id,
-                &keys,
-                false,
-                Some(consensus_protocol::UNANIMOUS),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I595: build change: {e}"));
-        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
-        let sigs = [&keys[0], &keys[1]]
-            .iter()
-            .map(|k| ts::threshold_sign(k, &bytes))
-            .collect();
+        // A founds: every listed member voices the founding roster.
+        let founded_at = e2::ms(chrono::Utc::now() - chrono::Duration::minutes(10));
+        let founding_voices = e2::community_voices(&signed(&founding), 1, None, founded_at);
+        match e2::put_voices(a, &founding_voices).await {
+            Ok(StatementOutcome::Row { .. }) => {}
+            other => panic!("{tag} I595: founding on A: {other:?}"),
+        }
+        let v1 = e2::row_id_of(&founding_voices[0]);
+
+        // A's amendment: renamed, and the protocol moved to unanimous, voiced
+        // by two of the three (the held majority).
         let mut v2 = next_version(a, &id, "renamed").await;
         v2.consensus_protocol = consensus_protocol::UNANIMOUS.to_owned();
-        a.supersede_affiliations_with_quorum(signed(&v2), change, sigs)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I595: A's quorum amendment: {e}"));
-        let served = a
-            .list_signed_communities_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.community.community.community_key_id == id)
-            .expect("served")
-            .community;
+        let (ka, kb) = (e2::signing_key(&keys[0]), e2::signing_key(&keys[1]));
+        let amended_at = e2::ms(chrono::Utc::now());
+        let v2_voices = e2::roster_voices(
+            &GroupRecord::Community(e2::community_with_kids(&v2)),
+            2,
+            Some(&v1),
+            amended_at,
+            &[&ka, &kb],
+        );
+        match e2::put_voices(a, &v2_voices[..1]).await {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            other => panic!("{tag} I595: one voice of three is short of majority: {other:?}"),
+        }
+        assert_eq!(
+            e2::held_head(a, &gid).await.map(|(_, v)| v),
+            Some(1),
+            "{tag} I595: a short amendment does not move A's head"
+        );
+        match e2::put_voices(a, &v2_voices[1..]).await {
+            Ok(StatementOutcome::Row { .. }) => {}
+            other => panic!("{tag} I595: the second voice lands A's amendment: {other:?}"),
+        }
+        let v2_id = e2::row_id_of(&v2_voices[0]);
+
+        // B takes the founding A serves it.
+        let requester = b.node_key_id().unwrap_or_else(|| e2::kid(&keys[0]));
+        deliver(b, &served(a, &requester, &[v1]).await).await;
+        assert!(
+            b.lookup_community(&gid).await.unwrap().is_some(),
+            "{tag} I595: B holds the affiliation"
+        );
 
         // A relabelled copy of the same amendment: B holds an affiliation.
-        let mut relabelled = served.clone();
-        relabelled.community.policy_blob = None;
-        let relabelled = crate::federation::SignedCommunity {
-            supersede_proof: served.supersede_proof.clone(),
-            ..ts::sign_community(&keys[0], relabelled.community)
-        };
+        let mut relabelled = v2.clone();
+        relabelled.policy_blob = None;
+        let relabel_voices = e2::roster_voices(
+            &GroupRecord::Community(e2::community_with_kids(&relabelled)),
+            2,
+            Some(&v1),
+            amended_at,
+            &[&ka, &kb],
+        );
         expect_mismatch(
-            b.put_community(relabelled).await,
+            first_refusal(b, &relabel_voices).await,
             "affiliations",
             "community",
             "I595: a replicated version relabelling the affiliation",
         );
 
-        b.put_community(served)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I595: B applies A's amendment: {e}"));
+        // B applies A's amendment.
+        let outs = deliver(b, &served(a, &requester, &[v2_id]).await).await;
+        assert!(
+            matches!(
+                outs.last(),
+                Some(ReplicatedStatementOutcome::Admitted(
+                    StatementOutcome::Row { .. }
+                ))
+            ),
+            "{tag} I595: B applies A's amendment: {outs:?}"
+        );
+        assert_eq!(
+            e2::held_head(b, &gid).await.map(|(h, v)| (h == v2_id, v)),
+            Some((true, 2)),
+            "{tag} I595: B's head is A's amendment"
+        );
         let aff = b
-            .list_group_versions(Cohort::Affiliations, &id)
+            .list_group_versions(Cohort::Affiliations, &gid)
             .await
             .unwrap();
         assert!(
@@ -532,7 +620,7 @@ pub mod bodies {
             "{tag} I595: B recorded the prior version under `affiliations`: {aff:?}"
         );
         assert!(
-            b.list_group_versions(Cohort::Community, &id)
+            b.list_group_versions(Cohort::Community, &gid)
                 .await
                 .unwrap()
                 .iter()
@@ -545,9 +633,9 @@ pub mod bodies {
     /// supersession; a valid one founds and resolves.
     pub async fn i594_the_config_is_checked_at_the_door(d: &dyn FederationDirectory, tag: &str) {
         let (aff, f, m) = (
-            format!("{tag}-aff"),
-            format!("{tag}-founder"),
-            format!("{tag}-member"),
+            format!("aff-{tag}"),
+            format!("founder-{tag}"),
+            format!("member-{tag}"),
         );
         users(d, &[&f, &m]).await;
         expect_rule(
@@ -573,13 +661,13 @@ pub mod bodies {
                 Some(affiliation_blob(Some(serde_json::json!({
                     "affiliation_archetype": "informal_adhoc",
                     "role_term": 90,
-                    "compartments": [{ "name": "board", "members": [f.clone()] }],
+                    "compartments": [{ "name": "board", "members": [e2::kid(&f)] }],
                 })))),
             ),
         )
         .await
         .expect("I594: a valid affiliation founds");
-        let held = d.lookup_community(&aff).await.unwrap().unwrap();
+        let held = d.lookup_community(&e2::kid(&aff)).await.unwrap().unwrap();
         let resolved = ac::resolved_affiliation_config(&held)
             .unwrap()
             .expect("an affiliation resolves");
@@ -589,10 +677,10 @@ pub mod bodies {
         );
         let mut bad = next_version(d, &aff, "bad").await;
         bad.policy_blob = Some(affiliation_blob(Some(serde_json::json!({
-            "compartments": [{ "name": "board", "members": [format!("{tag}-stranger")] }],
+            "compartments": [{ "name": "board", "members": [e2::kid(&format!("stranger-{tag}"))] }],
         }))));
         expect_rule(
-            d.supersede_affiliations(signed(&bad), None).await,
+            supersede(d, &bad).await,
             rule::COMPARTMENT_INVALID,
             "I594: a supersession naming a compartment member off the roster",
         );

@@ -46,6 +46,7 @@ pub(crate) mod bodies {
 
     use crate::federation::consent::{self, ScopedStance};
     use crate::federation::consent_grammar::{parse_grant_payload, CohortEntry, GRANT_DIMENSION};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::ConsentState;
     use crate::federation::read_probe;
     use crate::federation::tier_ingest::test_support as ts;
@@ -53,7 +54,7 @@ pub(crate) mod bodies {
     use crate::federation::types::identity_type::{AGENT, NODE, USER};
     use crate::federation::{
         admission, consent_by_humans as cbh, replication_audience as ra, Attestation, Error,
-        FederationDirectory, SignedAttestation,
+        FederationDirectory,
     };
 
     // ── the v53.1.4 bodies, verbatim ────────────────────────────────────
@@ -235,10 +236,53 @@ pub(crate) mod bodies {
         }
     }
 
+    /// v62.0.0 (JSON cut, E7) — a flipped row enters through the one entry
+    /// (`e2::put_signed`). An owner binding (`delegates_to` with the
+    /// owner-binding dimension) also takes the node's own voice (C557); a
+    /// trust charter (`trust:charter`) the co-signers' voices are put by
+    /// [`put_cosigned`].
     async fn put(d: &dyn FederationDirectory, a: Attestation) -> Result<(), Error> {
-        d.put_attestation(SignedAttestation { attestation: a })
-            .await
-            .map(|_| ())
+        e2::put_signed(d, &a).await?;
+        if a.attestation_type == attestation_type::DELEGATES_TO
+            && a.attestation_envelope
+                .get("dimension")
+                .and_then(|v| v.as_str())
+                == Some(crate::federation::types::owner_binding::DIMENSION)
+        {
+            let st = e2::carried_statement(&a).expect("the binding carries its statement");
+            e2::put_statement(d, &e2::voice_of(&st, &a.attested_key_id)).await?;
+        }
+        Ok(())
+    }
+
+    /// v62.0.0 (JSON cut, E7) — `owner` binds `node`, NOW-relative: the
+    /// builder stamps a fixed instant, and the node's voice is a node-key row
+    /// (CC 2.4.1.1), so the binding is re-dated to an hour ago and re-sealed.
+    fn owner_binding(owner: &str, node: &str) -> Attestation {
+        let at = admission::truncate_to_substrate_resolution(
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        );
+        let mut ob = ts::owner_binding_attestation("", owner, node);
+        ob.asserted_at = at;
+        ob.scrub_timestamp = at;
+        ob.attestation_envelope[crate::federation::envelope::paths::ASSERTED_AT] =
+            serde_json::Value::String(admission::render_signed_instant(at));
+        ts::reseal(&mut ob);
+        ob
+    }
+
+    /// `a`, then each co-signer's voice over it.
+    async fn put_cosigned(
+        d: &dyn FederationDirectory,
+        a: Attestation,
+        cosigners: &[&str],
+    ) -> Result<(), Error> {
+        put(d, a.clone()).await?;
+        let st = e2::carried_statement(&a).expect("the row carries its statement");
+        for c in cosigners {
+            e2::put_statement(d, &e2::voice_of(&st, c)).await?;
+        }
+        Ok(())
     }
 
     /// A `scores` row by `author` about `attested` carrying `env`, sealed.
@@ -345,8 +389,14 @@ pub(crate) mod bodies {
     }
 
     pub async fn seed_allow_corpus(d: &dyn FederationDirectory, s: &str) -> AllowCorpus {
-        let owners: Vec<String> = (1..=5).map(|i| format!("i533-o{i}-{s}")).collect();
-        let nodes: Vec<String> = (1..=3).map(|i| format!("i533-n{i}-{s}")).collect();
+        // v62.0.0 (JSON cut, E7) — every key is named by its identity-ref
+        // (`e2::kid`); the flipped helpers resolve it back to its seed.
+        let owners: Vec<String> = (1..=5)
+            .map(|i| e2::kid(&format!("i533-o{i}-{s}")))
+            .collect();
+        let nodes: Vec<String> = (1..=3)
+            .map(|i| e2::kid(&format!("i533-n{i}-{s}")))
+            .collect();
         let (o1, o2, o3, o4, o5) = (&owners[0], &owners[1], &owners[2], &owners[3], &owners[4]);
         let (n1, n2, n3) = (&nodes[0], &nodes[1], &nodes[2]);
         let mut reg: Vec<(&str, &str)> = owners.iter().map(|k| (k.as_str(), USER)).collect();
@@ -479,7 +529,7 @@ pub(crate) mod bodies {
         s: &str,
     ) {
         let c = seed_allow_corpus(d, s).await;
-        let nobody = format!("i533-nobody-{s}");
+        let nobody = e2::kid(&format!("i533-nobody-{s}"));
         let mut asked = 0usize;
         for o in &c.owners {
             for n in c.nodes.iter().chain(std::iter::once(&nobody)) {
@@ -558,30 +608,20 @@ pub(crate) mod bodies {
         )
     }
 
-    /// Point `fid`'s head at `digest`.
+    /// Point `fid`'s head at `digest`: v62.0.0 (JSON cut, E7; T1 §6) a
+    /// roster version v+1 naming the held head, voiced by the family's
+    /// members (`a` authors).
     async fn name_charter(d: &dyn FederationDirectory, fid: &str, a: &str, digest: String) {
         let held = d.lookup_family(fid).await.unwrap().unwrap();
-        let signed = crate::federation::types::SignedFamily {
-            family: {
-                let mut f = held.clone();
-                f.persist_row_hash = String::new();
-                f.prev_head_digest = held.persist_row_hash.clone();
-                f.charter_digest = digest;
-                f
-            },
-            authority_key_id: a.to_owned(),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            supersede_proof: None,
-            cosignatures: Vec::new(),
-        };
-        d.supersede_group_row(
-            crate::federation::cohort::Cohort::Family,
-            serde_json::to_value(&signed).unwrap(),
-            None,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("I534: the naming version of {fid}: {e}"));
+        let (head, version) = e2::held_head(d, fid).await.expect("the family is held");
+        let mut f = held.clone();
+        f.persist_row_hash = String::new();
+        f.charter_digest = digest;
+        let signed = ts::sign_family(a, f);
+        let at = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after 1970");
+        e2::put_voices(d, &e2::family_voices(&signed, version + 1, Some(&head), at))
+            .await
+            .unwrap_or_else(|e| panic!("I534: the naming version of {fid}: {e}"));
     }
 
     /// The groups I534 asks about, with their expected answer where one is
@@ -591,15 +631,20 @@ pub(crate) mod bodies {
         s: &str,
     ) -> Vec<(String, Option<bool>)> {
         use crate::federation::replication_audience_invariants::bodies as rab;
-        let (a, b) = (format!("i534-a-{s}"), format!("i534-b-{s}"));
+        let (a, b) = (
+            e2::kid(&format!("i534-a-{s}")),
+            e2::kid(&format!("i534-b-{s}")),
+        );
         rab::users(d, &[&a, &b]).await;
         let mut out: Vec<(String, Option<bool>)> = Vec::new();
 
         // fam1: a charter the head names — public.
-        let fam1 = format!("i534-fam1-{s}");
+        let fam1 = e2::kid(&format!("i534-fam1-{s}"));
         rab::family(d, &fam1, &[&a, &b]).await;
         let c1 = charter(&format!("i534-c1-{s}"), &fam1, &a, &b);
-        put(d, c1.clone()).await.expect("fam1 charter");
+        put_cosigned(d, c1.clone(), &[&b])
+            .await
+            .expect("fam1 charter");
         let digest = d
             .get_attestation(&c1.attestation_id)
             .await
@@ -610,18 +655,20 @@ pub(crate) mod bodies {
         out.push((fam1, Some(true)));
 
         // fam2: a charter the head does NOT name — private.
-        let fam2 = format!("i534-fam2-{s}");
+        let fam2 = e2::kid(&format!("i534-fam2-{s}"));
         rab::family(d, &fam2, &[&a, &b]).await;
-        put(d, charter(&format!("i534-c2-{s}"), &fam2, &a, &b))
+        put_cosigned(d, charter(&format!("i534-c2-{s}"), &fam2, &a, &b), &[&b])
             .await
             .expect("fam2 charter");
         out.push((fam2, Some(false)));
 
         // fam3: a named charter, recanted by its attester — private again.
-        let fam3 = format!("i534-fam3-{s}");
+        let fam3 = e2::kid(&format!("i534-fam3-{s}"));
         rab::family(d, &fam3, &[&a, &b]).await;
         let c3 = charter(&format!("i534-c3-{s}"), &fam3, &a, &b);
-        put(d, c3.clone()).await.expect("fam3 charter");
+        put_cosigned(d, c3.clone(), &[&b])
+            .await
+            .expect("fam3 charter");
         let digest = d
             .get_attestation(&c3.attestation_id)
             .await
@@ -635,23 +682,25 @@ pub(crate) mod bodies {
         out.push((fam3, Some(false)));
 
         // fam4: no charter.
-        let fam4 = format!("i534-fam4-{s}");
+        let fam4 = e2::kid(&format!("i534-fam4-{s}"));
         rab::family(d, &fam4, &[&a, &b]).await;
         out.push((fam4, Some(false)));
 
         // k1: a key root with a live charter row — public; k2: the same,
         // recanted; k3: a bare key.
         let (k1, k2, k3) = (
-            format!("i534-k1-{s}"),
-            format!("i534-k2-{s}"),
-            format!("i534-k3-{s}"),
+            e2::kid(&format!("i534-k1-{s}")),
+            e2::kid(&format!("i534-k2-{s}")),
+            e2::kid(&format!("i534-k3-{s}")),
         );
         rab::users(d, &[&k1, &k2, &k3]).await;
-        put(d, charter(&format!("i534-ck1-{s}"), &k1, &a, &b))
+        put_cosigned(d, charter(&format!("i534-ck1-{s}"), &k1, &a, &b), &[&b])
             .await
             .expect("k1 charter");
         let ck2 = charter(&format!("i534-ck2-{s}"), &k2, &a, &b);
-        put(d, ck2.clone()).await.expect("k2 charter");
+        put_cosigned(d, ck2.clone(), &[&b])
+            .await
+            .expect("k2 charter");
         put(d, composer(&a, &k2, attestation_type::RECANTS, &ck2))
             .await
             .expect("k2 charter recanted");
@@ -659,14 +708,12 @@ pub(crate) mod bodies {
         out.push((k2, Some(false)));
         out.push((k3, Some(false)));
 
-        // A plain room, and the accord family.
-        let room = format!("i534-room-{s}");
+        // A plain room. v62.0.0 (wave 3 rule 1) — the accord family's
+        // earlier-form record does not come back (genesis bundle/2), so it is
+        // no longer asked.
+        let room = e2::kid(&format!("i534-room-{s}"));
         rab::room(d, &room, &[&a]).await;
         out.push((room, Some(false)));
-        out.push((
-            crate::federation::canonical_community::accord_family_key_id().to_owned(),
-            Some(true),
-        ));
         out
     }
 
@@ -694,14 +741,14 @@ pub(crate) mod bodies {
     }
 
     pub async fn seed_consent_corpus(d: &dyn FederationDirectory, s: &str) -> ConsentCorpus {
-        let target = format!("i536-canon-{s}");
-        let alice = format!("i536-alice-{s}");
-        let node = format!("i536-node-{s}");
-        let agent = format!("i536-agent-{s}");
-        let bob = format!("i536-bob-{s}");
-        let carol = format!("i536-carol-{s}");
-        let dave = format!("i536-dave-{s}");
-        let other = format!("i536-other-{s}");
+        let target = e2::kid(&format!("i536-canon-{s}"));
+        let alice = e2::kid(&format!("i536-alice-{s}"));
+        let node = e2::kid(&format!("i536-node-{s}"));
+        let agent = e2::kid(&format!("i536-agent-{s}"));
+        let bob = e2::kid(&format!("i536-bob-{s}"));
+        let carol = e2::kid(&format!("i536-carol-{s}"));
+        let dave = e2::kid(&format!("i536-dave-{s}"));
+        let other = e2::kid(&format!("i536-other-{s}"));
         keys(
             d,
             &[
@@ -717,25 +764,16 @@ pub(crate) mod bodies {
         )
         .await;
         // alice stewards the node (owner binding) and the agent (occurrence).
-        put(
+        put(d, owner_binding(&alice, &node)).await.unwrap();
+        // v62.0.0 (lead ruling) — an agent is anchored to its human by the
+        // owner relation, never as an occurrence of the person (O1).
+        e2::put_agent_owner_binding(
             d,
-            ts::owner_binding_attestation(&format!("i536-ob-{s}"), &alice, &node),
+            &alice,
+            &agent,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after 1970"),
         )
-        .await
-        .unwrap();
-        d.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
-            identity_key_id: alice.clone(),
-            occurrence_key_id: agent.clone(),
-            device_class: "agent".to_owned(),
-            hardware_attestation: None,
-            asserted_at: chrono::Utc::now(),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .expect("occurrence row");
+        .await;
 
         // The node's own legacy grant; alice's analyze grant FOR the node,
         // then her revocation naming it on the causal plane; alice's view
@@ -892,12 +930,7 @@ pub(crate) mod bodies {
         // canonical's ~3.2k `consent:community_trust:v1` rows are this shape
         // (CC 3.3.1: the node's own row, admitted only under a held owner
         // binding — alice's).
-        put(
-            d,
-            ts::owner_binding_attestation(&format!("i536-obt-{s}"), &alice, &target),
-        )
-        .await
-        .unwrap();
+        put(d, owner_binding(&alice, &target)).await.unwrap();
         let mut ct = scores(
             &target,
             &target,
@@ -908,7 +941,7 @@ pub(crate) mod bodies {
             chrono::Utc::now(),
         );
         // v59.0.0 (CIRISPersist#1096) — the node, its owner and the agent key.
-        let ct_agent = format!("i536-ctagent-{s}");
+        let ct_agent = e2::kid(&format!("i536-ctagent-{s}"));
         ts::register_hybrid_key(d, &ct_agent).await;
         ct.subject_key_ids = vec![target.clone(), alice.clone(), bob.clone(), ct_agent];
         ts::reseal(&mut ct);
@@ -940,7 +973,7 @@ pub(crate) mod bodies {
                 carol,
                 dave,
                 other,
-                format!("i536-nobody-{s}"),
+                e2::kid(&format!("i536-nobody-{s}")),
             ],
         }
     }
@@ -1204,7 +1237,10 @@ pub(crate) mod bodies {
         let node = consent.subjects[0].as_str();
         bulk_rows_about(d, t, "i537t", 2_461 - 13).await;
         // (b) the allow list's owner: 330 authored rows beside one grant.
-        let (owner, dev) = (format!("i537-owner-{s}"), format!("i537-dev-{s}"));
+        let (owner, dev) = (
+            e2::kid(&format!("i537-owner-{s}")),
+            e2::kid(&format!("i537-dev-{s}")),
+        );
         keys(d, &[(&owner, USER), (&dev, NODE)]).await;
         bulk_self_reports(d, &owner, "i537o", 330).await;
         put(
@@ -1215,14 +1251,18 @@ pub(crate) mod bodies {
         .unwrap();
         // (c) a key root with a live charter among 500 rows about it.
         let (root, a, b) = (
-            format!("i537-root-{s}"),
-            format!("i537-a-{s}"),
-            format!("i537-b-{s}"),
+            e2::kid(&format!("i537-root-{s}")),
+            e2::kid(&format!("i537-a-{s}")),
+            e2::kid(&format!("i537-b-{s}")),
         );
         keys(d, &[(&root, USER), (&a, USER), (&b, USER)]).await;
-        put(d, charter(&format!("i537-charter-{s}"), &root, &a, &b))
-            .await
-            .expect("I537 charter");
+        put_cosigned(
+            d,
+            charter(&format!("i537-charter-{s}"), &root, &a, &b),
+            &[&b],
+        )
+        .await
+        .expect("I537 charter");
         bulk_rows_about(d, &root, "i537r", 500).await;
 
         let _ = read_probe::take();
@@ -1323,36 +1363,31 @@ pub(crate) mod bodies {
         const AGENTS: usize = 900;
         const STEWARDS: usize = 20;
         let now = chrono::Utc::now();
-        let t = format!("i538-canon-{s}");
-        let stewards: Vec<String> = (0..STEWARDS).map(|i| format!("i538-s{i}-{s}")).collect();
-        let agents: Vec<String> = (0..AGENTS).map(|i| format!("i538-a{i}-{s}")).collect();
+        let t = e2::kid(&format!("i538-canon-{s}"));
+        let stewards: Vec<String> = (0..STEWARDS)
+            .map(|i| e2::kid(&format!("i538-s{i}-{s}")))
+            .collect();
+        let agents: Vec<String> = (0..AGENTS)
+            .map(|i| e2::kid(&format!("i538-a{i}-{s}")))
+            .collect();
         let mut reg: Vec<(&str, &str)> = vec![(t.as_str(), NODE)];
         reg.extend(stewards.iter().map(|k| (k.as_str(), USER)));
         reg.extend(agents.iter().map(|k| (k.as_str(), AGENT)));
         keys(d, &reg).await;
         // T's owner (its community_trust rows need a held binding).
-        put_patiently(
-            d,
-            ts::owner_binding_attestation(&format!("i538-ob-{s}"), &stewards[0], &t),
-            "I538 owner binding",
-        )
-        .await;
+        put_patiently(d, owner_binding(&stewards[0], &t), "I538 owner binding").await;
         let started = std::time::Instant::now();
         for (i, a) in agents.iter().enumerate() {
             let steward = &stewards[i % STEWARDS];
-            d.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
-                identity_key_id: steward.clone(),
-                occurrence_key_id: a.clone(),
-                device_class: "agent".to_owned(),
-                hardware_attestation: None,
-                asserted_at: now,
-                valid_until: None,
-                encryption_pubkeys: None,
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
-            .await
-            .expect("occurrence row");
+            // v62.0.0 (lead ruling) — an agent is anchored to its human by the
+            // owner relation, never as an occurrence of the person (O1).
+            e2::put_agent_owner_binding(
+                d,
+                steward,
+                a,
+                u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after 1970"),
+            )
+            .await;
             // The agent's own analyze consent to T — what lets T score it.
             put_patiently(
                 d,

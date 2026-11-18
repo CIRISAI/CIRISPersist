@@ -19,7 +19,7 @@
 //! - **I1612** — a countersign from the WRONG signer (a registered member who
 //!   is not a designated official) is refused `affiliation_countersign_missing`:
 //!   the gate asks who signed, not that someone did.
-//! - **I1613** — a countersign that NAMES the official but was signed by
+//! - **I1613** (DELETED v62.0.0: an earlier-form co-signature forgery) — a countersign that NAMES the official but was signed by
 //!   another key is refused at verification and removes no one: the
 //!   co-signature is verified, not just stored.
 //! - **I1614** — the spec round-trips as the PyO3 door decodes it
@@ -44,30 +44,85 @@ pub(crate) mod bodies {
     use crate::federation::affiliation_floor_invariants::bodies::{
         active, affiliation, ms, rule, seat,
     };
-    use crate::federation::cohort::{Cohort, RevokeSpec};
-    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+    use crate::federation::cohort::Cohort;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::membership_acceptance_invariants::bodies::{
-        found_family, found_room_with_blob, reg,
+        found_family, found_room_with_blob, proposal, put, reg, reply,
     };
     use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::{
+        cohort_scope, CommunityMembershipRevocation, FamilyMembershipRevocation,
+        FamilyMembershipWidening,
+    };
     use crate::federation::{Error, FederationDirectory};
     use chrono::{DateTime, Duration, Utc};
 
-    /// A cohort-door spec for removing `m` from `group`, signed by
-    /// `signers[0]` and co-signed by the rest, over the revocation
-    /// `revoke_member` builds.
-    fn spec(
+    /// v62.0.0 (JSON cut, E7; lead ruling) — a cohort removal is a
+    /// `membership:removal` statement naming the held roster head; its
+    /// co-signers are counted VOICES (T1 §3). `signers[0]` authors, the rest
+    /// voice it. A removal short of what the group requires is held
+    /// `Pending` and removes no one. Signers are SEEDS (the earlier-form
+    /// signing helpers seed from the name, E0 v1.4); the group and the member
+    /// may be seeds (the voices write identity-refs).
+    async fn remove(
+        d: &dyn FederationDirectory,
         cohort: Cohort,
         group: &str,
         signers: &[&str],
         m: &str,
         at: DateTime<Utc>,
-    ) -> RevokeSpec {
-        let mut s = ts::sign_revoke_spec(cohort, signers[0], group, m, ms(at), None, vec![]);
-        for c in &signers[1..] {
-            ts::cosign_revoke_spec(&mut s, cohort, group, m, c);
+    ) -> Result<StatementOutcome, Error> {
+        let head = e2::held_head(d, &e2::kid(group)).await.map(|(h, _)| h);
+        if matches!(cohort, Cohort::Family) {
+            let mut s = ts::sign_family_membership_revocation(
+                signers[0],
+                FamilyMembershipRevocation {
+                    family_key_id: group.to_owned(),
+                    removed_identity_key_id: m.to_owned(),
+                    removed_at: ms(at),
+                    effective_at: ms(at),
+                    reason: None,
+                    witness_set: Vec::new(),
+                    persist_row_hash: String::new(),
+                },
+            );
+            for c in &signers[1..] {
+                ts::cosign_family_membership_revocation(&mut s, c);
+            }
+            return e2::put_voices(d, &e2::family_revocation_voices(&s, head.as_ref())).await;
         }
-        s
+        let mut s = ts::sign_community_membership_revocation(
+            signers[0],
+            CommunityMembershipRevocation {
+                community_key_id: group.to_owned(),
+                removed_identity_key_id: m.to_owned(),
+                removed_at: ms(at),
+                effective_at: ms(at),
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        );
+        for c in &signers[1..] {
+            ts::cosign_community_membership_revocation(&mut s, c);
+        }
+        e2::put_voices(d, &e2::community_revocation_voices(&s, head.as_ref())).await
+    }
+
+    /// The removal did not land: held `Pending` (short of the group's
+    /// count), or refused by the affiliation's countersign rule.
+    fn not_landed(r: &Result<StatementOutcome, Error>) -> bool {
+        match r {
+            Ok(StatementOutcome::Pending { .. }) => true,
+            Err(e) => rule(e) == AFFILIATION_COUNTERSIGN_MISSING,
+            Ok(_) => false,
+        }
+    }
+
+    /// The member is active in the group (keyed by identity-refs).
+    async fn active_kid(d: &dyn FederationDirectory, group: &str, k: &str) -> bool {
+        active(d, &e2::kid(group), &e2::kid(k)).await
     }
 
     /// A one-founder affiliation `solo` (founder `f`, official `official`)
@@ -87,7 +142,7 @@ pub(crate) mod bodies {
             "founder_only",
             &[f],
             &[],
-            Some(affiliation(Some(official))),
+            Some(affiliation(Some(&e2::kid(official)))),
         )
         .await
         .expect("1226: a sole practitioner's affiliation");
@@ -107,137 +162,63 @@ pub(crate) mod bodies {
         let at = Utc::now() - Duration::hours(1);
         sole_practice(d, &solo, &f, &official, &m, &n, at).await;
 
-        // I1611 — the seat alone, through the cohort door.
-        let e = d
-            .revoke_member(
-                Cohort::Affiliations,
-                &solo,
-                &m,
-                spec(
-                    Cohort::Affiliations,
-                    &solo,
-                    &[&f],
-                    &m,
-                    at + Duration::minutes(5),
-                ),
-            )
-            .await
-            .expect_err("I1611: the one seat alone");
-        assert_eq!(rule(&e), AFFILIATION_COUNTERSIGN_MISSING, "I1611: {e}");
-        assert!(active(d, &solo, &m).await, "I1611: still a member");
+        // I1611 — the seat alone.
+        let r = remove(
+            d,
+            Cohort::Affiliations,
+            &solo,
+            &[&f],
+            &m,
+            at + Duration::minutes(5),
+        )
+        .await;
+        assert!(not_landed(&r), "I1611: the one seat alone: {r:?}");
+        assert!(active_kid(d, &solo, &m).await, "I1611: still a member");
 
-        // I1612 — a verified countersign from the wrong signer (a member, not
-        // a designated official).
-        let e = d
-            .revoke_member(
-                Cohort::Affiliations,
-                &solo,
-                &m,
-                spec(
-                    Cohort::Affiliations,
-                    &solo,
-                    &[&f, &n],
-                    &m,
-                    at + Duration::minutes(6),
-                ),
-            )
-            .await
-            .expect_err("I1612: a countersign from outside the officials");
-        assert_eq!(rule(&e), AFFILIATION_COUNTERSIGN_MISSING, "I1612: {e}");
-        assert!(active(d, &solo, &m).await, "I1612: still a member");
-
-        // I1613 — a countersign that names the official, signed by `n`.
-        let mut forged = spec(
+        // I1612 — a voice from the wrong signer (a member, not a designated
+        // official).
+        let r = remove(
+            d,
             Cohort::Affiliations,
             &solo,
             &[&f, &n],
             &m,
-            at + Duration::minutes(7),
-        );
-        forged.cosignatures[0].authority_key_id = official.clone();
-        let e = d
-            .revoke_member(Cohort::Affiliations, &solo, &m, forged)
-            .await
-            .expect_err("I1613: a forged countersign is verified, not stored");
-        assert!(
-            !matches!(e, Error::RosterAuthorityUnauthorized { .. }),
-            "I1613: refused at verification, before standing: {e:?}"
-        );
-        assert!(active(d, &solo, &m).await, "I1613: still a member");
-
-        // I1610 — the seat with the official, through the cohort door.
-        d.revoke_member(
-            Cohort::Affiliations,
-            &solo,
-            &m,
-            spec(
-                Cohort::Affiliations,
-                &solo,
-                &[&f, &official],
-                &m,
-                at + Duration::minutes(8),
-            ),
+            at + Duration::minutes(6),
         )
-        .await
-        .expect("I1610: the seat with the designated official");
-        assert!(!active(d, &solo, &m).await, "I1610: removed");
-        assert!(active(d, &solo, &n).await, "I1610: only the named member");
-    }
+        .await;
+        assert!(
+            not_landed(&r),
+            "I1612: a voice from outside the officials: {r:?}"
+        );
+        assert!(active_kid(d, &solo, &m).await, "I1612: still a member");
 
-    /// **I1614** — the spec round-trips as the PyO3 door decodes it, and the
-    /// decoded spec drives the admitted removal.
-    pub(crate) async fn i1614_the_python_payload_round_trips(d: &dyn FederationDirectory, s: &str) {
-        let k = |x: &str| format!("i1614-{x}-{s}");
-        let (f, official, m, n, solo) = (k("f"), k("official"), k("m"), k("n"), k("solo"));
-        reg(d, &[&f, &official, &m, &n, &solo]).await;
-        let at = Utc::now() - Duration::hours(1);
-        sole_practice(d, &solo, &f, &official, &m, &n, at).await;
+        // v62.0.0 (wave 3 rule 4; T1 "delete" row) — I1613 (a co-signature
+        // naming the official but signed by another key) is deleted: it pins an
+        // earlier-form `RosterCosignature` proof shape. In edition 2 a voice is a
+        // statement the door verifies (`edition2_statement_invalid`).
 
-        let sent = spec(
+        // I1610 — the seat with the official's voice.
+        remove(
+            d,
             Cohort::Affiliations,
             &solo,
             &[&f, &official],
             &m,
-            at + Duration::minutes(5),
+            at + Duration::minutes(8),
+        )
+        .await
+        .expect("I1610: the seat with the designated official");
+        assert!(!active_kid(d, &solo, &m).await, "I1610: removed");
+        assert!(
+            active_kid(d, &solo, &n).await,
+            "I1610: only the named member"
         );
-        // What a host sends as `revoke_spec_json`.
-        let json = serde_json::to_string(&sent).expect("I1614: encode");
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            value["cosignatures"][0]["authority_key_id"], official,
-            "I1614: the wire names the countersign: {json}"
-        );
-        // What `cohort_revoke_member` decodes.
-        let decoded: RevokeSpec = serde_json::from_str(&json).expect("I1614: decode");
-        assert_eq!(
-            decoded, sent,
-            "I1614: the countersign survives the round trip"
-        );
-
-        // An old payload (no `cosignatures`) decodes to none.
-        let mut old = value.clone();
-        old.as_object_mut().unwrap().remove("cosignatures");
-        let old: RevokeSpec = serde_json::from_value(old).expect("I1614: an old payload");
-        assert!(old.cosignatures.is_empty(), "I1614: absent = none");
-        // A malformed list is a refusal, never read as none.
-        for bad in [
-            serde_json::json!([{}]),
-            serde_json::json!("official"),
-            serde_json::json!([{ "authority_key_id": official }]),
-        ] {
-            let mut v = value.clone();
-            v["cosignatures"] = bad.clone();
-            assert!(
-                serde_json::from_value::<RevokeSpec>(v).is_err(),
-                "I1614: malformed cosignatures {bad} is refused"
-            );
-        }
-
-        d.revoke_member(Cohort::Affiliations, &solo, &m, decoded)
-            .await
-            .expect("I1614: the decoded spec removes");
-        assert!(!active(d, &solo, &m).await, "I1614: removed");
     }
+
+    // v62.0.0 (JSON cut, E7) — I1614 (the `RevokeSpec` JSON a host sends to
+    // `cohort_revoke_member`, its `cosignatures` round trip and malformed
+    // lists) is deleted: an earlier-form co-signature wire shape. A removal is
+    // a statement with voices (I1610).
 
     /// **I1616** (D15) — the countersign is a second PERSON. The affiliation's
     /// designated official is `f2`, a device on the seat holder `f`'s own self
@@ -251,46 +232,42 @@ pub(crate) mod bodies {
         let k = |x: &str| format!("i1616-{x}-{s}");
         let (f, f2, m, n, solo) = (k("f"), k("f2"), k("m"), k("n"), k("solo"));
         reg(d, &[&f, &f2, &m, &n, &solo]).await;
-        // f2 joins f's self roster: f's second device.
-        d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(&f, &f, &f2, ms(Utc::now() - Duration::seconds(5)))
-                .await,
+        // f2 joins f's self roster: f's second device, an edition-2
+        // `identity:occurrence` bind (the device's own voice, then f's; O1).
+        crate::federation::edition2::fixture_occurrence::put_bind(
+            d,
+            &f,
+            &f,
+            &f2,
+            crate::federation::types::device_class::LAPTOP,
+            &crate::federation::edition2::fixture_occurrence::BindOptions::default(),
         )
         .await
         .expect("I1616: f's second device");
         let at = Utc::now() - Duration::hours(1);
         sole_practice(d, &solo, &f, &f2, &m, &n, at).await;
-        let e = d
-            .revoke_member(
-                Cohort::Affiliations,
-                &solo,
-                &m,
-                spec(Cohort::Affiliations, &solo, &[&f, &f2], &m, ms(Utc::now())),
-            )
-            .await
-            .expect_err("I1616: the seat's own device is not a second voice");
-        assert_eq!(rule(&e), AFFILIATION_COUNTERSIGN_MISSING, "I1616: {e}");
-        assert!(active(d, &solo, &m).await, "I1616: still a member");
+        let r = remove(d, Cohort::Affiliations, &solo, &[&f, &f2], &m, Utc::now()).await;
+        assert!(
+            not_landed(&r),
+            "I1616: the seat's own device is not a second voice: {r:?}"
+        );
+        assert!(active_kid(d, &solo, &m).await, "I1616: still a member");
 
         // Control: an official who is another person countersigns.
         let (g, official, p, q, other) = (k("g"), k("official"), k("p"), k("q"), k("other"));
         reg(d, &[&g, &official, &p, &q, &other]).await;
         sole_practice(d, &other, &g, &official, &p, &q, at).await;
-        d.revoke_member(
+        remove(
+            d,
             Cohort::Affiliations,
             &other,
+            &[&g, &official],
             &p,
-            spec(
-                Cohort::Affiliations,
-                &other,
-                &[&g, &official],
-                &p,
-                ms(Utc::now()),
-            ),
+            Utc::now(),
         )
         .await
         .expect("I1616: another person's countersign");
-        assert!(!active(d, &other, &p).await, "I1616: removed");
+        assert!(!active_kid(d, &other, &p).await, "I1616: removed");
     }
 
     /// **I1617** (L5) — a removal the removed member co-signed is their own
@@ -309,42 +286,22 @@ pub(crate) mod bodies {
         let at = Utc::now() - Duration::hours(1);
         sole_practice(d, &solo, &f, &official, &m, &n, at).await;
 
-        // A forged co-signature naming m, signed by n: refused, m stays.
-        let mut forged = spec(
-            Cohort::Affiliations,
-            &solo,
-            &[&f, &n],
-            &m,
-            at + Duration::minutes(5),
-        );
-        forged.cosignatures[0].authority_key_id = m.clone();
-        let e = d
-            .revoke_member(Cohort::Affiliations, &solo, &m, forged)
-            .await
-            .expect_err("I1617: a forged leave is verified, not stored");
-        assert!(
-            !matches!(e, Error::RosterAuthorityUnauthorized { .. }),
-            "I1617: refused at verification, before standing: {e:?}"
-        );
-        assert!(active(d, &solo, &m).await, "I1617: still a member");
+        // v62.0.0 (wave 3 rule 4) — the forged-co-signature arm is deleted (an
+        // earlier-form `RosterCosignature` proof shape).
 
         // m's own verified co-signature: their leave, admitted.
-        d.revoke_member(
+        remove(
+            d,
             Cohort::Affiliations,
             &solo,
+            &[&f, &m],
             &m,
-            spec(
-                Cohort::Affiliations,
-                &solo,
-                &[&f, &m],
-                &m,
-                at + Duration::minutes(6),
-            ),
+            at + Duration::minutes(6),
         )
         .await
-        .expect("I1617: the member's own co-signature is a leave");
-        assert!(!active(d, &solo, &m).await, "I1617: m left");
-        assert!(active(d, &solo, &n).await, "I1617: only m");
+        .expect("I1617: the member's own voice is a leave");
+        assert!(!active_kid(d, &solo, &m).await, "I1617: m left");
+        assert!(active_kid(d, &solo, &n).await, "I1617: only m");
     }
 
     async fn active_in_family(d: &dyn FederationDirectory, fid: &str, k: &str) -> bool {
@@ -367,70 +324,72 @@ pub(crate) mod bodies {
         found_family(d, &fam, "unanimous", &[&a, &b], &[])
             .await
             .expect("I1615: a two-founder unanimous family");
-        let row = crate::federation::types::FamilyMember {
-            key_id: u.clone(),
-            joined_at: ms(Utc::now() - Duration::hours(1)),
-            role: None,
-        };
-        let admit = ts::family_widening_admit_spec_by_consensus(d, &fam, &row).await;
-        assert_eq!(admit.cosignatures.len(), 1, "I1615: both founders sign");
-        assert!(
-            d.add_family_member_consented(&fam, row, &admit)
-                .await
-                .expect("I1615: u joins by the founders' widening"),
-            "I1615: the widening seated u"
+        // v62.0.0 (T1 v3) — u's widening lands as edition-2 rows: a founder's
+        // proposal, u's acceptance, then the widening voiced by both founders
+        // naming the held head.
+        let t = ms(Utc::now() - Duration::hours(1));
+        let p = proposal(
+            &a,
+            cohort_scope::FAMILY,
+            &fam,
+            &u,
+            None,
+            t,
+            Some(Duration::days(7)),
         );
-        assert!(active_in_family(d, &fam, &u).await, "I1615: u is a member");
+        put(d, &p).await.expect("I1615: the proposal");
+        put(d, &reply(&u, &u, &p, true, t + Duration::seconds(1)))
+            .await
+            .expect("I1615: u accepts");
+        let mut w = ts::sign_family_membership_widening(
+            &a,
+            FamilyMembershipWidening {
+                family_key_id: fam.clone(),
+                member_key_id: u.clone(),
+                joined_at: t + Duration::seconds(2),
+                effective_at: t + Duration::seconds(2),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_family_membership_widening(&mut w, &b);
+        let head = e2::held_head(d, &e2::kid(&fam)).await.map(|(h, _)| h);
+        e2::put_voices(d, &e2::family_widening_voices(&w, head.as_ref()))
+            .await
+            .expect("I1615: u joins by the founders' widening");
+        assert!(
+            active_in_family(d, &e2::kid(&fam), &e2::kid(&u)).await,
+            "I1615: u is a member"
+        );
         let at = Utc::now() - Duration::minutes(30);
 
-        d.revoke_member(
-            Cohort::Family,
-            &fam,
-            &u,
-            spec(Cohort::Family, &fam, &[&a], &u, at),
-        )
-        .await
-        .expect_err("I1615: one of two unanimous founders");
-        assert!(active_in_family(d, &fam, &u).await, "I1615: still a member");
-
-        d.revoke_member(
-            Cohort::Family,
-            &fam,
-            &u,
-            spec(
-                Cohort::Family,
-                &fam,
-                &[&a, &b],
-                &u,
-                at + Duration::minutes(1),
-            ),
-        )
-        .await
-        .expect("I1615: both founders, the second as a co-signature");
-        assert!(!active_in_family(d, &fam, &u).await, "I1615: removed");
-
-        // `self`: a co-signature has no gate to count it, so it is refused.
-        let mut selfie =
-            ts::sign_revoke_spec(Cohort::SelfId, &a, &a, &b, ms(Utc::now()), None, vec![]);
-        selfie
-            .cosignatures
-            .push(crate::federation::types::RosterCosignature {
-                authority_key_id: b.clone(),
-                scrub_signature_classical: "AA==".into(),
-                scrub_signature_pqc: None,
-            });
-        let e = d
-            .revoke_member(Cohort::SelfId, &a, &b, selfie)
-            .await
-            .expect_err("I1615: a self removal carries no co-signature");
+        let r = remove(d, Cohort::Family, &fam, &[&a], &u, at).await;
         assert!(
-            matches!(
-                e,
-                Error::RevokeMemberRefused { reason, .. }
-                    if reason == crate::federation::cohort::SELF_REMOVAL_COSIGNATURES_REFUSED
-            ),
-            "I1615: {e:?}"
+            matches!(r, Ok(StatementOutcome::Pending { .. })),
+            "I1615: one of two unanimous founders is short: {r:?}"
         );
+        assert!(
+            active_in_family(d, &e2::kid(&fam), &e2::kid(&u)).await,
+            "I1615: still a member"
+        );
+
+        remove(
+            d,
+            Cohort::Family,
+            &fam,
+            &[&a, &b],
+            &u,
+            at + Duration::minutes(1),
+        )
+        .await
+        .expect("I1615: both founders, the second as a voice");
+        assert!(
+            !active_in_family(d, &e2::kid(&fam), &e2::kid(&u)).await,
+            "I1615: removed"
+        );
+        // v62.0.0 (JSON cut, E7) — the `self` arm (a `RevokeSpec` carrying a
+        // `RosterCosignature` refused `self_removal_cosignatures_refused`) is
+        // deleted: an earlier-form co-signature shape (T1 "delete" row).
     }
 }
 
@@ -482,7 +441,6 @@ mod tests {
         i1610_i1613,
         bodies::i1610_i1613_the_cohort_door_carries_the_countersign
     );
-    on_every_backend!(i1614, bodies::i1614_the_python_payload_round_trips);
     on_every_backend!(i1615, bodies::i1615_family_arm_and_self_refusal);
     on_every_backend!(
         i1616,

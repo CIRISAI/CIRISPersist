@@ -99,8 +99,9 @@ async fn owners_at(
 ///
 /// 1. the row is about the NODE (`attested_key_id`), whose owner binding is
 ///    in force at the grant's `asserted_at`
-///    ([`owner_granters_in_force_at`]); with none the grant is refused and
-///    NOT stored — the binding rows replicate first and the grant is re-put;
+///    ([`owner_granters_in_force_at`]); with none the grant is HELD,
+///    concluding nothing (v62.0.0, wave GC4; CC 2.7.3), and concludes when
+///    the binding rows land — no re-put;
 /// 2. its author is the node itself, or — the owner-authored form — a live
 ///    roster key of the owner's fedID at the grant's `asserted_at`
 ///    ([`acts_as_steward_at`](super::self_roster::acts_as_steward_at), with
@@ -131,14 +132,31 @@ pub async fn check_community_trust_grant_admission(
         return Ok(());
     }
     let node = &row.attested_key_id;
+    // v62.0.0 (wave GC4; CC 2.7.3) — every check below reads OTHER rows:
+    // the owner bindings over the node, the owner's self roster, the
+    // subjects' key records. They are fold conditions: a grant that fails
+    // one is HELD with its token (never refused, never lost), reading the
+    // node, its author and every subject, so it re-folds when a binding,
+    // a roster seat or a key record lands or is withdrawn.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(node));
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&row.attesting_key_id));
+    for s in &row.subject_key_ids {
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(s));
+    }
     let owners = owners_at(directory, node, fold_at).await?;
+    for o in &owners {
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(o));
+    }
     if owners.is_empty() {
-        return Err(Error::InvalidArgument(format!(
-            "{COMMUNITY_TRUST_PREFIX}: no owner binding over {:?} is in force at the grant's \
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::COMMUNITY_TRUST_OWNER_UNBOUND,
+            Error::InvalidArgument(format!(
+                "{COMMUNITY_TRUST_PREFIX}: no owner binding over {:?} is in force at the grant's \
              instant {} — the owner-binding rows must be held before the grant is admitted \
              (CC 3.3.1: the listed owner must be able to revoke)",
-            row.attested_key_id, row.asserted_at
-        )));
+                row.attested_key_id, row.asserted_at
+            )),
+        ));
     }
     if row.attesting_key_id != *node {
         let mut stands = None;
@@ -156,27 +174,42 @@ pub async fn check_community_trust_grant_admission(
             }
         }
         let Some(owner) = stands else {
-            return Err(Error::InvalidArgument(format!(
+            return Err(super::edition2::fold::hold(
+                super::edition2::fold::reason::COMMUNITY_TRUST_ATTESTER_NOT_OWNER,
+                Error::InvalidArgument(format!(
                 "{ATTESTER_NOT_OWNER}: {:?} authored a capture grant over {node:?} but is neither \
                  the node nor a live roster key of its owner at the grant's instant {} (CC 3.3.1)",
                 row.attesting_key_id, row.asserted_at
-            )));
+            )),
+            ));
         };
+        // The roster act's freshness reads the owner's roster rows: a
+        // refusal there is the same fold condition (a substrate failure
+        // passes through unmarked).
         super::self_roster::check_roster_act_fresh(
             directory,
             &[owner],
             &row.attesting_key_id,
             row.asserted_at,
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            super::edition2::fold::hold_refusal(
+                super::edition2::fold::reason::COMMUNITY_TRUST_ATTESTER_NOT_OWNER,
+                e,
+            )
+        })?;
     }
     if !row.subject_key_ids.iter().any(|s| owners.contains(s)) {
-        return Err(Error::InvalidArgument(format!(
-            "{COMMUNITY_TRUST_PREFIX}: subject_key_ids {:?} does not list the node's owner at \
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::COMMUNITY_TRUST_OWNER_UNLISTED,
+            Error::InvalidArgument(format!(
+                "{COMMUNITY_TRUST_PREFIX}: subject_key_ids {:?} does not list the node's owner at \
              the grant's instant ({:?}) — the owner MUST always be able to revoke (CC 3.3.1)",
-            row.subject_key_ids,
-            owners.iter().collect::<Vec<_>>()
-        )));
+                row.subject_key_ids,
+                owners.iter().collect::<Vec<_>>()
+            )),
+        ));
     }
     #[cfg(test)]
     if test_support::v52_shape(node) {
@@ -191,12 +224,15 @@ pub async fn check_community_trust_grant_admission(
         }
     }
     if !names_three_parties(directory, &row.subject_key_ids, node, &owners).await? {
-        return Err(Error::InvalidArgument(format!(
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::COMMUNITY_TRUST_SUBJECTS_INCOMPLETE,
+            Error::InvalidArgument(format!(
             "{SUBJECTS_INCOMPLETE}: subject_key_ids {:?} must name the node {node:?}, its owner \
              at the grant's instant and the agent key that acts on it — each may withdraw (CC \
              3.3.1, CLM-consent-community-trust-owner-authored)",
             row.subject_key_ids
-        )));
+        )),
+        ));
     }
     Ok(())
 }
@@ -343,17 +379,5 @@ pub(crate) mod test_support {
     /// Is the v52 shape admitted for grants about `node`?
     pub(crate) fn v52_shape(node: &str) -> bool {
         V52_NODES.lock().expect("v52 seam").contains(node)
-    }
-
-    /// Admit (or stop admitting) the v52 shape for grants about `node`. Its
-    /// witnesses ride the sqlite / postgres test build.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub(crate) fn set_v52_shape(node: &str, on: bool) {
-        let mut nodes = V52_NODES.lock().expect("v52 seam");
-        if on {
-            nodes.insert(node.to_owned());
-        } else {
-            nodes.remove(node);
-        }
     }
 }

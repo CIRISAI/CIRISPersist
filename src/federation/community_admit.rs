@@ -168,7 +168,7 @@ where
         fold_at: super::canonical_community::head_instant(&community),
         received_at: crate::host::clock::now(),
     };
-    let planned = plan_put_community(dir, community, door, instants).await?;
+    let planned = Box::pin(plan_put_community(dir, community, door, instants)).await?;
     // v49.0.0 (CIRISPersist#910.5) — the occupied-id route the plan decided:
     // an identical re-put is a no-op, an authorized amendment is applied as a
     // supersede, an empty id (or a chain apply that found it empty) inserts.
@@ -224,6 +224,15 @@ where
     // v61 (CIRISPersist#1148) — the put-time audience precondition, as on the
     // attestation plane: a record this node may not receive is refused by
     // name before any door runs.
+    //
+    // v62.0.0 (wave GC6; CC 2.7 rc21 ruling 11, CC 2.7.5 corrected: "A node
+    // keeps a row only when it is in the row's audience as it reads it. A row
+    // it declines is not Invalid, and it may take the row once it is.") —
+    // `NotInAudience` is this node's LOCAL DECLINE, never a verdict on the
+    // record: nothing about the record is stored or marked here, so a
+    // re-offer after the audience answer changes is judged afresh. (This is
+    // the earlier-form JSON door, shut by `refuse_earlier_form` above once
+    // the doors close.)
     if let Some(me) = dir.node_key_id() {
         if !super::replication_audience::may_receive_community_record(dir, &me, &community)
             .await?
@@ -234,7 +243,12 @@ where
             });
         }
     }
-    let stored = put_community_planned(dir, community, CommunityDoor::ReplicatedApply).await;
+    let stored = Box::pin(put_community_planned(
+        dir,
+        community,
+        CommunityDoor::ReplicatedApply,
+    ))
+    .await;
     group_amendment::replicated_community_outcome(stored)
 }
 

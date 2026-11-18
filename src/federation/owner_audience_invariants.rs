@@ -366,6 +366,7 @@ pub(crate) mod bodies {
         // and round-trips as the literal.
         let env = serde_json::json!({ "payload": {
             "grants": "replication",
+            "attestation_prefixes": ["i3123:"],
             "for_key_id": "k",
             "cohorts": [fam_entry.clone(), "self"],
         }});
@@ -386,7 +387,8 @@ pub(crate) mod bodies {
             serde_json::json!(["selfish"]),
         ] {
             let env = serde_json::json!({ "payload": {
-                "grants": "replication", "for_key_id": "k", "cohorts": bad.clone(),
+                "grants": "replication", "attestation_prefixes": ["i3123:"],
+                "for_key_id": "k", "cohorts": bad.clone(),
             }});
             assert!(
                 parse_grant_payload(&env).is_err(),

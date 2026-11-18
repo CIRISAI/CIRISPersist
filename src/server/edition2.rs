@@ -172,6 +172,12 @@ pub struct StatementResponse {
     /// Why a replicated statement was refused (a policy outcome).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<AttestationRefusalReason>,
+    /// v62.0.0 (wave GC4; CC 2.7.3) — for a `pending` row (held, concluding
+    /// nothing): the fold's reason token (`edition2::fold::reason`), e.g.
+    /// `count_short`, `link_unheld`. Absent for every other plane, and when
+    /// the store records no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_reason: Option<String>,
 }
 
 /// A failure body (400 / 422 / 424 / 500).
@@ -405,7 +411,26 @@ fn kept(outcome: &str, o: &StatementOutcome) -> StatementResponse {
         row_id: Some(row_id.hex()),
         new: Some(is_new(o)),
         reason: None,
+        held_reason: None,
     }
+}
+
+/// v62.0.0 (wave GC4; CC 2.7.3) — [`kept`], with a `pending` row's fold
+/// reason read back (`edition2::fold::why_held`). A failed read leaves it
+/// absent: the row is held either way.
+async fn kept_held<F>(dir: &F, outcome: &str, o: &StatementOutcome) -> StatementResponse
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut r = kept(outcome, o);
+    if let StatementOutcome::Pending { row_id, .. } = o {
+        r.held_reason = crate::federation::edition2::fold::why_held(dir, row_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|h| h.reason);
+    }
+    r
 }
 
 fn is_new(o: &StatementOutcome) -> bool {
@@ -434,10 +459,10 @@ where
             };
             match Box::pin(apply_replicated_statement(dir, &body, &offered)).await {
                 Ok(ReplicatedStatementOutcome::Admitted(o)) => {
-                    (StatusCode::OK, Json(kept("admitted", &o))).into_response()
+                    (StatusCode::OK, Json(kept_held(dir, "admitted", &o).await)).into_response()
                 }
                 Ok(ReplicatedStatementOutcome::Unchanged(o)) => {
-                    (StatusCode::OK, Json(kept("unchanged", &o))).into_response()
+                    (StatusCode::OK, Json(kept_held(dir, "unchanged", &o).await)).into_response()
                 }
                 Ok(ReplicatedStatementOutcome::Refused { reason }) => (
                     StatusCode::OK,
@@ -447,6 +472,7 @@ where
                         row_id: None,
                         new: None,
                         reason: Some(reason),
+                        held_reason: None,
                     }),
                 )
                     .into_response(),
@@ -456,7 +482,7 @@ where
         None => match Box::pin(put_statement(dir, &body, None, INGEST_TIER)).await {
             Ok(o) => {
                 let outcome = if is_new(&o) { "admitted" } else { "unchanged" };
-                (StatusCode::OK, Json(kept(outcome, &o))).into_response()
+                (StatusCode::OK, Json(kept_held(dir, outcome, &o).await)).into_response()
             }
             Err(e) => error_response(&e),
         },

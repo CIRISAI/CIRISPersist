@@ -35,7 +35,7 @@ use ciris_verify_core::edition2::{cose_key, row_ref, Digest32};
 
 use super::ingest::{INSTANT_MEMBERS, SCALED_MEMBERS, STATEMENT_MEMBER};
 use super::liveness::statement_parts;
-use super::payloads::{is_digest_member, ref_members};
+use super::payloads::{body_number, is_body_member, is_digest_member, ref_members};
 use super::produce::ProduceError;
 use crate::federation::Error;
 
@@ -115,6 +115,28 @@ fn cbor_of(v: &serde_json::Value) -> Result<Value, ProduceError> {
                 .map(|(k, x)| Ok((text(k), cbor_of(x)?)))
                 .collect::<Result<_, ProduceError>>()?,
         ),
+    })
+}
+
+/// v62.0.0 (wave P1e; lead's ruling) — a free-form body subtree as CBOR:
+/// as [`cbor_of`], except that every JSON number is stated by
+/// [`body_number`] instead of a float being refused. A number whose exact
+/// decimal cannot be stated is refused (`body_number_unrepresentable`).
+fn body_cbor_of(v: &serde_json::Value) -> Result<Value, ProduceError> {
+    use serde_json::Value as J;
+    Ok(match v {
+        J::Number(n) => body_number(n).map_err(|_| {
+            ProduceError::Payload(
+                "body_number_unrepresentable: a body number whose exact decimal cannot be stated",
+            )
+        })?,
+        J::Array(a) => Value::Array(a.iter().map(body_cbor_of).collect::<Result<_, _>>()?),
+        J::Object(o) => sorted_map(
+            o.iter()
+                .map(|(k, x)| Ok((text(k), body_cbor_of(x)?)))
+                .collect::<Result<_, ProduceError>>()?,
+        ),
+        other => cbor_of(other)?,
     })
 }
 
@@ -265,6 +287,11 @@ pub fn payload_from_envelope(
             Value::Uint(ms_of(v)?)
         } else if is_digest_member(family, k) {
             digest_member(v)?
+        } else if is_body_member(family, k) {
+            // v62.0.0 (wave P1e; lead's ruling) — a free-form body: every
+            // JSON number states by `payloads::body_number` (an integral one
+            // a plain integer, a non-integral one a tag-4 decimal, exact).
+            body_cbor_of(v)?
         } else if SCALED_MEMBERS.contains(&k.as_str()) {
             scaled(v.as_f64().ok_or(ProduceError::Payload(
                 "a fixed-scale member is not a number",

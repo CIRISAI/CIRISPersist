@@ -9,9 +9,17 @@
 //!   key). Node A admits it under the NODE-COMPUTED row id (not the
 //!   uuid-derived `detection_attestation_id`) and projects it into
 //!   `detection_events`, the two signature columns the statement's
-//!   composite halves (64 / 3309 bytes), its reals fixed-scale integers
-//!   (`0.25` → `250000`, CC 2.6.1.5). Node B, with the same conferral,
+//!   composite halves (64 / 3309 bytes); a body real is a CBOR tag-4
+//!   decimal fraction (`0.25` → `4([-2, 25])`, P1's `body_number`). Node B, with the same conferral,
 //!   admits the same bytes and projects the same detection.
+//! - **I3539** — the detection KEEPS its trace as evidence
+//!   (`evidence_refs` = `[[-16, trace_evidence_ref(trace)]]`): a purge
+//!   selecting the trace (`PurgeSelection::ByActor` of its signer) reaches
+//!   the detection row (in the selection or its withheld list), the Art. 17
+//!   route.
+//! - **I3549** — the detection names the scored agent's canonical subject
+//!   (`subject_key_ids`): with no trace held, the DSAR door's by-subject
+//!   reach finds it, and with the producer's withdraws the plan cites it.
 //! - **I3536** — a key that only DECLARES `lenscore_detector` is refused
 //!   (`ReservedPrefixEmitterMismatch`): standing is never a self-declared
 //!   type.
@@ -53,7 +61,12 @@ fn event(signing_key_id: &str) -> DetectionEvent {
 }
 
 fn sign(seed: &str, ev: &DetectionEvent) -> Vec<u8> {
-    let (sub, family, payload) = detection_statement_parts(ev).expect("the detection's parts");
+    sign_naming(seed, ev, None)
+}
+
+fn sign_naming(seed: &str, ev: &DetectionEvent, subject: Option<&str>) -> Vec<u8> {
+    let (sub, family, payload) =
+        detection_statement_parts(ev, subject).expect("the detection's parts");
     ciris_verify_core::edition2::sign_row_statement(
         &e2::signing_key(seed),
         &sub,
@@ -79,7 +92,11 @@ async fn projected<B: DerivedSchema>(b: &B, ev: &DetectionEvent) -> Option<Detec
 
 async fn body<B>(a: &B, b: &B)
 where
-    B: FederationDirectory + DerivedSchema + Sync,
+    B: FederationDirectory
+        + DerivedSchema
+        + crate::federation::steward_purge_invariants::bodies::Seams
+        + crate::federation::attestation_admit::AttestationStore
+        + Sync,
 {
     // I3535 — the conferral (P4's fixture) on both nodes.
     Box::pin(super::standing_invariants::conferred_detector_body(a)).await;
@@ -93,6 +110,26 @@ where
         detection_attestation_id(&ev.detection_id),
         "I3535: the row id is node-computed"
     );
+    // I3535 — a non-integral body real is a CBOR tag-4 decimal fraction
+    // (CC ruling, P1's `body_number`): 0.25 → 4([-2, 25]); never a float,
+    // never text.
+    {
+        use ciris_verify_core::cde::{encode, Value};
+        let (_, payload) = super::liveness::statement_parts(&st).expect("decodes");
+        let score = payload
+            .get_text(crate::derived::detection_row::BODY_MEMBER)
+            .and_then(|b| b.get_text("conformity_payload"))
+            .and_then(|c| c.get_text("score"))
+            .expect("I3535: the body's score");
+        assert_eq!(
+            encode(score),
+            encode(&Value::Tag(
+                4,
+                Box::new(Value::Array(vec![Value::int(-2), Value::int(25)]))
+            )),
+            "I3535: 0.25 is 4([-2, 25])"
+        );
+    }
     for (node, d) in [("A", a), ("B", b)] {
         put_statement(d, &st, None, INGEST_TIER)
             .await
@@ -113,10 +150,121 @@ where
         );
         assert_eq!(p.ml_dsa_65_sig.len(), 3309, "I3535: its ML-DSA-65 half");
         assert_eq!(p.trace_id, ev.trace_id, "I3535");
-        assert_eq!(
-            p.conformity_payload,
-            serde_json::json!({"score": 250_000}),
-            "I3535: a real is a fixed-scale integer, never text"
+    }
+
+    // I3539 — the trace is the detection's evidence: a purge selecting the
+    // trace (by its signer) reaches the detection row through its
+    // `evidence_refs` digest (`detection_row::trace_evidence_ref`).
+    let tracer = "p8-tracer";
+    let tracer_id = e2::put_key(a, tracer, &["agent"]).await;
+    let traced = event(&e2::kid(det));
+    crate::federation::steward_purge_invariants::bodies::seed_trace(
+        a,
+        &traced.trace_id,
+        &tracer_id,
+        "p8-model",
+    )
+    .await;
+    let traced_st = sign(det, &traced);
+    put_statement(a, &traced_st, None, INGEST_TIER)
+        .await
+        .expect("I3539: the traced detection is admitted");
+    let traced_rid = super::names::RowId::of_statement(&traced_st)
+        .expect("a row")
+        .hex();
+    let resolved = crate::federation::steward_purge::resolve_selection(
+        a,
+        &crate::federation::steward_purge::PurgeSelection::ByActor {
+            key_id: tracer_id.clone(),
+        },
+    )
+    .await
+    .expect("I3539: resolved");
+    assert!(
+        format!("{resolved:?}").contains(&traced_rid),
+        "I3539: the purge of the trace reaches its detection row: {resolved:?}"
+    );
+
+    // I3549 — the detection NAMES the scored agent's canonical subject
+    // (`subject_key_ids`), so a DSAR erasure by subject reaches it after its
+    // trace is gone: no trace is held for this agent, and the door's
+    // by-agent reach (`detection_row_ids_for_agent`, its `attestation_subjects`
+    // arm) still finds the row; with the producer's withdraws held, the
+    // erasure plan cites it.
+    {
+        let agent = format!("p8-agent-{}", uuid::Uuid::new_v4().simple());
+        let subject = crate::federation::subject_erasure::agent_subject(&agent).expect("subject");
+        let named = event(&e2::kid(det));
+        let named_st = sign_naming(det, &named, Some(&subject));
+        put_statement(a, &named_st, None, INGEST_TIER)
+            .await
+            .expect("I3549: the detection naming its subject is admitted");
+        let named_rid = super::names::RowId::of_statement(&named_st)
+            .expect("a row")
+            .hex();
+        let row = a.get_attestation(&named_rid).await.unwrap().expect("held");
+        assert_eq!(row.subject_key_ids, vec![subject.clone()], "I3549: named");
+        // No trace is held for this detection: the trace-join arm of the
+        // door's reach can find nothing.
+        assert!(
+            a.trace_agent_id_hash(&named.trace_id)
+                .await
+                .expect("trace lookup")
+                .is_none(),
+            "I3549: the trace is gone"
+        );
+        // The key-scoped reach runs ONLY the trace join (the subject arm is
+        // the full erasure's): it does not reach the row ...
+        let by_trace = a
+            .detection_row_ids_for_agent(&agent, Some(&e2::kid(det)))
+            .await
+            .expect("I3549: the key-scoped reach");
+        assert!(
+            !by_trace.contains(&named_rid),
+            "I3549: no trace, so the trace join reaches nothing: {by_trace:?}"
+        );
+        // ... and the full erasure's by-SUBJECT arm (`attestation_subjects`
+        // WHERE subject_key_id = agent_subject, projected from the edition-2
+        // row's `subject_key_ids` at the put) does.
+        let reached = a
+            .detection_row_ids_for_agent(&agent, None)
+            .await
+            .expect("I3549: the full reach");
+        assert!(
+            reached.contains(&named_rid),
+            "I3549: erasure by subject reaches the detection with no trace held: {reached:?}"
+        );
+        let (w_sub, w_family, w_payload) =
+            crate::federation::subject_erasure::withdraws_statement_parts(
+                &row,
+                &e2::kid(det),
+                e2::ms(crate::host::clock::now()),
+            )
+            .expect("parts");
+        let w = ciris_verify_core::edition2::sign_row_statement(
+            &e2::signing_key(det),
+            &e2::kid(det),
+            &w_sub,
+            "withdraws",
+            &w_family,
+            &w_payload,
+            vec![],
+        )
+        .expect("signed");
+        put_statement(a, &w, None, INGEST_TIER)
+            .await
+            .expect("I3549: the producer's withdraws");
+        let plan = crate::federation::subject_erasure::plan_store_erasure(
+            a,
+            &agent,
+            None,
+            crate::host::clock::now(),
+        )
+        .await
+        .expect("I3549: the erasure plan");
+        assert!(
+            plan.citations.iter().any(|c| c.target == named_rid),
+            "I3549: the erasure cites the detection by subject"
         );
     }
 

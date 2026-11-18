@@ -27,6 +27,7 @@
 //! (lame duck): that is the accord-decision tally's, which this door does not
 //! touch — the version is admitted only once the window has closed.
 
+use super::edition2::fold::{self, reason, Dep};
 use super::types::SignedFamily;
 use super::{Error, FederationDirectory};
 
@@ -37,6 +38,19 @@ fn refuse<T>(token: &str, detail: impl std::fmt::Display) -> Result<T, Error> {
     Err(Error::CharterInvalid {
         detail: format!("{token}: {detail}"),
     })
+}
+
+/// v62.0.0 (wave GC6; CC 2.7.3) — [`refuse`] for a rule that read OTHER rows
+/// (the held accord head, a named decision, an added holder's key record):
+/// the refusal is a fold condition ([`fold::hold`]), its token the reason.
+/// Outside a fold attempt it is the plain refusal.
+fn hold_refuse<T>(token: &'static str, detail: impl std::fmt::Display) -> Result<T, Error> {
+    Err(fold::hold(
+        token,
+        Error::CharterInvalid {
+            detail: format!("{token}: {detail}"),
+        },
+    ))
 }
 
 /// One seat change as an accord decision binds it: the keys removed and the
@@ -132,8 +146,11 @@ where
         return Ok(None);
     }
     let offered = &signed.family;
+    // v62.0.0 (wave GC6) — the held head, the decisions about it, the added
+    // holders' records: the version re-folds when any of them changes.
+    fold::reads(Dep::key(accord));
     let Some(held) = directory.lookup_family(accord).await? else {
-        return refuse("accord_roster_change_no_held_accord", accord);
+        return hold_refuse(reason::ACCORD_ROSTER_CHANGE_NO_HELD_ACCORD, accord);
     };
     let field = |k: &str| env.get(k).and_then(|v| v.as_str()).unwrap_or_default();
     if field("family_key_id") != accord
@@ -142,8 +159,8 @@ where
         || offered.prev_head_digest != held.persist_row_hash
         || field("next_persist_row_hash") != super::types::compute_persist_row_hash(offered)?
     {
-        return refuse(
-            "accord_roster_change_unbound",
+        return hold_refuse(
+            reason::ACCORD_ROSTER_CHANGE_UNBOUND,
             "the envelope must name the accord, the held head it succeeds and this version",
         );
     }
@@ -153,8 +170,8 @@ where
         || offered.consensus_protocol_entrenched != held.consensus_protocol_entrenched
         || offered.dissolved_at != held.dissolved_at
     {
-        return refuse(
-            "accord_roster_change_not_seats",
+        return hold_refuse(
+            reason::ACCORD_ROSTER_CHANGE_NOT_SEATS,
             "a roster change changes the seats (and the charter it names), nothing else",
         );
     }
@@ -187,8 +204,8 @@ where
         let change: SeatChange = serde_json::from_value(c.clone())
             .map_err(|e| Error::InvalidArgument(format!("roster change: {e}")))?;
         let Some(decision) = directory.get_accord_decision(digest).await? else {
-            return refuse(
-                "accord_roster_change_uncovered",
+            return hold_refuse(
+                reason::ACCORD_ROSTER_CHANGE_UNCOVERED,
                 format!("no decision {digest}"),
             );
         };
@@ -203,8 +220,8 @@ where
             || !closed
             || p.payload_sha256 != seat_change_digest(accord, &change)?
         {
-            return refuse(
-                "accord_roster_change_uncovered",
+            return hold_refuse(
+                reason::ACCORD_ROSTER_CHANGE_UNCOVERED,
                 format!(
                     "decision {digest} is not an authorized roster change of the held head, \
                      closed, binding exactly this seat change"
@@ -213,16 +230,16 @@ where
         }
         for k in &change.remove {
             if seats.remove(k).is_none() {
-                return refuse(
-                    "accord_roster_change_uncovered",
+                return hold_refuse(
+                    reason::ACCORD_ROSTER_CHANGE_UNCOVERED,
                     format!("{k} holds no seat"),
                 );
             }
         }
         for m in &change.add {
             if seats.insert(m.key_id.clone(), m.role.clone()).is_some() {
-                return refuse(
-                    "accord_roster_change_uncovered",
+                return hold_refuse(
+                    reason::ACCORD_ROSTER_CHANGE_UNCOVERED,
                     format!("{} already holds a seat", m.key_id),
                 );
             }
@@ -244,16 +261,16 @@ where
         .map(|m| (m.key_id.clone(), m.role.clone()))
         .collect();
     if offered_seats != seats {
-        return refuse(
-            "accord_roster_change_uncovered",
+        return hold_refuse(
+            reason::ACCORD_ROSTER_CHANGE_UNCOVERED,
             "the offered roster is not the held roster with the decided changes applied",
         );
     }
     // Yes-cosigns: a strict majority of the STANDING roster (the held head's).
     let standing: Vec<String> = held.members.iter().map(|m| m.key_id.clone()).collect();
     if !super::tier_ingest::standing_majority_signed_by(directory, &standing, proof).await? {
-        return refuse(
-            "accord_roster_change_short",
+        return hold_refuse(
+            reason::ACCORD_ROSTER_CHANGE_SHORT,
             format!(
                 "yes-cosigns from fewer than a strict majority of the standing roster \
                  ({} of {})",
@@ -278,15 +295,16 @@ where
         .cloned()
         .collect();
     if let Some(k) = added.iter().find(|k| !record_signers.contains(k.as_str())) {
-        return refuse(
-            "accord_roster_change_unconsented",
+        return hold_refuse(
+            reason::ACCORD_ROSTER_CHANGE_UNCONSENTED,
             format!("added holder {k} did not sign the version that seats them"),
         );
     }
     for k in &added {
+        fold::reads(Dep::key(k));
         if !is_accord_holder_key(directory, k).await? {
-            return refuse(
-                "accord_roster_change_not_a_holder_key",
+            return hold_refuse(
+                reason::ACCORD_ROSTER_CHANGE_NOT_A_HOLDER_KEY,
                 format!("{k} is not an accord_holder key record (CC 4.2.6)"),
             );
         }
@@ -320,6 +338,12 @@ where
             "the accord's version names no charter, so no holder has a recovery commitment",
         );
     }
+    // v62.0.0 (wave GC6; CC 2.7.3) — the empty digest above is the version's
+    // own bytes (refused). Everything below reads OTHER rows (the named
+    // charter row, the recorded recoveries): a fold. A charter not held yet
+    // WAITS (held), and a coverage miss is held; both re-fold when the
+    // family's rows change.
+    fold::reads(Dep::key(&offered.family_key_id));
     // v53.1.2 (CIRISPersist#984 row 5) — the LIVE charter row: a charter-
     // labelled `delegates_to` toward the family, direction standing, not
     // retired. A row-hash match on any held attestation was not that.
@@ -330,7 +354,7 @@ where
     )
     .await?;
     let Some(charter) = charter else {
-        return refuse(
+        return coverage_hold(
             "accord_charter_not_held",
             format!(
                 "the charter {} the version names is not held here as a live charter row \
@@ -371,7 +395,19 @@ where
         .collect();
     let roster: Vec<&str> = offered.members.iter().map(|m| m.key_id.as_str()).collect();
     charter_commitments_cover(&commitments, &roster, &replaced, &recovered)
-        .or_else(|(token, detail)| refuse(token, detail))
+        .or_else(|(token, detail)| coverage_hold(token, detail))
+}
+
+/// v62.0.0 (wave GC6) — [`refuse`] for a coverage rule that read the held
+/// charter or recoveries: held with `fold::reason::ACCORD_CHARTER_COVERAGE`
+/// (the token stays in the detail). Outside an attempt, the plain refusal.
+fn coverage_hold<T>(token: &str, detail: impl std::fmt::Display) -> Result<T, Error> {
+    Err(fold::hold(
+        reason::ACCORD_CHARTER_COVERAGE,
+        Error::CharterInvalid {
+            detail: format!("{token}: {detail}"),
+        },
+    ))
 }
 
 /// **The one coverage rule**, pure: `commitments` (a charter's

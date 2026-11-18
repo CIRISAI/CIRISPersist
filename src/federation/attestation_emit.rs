@@ -212,18 +212,6 @@ pub fn assemble(
     Ok((row, emitted))
 }
 
-/// [`assemble`] without the row-type slot: for a witness that must put a
-/// validly signed row of a refused type (a retired carrier) at a door.
-#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
-pub(crate) fn assemble_for_door_witness(
-    key_id: String,
-    canonical: &[u8],
-    sig: ciris_crypto::HybridSignature,
-    input: EmitAttestationInput,
-) -> Result<(Attestation, EmittedAttestation), Error> {
-    assemble_any_row_type(key_id, canonical, sig, input)
-}
-
 fn assemble_any_row_type(
     key_id: String,
     canonical: &[u8],

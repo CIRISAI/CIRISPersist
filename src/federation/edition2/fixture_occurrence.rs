@@ -47,6 +47,9 @@ pub struct BindOptions {
     /// (`occurrence::current_roster_head`); [`occurrence_bind_voices`]
     /// states none (the door refuses it).
     pub head: Option<super::names::RowId>,
+    /// v7 — the other tips the bind merges, `refs.further_heads` (CC rc21).
+    /// [`put_bind`] states the current ones when `head` is `None`.
+    pub further_heads: Vec<super::names::RowId>,
 }
 
 impl Default for BindOptions {
@@ -56,6 +59,7 @@ impl Default for BindOptions {
             valid_until_ms: None,
             extra: Vec::new(),
             head: None,
+            further_heads: Vec::new(),
         }
     }
 }
@@ -90,10 +94,19 @@ pub fn occurrence_bind_voices(
         m.push((*k, v.clone()));
     }
     if let Some(h) = &opts.head {
-        m.push((
-            "refs",
-            det_map(vec![("head", ciris_verify_core::edition2::row_ref(&h.0))]),
-        ));
+        let mut refs = vec![("head", ciris_verify_core::edition2::row_ref(&h.0))];
+        if !opts.further_heads.is_empty() {
+            refs.push((
+                "further_heads",
+                Value::Array(
+                    opts.further_heads
+                        .iter()
+                        .map(|f| ciris_verify_core::edition2::row_ref(&f.0))
+                        .collect(),
+                ),
+            ));
+        }
+        m.push(("refs", det_map(refs)));
     }
     let payload = det_map(m);
     let sign = |seed: &str, iss: &str| {
@@ -131,7 +144,12 @@ pub async fn put_bind<D: FederationDirectory + ?Sized>(
 ) -> Result<StatementOutcome, Error> {
     let mut opts = opts.clone();
     if opts.head.is_none() {
-        opts.head = super::occurrence::current_roster_head(dir, &kid(identity)).await?;
+        if let Some((h, further)) =
+            super::occurrence::current_roster_heads(dir, &kid(identity)).await?
+        {
+            opts.head = Some(h);
+            opts.further_heads = further;
+        }
     }
     let mut last = None;
     for v in occurrence_bind_voices(author, identity, occurrence, device_class, &opts) {

@@ -13,13 +13,15 @@
 ))]
 pub mod bodies {
     use crate::federation::blob_tombstone::{binding_state, BindingState};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::attestation_type;
-    use crate::federation::{BlobError, BlobStorage, FederationDirectory, SignedAttestation};
+    use crate::federation::{BlobError, BlobStorage, FederationDirectory};
 
     /// A federation-tier content row by `author`, about `subjects`, that
     /// binds `sha_hex` by a **pointer member** (the chat shape: no
-    /// `evidence_refs`) when `by_pointer`, else by `evidence_refs`.
+    /// `evidence_refs`) when `by_pointer`, else by `evidence_refs`. Returns
+    /// the node-computed row id (v62: `id` is only a label).
     async fn bind_row<B>(
         b: &B,
         id: &str,
@@ -27,7 +29,8 @@ pub mod bodies {
         subjects: &[&str],
         sha_hex: &str,
         by_pointer: bool,
-    ) where
+    ) -> String
+    where
         B: FederationDirectory + Sync,
     {
         let env = if by_pointer {
@@ -41,37 +44,43 @@ pub mod bodies {
                 "evidence_refs": [sha_hex]
             })
         };
-        let mut row = ts::bare_attestation(id, author, author, &env);
+        // v62 (E4): the earlier-shaped literal, then the author's edition-2
+        // statement of it through the statement door.
+        let mut row = e2::with_earlier_form(|| ts::bare_attestation(id, author, author, &env));
         row.attestation_type = attestation_type::SCORES.into();
         row.cohort_scope = "federation".into();
         row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
-        ts::seal_row_in_place(author, &mut row);
-        b.put_attestation(SignedAttestation { attestation: row })
+        let stored = e2::try_put_row(b, &row, author)
             .await
             .unwrap_or_else(|e| panic!("bind_row {id}: {e}"));
+        e2::rid(&stored)
     }
 
     /// A `withdraws` by `issuer` naming `target_id`, through the real door.
+    /// Returns its node-computed row id. v62: a composer carries its
+    /// target's family, so the target must be held.
     async fn withdraw<B>(
         b: &B,
         id: &str,
         issuer: &str,
         target_id: &str,
-    ) -> Result<(), crate::federation::Error>
+    ) -> Result<String, crate::federation::Error>
     where
         B: FederationDirectory + Sync,
     {
+        let target = b.get_attestation(target_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!("withdraw {id}: target not held"))
+        })?;
         let env = serde_json::json!({
             "references_attestation_id": target_id,
             "withdrawal_reason": "CC 2.3",
         });
-        let mut w = ts::bare_attestation(id, issuer, issuer, &env);
+        let mut w = e2::with_earlier_form(|| ts::bare_attestation(id, issuer, issuer, &env));
         w.attestation_type = attestation_type::WITHDRAWS.into();
         w.cohort_scope = "federation".into();
-        ts::seal_row_in_place(issuer, &mut w);
-        b.put_attestation(SignedAttestation { attestation: w })
-            .await
-            .map(|_| ())
+        let st = e2::statement_of_family(&w, issuer, &e2::family_of(&target));
+        e2::put_statement(b, &st).await?;
+        Ok(e2::rid(&e2::row_of_statement(&st, "federation")))
     }
 
     /// A federation-scope blob announced by a node signer seeded from
@@ -118,7 +127,7 @@ pub mod bodies {
         let subject = format!("i149-subject-{s}");
         let stranger = format!("i149-stranger-{s}");
         for k in [&subject, &stranger] {
-            ts::register_identity_key(b, k, crate::federation::types::identity_type::USER).await;
+            e2::put_key(b, k, &[crate::federation::types::identity_type::USER]).await;
         }
         let (sha, author) = seal_blob(
             b,
@@ -127,8 +136,15 @@ pub mod bodies {
         )
         .await;
         let sha_hex = hex::encode(sha);
-        let row = format!("i149-row-{s}");
-        bind_row(b, &row, &author, &[&author, &subject], &sha_hex, true).await;
+        let row = bind_row(
+            b,
+            &format!("i149-row-{s}"),
+            &author,
+            &[&author, &subject],
+            &sha_hex,
+            true,
+        )
+        .await;
 
         // Before: bound and live, and every door reads.
         assert_eq!(
@@ -149,8 +165,7 @@ pub mod bodies {
         );
 
         // The SUBJECT withdraws the row (rule 2 — not the author).
-        let w = format!("i149-w-{s}");
-        withdraw(b, &w, &subject, &row)
+        let w = withdraw(b, &format!("i149-w-{s}"), &subject, &row)
             .await
             .expect("I149: a subject's withdraws is admitted (rule 2)");
 
@@ -185,7 +200,7 @@ pub mod bodies {
         // A commons-tier blob authorizes ANY viewer, so a "stranger" is an
         // authorized viewer here and correctly sees `Withdrawn` (the refusal
         // names only what a holder of the rows already sees on the wire).
-        let r = engine.read_blob_as(&sha, &stranger, None).await;
+        let r = engine.read_blob_as(&sha, &e2::kid(&stranger), None).await;
         assert!(
             matches!(&r, Err(BlobError::Withdrawn { .. })),
             "I149: on a commons blob every viewer is authorized: {r:?}"
@@ -196,7 +211,7 @@ pub mod bodies {
         // occurrence can read (the cohort-lifecycle fixture), bound and
         // withdrawn the same way. The member sees `Withdrawn`; a stranger is
         // `NotGranted` and never sees the tombstone.
-        let comm = format!("i149-comm-{s}");
+        let comm = crate::federation::edition2::fixture_switch::kid(&format!("i149-comm-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         let alice = format!("i149-alice-{s}");
         let alice_occ = format!("i149-alice-occ-{s}");
         crate::federation::community_dek::lifecycle_support::seed_community(
@@ -226,10 +241,9 @@ pub mod bodies {
             "ok",
             "I149: the member occurrence reads the sealed blob before"
         );
-        let sealed_row = format!("i149-sealed-row-{s}");
-        bind_row(
+        let sealed_row = bind_row(
             b,
-            &sealed_row,
+            &format!("i149-sealed-row-{s}"),
             &alice,
             &[&alice, &subject],
             &hex::encode(sealed),
@@ -244,98 +258,21 @@ pub mod bodies {
             matches!(&r, Err(BlobError::Withdrawn { .. })),
             "I149: the member sees Withdrawn on the sealed, withdrawn blob: {r:?}"
         );
-        let r = engine.read_blob_as(&sealed, &stranger, None).await;
+        let r = engine
+            .read_blob_as(&sealed, &e2::kid(&stranger), None)
+            .await;
         assert!(
             matches!(&r, Err(BlobError::NotGranted { .. })),
             "I149: a stranger is NotGranted FIRST on a sealed blob and never sees the tombstone: {r:?}"
         );
     }
 
-    /// **I150 — the stored rule is not consulted.** The same stored value
-    /// (`withdraws_admission_rule = None`, admitted out of order) yields
-    /// opposite verdicts depending only on the authority re-derived NOW.
-    pub async fn i150_the_stored_rule_is_never_consulted<B>(b: &B, engine: &crate::Engine, s: &str)
-    where
-        B: BlobStorage + FederationDirectory + Sync,
-    {
-        let subject = format!("i150-subject-{s}");
-        let third = format!("i150-third-{s}");
-        for k in [&subject, &third] {
-            ts::register_identity_key(b, k, crate::federation::types::identity_type::USER).await;
-        }
-        let (sha, author) = seal_blob(b, &format!("i150-author-{s}"), b"out of order").await;
-        let row = format!("i150-row-{s}");
-        // OUT OF ORDER, twice: each withdraws lands BEFORE its target, so the
-        // write door admits it with rule = None. The two rows differ only in
-        // who signed the deferred withdraws — a SUBJECT (entitled) on row A,
-        // a THIRD PARTY (not) on row B. The stored column is `None` on both;
-        // only the authority re-derived against the landed target differs.
-        let sha_b = seal_blob(b, &format!("i150-author-b-{s}"), b"out of order, too")
-            .await
-            .0;
-        let row_b = format!("i150-row-b-{s}");
-        let w_subject = format!("i150-w-subject-{s}");
-        let w_third = format!("i150-w-third-{s}");
-        withdraw(b, &w_subject, &subject, &row)
-            .await
-            .expect("I150: deferred admission (target absent)");
-        withdraw(b, &w_third, &third, &row_b)
-            .await
-            .expect("I150: deferred admission (target absent)");
-        for w in [&w_subject, &w_third] {
-            assert_eq!(
-                b.get_attestation(w)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .withdraws_admission_rule,
-                None,
-                "I150: precondition — a withdraws admitted ahead of its target stores rule None"
-            );
-        }
-        // Now both targets land, and only NOW can authority be derived.
-        bind_row(
-            b,
-            &row,
-            &author,
-            &[&author, &subject],
-            &hex::encode(sha),
-            true,
-        )
-        .await;
-        bind_row(
-            b,
-            &row_b,
-            &author,
-            &[&author, &subject],
-            &hex::encode(sha_b),
-            true,
-        )
-        .await;
-        assert_eq!(
-            binding_state(b as &dyn FederationDirectory, &sha).await.unwrap(),
-            BindingState::Withdrawn {
-                attestation_id: row.clone(),
-                withdraws_id: w_subject.clone()
-            },
-            "I150/A: the SUBJECT's deferred withdraws (stored None) retires the bytes — a fold that \
-             trusts the stored rule cannot produce this"
-        );
-        assert_eq!(
-            kind_of(&engine.read_blob_as(&sha, &author, None).await),
-            "blob_withdrawn"
-        );
-        assert_eq!(
-            binding_state(b as &dyn FederationDirectory, &sha_b).await.unwrap(),
-            BindingState::Live,
-            "I150/B: the THIRD PARTY's deferred withdraws (also stored None) retires nothing — a fold \
-             that reads None as retired makes replication a remote-delete primitive"
-        );
-        assert_eq!(
-            kind_of(&engine.read_blob_as(&sha_b, &author, None).await),
-            "ok"
-        );
-    }
+    // v62 (E4): I150 ("the stored rule is not consulted") is deleted. Its
+    // premise is a `withdraws` admitted AHEAD of its target and stored with
+    // rule None; an edition-2 composer names its target by `refs.target` and
+    // carries the target's family, so it waits until the target is held and
+    // is never stored ahead of it. The fold's re-derivation is still
+    // witnessed by I149 (a subject's withdraws) and I151.
 
     /// **I151 — one live binding keeps the bytes.**
     pub async fn i151_one_live_binding_keeps_the_bytes<B>(b: &B, engine: &crate::Engine, s: &str)
@@ -343,12 +280,12 @@ pub mod bodies {
         B: BlobStorage + FederationDirectory + Sync,
     {
         let c = format!("i151-c-{s}");
-        ts::register_identity_key(b, &c, crate::federation::types::identity_type::USER).await;
+        e2::put_key(b, &c, &[crate::federation::types::identity_type::USER]).await;
         let (sha, a) = seal_blob(b, &format!("i151-a-{s}"), b"quoted twice").await;
         let hx = hex::encode(sha);
-        let (r1, r2) = (format!("i151-r1-{s}"), format!("i151-r2-{s}"));
-        bind_row(b, &r1, &a, &[&a], &hx, true).await;
-        bind_row(b, &r2, &c, &[&c], &hx, false).await; // the other reference shape
+        let r1 = bind_row(b, &format!("i151-r1-{s}"), &a, &[&a], &hx, true).await;
+        // the other reference shape
+        let r2 = bind_row(b, &format!("i151-r2-{s}"), &c, &[&c], &hx, false).await;
         withdraw(b, &format!("i151-w1-{s}"), &a, &r1).await.unwrap();
         assert_eq!(
             binding_state(b as &dyn FederationDirectory, &sha)
@@ -396,7 +333,7 @@ pub mod bodies {
         row.attestation_type = attestation_type::SCORES.into();
         row.cohort_scope = crate::federation::types::cohort_scope::FEDERATION.into();
         ts::seal_row_in_place(device, &mut row);
-        b.put_attestation(SignedAttestation { attestation: row })
+        b.put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
             .unwrap_or_else(|e| panic!("custody_here {id}: {e}"));
     }
@@ -424,8 +361,15 @@ pub mod bodies {
         .await;
         let (sha, author) = seal_blob(b, &format!("i149b-author-{s}"), b"alice's self file").await;
         let hx = hex::encode(sha);
-        let file = format!("i149b-file-{s}");
-        bind_row(b, &file, &author, &[&author], &hx, false).await;
+        let file = bind_row(
+            b,
+            &format!("i149b-file-{s}"),
+            &author,
+            &[&author],
+            &hx,
+            false,
+        )
+        .await;
         custody_here(b, &format!("i149b-ack-{s}"), &device, &sha).await;
 
         let mut ids: Vec<String> = b
@@ -477,9 +421,8 @@ pub mod bodies {
         // (d) — a genuine second reference keeps a second blob Live.
         let (sha2, a2) = seal_blob(b, &format!("i149b-a2-{s}"), b"quoted twice").await;
         let hx2 = hex::encode(sha2);
-        let (r1, r2) = (format!("i149b-r1-{s}"), format!("i149b-r2-{s}"));
-        bind_row(b, &r1, &a2, &[&a2], &hx2, false).await;
-        bind_row(b, &r2, &a2, &[&a2], &hx2, true).await;
+        let r1 = bind_row(b, &format!("i149b-r1-{s}"), &a2, &[&a2], &hx2, false).await;
+        bind_row(b, &format!("i149b-r2-{s}"), &a2, &[&a2], &hx2, true).await;
         custody_here(b, &format!("i149b-ack2-{s}"), &device, &sha2).await;
         withdraw(b, &format!("i149b-w1-{s}"), &a2, &r1)
             .await
@@ -501,26 +444,27 @@ pub mod bodies {
         B: FederationDirectory + Sync,
     {
         let a = format!("i152-a-{s}");
-        ts::register_identity_key(b, &a, crate::federation::types::identity_type::USER).await;
+        e2::put_key(b, &a, &[crate::federation::types::identity_type::USER]).await;
         let sha_hex = "ab".repeat(32);
         let (p, e, bad) = (
             format!("i152-p-{s}"),
             format!("i152-e-{s}"),
             format!("i152-bad-{s}"),
         );
-        bind_row(b, &p, &a, &[&a], &sha_hex, true).await;
-        bind_row(b, &e, &a, &[&a], &sha_hex, false).await;
+        let p = bind_row(b, &p, &a, &[&a], &sha_hex, true).await;
+        let e = bind_row(b, &e, &a, &[&a], &sha_hex, false).await;
         // Pointer-shaped at these bytes but unreadable (a non-string tier).
         let env = serde_json::json!({
             "id": bad, "dimension": "file:v1", "cohort_scope": "federation",
             "content": {"content_sha256": sha_hex, "community_key_id": "", "tier": 7}
         });
-        let mut row = ts::bare_attestation(&bad, &a, &a, &env);
+        let mut row = e2::with_earlier_form(|| ts::bare_attestation(&bad, &a, &a, &env));
         row.attestation_type = attestation_type::SCORES.into();
         row.cohort_scope = "federation".into();
         row.subject_key_ids = vec![a.clone()];
-        ts::seal_row_in_place(&a, &mut row);
-        b.put_attestation(SignedAttestation { attestation: row }).await.expect("I152: the malformed-pointer row is stored (its pointer is refused where it is USED)");
+        let bad = e2::rid(&e2::try_put_row(b, &row, &a).await.expect(
+            "I152: the malformed-pointer row is stored (its pointer is refused where it is USED)",
+        ));
         let mut got: Vec<String> = b
             .attestations_binding_content(&sha_hex)
             .await
@@ -546,12 +490,14 @@ pub mod bodies {
         // runner seeds the engine from the label below; the assert pins it.
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(b, "node-tomb").await;
-        let node = signer.derived_key_id();
         assert_eq!(
             engine.local_derived_key_id().await.unwrap(),
-            node,
+            signer.derived_key_id(),
             "I153: the runner's engine must be signed by the label this body rebuilds"
         );
+        // v62 (E4, wave 4; cut B): the node states its rows (the holding
+        // claim, the eviction's `withdraws`) under its composite identity-ref.
+        let node = signer.federation_id().await;
         let withdraws_by = |n: String| async move {
             b.all_attestations_by(&n)
                 .await
@@ -679,18 +625,6 @@ mod run {
                         return;
                     };
                     super::super::bodies::i149_a_withdrawn_reference_stops_the_bytes(
-                        &*b,
-                        &engine,
-                        &super::suffix(),
-                    )
-                    .await
-                }
-                #[tokio::test]
-                async fn i150() {
-                    let Some((engine, b)) = $fresh.await else {
-                        return;
-                    };
-                    super::super::bodies::i150_the_stored_rule_is_never_consulted(
                         &*b,
                         &engine,
                         &super::suffix(),

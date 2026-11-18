@@ -7,10 +7,10 @@
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::types::identity_type::USER;
     use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
-    use crate::federation::{admission, Attestation, FederationDirectory, SignedAttestation};
+    use crate::federation::{admission, Attestation, FederationDirectory};
 
     pub(crate) fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         admission::truncate_to_substrate_resolution(s.parse().unwrap())
@@ -21,7 +21,10 @@ pub(crate) mod bodies {
         hex::encode(sha2::Sha256::digest(seed.as_bytes()))
     }
 
-    /// A federation-tier `scores` row signed by `signer` over `envelope`.
+    /// A federation-tier `scores` row by `signer` over `envelope`,
+    /// earlier-shaped and UNSIGNED. v62 (E4): [`put`] offers it as `signer`'s
+    /// edition-2 statement (the literal's `attesting_key_id` is the signing
+    /// seed), so every refusal below still comes from the door.
     pub(crate) fn row(
         id: &str,
         signer: &str,
@@ -34,8 +37,7 @@ pub(crate) mod bodies {
         env["id"] = serde_json::Value::String(id.to_owned());
         env[crate::federation::envelope::paths::ASSERTED_AT] =
             serde_json::Value::String(asserted.to_rfc3339());
-        let (och, ed_sig, pqc_sig) = ts::sign_envelope(signer, &env);
-        let mut r = Attestation {
+        Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: signer.to_owned(),
             attested_key_id: target.to_owned(),
@@ -44,9 +46,9 @@ pub(crate) mod bodies {
             asserted_at: asserted,
             expires_at: None,
             attestation_envelope: env,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: signer.to_owned(),
             scrub_timestamp: asserted,
             pqc_completed_at: None,
@@ -57,9 +59,20 @@ pub(crate) mod bodies {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        };
-        ts::seal_row_in_place(signer, &mut r);
-        ts::reseal(&mut r);
+        }
+    }
+
+    /// `r` re-dated to now, in the column and in the signed instant. v62
+    /// (E4; E0.api.md v1.6 fixed-instant rule): [`row`]'s fixed 2026-05-01
+    /// instant is covered by the `user` keys these bodies register (no
+    /// start); a body that signs as a default `node`/`agent` key (whose
+    /// record starts today - 180 days) re-dates its rows with this.
+    pub(crate) fn dated_now(mut r: Attestation) -> Attestation {
+        let now = admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        r.asserted_at = now;
+        r.scrub_timestamp = now;
+        r.attestation_envelope[crate::federation::envelope::paths::ASSERTED_AT] =
+            serde_json::Value::String(now.to_rfc3339());
         r
     }
 
@@ -77,7 +90,7 @@ pub(crate) mod bodies {
             signer,
             target,
             serde_json::json!({
-                "dimension": "external_content:image:v1",
+                "dimension": "image:photo:v1", "subject_kind": "external_content", "sub_kind": "image",
                 "score": 1.0,
                 "evidence_refs": [digest],
                 "media": media,
@@ -101,17 +114,42 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         a: Attestation,
     ) -> Result<(), crate::federation::Error> {
-        d.put_attestation(SignedAttestation { attestation: a })
-            .await
-            .map(|_| ())
+        put_rid(d, a).await.map(|_| ())
+    }
+
+    /// [`put`], returning the node-computed row id (v62: the literal's
+    /// `attestation_id` is only a label).
+    pub(crate) async fn put_rid(
+        d: &dyn FederationDirectory,
+        a: Attestation,
+    ) -> Result<String, crate::federation::Error> {
+        let seed = a.attesting_key_id.clone();
+        e2::try_put_row(d, &a, &seed).await.map(|r| e2::rid(&r))
+    }
+
+    /// A structural composer literal `a` (no dimension) naming the held row
+    /// `target_id`, as its signer's edition-2 statement: it carries the
+    /// target's family (`composer_family_mismatch` otherwise).
+    pub(crate) async fn put_composer(
+        d: &dyn FederationDirectory,
+        a: Attestation,
+        target_id: &str,
+    ) -> Result<String, crate::federation::Error> {
+        let target = d.get_attestation(target_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!("{target_id}: target not held"))
+        })?;
+        let seed = a.attesting_key_id.clone();
+        let st = e2::statement_of_family(&a, &seed, &e2::family_of(&target));
+        e2::put_statement(d, &st).await?;
+        Ok(e2::rid(&e2::row_of_statement(&st, &a.tier)))
     }
 
     /// **I115 — a malformed struct is refused by name; a well-formed one is
     /// admitted.**
     pub async fn i115_the_struct_is_refused_by_name(d: &dyn FederationDirectory, s: &str) {
         let (signer, target) = (format!("i115-s-{s}"), format!("i115-t-{s}"));
-        ts::register_identity_key(d, &signer, USER).await;
-        ts::register_identity_key(d, &target, USER).await;
+        e2::put_key(d, &signer, &[USER]).await;
+        e2::put_key(d, &target, &[USER]).await;
         let digest = hex64(&format!("i115-bytes-{s}"));
         let bad: &[(&str, serde_json::Value, &str)] = &[
             (
@@ -265,7 +303,7 @@ pub(crate) mod bodies {
             );
         }
         // Well-formed: admitted, and the struct survives the round trip.
-        put(
+        let ok = put_rid(
             d,
             media_row(
                 &format!("i115-ok-{s}"),
@@ -278,30 +316,35 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I115: a well-formed struct is admitted");
-        let stored = d
-            .get_attestation(&format!("i115-ok-{s}"))
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = d.get_attestation(&ok).await.unwrap().unwrap();
         assert_eq!(stored.attestation_envelope["media"]["size"], 4096);
         // mp4 with a codec; a video with captions cited.
         let vtt = hex64(&format!("i115-vtt-{s}"));
-        let mut video = row(
+        let video = row(
             &format!("i115-video-{s}"),
             &signer,
             &target,
             serde_json::json!({
-                "dimension": "external_content:video:v1", "score": 1.0,
+                "dimension": "video:clip:v1", "subject_kind": "external_content", "sub_kind": "video", "score": 1.0,
                 "evidence_refs": [digest, vtt],
                 "media": {"digest": digest, "size": 10, "format": "video/mp4", "codec": "avc1.42E01E", "captions": vtt, "duration_ms": 1200},
             }),
             cohort_scope::FEDERATION,
         );
-        video.attestation_id = format!("i115-video-{s}");
         put(d, video)
             .await
             .expect("I115: video/mp4 with a codec and cited captions is admitted");
-        // The local door refuses the same way.
+    }
+
+    /// **I115 (local-door leg)** — the local door refuses a malformed
+    /// struct the same way. v62 (E4): split out of I115; the local write door
+    /// (producer authority, `cohort_scope = self`) is not an earlier-form
+    /// door, and its signer is an edition-2 key.
+    pub async fn i115_the_local_door_refuses_too(d: &dyn FederationDirectory, s: &str) {
+        let (signer, target) = (format!("i115l-s-{s}"), format!("i115l-t-{s}"));
+        e2::put_key(d, &signer, &[USER]).await;
+        e2::put_key(d, &target, &[USER]).await;
+        let digest = hex64(&format!("i115l-bytes-{s}"));
         let local = crate::federation::types::LocalAttestationInput {
             attestation_id: Some(format!("i115-local-{s}")),
             attesting_key_id: signer.clone(),
@@ -311,7 +354,7 @@ pub(crate) mod bodies {
             expires_at: None,
             attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
                 serde_json::json!({
-                    "dimension": "external_content:image:v1", "evidence_refs": [digest],
+                    "dimension": "image:photo:v1", "subject_kind": "external_content", "sub_kind": "image", "evidence_refs": [digest],
                     "media": {"digest": digest, "format": "image/png"},
                 }),
             )
@@ -332,8 +375,8 @@ pub(crate) mod bodies {
     /// stays bare sha256.**
     pub async fn i116_the_struct_cites_what_the_row_cites(d: &dyn FederationDirectory, s: &str) {
         let (signer, target) = (format!("i116-s-{s}"), format!("i116-t-{s}"));
-        ts::register_identity_key(d, &signer, USER).await;
-        ts::register_identity_key(d, &target, USER).await;
+        e2::put_key(d, &signer, &[USER]).await;
+        e2::put_key(d, &target, &[USER]).await;
         let (digest, other, vtt) = (
             hex64(&format!("i116-a-{s}")),
             hex64(&format!("i116-b-{s}")),
@@ -341,13 +384,13 @@ pub(crate) mod bodies {
         );
         // digest not cited
         let err = put(d, row(&format!("i116-uncited-{s}"), &signer, &target,
-            serde_json::json!({"dimension": "external_content:image:v1", "score": 1.0, "evidence_refs": [other], "media": good_media(&digest)}),
+            serde_json::json!({"dimension": "image:photo:v1", "subject_kind": "external_content", "sub_kind": "image", "score": 1.0, "evidence_refs": [other], "media": good_media(&digest)}),
             cohort_scope::FEDERATION)).await.unwrap_err();
         assert_eq!(err.kind(), "federation_media_source_invalid");
         assert!(err.to_string().contains("evidence_refs"), "I116: {err}");
         // captions not cited
         let err = put(d, row(&format!("i116-uncited-vtt-{s}"), &signer, &target,
-            serde_json::json!({"dimension": "external_content:video:v1", "score": 1.0, "evidence_refs": [digest],
+            serde_json::json!({"dimension": "video:clip:v1", "subject_kind": "external_content", "sub_kind": "video", "score": 1.0, "evidence_refs": [digest],
                 "media": {"digest": digest, "size": 10, "format": "video/mp4", "codec": "avc1.42E01E", "captions": vtt}}),
             cohort_scope::FEDERATION)).await.unwrap_err();
         assert!(err.to_string().contains("captions"), "I116: {err}");
@@ -368,7 +411,7 @@ pub(crate) mod bodies {
     /// `here`, whose parse requires a positive size (`custody_ack_malformed`).
     pub async fn i117_a_claim_without_size_is_refused(d: &dyn FederationDirectory, s: &str) {
         let holder = format!("i117-h-{s}");
-        ts::register_identity_key(d, &holder, USER).await;
+        e2::put_key(d, &holder, &[USER]).await;
         let sha: [u8; 32] = {
             use sha2::Digest as _;
             sha2::Sha256::digest(format!("i117-bytes-{s}").as_bytes()).into()
@@ -386,7 +429,6 @@ pub(crate) mod bodies {
             }
             let mut r = row(id, &holder, &holder, env, cohort_scope::FEDERATION);
             r.attestation_type = "scores".into();
-            ts::reseal(&mut r);
             r
         };
         for (n, size) in [
@@ -411,7 +453,7 @@ pub(crate) mod bodies {
         assert_eq!(sized.len(), 1);
         assert_eq!(
             (sized[0].key_id.as_str(), sized[0].size),
-            (holder.as_str(), 12)
+            (e2::kid(&holder).as_str(), 12)
         );
     }
 
@@ -421,13 +463,12 @@ pub(crate) mod bodies {
     pub async fn i118_the_rendition_index(d: &dyn FederationDirectory, s: &str) {
         use crate::federation::renditions::Rendition;
         let (signer, target) = (format!("i118-s-{s}"), format!("i118-t-{s}"));
-        ts::register_identity_key(d, &signer, USER).await;
-        ts::register_identity_key(d, &target, USER).await;
+        e2::put_key(d, &signer, &[USER]).await;
+        e2::put_key(d, &target, &[USER]).await;
         let original = hex64(&format!("i118-orig-{s}"));
         let thumb = hex64(&format!("i118-thumb-{s}"));
         assert!(d.list_derived_hex(&original).await.unwrap().is_empty());
-        let rid = format!("i118-thumb-row-{s}");
-        put(d, media_row(&rid, &signer, &target, &thumb,
+        let rid = put_rid(d, media_row(&format!("i118-thumb-row-{s}"), &signer, &target, &thumb,
             serde_json::json!({"digest": thumb, "size": 512, "format": "image/webp", "width": 32, "height": 24, "name": "thumbnail", "derived_from": original}),
             cohort_scope::FEDERATION)).await.expect("I118: a rendition row is admitted");
         let got = d.list_derived_hex(&original).await.unwrap();
@@ -457,10 +498,9 @@ pub(crate) mod bodies {
                 cohort_scope::FEDERATION,
             );
             r.attestation_type = attestation_type::WITHDRAWS.to_owned();
-            ts::reseal(&mut r);
             r
         };
-        put(d, withdraw)
+        put_composer(d, withdraw, &rid)
             .await
             .expect("I118: the producer withdraws its own row");
         assert!(
@@ -483,7 +523,7 @@ pub(crate) mod bodies {
         use crate::federation::envelope::EnvelopeCore;
         use crate::federation::types::LocalAttestationInput;
         let signer = format!("i118c-s-{s}");
-        ts::register_identity_key(d, &signer, USER).await;
+        e2::put_key(d, &signer, &[USER]).await;
         let original = hex64(&format!("i118c-orig-{s}"));
         let (thumb_a, thumb_b) = (
             hex64(&format!("i118c-a-{s}")),
@@ -498,7 +538,7 @@ pub(crate) mod bodies {
             weight: None,
             expires_at: None,
             attestation_envelope: EnvelopeCore::from_value(serde_json::json!({
-                "dimension": "external_content:image:v1", "evidence_refs": [thumb],
+                "dimension": "image:photo:v1", "subject_kind": "external_content", "sub_kind": "image", "evidence_refs": [thumb],
                 "media": {"digest": thumb, "size": 96, "format": "image/webp", "name": "poster", "derived_from": original},
             }))
             .unwrap(),
@@ -589,14 +629,14 @@ pub(crate) mod bodies {
         let media = serde_json::json!({"digest": thumb, "size": 64, "format": "image/png", "name": "thumbnail", "derived_from": hex::encode(sha)});
         let err = put(
             b,
-            media_row(
+            dated_now(media_row(
                 &format!("i118b-wrong-{s}"),
                 &n.key,
                 &n.key,
                 &thumb,
                 media.clone(),
                 cohort_scope::SPECIES,
-            ),
+            )),
         )
         .await
         .unwrap_err();
@@ -607,14 +647,14 @@ pub(crate) mod bodies {
         );
         put(
             b,
-            media_row(
+            dated_now(media_row(
                 &format!("i118b-right-{s}"),
                 &n.key,
                 &n.key,
                 &thumb,
                 media,
                 cohort_scope::FEDERATION,
-            ),
+            )),
         )
         .await
         .expect("I118b: same scope as the original");
@@ -704,7 +744,7 @@ pub(crate) mod bodies {
         .expect("I117d: the true length is admitted");
         assert_eq!(b.list_holders_sized(&sha).await.unwrap()[0].size, len);
         // The adopt door, at the sealed community shape.
-        let comm = format!("i117d-comm-{s}");
+        let comm = crate::federation::edition2::fixture_switch::kid(&format!("i117d-comm-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         seed_community_everywhere(&[&n], &comm, &[(&format!("i117d-m-{s}"), Some(&n))]).await;
         let envelope = seal(
             &fresh_dek().unwrap(),
@@ -786,8 +826,8 @@ pub(crate) mod bodies {
     ) {
         use crate::federation::admission::check_promotion_admission;
         let (signer, target) = (format!("i119b-s-{s}"), format!("i119b-t-{s}"));
-        ts::register_identity_key(d, &signer, USER).await;
-        ts::register_identity_key(d, &target, USER).await;
+        e2::put_key(d, &signer, &[USER]).await;
+        e2::put_key(d, &target, &[USER]).await;
         let digest = hex64(&format!("i119b-{s}"));
         let bad = media_row(
             &format!("i119b-bad-{s}"),
@@ -827,7 +867,7 @@ pub(crate) mod bodies {
             use sha2::Digest as _;
             sha2::Sha256::digest(format!("i119b-bytes-{s}").as_bytes()).into()
         };
-        let mut sizeless = row(
+        let sizeless = row(
             &format!("i119b-sizeless-{s}"),
             &signer,
             &signer,
@@ -840,7 +880,6 @@ pub(crate) mod bodies {
             }),
             cohort_scope::FEDERATION,
         );
-        ts::reseal(&mut sizeless);
         let err = check_promotion_admission(d, &sizeless, None)
             .await
             .expect_err("I119b: the chokepoint refuses a size-less holder claim");
@@ -902,28 +941,29 @@ pub(crate) mod bodies {
             (na.key.as_str(), len),
             "I117b: the put door's claim carries the stored length"
         );
-        // The claim crosses with its size (the #870 shape: hashes → point reads → apply).
-        let mut cursor: Option<String> = None;
+        // The claim crosses with its size. v62 (E4, wave 4): A serves its
+        // edition-2 statements (`edition2_statements_since`, cut B's serve
+        // path) and B admits each through the one statement door, in A's
+        // admission order (so the holder's `key:record` lands before its claim).
+        let mut cursor: Option<crate::federation::edition2::store::StatementCursor> = None;
         loop {
             let page = a
-                .list_wire_hashes_since("Attestation", cursor.as_deref(), 256)
+                .edition2_statements_since(cursor.as_ref(), 256)
                 .await
                 .unwrap();
             if page.is_empty() {
                 break;
             }
-            cursor = page.last().cloned();
-            for h in &page {
-                let bytes = a
-                    .lookup_signed_record_by_content_hash("Attestation", h)
-                    .await
-                    .unwrap()
-                    .expect("advertised is fetchable (#870)");
-                let r: Attestation = serde_json::from_slice(&bytes).unwrap();
-                let _ = b
-                    .apply_replicated_attestation(SignedAttestation { attestation: r })
-                    .await
-                    .unwrap();
+            cursor = page.last().map(|st| st.cursor);
+            for st in &page {
+                crate::federation::edition2::ingest::put_statement(
+                    b,
+                    &st.bytes,
+                    None,
+                    crate::federation::edition2::ingest::INGEST_TIER,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("I117b: B admits A's served statement: {e}"));
             }
         }
         let on_b = b.list_holders_sized(&sha).await.unwrap();
@@ -933,7 +973,7 @@ pub(crate) mod bodies {
             "I117b: the peer learned the holder AND the size"
         );
         // The adopt door, at the sealed community shape.
-        let comm = format!("i117b-comm-{s}");
+        let comm = crate::federation::edition2::fixture_switch::kid(&format!("i117b-comm-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         seed_community_everywhere(&[&nb], &comm, &[(&format!("i117b-m-{s}"), Some(&nb))]).await;
         let envelope = seal(
             &fresh_dek().unwrap(),
@@ -1104,6 +1144,11 @@ mod run {
                     let Some(b) = $fresh.await else { return };
                     bodies::i118c_the_local_door_projects_and_replace_retires(&b, &super::suffix())
                         .await
+                }
+                #[tokio::test]
+                async fn i115_local() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i115_the_local_door_refuses_too(&b, &super::suffix()).await
                 }
             }
         };

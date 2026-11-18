@@ -373,9 +373,10 @@ fn the_deferred_begin_scanner_reads_calls_not_mentions_1238() {
 
 #[cfg(feature = "sqlite")]
 mod behaviour {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::attestation_type;
-    use crate::federation::{FederationDirectory, SignedAttestation};
+    use crate::federation::types::{attestation_type, identity_type};
+    use crate::federation::FederationDirectory;
     use crate::store::backend::Backend;
     use crate::store::sqlite::SqliteBackend;
     use std::time::{Duration, Instant};
@@ -441,6 +442,10 @@ mod behaviour {
     /// `register_self_federation_key` fails. With another connection holding
     /// the write lock, it waits the lock out and lands. RED (`database is
     /// locked`, in about a millisecond) when `write_tx` begins deferred.
+    ///
+    /// v62.0.0 (JSON cut, E5) — the key arrives as its edition-2 `key:record`
+    /// statement (`e2::put_key`), the door that keeps it and projects it into
+    /// `federation_keys` in one write; it is read back by its identity-ref.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn i1660_a_read_then_write_key_record_waits_out_a_held_write_lock() {
         let (dir, path, backend) = migrated("key").await;
@@ -449,13 +454,13 @@ mod behaviour {
         let (held_at, holder) = hold_write_lock(&path, HOLD);
         // Panics with the backend error (SQLITE_BUSY, "database is locked")
         // if the door failed instead of waiting.
-        ts::register_hybrid_key(&backend, key).await;
+        let key = e2::put_key(&backend, key, &[identity_type::AGENT]).await;
         let done = Instant::now();
         let released = holder.join().expect("I1660 holder thread");
         assert_waited("key record", held_at, released, done);
 
         // Fully qualified: `Backend` has a `lookup_public_key` too.
-        let held = FederationDirectory::lookup_public_key(&backend, key)
+        let held = FederationDirectory::lookup_public_key(&backend, &key)
             .await
             .expect("I1660 lookup")
             .expect("I1660: the key record landed");
@@ -469,11 +474,14 @@ mod behaviour {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn i1660_put_attestation_waits_out_a_held_write_lock() {
         let (dir, path, backend) = migrated("attestation").await;
-        let attester = "i1660-attester";
-        ts::register_hybrid_key(&backend, attester).await;
+        let attester = e2::put_key(&backend, "i1660-attester", &[identity_type::AGENT]).await;
+        let attester = attester.as_str();
 
         let id = uuid::Uuid::new_v4().to_string();
-        let env = serde_json::json!({ "dimension": "i1660:probe:v1", "n": id });
+        // v62.0.0 (E5) — a registered dimension (`i1660:probe:v1` was open
+        // vocabulary, which the edition-2 door refuses).
+        let env =
+            serde_json::json!({ "dimension": "evidence:safety_battery:capture:a:b:v1", "n": id });
         let mut row = ts::bare_attestation(&id, attester, attester, &env);
         row.attestation_type = attestation_type::SCORES.into();
         row.weight = None;
@@ -485,11 +493,11 @@ mod behaviour {
         row.scrub_timestamp = when;
         row.subject_key_ids = vec!["i1660-subject".to_owned()];
         ts::seal_row_in_place(attester, &mut row);
+        // v62.0.0 (E5) — the row is stored under its node-computed id.
+        let id = e2::rid(&row);
 
         let (held_at, holder) = hold_write_lock(&path, HOLD);
-        let put =
-            FederationDirectory::put_attestation(&backend, SignedAttestation { attestation: row })
-                .await;
+        let put = e2::put_signed(&backend, &row).await;
         let done = Instant::now();
         let released = holder.join().expect("I1660 holder thread");
         if let Err(e) = &put {

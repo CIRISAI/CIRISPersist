@@ -222,12 +222,22 @@ where
         )));
     }
     super::admission::verify_signed_transport_destination(dir.as_dyn_directory(), &carried).await?;
-    let Some(family) = dir
-        .lookup_family(ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
-        .await?
-    else {
-        return Err(refuse(
-            "this node holds no accord family to count against".into(),
+    // v62.0.0 (wave GC4; CC 2.7.3) — the checks above read the row's own
+    // bytes and the pinned bundle's seats (door). The count below reads
+    // OTHER rows (the accord family, its roster, the holders' key records):
+    // a fold. Unmet, the re-bind is HELD (`link_unheld` with no family,
+    // `count_short` short of the holders) and re-folds when one lands.
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(accord));
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(node));
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&row.scrub_key_id));
+    for s in &row.additional_scrubs {
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(&s.scrub_key_id));
+    }
+    let Some(family) = dir.lookup_family(accord).await? else {
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::LINK_UNHELD,
+            refuse("this node holds no accord family to count against".into()),
         ));
     };
     let quorum =
@@ -260,24 +270,68 @@ where
     Ok(())
 }
 
-/// **The unilateral-rotation rule** (the transport door asks it after the
-/// row's own checks): see the module doc.
+/// **The unilateral-rotation rule at a RECEIVER** (the transport door asks
+/// it after the row's own checks): see the module doc.
+///
+/// v62.0.0 (wave GC4; CC rc21 items 12, 13 — 5.3.4, 3.3.6.2) — a receiver
+/// KEEPS a rotation no held re-bind carries and does not count it: inside a
+/// fold attempt the row is HELD `serve_transit_pair_rotation_before_rebind`,
+/// reading `key:<node>`, and concludes when the holders' re-bind carrying it
+/// lands. The node's OWN emission guard is [`refuse_own_serve_rotation`].
 ///
 /// # Errors
 ///
-/// [`SERVE_TRANSIT_PAIR_ROTATION_BEFORE_REBIND`].
+/// [`SERVE_TRANSIT_PAIR_ROTATION_BEFORE_REBIND`] (held inside an attempt).
 pub async fn check_serve_rotation(
     dir: &dyn FederationDirectory,
     signed: &SignedTransportDestination,
 ) -> Result<(), Error> {
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(
+        &signed.transport_destination.occurrence_key_id,
+    ));
+    match serve_rotation_unrooted(dir, signed).await? {
+        None => Ok(()),
+        Some(e) => Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::SERVE_ROTATION_BEFORE_REBIND,
+            e,
+        )),
+    }
+}
+
+/// v62.0.0 (wave GC4; CC rc21 item 12) — **the node's own emission guard**:
+/// the node does not sign a rotation that would retire its pinned pair
+/// before it holds the replacement Rooted. A plain refusal (an emitter
+/// declining to write, never a fold mark): call it on the LOCAL signing path
+/// only, never on receipt (that is [`check_serve_rotation`]).
+///
+/// # Errors
+///
+/// [`SERVE_TRANSIT_PAIR_ROTATION_BEFORE_REBIND`].
+pub async fn refuse_own_serve_rotation(
+    dir: &dyn FederationDirectory,
+    signed: &SignedTransportDestination,
+) -> Result<(), Error> {
+    match super::edition2::fold::isolated(serve_rotation_unrooted(dir, signed)).await? {
+        None => Ok(()),
+        Some(e) => Err(e),
+    }
+}
+
+/// The shared reading: `Some(refusal)` when `signed` rotates a seated serve
+/// node's pinned transit pair and no held re-bind carries it; `None` when it
+/// stands.
+async fn serve_rotation_unrooted(
+    dir: &dyn FederationDirectory,
+    signed: &SignedTransportDestination,
+) -> Result<Option<Error>, Error> {
     let td = &signed.transport_destination;
     let Some(pinned) = pinned_row(&td.occurrence_key_id, &td.transport_kind) else {
-        return Ok(());
+        return Ok(None);
     };
     let pinned_pair = pair_of(pinned)?;
     let incoming = pair_of(signed)?;
     if incoming == pinned_pair {
-        return Ok(());
+        return Ok(None);
     }
     // The live binding of this kind: does it still carry the pinned pair?
     let live = dir
@@ -294,7 +348,7 @@ pub async fn check_serve_rotation(
     };
     if live_pair != pinned_pair {
         // A replacement is already Rooted (a quorum re-bind landed).
-        return Ok(());
+        return Ok(None);
     }
     // A held re-bind carrying exactly this row authorizes it.
     let mut pages = super::attestation_query::AttestationQuery::to(
@@ -310,14 +364,14 @@ pub async fn check_serve_rotation(
             .filter_map(carried_row)
             .any(|c| c.signed_envelope == signed.signed_envelope)
         {
-            return Ok(());
+            return Ok(None);
         }
     }
-    Err(Error::InvalidArgument(format!(
+    Ok(Some(Error::InvalidArgument(format!(
         "{SERVE_TRANSIT_PAIR_ROTATION_BEFORE_REBIND}: {} is a seated serve node whose \
          {} transit pair the pinned genesis bundle carries; a rotation signed by the node \
          alone would retire it before a replacement is Rooted — rotate by the holders' \
          quorum re-bind (`{REBIND_DIMENSION}`, CC 5.3.4)",
         td.occurrence_key_id, td.transport_kind
-    )))
+    ))))
 }

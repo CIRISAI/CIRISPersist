@@ -13,36 +13,62 @@
 //! traces already captured. A held node-authored grant in the v52 shape (the
 //! owner alone) keeps counting and is counted at open; a new one missing a
 //! party is refused `community_trust_subjects_incomplete`.
+//!
+//! v62.0.0 (the JSON cut): every row is an edition-2 statement
+//! (`edition2::fixture_switch`); keys are live by their `key:record` and
+//! named by `kid(label)`; the owner binding carries the node's voice; a
+//! retraction names its target by `refs.target`. The v52-shape grandfather
+//! legs (I1154's held owner-only grant, its open-time count) are deleted:
+//! nothing of the earlier form carries into a v62 store.
 
 pub(crate) mod bodies {
-    use crate::federation::admission::steward_liveness_test_support::{
-        register, signed_row, withdraws_of,
-    };
     use crate::federation::community_trust_consent::{
         community_trust_consent_for, COMMUNITY_TRUST_DIMENSION,
     };
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{attestation_type, identity_type as it, SignedAttestation};
-    use crate::federation::{Attestation, AttestationOutcome, Error, FederationDirectory};
+    use crate::federation::types::{attestation_type, identity_type as it};
+    use crate::federation::{Attestation, Error, FederationDirectory};
 
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
     }
 
+    /// `key` is live by its edition-2 `key:record` carrying `types`.
+    async fn register(d: &dyn FederationDirectory, key: &str, types: &[&str]) {
+        let _ = e2::put_key(d, key, types).await;
+    }
+
+    /// A community-trust grant about `node` listing `subjects`, signed by
+    /// `attester` (its edition-2 statement's mapped row).
     fn grant(node: &str, subjects: &[&str], attester: &str) -> Attestation {
-        let mut r = signed_row(
-            attester,
-            node,
-            attestation_type::SCORES,
-            serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "dimension": COMMUNITY_TRUST_DIMENSION,
-                "score": 1.0,
-            }),
-        );
+        let mut r = e2::with_earlier_form(|| {
+            ts::bare_attestation(
+                "",
+                attester,
+                node,
+                &serde_json::json!({
+                    "dimension": COMMUNITY_TRUST_DIMENSION,
+                    "score": 1.0,
+                }),
+            )
+        });
+        r.attestation_type = attestation_type::SCORES.to_owned();
         r.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
-        ts::reseal(&mut r);
-        r
+        e2::row_of(&r, attester)
+    }
+
+    /// `owner` binds `node`: the owner's row, then the node's voice over it.
+    async fn bind(d: &dyn FederationDirectory, id: &str, owner: &str, node: &str) {
+        let row = ts::owner_binding_attestation(id, owner, node);
+        e2::put_signed(d, &row)
+            .await
+            .expect("the owner binds the node");
+        let st = e2::carried_statement(&row).expect("a mapped row carries its statement");
+        e2::put_statement(d, &e2::voice_of(&st, node))
+            .await
+            .expect("the node's voice on its owner binding");
     }
 
     /// **I1154** (see the module header).
@@ -69,18 +95,10 @@ pub(crate) mod bodies {
         srb::add(d, &owner, &owner, &dev, srb::ms_now())
             .await
             .expect("the owner's second device");
-        let put = |a: Attestation| async move {
-            d.put_attestation(SignedAttestation { attestation: a })
-                .await
-        };
-        put(ts::owner_binding_attestation(
-            &format!("ct4-ob-{s}"),
-            &owner,
-            &node,
-        ))
-        .await
-        .expect("the owner binds the node");
-        let consent = || async { community_trust_consent_for(d, &node).await.unwrap() };
+        let put = |a: Attestation| async move { e2::put_signed(d, &a).await };
+        bind(d, &format!("ct4-ob-{s}"), &owner, &node).await;
+        let node_kid = e2::kid(&node);
+        let consent = || async { community_trust_consent_for(d, &node_kid).await.unwrap() };
         let three = [node.as_str(), owner.as_str(), agent.as_str()];
         let tick = || tokio::time::sleep(std::time::Duration::from_millis(20));
 
@@ -101,12 +119,13 @@ pub(crate) mod bodies {
         tick().await;
         let go = grant(&node, &three, &dev);
         let go_id = go.attestation_id.clone();
-        assert_eq!(
+        let go_row = go.clone();
+        assert!(matches!(
             put(go)
                 .await
                 .expect("I1154: the owner's roster key authors a grant"),
-            AttestationOutcome::Inserted
-        );
+            StatementOutcome::Row { new: true, .. }
+        ));
         assert_eq!(
             consent().await.map(|a| a.attestation_id),
             Some(go_id.clone()),
@@ -125,15 +144,7 @@ pub(crate) mod bodies {
         // The owner recants its grant: the boundary ends every grant at or
         // before it, the node-authored ones included.
         tick().await;
-        let recant = signed_row(
-            &dev,
-            &node,
-            attestation_type::RECANTS,
-            serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "references_attestation_id": go_id,
-            }),
-        );
+        let recant = e2::composer_of(attestation_type::RECANTS, &go_row, &dev);
         put(recant).await.expect("I1154: the attester recants");
         assert!(
             consent().await.is_none(),
@@ -145,7 +156,7 @@ pub(crate) mod bodies {
         tick().await;
         let g = grant(&node, &three, &dev);
         let g_id = g.attestation_id.clone();
-        put(g).await.unwrap();
+        put(g.clone()).await.unwrap();
         assert_eq!(
             consent().await.map(|a| a.attestation_id),
             Some(g_id.clone())
@@ -157,7 +168,7 @@ pub(crate) mod bodies {
         .await
         .expect("I1154: a trace captured under the grant");
         tick().await;
-        put(withdraws_of(&agent, &node, &g_id))
+        put(e2::composer_of(attestation_type::WITHDRAWS, &g, &agent))
             .await
             .expect("I1154: the agent key withdraws (rule 2)");
         assert!(
@@ -189,64 +200,6 @@ pub(crate) mod bodies {
         }
     }
 
-    /// I1154's grandfather leg: a node-authored grant in the v52 shape (the
-    /// owner alone), stored by a node that ran the v52 gate, keeps counting;
-    /// returns its id.
-    pub(crate) async fn i1154_a_held_v52_grant_still_counts(d: &dyn FederationDirectory) -> String {
-        use crate::federation::community_trust_consent as ctc;
-        let s = suffix();
-        let (owner, node) = (format!("ct5-owner-{s}"), format!("ct5-node-{s}"));
-        register(d, &owner, &[it::USER]).await;
-        register(d, &node, &[it::NODE]).await;
-        d.put_attestation(SignedAttestation {
-            attestation: ts::owner_binding_attestation(&format!("ct5-ob-{s}"), &owner, &node),
-        })
-        .await
-        .unwrap();
-        let legacy = grant(&node, &[&owner], &node);
-        let id = legacy.attestation_id.clone();
-        ctc::test_support::set_v52_shape(&node, true);
-        let stored = d
-            .put_attestation(SignedAttestation {
-                attestation: legacy.clone(),
-            })
-            .await;
-        ctc::test_support::set_v52_shape(&node, false);
-        stored.expect("I1154: a v52 node stored the owner-only shape");
-        assert!(ctc::is_legacy_node_authored_grant(d, &legacy)
-            .await
-            .unwrap());
-        assert_eq!(
-            community_trust_consent_for(d, &node)
-                .await
-                .unwrap()
-                .map(|a| a.attestation_id),
-            Some(id.clone()),
-            "I1154: the held v52 grant still counts"
-        );
-        // Its byte-identical re-offer still settles.
-        assert_eq!(
-            d.put_attestation(SignedAttestation {
-                attestation: legacy
-            })
-            .await
-            .unwrap(),
-            AttestationOutcome::AlreadyHeld
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let e = d
-            .put_attestation(SignedAttestation {
-                attestation: grant(&node, &[&owner], &node),
-            })
-            .await
-            .expect_err("I1154: a new owner-only grant");
-        assert!(
-            matches!(&e, Error::InvalidArgument(m) if m.starts_with(ctc::SUBJECTS_INCOMPLETE)),
-            "I1154: {e:?}"
-        );
-        id
-    }
-
     pub(crate) async fn i148_the_capture_grant_names_its_owner_and_folds_by_boundary(
         d: &dyn FederationDirectory,
     ) {
@@ -265,19 +218,11 @@ pub(crate) mod bodies {
         register(d, &node, &[it::NODE]).await;
         register(d, &stranger, &[it::USER]).await;
         register(d, &unbound, &[it::NODE]).await;
-        let put = |a: Attestation| async move {
-            d.put_attestation(SignedAttestation { attestation: a })
-                .await
-        };
-        put(ts::owner_binding_attestation(
-            &format!("ct-ob-{s}"),
-            &owner,
-            &node,
-        ))
-        .await
-        .expect("the owner binds the node");
+        let put = |a: Attestation| async move { e2::put_signed(d, &a).await };
+        bind(d, &format!("ct-ob-{s}"), &owner, &node).await;
+        let node_kid = e2::kid(&node);
         assert!(
-            community_trust_consent_for(d, &node)
+            community_trust_consent_for(d, &node_kid)
                 .await
                 .unwrap()
                 .is_none(),
@@ -312,9 +257,12 @@ pub(crate) mod bodies {
         // the node's own grant listing its owner admits and stands
         let g1 = grant(&node, &[&node, &owner, &agent], &node);
         let g1_id = g1.attestation_id.clone();
-        assert_eq!(put(g1).await.unwrap(), AttestationOutcome::Inserted);
+        assert!(matches!(
+            put(g1).await.unwrap(),
+            StatementOutcome::Row { new: true, .. }
+        ));
         assert_eq!(
-            community_trust_consent_for(d, &node)
+            community_trust_consent_for(d, &node_kid)
                 .await
                 .unwrap()
                 .map(|a| a.attestation_id),
@@ -324,9 +272,9 @@ pub(crate) mod bodies {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let g2 = grant(&node, &[&node, &owner, &agent], &node);
         let g2_id = g2.attestation_id.clone();
-        put(g2).await.unwrap();
+        put(g2.clone()).await.unwrap();
         assert_eq!(
-            community_trust_consent_for(d, &node)
+            community_trust_consent_for(d, &node_kid)
                 .await
                 .unwrap()
                 .map(|a| a.attestation_id),
@@ -336,7 +284,7 @@ pub(crate) mod bodies {
         // the OWNER revokes the newest (rule 2, listed in subject_key_ids): a
         // boundary — the older grant is NOT resurrected
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let w = withdraws_of(&owner, &node, &g2_id);
+        let w = e2::composer_of(attestation_type::WITHDRAWS, &g2, &owner);
         let w_id = w.attestation_id.clone();
         put(w).await.expect("the listed owner revokes");
         // admitted on the third-party path: rule 2 (listed subject), or rule 1
@@ -349,7 +297,7 @@ pub(crate) mod bodies {
             .withdraws_admission_rule;
         assert!(matches!(rule, Some(1) | Some(2)), "{rule:?}");
         assert!(
-            community_trust_consent_for(d, &node)
+            community_trust_consent_for(d, &node_kid)
                 .await
                 .unwrap()
                 .is_none(),
@@ -361,7 +309,7 @@ pub(crate) mod bodies {
         let g3_id = g3.attestation_id.clone();
         put(g3).await.unwrap();
         assert_eq!(
-            community_trust_consent_for(d, &node)
+            community_trust_consent_for(d, &node_kid)
                 .await
                 .unwrap()
                 .map(|a| a.attestation_id),
@@ -381,15 +329,6 @@ mod runners {
                 async fn i1154() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i1154_the_owner_may_author_the_grant(&d).await
-                }
-
-                #[tokio::test]
-                async fn i1154_grandfathered() {
-                    let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i1154_a_held_v52_grant_still_counts(
-                        &d as &dyn crate::federation::FederationDirectory,
-                    )
-                    .await;
                 }
 
                 #[tokio::test]
@@ -422,55 +361,4 @@ mod runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
-}
-
-/// I1154's open-time count: a held v52-shape grant is counted (and logged) by
-/// the sqlite and postgres opens; nothing is rewritten.
-#[cfg(test)]
-mod grandfather_count {
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i1154_counted_at_open_sqlite() {
-        use crate::store::Backend as _;
-        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        assert_eq!(b.legacy_community_trust_grants_at_open().await.unwrap(), 0);
-        let id = super::bodies::i1154_a_held_v52_grant_still_counts(&b).await;
-        assert_eq!(b.legacy_community_trust_grants_at_open().await.unwrap(), 1);
-        b.run_migrations().await.unwrap();
-        assert!(
-            crate::federation::FederationDirectory::get_attestation(&b, &id)
-                .await
-                .unwrap()
-                .is_some(),
-            "I1154: the open rewrote nothing"
-        );
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    async fn i1154_counted_at_open_postgres() {
-        use crate::store::Backend as _;
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            return;
-        };
-        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        assert_eq!(b.legacy_community_trust_grants_at_open().await.unwrap(), 0);
-        let id = super::bodies::i1154_a_held_v52_grant_still_counts(&b).await;
-        assert_eq!(b.legacy_community_trust_grants_at_open().await.unwrap(), 1);
-        b.run_migrations().await.unwrap();
-        assert!(
-            crate::federation::FederationDirectory::get_attestation(&b, &id)
-                .await
-                .unwrap()
-                .is_some(),
-            "I1154: the open rewrote nothing"
-        );
-        eprintln!("i1154_counted_at_open_postgres: RAN");
-    }
 }

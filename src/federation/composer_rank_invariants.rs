@@ -19,12 +19,12 @@
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::membership_acceptance_invariants::bodies::{found_community, reg};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
     use crate::federation::{
         Attestation, Audience, CrossingBasis, FederationDirectory, MeshCrossingOutcome,
-        SignedAttestation,
     };
     use chrono::{DateTime, Duration, Utc};
 
@@ -38,6 +38,9 @@ pub(crate) mod bodies {
     where
         B: FederationDirectory + crate::read::ReadEngine,
     {
+        // v62.0.0 (JSON cut, E7) — the author is keyed by its identity-ref.
+        let author = e2::kid(author);
+        let author = author.as_str();
         let filter = crate::read::AttestationFilter {
             attesting_key_id: Some(author.to_owned()),
             ..Default::default()
@@ -66,13 +69,16 @@ pub(crate) mod bodies {
         row.tier = attestation_tier::LOCAL.to_owned();
         row.cohort_scope = cohort_scope::SELF.to_owned();
         ts::reseal(&mut row);
-        let id = row.attestation_id.clone();
-        d.put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect("the self write");
+        // v62.0.0 (JSON cut, E7; P8) — the flipped row through the one entry,
+        // crossed IN PLACE on its own statement (a JCS actor custody for a
+        // statement-bearing row is refused).
+        let id = e2::rid(&row);
+        put(d, &row).await.expect("the self write");
         let local = d.get_attestation(&id).await.unwrap().unwrap();
         let ci = ts::describe_own(&local, CrossingBasis::ProducerAuthority);
-        d.enter_mesh(&id, &ci, &ts::actor_reseal(&local))
+        let custody = crate::federation::TierPromotionCustody::of_statement(&local, Utc::now())
+            .expect("a flipped row carries its statement");
+        d.enter_mesh(&id, &ci, &custody)
             .await
             .expect("the crossing");
         d.get_attestation(&id).await.unwrap().unwrap()
@@ -84,12 +90,21 @@ pub(crate) mod bodies {
         prior: &Attestation,
         room: &str,
     ) -> Attestation {
-        let out = ts::widen(
-            d,
+        // v62.0.0 (JSON cut, E7; P8) — widening an edition-2 row is a
+        // RESTATEMENT at the wider audience signed by the prior's actor (a
+        // new row id), not a `supersedes`.
+        let ci = ts::describe_for(
             prior,
             Audience::Community {
                 community_key_id: room.to_owned(),
             },
+            CrossingBasis::ProducerAuthority,
+        );
+        let out = crate::federation::crossing::widen_by_restatement(
+            d,
+            prior,
+            &ci,
+            &ts::local_signer(&prior.attesting_key_id),
             &[],
         )
         .await
@@ -119,7 +134,7 @@ pub(crate) mod bodies {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut env = serde_json::json!({
             "references_attestation_id": head.attestation_id,
-            "community_key_id": room,
+            "community_key_id": e2::kid(room),
         });
         if kind == attestation_type::SUPERSEDES {
             env["dimension"] = serde_json::json!("trust:demo:v1");
@@ -139,15 +154,13 @@ pub(crate) mod bodies {
         r
     }
 
+    /// v62.0.0 (JSON cut, E7) — a flipped row enters through the one entry
+    /// (`e2::put_signed`; a mapped row is not routed by `put_attestation`).
     async fn put(
         d: &dyn FederationDirectory,
         r: &Attestation,
     ) -> Result<(), crate::federation::Error> {
-        d.put_attestation(SignedAttestation {
-            attestation: r.clone(),
-        })
-        .await
-        .map(|_| ())
+        e2::put_signed(d, r).await.map(|_| ())
     }
 
     /// **I1506** — one row, two rooms, two live placements.
@@ -179,7 +192,7 @@ pub(crate) mod bodies {
         assert_ne!(pa.attestation_id, pb.attestation_id, "I1506: two rows");
         assert_eq!(
             crate::federation::admission::envelope_cohort_target(&pb.attestation_envelope).unwrap(),
-            Some(b.as_str()),
+            Some(e2::kid(&b).as_str()),
             "I1506: the second room's placement names the second room"
         );
         let live = live_ids(d, &author).await;
@@ -332,7 +345,7 @@ pub(crate) mod bodies {
 pub(crate) mod two_node {
     use super::bodies::{composer, convergence_room, live_ids};
     use crate::federation::types::attestation_type::SUPERSEDES;
-    use crate::federation::{FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
     use chrono::{Duration, Utc};
 
     /// **I1508** — order does not matter; a tie goes to the lower id.
@@ -356,18 +369,14 @@ pub(crate) mod two_node {
             None,
         );
         for r in [&x, &y] {
-            a.apply_replicated_attestation(SignedAttestation {
-                attestation: r.clone(),
-            })
-            .await
-            .expect("I1508: A applies");
+            crate::federation::edition2::fixture_switch::put_signed(a, r)
+                .await
+                .expect("I1508: A applies");
         }
         for r in [&y, &x] {
-            b.apply_replicated_attestation(SignedAttestation {
-                attestation: r.clone(),
-            })
-            .await
-            .expect("I1508: B applies");
+            crate::federation::edition2::fixture_switch::put_signed(b, r)
+                .await
+                .expect("I1508: B applies");
         }
         let (la, lb) = (live_ids(a, &author).await, live_ids(b, &author).await);
         assert!(
@@ -387,32 +396,21 @@ pub(crate) mod two_node {
             "I1508: the earlier is hidden on B"
         );
         // A tie on the signed instant: the lower attestation_id bytewise.
+        // v62.0.0 (JSON cut, E7) — the ids are node-computed, so "lo" / "hi"
+        // are whichever of the two minted rows sorts lower / higher.
         let at = t + Duration::minutes(5);
-        let lo = composer(
-            &author,
-            SUPERSEDES,
-            &p,
-            &room,
-            at,
-            "lo",
-            Some("00000000-0000-4000-8000-000000000001"),
-        );
-        let hi = composer(
-            &author,
-            SUPERSEDES,
-            &p,
-            &room,
-            at,
-            "hi",
-            Some("ffffffff-0000-4000-8000-000000000001"),
-        );
+        let one = composer(&author, SUPERSEDES, &p, &room, at, "tie-1", None);
+        let two = composer(&author, SUPERSEDES, &p, &room, at, "tie-2", None);
+        let (lo, hi) = if one.attestation_id < two.attestation_id {
+            (one, two)
+        } else {
+            (two, one)
+        };
         for (n, order) in [(a, [&hi, &lo]), (b, [&lo, &hi])] {
             for r in order {
-                n.apply_replicated_attestation(SignedAttestation {
-                    attestation: r.clone(),
-                })
-                .await
-                .expect("I1508: the tie applies");
+                crate::federation::edition2::fixture_switch::put_signed(n, r)
+                    .await
+                    .expect("I1508: the tie applies");
             }
             let live = live_ids(n, &author).await;
             assert!(
@@ -441,21 +439,21 @@ pub(crate) mod two_node {
         )
         .await;
         reg(b, &[room]).await;
-        let rec = a
-            .list_signed_communities_since(None, 1000)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|c| c.community.community.community_key_id == room)
-            .expect("A serves the room");
-        b.put_community(rec.community)
+        // v62.0.0 (JSON cut, E7) — B takes the room as a peer delivers it:
+        // the voices of A's held roster version, through B's one entry.
+        let (head, _) = crate::federation::edition2::fixture_switch::held_head(
+            a,
+            &crate::federation::edition2::fixture_switch::kid(room),
+        )
+        .await
+        .expect("A holds the room");
+        let voices = a.edition2_voices(&head).await.expect("A serves the room");
+        crate::federation::edition2::fixture_switch::put_voices(b, &voices)
             .await
             .expect("I1508: B takes the room");
-        b.apply_replicated_attestation(SignedAttestation {
-            attestation: p.clone(),
-        })
-        .await
-        .expect("I1508: B takes the placement");
+        crate::federation::edition2::fixture_switch::put_signed(b, p)
+            .await
+            .expect("I1508: B takes the placement");
     }
 }
 

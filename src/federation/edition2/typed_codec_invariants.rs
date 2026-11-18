@@ -53,9 +53,32 @@ fn at(ms: i64) -> chrono::DateTime<Utc> {
 /// `k` signs `p` under `prefix`'s family id about `sub`; the door admits it
 /// over `k`'s own key record.
 fn admitted(k: &K, sub: &str, prefix: &str, p: &Value) -> AdmittedRow {
+    admitted_in(k, sub, prefix, p, SelectContext::default())
+}
+
+/// [`admitted`] under the selector context the door supplies for the family
+/// (`typed::family_context`): a cell that reads `identity`, `group` or
+/// `seats` is decided only with it (T2-fix1).
+fn admitted_in(k: &K, sub: &str, prefix: &str, p: &Value, ctx: SelectContext) -> AdmittedRow {
     let st = sign_row_statement(k, &iref(k), sub, "scores", &family_id(prefix), p, vec![])
         .expect("sign");
-    admit_row(&st, &holding(&[k]), None, SelectContext::default()).expect("the door admits it")
+    admit_row(&st, &holding(&[k]), None, ctx).expect("the door admits it")
+}
+
+/// The context `family_context` gives a takedown notice placed at no group.
+fn no_group() -> SelectContext {
+    SelectContext {
+        seats: Some(0),
+        ..SelectContext::default()
+    }
+}
+
+/// The context `family_context` gives a user self's occurrence revocation.
+fn user_identity() -> SelectContext {
+    SelectContext {
+        identity: Some(vec!["user".to_owned()]),
+        ..SelectContext::default()
+    }
 }
 
 fn reason(e: &Error) -> String {
@@ -219,7 +242,11 @@ fn i3143_a_takedown_notice_reads_back_through_the_notice_shape() {
         1_000,
     )
     .unwrap();
-    let a = attestation_of(&admitted(&c, &ci, TAKEDOWN_PREFIX, &p), INGEST_TIER).unwrap();
+    let a = attestation_of(
+        &admitted_in(&c, &ci, TAKEDOWN_PREFIX, &p, no_group()),
+        INGEST_TIER,
+    )
+    .unwrap();
     let shape = crate::federation::takedown_tombstone::notice_row_shape(&a)
         .expect("I3143 the notice gate reads the projected envelope");
     assert_eq!(shape.content_sha256, hex::encode([0x71; 32]), "I3143");
@@ -299,22 +326,34 @@ fn i3146_an_occurrence_revocation_reads_back() {
     };
     let p = occurrence_revocation_payload(
         &rev,
-        &iref(&id),
+        None,
         Some(3),
         &super::names::RowId([3; 32]),
         &[],
         3_000,
     )
     .unwrap();
-    let got =
-        occurrence_revocation_of(&admitted(&id, &occ, OCCURRENCE_REVOCATION_PREFIX, &p)).unwrap();
+    let got = occurrence_revocation_of(&admitted_in(
+        &id,
+        &occ,
+        OCCURRENCE_REVOCATION_PREFIX,
+        &p,
+        user_identity(),
+    ))
+    .unwrap();
     assert_eq!(got.identity_key_id, iref(&id), "I3146");
     assert_eq!(got.occurrence_key_id, occ, "I3146");
     assert_eq!(got.effective_at, at(2_000), "I3146");
     assert_eq!(got.reason.as_deref(), Some("3"), "I3146 the code");
     let other = iref(&key(73));
-    let e = occurrence_revocation_of(&admitted(&id, &other, OCCURRENCE_REVOCATION_PREFIX, &p))
-        .unwrap_err();
+    let e = occurrence_revocation_of(&admitted_in(
+        &id,
+        &other,
+        OCCURRENCE_REVOCATION_PREFIX,
+        &p,
+        user_identity(),
+    ))
+    .unwrap_err();
     assert_eq!(
         reason(&e),
         malformed_row::EDITION2_PAYLOAD_INVALID,
@@ -339,8 +378,7 @@ fn i3147_a_revocation_names_its_head_and_further_heads() {
         persist_row_hash: String::new(),
     };
     let (head, f1, f2) = (RowId([1; 32]), RowId([2; 32]), RowId([3; 32]));
-    let p =
-        occurrence_revocation_payload(&rev, &iref(&id), None, &head, &[f2, f1, f2], 2_000).unwrap();
+    let p = occurrence_revocation_payload(&rev, None, None, &head, &[f2, f1, f2], 2_000).unwrap();
     let names = names_of(&p).expect("I3147 the refs read");
     let role = |r: &str| -> Vec<RowId> {
         names
@@ -353,7 +391,7 @@ fn i3147_a_revocation_names_its_head_and_further_heads() {
     let mut further = role("further_heads");
     further.sort();
     assert_eq!(further, vec![f1, f2], "I3147 refs.further_heads, a set");
-    let plain = occurrence_revocation_payload(&rev, &iref(&id), None, &head, &[], 2_000).unwrap();
+    let plain = occurrence_revocation_payload(&rev, None, None, &head, &[], 2_000).unwrap();
     assert!(
         names_of(&plain)
             .unwrap()

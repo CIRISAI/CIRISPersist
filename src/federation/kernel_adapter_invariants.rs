@@ -27,33 +27,49 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::admission::owner_of;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, identity_type};
-    use crate::federation::{FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
+
+    /// v62 (E4): `seed`'s `withdraws` of the held row `target_id`, as its
+    /// edition-2 composer (`refs.target`, the target's family).
+    async fn withdraw(d: &dyn FederationDirectory, seed: &str, target_id: &str) {
+        let target = d
+            .get_attestation(target_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("the target {target_id} is held"));
+        e2::put_signed(
+            d,
+            &e2::composer_of(attestation_type::WITHDRAWS, &target, seed),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{seed} withdraws {target_id}: {e}"));
+    }
 
     /// **I1840** — see the module doc.
     pub(crate) async fn i1840_an_owner_binding_counts_with_the_nodes_cosignature(
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        let (owner, bare, cosigned) = (
+        let (owner_s, bare_s, cosigned_s) = (
             format!("i1840-owner-{s}"),
             format!("i1840-bare-{s}"),
             format!("i1840-cosigned-{s}"),
         );
-        ts::register_hybrid_key_as(d, &owner, &owner, identity_type::USER).await;
-        for n in [&bare, &cosigned] {
-            ts::register_hybrid_key_as(d, n, n, identity_type::NODE).await;
-        }
-        // The node never cosigned: its co-scrub is stripped after the seal.
-        let mut row =
-            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner, &bare);
-        assert!(
-            row.additional_scrubs.iter().any(|c| c.scrub_key_id == bare),
-            "I1840: the fixture sealer co-scrubs an owner binding by its node"
-        );
-        row.additional_scrubs.clear();
-        d.put_attestation(SignedAttestation { attestation: row })
+        // v62 (E4): edition-2 keys, named by identity-ref.
+        let owner = e2::put_key(d, &owner_s, &[identity_type::USER]).await;
+        let bare = e2::put_key(d, &bare_s, &[identity_type::NODE]).await;
+        let cosigned = e2::put_key(d, &cosigned_s, &[identity_type::NODE]).await;
+        // The node never cosigned: the owner's statement alone (the node's
+        // cosignature is a second voice of the same row, CC 3.2 / RULINGS
+        // "owner binding ... with the node's own statement as the second
+        // voice"; here it is never offered).
+        let row =
+            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner_s, &bare_s);
+        e2::put_signed(d, &row)
             .await
             .expect("I1840: an uncosigned owner binding is a well-formed, held row");
         assert_eq!(
@@ -61,21 +77,27 @@ pub(crate) mod bodies {
             None,
             "I1840: CC 3.2 — a binding the node never cosigned names no owner"
         );
-        // The node cosigned.
+        // The node cosigned: its voice over the same statement, after the row.
         let row =
-            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner, &cosigned);
-        let id = row.attestation_id.clone();
-        d.put_attestation(SignedAttestation {
-            attestation: row.clone(),
-        })
-        .await
-        .expect("I1840: the cosigned binding lands");
-        let held = d.get_attestation(&id).await.unwrap().expect("held");
+            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner_s, &cosigned_s);
+        let id = e2::rid(&row);
+        e2::put_signed(d, &row)
+            .await
+            .expect("I1840: the cosigned binding lands");
+        let voice = e2::voice_of(
+            &e2::carried_statement(&row).expect("I1840: the binding carries its statement"),
+            &cosigned_s,
+        );
+        let out = e2::put_statement(d, &voice)
+            .await
+            .expect("I1840: the node's voice lands");
         assert!(
-            held.additional_scrubs
-                .iter()
-                .any(|c| c.scrub_key_id == cosigned),
-            "I1840: the node's co-scrub is stored with the row"
+            matches!(out, StatementOutcome::Voice { .. }),
+            "I1840: the node's cosignature is a further voice of the held binding, not a row: {out:?}"
+        );
+        assert!(
+            d.get_attestation(&id).await.unwrap().is_some(),
+            "I1840: held"
         );
         assert_eq!(
             owner_of(d, &cosigned).await.expect("owner_of"),
@@ -83,9 +105,7 @@ pub(crate) mod bodies {
             "I1840: the cosigned binding names its owner"
         );
         // The owner's own withdraws ends the seat.
-        ts::put_retraction(d, &owner, &cosigned, &id, attestation_type::WITHDRAWS)
-            .await
-            .expect("I1840: the owner withdraws the binding");
+        withdraw(d, &owner_s, &id).await;
         assert_eq!(
             owner_of(d, &cosigned).await.expect("owner_of"),
             None,
@@ -100,7 +120,7 @@ pub(crate) mod bodies {
     ) {
         let (a, b) = (format!("i1841-a-{s}"), format!("i1841-b-{s}"));
         for k in [&a, &b] {
-            ts::register_hybrid_key_as(d, k, k, identity_type::AGENT).await;
+            e2::put_key(d, k, &[identity_type::AGENT]).await;
         }
         ts::put_delegates_to(d, &a, &b, None)
             .await
@@ -108,7 +128,7 @@ pub(crate) mod bodies {
         ts::put_delegates_to(d, &b, &a, None)
             .await
             .expect("I1841: b → a closes a cycle and is admitted (v62)");
-        let g = crate::federation::build_delegation_graph(d, &a, Some(8))
+        let g = crate::federation::build_delegation_graph(d, &e2::kid(&a), Some(8))
             .await
             .expect("I1841: the walk");
         assert_eq!(g.edges.len(), 2, "I1841: both edges, each read once");
@@ -127,13 +147,13 @@ pub(crate) mod bodies {
             format!("i1842-subject-{s}"),
         );
         for k in [&user, &subject] {
-            ops::register_typed_key(d, k, identity_type::NODE)
-                .await
-                .expect("register");
+            e2::put_key(d, k, &[identity_type::NODE]).await;
         }
         ops::establish_trust_root(d, &user, &root, &subject, INFRA_SERVE_SCOPE)
             .await
             .expect("I1842: establish the root");
+        // v62 (E4): the store names each key by its identity-ref.
+        let (user_s, user, root) = (user.clone(), e2::kid(&user), e2::kid(&root));
         let v = trust_root_valid(d, &user, &root).await.expect("verdict");
         assert!(v.edge_exists, "I1842: the user's acceptance edge is live");
         assert!(v.valid, "I1842: a valid key root");
@@ -146,15 +166,7 @@ pub(crate) mod bodies {
                 r.attestation_type == attestation_type::DELEGATES_TO && r.attested_key_id == root
             })
             .expect("I1842: the user's edge to the root");
-        ts::put_retraction(
-            d,
-            &user,
-            &root,
-            &edge.attestation_id,
-            attestation_type::WITHDRAWS,
-        )
-        .await
-        .expect("I1842: the user withdraws the edge");
+        withdraw(d, &user_s, &edge.attestation_id).await;
         let v = trust_root_valid(d, &user, &root).await.expect("verdict");
         assert!(
             !v.edge_exists,
@@ -164,58 +176,91 @@ pub(crate) mod bodies {
     }
 
     /// **I1843** — a FORK of a held head: two versions naming one head. The
-    /// family's v1 is held; v2 naming v1 is admitted (the head moves); v3
-    /// naming v1 too — v2's sibling — is the fork. The kernel reads it as a
-    /// tip beside v2 (CC 2.7.8: "Two versions of one head wait as tips"),
-    /// and v62.0.0 (kernel pass 2, K1) persist holds it so: the supersede is
-    /// `Ok` at the held head's version, and the head is still v2. The
-    /// differential witness records the former refusal as the `fork_as_tip`
-    /// departure, on both backends.
+    /// family's v1 is held; v2 naming v1 is admitted (the head moves); a
+    /// sibling v2' naming v1 too is the fork. v62 (E4, flip wave 2): the
+    /// versions are `group:roster` statements (T1), and the door holds the
+    /// fork as a K1 tip (CC 2.7.8: "Two versions of one head wait as tips")
+    /// rather than refusing it; the kernel reads it as a tip too.
     pub(crate) async fn i1843_a_fork_of_the_held_head_is_a_tip_to_the_kernel(
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        use crate::federation::operational::test_support as ops;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::types::{Family, FamilyMember};
         use crate::kernel::head::{head_reading, HeadReading};
         let holders: Vec<String> = (0..3).map(|i| format!("i1843-h{i}-{s}")).collect();
         for h in &holders {
-            ops::register_typed_key(d, h, identity_type::NODE)
-                .await
-                .expect("register");
+            e2::put_key(d, h, &[identity_type::NODE]).await;
         }
-        let fam = format!("i1843-fam-{s}");
-        ops::seed_test_family(d, &fam, &holders, "quorum:2/3")
-            .await
-            .expect("I1843: v1");
+        let fam_s = format!("i1843-fam-{s}");
+        let fam = e2::kid(&fam_s);
+        // Node-signed rows stay now-relative (CC 2.4.1.1).
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let now_ms = u64::try_from(now.timestamp_millis()).expect("after the epoch");
+        let family = |name: &str| Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            family_key_id: fam_s.clone(),
+            family_name: name.into(),
+            members: holders
+                .iter()
+                .enumerate()
+                .map(|(i, k)| FamilyMember {
+                    key_id: k.clone(),
+                    joined_at: now,
+                    role: (i == 0).then(|| "founder".to_owned()),
+                })
+                .collect(),
+            founded_at: now,
+            consensus_protocol: "quorum:2/3".to_owned(),
+            consensus_protocol_entrenched: false,
+            dissolved_at: None,
+            persist_row_hash: String::new(),
+        };
+        e2::put_voices(
+            d,
+            &e2::family_voices(&ts::sign_family(&holders[0], family("v1")), 1, None, now_ms),
+        )
+        .await
+        .expect("I1843: v1");
         let v1 = d.lookup_family(&fam).await.unwrap().expect("held");
-        let mut v2 = v1.clone();
-        v2.prev_head_digest = v1.persist_row_hash.clone();
-        v2.family_name = "v2".into();
-        v2.persist_row_hash = String::new();
-        d.supersede_family(ts::sign_family(&holders[0], v2), None)
+        let (h1, _) = e2::held_head(d, &fam)
             .await
-            .expect("I1843: v2 names the held head");
+            .expect("I1843: v1 is the held head");
+        e2::put_voices(
+            d,
+            &e2::family_voices(
+                &ts::sign_family(&holders[0], family("v2")),
+                2,
+                Some(&h1),
+                now_ms,
+            ),
+        )
+        .await
+        .expect("I1843: v2 names the held head");
         let held = d.lookup_family(&fam).await.unwrap().expect("held");
-        let mut v3 = v1.clone();
-        v3.prev_head_digest = v1.persist_row_hash.clone();
-        v3.family_name = "v3".into();
-        v3.persist_row_hash = String::new();
-        let v = d
-            .supersede_family(ts::sign_family(&holders[0], v3), None)
-            .await
-            .expect("I1843: persist holds the fork as a tip (kernel pass 2)");
-        assert_eq!(v, 2, "I1843: the head's version, unchanged");
-        assert_eq!(
-            d.lookup_family(&fam).await.unwrap().expect("held"),
-            held,
-            "I1843: the head did not move"
+        let fork = e2::put_voices(
+            d,
+            &e2::family_voices(
+                &ts::sign_family(&holders[0], family("v3")),
+                2,
+                Some(&h1),
+                now_ms,
+            ),
+        )
+        .await
+        .expect("I1843: the fork is held as a tip, not refused");
+        assert!(
+            matches!(fork, StatementOutcome::Row { .. }),
+            "I1843: the door holds the sibling version as a K1 tip: {fork:?}"
         );
         assert_eq!(
             head_reading(
                 &fam,
                 Some(&held.persist_row_hash),
                 &v1.persist_row_hash,
-                &holders[0]
+                &e2::kid(&holders[0])
             ),
             HeadReading::Tip,
             "I1843: the kernel holds v3 as a tip beside v2 (CC 2.7.8)"
@@ -228,50 +273,71 @@ pub(crate) mod bodies {
     /// cat; cat leaves (removed by ann and ben, every other member); then a
     /// widening of dan signed by ann and ben is admitted. A count over the
     /// roster of the version before cat left would read 2 of 3 and refuse.
+    /// v62 (E4, flip wave 2): the roster, the removal and the widening are
+    /// edition-2 statements (T1); dan's proposal and acceptance are held as
+    /// edition-2 rows first (the #955 growth gate). The fixed 2026 instants
+    /// are signed by `user` keys only (no record end).
     pub(crate) async fn i1845_a_leaving_in_the_rows_past_is_not_counted(
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+        use crate::federation::membership_acceptance::test_support::{
+            acceptance_row, proposal_row,
+        };
         use crate::federation::types::{
-            Family, FamilyMember, FamilyMembershipRevocation, FamilyMembershipWidening,
+            cohort_scope, Family, FamilyMember, FamilyMembershipRevocation,
+            FamilyMembershipWidening,
         };
         let at = |t: &str| -> chrono::DateTime<chrono::Utc> { t.parse().expect("instant") };
+        let ms =
+            |t: chrono::DateTime<chrono::Utc>| u64::try_from(t.timestamp_millis()).expect("ms");
         let [ann, ben, cat, dan] = ["ann", "ben", "cat", "dan"].map(|n| format!("i1845-{n}-{s}"));
         for k in [&ann, &ben, &cat, &dan] {
-            ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+            e2::put_key(d, k, &[identity_type::USER]).await;
         }
-        let fam = format!("i1845-fam-{s}");
+        let fam_s = format!("i1845-fam-{s}");
+        let fam = e2::kid(&fam_s);
         let founded = at("2026-01-01T00:00:00Z");
-        d.put_family(ts::sign_family(
-            &ann,
-            Family {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                family_key_id: fam.clone(),
-                family_name: "household".into(),
-                members: [&ann, &ben, &cat]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, k)| FamilyMember {
-                        key_id: (*k).clone(),
-                        joined_at: founded,
-                        role: (i == 0).then(|| "founder".to_owned()),
-                    })
-                    .collect(),
-                founded_at: founded,
-                consensus_protocol: "unanimous".to_owned(),
-                consensus_protocol_entrenched: false,
-                dissolved_at: None,
-                persist_row_hash: String::new(),
-            },
-        ))
+        e2::put_voices(
+            d,
+            &e2::family_voices(
+                &ts::sign_family(
+                    &ann,
+                    Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
+                        family_key_id: fam_s.clone(),
+                        family_name: "household".into(),
+                        members: [&ann, &ben, &cat]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, k)| FamilyMember {
+                                key_id: (*k).clone(),
+                                joined_at: founded,
+                                role: (i == 0).then(|| "founder".to_owned()),
+                            })
+                            .collect(),
+                        founded_at: founded,
+                        consensus_protocol: "unanimous".to_owned(),
+                        consensus_protocol_entrenched: false,
+                        dissolved_at: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+                1,
+                None,
+                ms(founded),
+            ),
+        )
         .await
         .expect("I1845: the family");
+        let (head, _) = e2::held_head(d, &fam)
+            .await
+            .expect("I1845: the roster's head");
         let mut r = ts::sign_family_membership_revocation(
             &ann,
             FamilyMembershipRevocation {
-                family_key_id: fam.clone(),
+                family_key_id: fam_s.clone(),
                 removed_identity_key_id: cat.clone(),
                 removed_at: at("2026-02-01T00:00:00Z"),
                 effective_at: at("2026-02-01T00:00:00Z"),
@@ -281,13 +347,34 @@ pub(crate) mod bodies {
             },
         );
         ts::cosign_family_membership_revocation(&mut r, &ben);
-        d.put_family_membership_revocation(r)
+        e2::put_voices(d, &e2::family_revocation_voices(&r, Some(&head)))
             .await
             .expect("I1845: cat leaves (every other member signs)");
+        // The #955 growth gate: dan's proposal and acceptance, held first.
+        let proposal = proposal_row(
+            &ann,
+            cohort_scope::FAMILY,
+            &fam,
+            &dan,
+            None,
+            at("2026-03-01T00:00:00Z"),
+        );
+        e2::put_signed(d, &proposal)
+            .await
+            .expect("I1845: the proposal");
+        e2::put_signed(
+            d,
+            &acceptance_row(&dan, &proposal, at("2026-03-01T00:00:00Z")),
+        )
+        .await
+        .expect("I1845: dan's acceptance");
+        let (head, _) = e2::held_head(d, &fam)
+            .await
+            .expect("I1845: the roster's head");
         let mut w = ts::sign_family_membership_widening(
             &ann,
             FamilyMembershipWidening {
-                family_key_id: fam.clone(),
+                family_key_id: fam_s.clone(),
                 member_key_id: dan.clone(),
                 joined_at: at("2026-03-01T00:00:00Z"),
                 effective_at: at("2026-03-01T00:00:00Z"),
@@ -296,7 +383,7 @@ pub(crate) mod bodies {
             },
         );
         ts::cosign_family_membership_widening(&mut w, &ben);
-        d.put_family_membership_widening_consented(w)
+        e2::put_voices(d, &e2::family_widening_voices(&w, Some(&head)))
             .await
             .expect("I1845: ann and ben are every member at the change: unanimous");
         let active: Vec<String> = d
@@ -307,53 +394,78 @@ pub(crate) mod bodies {
             .map(|m| m.key_id)
             .collect();
         assert!(
-            active.contains(&dan) && !active.contains(&cat),
+            active.contains(&e2::kid(&dan)) && !active.contains(&e2::kid(&cat)),
             "I1845: {active:?}"
         );
     }
 
-    /// **I1846** — a reference cycle on today's wire: two `supersedes` rows of
-    /// the user's, toward the root, each naming the other's attestation id (a
-    /// peer-chosen string). Whatever the door admits, `trust_root_valid`
-    /// returns within a bound, and the pair gives no edge (the kernel's door,
-    /// `layers::kept`, never keeps a row whose names are not held first).
+    /// **I1846** — a reference cycle cannot arise (v62 edition-2 form; CC
+    /// asked for this witness by file and line). An edition-2 row names
+    /// another only by `refs.target`, the node-computed id of a row ALREADY
+    /// HELD, and that id is computed over the named row's own bytes. So:
+    /// (a) a row naming an id this node does not hold is not admitted and
+    /// nothing is stored (it waits or is refused, per the door); (b) the row
+    /// that would "close" the loop is a different statement from the one
+    /// first named, so its id is not the id the first row named; (c) with
+    /// neither row held, the trust walk over held rows returns within a bound
+    /// and gives no edge.
     pub(crate) async fn i1846_a_reference_cycle_never_hangs_the_trust_walk(
         d: &dyn FederationDirectory,
         s: &str,
     ) {
         use crate::federation::trust_root::{trust_root_valid, TRUST_ACCEPTS_DIMENSION};
-        let (user, root) = (format!("i1846-user-{s}"), format!("i1846-root-{s}"));
-        for k in [&user, &root] {
-            ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
-        }
-        let (a, b) = (format!("i1846-a-{s}"), format!("i1846-b-{s}"));
-        for (id, names) in [(&a, &b), (&b, &a)] {
-            let mut row = ts::bare_attestation(
-                id,
-                &user,
-                &root,
-                &serde_json::json!({
-                    "id": id,
-                    "references_attestation_id": names,
-                    "dimension": TRUST_ACCEPTS_DIMENSION,
-                }),
+        let (user_s, root_s) = (format!("i1846-user-{s}"), format!("i1846-root-{s}"));
+        let user = e2::put_key(d, &user_s, &[identity_type::USER]).await;
+        let root = e2::put_key(d, &root_s, &[identity_type::USER]).await;
+        // A `supersedes` by the user toward the root naming `target` (64 hex).
+        let naming = |label: &str, target: &str| {
+            let mut r = e2::with_earlier_form(|| {
+                ts::bare_attestation(
+                    label,
+                    &user_s,
+                    &root_s,
+                    &serde_json::json!({
+                        "references_attestation_id": target,
+                        "dimension": TRUST_ACCEPTS_DIMENSION,
+                    }),
+                )
+            });
+            r.attestation_type = attestation_type::SUPERSEDES.to_owned();
+            r
+        };
+        // B0 names an arbitrary id; A names B0's id; B names A's id.
+        let b0 = naming("i1846-b0", &"ab".repeat(32));
+        let id_b0 = e2::rid(&e2::row_of(&b0, &user_s));
+        let a = naming("i1846-a", &id_b0);
+        let id_a = e2::rid(&e2::row_of(&a, &user_s));
+        let b = naming("i1846-b", &id_a);
+        let id_b = e2::rid(&e2::row_of(&b, &user_s));
+        // (b) the loop never closes: B's id is not the id A named.
+        assert_ne!(
+            id_b, id_b0,
+            "I1846: a row's id is computed over its own bytes, so the row naming A is not the \
+             row A named"
+        );
+        // (a) neither names a held row, so neither is admitted or stored.
+        for (row, id, what) in [(&a, &id_a, "A"), (&b, &id_b, "B")] {
+            assert!(
+                e2::try_put_row(d, row, &user_s).await.is_err(),
+                "I1846: {what} names a row this node does not hold and is not admitted"
             );
-            row.attestation_type = attestation_type::SUPERSEDES.to_owned();
-            ts::seal_row_in_place(&user, &mut row);
-            // the door may refuse a rotation of a grant it does not hold;
-            // either way the walk below must return
-            let _ = d
-                .put_attestation(SignedAttestation { attestation: row })
-                .await;
+            assert!(
+                d.get_attestation(id).await.unwrap().is_none(),
+                "I1846: {what} is not stored"
+            );
         }
+        // (c) the walk over held rows is bounded and gives no edge.
         let v = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             trust_root_valid(d, &user, &root),
         )
         .await
-        .expect("I1846: the trust walk returns within a bound over a reference cycle")
+        .expect("I1846: the trust walk returns within a bound")
         .expect("I1846: the verdict");
-        assert!(!v.edge_exists, "I1846: a reference cycle gives no edge");
+        assert!(!v.edge_exists, "I1846: no held row, no edge");
     }
 }
 
@@ -428,9 +540,10 @@ mod runners {
 #[cfg(all(test, feature = "sqlite"))]
 mod profile {
     use crate::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, identity_type};
-    use crate::federation::{FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
     use std::time::Instant;
 
     #[tokio::test]
@@ -442,12 +555,14 @@ mod profile {
             .unwrap();
         b.run_migrations().await.unwrap();
         let d: &dyn FederationDirectory = &b;
-        let (owner, node) = ("prof-owner".to_owned(), "prof-node".to_owned());
-        ts::register_hybrid_key_as(d, &owner, &owner, identity_type::USER).await;
-        ts::register_hybrid_key_as(d, &node, &node, identity_type::NODE).await;
-        d.put_attestation(SignedAttestation {
-            attestation: ts::owner_binding_attestation("prof-b", &owner, &node),
-        })
+        e2::put_key(d, "prof-owner", &[identity_type::USER]).await;
+        let node = e2::put_key(d, "prof-node", &[identity_type::NODE]).await;
+        let row = ts::owner_binding_attestation("prof-b", "prof-owner", "prof-node");
+        e2::put_signed(d, &row).await.unwrap();
+        e2::put_statement(
+            d,
+            &e2::voice_of(&e2::carried_statement(&row).unwrap(), "prof-node"),
+        )
         .await
         .unwrap();
         let n = 300u32;

@@ -43,7 +43,7 @@ pub(crate) struct Observed {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use super::Observed;
-    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::types::{attestation_type, cohort_scope, identity_type};
     use crate::federation::FederationDirectory;
 
@@ -77,8 +77,9 @@ pub(crate) mod bodies {
     const CAPABILITY: &str = "capability:reasoning:v1";
 
     pub(crate) async fn i951_observe(d: &dyn FederationDirectory, tag: &str) -> Observed {
-        let a = format!("{tag}-a");
-        ts::register_hybrid_key_as(d, &a, &a, identity_type::STEWARD).await;
+        // v62.0.0 (JSON cut, E7) — the attester is an edition-2 key: its
+        // `key:record` is live, and its key id is the identity-ref.
+        let a = e2::put_key(d, &format!("{tag}-a"), &[identity_type::STEWARD]).await;
         let id = |n: &str| {
             uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, format!("{tag}-{n}").as_bytes())
                 .to_string()
@@ -95,8 +96,7 @@ pub(crate) mod bodies {
         let same_dimension_weight = d.get_attestation(&x).await.unwrap().and_then(|r| r.weight);
 
         // (B) a held row of another dimension's id, re-used by an upsert.
-        let b = format!("{tag}-b");
-        ts::register_hybrid_key_as(d, &b, &b, identity_type::STEWARD).await;
+        let b = e2::put_key(d, &format!("{tag}-b"), &[identity_type::STEWARD]).await;
         let (y, z) = (id("y"), id("z"));
         d.attestation_insert_local(input(&y, &b, CAPABILITY, 1.0))
             .await

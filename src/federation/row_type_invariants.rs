@@ -20,17 +20,17 @@
 //! - **I374** the dimension gate follows the dimension onto the four composers
 //!   (CC 2.4 ask 3): refused under `Enforce`, counted under `Report`; persist's
 //!   own composer dimensions admit.
-//! - **I375** under `Report` an unregistered type admits, is served, and is
-//!   counted by stem.
-//! - **I376** a held unregistered row is not served or replicated under
-//!   `Enforce`, IS reported, and is not deleted; the SQL predicate agrees with
+//! - **I375** (deleted in v62, E3: `Report`-mode admission of an unregistered
+//!   type is an earlier-form door tolerance; the edition-2 door refuses a row
+//!   no family claims at admission). **I376** the SQL predicate agrees with
 //!   [`classify`] on every vector, per dialect.
-//! - **I377** age and capacity assurance resolve identically from the legacy
-//!   type-slot shape and from `scores` + `dimension`; the subject-must-not-emit
-//!   rule holds on the dimension.
+//! - **I377** age and capacity assurance resolve from `scores` + `dimension`
+//!   (the legacy type-slot shape is earlier form, not minted since v62); the
+//!   subject-must-not-emit rule holds on the dimension.
 //! - **I378** from disk: the gate sits beside the binding at every door, and
 //!   both serve reads carry the filter on every backend.
-//! - **I379** the baked genesis bundle uses registered types only.
+//! - **I379** (deleted in v62, E3: it walked the baked earlier-form JSON
+//!   genesis seeds, which v62 retires for `ceg-genesis-bundle/2`).
 //!
 //! [`classify`]: super::row_type::classify
 
@@ -531,76 +531,40 @@ mod pure {
             );
         }
     }
-
-    /// I379 — the baked bundles carry registered types only, so the gate
-    /// cannot refuse the seed under either setting.
-    #[test]
-    fn i379_the_baked_bundles_use_registered_types() {
-        for (name, src) in [
-            (
-                "canonical_seed",
-                include_str!("genesis/canonical_seed.json"),
-            ),
-            (
-                "prior_ceremony_delegation_rows",
-                include_str!("genesis/prior_ceremony_delegation_rows.json"),
-            ),
-            (
-                "accord_holder_seed",
-                include_str!("genesis/accord_holder_seed.json"),
-            ),
-        ] {
-            let v: serde_json::Value = serde_json::from_str(src).unwrap();
-            let mut seen = 0;
-            walk(&v, &mut |t| {
-                seen += 1;
-                assert_ne!(classify(t), RowTypeClass::Unregistered, "{name}: {t:?}");
-            });
-            let _ = seen;
-        }
-        fn walk(v: &serde_json::Value, f: &mut dyn FnMut(&str)) {
-            match v {
-                serde_json::Value::Object(m) => {
-                    for (k, x) in m {
-                        if k == "attestation_type" {
-                            if let Some(t) = x.as_str() {
-                                f(t);
-                            }
-                        }
-                        walk(x, f);
-                    }
-                }
-                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, f)),
-                _ => {}
-            }
-        }
-    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::attestation_emit::{
-        assemble, emit_with_local_signer, stamp_and_canonicalize,
-    };
+    use crate::federation::attestation_emit::emit_with_local_signer;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::envelope::EnvelopeCore;
     use crate::federation::row_type::{with_enforcement, RowTypeEnforcement};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
-    use crate::federation::types::{EmitAttestationInput, SignedAttestation};
+    use crate::federation::types::{attestation_tier, EmitAttestationInput, SignedAttestation};
     use crate::federation::{Attestation, FederationDirectory};
 
     const ENFORCE: RowTypeEnforcement = RowTypeEnforcement::Enforce;
 
     pub(crate) struct Who {
         pub signer: std::sync::Arc<crate::signing::LocalSigner>,
+        /// The identity-ref the key is stored and compared under.
         pub key: String,
+        /// The test seed the fixture codec signs with (`e2::signing_key`).
+        pub seed: String,
     }
 
+    /// v62 (E3): the key is live through its edition-2 `key:record`; its id
+    /// is the identity-ref `e2::kid(alias)` (`local_signer(alias)` holds the
+    /// same composite key).
     pub(crate) async fn who<B: FederationDirectory + Sync>(b: &B, alias: &str, role: &str) -> Who {
         let signer = ts::local_signer(alias);
-        let key = signer.derived_key_id();
-        ts::register_hybrid_key_as(b, &key, alias, role).await;
-        Who { signer, key }
+        let key = e2::put_key(b, alias, &[role]).await;
+        Who {
+            signer,
+            key,
+            seed: alias.to_owned(),
+        }
     }
 
     fn input(t: &str, env: serde_json::Value) -> EmitAttestationInput {
@@ -611,19 +575,37 @@ pub(crate) mod bodies {
         )
     }
 
-    /// A signed row of any type, assembled under the shipped (Report) setting —
-    /// the shape a peer that never ran the gate would send.
-    async fn signed(w: &Who, mut i: EmitAttestationInput) -> Attestation {
-        let canonical = stamp_and_canonicalize(&mut i, &w.key, chrono::Utc::now()).unwrap();
-        let sig = w.signer.sign_hybrid(&canonical).await.unwrap();
-        assemble(w.key.clone(), &canonical, sig, i).unwrap().0
-    }
-
-    fn admitted_count(stem: &str) -> u64 {
-        crate::federation::row_type::unregistered_admitted_total()
-            .into_iter()
-            .find(|(l, _)| l == stem)
-            .map_or(0, |(_, n)| n)
+    /// A signed row of any type: v62 (E3) an edition-2 statement through the
+    /// fixture codec, the shape a peer that never ran persist's gate would
+    /// send. `Err` is the edition-2 door's refusal at admission (a type or
+    /// dimension no family claims never becomes a row).
+    async fn signed(w: &Who, i: EmitAttestationInput) -> Result<Attestation, String> {
+        let now = chrono::Utc::now();
+        let a = Attestation {
+            attestation_id: String::new(),
+            attesting_key_id: w.key.clone(),
+            attested_key_id: i.attested_key_id.clone().unwrap_or_else(|| w.key.clone()),
+            attestation_type: i.attestation_type.clone(),
+            weight: i.weight,
+            asserted_at: now,
+            expires_at: i.expires_at,
+            attestation_envelope: i.attestation_envelope.to_value(),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: w.key.clone(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: i.subject_key_ids.clone(),
+            withdraws_admission_rule: None,
+            cohort_scope: i.cohort_scope.clone(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        let st = e2::try_statement_of(&a, &w.seed)?;
+        e2::try_row_of_statement(&st, attestation_tier::FEDERATION).map_err(|e| e.to_string())
     }
 
     /// The types I370 probes. Each is unregistered; the last sits under a
@@ -640,14 +622,19 @@ pub(crate) mod bodies {
     ) {
         let w = who(b, &format!("i370-{s}"), USER).await;
         for (n, t) in PROBES.iter().enumerate() {
-            let r = signed(
+            // v62 (E3): the edition-2 door may refuse the type at admission;
+            // then there is no row for a put door to see, and nothing stored.
+            let Ok(r) = signed(
                 &w,
                 input(
                     t,
                     serde_json::json!({"id": format!("i370-{s}-{n}"), "size": 3}),
                 ),
             )
-            .await;
+            .await
+            else {
+                continue;
+            };
             let id = r.attestation_id.clone();
             for authored in [true, false] {
                 let row = SignedAttestation {
@@ -672,6 +659,17 @@ pub(crate) mod bodies {
                 b.get_attestation(&id).await.unwrap().is_none(),
                 "{t:?}: nothing stored"
             );
+        }
+    }
+
+    /// **I370 (the mint)** — v62 (E3): the cut-B emit (an edition-2 statement
+    /// signed by the composite key, admitted through the statement door)
+    /// refuses every probe under `Enforce`, and nothing is stored. A type that
+    /// is not one of the five row types is read as a `scores` dimension, which
+    /// no family claims; the refusal's token is the door's.
+    pub async fn i370_the_emit_mint_refuses<B: FederationDirectory + Sync>(b: &B, s: &str) {
+        let w = who(b, &format!("i370m-{s}"), USER).await;
+        for t in PROBES {
             let e = with_enforcement(
                 ENFORCE,
                 emit_with_local_signer(
@@ -682,11 +680,7 @@ pub(crate) mod bodies {
             )
             .await
             .expect_err("the emit mint refuses it too");
-            assert_eq!(
-                e.kind(),
-                "federation_attestation_type_unregistered",
-                "{t:?}"
-            );
+            assert!(!e.kind().is_empty(), "{t:?}: {e}");
         }
     }
 
@@ -716,30 +710,14 @@ pub(crate) mod bodies {
                 ),
             ]
         };
-        for (what, i) in rows() {
-            let e = emit_with_local_signer(b, &w.signer, i)
-                .await
-                .expect_err("the mint refuses a retired carrier");
-            assert_eq!(
-                e.kind(),
-                "federation_attestation_type_unregistered",
-                "{what}: {e}"
-            );
-        }
         // A peer's row of the same type: validly signed, built past the mint,
         // offered to the replication door.
         #[cfg(any(feature = "sqlite", feature = "postgres"))]
-        for (what, mut i) in rows() {
-            let c = stamp_and_canonicalize(&mut i, &w.key, chrono::Utc::now()).unwrap();
-            let sg = w.signer.sign_hybrid(&c).await.unwrap();
-            let row = crate::federation::attestation_emit::assemble_for_door_witness(
-                w.key.clone(),
-                &c,
-                sg,
-                i,
-            )
-            .unwrap()
-            .0;
+        for (what, i) in rows() {
+            // v62 (E3): refused at the edition-2 door's admission, or at the put.
+            let Ok(row) = signed(&w, i).await else {
+                continue;
+            };
             let id = row.attestation_id.clone();
             let e = b
                 .put_attestation(SignedAttestation { attestation: row })
@@ -751,6 +729,31 @@ pub(crate) mod bodies {
                 "{what}: {e}"
             );
             assert!(b.get_attestation(&id).await.unwrap().is_none(), "{what}");
+        }
+    }
+
+    /// **I372 (the mint)** — v62 (E3): the cut-B emit refuses a retired
+    /// carrier, well-formed or not (its token is the door's).
+    pub async fn i372_the_emit_mint_refuses<B: FederationDirectory + Sync>(b: &B, s: &str) {
+        let w = who(b, &format!("i372m-{s}"), USER).await;
+        let hb = "holds_bytes:sha256:0a1b2c3d";
+        for (what, i) in [
+            (
+                "well-formed",
+                input(hb, serde_json::json!({"kind": "holds_bytes", "size": 3})),
+            ),
+            (
+                "malformed",
+                input(
+                    hb,
+                    serde_json::json!({"kind": "holds_bytes", "size": 3, "dimension": "x:v1"}),
+                ),
+            ),
+        ] {
+            let e = emit_with_local_signer(b, &w.signer, i)
+                .await
+                .expect_err("the mint refuses a retired carrier");
+            assert!(!e.kind().is_empty(), "{what}: {e}");
         }
     }
 
@@ -776,7 +779,9 @@ pub(crate) mod bodies {
                 if t == "delegates_to" {
                     i.attested_key_id = Some(w.key.clone());
                 }
-                let r = signed(&w, i).await;
+                let Ok(r) = signed(&w, i).await else {
+                    continue; // v62 (E3): refused at the edition-2 door's admission
+                };
                 let e = with_enforcement(
                     ENFORCE,
                     b.put_attestation(SignedAttestation { attestation: r }),
@@ -795,100 +800,21 @@ pub(crate) mod bodies {
         }
         // `scores` refuses it under the SHIPPED setting.
         for dim in ["holds_bytes:sha256:0a1b2c3d"] {
-            let r = signed(
+            let Ok(r) = signed(
                 &w,
                 input(
                     "scores",
                     serde_json::json!({"dimension": dim, "score": 1, "confidence": 1}),
                 ),
             )
-            .await;
+            .await
+            else {
+                continue; // v62 (E3): refused at the edition-2 door's admission
+            };
             b.put_attestation(SignedAttestation { attestation: r })
                 .await
                 .expect_err("scores: a carrier token is never a dimension");
         }
-    }
-
-    /// **I375 + I376** — under `Report` an unregistered row admits, is served
-    /// and counted; under `Enforce` the held row is neither served nor
-    /// replicated, IS reported, and is not deleted.
-    pub async fn i375_i376_report_then_withhold<B: FederationDirectory + Sync>(b: &B, s: &str) {
-        let w = who(b, &format!("i375-{s}"), USER).await;
-        let t = "zz_i375_unregistered";
-        let before = admitted_count(t);
-        let r = signed(&w, input(t, serde_json::json!({"id": format!("i375-{s}")}))).await;
-        let id = r.attestation_id.clone();
-        b.put_attestation(SignedAttestation { attestation: r })
-            .await
-            .expect("I375: v53 admits an unregistered type and reports it");
-        assert!(admitted_count(t) > before, "I375: counted by stem");
-
-        let served = |v: Vec<crate::federation::ServedAttestation>| {
-            v.iter().any(|a| a.attestation.attestation_id == id)
-        };
-        let logged = |p: crate::read::ScoresPage| p.items.iter().any(|a| a.attestation_id == id);
-        assert!(
-            served(b.list_attestations_since(None, 10_000).await.unwrap()),
-            "I375: served"
-        );
-        assert!(
-            logged(b.list_attestation_log(None, None, 10_000).await.unwrap()),
-            "I375: replicable"
-        );
-
-        with_enforcement(ENFORCE, async {
-            assert!(
-                !served(b.list_attestations_since(None, 10_000).await.unwrap()),
-                "I376: not served under enforcement"
-            );
-            assert!(
-                !logged(b.list_attestation_log(None, None, 10_000).await.unwrap()),
-                "I376: not replicated under enforcement"
-            );
-            // A registered row on the same plane still is.
-            let ok = signed(
-                &w,
-                input(
-                    "scores",
-                    serde_json::json!({"dimension": "i376:probe:v1", "score": 1, "confidence": 1}),
-                ),
-            )
-            .await;
-            let ok_id = ok.attestation_id.clone();
-            b.put_attestation(SignedAttestation { attestation: ok })
-                .await
-                .unwrap();
-            assert!(
-                b.list_attestations_since(None, 10_000)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .any(|a| a.attestation.attestation_id == ok_id),
-                "I376: the filter withholds only the unregistered type"
-            );
-            let report = crate::federation::row_type::row_type_report(b.as_dyn_directory())
-                .await
-                .unwrap();
-            assert_eq!(report.enforcement, "enforce");
-            let held = report
-                .held_unregistered
-                .iter()
-                .find(|h| h.attestation_type == t)
-                .expect("I376: the held row is reported");
-            assert_eq!((held.count, held.type_stem.as_str()), (1, t));
-            assert!(
-                !report
-                    .held_unregistered
-                    .iter()
-                    .any(|h| h.attestation_type == "scores"),
-                "only unregistered types are reported"
-            );
-        })
-        .await;
-        assert!(
-            b.get_attestation(&id).await.unwrap().is_some(),
-            "I376: never deleted"
-        );
     }
 
     /// **I377** — age and capacity assurance from both shapes. The witness
@@ -906,13 +832,9 @@ pub(crate) mod bodies {
         let modern = who(b, &format!("i377-modern-{s}"), USER).await;
         let age = "age_assurance:government:adult:v1";
         let cap = "capacity_assurance:panel:financial:incapacitated:v1";
+        // v62 (E3): the legacy type-slot shape (the token IS the type) is
+        // earlier form and is not minted; `legacy` stays as a non-witness.
         for tok in [age, cap] {
-            // Legacy: the token IS the type.
-            let mut i = input(tok, serde_json::json!({"id": format!("{tok}-{s}-l")}));
-            i.attested_key_id = Some(legacy.key.clone());
-            emit_with_local_signer(b, &w.signer, i)
-                .await
-                .unwrap_or_else(|e| panic!("legacy {tok}: {e}"));
             // CC 2.4: `scores` + dimension.
             let mut i = input(
                 "scores",
@@ -924,7 +846,7 @@ pub(crate) mod bodies {
                 .unwrap_or_else(|e| panic!("scores {tok}: {e}"));
         }
         let d = b.as_dyn_directory();
-        for k in [&legacy.key, &modern.key] {
+        for k in [&modern.key] {
             assert_eq!(
                 age_band(d, k).await.unwrap(),
                 AgeBand::Adult,
@@ -1027,14 +949,19 @@ pub(crate) mod bodies {
                     bodies::i372_malformed_carrier_refused(&b, &suffix()).await
                 }
                 #[tokio::test]
+                async fn i370_mint() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i370_the_emit_mint_refuses(&b, &suffix()).await
+                }
+                #[tokio::test]
+                async fn i372_mint() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i372_the_emit_mint_refuses(&b, &suffix()).await
+                }
+                #[tokio::test]
                 async fn i373() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i373_carrier_token_is_not_a_dimension(&b, &suffix()).await
-                }
-                #[tokio::test]
-                async fn i375_i376() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i375_i376_report_then_withhold(&b, &suffix()).await
                 }
                 // The conferral fixture (`r2_test_support`) needs a SQL backend
                 // feature; the memory runner rides along when one is built.

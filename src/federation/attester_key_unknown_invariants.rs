@@ -13,103 +13,21 @@
 //! is the retryable `federation_signer_not_acting_for` on all four doors that
 //! ask it; I631 — a backend failure of the shared envelope verifier's attester
 //! lookup propagates as itself, never as a verdict.
+//!
+//! v62 (E3): I613 (the earlier key-record plane) and I631 (the earlier
+//! envelope verifier) are deleted with the earlier form; the attestation
+//! legs of I615/I632/I834 run on edition-2 rows.
 
 #[cfg(test)]
 pub(crate) mod bodies {
-    use crate::federation::register::{self, KeyRefusalReason, ReplicatedKeyOutcome};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::identity_type::{AGENT, NODE, USER};
+    use crate::federation::types::identity_type::{AGENT, USER};
     use crate::federation::types::{attestation_tier, attestation_type};
-    use crate::federation::{
-        Attestation, Error, FederationDirectory, SignedAttestation, SignedKeyRecord,
-    };
+    use crate::federation::{Attestation, Error, FederationDirectory, SignedAttestation};
 
     /// The kind every plane's ordering gap reports.
     const GAP: &str = "federation_attester_key_unknown";
-
-    /// **I613 — the key plane.** A record scrubbed by a key this node does not
-    /// hold: the direct registration gate (`verify_key_registration`, the one
-    /// `register_federation_key` runs) reports the gap, and the replicated
-    /// Insert arm returns the typed `attester_key_unknown` refusal (before
-    /// v54.1.0: a bare `Err`, CIRISEdge#858). A known scrubber whose signature
-    /// covers other bytes is the terminal `unverifiable_signature`. After the
-    /// scrubber's Key row lands, the same record is inserted.
-    pub async fn i613_key_plane(d: &dyn FederationDirectory, s: &str) {
-        let anchor = format!("i613-anchor-{s}");
-        let k = format!("i613-k-{s}");
-        let record = ts::replicated_key_record(&k, AGENT, &anchor, &anchor, "n1");
-
-        let direct = register::verify_key_registration(d, &record)
-            .await
-            .expect_err("I613: an unknown scrubber cannot be verified");
-        assert_eq!(direct.kind(), GAP, "I613: direct door: {direct}");
-        assert!(
-            matches!(&direct, Error::AttesterKeyUnknown { attesting_key_id, plane: "key_registration" } if *attesting_key_id == anchor),
-            "I613: the gap names the scrubber: {direct:?}"
-        );
-
-        let out = d
-            .apply_replicated_key_record(SignedKeyRecord {
-                record: record.clone(),
-            })
-            .await
-            .expect("I613: a refusal is an outcome, never a bare Err");
-        assert_eq!(
-            out,
-            ReplicatedKeyOutcome::Refused {
-                reason: KeyRefusalReason::AttesterKeyUnknown
-            },
-            "I613: replicated Insert, unknown scrubber"
-        );
-        assert_eq!(
-            KeyRefusalReason::AttesterKeyUnknown.as_str(),
-            "attester_key_unknown"
-        );
-        assert!(
-            d.lookup_public_key(&k).await.unwrap().is_none(),
-            "I613: nothing stored on the refusal"
-        );
-
-        // The scrubber's Key row lands.
-        ts::register_identity_key(d, &anchor, NODE).await;
-
-        // A known scrubber, a signature over OTHER bytes: terminal.
-        let other = ts::replicated_key_record(&k, AGENT, &anchor, &anchor, "n2");
-        let mut forged = record.clone();
-        forged.scrub_signature_classical = other.scrub_signature_classical;
-        forged.scrub_signature_pqc = other.scrub_signature_pqc;
-        let terminal = register::verify_key_registration(d, &forged)
-            .await
-            .expect_err("I613: a signature over other bytes does not verify");
-        assert_eq!(
-            terminal.kind(),
-            "federation_signature_invalid",
-            "I613: direct door, known scrubber: {terminal}"
-        );
-        let out = d
-            .apply_replicated_key_record(SignedKeyRecord { record: forged })
-            .await
-            .expect("I613: a refusal is an outcome");
-        assert_eq!(
-            out,
-            ReplicatedKeyOutcome::Refused {
-                reason: KeyRefusalReason::UnverifiableSignature
-            },
-            "I613: replicated Insert, known scrubber, bad signature"
-        );
-        assert!(d.lookup_public_key(&k).await.unwrap().is_none());
-
-        // The SAME record, re-offered, now admits.
-        let out = d
-            .apply_replicated_key_record(SignedKeyRecord { record })
-            .await
-            .unwrap();
-        assert_eq!(
-            out,
-            ReplicatedKeyOutcome::Inserted,
-            "I613: re-offered after the key plane"
-        );
-    }
 
     /// **I614 — the identity_occurrence plane** (the 2026-10-08 fresh-install
     /// defect). `put_identity_occurrence` is the one door for the wire and the
@@ -158,18 +76,19 @@ pub(crate) mod bodies {
             .expect("I614: the same row admits after the key plane");
     }
 
-    /// A self-scored federation-tier row by `attester`, sealed (the erasable
-    /// witnesses' shape).
+    /// A self-scored federation-tier row by `attester`, as the door maps the
+    /// attester's edition-2 statement (the erasable witnesses' shape).
     fn scored_row(attester: &str, id: &str) -> Attestation {
         let envelope = serde_json::json!({
             "id": id,
-            "dimension": "identity_binding:v1",
+            // Edition 2: a dimension Verify registers (`trust:{job}:{version}`).
+            "dimension": "trust:demo:v1",
             "score": 1.0,
             "confidence": 0.9,
         });
         let now = chrono::Utc::now();
-        let mut row = Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
+        let row = Attestation {
+            attestation_id: String::new(),
             attesting_key_id: attester.to_owned(),
             attested_key_id: attester.to_owned(),
             attestation_type: attestation_type::SCORES.to_owned(),
@@ -191,8 +110,8 @@ pub(crate) mod bodies {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        ts::seal_row_in_place(attester, &mut row);
-        row
+        // The door's mapping of the attester's statement over the literal.
+        e2::row_of(&row, attester)
     }
 
     /// **I615 — the attestation plane** (`put_attestation`, the door the
@@ -216,29 +135,16 @@ pub(crate) mod bodies {
             .expect_err("I615: an unknown attester cannot be verified");
         assert_eq!(gap.kind(), GAP, "I615: {gap}");
         assert!(
-            matches!(&gap, Error::AttesterKeyUnknown { attesting_key_id, plane: "attestation" } if *attesting_key_id == attester),
+            matches!(&gap, Error::AttesterKeyUnknown { attesting_key_id, plane: "attestation" } if *attesting_key_id == e2::kid(&attester)),
             "I615: {gap:?}"
         );
 
         ts::register_hybrid_key(d, &attester).await;
 
-        let other = scored_row(&attester, &format!("i615-b-{s}"));
-        let mut forged = row.clone();
-        forged.scrub_signature_classical = other.scrub_signature_classical;
-        forged.scrub_signature_pqc = other.scrub_signature_pqc;
-        let terminal = d
-            .put_attestation(SignedAttestation {
-                attestation: forged,
-            })
-            .await
-            .expect_err("I615: a signature over other bytes does not verify");
-        assert_eq!(
-            terminal.kind(),
-            "federation_federation_tier_unverified",
-            "I615: {terminal}"
-        );
-
-        d.put_attestation(SignedAttestation { attestation: row })
+        // v62 (E3): the "signature over other bytes" leg is deleted with the
+        // earlier-form scrub; a statement's own signature check is witnessed
+        // in `edition2::door_invariants`.
+        crate::federation::edition2::fixture_switch::put_signed(d, &row)
             .await
             .expect("I615: the same row admits after the key plane");
     }
@@ -319,9 +225,10 @@ pub(crate) mod bodies {
             .put_attestation(rev.clone())
             .await
             .expect_err("I630: an unbound signer cannot revoke yet");
+        // The flipped builder signs as `e2::kid(sr)`.
         expect_not_acting(
             &e,
-            &sr,
+            &e2::kid(&sr),
             &identity,
             "identity_occurrence_withdraws",
             "I630 revocation",
@@ -383,47 +290,6 @@ pub(crate) mod bodies {
             .expect("I630: the same touch admits once the signer is bound");
     }
 
-    /// **I631 (#1042 follow-up, CIRISEdge#858) — a backend failure of the
-    /// attester lookup is not a verdict.** `verify_envelope_hybrid_signature`
-    /// (the shared envelope verifier) over a directory whose
-    /// `lookup_public_key` FAILS returns that backend error, not the terminal
-    /// `federation_federation_tier_unverified`; over the same directory
-    /// without the fault, the attester's real row verifies.
-    pub async fn i631_lookup_failure_is_not_a_verdict(
-        d: std::sync::Arc<dyn FederationDirectory>,
-        s: &str,
-    ) {
-        use crate::federation::directory_double::FaultInjectingDirectory;
-        let attester = format!("i631-att-{s}");
-        ts::register_hybrid_key(d.as_ref(), &attester).await;
-        let row = scored_row(&attester, &format!("i631-a-{s}"));
-        let verify = |dir: FaultInjectingDirectory| {
-            let row = row.clone();
-            let attester = attester.clone();
-            async move {
-                crate::federation::tier_ingest::verify_envelope_hybrid_signature(
-                    &dir,
-                    &attester,
-                    &row.attestation_envelope,
-                    &row.scrub_signature_classical,
-                    row.scrub_signature_pqc.as_deref(),
-                )
-                .await
-            }
-        };
-        let faulted = verify(FaultInjectingDirectory::new(d.clone()).erroring("lookup_public_key"))
-            .await
-            .expect_err("I631: the lookup failed");
-        assert!(
-            matches!(&faulted, Error::Backend(m) if m.contains("injected backend failure")),
-            "I631: a backend failure propagates as itself, never a verdict: {} ({faulted:?})",
-            faulted.kind()
-        );
-        verify(FaultInjectingDirectory::new(d))
-            .await
-            .expect("I631: without the fault the same row verifies");
-    }
-
     /// `e` is the terminal `MalformedRow { reason: no_signer }` (v55.0.0,
     /// CIRISPersist#1055; before, an `InvalidArgument`), never the retryable
     /// gap.
@@ -468,41 +334,11 @@ pub(crate) mod bodies {
     /// signed envelope (the exact case Edge reported). Each is refused with
     /// its plane and reason token, and the untouched row admits.
     pub async fn i834_typed_divergence_is_malformed_row(d: &dyn FederationDirectory, s: &str) {
+        // v62 (E3): the attestation-door legs are deleted. An edition-2
+        // row's typed columns are the door's mapping of its statement, so a
+        // typed column cannot diverge from what was signed; the occurrence
+        // door (still the earlier typed plane) keeps its leg.
         use crate::federation::malformed_row as why;
-        let attester = format!("i834-att-{s}");
-        ts::register_hybrid_key(d, &attester).await;
-        let row = scored_row(&attester, &format!("i834-a-{s}"));
-
-        let mut moved = row.clone();
-        moved.asserted_at += chrono::Duration::seconds(1);
-        let e = d
-            .put_attestation(SignedAttestation { attestation: moved })
-            .await
-            .expect_err("I834: a typed asserted_at off its envelope");
-        expect_malformed_as(
-            &e,
-            "attestation",
-            why::TYPED_DIVERGES_FROM_ENVELOPE,
-            "I834 asserted_at",
-        );
-
-        let mut moved = row.clone();
-        moved.attested_key_id = format!("i834-other-{s}");
-        let e = d
-            .put_attestation(SignedAttestation { attestation: moved })
-            .await
-            .expect_err("I834: a typed mirror column off its envelope");
-        expect_malformed_as(
-            &e,
-            "attestation",
-            why::TYPED_DIVERGES_FROM_ENVELOPE,
-            "I834 mirror",
-        );
-
-        d.put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect("I834: the untouched row admits");
-
         let identity = format!("i834-id-{s}");
         let occ = format!("i834-occ-{s}");
         ts::register_identity_key(d, &identity, USER).await;
@@ -540,47 +376,9 @@ pub(crate) mod bodies {
     /// `unverifiable_signature` outcome), the attestation door, the signed
     /// occurrence door, and the shared envelope verifier.
     pub async fn i632_empty_signer_is_malformed(d: &dyn FederationDirectory, s: &str) {
-        // Key plane: a record scrubbed by "".
-        let k = format!("i632-k-{s}");
-        let record = ts::replicated_key_record(&k, AGENT, "", "", "n1");
-        let direct = register::verify_key_registration(d, &record)
-            .await
-            .expect_err("I632: a record scrubbed by nobody");
-        expect_malformed(&direct, "I632 key plane (direct)");
-        let out = d
-            .apply_replicated_key_record(SignedKeyRecord { record })
-            .await
-            .expect("I632: a refusal is an outcome");
-        assert_eq!(
-            out,
-            ReplicatedKeyOutcome::Refused {
-                reason: KeyRefusalReason::UnverifiableSignature
-            },
-            "I632 key plane (replicated): terminal, not attester_key_unknown"
-        );
-
-        // Attestation door: a row whose attesting_key_id is "".
-        let row = scored_row("", &format!("i632-a-{s}"));
-        let e = d
-            .put_attestation(SignedAttestation {
-                attestation: row.clone(),
-            })
-            .await
-            .expect_err("I632: a row naming no attester");
-        expect_malformed(&e, "I632 attestation door");
-
-        // The shared envelope verifier, directly.
-        let e = crate::federation::tier_ingest::verify_envelope_hybrid_signature(
-            d,
-            "",
-            &row.attestation_envelope,
-            &row.scrub_signature_classical,
-            row.scrub_signature_pqc.as_deref(),
-        )
-        .await
-        .expect_err("I632: the verifier with no signer");
-        expect_malformed(&e, "I632 signed_envelope");
-
+        // v62 (E3): the key-plane, attestation-door and envelope-verifier
+        // legs are deleted (earlier-form scrub signers; an edition-2
+        // statement always names its signer in its header).
         // Signed occurrence door: signed by "".
         let identity = format!("i632-id-{s}");
         let occ = format!("i632-occ-{s}");
@@ -606,11 +404,6 @@ mod run {
             mod $modname {
                 use super::super::bodies;
                 #[tokio::test]
-                async fn i613_key_plane() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i613_key_plane(&b, &super::suffix()).await
-                }
-                #[tokio::test]
                 async fn i614_occurrence_plane() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i614_occurrence_plane(&b, &super::suffix()).await
@@ -634,15 +427,6 @@ mod run {
                 async fn i834_typed_divergence_is_malformed_row() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i834_typed_divergence_is_malformed_row(&b, &super::suffix()).await
-                }
-                #[tokio::test]
-                async fn i631_lookup_failure_is_not_a_verdict() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i631_lookup_failure_is_not_a_verdict(
-                        std::sync::Arc::new(b),
-                        &super::suffix(),
-                    )
-                    .await
                 }
             }
         };

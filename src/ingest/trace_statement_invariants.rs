@@ -44,6 +44,17 @@
 //!   `list_attestations_since` (the serve feed); with the doors shut the
 //!   unsigned trace is still accepted in this mode and still not served,
 //!   while Full mode refuses the same shape `earlier_form_object`.
+//! - **I3486** two nodes: a row ingested on A, replicated to B by
+//!   `apply_replicated_statement`, its blob delivered by `put_blob_edition2`:
+//!   B projects the same `trace_events` row-first (on the blob's arrival) and
+//!   blob-first (in the row's own write).
+//! - **I3487** the sign call, end to end: `Engine::seal_trace` signs with the
+//!   Engine's composite LocalSigner and the same Engine ingests the row
+//!   (sqlite, pg).
+//! - **I3488** a sealed `self` trace (option A), two engines: B holds the
+//!   envelope and the row but no DEK, so the row is HELD `trace_dek_not_held`
+//!   (G0's fold) and projects nothing; A's key grant reaches B and the row
+//!   concludes BY ITSELF, with A's `trace_events` (sqlite, pg).
 //! - **I3483** seal scrubs: `prepare_trace_row` (the body of
 //!   `seal_trace_row`) runs persist's scrubber at the given level, so a
 //!   pre-scrub field (an e-mail address in `task_description`) never appears
@@ -282,7 +293,15 @@ where
         summary.signatures_verified, 1,
         "I3472: an admitted statement counts"
     );
-    assert!(summary.trace_events_inserted > 0, "I3472: its rows land");
+    let trace_id_1 = parsed(&blob).trace_id;
+    assert!(
+        events_of(d, &trace_id_1).await > 0,
+        "I3472: its rows land, projected in the row's own write"
+    );
+    assert_eq!(
+        summary.trace_events_inserted, 0,
+        "I3472: not projected a second time from the batch"
+    );
     assert_eq!(
         summary.trace_attestations_minted, 0,
         "I3472: the row is the trace's home; nothing minted beside it"
@@ -617,6 +636,351 @@ fn i3483_seal_refuses_a_level_the_trace_does_not_state() {
     }
 }
 
+/// The `trace_events` rows this node holds for `trace_id`.
+async fn events_of<D>(d: &D, trace_id: &str) -> usize
+where
+    D: Backend,
+{
+    d.fetch_trace_events_page(-1, i64::MAX, None)
+        .await
+        .expect("fetch_trace_events_page")
+        .into_iter()
+        .filter(|(_, r)| r.trace_id == trace_id)
+        .count()
+}
+
+/// Deliver `blob` to `d` on the blob plane as a peer's replication does:
+/// T2's `put_blob_edition2` under a holder's `custody:ack:v1` claim.
+async fn deliver_blob<D>(d: &D, holder: &str, blob: &[u8])
+where
+    D: BlobStorage,
+{
+    let sha = digest_of(blob);
+    let claim = crate::federation::edition2::typed_fixtures::custody_statement(
+        holder,
+        &sha,
+        Some(u64::try_from(blob.len()).unwrap()),
+        "federation",
+        None,
+        u64::try_from(recently().timestamp_millis()).unwrap(),
+    );
+    d.put_blob_edition2(
+        &sha,
+        BlobBody::Inline(blob.to_vec()),
+        Some(TRACE_BLOB_MEDIA_TYPE),
+        &claim,
+    )
+    .await
+    .expect("the blob lands");
+}
+
+/// I3486 — **two nodes**: a trace row ingested on A reaches B by
+/// replication (`apply_replicated_statement`) and its blob by the blob
+/// plane (`put_blob_edition2`); B projects the trace's `trace_events` in
+/// EITHER order: row first (on the blob's arrival) and blob first (in the
+/// row's own write).
+async fn exercise_replicated_projection<D>(a_node: &D, b_node: &D)
+where
+    D: Backend + FederationDirectory + BlobStorage,
+{
+    let agent = unique("agent-repl");
+    let holder = unique("holder");
+    let kid = e2::put_key(a_node, &agent, &["agent"]).await;
+    e2::put_key(b_node, &agent, &["agent"]).await;
+    e2::put_key(b_node, &holder, &["user"]).await;
+
+    for blob_first in [false, true] {
+        let raw = raw_trace(recently());
+        let trace_id = raw["trace_id"].as_str().unwrap().to_owned();
+        let blob = blob_of(&raw);
+        let st = statement(&blob, &agent);
+        let got = ingest(a_node, &row_batch(&blob, &st)).await;
+        assert_eq!(kind_of(&got), "admitted", "I3486: A ingests: {got:?}");
+        assert!(events_of(a_node, &trace_id).await > 0, "I3486: A projects");
+        assert_eq!(
+            events_of(b_node, &trace_id).await,
+            0,
+            "I3486: B holds nothing yet"
+        );
+
+        let row_id: [u8; 32] = hex::decode(row_id_hex(&blob, &kid))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        if blob_first {
+            deliver_blob(b_node, &holder, &blob).await;
+            assert_eq!(
+                events_of(b_node, &trace_id).await,
+                0,
+                "I3486: a blob alone projects nothing (no row names it yet)"
+            );
+        }
+        let applied = Box::pin(
+            crate::federation::edition2::ingest::apply_replicated_statement(b_node, &st, &row_id),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I3486: B admits the replicated row: {e}"));
+        assert!(applied.advances_cursor());
+        if blob_first {
+            assert!(
+                events_of(b_node, &trace_id).await > 0,
+                "I3486 (blob first): the row's own write projects from the held blob"
+            );
+        } else {
+            assert_eq!(
+                events_of(b_node, &trace_id).await,
+                0,
+                "I3486 (row first): no blob yet, nothing projected"
+            );
+            deliver_blob(b_node, &holder, &blob).await;
+            assert!(
+                events_of(b_node, &trace_id).await > 0,
+                "I3486 (row first): the blob's arrival projects the held row"
+            );
+        }
+        assert_eq!(
+            events_of(b_node, &trace_id).await,
+            events_of(a_node, &trace_id).await,
+            "I3486: B holds the same trace_events A projected"
+        );
+    }
+}
+
+/// The Engine-level witnesses: `Engine::seal_trace` (the producer, the sign
+/// call included) and the sealed `self` path (option A), on two engines.
+#[cfg(feature = "scrub")]
+pub(crate) mod engine_level {
+    use super::*;
+    use crate::federation::key_grant_invariants::two_node::{introduce_as, Node};
+    use crate::federation::self_collective_invariants::bodies::bind;
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::{AdoptDisposition, BlobProvenance, EncryptionPubkeys};
+    use crate::Engine;
+    use std::sync::Arc;
+
+    pub(crate) type Pick<B> = fn(&Engine) -> Arc<B>;
+
+    async fn node_engine(alias: &str, dsn: &str) -> Engine {
+        let e = Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
+            .await
+            .unwrap();
+        e.register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
+            .await
+            .unwrap();
+        e
+    }
+
+    /// **I3487 — the sign call, end to end.** `Engine::seal_trace` scrubs,
+    /// builds and SIGNS the row with the Engine's composite LocalSigner
+    /// (`produce::sign_row`); the same Engine's `receive_and_persist` admits
+    /// it through the statement door and projects its `trace_events`.
+    pub(crate) async fn i3487_seal_then_ingest<B>(dsn: &str, run: &str, pick: Pick<B>)
+    where
+        B: Backend + FederationDirectory + BlobStorage + Sync,
+    {
+        let alias = format!("p7-seal-{run}");
+        let engine = node_engine(&alias, dsn).await;
+        let iss = engine.local_derived_key_id().await.unwrap();
+        let raw = raw_trace(recently());
+        let trace_id = raw["trace_id"].as_str().unwrap().to_owned();
+        let sealed = engine
+            .seal_trace(&raw, TraceLevel::Generic)
+            .await
+            .unwrap_or_else(|e| panic!("I3487: seal_trace signs: {} ({e})", e.kind()));
+        let (signed_as, _) = check_trace_row_shape(&sealed.statement, &sealed.trace_blob)
+            .expect("I3487: the sealed row names its blob");
+        assert_eq!(signed_as, iss, "I3487: signed by the Engine's own key");
+        assert!(
+            !is_sealed_trace_blob(&sealed.trace_blob),
+            "I3487: a commons trace is plaintext"
+        );
+        let got = engine
+            .receive_and_persist_with(
+                &row_batch(&sealed.trace_blob, &sealed.statement),
+                &crate::scrub::NullScrubber,
+                VerifyMode::Full,
+            )
+            .await;
+        let summary =
+            got.unwrap_or_else(|e| panic!("I3487: the sealed row ingests: {} ({e})", e.kind()));
+        assert_eq!(summary.signatures_verified, 1, "I3487");
+        let b = pick(&engine);
+        assert!(
+            events_of(b.as_ref(), &trace_id).await > 0,
+            "I3487: projected"
+        );
+        assert_eq!(
+            held_blob(b.as_ref(), &sealed.trace_blob).await.as_deref(),
+            Some(sealed.trace_blob.as_slice()),
+            "I3487: the blob is held as sealed"
+        );
+    }
+
+    /// **I3488 — a sealed `self` trace (option A), two nodes.** A seals
+    /// through `Engine::seal_trace`: the blob is the at-rest envelope (its
+    /// digest is what the row names) wrapped only to A. B adopts the envelope
+    /// verbatim and receives the row: B cannot open it, so the row is HELD
+    /// `trace_dek_not_held` and projects nothing. A re-keys the owner's new
+    /// occurrence B and its key grant reaches B: the grant lands
+    /// (`put_at_rest_grants`), the held row re-folds by itself, opens,
+    /// binds, and B holds the trace's `trace_events`.
+    pub(crate) async fn i3488_sealed_self_trace_waits_for_its_dek<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: Backend + FederationDirectory + BlobStorage + Sync,
+    {
+        use crate::federation::types::cohort_scope::{self, CryptoTier};
+        let (alias_a, alias_b) = (format!("p7-sa-{run}"), format!("p7-sb-{run}"));
+        let engine_a = node_engine(&alias_a, dsn_a).await;
+        let engine_b = node_engine(&alias_b, dsn_b).await;
+        let (sa, sb) = (pick(&engine_a), pick(&engine_b));
+        let kem =
+            |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
+                x25519_base64: id.x25519_pubkey_b64,
+                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+            };
+        let a = Node {
+            backend: sa.as_ref(),
+            signer: ts::local_signer(&alias_a),
+            key: engine_a.local_derived_key_id().await.unwrap(),
+            kem: kem(sa.load_or_init_content_kem_identity().await.unwrap()),
+        };
+        let b = Node {
+            backend: sb.as_ref(),
+            signer: ts::local_signer(&alias_b),
+            key: engine_b.local_derived_key_id().await.unwrap(),
+            kem: kem(sb.load_or_init_content_kem_identity().await.unwrap()),
+        };
+        introduce_as(
+            &[&a, &b],
+            &[&alias_a, &alias_b],
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        // The trace's owner is A's own identity; A is its only occurrence.
+        for n in [&a, &b] {
+            bind(n.backend, &a.key, &a.key, Some(a.kem.clone())).await;
+        }
+        let mut raw = raw_trace(recently());
+        raw["cohort_scope"] = serde_json::json!(cohort_scope::SELF);
+        let trace_id = raw["trace_id"].as_str().unwrap().to_owned();
+        let sealed = engine_a
+            .seal_trace(&raw, TraceLevel::Generic)
+            .await
+            .unwrap_or_else(|e| panic!("I3488: A seals its self trace: {} ({e})", e.kind()));
+        assert!(
+            is_sealed_trace_blob(&sealed.trace_blob),
+            "I3488: a self trace's blob is the at-rest envelope"
+        );
+        let (iss, _) = check_trace_row_shape(&sealed.statement, &sealed.trace_blob)
+            .expect("I3488: the row names the envelope's digest");
+        assert_eq!(iss, a.key);
+        // A ingests its own sealed trace: it holds the DEK, so it projects.
+        let mine = engine_a
+            .receive_and_persist_with(
+                &row_batch(&sealed.trace_blob, &sealed.statement),
+                &crate::scrub::NullScrubber,
+                VerifyMode::Full,
+            )
+            .await;
+        assert_eq!(kind_of(&mine), "admitted", "I3488: A ingests: {mine:?}");
+        assert!(
+            events_of(sa.as_ref(), &trace_id).await > 0,
+            "I3488: A projects"
+        );
+
+        // B becomes an occurrence of the owner AFTER the seal (no wrap yet).
+        for n in [&a, &b] {
+            bind(n.backend, &a.key, &b.key, Some(b.kem.clone())).await;
+        }
+        engine_b
+            .adopt_sealed_blob(
+                &sealed.trace_blob,
+                BlobProvenance {
+                    author_key_id: a.key.clone(),
+                    cohort_scope: cohort_scope::SELF.to_owned(),
+                    community_key_id: None,
+                    epoch: None,
+                    tier: CryptoTier::InvisibleEncrypted,
+                    minter_key_id: Some(a.key.clone()),
+                },
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I3488: B adopts the envelope verbatim");
+        let row_id = row_id_of_statement(&sealed.statement, &iss);
+        let applied = Box::pin(
+            crate::federation::edition2::ingest::apply_replicated_statement(
+                sb.as_ref(),
+                &sealed.statement,
+                &row_id,
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I3488: B keeps the replicated row: {e}"));
+        assert!(applied.advances_cursor());
+        let held = crate::federation::edition2::fold::why_held(
+            sb.as_ref(),
+            &crate::federation::edition2::names::RowId(row_id),
+        )
+        .await
+        .unwrap()
+        .expect("I3488: no DEK: the row is HELD, not admitted with a warning");
+        assert_eq!(
+            held.reason, TRACE_DEK_NOT_HELD,
+            "I3488: held by name: {held:?}"
+        );
+        assert_eq!(
+            events_of(sb.as_ref(), &trace_id).await,
+            0,
+            "I3488: nothing projected"
+        );
+
+        // The DEK arrives: A re-keys B in, and its key grant reaches B.
+        let rk = engine_a
+            .rekey_self_occurrence_add(&a.key, std::slice::from_ref(&b.key))
+            .await
+            .expect("I3488: A re-keys the owner's new occurrence");
+        assert!(
+            rk.granted.iter().any(|(r, n)| r == &b.key && *n >= 1),
+            "I3488: a wrap for B: {rk:?}"
+        );
+        engine_a.emit_pending_key_grants().await.unwrap();
+        let sets = crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            sa.as_ref(),
+            &a.key,
+            &b.key,
+        )
+        .await;
+        assert!(!sets.is_empty(), "I3488: A emitted B's content grant");
+        for set in sets {
+            engine_b
+                .apply_replicated_key_grant(set)
+                .await
+                .expect("I3488: B admits A's grant");
+        }
+        assert!(
+            crate::federation::edition2::fold::why_held(
+                sb.as_ref(),
+                &crate::federation::edition2::names::RowId(row_id),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "I3488: the grant concluded the held row by itself (G0's re-fold)"
+        );
+        assert_eq!(
+            events_of(sb.as_ref(), &trace_id).await,
+            events_of(sa.as_ref(), &trace_id).await,
+            "I3488: B projects the same trace_events A did"
+        );
+    }
+}
+
 /// I3482 (pure) — the crossing gate itself.
 #[test]
 fn i3482_the_crossing_gate() {
@@ -852,6 +1216,13 @@ mod sqlite {
         Box::pin(exercise_unsigned_stays_local(&b)).await;
     }
 
+    #[tokio::test]
+    async fn i3486_replicated_row_projects_sqlite() {
+        let a = backend().await;
+        let b = backend().await;
+        Box::pin(exercise_replicated_projection(&a, &b)).await;
+    }
+
     #[cfg(feature = "scrub")]
     #[tokio::test]
     async fn i3483_seal_scrubs_sqlite() {
@@ -891,10 +1262,82 @@ mod postgres {
         Box::pin(exercise_unsigned_stays_local(&b)).await;
     }
 
+    #[tokio::test]
+    async fn i3486_replicated_row_projects_postgres() {
+        let Some(a) = backend().await else { return };
+        let Some(b) = backend().await else { return };
+        Box::pin(exercise_replicated_projection(&a, &b)).await;
+    }
+
     #[cfg(feature = "scrub")]
     #[tokio::test]
     async fn i3483_seal_scrubs_postgres() {
         let Some(b) = backend().await else { return };
         Box::pin(exercise_seal_scrubs(&b)).await;
+    }
+}
+
+#[cfg(feature = "scrub")]
+mod engine_runs {
+    use super::engine_level;
+
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
+    }
+
+    #[cfg(feature = "sqlite")]
+    mod sqlite {
+        use super::{engine_level, suffix};
+        fn pick(e: &crate::Engine) -> std::sync::Arc<crate::store::sqlite::SqliteBackend> {
+            e.sqlite_backend().expect("sqlite").clone()
+        }
+        #[tokio::test]
+        async fn i3487_seal_then_ingest_sqlite() {
+            Box::pin(engine_level::i3487_seal_then_ingest(
+                "sqlite::memory:",
+                &suffix(),
+                pick,
+            ))
+            .await;
+        }
+        #[tokio::test]
+        async fn i3488_sealed_self_trace_sqlite() {
+            Box::pin(engine_level::i3488_sealed_self_trace_waits_for_its_dek(
+                "sqlite::memory:",
+                "sqlite::memory:",
+                &suffix(),
+                pick,
+            ))
+            .await;
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    mod postgres {
+        use super::{engine_level, suffix};
+        fn pick(e: &crate::Engine) -> std::sync::Arc<crate::store::postgres::PostgresBackend> {
+            e.postgres_backend().expect("postgres").clone()
+        }
+        #[tokio::test]
+        async fn i3487_seal_then_ingest_postgres() {
+            let Some(dsn) = crate::test_pg::empty_dsn() else {
+                return;
+            };
+            Box::pin(engine_level::i3487_seal_then_ingest(&dsn, &suffix(), pick)).await;
+        }
+        #[tokio::test]
+        async fn i3488_sealed_self_trace_postgres() {
+            let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn())
+            else {
+                return;
+            };
+            Box::pin(engine_level::i3488_sealed_self_trace_waits_for_its_dek(
+                &a,
+                &b,
+                &suffix(),
+                pick,
+            ))
+            .await;
+        }
     }
 }

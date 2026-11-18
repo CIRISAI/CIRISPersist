@@ -782,7 +782,16 @@ where
                 .to_owned(),
         ));
     }
+    // v62.0.0 (wave GC8; CC 2.7.3) — "no root yet" is a wait on the
+    // ceremony: the holders' key records (and the genesis bundle that seats
+    // them) are other rows. An absent root is a fold condition, held with
+    // `federation_no_constitutional_root_yet` and re-folded when a holder's
+    // record or a bundle lands. An empty COMPILED roster (above) and a
+    // directory that cannot answer (below) stay refusals: neither is a row.
+    // A bundle seating a holder touches `key:<holder>` (G0 v3 §2), so the
+    // holders' keys are the whole read set (no `family:` key, G0 v4).
     for kid in roster_key_ids {
+        crate::federation::edition2::fold::reads(crate::federation::edition2::fold::Dep::key(kid));
         match dir.lookup_public_key(kid).await {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
@@ -796,12 +805,15 @@ where
             }
         }
     }
-    Err(refuse(
-        "absent",
-        format!(
-            "not one of the {} declared accord-holder seat(s) resolves in this node's \
-             directory, so there is no roster to tally a quorum against",
-            roster_key_ids.len()
+    Err(crate::federation::edition2::fold::hold(
+        crate::federation::edition2::fold::reason::gc8::NO_CONSTITUTIONAL_ROOT_YET,
+        refuse(
+            "absent",
+            format!(
+                "not one of the {} declared accord-holder seat(s) resolves in this node's \
+                 directory, so there is no roster to tally a quorum against",
+                roster_key_ids.len()
+            ),
         ),
     ))
 }
@@ -818,9 +830,27 @@ pub async fn require_constitutional_root<D>(dir: &D, operation: &'static str) ->
 where
     D: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC8) — the bundle in force is other rows: a divergent
+    // reading is a fold condition (held, re-folded when a bundle lands); an
+    // unreadable store stays a refusal. A bundle's re-fold touches its
+    // holders' keys: those are the read set.
+    for kid in crate::federation::admission::accord_holder_roster_key_ids() {
+        crate::federation::edition2::fold::reads(crate::federation::edition2::fold::Dep::key(&kid));
+    }
     match accord_roster_seated(dir).await {
         Ok(()) => return Ok(()),
-        Err(f @ (GenesisFault::Divergent { .. } | GenesisFault::Unreadable { .. })) => {
+        Err(f @ GenesisFault::Divergent { .. }) => {
+            return Err(crate::federation::edition2::fold::hold(
+                crate::federation::edition2::fold::reason::gc8::NO_CONSTITUTIONAL_ROOT_YET,
+                Error::NoConstitutionalRootYet {
+                    operation,
+                    leg: f.leg(),
+                    fault_kind: f.as_str(),
+                    detail: f.detail().to_owned(),
+                },
+            ));
+        }
+        Err(f @ GenesisFault::Unreadable { .. }) => {
             return Err(Error::NoConstitutionalRootYet {
                 operation,
                 leg: f.leg(),

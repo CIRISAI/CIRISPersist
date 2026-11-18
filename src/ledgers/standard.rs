@@ -738,6 +738,38 @@ fn pinned_jcs(value: &serde_json::Value) -> Result<Vec<u8>, LedgerError> {
         .map_err(|e| LedgerError::Canonical(e.to_string()))
 }
 
+/// v62.0.0 (wave GC6; CC 2.7 rc21 X4, CC 3.3.10.1 (1) corrected: "Two
+/// ledgers claiming one triple are contested, and neither counts while both
+/// stand") — the reason a contested head carries. The derived `ledger_id` IS
+/// the triple (L1, [`derive_ledger_id`]), so two ledgers on one triple are two
+/// chains under one id: two heads at one seq. The working index keeps BOTH
+/// (one `double_head` fork-evidence row per contested head, keyed by
+/// [`contest_evidence_id`]) and concludes NEITHER (the stored head is cleared
+/// and every later advance answers `Contested`), whichever arrived first.
+pub const LEDGER_TRIPLE_CONTESTED: &str = "ledger_triple_contested";
+
+/// v62.0.0 (wave GC6) — the evidence id of one contested head: a content
+/// hash of `(ledger_id, seq, head_hash)`, so recording it is idempotent and
+/// independent of arrival order.
+#[must_use]
+pub fn contest_evidence_id(ledger_id: &str, seq: u64, head_hash: &str) -> String {
+    format!(
+        "lcontest-{}",
+        sha256_hex(
+            format!("{LEDGER_TRIPLE_CONTESTED}\n{ledger_id}\n{seq}\n{head_hash}").as_bytes()
+        )
+    )
+}
+
+/// v62.0.0 (wave GC6) — the `evidence_json` of one contested head.
+#[must_use]
+pub fn contest_evidence_json(head_hash: &str) -> serde_json::Value {
+    serde_json::json!({
+        "reason": LEDGER_TRIPLE_CONTESTED,
+        "head_hash": head_hash,
+    })
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);

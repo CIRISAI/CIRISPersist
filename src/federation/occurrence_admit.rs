@@ -30,6 +30,12 @@ pub(crate) struct PlannedOccurrence {
     pub(crate) transport_binding_json: Option<String>,
     /// The signature container (the signed door only).
     pub(crate) signed: Option<PlannedOccurrenceSignature>,
+    /// v62.0.0 (wave O1; the CC 2.7 ruling) — an edition-2 bind's roster
+    /// receipt, `(row id hex, identity)`: the transaction-level write
+    /// records it LANDED (`lands_quorum`, first-settled wins), so the door's
+    /// landing and the genesis import (a seat binding is landed by
+    /// definition) both leave a receipt the next roster row's head can name.
+    pub(crate) roster_row: Option<(String, String)>,
 }
 
 /// The signed door's container columns.
@@ -132,6 +138,7 @@ fn plan_occurrence(
             enc_ml_kem,
             transport_binding_json,
             signed,
+            roster_row: None,
         },
         projected_route,
     ))
@@ -246,9 +253,11 @@ pub(crate) fn plan_edition2_occurrence(
     let super::edition2::occurrence::OccurrenceBind {
         occurrence: row,
         author_key_id,
+        row_id,
         ..
     } = bind;
-    plan_occurrence(
+    let roster_row = Some((row_id.hex(), row.identity_key_id.clone()));
+    let (mut planned, route) = plan_occurrence(
         row,
         Some(PlannedOccurrenceSignature {
             attesting_key_id: author_key_id,
@@ -256,7 +265,9 @@ pub(crate) fn plan_edition2_occurrence(
             // Not written: the bind's authority is its held statements.
             signature_json: String::new(),
         }),
-    )
+    )?;
+    planned.roster_row = roster_row;
+    Ok((planned, route))
 }
 
 /// v62.0.0 (wave O1) — **what follows an edition-2 bind's commit**, never

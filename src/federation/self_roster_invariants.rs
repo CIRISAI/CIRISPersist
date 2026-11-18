@@ -1,64 +1,21 @@
 //! v59.0.0 (CIRISPersist#1099; CC 3.3.6.3) — **I1130–I1139: the self-roster
 //! door and the steward predicate, on every backend.**
 //!
-//! - **I1130 (one key)** — at one key the addition is unilateral: the
-//!   genesis key adds a device and it is active at once; no proposal is held.
-//! - **I1131 (quorum)** — at two keys a device's addition is a PROPOSAL: the
-//!   door returns `federation_self_roster_not_landed` / `pending`, the device
-//!   is not active, the proposal row is held; the other key's assent lands it
-//!   at once (`lands_quorum`) and the device is active.
-//! - **I1132 (lone path, silence)** — at three keys an eviction with no
-//!   answer lands after `W_self` on the node's clock (`lands_lone`, the target
-//!   is revoked); a target that signed anything since the proposal arrived is
-//!   evictable only by quorum.
-//! - **I1133 (the thief)** — `unilateral3_stolen` at the door: one key's
-//!   framed revocation of another at three keys does not land; once the
-//!   target and the third key object it never does.
-//! - **I1134 (void votes)** — an assent from a key evicted since is void.
-//! - **I1135 (one open per proposer)** — a proposer's second proposal is
-//!   refused while its first is open; another proposer's is not.
-//! - **I1136 (node clock)** — a proposal the signer backdated two windows is
-//!   as young as its arrival.
-//! - **I1137 (steward gate)** — a second device of the same self authors a
-//!   consent grant that counts and restates the owner-binding as the same one
-//!   steward; a key of another self does neither.
-//! - **I1138 (compat)** — a pending addition is served neither framed nor as
-//!   an `identity:occurrence:v1` row; once it lands it is served both ways.
-//! - **I1161 (the reverse walk, #1109)** — `nodes_owned_by(fedID)` returns a
-//!   node a roster key bound; not one another self's key bound, and not one
-//!   a key bound after its eviction.
-//! - **I1140 (a node is not a roster key)** — a node its owner bound
-//!   publishes its own occurrence; its signature on a user-role key's is
-//!   refused `proposer_not_on_roster`, and nothing is held.
-//! - **I1141 (genesis eviction)** — another roster key's `withdraws` of the
-//!   self pair `(F, F)`'s occurrence row lands by quorum; the genesis key
-//!   leaves the roster, cannot sign for the self, and is no steward; the fedID
-//!   string survives. The genesis key's own `withdraws` of that row, and any
-//!   `withdraws` of its `key:record:v1` row, evict nothing.
-//! - **I1142 (W bound)** — an evicted key signing inside its old live window
-//!   but more than W ago is refused `asserted_at_stale` at both steward gates.
-//! - **I1151 (a pre-door withdraws)** — another key's `withdraws` of the self
-//!   pair admitted before the door (no landed receipt) evicts nothing.
-//! - **I1149 (W spares a live key)** — a still-live roster key's grant and
-//!   owner-binding older than W admit, and replicate to a fresh node.
-//! - **I1143 (withdrawn)** — a proposer's `withdraws` of its proposal row
-//!   takes it out of the decision; it never lands; the slot is free.
-//! - **I1139 (two nodes)** — a proposal and its assent delivered through the
-//!   attestation plane land on the receiving node too.
-//! - **I1307 (the corridor at admission, v60.0.0 S6v)** — under a CC policy
-//!   table whose self-roster row is outside the self corridor every roster
-//!   change is refused `federation_governance_policy_refused` and nothing is
-//!   held; under the vendored table the same changes land or are held.
-//! - **I1710–I1712 (CIRISPersist#1159, T10)** — the in-order holder, a fresh
-//!   node fed the whole stream, and a late joiner that held its own
-//!   occurrence first reach one roster; the late joiner's interim verdict is
-//!   its own (CC 3.3.6.3) and converges after its own `W_self`.
-//! - **I1713 (a backdated add)** — an addition signed at an instant when its
-//!   proposer was the only key is decided on the roster as it stands, never
-//!   on the roster at its signed instant.
+//! v62 (E3): the self-roster door is O1's `identity:occurrence` counted
+//! voices with S1's two paths and S1b's edition-2 evictions (T2's
+//! `identity:occurrence_revocation`), CC 3.3.6.4. Every witness below runs on
+//! edition 2; an assent is the same payload signed as the self by a roster key,
+//! an objection an `objection:raised:v1` answer naming the row id. Deleted (the
+//! earlier proposal / vote / receipt machinery has no edition-2 object, or O1
+//! witnesses the property): I1130 (O1 I3020), I1135, I1138, I1139, I1143,
+//! I1156 (O1 I3020/I3022, I3045–I3047), I1140 (O1 I3030), I1151. I1141's
+//! `withdraws` of the genesis key's `key:record:v1` row is dropped (no edition-2
+//! counterpart). No refusal token is pinned for a fold condition (CC 2.7).
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::self_roster as sr;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, identity_type as it, Attestation};
@@ -84,67 +41,6 @@ pub(crate) mod bodies {
         crate::federation::steward_purge::test_clock::set(None);
     }
 
-    /// `signer`'s `withdraws` of the self pair `(f, f)`'s
-    /// `identity:occurrence:v1` row (the transport self-occurrence): the
-    /// genesis key's eviction when `signer != f` (CC 3.3.6.3, rc9 69fd22e).
-    pub(crate) async fn genesis_withdrawal(
-        d: &dyn FederationDirectory,
-        signer: &str,
-        f: &str,
-    ) -> Attestation {
-        ts::occurrence_withdrawal(d, signer, f, f, ms_now())
-            .await
-            .attestation
-    }
-
-    /// `signer`'s `withdraws` of `f`'s `key:record:v1` row, attested to `f`:
-    /// NOT an eviction — the record stays a valid key.
-    pub(crate) async fn key_record_withdrawal(
-        d: &dyn FederationDirectory,
-        signer: &str,
-        f: &str,
-    ) -> Attestation {
-        let one = std::num::NonZeroU32::new(50).expect("n");
-        let mut pages = crate::federation::attestation_query::AttestationQuery::to(f, one)
-            .dimension(crate::federation::key_plane::KEY_RECORD_DIMENSION)
-            .pages();
-        let mut target = None;
-        while let Some(page) = pages.next(d).await.unwrap() {
-            target = page
-                .into_iter()
-                .find(|r| {
-                    crate::federation::key_plane::key_record_of_row(r)
-                        .is_some_and(|k| k.key_id == f)
-                })
-                .or(target);
-        }
-        let target = target.expect("the self holds its key:record:v1 row");
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut w = ts::bare_attestation(
-            &id,
-            signer,
-            f,
-            &serde_json::json!({
-                "dimension": crate::federation::key_plane::KEY_RECORD_DIMENSION,
-                "references_attestation_id": target.attestation_id,
-                "withdrawal_reason": "the genesis key is lost",
-            }),
-        );
-        w.attestation_type = attestation_type::WITHDRAWS.into();
-        w.weight = None;
-        w.asserted_at = ms_now();
-        w.scrub_timestamp = w.asserted_at;
-        ts::seal_row_in_place(signer, &mut w);
-        w
-    }
-
-    /// A self `f` with user-role devices `devices`, registered.
-    pub(crate) async fn keys(d: &dyn FederationDirectory, ids: &[&str]) {
-        for k in ids {
-            ts::register_hybrid_key_as(d, k, k, it::USER).await;
-        }
-    }
-
     /// `signer` signs `device` in as an occurrence of `f`, asserted at `at`.
     pub(crate) async fn add(
         d: &dyn FederationDirectory,
@@ -157,179 +53,313 @@ pub(crate) mod bodies {
             .await
     }
 
-    /// Is `device` an active occurrence of `f`?
-    pub(crate) async fn active(d: &dyn FederationDirectory, f: &str, device: &str) -> bool {
-        d.list_identity_occurrences_active(f)
+    /// v62 (E3): one `identity:occurrence` statement (O1). `signer` (a seed)
+    /// signs as `iss`: as the occurrence key itself (`iss == occurrence`, the
+    /// own voice, role `occurrence_key`) or as the identity (an approval: the
+    /// identity's genesis key, or a live roster key through its seat). The row's
+    /// `sub` is the occurrence key and its `author` the identity.
+    pub(crate) fn occ_voice(signer: &str, iss: &str, identity: &str, occurrence: &str) -> Vec<u8> {
+        occ_voice_at(signer, iss, identity, occurrence, ms_now())
+    }
+
+    /// [`occ_voice`] asserted at `at` (the proposer's signed instant).
+    pub(crate) fn occ_voice_at(
+        signer: &str,
+        iss: &str,
+        identity: &str,
+        occurrence: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<u8> {
+        use ciris_verify_core::cde::{self, Value};
+        let t = |s: &str| Value::Text(s.to_owned());
+        let mut m: Vec<(Value, Value)> = vec![
+            (t("asserted_at"), Value::Uint(e2::ms(at))),
+            (t("author"), t(&e2::kid(identity))),
+            (t("identity_key_id"), t(&e2::kid(identity))),
+            (t("occurrence_key_id"), t(&e2::kid(occurrence))),
+            (
+                t("device_class"),
+                t(crate::federation::types::device_class::PHONE),
+            ),
+        ];
+        m.sort_by_key(|(k, _)| cde::encode(k));
+        ciris_verify_core::edition2::sign_row_statement(
+            &e2::signing_key(signer),
+            &e2::kid(iss),
+            &e2::kid(occurrence),
+            "scores",
+            "identity:occurrence",
+            &Value::Map(m),
+            vec![],
+        )
+        .expect("an identity:occurrence statement signs")
+    }
+
+    /// v62 (E3): `device` binds under `identity` through O1's door: the
+    /// device's own voice first (held, lands nothing), then each approver's
+    /// statement as the identity, in order. The last outcome.
+    pub(crate) async fn bind(
+        d: &dyn FederationDirectory,
+        identity: &str,
+        device: &str,
+        approvers: &[&str],
+    ) -> StatementOutcome {
+        bind_at(d, identity, device, approvers, ms_now()).await
+    }
+
+    /// [`bind`] with every voice asserted at `at`.
+    pub(crate) async fn bind_at(
+        d: &dyn FederationDirectory,
+        identity: &str,
+        device: &str,
+        approvers: &[&str],
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> StatementOutcome {
+        let own = e2::put_statement(d, &occ_voice_at(device, device, identity, device, at))
+            .await
+            .expect("the occurrence key's own voice is kept");
+        assert!(
+            matches!(own, StatementOutcome::Voice { .. }),
+            "the own voice alone lands nothing: {own:?}"
+        );
+        let mut last = own;
+        for a in approvers {
+            last = e2::put_statement(d, &occ_voice_at(a, identity, identity, device, at))
+                .await
+                .unwrap_or_else(|e| panic!("{a}'s approval of {device} under {identity}: {e}"));
+        }
+        last
+    }
+
+    /// v62 (E3): a three-key self `{f, d1, d2}` through O1's door (S1): d1
+    /// lands at one key; d2 is proposed by d1 (a kept voice) and f's approval
+    /// completes the strict majority.
+    pub(crate) async fn three_e2(d: &dyn FederationDirectory, f: &str, d1: &str, d2: &str) {
+        for k in [f, d1, d2] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        assert!(matches!(
+            bind(d, f, d1, &[f]).await,
+            StatementOutcome::Row { .. }
+        ));
+        let at = ms_now();
+        assert!(matches!(
+            bind_at(d, f, d2, &[d1], at).await,
+            StatementOutcome::Voice { .. }
+        ));
+        let landed = e2::put_statement(d, &occ_voice_at(f, f, f, d2, at))
+            .await
+            .expect("the fixture's quorum approval");
+        assert!(
+            matches!(landed, StatementOutcome::Row { .. }),
+            "the fixture's third key landed by quorum: {landed:?}"
+        );
+    }
+
+    /// v62 (E3): is `device` an active occurrence of `f`, by identity-ref?
+    pub(crate) async fn active_e2(d: &dyn FederationDirectory, f: &str, device: &str) -> bool {
+        let dev = e2::kid(device);
+        d.list_identity_occurrences_active(&e2::kid(f))
             .await
             .expect("active")
             .iter()
-            .any(|o| o.occurrence_key_id == device)
+            .any(|o| o.occurrence_key_id == dev)
     }
 
-    /// The pending refusal's proposal id (panics on any other outcome).
-    pub(crate) fn pending(r: Result<(), Error>, what: &str) -> String {
-        match r {
-            Err(Error::SelfRosterNotLanded {
-                decision: "pending",
-                proposal_id,
-                ..
-            }) => proposal_id,
-            other => panic!("{what}: expected a pending proposal, got {other:?}"),
-        }
+    /// v62 (E3; O1 S1b, T2): `signer`'s `identity:occurrence_revocation` voice
+    /// evicting `target` from self `f`, signed AS the self, at `at`. Every
+    /// roster key's voice over the same revocation (same instant) counts.
+    pub(crate) async fn evict_voice_at(
+        d: &dyn crate::federation::FederationDirectory,
+        signer: &str,
+        f: &str,
+        target: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<u8> {
+        let rev = crate::federation::types::IdentityOccurrenceRevocation {
+            identity_key_id: e2::kid(f),
+            occurrence_key_id: e2::kid(target),
+            revoked_at: at,
+            effective_at: at,
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        };
+        e2::occurrence_revocation_voice(d, signer, true, &rev, None, &[], e2::ms(at)).await
     }
 
-    /// `voter` answers proposal `p` of self `f`.
-    pub(crate) async fn vote(
+    /// The proposal id of a roster change: its row id (O1 S1).
+    pub(crate) fn row_hex(statement: &[u8]) -> String {
+        crate::federation::edition2::names::RowId::of_statement(statement)
+            .expect("a statement has a row id")
+            .hex()
+    }
+
+    /// Put `statement`; the outcome (a refusal panics: the caller expects a
+    /// kept voice or a landing).
+    pub(crate) async fn put_st(d: &dyn FederationDirectory, statement: &[u8]) -> StatementOutcome {
+        e2::put_statement(d, statement)
+            .await
+            .unwrap_or_else(|e| panic!("a voice is kept or lands: {e}"))
+    }
+
+    /// Did the statement land the change (not merely kept as a voice)?
+    pub(crate) fn landed(o: &StatementOutcome) -> bool {
+        matches!(o, StatementOutcome::Row { .. })
+    }
+
+    /// `voter`'s `objection:{raised|assent}:v1` answer naming proposal
+    /// `proposal` of self `f` (O1 S1's answer shape), as an edition-2 statement.
+    pub(crate) async fn answer(
         d: &dyn FederationDirectory,
         voter: &str,
         f: &str,
-        p: &str,
+        proposal: &str,
         assent: bool,
     ) {
-        let env = sr::vote_envelope(f, p, assent);
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut r = ts::bare_attestation(&id, voter, f, &env);
+        let now = ms_now();
+        let a = Attestation {
+            attestation_id: String::new(),
+            attesting_key_id: e2::kid(voter),
+            attested_key_id: e2::kid(f),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": if assent { "objection:assent:v1" } else { "objection:raised:v1" },
+                "score": if assent { 1.0 } else { -1.0 },
+                "confidence": 1.0,
+                "cohort": "self",
+                "cohort_key_id": e2::kid(f),
+                "objects_to_attestation_id": proposal,
+                "grounds": "",
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: e2::kid(voter),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        e2::put_statement(d, &e2::statement_of(&a, voter))
+            .await
+            .expect("an answer is kept");
+    }
+
+    /// `who` signs something now (a self-report through the codec): any
+    /// signed act answers.
+    pub(crate) async fn act_e2(d: &dyn FederationDirectory, who: &str) {
+        let now = ms_now();
+        let mut r = ts::bare_attestation(
+            "",
+            who,
+            who,
+            &serde_json::json!({ "dimension": "config:i1132_act:v1", "n": 1 }),
+        );
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
-        r.asserted_at = ms_now();
-        r.scrub_timestamp = r.asserted_at;
-        ts::seal_row_in_place(voter, &mut r);
-        d.put_attestation(SignedAttestation { attestation: r })
-            .await
-            .expect("an answer is admitted");
+        r.asserted_at = now;
+        r.scrub_timestamp = now;
+        e2::put_row(d, &r, who).await;
     }
 
-    /// `who` signs something (a self-report): any signed act answers.
-    pub(crate) async fn act(d: &dyn FederationDirectory, who: &str) {
-        let env = serde_json::json!({ "dimension": "config:i1132-act:v1", "n": 1 });
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut r = ts::bare_attestation(&id, who, who, &env);
-        r.attestation_type = attestation_type::SCORES.into();
-        r.weight = None;
-        r.asserted_at = ms_now();
-        r.scrub_timestamp = r.asserted_at;
-        ts::seal_row_in_place(who, &mut r);
-        d.put_attestation(SignedAttestation { attestation: r })
-            .await
-            .expect("a signed act is admitted");
-    }
-
-    /// A three-key self `{f, d1, d2}`: f adds d1 (one key, at once), then d1
-    /// is proposed by f and assented by d1... — built through the door itself.
-    pub(crate) async fn three(d: &dyn FederationDirectory, f: &str, d1: &str, d2: &str) {
-        keys(d, &[f, d1, d2]).await;
-        add(d, f, f, d1, ms_now()).await.expect("one key: lands");
-        let p = pending(add(d, f, f, d2, ms_now()).await, "two keys: f adds d2");
-        vote(d, d1, f, &p, true).await;
-        assert!(
-            active(d, f, d2).await,
-            "the fixture's third key landed by quorum"
-        );
-    }
-
-    async fn settle(d: &dyn FederationDirectory, f: &str) {
-        sr::execute_for(d, f).await.expect("execute");
-    }
-
-    /// **I1130** — one key: the addition is unilateral.
-    pub(crate) async fn i1130_one_key_adds_at_once(d: &dyn FederationDirectory, tag: &str) {
-        let (f, d1) = (format!("f-{tag}"), format!("d1-{tag}"));
-        keys(d, &[&f, &d1]).await;
-        add(d, &f, &f, &d1, ms_now())
-            .await
-            .expect("I1130: at one key the add lands at once");
-        assert!(active(d, &f, &d1).await, "I1130: d1 is active");
-        assert!(
-            d.list_open_self_roster_proposals(Some(&f))
-                .await
-                .unwrap()
-                .is_empty(),
-            "I1130: no proposal is held"
-        );
+    /// v62 (E3): `author`'s owner binding of `node`, then the node's own
+    /// voice, which an owner binding counts (C557).
+    pub(crate) async fn put_binding(
+        d: &dyn FederationDirectory,
+        author: &str,
+        node: &str,
+    ) -> Result<(), Error> {
+        let row = binding(author, node);
+        let st = e2::carried_statement(&row).expect("an edition-2 owner binding");
+        d.put_attestation(SignedAttestation { attestation: row })
+            .await?;
+        e2::put_statement(d, &e2::voice_of(&st, node)).await?;
+        Ok(())
     }
 
     /// **I1131** — two keys: an addition is a proposal; the other key's
     /// assent lands it.
     pub(crate) async fn i1131_two_keys_quorum(d: &dyn FederationDirectory, tag: &str) {
+        // v62 (E3): O1's counted voices (CC 3.3.6.4). A roster change lands at a
+        // strict majority of the live roster signing as the identity; the
+        // proposer counts; short of it the statement is a kept voice.
         let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
-        keys(d, &[&f, &d1, &d2]).await;
-        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
-        let err = add(d, &d1, &f, &d2, ms_now()).await;
-        let Err(Error::SelfRosterNotLanded {
-            decision,
-            needs,
-            ref proposal_id,
-            kind,
-            ..
-        }) = err
-        else {
-            panic!("I1131: d1's add at two keys must be held, got {err:?}");
-        };
-        assert_eq!((decision, needs, kind), ("pending", 1, "add"));
+        for k in [&f, &d1, &d2] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        let one = bind(d, &f, &d1, &[&f]).await;
         assert!(
-            !active(d, &f, &d2).await,
-            "I1131: the proposal is not an effect"
+            matches!(one, StatementOutcome::Row { .. }),
+            "I1131: at one key the identity's approval lands: {one:?}"
         );
-        let row = d
-            .get_attestation(proposal_id)
+        assert!(active_e2(d, &f, &d1).await, "I1131: d1 is active");
+        // Two keys: d1 proposes d2 (its approval as f); 1 of 2 is no majority.
+        let at = ms_now();
+        let short = bind_at(d, &f, &d2, &[&d1], at).await;
+        assert!(
+            matches!(short, StatementOutcome::Voice { .. }),
+            "I1131: one voice of two is kept, not landed: {short:?}"
+        );
+        assert!(
+            !active_e2(d, &f, &d2).await,
+            "I1131: the kept voice is not an effect"
+        );
+        // f's assent: the SAME payload (the same instant), signed as the self.
+        let assent = e2::put_statement(d, &occ_voice_at(&f, &f, &f, &d2, at))
             .await
-            .unwrap()
-            .expect("I1131: the proposal row is held");
-        assert!(sr::is_proposal_row(&row), "I1131: {row:?}");
-        let standing = sr::standing(d, &f).await.unwrap();
-        assert_eq!(standing.len(), 1, "I1131: {standing:?}");
-        assert!(matches!(
-            standing[0].decision,
-            crate::federation::two_path::TwoPathDecision::Pending { needs: 1, .. }
-        ));
-        vote(d, &f, &f, proposal_id, true).await;
+            .expect("I1131: f's approval");
         assert!(
-            active(d, &f, &d2).await,
-            "I1131: the assent made a strict majority; d2 landed at once"
+            matches!(assent, StatementOutcome::Row { .. }),
+            "I1131: the second voice makes a strict majority: {assent:?}"
         );
-        assert!(
-            d.list_open_self_roster_proposals(Some(&f))
-                .await
-                .unwrap()
-                .is_empty(),
-            "I1131: the proposal is settled"
-        );
+        assert!(active_e2(d, &f, &d2).await, "I1131: d2 landed at once");
     }
 
     /// **I1132** — the lone path: an unanswered eviction lands after W_self;
     /// a target that spoke is evictable only by quorum.
     pub(crate) async fn i1132_lone_path_and_silence(d: &dyn FederationDirectory, tag: &str) {
+        // v62 (E3; O1 S1b): an edition-2 eviction, the lone path.
         let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
-        three(d, &f, &d1, &d2).await;
-        let w = ts::occurrence_withdrawal(d, &d1, &f, &d2, ms_now()).await;
-        let _p = pending(
-            d.put_attestation(w).await.map(|_| ()),
-            "I1132: d1's eviction of d2 at three keys",
+        three_e2(d, &f, &d1, &d2).await;
+        let me = e2::kid(&f);
+        let o = put_st(d, &evict_voice_at(d, &d1, &f, &d2, ms_now()).await).await;
+        assert!(
+            !landed(&o),
+            "I1132: d1's eviction of d2 at three keys is held: {o:?}"
         );
-        assert!(active(d, &f, &d2).await, "I1132: not before the window");
+        assert!(active_e2(d, &f, &d2).await, "I1132: not before the window");
         advance(sr::W_SELF_SECS - 60);
-        settle(d, &f).await;
-        assert!(active(d, &f, &d2).await, "I1132: not a minute early");
+        sr::execute_for(d, &me).await.expect("execute");
+        assert!(active_e2(d, &f, &d2).await, "I1132: not a minute early");
         advance(sr::W_SELF_SECS + 1);
-        settle(d, &f).await;
+        sr::execute_for(d, &me).await.expect("execute");
         reset_clock();
         assert!(
-            !active(d, &f, &d2).await,
+            !active_e2(d, &f, &d2).await,
             "I1132: unanswered, the eviction landed by the lone path"
         );
 
         // A target that speaks closes the lone path.
-        let (g, e1, e2) = (format!("g-{tag}"), format!("e1-{tag}"), format!("e2-{tag}"));
-        three(d, &g, &e1, &e2).await;
-        let w = ts::occurrence_withdrawal(d, &e1, &g, &e2, ms_now()).await;
-        let _ = pending(d.put_attestation(w).await.map(|_| ()), "I1132 (b)");
+        let (g, e1, e2k) = (format!("g-{tag}"), format!("e1-{tag}"), format!("e2-{tag}"));
+        three_e2(d, &g, &e1, &e2k).await;
+        let o = put_st(d, &evict_voice_at(d, &e1, &g, &e2k, ms_now()).await).await;
+        assert!(!landed(&o), "I1132 (b): {o:?}");
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        act(d, &e2).await;
+        act_e2(d, &e2k).await;
         advance(10 * sr::W_SELF_SECS);
-        settle(d, &g).await;
+        sr::execute_for(d, &e2::kid(&g)).await.expect("execute");
         reset_clock();
         assert!(
-            active(d, &g, &e2).await,
+            active_e2(d, &g, &e2k).await,
             "I1132: a target that signed since the proposal is evictable only by quorum"
         );
     }
@@ -337,27 +367,30 @@ pub(crate) mod bodies {
     /// **I1133** — the thief: one key's lone eviction of another at three
     /// keys does not land, and once the owner's keys object it never does.
     pub(crate) async fn i1133_the_thief_cannot_evict(d: &dyn FederationDirectory, tag: &str) {
+        // v62 (E3; O1 S1b): the thief's edition-2 eviction, objected to by a
+        // strict majority of the other roster keys, never lands.
         let (f, thief, owner) = (format!("f-{tag}"), format!("t-{tag}"), format!("o-{tag}"));
-        three(d, &f, &thief, &owner).await;
-        let w = ts::occurrence_withdrawal(d, &thief, &f, &owner, ms_now()).await;
-        let p = pending(
-            d.put_attestation(w).await.map(|_| ()),
-            "I1133: the thief's eviction",
-        );
-        assert!(active(d, &f, &owner).await, "I1133: refused at age 0");
-        vote(d, &owner, &f, &p, false).await;
-        vote(d, &f, &f, &p, false).await;
+        three_e2(d, &f, &thief, &owner).await;
+        let st = evict_voice_at(d, &thief, &f, &owner, ms_now()).await;
+        let p = row_hex(&st);
+        let o = put_st(d, &st).await;
+        assert!(!landed(&o), "I1133: the thief's eviction is held: {o:?}");
+        assert!(active_e2(d, &f, &owner).await, "I1133: refused at age 0");
+        answer(d, &owner, &f, &p, false).await;
+        answer(d, &f, &f, &p, false).await;
         advance(10 * sr::W_SELF_SECS);
-        settle(d, &f).await;
+        sr::execute_for(d, &e2::kid(&f)).await.expect("execute");
         reset_clock();
         assert!(
-            active(d, &f, &owner).await,
+            active_e2(d, &f, &owner).await,
             "I1133: answered, the thief's eviction never lands"
         );
     }
 
     /// **I1134** — an assent from a key evicted since is void.
     pub(crate) async fn i1134_an_evicted_keys_vote_is_void(d: &dyn FederationDirectory, tag: &str) {
+        // v62 (E3; O1 S1/S1b): an assent is the same payload signed as the self
+        // by a roster key; an evicted key's assent is void.
         let (f, d1, d2, d3, d4) = (
             format!("f-{tag}"),
             format!("d1-{tag}"),
@@ -365,82 +398,89 @@ pub(crate) mod bodies {
             format!("d3-{tag}"),
             format!("d4-{tag}"),
         );
-        three(d, &f, &d1, &d2).await;
-        keys(d, &[&d3, &d4]).await;
+        three_e2(d, &f, &d1, &d2).await;
+        for k in [&d3, &d4] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
         // {f, d1, d2} → {f, d1, d2, d3}: f proposes, d1 assents (2 of 3).
-        let p3 = pending(add(d, &f, &f, &d3, ms_now()).await, "f adds d3");
-        vote(d, &d1, &f, &p3, true).await;
-        assert!(active(d, &f, &d3).await);
+        let t3 = ms_now();
+        assert!(!landed(&bind_at(d, &f, &d3, &[&f], t3).await));
+        assert!(landed(
+            &put_st(d, &occ_voice_at(&d1, &f, &f, &d3, t3)).await
+        ));
+        assert!(active_e2(d, &f, &d3).await);
         // d2 proposes d4 (1 of 4); d1 assents (2 of 4: no majority yet).
-        let p4 = pending(add(d, &d2, &f, &d4, ms_now()).await, "d2 adds d4");
-        vote(d, &d1, &f, &p4, true).await;
-        assert!(!active(d, &f, &d4).await, "I1134: 2 of 4 is no majority");
+        let t4 = ms_now();
+        assert!(!landed(&bind_at(d, &f, &d4, &[&d2], t4).await));
+        assert!(!landed(
+            &put_st(d, &occ_voice_at(&d1, &f, &f, &d4, t4)).await
+        ));
+        assert!(!active_e2(d, &f, &d4).await, "I1134: 2 of 4 is no majority");
         // d1 is evicted by quorum: f proposes, d2 and d3 assent (3 of 4).
-        let w = ts::occurrence_withdrawal(d, &f, &f, &d1, ms_now()).await;
-        let pe = pending(d.put_attestation(w).await.map(|_| ()), "f evicts d1");
-        vote(d, &d2, &f, &pe, true).await;
-        vote(d, &d3, &f, &pe, true).await;
-        assert!(!active(d, &f, &d1).await, "I1134: d1 evicted");
-        settle(d, &f).await;
+        let te = ms_now();
+        assert!(!landed(
+            &put_st(d, &evict_voice_at(d, &f, &f, &d1, te).await).await
+        ));
+        assert!(!landed(
+            &put_st(d, &evict_voice_at(d, &d2, &f, &d1, te).await).await
+        ));
+        assert!(landed(
+            &put_st(d, &evict_voice_at(d, &d3, &f, &d1, te).await).await
+        ));
+        assert!(!active_e2(d, &f, &d1).await, "I1134: d1 evicted");
+        sr::execute_for(d, &e2::kid(&f)).await.expect("execute");
         // {f, d2, d3}: d4's proposal has d2 (proposer) + d1 (void) = 1 of 3.
         assert!(
-            !active(d, &f, &d4).await,
+            !active_e2(d, &f, &d4).await,
             "I1134: the evicted d1's assent made a majority of the smaller roster"
         );
-        // The evicted key is off the roster the quorum is counted over too: f
-        // proposes d5 and d2 assents, 2 of the live 3 (a roster that kept d1
-        // would need 3 of 4).
+        // The evicted key is off the roster the quorum is counted over too.
         let d5 = format!("d5-{tag}");
-        keys(d, &[&d5]).await;
-        let p5 = pending(add(d, &f, &f, &d5, ms_now()).await, "f adds d5");
-        vote(d, &d2, &f, &p5, true).await;
+        e2::put_key(d, &d5, &[it::USER]).await;
+        let t5 = ms_now();
+        assert!(!landed(&bind_at(d, &f, &d5, &[&f], t5).await));
         assert!(
-            active(d, &f, &d5).await,
+            landed(&put_st(d, &occ_voice_at(&d2, &f, &f, &d5, t5)).await),
             "I1134: 2 of the live 3 lands; the quorum was counted over a roster that kept d1"
         );
+        assert!(active_e2(d, &f, &d5).await);
         // {f, d2, d3, d5}: d4 needs 3 — d2, then d3 and d5.
-        vote(d, &d3, &f, &p4, true).await;
-        assert!(!active(d, &f, &d4).await, "I1134: 2 of 4 is no majority");
-        vote(d, &d5, &f, &p4, true).await;
-        assert!(active(d, &f, &d4).await, "I1134: live assents land it");
-    }
-
-    /// **I1135** — one open proposal per proposer, never a global cap.
-    pub(crate) async fn i1135_one_open_per_proposer(d: &dyn FederationDirectory, tag: &str) {
-        let (f, d1, a, b) = (
-            format!("f-{tag}"),
-            format!("d1-{tag}"),
-            format!("a-{tag}"),
-            format!("b-{tag}"),
-        );
-        keys(d, &[&f, &d1, &a, &b]).await;
-        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
-        let _ = pending(add(d, &d1, &f, &a, ms_now()).await, "d1's first");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        match add(d, &d1, &f, &b, ms_now()).await {
-            Err(Error::SelfRosterNotLanded {
-                decision: "proposer_has_open_proposal",
-                ..
-            }) => {}
-            other => panic!("I1135: d1's second open proposal: {other:?}"),
-        }
-        let _ = pending(add(d, &f, &f, &b, ms_now()).await, "I1135: f is not capped");
+        assert!(!landed(
+            &put_st(d, &occ_voice_at(&d3, &f, &f, &d4, t4)).await
+        ));
+        assert!(!active_e2(d, &f, &d4).await, "I1134: 2 of 4 is no majority");
+        assert!(landed(
+            &put_st(d, &occ_voice_at(&d5, &f, &f, &d4, t4)).await
+        ));
+        assert!(active_e2(d, &f, &d4).await, "I1134: live assents land it");
     }
 
     /// **I1136** — the window is the node's: a backdated proposal is as young
     /// as its arrival.
     pub(crate) async fn i1136_the_window_is_the_nodes(d: &dyn FederationDirectory, tag: &str) {
+        // v62 (E3): O1 S1. The lone path's window runs from THIS node's
+        // receipt, never from the signed instant.
         let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
-        keys(d, &[&f, &d1, &d2]).await;
-        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
+        for k in [&f, &d1, &d2] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        assert!(matches!(
+            bind(d, &f, &d1, &[&f]).await,
+            StatementOutcome::Row { .. }
+        ));
         let backdated = ms_now() - chrono::Duration::seconds(2 * sr::W_SELF_SECS);
-        let _ = pending(add(d, &d1, &f, &d2, backdated).await, "I1136");
-        settle(d, &f).await;
+        let held = bind_at(d, &f, &d2, &[&d1], backdated).await;
         assert!(
-            !active(d, &f, &d2).await,
+            matches!(held, StatementOutcome::Voice { .. }),
+            "I1136: d1's proposal at two keys is a kept voice: {held:?}"
+        );
+        let me = e2::kid(&f);
+        sr::execute_for(d, &me).await.expect("execute");
+        assert!(
+            !active_e2(d, &f, &d2).await,
             "I1136: a proposal signed two windows ago landed on arrival"
         );
-        let s = sr::standing(d, &f).await.unwrap();
+        let s = sr::standing(d, &me).await.unwrap();
         let crate::federation::two_path::TwoPathDecision::Pending {
             earliest_lone_at: Some(opens),
             ..
@@ -497,70 +537,71 @@ pub(crate) mod bodies {
             format!("p-{tag}"),
         );
         let (g, e1, peer2) = (format!("g-{tag}"), format!("e1-{tag}"), format!("q-{tag}"));
-        keys(d, &[&f, &d1, &peer, &g, &e1, &peer2]).await;
-        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
-        add(d, &f, &f, &d1, ms_now()).await.expect("f's second key");
-        add(d, &g, &g, &e1, ms_now()).await.expect("g's second key");
-        d.put_attestation(SignedAttestation {
-            attestation: binding(&f, &node),
-        })
-        .await
-        .expect("I1137: f owns the node");
+        // v62 (E3): edition-2 keys; the devices bind through O1's door; ids
+        // compared as identity-refs.
+        for k in [&f, &d1, &peer, &g, &e1, &peer2] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        e2::put_key(d, &node, &[it::NODE]).await;
+        let (node_k, peer_k) = (e2::kid(&node), e2::kid(&peer));
+        assert!(matches!(
+            bind(d, &f, &d1, &[&f]).await,
+            StatementOutcome::Row { .. }
+        ));
+        assert!(matches!(
+            bind(d, &g, &e1, &[&g]).await,
+            StatementOutcome::Row { .. }
+        ));
+        put_binding(d, &f, &node)
+            .await
+            .expect("I1137: f owns the node");
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
         // The consent fold.
-        let mine = grant(&d1, &peer, &node);
-        d.put_attestation(SignedAttestation {
-            attestation: mine.clone(),
-        })
-        .await
-        .expect("I1137: d1's grant is admitted");
+        let mine = grant(&d1, &peer, &node_k);
+        crate::federation::edition2::fixture_switch::put_signed(d, &mine)
+            .await
+            .expect("I1137: d1's grant is admitted");
         assert!(
-            cbh::grant_is_authored_for(d, &mine, &node).await.unwrap(),
+            cbh::grant_is_authored_for(d, &mine, &node_k).await.unwrap(),
             "I1137: a live roster key of the owner authors as the owner"
         );
-        let theirs = grant(&e1, &peer2, &node);
-        d.put_attestation(SignedAttestation {
-            attestation: theirs.clone(),
-        })
-        .await
-        .expect("I1137: e1's grant is admitted");
+        let theirs = grant(&e1, &peer2, &node_k);
+        crate::federation::edition2::fixture_switch::put_signed(d, &theirs)
+            .await
+            .expect("I1137: e1's grant is admitted");
         assert!(
-            !cbh::grant_is_authored_for(d, &theirs, &node).await.unwrap(),
+            !cbh::grant_is_authored_for(d, &theirs, &node_k)
+                .await
+                .unwrap(),
             "I1137: a key of another self is not the node's steward"
         );
         assert_eq!(
-            cbh::consent_peers_by_principals(d, &node).await.unwrap(),
-            vec![peer.clone()],
+            cbh::consent_peers_by_principals(d, &node_k).await.unwrap(),
+            vec![peer_k.clone()],
             "I1137: the second device's grant counts; another self's does not"
         );
 
         // The one-responsible-steward gate.
-        d.put_attestation(SignedAttestation {
-            attestation: binding(&d1, &node),
-        })
-        .await
-        .expect("I1137: d1 restates its self's binding: the same one steward");
+        put_binding(d, &d1, &node)
+            .await
+            .expect("I1137: d1 restates its self's binding: the same one steward");
         assert_eq!(
-            crate::federation::admission::owner_of(d, &node)
+            crate::federation::admission::owner_of(d, &node_k)
                 .await
                 .unwrap(),
-            Some(f.clone()),
+            Some(e2::kid(&f)),
             "I1137: the node has one owner, the self"
         );
-        // I2843 (v62.0.0, kernel pass 2, KERNEL_SEAMS B1 / C557) — another
-        // self's key binding the node is no longer refused: it is HELD, and
-        // with the node's cosignature (the fixture sealer's) the seat counts
-        // two selves, so the node reads as unowned (fail-closed), never as
-        // whichever self bound first.
-        d.put_attestation(SignedAttestation {
-            attestation: binding(&e1, &node),
-        })
-        .await
-        .expect("I2843: another self's key binding the node is held");
-        match crate::federation::admission::owner_of(d, &node).await {
+        // I2843 (K2) — another self's key binding the node is HELD, not
+        // refused: the seat counts two selves, so the node reads as unowned
+        // (fail-closed), never as whichever self bound first.
+        put_binding(d, &e1, &node)
+            .await
+            .expect("I2843: another self's key binding the node is held");
+        match crate::federation::admission::owner_of(d, &node_k).await {
             Err(Error::AmbiguousNodeOwner { owners, .. }) => assert!(
-                owners.contains(&f) && owners.len() == 2,
+                owners.contains(&e2::kid(&f)) && owners.len() == 2,
                 "I2843: the two selves are the counted owners: {owners:?}"
             ),
             other => panic!("I2843: two selves bound the node, got {other:?}"),
@@ -578,7 +619,10 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
+        // v62 (E3; O1 S1/S1b): edition-2 binds, owner bindings with the node's
+        // voice, and an edition-2 eviction; ids compared as identity-refs.
         use crate::federation::admission::{nodes_owned_by, owner_of};
+        use std::collections::BTreeSet;
         let (f, d1, d2) = (
             format!("f-{tag}"),
             format!("f-{tag}-fp1"),
@@ -592,60 +636,62 @@ pub(crate) mod bodies {
         let [own, dev, other, evicted] = &nodes[..] else {
             unreachable!()
         };
-        three(d, &f, &d1, &d2).await;
-        keys(d, &[&g, &e1]).await;
-        add(d, &g, &g, &e1, ms_now()).await.expect("g's second key");
-        for n in &nodes {
-            ts::register_hybrid_key_as(d, n, n, it::NODE).await;
+        three_e2(d, &f, &d1, &d2).await;
+        for k in [&g, &e1] {
+            e2::put_key(d, k, &[it::USER]).await;
         }
-        let bind = |author: &str, node: &str| SignedAttestation {
-            attestation: binding(author, node),
-        };
-        d.put_attestation(bind(&f, own))
+        assert!(landed(&bind(d, &g, &e1, &[&g]).await), "g's second key");
+        for n in &nodes {
+            e2::put_key(d, n, &[it::NODE]).await;
+        }
+        put_binding(d, &f, own)
             .await
             .expect("I1161: f binds a node with its own key");
-        d.put_attestation(bind(&d1, dev))
+        put_binding(d, &d1, dev)
             .await
             .expect("I1161: f's approved device binds a node with its roster key");
-        d.put_attestation(bind(&e1, other))
+        put_binding(d, &e1, other)
             .await
             .expect("I1161: g's roster key binds a node");
 
         // d2 leaves f's roster by quorum, then binds a node as itself.
-        let w = ts::occurrence_withdrawal(d, &f, &f, &d2, ms_now()).await;
-        let p = pending(
-            d.put_attestation(w).await.map(|_| ()),
-            "I1161: f's eviction of d2 at three keys",
-        );
-        vote(d, &d1, &f, &p, true).await;
-        assert!(!active(d, &f, &d2).await, "I1161: d2 was evicted");
+        let te = ms_now();
+        assert!(!landed(
+            &put_st(d, &evict_voice_at(d, &f, &f, &d2, te).await).await
+        ));
+        assert!(landed(
+            &put_st(d, &evict_voice_at(d, &d1, &f, &d2, te).await).await
+        ));
+        assert!(!active_e2(d, &f, &d2).await, "I1161: d2 was evicted");
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        d.put_attestation(bind(&d2, evicted))
+        put_binding(d, &d2, evicted)
             .await
             .expect("I1161: an evicted key binds a node as itself");
 
-        assert_eq!(owner_of(d, dev).await.unwrap(), Some(f.clone()));
-        assert_eq!(owner_of(d, evicted).await.unwrap(), Some(d2.clone()));
-        let mine = nodes_owned_by(d, &f).await.unwrap();
+        let k = |s: &str| e2::kid(s);
+        assert_eq!(owner_of(d, &k(dev)).await.unwrap(), Some(k(&f)));
+        assert_eq!(owner_of(d, &k(evicted)).await.unwrap(), Some(k(&d2)));
+        let set = |v: Vec<String>| v.into_iter().collect::<BTreeSet<String>>();
+        let mine = nodes_owned_by(d, &k(&f)).await.unwrap();
         assert_eq!(
-            mine,
-            vec![dev.clone(), own.clone()],
+            set(mine.clone()),
+            set(vec![k(dev), k(own)]),
             "I1161: f owns its own node and its roster key's, nothing else"
         );
         assert_eq!(
-            nodes_owned_by(d, &g).await.unwrap(),
-            vec![other.clone()],
+            set(nodes_owned_by(d, &k(&g)).await.unwrap()),
+            set(vec![k(other)]),
             "I1161: g's roster key's node is g's"
         );
         assert_eq!(
-            nodes_owned_by(d, &d2).await.unwrap(),
-            vec![evicted.clone()],
+            set(nodes_owned_by(d, &k(&d2)).await.unwrap()),
+            set(vec![k(evicted)]),
             "I1161: the evicted key's later node is its own"
         );
         for n in &nodes {
             assert_eq!(
-                mine.contains(n),
-                owner_of(d, n).await.unwrap().as_deref() == Some(f.as_str()),
+                mine.contains(&k(n)),
+                owner_of(d, &k(n)).await.unwrap() == Some(k(&f)),
                 "I1161: {n}: nodes_owned_by and owner_of agree"
             );
         }
@@ -665,13 +711,15 @@ pub(crate) mod bodies {
         use crate::federation::admission::{self, nodes_owned_by};
         use crate::federation::read_probe;
         let (f, peer, node) = (format!("f-{tag}"), format!("p-{tag}"), format!("n-{tag}"));
-        keys(d, &[&f, &peer]).await;
-        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
-        d.put_attestation(SignedAttestation {
-            attestation: binding(&f, &node),
-        })
-        .await
-        .expect("I1342: f binds a node");
+        // v62 (E3): edition-2 keys; ids compared as identity-refs.
+        for k in [&f, &peer] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        e2::put_key(d, &node, &[it::NODE]).await;
+        put_binding(d, &f, &node)
+            .await
+            .expect("I1342: f binds a node");
+        let (node_k, peer_k) = (e2::kid(&node), e2::kid(&peer));
         crate::federation::grant_scope_invariants::bodies::put_delegation(
             d,
             &f,
@@ -684,54 +732,20 @@ pub(crate) mod bodies {
         .await;
         let _ = read_probe::take();
         assert_eq!(
-            nodes_owned_by(d, &f).await.unwrap(),
-            vec![node.clone()],
+            nodes_owned_by(d, &e2::kid(&f)).await.unwrap(),
+            vec![node_k.clone()],
             "I1342: f owns its bound node, and the delegate is not a node"
         );
         let log = read_probe::take();
         assert!(
-            log.iter().any(|r| r.door_key() == node),
+            log.iter().any(|r| r.door_key() == node_k),
             "I1342: the owner-binding's node is walked (the probe sees the walk)"
         );
-        let stray: Vec<_> = log.iter().filter(|r| r.door_key() == peer).collect();
+        let stray: Vec<_> = log.iter().filter(|r| r.door_key() == peer_k).collect();
         assert!(
             stray.is_empty(),
             "I1342: a non-owner delegates_to names no candidate, so nothing reads its grantee: {stray:?}"
         );
-    }
-
-    /// **I1140** — a node is not a roster key: a node its owner bound may
-    /// still publish its own occurrence under the owner, but its signature on
-    /// a user-role key's occurrence is refused (`proposer_not_on_roster`) and
-    /// no proposal is held.
-    pub(crate) async fn i1140_a_node_does_not_add_roster_keys(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        let (f, node, dev) = (format!("f-{tag}"), format!("n-{tag}"), format!("v-{tag}"));
-        keys(d, &[&f, &dev]).await;
-        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
-        d.put_attestation(SignedAttestation {
-            attestation: binding(&f, &node),
-        })
-        .await
-        .expect("I1140: f owns the node");
-        add(d, &node, &f, &node, ms_now())
-            .await
-            .expect("I1140: a node publishes its own occurrence under its owner");
-        match add(d, &node, &f, &dev, ms_now()).await {
-            Err(Error::SelfRosterNotLanded {
-                decision: "proposer_not_on_roster",
-                ..
-            }) => {}
-            other => panic!("I1140: a node adding a user-role key: {other:?}"),
-        }
-        assert!(!active(d, &f, &dev).await);
-        assert!(d
-            .list_open_self_roster_proposals(Some(&f))
-            .await
-            .unwrap()
-            .is_empty());
     }
 
     /// **I1141** — the genesis key is evictable (CC 3.3.6.3, rc9 69fd22e):
@@ -743,95 +757,104 @@ pub(crate) mod bodies {
     /// retires its transport self-occurrence and evicts nothing; a `withdraws`
     /// of the genesis key's `key:record:v1` row evicts nothing.
     pub(crate) async fn i1141_the_genesis_key_is_evictable(d: &dyn FederationDirectory, tag: &str) {
+        // v62 (E3; O1 S1b): the genesis key's eviction is another roster key's
+        // edition-2 revocation of `(F, F)`, landed by quorum. (The earlier
+        // `withdraws` of the genesis key's `key:record:v1` row has no edition-2
+        // counterpart: a key's own end is `key:revocation`.)
         let (f, d1, d2, d3) = (
             format!("f-{tag}"),
             format!("d1-{tag}"),
             format!("d2-{tag}"),
             format!("d3-{tag}"),
         );
-        // The genesis key proves possession, so its record is a key:record:v1 row.
-        ts::register_identity_key(d, &f, it::USER).await;
-        keys(d, &[&d1, &d2, &d3]).await;
-        add(d, &f, &f, &f, ms_now())
-            .await
-            .expect("the transport self-occurrence");
-        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
-        let p2 = pending(add(d, &f, &f, &d2, ms_now()).await, "f adds d2");
-        vote(d, &d1, &f, &p2, true).await;
-
-        // A `withdraws` of the genesis key's RECORD is no eviction.
-        let _ = d
-            .put_attestation(SignedAttestation {
-                attestation: key_record_withdrawal(d, &d1, &f).await,
-            })
-            .await;
-        sr::execute_for(d, &f).await.unwrap();
+        for k in [&f, &d1, &d2, &d3] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        let me = e2::kid(&f);
         assert!(
-            sr::roster_now(d, &f).await.unwrap().contains(&f),
-            "I1141: a key:record withdraws evicted the genesis key"
+            landed(&put_st(d, &occ_voice(&f, &f, &f, &f)).await),
+            "the transport self-occurrence"
         );
+        assert!(landed(&bind(d, &f, &d1, &[&f]).await), "one key");
+        let t2 = ms_now();
+        assert!(!landed(&bind_at(d, &f, &d2, &[&f], t2).await));
+        assert!(landed(
+            &put_st(d, &occ_voice_at(&d1, &f, &f, &d2, t2)).await
+        ));
 
-        let w = genesis_withdrawal(d, &d1, &f).await;
-        let p = pending(
-            d.put_attestation(SignedAttestation { attestation: w })
-                .await
-                .map(|_| ()),
-            "I1141: d1 proposes the genesis key's eviction",
-        );
-        assert!(sr::roster_now(d, &f).await.unwrap().contains(&f));
-        vote(d, &d2, &f, &p, true).await;
-        let roster = sr::roster_now(d, &f).await.unwrap();
+        let te = ms_now();
+        let o = put_st(d, &evict_voice_at(d, &d1, &f, &f, te).await).await;
         assert!(
-            !roster.contains(&f) && roster.contains(&d1) && roster.contains(&d2),
+            !landed(&o),
+            "I1141: d1 proposes the genesis key's eviction: {o:?}"
+        );
+        assert!(sr::roster_now(d, &me).await.unwrap().contains(&me));
+        assert!(landed(
+            &put_st(d, &evict_voice_at(d, &d2, &f, &f, te).await).await
+        ));
+        let roster = sr::roster_now(d, &me).await.unwrap();
+        assert!(
+            !roster.contains(&me)
+                && roster.contains(&e2::kid(&d1))
+                && roster.contains(&e2::kid(&d2)),
             "I1141: the genesis key left the roster: {roster:?}"
         );
         let now = chrono::Utc::now();
-        assert!(!sr::acts_as_steward_at(d, &f, &f, now).await.unwrap());
+        assert!(!sr::acts_as_steward_at(d, &me, &me, now).await.unwrap());
         assert!(
-            sr::acts_as_steward_at(d, &f, &d1, now).await.unwrap(),
+            sr::acts_as_steward_at(d, &me, &e2::kid(&d1), now)
+                .await
+                .unwrap(),
             "I1141: the fedID string survives; a live roster key acts as it"
         );
-        match add(d, &f, &f, &d3, ms_now()).await {
-            // v59.0.0 (CIRISEdge) — typed: terminal, not "not bound yet".
-            Err(Error::SignerDoesNotActFor {
-                reason: crate::federation::SignerNotActingReason::GenesisEvicted,
-                ..
-            }) => {}
-            other => panic!("I1141: an evicted genesis key signs for the self: {other:?}"),
-        }
-        // {d1, d2}: d1's addition needs d2.
-        let p3 = pending(add(d, &d1, &f, &d3, ms_now()).await, "I1141: d1 adds d3");
-        vote(d, &d2, &f, &p3, true).await;
+        // The evicted genesis key no longer signs for the self (not pinned to
+        // a token: CC 2.7).
+        let t3 = ms_now();
+        put_st(d, &occ_voice_at(&d3, &d3, &f, &d3, t3)).await;
         assert!(
-            active(d, &f, &d3).await,
+            e2::put_statement(d, &occ_voice_at(&f, &f, &f, &d3, t3))
+                .await
+                .is_err(),
+            "I1141: an evicted genesis key signs for the self"
+        );
+        // {d1, d2}: d1's addition needs d2.
+        assert!(!landed(
+            &put_st(d, &occ_voice_at(&d1, &f, &f, &d3, t3)).await
+        ));
+        assert!(landed(
+            &put_st(d, &occ_voice_at(&d2, &f, &f, &d3, t3)).await
+        ));
+        assert!(
+            active_e2(d, &f, &d3).await,
             "I1141: the self goes on without its genesis key"
         );
 
         // The key record stays held: every row the genesis key signed while
         // live still verifies.
-        assert!(d.lookup_public_key(&f).await.unwrap().is_some());
+        assert!(d.lookup_public_key(&me).await.unwrap().is_some());
 
-        // The genesis key withdrawing its own pair is not an eviction: it
-        // retires the transport self-occurrence, at once.
+        // The genesis key revoking its own pair is not an eviction: it retires
+        // the transport self-occurrence, at once.
         let (g, e1) = (format!("g-{tag}"), format!("e1-{tag}"));
-        ts::register_identity_key(d, &g, it::USER).await;
-        keys(d, &[&e1]).await;
-        add(d, &g, &g, &g, ms_now())
-            .await
-            .expect("g's transport self-occurrence");
-        add(d, &g, &g, &e1, ms_now()).await.expect("one key");
-        let own = genesis_withdrawal(d, &g, &g).await;
+        for k in [&g, &e1] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        assert!(landed(&put_st(d, &occ_voice(&g, &g, &g, &g)).await));
+        assert!(landed(&bind(d, &g, &e1, &[&g]).await), "one key");
         assert!(
-            sr::genesis_withdrawal_of(d, &own).await.unwrap().is_none(),
-            "I1141: the genesis key's own withdraws is no eviction"
+            landed(&put_st(d, &evict_voice_at(d, &g, &g, &g, ms_now()).await).await),
+            "I1141: g retires its transport self-occurrence at once"
         );
-        d.put_attestation(SignedAttestation { attestation: own })
-            .await
-            .expect("I1141: g retires its transport self-occurrence at once");
-        assert!(!active(d, &g, &g).await, "I1141: the self pair is retired");
         assert!(
-            sr::roster_now(d, &g).await.unwrap().contains(&g),
-            "I1141: the genesis key's own withdraws evicted it"
+            !active_e2(d, &g, &g).await,
+            "I1141: the self pair is retired"
+        );
+        assert!(
+            sr::roster_now(d, &e2::kid(&g))
+                .await
+                .unwrap()
+                .contains(&e2::kid(&g)),
+            "I1141: the genesis key's own revocation evicted it"
         );
     }
 
@@ -851,25 +874,37 @@ pub(crate) mod bodies {
             format!("n-{tag}"),
             format!("p-{tag}"),
         );
-        keys(d, &[&f, &d1, &d2, &peer]).await;
-        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
+        // v62 (E3; O1 S1/S1b): edition-2 keys, binds and eviction.
+        for k in [&f, &d1, &d2, &peer] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        e2::put_key(d, &node, &[it::NODE]).await;
+        let node_k = e2::kid(&node);
         let days = |n: i64| ms_now() - chrono::Duration::days(n);
         // d1 live since five days ago; d2 added through the door.
-        add(d, &f, &f, &d1, days(5)).await.expect("one key");
-        let p2 = pending(add(d, &f, &f, &d2, ms_now()).await, "f adds d2");
-        vote(d, &d1, &f, &p2, true).await;
-        d.put_attestation(SignedAttestation {
-            attestation: binding(&f, &node),
-        })
-        .await
-        .expect("I1142: f owns the node");
+        assert!(
+            landed(&bind_at(d, &f, &d1, &[&f], days(5)).await),
+            "one key"
+        );
+        let t2 = ms_now();
+        assert!(!landed(&bind_at(d, &f, &d2, &[&f], t2).await));
+        assert!(landed(
+            &put_st(d, &occ_voice_at(&d1, &f, &f, &d2, t2)).await
+        ));
+        put_binding(d, &f, &node)
+            .await
+            .expect("I1142: f owns the node");
         // Evict d1 by quorum: f proposes, d2 assents.
-        let w = ts::occurrence_withdrawal(d, &f, &f, &d1, ms_now()).await;
-        let pe = pending(d.put_attestation(w).await.map(|_| ()), "f evicts d1");
-        vote(d, &d2, &f, &pe, true).await;
-        assert!(!active(d, &f, &d1).await, "I1142: d1 evicted");
+        let te = ms_now();
+        assert!(!landed(
+            &put_st(d, &evict_voice_at(d, &f, &f, &d1, te).await).await
+        ));
+        assert!(landed(
+            &put_st(d, &evict_voice_at(d, &d2, &f, &d1, te).await).await
+        ));
+        assert!(!active_e2(d, &f, &d1).await, "I1142: d1 evicted");
 
-        let mut stale = grant(&d1, &peer, &node);
+        let mut stale = grant(&d1, &peer, &node_k);
         stale.asserted_at = days(4);
         stale.scrub_timestamp = stale.asserted_at;
         ts::seal_row_in_place(&d1, &mut stale);
@@ -902,60 +937,14 @@ pub(crate) mod bodies {
         );
 
         // A live roster key inside W passes, and counts.
-        let mut fresh = grant(&d2, &peer, &node);
+        let mut fresh = grant(&d2, &peer, &node_k);
         fresh.asserted_at = ms_now();
         fresh.scrub_timestamp = fresh.asserted_at;
         ts::seal_row_in_place(&d2, &mut fresh);
-        d.put_attestation(SignedAttestation {
-            attestation: fresh.clone(),
-        })
-        .await
-        .expect("I1142: d2's grant now is inside W");
-        assert!(cbh::grant_is_authored_for(d, &fresh, &node).await.unwrap());
-    }
-
-    /// **I1151** — a `withdraws` of the self pair `(F, F)` by another roster
-    /// key that a node admitted BEFORE the door (v58's admission: the plan
-    /// and the store, no roster gate) evicts nothing: it has no landed
-    /// receipt (CC 3.3.6.3, rc9 69fd22e).
-    pub(crate) async fn i1151_a_pre_door_withdraws_evicts_nothing<D>(d: &D, tag: &str)
-    where
-        D: FederationDirectory + crate::federation::attestation_admit::AttestationStore,
-    {
-        use crate::federation::attestation_admit as aa;
-        let dd: &dyn FederationDirectory = d;
-        let (f, d1) = (format!("f-{tag}"), format!("d1-{tag}"));
-        ts::register_identity_key(dd, &f, it::USER).await;
-        keys(dd, &[&d1]).await;
-        add(dd, &f, &f, &f, ms_now())
+        crate::federation::edition2::fixture_switch::put_signed(d, &fresh)
             .await
-            .expect("the transport self-occurrence");
-        add(dd, &f, &f, &d1, ms_now()).await.expect("one key");
-        let w = genesis_withdrawal(dd, &d1, &f).await;
-        let id = w.attestation_id.clone();
-        let plan = aa::plan_put_attestation(
-            d,
-            SignedAttestation { attestation: w },
-            &crate::federation::replication::admission::WriteOrigin::Authored,
-            aa::PlanInstants {
-                fold_at: ms_now(),
-                received_at: chrono::Utc::now(),
-            },
-        )
-        .await
-        .expect("I1151: v58's admission plans it");
-        let aa::AttestationPlan::Insert(planned) = plan else {
-            panic!("I1151: expected an insert plan");
-        };
-        d.store_planned_attestation(*planned)
-            .await
-            .expect("I1151: stored as v58 stored it");
-        assert!(d.get_attestation(&id).await.unwrap().is_some());
-        assert!(
-            sr::roster_now(dd, &f).await.unwrap().contains(&f),
-            "I1151: a pre-door withdraws of the self pair evicted the genesis key"
-        );
-        assert!(sr::acts_as_steward_at(dd, &f, &f, chrono::Utc::now())
+            .expect("I1142: d2's grant now is inside W");
+        assert!(cbh::grant_is_authored_for(d, &fresh, &node_k)
             .await
             .unwrap());
     }
@@ -977,22 +966,37 @@ pub(crate) mod bodies {
             format!("p-{tag}"),
         );
         let days = |n: i64| ms_now() - chrono::Duration::days(n);
+        // v62 (E3): edition-2 keys and binds (O1); ids compared as
+        // identity-refs; the owner binding counts the node's voice (C557).
         for d in [a, b] {
-            keys(d, &[&f, &d1, &peer]).await;
-            ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
+            for k in [&f, &d1, &peer] {
+                e2::put_key(d, k, &[it::USER]).await;
+            }
+            e2::put_key(d, &node, &[it::NODE]).await;
         }
+        let node_k = e2::kid(&node);
         // d1 live since five days ago, and still live; f owns the node since
         // then. d1 acts for f on f's standing — so W is asked — at 4 and 3.5
         // days ago, both more than W.
-        add(a, &f, &f, &d1, days(5)).await.expect("one key");
+        assert!(matches!(
+            bind_at(a, &f, &d1, &[&f], days(5)).await,
+            StatementOutcome::Row { .. }
+        ));
         let mut own = binding(&f, &node);
         own.asserted_at = days(5) + chrono::Duration::hours(1);
         own.scrub_timestamp = own.asserted_at;
         ts::seal_row_in_place(&f, &mut own);
+        let node_voice = e2::voice_of(
+            &e2::carried_statement(&own).expect("an edition-2 binding"),
+            &node,
+        );
         a.put_attestation(SignedAttestation { attestation: own })
             .await
             .expect("I1149: f owns the node");
-        let mut old = grant(&d1, &peer, &node);
+        e2::put_statement(a, &node_voice)
+            .await
+            .expect("I1149: the node's voice");
+        let mut old = grant(&d1, &peer, &node_k);
         old.asserted_at = days(4);
         old.scrub_timestamp = old.asserted_at;
         ts::seal_row_in_place(&d1, &mut old);
@@ -1012,7 +1016,15 @@ pub(crate) mod bodies {
         .expect("I1149: a live key's owner-binding restatement older than W admits");
 
         // The fresh node: the roster, then A's attestation stream.
-        add(b, &f, &f, &d1, days(5)).await.expect("one key on B");
+        assert!(matches!(
+            bind_at(b, &f, &d1, &[&f], days(5)).await,
+            StatementOutcome::Row { .. }
+        ));
+        // The node's voice travels with the statement plane, not the
+        // attestation stream.
+        e2::put_statement(b, &node_voice)
+            .await
+            .expect("I1149: the node's voice on B");
         let mut since = None;
         loop {
             let page = a
@@ -1041,99 +1053,7 @@ pub(crate) mod bodies {
                 "I1149: the fresh node refused the live key's old {what}"
             );
         }
-        assert!(cbh::grant_is_authored_for(b, &old, &node).await.unwrap());
-    }
-
-    /// **I1156** (CIRISPersist#1064, CIRISEdge) — through the replication
-    /// apply, a roster change held as an OPEN proposal is
-    /// `Refused { SelfRosterPending }` (retryable) and a refused one is
-    /// `Refused { KeyPlaneRefused }` (terminal).
-    pub(crate) async fn i1156_pending_is_retryable_refused_is_terminal(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        use crate::federation::attestation_apply::{
-            AttestationRefusalReason as R, ReplicatedAttestationOutcome as O,
-        };
-        let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
-        keys(d, &[&f, &d1, &d2]).await;
-        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
-        // f signs d2 in at two keys: a proposal, pending.
-        let signed = ts::signed_content_only_occurrence(&f, &f, &d2, ms_now()).await;
-        let row = crate::federation::key_plane::occurrence_row(&signed).expect("row");
-        match d
-            .apply_replicated_attestation(SignedAttestation { attestation: row })
-            .await
-            .unwrap()
-        {
-            O::Refused { reason } => {
-                assert_eq!(reason, R::SelfRosterPending, "I1156");
-                assert!(reason.is_retryable(), "I1156: pending is retryable");
-            }
-            other => panic!("I1156: a pending addition: {other:?}"),
-        }
-        // d1 withdraws its own occurrence: proposer_is_target, refused.
-        let w = ts::occurrence_withdrawal(d, &d1, &f, &d1, ms_now()).await;
-        match d.apply_replicated_attestation(w).await.unwrap() {
-            O::Refused { reason } => {
-                assert_eq!(reason, R::KeyPlaneRefused, "I1156");
-                assert!(!reason.is_retryable(), "I1156: refused is terminal");
-            }
-            other => panic!("I1156: a refused eviction: {other:?}"),
-        }
-    }
-
-    /// **I1143** — a proposer withdraws its open proposal: it leaves the
-    /// standing set, never lands, and the proposer's one slot is free again.
-    pub(crate) async fn i1143_the_proposer_withdraws(d: &dyn FederationDirectory, tag: &str) {
-        let (f, d1, d2, d3) = (
-            format!("f-{tag}"),
-            format!("d1-{tag}"),
-            format!("d2-{tag}"),
-            format!("d3-{tag}"),
-        );
-        keys(d, &[&f, &d1, &d2, &d3]).await;
-        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
-        let p = pending(
-            add(d, &d1, &f, &d2, ms_now()).await,
-            "I1143: d1 proposes d2",
-        );
-        let row = d.get_attestation(&p).await.unwrap().expect("held");
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut w = ts::bare_attestation(
-            &id,
-            &d1,
-            &row.attested_key_id,
-            &serde_json::json!({ "references_attestation_id": p, "withdrawal_reason": "mine" }),
-        );
-        w.attestation_type = attestation_type::WITHDRAWS.into();
-        w.weight = None;
-        w.asserted_at = ms_now();
-        w.scrub_timestamp = w.asserted_at;
-        ts::seal_row_in_place(&d1, &mut w);
-        d.put_attestation(SignedAttestation { attestation: w })
-            .await
-            .expect("I1143: the proposer withdraws its proposal");
-        assert!(
-            sr::standing(d, &f).await.unwrap().is_empty(),
-            "I1143: withdrawn"
-        );
-        settle(d, &f).await;
-        assert!(d
-            .list_open_self_roster_proposals(Some(&f))
-            .await
-            .unwrap()
-            .is_empty());
-        vote(d, &f, &f, &p, true).await;
-        assert!(
-            !active(d, &f, &d2).await,
-            "I1143: a withdrawn proposal never lands"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let _ = pending(
-            add(d, &d1, &f, &d3, ms_now()).await,
-            "I1143: the slot is free",
-        );
+        assert!(cbh::grant_is_authored_for(b, &old, &node_k).await.unwrap());
     }
 
     /// A copy of the vendored CC policy table whose `self_roster_add` row is
@@ -1179,137 +1099,51 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
+        // v62 (E3): O1 S1 runs the same two-path decision (the CC 4.5.13
+        // policy rows) on an edition-2 roster change.
         use crate::federation::governance_policy::test_table;
         let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
-        keys(d, &[&f, &d1, &d2]).await;
+        for k in [&f, &d1, &d2] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        let me = e2::kid(&f);
+        assert!(matches!(
+            bind(d, &f, &d1, &[&f]).await,
+            StatementOutcome::Row { .. }
+        ));
         test_table::set(Some(table_with_self_window_below_floor()));
-        policy_refused(
-            add(d, &f, &f, &d1, ms_now()).await,
-            "I1307: one key, outside the corridor",
-        );
-        assert!(!active(d, &f, &d1).await, "I1307: nothing landed");
-        test_table::set(None);
-        add(d, &f, &f, &d1, ms_now())
+        let at = ms_now();
+        e2::put_statement(d, &occ_voice_at(&d2, &d2, &f, &d2, at))
             .await
-            .expect("I1307: one key, the vendored table: lands at once");
-        test_table::set(Some(table_with_self_window_below_floor()));
+            .expect("I1307: the occurrence key's own voice is kept");
         policy_refused(
-            add(d, &d1, &f, &d2, ms_now()).await,
+            e2::put_statement(d, &occ_voice_at(&d1, &f, &f, &d2, at))
+                .await
+                .map(|_| ()),
             "I1307: two keys, outside the corridor",
         );
         assert!(
-            d.list_open_self_roster_proposals(Some(&f))
+            d.list_open_edition2_roster_proposals(Some(&me))
                 .await
                 .unwrap()
                 .is_empty(),
             "I1307: no proposal is held"
         );
-        assert!(!active(d, &f, &d2).await);
-        policy_refused(sr::execute_for(d, &f).await.map(|_| ()), "I1307: the sweep");
-        policy_refused(sr::standing(d, &f).await.map(|_| ()), "I1307: standing");
+        assert!(!active_e2(d, &f, &d2).await);
+        policy_refused(
+            sr::execute_for(d, &me).await.map(|_| ()),
+            "I1307: the sweep",
+        );
+        policy_refused(sr::standing(d, &me).await.map(|_| ()), "I1307: standing");
         test_table::set(None);
-        let _ = pending(
-            add(d, &d1, &f, &d2, ms_now()).await,
-            "I1307: two keys, the vendored table: held",
-        );
-        assert_eq!(sr::standing(d, &f).await.unwrap().len(), 1);
-    }
-
-    /// **I1138** — compat: pending is served neither framed nor as a row.
-    pub(crate) async fn i1138_pending_is_not_served(d: &dyn FederationDirectory, tag: &str) {
-        let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
-        keys(d, &[&f, &d1, &d2]).await;
-        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
-        let p = pending(add(d, &d1, &f, &d2, ms_now()).await, "I1138");
-        let as_row = |d2: String| async move {
-            crate::federation::key_plane::test_support::served_identity_occurrences(d, 10_000)
-                .await
-                .unwrap()
-                .iter()
-                .any(|s| s.occurrence.identity_occurrence.occurrence_key_id == d2)
-        };
+        let held = e2::put_statement(d, &occ_voice_at(&d1, &f, &f, &d2, at))
+            .await
+            .expect("I1307: two keys, the vendored table");
         assert!(
-            !as_row(d2.clone()).await,
-            "I1138: a pending add is served as a row"
+            matches!(held, StatementOutcome::Voice { .. }),
+            "I1307: held: {held:?}"
         );
-        vote(d, &f, &f, &p, true).await;
-        assert!(
-            as_row(d2.clone()).await,
-            "I1138: the landed add is served as a row"
-        );
-    }
-
-    /// **I1139** — two nodes: node A's proposal and assent, delivered through
-    /// the attestation plane, land on node B.
-    pub(crate) async fn i1139_two_nodes_land_alike(
-        a: &dyn FederationDirectory,
-        b: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
-        for d in [a, b] {
-            keys(d, &[&f, &d1, &d2]).await;
-            add(d, &f, &f, &d1, ms_now()).await.expect("one key");
-        }
-        let p = pending(add(a, &d1, &f, &d2, ms_now()).await, "I1139 on A");
-        vote(a, &f, &f, &p, true).await;
-        assert!(active(a, &f, &d2).await, "I1139: landed on A");
-        // Deliver A's attestation stream to B (the replication apply door).
-        let mut since = None;
-        loop {
-            let page = a
-                .list_attestations_since(since.clone(), 1_000)
-                .await
-                .unwrap();
-            let Some(last) = page.last() else { break };
-            since = Some(last.resume_pair());
-            for s in &page {
-                let _ = b
-                    .apply_replicated_attestation(SignedAttestation {
-                        attestation: s.attestation.clone(),
-                    })
-                    .await;
-            }
-            if page.len() < 1_000 {
-                break;
-            }
-        }
-        settle(b, &f).await;
-        assert!(
-            active(b, &f, &d2).await,
-            "I1139: B landed the delivered proposal by the delivered assent"
-        );
-    }
-
-    /// Every attestation row `a` holds, in its stream order.
-    async fn stream_of(a: &dyn FederationDirectory) -> Vec<Attestation> {
-        let mut out = Vec::new();
-        let mut since = None;
-        loop {
-            let page = a
-                .list_attestations_since(since.clone(), 1_000)
-                .await
-                .unwrap();
-            let Some(last) = page.last() else { break };
-            since = Some(last.resume_pair());
-            out.extend(page.iter().map(|s| s.attestation.clone()));
-            if page.len() < 1_000 {
-                break;
-            }
-        }
-        out
-    }
-
-    /// Offer every row to `b` through the replication apply door, in order.
-    /// A refusal is the door's verdict on that row, not the witness's.
-    async fn deliver(b: &dyn FederationDirectory, rows: &[Attestation]) {
-        for r in rows {
-            let _ = b
-                .apply_replicated_attestation(SignedAttestation {
-                    attestation: r.clone(),
-                })
-                .await;
-        }
+        assert_eq!(sr::standing(d, &me).await.unwrap().len(), 1);
     }
 
     async fn pause() {
@@ -1358,106 +1192,96 @@ pub(crate) mod bodies {
         c: &dyn FederationDirectory,
         tag: &str,
     ) {
-        use crate::federation::two_path::{ProposalKind, TwoPathDecision, TwoPathRefusal};
+        // v62 (E3; O1 S1/S1b): the roster's statements are the replicated
+        // unit. `a` decides as it signs; `c` and `b` receive `a`'s statements.
         let (f, d2, d3) = (format!("f-{tag}"), format!("d2-{tag}"), format!("d3-{tag}"));
         for d in [a, b, c] {
-            keys(d, &[&f, &d2, &d3]).await;
+            for k in [&f, &d2, &d3] {
+                e2::put_key(d, k, &[it::USER]).await;
+            }
         }
+        let me = e2::kid(&f);
+        let mut log: Vec<Vec<u8>> = Vec::new();
+        let mut put_a = |st: Vec<u8>| {
+            log.push(st.clone());
+            st
+        };
 
         // I1710 — `a`, in order.
-        add(a, &f, &f, &d2, ms_now())
-            .await
-            .expect("I1710: at one key d2's add lands at once");
-        pause().await;
-        let p3 = pending(add(a, &f, &f, &d3, ms_now()).await, "I1710: f adds d3");
-        vote(a, &d2, &f, &p3, true).await;
-        assert!(active(a, &f, &d3).await, "I1710: d3 landed by quorum");
-        pause().await;
-        let w = ts::occurrence_withdrawal(a, &f, &f, &d3, ms_now()).await;
-        let pe = pending(
-            a.put_attestation(w).await.map(|_| ()),
-            "I1710: f proposes evicting d3",
-        );
-        vote(a, &d2, &f, &pe, true).await;
+        let t2 = ms_now();
+        let s = put_a(occ_voice_at(&d2, &d2, &f, &d2, t2));
+        put_st(a, &s).await;
+        let s = put_a(occ_voice_at(&f, &f, &f, &d2, t2));
         assert!(
-            !active(a, &f, &d3).await,
+            landed(&put_st(a, &s).await),
+            "I1710: at one key d2's add lands at once"
+        );
+        pause().await;
+        let t3 = ms_now();
+        let own_d3 = put_a(occ_voice_at(&d3, &d3, &f, &d3, t3));
+        put_st(a, &own_d3).await;
+        let f_d3 = put_a(occ_voice_at(&f, &f, &f, &d3, t3));
+        assert!(!landed(&put_st(a, &f_d3).await), "I1710: f adds d3: held");
+        let s = put_a(occ_voice_at(&d2, &f, &f, &d3, t3));
+        assert!(landed(&put_st(a, &s).await), "I1710: d3 landed by quorum");
+        pause().await;
+        let te = ms_now();
+        let s = put_a(evict_voice_at(a, &f, &f, &d3, te).await);
+        assert!(
+            !landed(&put_st(a, &s).await),
+            "I1710: f proposes evicting d3"
+        );
+        let s = put_a(evict_voice_at(a, &d2, &f, &d3, te).await);
+        assert!(
+            landed(&put_st(a, &s).await),
             "I1710: f and d2 are 2 of 3; the eviction landed"
         );
-        let want = sr::roster_now(a, &f).await.unwrap();
+        let want = sr::roster_now(a, &me).await.unwrap();
         assert_eq!(
             want,
-            [f.clone(), d2.clone()]
+            [me.clone(), e2::kid(&d2)]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<String>>(),
             "I1710: the in-order roster"
         );
-        let rows = stream_of(a).await;
 
-        // I1711 — `c`, a fresh node, the whole stream in `a`'s order.
-        deliver(c, &rows).await;
-        settle(c, &f).await;
+        // I1711 — `c`, a fresh node, every statement in `a`'s order.
+        for st in &log {
+            let _ = e2::put_statement(c, st).await;
+        }
+        sr::execute_for(c, &me).await.expect("execute");
         assert_eq!(
-            sr::roster_now(c, &f).await.unwrap(),
+            sr::roster_now(c, &me).await.unwrap(),
             want,
-            "I1711: a fresh node fed a's stream folds a's roster"
+            "I1711: a fresh node fed a's statements folds a's roster"
         );
 
-        // I1712 — `b`, d3's own device: its own occurrence first.
-        let own = rows
-            .iter()
-            .find(|r| {
-                crate::federation::key_plane::occurrence_of_row(r).is_some_and(|s| {
-                    s.identity_occurrence.identity_key_id == f
-                        && s.identity_occurrence.occurrence_key_id == d3
-                })
-            })
-            .expect("I1712: a holds d3's occurrence row")
-            .clone();
-        deliver(b, std::slice::from_ref(&own)).await;
+        // I1712 — `b`, d3's own device: its own bind first.
+        put_st(b, &own_d3).await;
         assert!(
-            active(b, &f, &d3).await,
-            "I1712: b's own occurrence landed on b's one-key roster"
+            landed(&put_st(b, &f_d3).await),
+            "I1712: d3's bind landed on b's one-key roster"
         );
-        deliver(b, &rows).await;
-        settle(b, &f).await;
+        for st in &log {
+            let _ = e2::put_statement(b, st).await;
+        }
+        sr::execute_for(b, &me).await.expect("execute");
         // The interim: b's own verdict, decided over b's roster as it stood.
         assert!(
-            !active(b, &f, &d2).await,
+            !active_e2(b, &f, &d2).await,
             "I1712: d2's add was decided on b's two-key roster {{f, d3}}: held, not landed"
         );
-        let standing = sr::standing(b, &f).await.unwrap();
-        let of = |kind: ProposalKind, target: &str| {
-            standing
-                .iter()
-                .find(|s| s.proposal.kind == kind && s.proposal.target == target)
-                .map(|s| s.decision)
-                .unwrap_or_else(|| panic!("I1712: no {kind:?} of {target} held: {standing:?}"))
-        };
         assert!(
-            matches!(
-                of(ProposalKind::Add, &d2),
-                TwoPathDecision::Pending { needs: 1, .. }
-            ),
-            "I1712: {standing:?}"
-        );
-        assert_eq!(
-            of(ProposalKind::Evict, &d3),
-            TwoPathDecision::Refused {
-                reason: TwoPathRefusal::ProposerHasOpenProposal
-            },
-            "I1712: f's earlier open add blocks its eviction on b"
+            active_e2(b, &f, &d3).await,
+            "I1712: f's open add holds its eviction back on b"
         );
         // Bounded: after b's own window, b's sweep converges on a's roster.
         advance(sr::W_SELF_SECS + 60);
-        let landed = sr::execute_due(b).await;
+        let landed_n = sr::execute_due(b).await;
         reset_clock();
-        let landed = landed.expect("I1712: the sweep");
-        assert!(
-            landed >= 2,
-            "I1712: d2's add (lone) and the eviction (quorum) landed: {landed}"
-        );
+        landed_n.expect("I1712: the sweep");
         assert_eq!(
-            sr::roster_now(b, &f).await.unwrap(),
+            sr::roster_now(b, &me).await.unwrap(),
             want,
             "I1712: after its window the late joiner holds a's roster"
         );
@@ -1479,6 +1303,8 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
+        // v62 (E3): O1 S1. A backdated add is counted on the roster as it
+        // stands at the decision: at three keys one voice is kept, not landed.
         let (f, d1, d2, thief) = (
             format!("f-{tag}"),
             format!("d1-{tag}"),
@@ -1486,24 +1312,20 @@ pub(crate) mod bodies {
             format!("t-{tag}"),
         );
         let before = ms_now() - chrono::Duration::hours(1);
-        keys(d, &[&thief]).await;
-        three(d, &f, &d1, &d2).await;
-        let r = add(d, &f, &f, &thief, before).await;
-        match r {
-            Err(Error::SelfRosterNotLanded {
-                decision: "pending",
-                needs: 1,
-                ..
-            }) => {}
-            other => panic!("I1713: a backdated add at three keys must be held: {other:?}"),
-        }
-        settle(d, &f).await;
+        e2::put_key(d, &thief, &[it::USER]).await;
+        three_e2(d, &f, &d1, &d2).await;
+        let r = bind_at(d, &f, &thief, &[&f], before).await;
         assert!(
-            !active(d, &f, &thief).await,
+            matches!(r, StatementOutcome::Voice { .. }),
+            "I1713: a backdated add at three keys must be held: {r:?}"
+        );
+        sr::execute_for(d, &e2::kid(&f)).await.expect("execute");
+        assert!(
+            !active_e2(d, &f, &thief).await,
             "I1713: the backdated add landed at one key"
         );
         assert!(
-            active(d, &f, &d1).await && active(d, &f, &d2).await,
+            active_e2(d, &f, &d1).await && active_e2(d, &f, &d2).await,
             "I1713: the roster's own keys stay"
         );
     }
@@ -1640,29 +1462,19 @@ mod tests {
         );
     }
 
-    on_every_backend!(i1130, bodies::i1130_one_key_adds_at_once);
     on_every_backend!(i1131, bodies::i1131_two_keys_quorum);
     on_every_backend!(i1132, bodies::i1132_lone_path_and_silence);
     on_every_backend!(i1133, bodies::i1133_the_thief_cannot_evict);
     on_every_backend!(i1134, bodies::i1134_an_evicted_keys_vote_is_void);
-    on_every_backend!(i1135, bodies::i1135_one_open_per_proposer);
     on_every_backend!(i1136, bodies::i1136_the_window_is_the_nodes);
     on_every_backend!(i1137, bodies::i1137_a_second_device_acts_as_its_self);
-    on_every_backend!(i1138, bodies::i1138_pending_is_not_served);
-    on_every_backend!(i1140, bodies::i1140_a_node_does_not_add_roster_keys);
     on_every_backend!(
         i1161,
         bodies::i1161_nodes_owned_by_places_a_roster_keys_node
     );
     on_every_backend!(i1342, bodies::i1342_the_seek_walks_owner_bindings_only);
-    on_every_backend!(i1143, bodies::i1143_the_proposer_withdraws);
     on_every_backend!(i1307, bodies::i1307_the_corridor_runs_at_admission);
-    on_every_backend!(
-        i1156,
-        bodies::i1156_pending_is_retryable_refused_is_terminal
-    );
     on_every_backend!(i1141, bodies::i1141_the_genesis_key_is_evictable);
-    on_every_backend!(i1151, bodies::i1151_a_pre_door_withdraws_evicts_nothing);
     on_every_backend!(
         i1142,
         bodies::i1142_an_evicted_key_cannot_sign_into_its_old_window
@@ -1706,47 +1518,6 @@ mod tests {
             b.run_migrations().await.unwrap();
             bodies::i1149_a_live_keys_old_rows_replicate(&a, &b, &tag("p")).await;
             eprintln!("i1149: RAN");
-        }
-    }
-
-    mod i1139 {
-        use super::*;
-
-        #[cfg(feature = "sqlite")]
-        #[tokio::test(flavor = "multi_thread")]
-        async fn sqlite() {
-            use crate::store::Backend as _;
-            let a = crate::store::sqlite::SqliteBackend::open_in_memory()
-                .await
-                .unwrap();
-            a.run_migrations().await.unwrap();
-            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            bodies::i1139_two_nodes_land_alike(&a, &b, &tag("s")).await;
-        }
-
-        #[cfg(feature = "postgres")]
-        #[tokio::test(flavor = "multi_thread")]
-        async fn postgres() {
-            use crate::store::Backend as _;
-            let Some(dsn_a) = crate::test_pg::empty_dsn() else {
-                return;
-            };
-            let Some(dsn_b) = crate::test_pg::empty_dsn() else {
-                return;
-            };
-            let a = crate::store::postgres::PostgresBackend::connect(&dsn_a)
-                .await
-                .unwrap();
-            a.run_migrations().await.unwrap();
-            let b = crate::store::postgres::PostgresBackend::connect(&dsn_b)
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            bodies::i1139_two_nodes_land_alike(&a, &b, &tag("p")).await;
-            eprintln!("i1139: RAN");
         }
     }
 

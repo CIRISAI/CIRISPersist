@@ -116,6 +116,7 @@ DELEGATED_DEFAULTS = (
     "fold_state",
     "fold_slot_rows",
     "fold_any_refolding",
+    "fold_slot_held",
 )
 
 # NOT_DELEGATED — an `Unsupported`-bodied default the double must NOT delegate,

@@ -342,15 +342,18 @@ impl CallerAdmission {
     }
 }
 
-/// v4.8.0 (CIRISPersist#161 Ask 6) — `build_caller_admission` honors
-/// revocation: a revoked occurrence falls through to the singleton
-/// fallback and a removed family member drops out of `family_key_ids`.
+// v4.8.0 (CIRISPersist#161 Ask 6) — `build_caller_admission` honors
+// revocation: a revoked occurrence falls through to the singleton
+// fallback and a removed family member drops out of `family_key_ids`.
 #[cfg(all(test, feature = "sqlite"))]
 mod revocation_honesty_tests {
-    use crate::federation::{
-        FamilyMembershipRevocation, FederationDirectory, IdentityOccurrence,
-        IdentityOccurrenceRevocation, KeyRecord, SignedKeyRecord,
-    };
+    //! v62.0.0 (flip wave 2, slice E6) — every key is an edition-2
+    //! `key:record` (`fixture_switch::put_key`) named by its kid; the family
+    //! lands as its `group:roster` voices and the removal as its
+    //! `membership:removal` voice (T1's `family_voices` /
+    //! `family_revocation_voices`, through `put_statement`).
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::{FamilyMembershipRevocation, IdentityOccurrenceRevocation};
     use crate::signing::LocalSigner;
     use crate::Engine;
     use ed25519_dalek::SigningKey;
@@ -365,62 +368,22 @@ mod revocation_honesty_tests {
         ))
     }
 
-    fn key(k: &str) -> SignedKeyRecord {
-        // v21.0.0 (CIRISPersist#502 E4) — REAL deterministic hybrid pubkeys
-        // (was an all-zeros placeholder) so `k` can also act as a `Signed*`
-        // authority (`sign_family` / `sign_family_membership_revocation`
-        // below sign with the SAME derivation).
-        let (ed_pk, mldsa_pk) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(k);
-        SignedKeyRecord {
-            record: KeyRecord {
-                key_id: k.into(),
-                pubkey_ed25519_base64: ed_pk,
-                pubkey_ml_dsa_65_base64: mldsa_pk,
-                algorithm: crate::federation::types::algorithm::HYBRID.into(),
-                identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
-                identity_ref: k.into(),
-                valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
-                valid_until: None,
-                registration_envelope: serde_json::json!({ "id": k }),
-                original_content_hash: "deadbeef".into(),
-                scrub_signature_classical: "c2ln".into(),
-                scrub_signature_pqc: None,
-                scrub_key_id: k.into(),
-                scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            },
-        }
+    fn now_ms() -> u64 {
+        u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after the epoch")
     }
 
-    #[tokio::test]
-    async fn revoked_occurrence_falls_through_to_singleton() {
-        let engine = Engine::with_signer(signer(), "sqlite::memory:")
-            .await
-            .expect("engine");
-        let sq = engine.sqlite_backend().expect("sqlite").clone();
-        for k in ["alice-root", "alice-phone", "fam-1"] {
-            sq.put_public_key(key(k)).await.unwrap();
-        }
-        sq.put_identity_occurrence_local(IdentityOccurrence {
-            identity_key_id: "alice-root".into(),
-            occurrence_key_id: "alice-phone".into(),
-            device_class: crate::federation::types::device_class::PHONE.into(),
-            hardware_attestation: None,
-            asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .unwrap();
-        sq.put_family(crate::federation::tier_ingest::test_support::sign_family(
+    /// `seed`'s key, live; its kid.
+    async fn key(d: &crate::store::sqlite::SqliteBackend, seed: &str) -> String {
+        e2::put_key(d, seed, &[crate::federation::types::identity_type::USER]).await
+    }
+
+    /// The family `fam-1` founded with `member` (seeds), landed as its
+    /// roster voices; the roster version's row id.
+    async fn found_family(
+        d: &crate::store::sqlite::SqliteBackend,
+        member: &str,
+    ) -> crate::federation::edition2::names::RowId {
+        let signed = crate::federation::tier_ingest::test_support::sign_family(
             "fam-1",
             crate::federation::Family {
                 prev_head_digest: String::new(),
@@ -428,7 +391,7 @@ mod revocation_honesty_tests {
                 family_key_id: "fam-1".into(),
                 family_name: "Fam".into(),
                 members: vec![crate::federation::FamilyMember {
-                    key_id: "alice-root".into(),
+                    key_id: member.into(),
                     joined_at: "2026-06-01T00:00:00Z".parse().unwrap(),
                     role: None,
                 }],
@@ -438,39 +401,78 @@ mod revocation_honesty_tests {
                 dissolved_at: None,
                 persist_row_hash: String::new(),
             },
-        ))
+        );
+        let voices = e2::family_voices(&signed, 1, None, now_ms());
+        e2::put_voices(d, &voices)
+            .await
+            .expect("the family's roster voices land");
+        e2::row_id_of(&voices[0])
+    }
+
+    #[tokio::test]
+    async fn revoked_occurrence_falls_through_to_singleton() {
+        let engine = Engine::with_signer(signer(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        let root = key(&sq, "alice-root").await;
+        let phone = key(&sq, "alice-phone").await;
+        let fam = key(&sq, "fam-1").await;
+        // v62 (X2 pass 2): the occurrence's local door is gone (O1/T2); the
+        // bind is the identity's own edition-2 `identity:occurrence` voice.
+        e2::put_bind(
+            &*sq,
+            "alice-root",
+            "alice-root",
+            "alice-phone",
+            crate::federation::types::device_class::PHONE,
+            &e2::BindOptions::default(),
+        )
         .await
-        .unwrap();
+        .expect("the occurrence bind lands");
+        found_family(&sq, "alice-root").await;
 
         // Pre-revocation: alice-phone resolves to alice-root + fam-1.
-        let adm = super::build_caller_admission(&engine, &"alice-phone".to_string())
+        let adm = super::build_caller_admission(&engine, &phone)
             .await
             .unwrap();
-        assert_eq!(adm.identity_key_id, "alice-root");
-        assert!(adm.family_key_ids.contains("fam-1"));
+        assert_eq!(adm.identity_key_id, root);
+        assert!(adm.family_key_ids.contains(&fam));
 
         // Revoke the occurrence binding (effective in the past). Trusted-local
         // write (#421): the test acts as the engine-internal path; the gated
         // put is for wire-received, signed revocations.
-        sq.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: "alice-root".into(),
-            occurrence_key_id: "alice-phone".into(),
-            revoked_at: "2026-06-02T00:00:00Z".parse().unwrap(),
-            effective_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+        let revoked: chrono::DateTime<chrono::Utc> = "2026-06-02T00:00:00Z".parse().unwrap();
+        let rev = IdentityOccurrenceRevocation {
+            identity_key_id: root.clone(),
+            occurrence_key_id: phone.clone(),
+            revoked_at: revoked,
+            effective_at: revoked,
             reason: None,
-            witness_set: vec!["alice-root".into()],
+            witness_set: vec![root.clone()],
             persist_row_hash: String::new(),
-        })
-        .await
-        .unwrap();
+        };
+        let voice = e2::occurrence_revocation_voice(
+            &*sq,
+            "alice-root",
+            true,
+            &rev,
+            None,
+            &[],
+            u64::try_from(revoked.timestamp_millis()).expect("ms"),
+        )
+        .await;
+        e2::put_statement(&*sq, &voice)
+            .await
+            .expect("the identity revokes its occurrence");
 
         // Post-revocation: alice-phone speaks only for itself — singleton
         // fallback, no inherited family admission.
-        let adm = super::build_caller_admission(&engine, &"alice-phone".to_string())
+        let adm = super::build_caller_admission(&engine, &phone)
             .await
             .unwrap();
         assert_eq!(
-            adm.identity_key_id, "alice-phone",
+            adm.identity_key_id, phone,
             "revoked occurrence falls through to singleton identity"
         );
         assert!(
@@ -485,56 +487,32 @@ mod revocation_honesty_tests {
             .await
             .expect("engine");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
-        for k in ["bob-root", "fam-1"] {
-            sq.put_public_key(key(k)).await.unwrap();
-        }
-        sq.put_family(crate::federation::tier_ingest::test_support::sign_family(
-            "fam-1",
-            crate::federation::Family {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                family_key_id: "fam-1".into(),
-                family_name: "Fam".into(),
-                members: vec![crate::federation::FamilyMember {
-                    key_id: "bob-root".into(),
-                    joined_at: "2026-06-01T00:00:00Z".parse().unwrap(),
-                    role: None,
-                }],
-                founded_at: "2026-06-01T00:00:00Z".parse().unwrap(),
-                consensus_protocol: "unanimous".into(),
-                consensus_protocol_entrenched: false,
-                dissolved_at: None,
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap();
+        let bob = key(&sq, "bob-root").await;
+        let fam = key(&sq, "fam-1").await;
+        let head = found_family(&sq, "bob-root").await;
         // bob-root is a singleton identity (no occurrence binding) in fam-1.
-        let adm = super::build_caller_admission(&engine, &"bob-root".to_string())
-            .await
-            .unwrap();
-        assert!(adm.family_key_ids.contains("fam-1"));
+        let adm = super::build_caller_admission(&engine, &bob).await.unwrap();
+        assert!(adm.family_key_ids.contains(&fam));
 
-        sq.put_family_membership_revocation(
+        let now = chrono::Utc::now();
+        let removal =
             crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
                 "bob-root", /* v49.0.0 (#910): the member leaves on their own signature */
                 FamilyMembershipRevocation {
                     family_key_id: "fam-1".into(),
                     removed_identity_key_id: "bob-root".into(),
-                    removed_at: "2026-06-02T00:00:00Z".parse().unwrap(),
-                    effective_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+                    removed_at: now,
+                    effective_at: now,
                     reason: None,
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
-            ),
-        )
-        .await
-        .unwrap();
-
-        let adm = super::build_caller_admission(&engine, &"bob-root".to_string())
+            );
+        e2::put_voices(&*sq, &e2::family_revocation_voices(&removal, Some(&head)))
             .await
-            .unwrap();
+            .expect("the member's own removal voice lands");
+
+        let adm = super::build_caller_admission(&engine, &bob).await.unwrap();
         assert!(
             adm.family_key_ids.is_empty(),
             "removed member loses family admission (forge surface closed)"

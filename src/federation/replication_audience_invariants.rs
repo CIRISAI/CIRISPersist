@@ -9,12 +9,14 @@
 //! - **I393** the operator's example: an allow list naming `work` keeps
 //!   `adulthub` off the work laptop — at the cohort view, the receiver's hold
 //!   decision and the sender's set; the owner's phone (no list) keeps both.
-//! - **I394** class defaults: a server/agent occurrence gets no `self` or
-//!   `family` content but its owner's rooms; a laptop gets everything.
+//! - **I394** class defaults: a server-class node gets no `self` or `family`
+//!   content but its owner's rooms; an OWNED agent gets `self` and the rooms
+//!   but no `family` (v62, P5c update 4); a laptop gets everything.
 //! - **I395** a live invitee's node receives the private group's planes; a
 //!   declined invitation stops it.
-//! - **I396** an empty list is explicitly none (self still follows the
-//!   class); the grammar and admission refuse malformed lists, a list on a
+//! - **I396** an empty list is explicitly none, `self` included (v62, P5c
+//!   update 5: a present list without the literal `"self"` entry excludes
+//!   `self` for every class); the grammar and admission refuse malformed lists, a list on a
 //!   grant with no `for_key_id`, and a list on a node's grant for itself.
 //! - **I397** origin and refers-to: a node receives its own grant and its own
 //!   rows whatever its list says; a sibling node does not receive them.
@@ -24,6 +26,17 @@
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    /// v62 (E3): an id as the edition-2 rows carry it: a seed becomes its
+    /// identity-ref (`kid_or_keep`; an identity-ref, a 64-hex row id or a
+    /// `canonical:` / `sha256:` name is kept). Inside `with_earlier_form_async`
+    /// (earlier-form fixtures) the seed is kept as it is.
+    pub(crate) fn kr(s: &str) -> String {
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            crate::federation::edition2::fixture_switch::kid_or_keep(s)
+        } else {
+            s.to_owned()
+        }
+    }
     use crate::federation::replication_audience as ra;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{COMMUNITY, FAMILY, SELF};
@@ -55,9 +68,99 @@ pub(crate) mod bodies {
         }
     }
 
-    /// `owner` claims `node` as a device of class `class` (a trusted-local
-    /// occurrence: the binding this node produced for its own user).
+    /// The owner bindings `claim` put under edition 2, by `(owner, node)`, so
+    /// `unclaim` can withdraw the exact row (its id is node-computed).
+    fn claimed(
+    ) -> &'static std::sync::Mutex<std::collections::HashMap<(String, String), Attestation>> {
+        static CLAIMED: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<(String, String), Attestation>>,
+        > = std::sync::OnceLock::new();
+        CLAIMED.get_or_init(Default::default)
+    }
+
+    /// `owner` owns `node`.
+    ///
+    /// v62 (E3; O1.api v3, the person/machine exclusion): a node is never
+    /// bound under a person's key as a device, on any path, so there is no
+    /// occurrence here. Under edition 2:
+    /// - the node is node-bearing by its own `key:record` (`put_key(node, [node])`);
+    /// - the person owns it through an OWNER BINDING
+    ///   (`ownership:{relation}:node`): the owner's statement, then the
+    ///   node's own voice (C557).
+    ///
+    /// `class` is the node's own self-occurrence's `device_class` (P5c update
+    /// 1); the owner binding carries no class.
+    /// Seeds in; the rows carry `kid(seed)`.
     pub(crate) async fn claim(d: &dyn FederationDirectory, owner: &str, node: &str, class: &str) {
+        use crate::federation::edition2::fixture_switch as e2;
+        if !e2::emit_edition2() {
+            return claim_earlier(d, owner, node, class).await;
+        }
+        claim_with(d, owner, node, class, &e2::BindOptions::default()).await
+    }
+
+    /// v62 (E3b) — `claim` under edition 2, with the self-occurrence's
+    /// further members in `opts` (`encryption_pubkeys` for a node that must
+    /// be able to hold keys: `key_bodies::keyed_claim`).
+    ///
+    /// The binding is re-dated now − 5 min and resealed by the owner: the
+    /// builder's fixed instant (2026-05-01) lies before a node key's default
+    /// record window (180 days back), so the node's voice over it would not
+    /// be live (E13's `bind_on`, the same fix). Node-signed rows are
+    /// now-relative.
+    pub(crate) async fn claim_with(
+        d: &dyn FederationDirectory,
+        owner: &str,
+        node: &str,
+        class: &str,
+        opts: &crate::federation::edition2::fixture_switch::BindOptions,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        e2::put_key(d, node, &[NODE]).await;
+        let mut binding =
+            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner, &e2::kid(node));
+        binding.asserted_at = ms(Utc::now() - Duration::minutes(5));
+        binding.scrub_timestamp = binding.asserted_at;
+        ts::seal_row_in_place(owner, &mut binding);
+        e2::put_signed(d, &binding)
+            .await
+            .unwrap_or_else(|e| panic!("owner binding {owner} → {node}: {e}"));
+        let st = e2::carried_statement(&binding).expect("a flipped binding carries its statement");
+        e2::put_statement(d, &e2::voice_of(&st, node))
+            .await
+            .unwrap_or_else(|e| panic!("the node's voice on {owner} → {node}: {e}"));
+        // P5c (update 1): the owner binding says WHO the human is; WHAT KIND
+        // of device the node is comes from its own self-occurrence (O1's
+        // edition-2 self pair: identity = occurrence = the node key).
+        e2::put_bind(d, node, node, node, class, opts)
+            .await
+            .unwrap_or_else(|e| panic!("{node}'s self-occurrence as {class}: {e}"));
+        claimed()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((owner.to_owned(), node.to_owned()), binding);
+    }
+
+    /// `owner` disowns `node`: under edition 2, the owner's `withdraws` of the
+    /// owner binding `claim` put (the target's family, `refs.target`).
+    async fn unclaim(d: &dyn FederationDirectory, owner: &str, node: &str) {
+        use crate::federation::edition2::fixture_switch as e2;
+        if !e2::emit_edition2() {
+            return unclaim_earlier(d, owner, node).await;
+        }
+        let binding = claimed()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(owner.to_owned(), node.to_owned()))
+            .cloned()
+            .unwrap_or_else(|| panic!("unclaim {owner} → {node}: never claimed"));
+        let w = e2::composer_of("withdraws", &binding, owner);
+        e2::put_signed(d, &w)
+            .await
+            .unwrap_or_else(|e| panic!("unclaim {owner} → {node}: {e}"));
+    }
+
+    async fn claim_earlier(d: &dyn FederationDirectory, owner: &str, node: &str, class: &str) {
         d.put_identity_occurrence_local(IdentityOccurrence {
             identity_key_id: owner.to_owned(),
             occurrence_key_id: node.to_owned(),
@@ -83,7 +186,7 @@ pub(crate) mod bodies {
         .unwrap_or_else(|e| panic!("owner binding {owner} → {node}: {e}"));
     }
 
-    async fn unclaim(d: &dyn FederationDirectory, owner: &str, node: &str) {
+    async fn unclaim_earlier(d: &dyn FederationDirectory, owner: &str, node: &str) {
         d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
             identity_key_id: owner.to_owned(),
             occurrence_key_id: node.to_owned(),
@@ -129,9 +232,25 @@ pub(crate) mod bodies {
         let env = c.signing_envelope();
         let mut signed = ts::sign_community(founders[0], c);
         signed.cosignatures = founders[1..].iter().map(|f| cosign(f, &env)).collect();
-        d.put_community(signed)
-            .await
-            .unwrap_or_else(|e| panic!("room {cid}: {e}"));
+        // v62 (E3): switch-aware. Under edition 2 the founding roster is the
+        // founders' `group:roster` voices (T1); ids go in as seeds and are
+        // stored as `kid(seed)`. Under `with_earlier_form_async` it stays the
+        // earlier typed put.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            let voices = crate::federation::edition2::fixture_switch::community_voices(
+                &signed,
+                1,
+                None,
+                crate::federation::edition2::fixture_switch::ms(chrono::Utc::now()),
+            );
+            crate::federation::edition2::fixture_switch::put_voices(d, &voices)
+                .await
+                .unwrap_or_else(|e| panic!("room {cid}: {e}"));
+        } else {
+            d.put_community(signed)
+                .await
+                .unwrap_or_else(|e| panic!("room {cid}: {e}"));
+        }
     }
 
     pub(crate) async fn family(d: &dyn FederationDirectory, fid: &str, founders: &[&str]) {
@@ -157,14 +276,27 @@ pub(crate) mod bodies {
         let env = f.signing_envelope();
         let mut signed = ts::sign_family(founders[0], f);
         signed.cosignatures = founders[1..].iter().map(|k| cosign(k, &env)).collect();
-        d.put_family(signed)
-            .await
-            .unwrap_or_else(|e| panic!("family {fid}: {e}"));
+        // v62 (E3): switch-aware, as `room`.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            let voices = crate::federation::edition2::fixture_switch::family_voices(
+                &signed,
+                1,
+                None,
+                crate::federation::edition2::fixture_switch::ms(chrono::Utc::now()),
+            );
+            crate::federation::edition2::fixture_switch::put_voices(d, &voices)
+                .await
+                .unwrap_or_else(|e| panic!("family {fid}: {e}"));
+        } else {
+            d.put_family(signed)
+                .await
+                .unwrap_or_else(|e| panic!("family {fid}: {e}"));
+        }
     }
 
     /// `author`'s `consent:replication` grant FOR `for_key`, with `cohorts`
     /// (raw JSON, so the malformed shapes can be offered too).
-    pub(crate) fn grant(
+    fn grant_unsealed(
         author: &str,
         for_key: Option<&str>,
         cohorts: Option<serde_json::Value>,
@@ -174,7 +306,7 @@ pub(crate) mod bodies {
             "attestation_prefixes": ["i39x:"],
         });
         if let Some(k) = for_key {
-            payload["for_key_id"] = k.into();
+            payload["for_key_id"] = kr(k).into();
         }
         if let Some(c) = cohorts {
             payload["cohorts"] = c;
@@ -187,11 +319,55 @@ pub(crate) mod bodies {
         let mut r = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env);
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
+        r
+    }
+
+    /// `author`'s `consent:replication` grant, sealed (a row the door admits).
+    pub(crate) fn grant(
+        author: &str,
+        for_key: Option<&str>,
+        cohorts: Option<serde_json::Value>,
+    ) -> Attestation {
+        let mut r = grant_unsealed(author, for_key, cohorts);
         ts::seal_row_in_place(author, &mut r);
         r
     }
 
+    /// v62 (E3): offer a grant that the door may REFUSE (a malformed
+    /// `cohorts` list, a list on the wrong grant). Sealing through the fixture
+    /// (`seal_row_in_place`) admits the row and panics on a refusal, so the
+    /// statement is signed without admitting and handed to the door, whose
+    /// refusal comes back as the `Err`. Under the earlier form it is the
+    /// earlier put. "Malformed is a refusal": a codec failure here is a
+    /// fixture bug, so it panics naming the payload.
+    pub(crate) async fn try_put_grant(
+        d: &dyn FederationDirectory,
+        author: &str,
+        for_key: Option<&str>,
+        cohorts: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        if !e2::emit_edition2() {
+            return put(d, &grant(author, for_key, cohorts)).await;
+        }
+        let r = grant_unsealed(author, for_key, cohorts);
+        let st = e2::try_statement_of(&r, author).unwrap_or_else(|e| {
+            panic!(
+                "the codec cannot state this grant ({e}): {}",
+                r.attestation_envelope
+            )
+        });
+        e2::put_statement(d, &st).await.map(|_| ())
+    }
+
     pub(crate) async fn put(d: &dyn FederationDirectory, a: &Attestation) -> Result<(), Error> {
+        // v62 (E3): a flipped row goes through the one statement door
+        // (E0: `put_attestation` does not route a carried statement).
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            return crate::federation::edition2::fixture_switch::put_signed(d, a)
+                .await
+                .map(|_| ());
+        }
         d.put_attestation(SignedAttestation {
             attestation: a.clone(),
         })
@@ -208,20 +384,17 @@ pub(crate) mod bodies {
         withdraw(d, author, target).await
     }
 
+    /// v62 (E3): an edition-2 composer carrying the target's family.
     async fn withdraw(d: &dyn FederationDirectory, author: &str, target: &Attestation) {
-        let id = uuid::Uuid::new_v4().to_string();
-        let env =
-            serde_json::json!({ "id": id, "references_attestation_id": target.attestation_id });
-        let mut r = ts::bare_attestation(&id, author, author, &env);
-        r.attestation_type = attestation_type::WITHDRAWS.into();
-        ts::seal_row_in_place(author, &mut r);
+        let r =
+            crate::federation::edition2::fixture_switch::composer_of("withdraws", target, author);
         put(d, &r).await.expect("withdraws admitted");
     }
 
     pub(crate) fn entries(pairs: &[(&str, &str)]) -> serde_json::Value {
         let mut v: Vec<(String, String)> = pairs
             .iter()
-            .map(|(s, t)| ((*s).to_owned(), (*t).to_owned()))
+            .map(|(s, t)| ((*s).to_owned(), kr(t)))
             .collect();
         v.sort();
         serde_json::Value::Array(
@@ -237,10 +410,10 @@ pub(crate) mod bodies {
         target: &str,
         node: &str,
     ) -> bool {
-        ra::audience_nodes(d, scope, Some(target))
+        ra::audience_nodes(d, scope, Some(&*kr(target)))
             .await
             .unwrap()
-            .contains(node)
+            .contains(&kr(node))
     }
 
     /// The receiver's decision for content at `scope`/`target` authored by
@@ -252,9 +425,16 @@ pub(crate) mod bodies {
         target: Option<&str>,
         author: &str,
     ) -> bool {
-        crate::federation::replication::hold::is_audience(d, scope, target, author, |_| false, node)
-            .await
-            .unwrap()
+        crate::federation::replication::hold::is_audience(
+            d,
+            scope,
+            target.map(kr).as_deref(),
+            &kr(author),
+            |_| false,
+            &kr(node),
+        )
+        .await
+        .unwrap()
     }
 
     /// **I390** — public groups reach every peer; a private group's planes do not.
@@ -267,39 +447,30 @@ pub(crate) mod bodies {
         users(d, &[&owner]).await;
         nodes(d, &[&stranger]).await;
         room(d, &cid, &[&owner]).await;
-        let accord = crate::federation::canonical_community::accord_family_key_id();
+        // v62 (E3, ruling 1): the accord family record is gone (bundle/2);
+        // its public-group legs are deleted.
         assert!(
-            ra::is_public_group(d, accord).await.unwrap(),
-            "I390 the accord family is public"
-        );
-        assert_eq!(
-            ra::audience_nodes(d, FAMILY, Some(accord)).await.unwrap(),
-            ra::Audience::Everyone,
-            "I390 a public group's audience is every peer"
-        );
-        assert!(
-            ra::may_receive_group_plane(d, &stranger, FAMILY, accord, None)
-                .await
-                .unwrap()
-                .allowed(),
-            "I390 a non-member receives a public group's planes"
-        );
-        assert!(
-            !ra::is_public_group(d, &cid).await.unwrap(),
+            !ra::is_public_group(d, &kr(&cid)).await.unwrap(),
             "I390 a plain room is private"
         );
         assert_eq!(
-            ra::may_receive_group_plane(d, &stranger, COMMUNITY, &cid, None)
+            ra::may_receive_group_plane(d, &kr(&stranger), COMMUNITY, &kr(&cid), None)
                 .await
                 .unwrap(),
             ra::Verdict::No(ra::Reason::NotInAudience),
             "I390 a non-member does not receive a private room's planes"
         );
         assert!(
-            ra::may_receive_group_plane(d, &stranger, COMMUNITY, &cid, Some(&stranger))
-                .await
-                .unwrap()
-                .allowed(),
+            ra::may_receive_group_plane(
+                d,
+                &kr(&stranger),
+                COMMUNITY,
+                &kr(&cid),
+                Some(&*kr(&stranger))
+            )
+            .await
+            .unwrap()
+            .allowed(),
             "I390 the member a row names receives it (a revocation reaches the removed)"
         );
     }
@@ -360,27 +531,41 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        let (owner, laptop, phone, adult, work, fam) = (
+        let (owner, laptop, bare, phone, adult, work, fam) = (
             format!("i393-o-{s}"),
             format!("i393-l-{s}"),
+            format!("i393-bare-{s}"),
             format!("i393-p-{s}"),
             format!("i393-adulthub-{s}"),
             format!("i393-work-{s}"),
             format!("i393-f-{s}"),
         );
         users(d, &[&owner]).await;
-        nodes(d, &[&laptop, &phone]).await;
+        nodes(d, &[&laptop, &bare, &phone]).await;
         claim(d, &owner, &laptop, device_class::LAPTOP).await;
+        claim(d, &owner, &bare, device_class::LAPTOP).await;
         claim(d, &owner, &phone, device_class::PHONE).await;
         room(d, &adult, &[&owner]).await;
         room(d, &work, &[&owner]).await;
         family(d, &fam, &[&owner]).await;
+        // v62 (P5c update 5, CC rc21 3.3.7): a present list carries `self`
+        // only through the literal `"self"` entry, sorted after the group
+        // entries. The work laptop's list names `work` and `self`; the `bare`
+        // laptop's names `work` alone.
+        let mut work_and_self = entries(&[(COMMUNITY, &work)]);
+        work_and_self
+            .as_array_mut()
+            .expect("entries is an array")
+            .push(serde_json::Value::String("self".into()));
+        put(d, &grant(&owner, Some(&laptop), Some(work_and_self)))
+            .await
+            .expect("I393 the owner's grant for the work laptop is admitted");
         put(
             d,
-            &grant(&owner, Some(&laptop), Some(entries(&[(COMMUNITY, &work)]))),
+            &grant(&owner, Some(&bare), Some(entries(&[(COMMUNITY, &work)]))),
         )
         .await
-        .expect("I393 the owner's grant for the work laptop is admitted");
+        .expect("I393 the owner's grant for the bare laptop is admitted");
         // the cohort view
         assert!(
             in_audience(d, COMMUNITY, &work, &laptop).await,
@@ -415,16 +600,28 @@ pub(crate) mod bodies {
             !holds(d, &laptop, FAMILY, Some(&fam), &owner).await,
             "I393 the laptop holds no family row"
         );
+        // v62 (P5c update 5, CC rc21 6.1 / 3.3.7): one rule for `self` —
+        // a present allow list carries `self` iff it names the literal
+        // `"self"` entry, for every class.
         assert!(
             holds(d, &laptop, SELF, None, &owner).await,
-            "I393 self follows the class (laptop: yes)"
+            "I393 a list naming \"self\" keeps self (work laptop: yes)"
+        );
+        assert!(
+            !holds(d, &bare, SELF, None, &owner).await,
+            "I393 a list without \"self\" excludes self (bare laptop: no)"
+        );
+        assert!(
+            holds(d, &bare, COMMUNITY, Some(&work), &owner).await
+                && !holds(d, &bare, COMMUNITY, Some(&adult), &owner).await,
+            "I393 the bare laptop's group entries still rule its rooms"
         );
         // the sender
-        let sent = crate::federation::self_collective::send_set_for(d, &owner, FAMILY)
+        let sent = crate::federation::self_collective::send_set_for(d, &kr(&owner), FAMILY)
             .await
             .unwrap();
         assert!(
-            !sent.contains(&laptop) && sent.contains(&phone),
+            !sent.contains(&kr(&laptop)) && sent.contains(&kr(&phone)),
             "I393 the family send set skips the laptop: {sent:?}"
         );
     }
@@ -446,22 +643,27 @@ pub(crate) mod bodies {
         claim(d, &owner, &laptop, device_class::LAPTOP).await;
         room(d, &cid, &[&owner]).await;
         family(d, &fam, &[&owner]).await;
-        for n in [&server, &agent] {
-            assert!(
-                !holds(d, n, SELF, None, &owner).await,
-                "I394 a server-class node holds no self content"
+        // v62 (P5c update 4): an `agent`-class device its owner OWNS is
+        // `OwnedAgent` — within the owner's `self` (no list), no `family` by
+        // default, the rooms. The server class gets no `self`.
+        for (n, gets_self) in [(&server, false), (&agent, true)] {
+            assert_eq!(
+                holds(d, n, SELF, None, &owner).await,
+                gets_self,
+                "I394 self content: server no, owned agent yes ({n})"
             );
             assert!(
                 !holds(d, n, FAMILY, Some(&fam), &owner).await,
-                "I394 nor family content"
+                "I394 no family content ({n})"
             );
             assert!(
                 holds(d, n, COMMUNITY, Some(&cid), &owner).await,
-                "I394 but its owner's rooms"
+                "I394 but its owner's rooms ({n})"
             );
-            assert!(
-                !in_audience(d, SELF, &owner, n).await,
-                "I394 the self audience skips it"
+            assert_eq!(
+                in_audience(d, SELF, &owner, n).await,
+                gets_self,
+                "I394 the self audience: server no, owned agent yes ({n})"
             );
         }
         assert!(
@@ -517,7 +719,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         assert!(
-            !ra::may_receive_group_plane(d, &knode, COMMUNITY, &cid, None)
+            !ra::may_receive_group_plane(d, &kr(&knode), COMMUNITY, &kr(&cid), None)
                 .await
                 .unwrap()
                 .allowed(),
@@ -535,7 +737,7 @@ pub(crate) mod bodies {
         );
         ma::put(d, &p).await.unwrap();
         assert!(
-            ra::may_receive_group_plane(d, &knode, COMMUNITY, &cid, None)
+            ra::may_receive_group_plane(d, &kr(&knode), COMMUNITY, &kr(&cid), None)
                 .await
                 .unwrap()
                 .allowed(),
@@ -545,7 +747,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         assert!(
-            !ra::may_receive_group_plane(d, &knode, COMMUNITY, &cid, None)
+            !ra::may_receive_group_plane(d, &kr(&knode), COMMUNITY, &kr(&cid), None)
                 .await
                 .unwrap()
                 .allowed(),
@@ -574,9 +776,11 @@ pub(crate) mod bodies {
             !holds(d, &laptop, COMMUNITY, Some(&cid), &owner).await,
             "I396 [] is explicitly none"
         );
+        // v62 (P5c update 5): `[]` names no `"self"` entry, so self is
+        // excluded too.
         assert!(
-            holds(d, &laptop, SELF, None, &owner).await,
-            "I396 self still follows the class"
+            !holds(d, &laptop, SELF, None, &owner).await,
+            "I396 [] excludes self as well"
         );
         let bad = [
             (
@@ -602,21 +806,23 @@ pub(crate) mod bodies {
         ];
         for (why, c) in bad {
             assert!(
-                put(d, &grant(&owner, Some(&laptop), Some(c)))
+                try_put_grant(d, &owner, Some(&laptop), Some(c))
                     .await
                     .is_err(),
                 "I396 refused: {why}"
             );
         }
         assert!(
-            put(d, &grant(&owner, None, Some(entries(&[(COMMUNITY, &cid)]))))
+            try_put_grant(d, &owner, None, Some(entries(&[(COMMUNITY, &cid)])))
                 .await
                 .is_err(),
             "I396 a list on a grant naming no node is refused"
         );
-        let e = put(
+        let e = try_put_grant(
             d,
-            &grant(&laptop, Some(&laptop), Some(entries(&[(COMMUNITY, &cid)]))),
+            &laptop,
+            Some(&laptop),
+            Some(entries(&[(COMMUNITY, &cid)])),
         )
         .await
         .expect_err("I396 a node's grant for itself carries no list");
@@ -640,12 +846,15 @@ pub(crate) mod bodies {
         let g = grant(&owner, Some(&laptop), Some(serde_json::json!([])));
         put(d, &g).await.unwrap();
         assert_eq!(
-            ra::may_receive(d, &laptop, &g).await.unwrap(),
+            ra::may_receive(d, &kr(&laptop), &g).await.unwrap(),
             ra::Verdict::Yes(ra::Reason::RefersTo),
             "I397 the node receives the grant FOR it"
         );
         assert!(
-            !ra::may_receive(d, &sibling, &g).await.unwrap().allowed(),
+            !ra::may_receive(d, &kr(&sibling), &g)
+                .await
+                .unwrap()
+                .allowed(),
             "I397 a sibling node does not"
         );
         // A key-grant row TO the server-class laptop, at a family it may not
@@ -665,7 +874,10 @@ pub(crate) mod bodies {
         row.attestation_type = crate::federation::types::attestation_type::SCORES.into();
         row.cohort_scope = FAMILY.into();
         assert!(
-            !ra::may_receive(d, &laptop, &row).await.unwrap().allowed(),
+            !ra::may_receive(d, &kr(&laptop), &row)
+                .await
+                .unwrap()
+                .allowed(),
             "I397 a key-grant row to a device outside the cohort's audience does not reach it"
         );
         // And a retired SET (rc6) reaches nobody but its signer.
@@ -679,13 +891,16 @@ pub(crate) mod bodies {
         set.cohort_scope = FAMILY.into();
         set.subject_key_ids = vec![laptop.clone()];
         assert!(
-            !ra::may_receive(d, &laptop, &set).await.unwrap().allowed(),
+            !ra::may_receive(d, &kr(&laptop), &set)
+                .await
+                .unwrap()
+                .allowed(),
             "I397 a retired key-grant set is served to nobody"
         );
         let mut own = ts::bare_attestation("i397-own", &laptop, &laptop, &serde_json::json!({}));
         own.cohort_scope = SELF.into();
         assert_eq!(
-            ra::may_receive(d, &laptop, &own).await.unwrap(),
+            ra::may_receive(d, &kr(&laptop), &own).await.unwrap(),
             ra::Verdict::Yes(ra::Reason::Origin),
             "I397 a row the node signed reaches it"
         );
@@ -772,13 +987,13 @@ pub(crate) mod bodies {
         ma::put(d, &p).await.unwrap();
         for n in [&kphone, &kserver] {
             assert_eq!(
-                ra::may_receive(d, n, &p).await.unwrap(),
+                ra::may_receive(d, &kr(n), &p).await.unwrap(),
                 ra::Verdict::Yes(ra::Reason::RefersTo),
                 "I398b the invitee's node {n} receives the proposal (CC 3.1.3.2)"
             );
         }
         assert!(
-            !ra::may_receive(d, &snode, &p).await.unwrap().allowed(),
+            !ra::may_receive(d, &kr(&snode), &p).await.unwrap().allowed(),
             "I398b a stranger's node does not"
         );
     }
@@ -857,27 +1072,27 @@ pub(crate) mod bodies {
         users(d, &[&k]).await;
         invitee_seen_from_the_creator(d, &k, &knode, true).await;
         assert!(
-            d.active_identities_for_occurrence(&knode)
+            d.active_identities_for_occurrence(&kr(&knode))
                 .await
                 .unwrap()
                 .is_empty(),
             "I1470 precondition — #932 H1: the unagreed row resolves nothing"
         );
         assert_eq!(
-            crate::federation::admission::owner_of(d, &knode)
+            crate::federation::admission::owner_of(d, &kr(&knode))
                 .await
                 .unwrap(),
-            Some(k.clone()),
+            Some(kr(&k)),
             "I1470 precondition — the owner binding names the invitee"
         );
         assert_eq!(
             principals_of(d, &knode).await.unwrap(),
-            vec![k.clone()],
+            vec![kr(&k)],
             "I1470 an unagreed occurrence row does not drop the node's owner"
         );
         let p = pair_room_proposal(d, &cid, &creator, &k).await;
         assert_eq!(
-            ra::may_receive(d, &knode, &p).await.unwrap(),
+            ra::may_receive(d, &kr(&knode), &p).await.unwrap(),
             ra::Verdict::Yes(ra::Reason::RefersTo),
             "I1470 the invitee's node receives the pair-room invitation"
         );
@@ -887,7 +1102,7 @@ pub(crate) mod bodies {
         // `may_receive_group_plane` read `active_identities_for_occurrence`
         // only, so the joiner never learned it was seated.
         assert_eq!(
-            ra::may_receive_group_plane(d, &knode, COMMUNITY, &cid, None)
+            ra::may_receive_group_plane(d, &kr(&knode), COMMUNITY, &kr(&cid), None)
                 .await
                 .unwrap(),
             ra::Verdict::Yes(ra::Reason::Cohort),
@@ -922,7 +1137,7 @@ pub(crate) mod bodies {
         .expect("I1471 the occurrence's agreement is admitted");
         assert_eq!(
             principals_of(d, &agreed).await.unwrap(),
-            vec![k.clone()],
+            vec![kr(&k)],
             "I1471 precondition — the agreed occurrence's principal is its owner"
         );
         // `unagreed`: the I1470 shape — then revoked.
@@ -932,8 +1147,10 @@ pub(crate) mod bodies {
         let p = pair_room_proposal(d, &cid, &creator, &k).await;
         for n in [&agreed, &unagreed] {
             assert_eq!(
-                crate::federation::admission::owner_of(d, n).await.unwrap(),
-                Some(k.clone()),
+                crate::federation::admission::owner_of(d, &kr(n))
+                    .await
+                    .unwrap(),
+                Some(kr(&k)),
                 "I1471 precondition — the owner binding to {n} is still live"
             );
             assert!(
@@ -941,11 +1158,11 @@ pub(crate) mod bodies {
                 "I1471 a revoked occurrence ({n}) does not get its owner back"
             );
             assert!(
-                !ra::may_receive(d, n, &p).await.unwrap().allowed(),
+                !ra::may_receive(d, &kr(n), &p).await.unwrap().allowed(),
                 "I1471 the revoked node {n} does not receive the invitation"
             );
             assert!(
-                !ra::may_receive_group_plane(d, n, COMMUNITY, &cid, None)
+                !ra::may_receive_group_plane(d, &kr(n), COMMUNITY, &kr(&cid), None)
                     .await
                     .unwrap()
                     .allowed(),
@@ -981,8 +1198,10 @@ pub(crate) mod bodies {
         .await
         .expect("I1472 the occurrence's agreement is admitted");
         assert_eq!(
-            d.active_identities_for_occurrence(&agreed).await.unwrap(),
-            vec![k.clone()],
+            d.active_identities_for_occurrence(&kr(&agreed))
+                .await
+                .unwrap(),
+            vec![kr(&k)],
             "I1472 precondition — the agreed occurrence resolves"
         );
         invitee_seen_from_the_creator(d, &k, &kemless, false).await;
@@ -996,7 +1215,7 @@ pub(crate) mod bodies {
             revoked_at: ago(1),
             effective_at: ms(Utc::now() + Duration::days(3)),
             reason: None,
-            witness_set: vec![k.clone()],
+            witness_set: vec![kr(&k)],
             persist_row_hash: String::new(),
         })
         .await
@@ -1023,11 +1242,11 @@ pub(crate) mod bodies {
         for n in [&agreed, &kemless, &unagreed, &later, &readded] {
             assert_eq!(
                 principals_of(d, n).await.unwrap(),
-                vec![k.clone()],
+                vec![kr(&k)],
                 "I1472 {n} keeps its owner as principal"
             );
             assert_eq!(
-                ra::may_receive(d, n, &p).await.unwrap(),
+                ra::may_receive(d, &kr(n), &p).await.unwrap(),
                 ra::Verdict::Yes(ra::Reason::RefersTo),
                 "I1472 {n} receives the invitation"
             );
@@ -1098,12 +1317,12 @@ pub(crate) mod bodies {
         ma::put(d, &decline).await.unwrap();
         for (a, what) in [(&accept, "acceptance"), (&decline, "decline")] {
             assert_eq!(
-                ra::may_receive(d, &fnode, a).await.unwrap(),
+                ra::may_receive(d, &kr(&fnode), a).await.unwrap(),
                 ra::Verdict::Yes(ra::Reason::RefersTo),
                 "I398c the {what} returns to the proposer's node"
             );
             assert!(
-                !ra::may_receive(d, &snode, a).await.unwrap().allowed(),
+                !ra::may_receive(d, &kr(&snode), a).await.unwrap().allowed(),
                 "I398c a stranger's node does not receive the {what}"
             );
         }
@@ -1151,11 +1370,11 @@ pub(crate) mod bodies {
             mac::live_invitees_of(d, COMMUNITY, &cid, std::slice::from_ref(&founder))
                 .await
                 .unwrap(),
-            vec![k.clone()],
+            vec![kr(&k)],
             "I398d the affiliations proposal is a live invitation of the room"
         );
         assert!(
-            ra::may_receive_group_plane(d, &knode, COMMUNITY, &cid, None)
+            ra::may_receive_group_plane(d, &kr(&knode), COMMUNITY, &kr(&cid), None)
                 .await
                 .unwrap()
                 .allowed(),
@@ -1173,15 +1392,106 @@ pub(crate) mod bodies {
         );
     }
 
+    /// v62 (E3b) — what `from` serves `requester` of the rows `rows`: every
+    /// statement (each voice) of those rows on cut B's FILTERED serve path
+    /// (`edition2::serve::statements_served_to`), in `from`'s admission
+    /// order. Empty when the path withholds them (E13's `served`, without
+    /// its non-empty assert: I398e asserts a withholding too).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn served_rows(
+        from: &dyn FederationDirectory,
+        requester: &str,
+        rows: &[crate::federation::edition2::names::RowId],
+    ) -> Vec<(Vec<u8>, crate::federation::edition2::names::RowId)> {
+        use crate::federation::edition2::names::RowId;
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = crate::federation::edition2::serve::statements_served_to(
+                from,
+                cursor.as_ref(),
+                1000,
+                Some(requester),
+            )
+            .await
+            .expect("serve statements");
+            for st in page.statements {
+                if let Some(id) = RowId::of_statement(&st.bytes) {
+                    if rows.contains(&id) {
+                        out.push((st.bytes, id));
+                    }
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// v62 (E3b) — the statement `row` carries, as its author pushes it to a
+    /// node the sender's verdict (`may_receive`) names: the bytes and the row
+    /// id they name.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn pushed(row: &Attestation) -> Vec<(Vec<u8>, crate::federation::edition2::names::RowId)> {
+        use crate::federation::edition2::fixture_switch as e2;
+        let st = e2::carried_statement(row).expect("a flipped row carries its statement");
+        let id = e2::row_id_of(&st);
+        vec![(st, id)]
+    }
+
+    /// v62 (E3b) — each statement through `to`'s replicated statement door
+    /// (`edition2::ingest::apply_replicated_statement`), under the id it
+    /// names; every one must be admitted (new here) or already held.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn deliver(
+        to: &dyn FederationDirectory,
+        statements: &[(Vec<u8>, crate::federation::edition2::names::RowId)],
+        what: &str,
+    ) {
+        use crate::federation::edition2::ingest::{
+            apply_replicated_statement, ReplicatedStatementOutcome,
+        };
+        for (bytes, id) in statements {
+            match apply_replicated_statement(to, bytes, &id.0)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: a replicated statement: {e}"))
+            {
+                ReplicatedStatementOutcome::Admitted(_)
+                | ReplicatedStatementOutcome::Unchanged(_) => {}
+                ReplicatedStatementOutcome::Refused { reason } => {
+                    panic!("{what}: the replicated statement is refused: {reason:?}")
+                }
+            }
+        }
+    }
+
     /// **I398e** — two nodes, through `may_receive` as the sender's verdict:
     /// A (the room's) sends the proposal to K's node B; B, holding no roster,
     /// sends K's acceptance back to the proposer's node.
+    ///
+    /// v62 (E3b): on E5's flipped `membership_acceptance_invariants::bodies`
+    /// (`reg`, `id_of`, `found_community`, `proposal`, `reply`, `put`); the
+    /// group ids and signers are the ids the directory keys them by
+    /// (`ma::id_of`). Nothing crosses by a local put any more:
+    /// - A learns K's owner binding (a commons row) the way a peer does: B's
+    ///   FILTERED serve path with A's node (`fnode`) as the requester
+    ///   (`statements_served_to`), then A's `apply_replicated_statement`
+    ///   (E13's pattern). The binding and the node's voice cross.
+    /// - The proposal and the acceptance are PUSHED where the sender's
+    ///   verdict sends them (`may_receive`, this witness's subject): the
+    ///   author's statement through the receiver's replicated door.
+    /// - B's filtered serve path withholds the acceptance from the
+    ///   proposer's node it cannot resolve (the same "no binding" fact as the
+    ///   sender's verdict).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i398e_the_ceremony_crosses_two_nodes(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
         s: &str,
     ) {
+        use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::membership_acceptance_invariants::bodies as ma;
         let (cid, founder, fnode, k, knode) = (
             format!("i398e-c-{s}"),
@@ -1196,123 +1506,88 @@ pub(crate) mod bodies {
         }
         claim(a, &founder, &fnode, device_class::LAPTOP).await;
         claim(b, &k, &knode, device_class::PHONE).await;
-        ma::found_community(a, &cid, "quorum:1/1", &[&founder], &[])
+        // The ids the directory keys them by (E5: `reg` puts `kid(seed)`).
+        let (cid_k, founder_k, k_k) = (ma::id_of(&cid), ma::id_of(&founder), ma::id_of(&k));
+        ma::found_community(a, &cid_k, "quorum:1/1", &[&founder_k], &[])
             .await
             .unwrap();
         let now = Utc::now();
         let p = ma::proposal(
-            &founder,
+            &founder_k,
             COMMUNITY,
-            &cid,
-            &k,
+            &cid_k,
+            &k_k,
             None,
             now,
             Some(Duration::days(7)),
         );
         ma::put(a, &p).await.unwrap();
         assert!(
-            !ra::may_receive(a, &knode, &p).await.unwrap().allowed(),
+            !ra::may_receive(a, &kr(&knode), &p).await.unwrap().allowed(),
             "I398e precondition — A does not know K's node is K's"
         );
-        // A learns K's binding the way a peer does: the node's occurrence.
-        claim(a, &k, &knode, device_class::PHONE).await;
+        // A learns K's binding the way a peer does: B serves it (a commons
+        // row: the binding and the node's voice) to A's node, and A applies
+        // each statement at its replicated door.
+        let binding = claimed()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(k.clone(), knode.clone()))
+            .cloned()
+            .expect("I398e fixture — K's binding on B");
+        let binding_id = e2::row_id_of(
+            &e2::carried_statement(&binding).expect("the binding carries its statement"),
+        );
+        let carried = served_rows(b, &kr(&fnode), &[binding_id]).await;
         assert!(
-            ra::may_receive(a, &knode, &p).await.unwrap().allowed(),
+            carried.len() >= 2,
+            "I398e B serves A's node K's binding and the node's voice: {} statement(s)",
+            carried.len()
+        );
+        deliver(a, &carried, "I398e K's binding onto A").await;
+        assert!(
+            ra::may_receive(a, &kr(&knode), &p).await.unwrap().allowed(),
             "I398e A sends the proposal to K's node"
         );
-        ma::put(b, &p)
-            .await
-            .expect("I398e B admits the proposal (no roster held)");
-        let acc = ma::reply(&k, &k, &p, true, now);
+        deliver(
+            b,
+            &pushed(&p),
+            "I398e B admits the proposal (no roster held)",
+        )
+        .await;
+        let acc = ma::reply(&k_k, &k_k, &p, true, now);
         ma::put(b, &acc)
             .await
             .expect("I398e B admits K's acceptance");
         assert!(
-            ra::may_receive(b, &founder, &acc).await.unwrap().allowed(),
+            ra::may_receive(b, &kr(&founder), &acc)
+                .await
+                .unwrap()
+                .allowed(),
             "I398e B sends the acceptance back to the proposer"
         );
         assert!(
-            !ra::may_receive(b, &fnode, &acc).await.unwrap().allowed(),
+            !ra::may_receive(b, &kr(&fnode), &acc)
+                .await
+                .unwrap()
+                .allowed(),
             "I398e B cannot resolve a node of the proposer it holds no binding for"
         );
-        ma::put(a, &acc)
-            .await
-            .expect("I398e A admits the acceptance");
+        let acc_id = pushed(&acc)[0].1;
         assert!(
-            ra::may_receive(a, &fnode, &acc).await.unwrap().allowed(),
+            served_rows(b, &kr(&fnode), &[acc_id]).await.is_empty(),
+            "I398e B's serve path withholds the acceptance from that node too"
+        );
+        deliver(a, &pushed(&acc), "I398e A admits the acceptance").await;
+        assert!(
+            ra::may_receive(a, &kr(&fnode), &acc)
+                .await
+                .unwrap()
+                .allowed(),
             "I398e on A the acceptance reaches the proposer's node"
         );
-    }
-
-    /// **I398f** — the keyless trust-root community (`ciris-canonical`) is
-    /// public when ROOTED by its accord birth: an outside node receives its
-    /// record's planes and its rows. A constraint row at another id that is
-    /// not accord-born (NotRooted) is not public.
-    pub(crate) async fn i398f_a_rooted_trust_root_is_public(d: &dyn FederationDirectory, s: &str) {
-        use crate::federation::canonical_community::{
-            self as cc, CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON,
-        };
-        use crate::federation::canonical_community_invariants::bodies as ccb;
-        ccb::stand_up(d).await;
-        d.put_community(ccb::signed(
-            ccb::canonical_row(&ccb::FOUNDERS),
-            &["A1", "B1"],
-        ))
-        .await
-        .expect("the accord births the row");
-        assert!(matches!(
-            cc::stored_standing(d, CANON).await.unwrap(),
-            cc::StoredStanding::Rooted(_)
-        ));
-        assert!(
-            d.lookup_public_key(CANON).await.unwrap().is_none(),
-            "I398f precondition — ciris-canonical has no key record"
-        );
-        let (outsider, onode) = (format!("i398f-o-{s}"), format!("i398f-on-{s}"));
-        users(d, &[&outsider]).await;
-        nodes(d, &[&onode]).await;
-        claim(d, &outsider, &onode, device_class::PHONE).await;
-        assert!(
-            ra::is_public_group(d, CANON).await.unwrap(),
-            "I398f rooted ⇒ public"
-        );
-        assert_eq!(
-            ra::may_receive_group_plane(d, &onode, COMMUNITY, CANON, None)
-                .await
-                .unwrap(),
-            ra::Verdict::Yes(ra::Reason::Public),
-            "I398f an outside node receives the record's planes"
-        );
-        let mut row = ts::bare_attestation(
-            &format!("i398f-row-{s}"),
-            ccb::FOUNDERS[0],
-            ccb::FOUNDERS[0],
-            &serde_json::json!({ "community_key_id": CANON }),
-        );
-        row.cohort_scope = COMMUNITY.into();
-        assert_eq!(
-            ra::may_receive(d, &onode, &row).await.unwrap(),
-            ra::Verdict::Yes(ra::Reason::Public),
-            "I398f an outside node receives a row placed at ciris-canonical"
-        );
-        // Another id declaring the same constraint, never accord-born: kept
-        // as data by the replicated door, NotRooted, NOT public.
-        let other_id = format!("i398f-q-{s}");
-        let mut other = ccb::canonical_row(&ccb::FOUNDERS);
-        other.community_key_id = other_id.clone();
-        other.members.retain(|m| m.key_id != ccb::SERVE_NODE);
-        let _ = d
-            .apply_replicated_community(ts::sign_community(ccb::FOUNDERS[0], other))
-            .await
-            .unwrap();
-        assert!(matches!(
-            cc::stored_standing(d, &other_id).await.unwrap(),
-            cc::StoredStanding::NotRooted { .. }
-        ));
-        assert!(
-            !ra::is_public_group(d, &other_id).await.unwrap(),
-            "I398f an unrooted constraint row is not public"
-        );
+        let again = pushed(&acc);
+        deliver(a, &again, "I398e the acceptance re-delivered").await;
     }
 
     /// **I399** — live lists intersect; withdrawing one leaves the other.
@@ -1361,48 +1636,44 @@ pub(crate) mod bodies {
 /// content gets no key for it. SQL backends (the cascades need blob storage).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod key_bodies {
-    use super::bodies::{entries, family, grant, nodes, put, room, users};
+    // v62 (E3b): every id handed to a production read, and every expected
+    // member of a recipient set, is `kr(seed)` (the identity-ref the
+    // edition-2 rows carry); the fixtures (`users`, `nodes`, `claim_with`,
+    // `room`, `family`, `grant`) take seeds.
+    use super::bodies::{entries, family, grant, kr, nodes, put, room, users};
     use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
     use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
-    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::types::cohort_scope::{COMMUNITY, FAMILY, SELF};
-    use crate::federation::types::{device_class, IdentityOccurrence};
-    use crate::federation::{BlobStorage, FederationDirectory, SignedAttestation};
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use crate::federation::types::device_class;
+    use crate::federation::{BlobStorage, FederationDirectory};
 
-    /// `owner` claims `node` (class `class`) with real content-KEM keys, and
-    /// binds it as its owner.
+    /// `owner` owns `node` (its self-occurrence's class `class`), and the
+    /// node holds real content-KEM keys.
+    ///
+    /// v62 (E3b; P5c, O1): a node is never bound under a person
+    /// (`occurrence_binds_machine_to_person`), so there is no `(owner, node)`
+    /// occurrence. WHO: the owner binding plus the node's voice
+    /// (`bodies::claim_with`). WHAT KIND, and the keys a wrap is sealed to:
+    /// the node's OWN self-occurrence (identity = occurrence = the node key),
+    /// carrying `class` and `encryption_pubkeys` (a CBOR map of the raw
+    /// `x25519` / `ml_kem_768` public halves, as E13's `anchor_self_on`).
     async fn keyed_claim<B>(b: &B, owner: &str, node: &str, class: &str)
     where
         B: FederationDirectory + Sync,
     {
+        use ciris_verify_core::cde::Value;
         let (_xp, x_pub, _mp, ml_pub) =
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("kem");
-        b.put_identity_occurrence_local(IdentityOccurrence {
-            identity_key_id: owner.to_owned(),
-            occurrence_key_id: node.to_owned(),
-            device_class: class.to_owned(),
-            hardware_attestation: None,
-            asserted_at: chrono::Utc::now() - chrono::Duration::days(2),
-            valid_until: None,
-            encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
-                x25519_base64: B64.encode(x_pub),
-                ml_kem_768_base64: B64.encode(&ml_pub),
-            }),
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("keyed claim {owner} → {node}: {e}"));
-        b.put_attestation(SignedAttestation {
-            attestation: ts::owner_binding_attestation(
-                &uuid::Uuid::new_v4().to_string(),
-                owner,
-                node,
-            ),
-        })
-        .await
-        .unwrap();
+        let enc = Value::Map(vec![
+            (Value::Text("x25519".into()), Value::Bytes(x_pub.to_vec())),
+            (Value::Text("ml_kem_768".into()), Value::Bytes(ml_pub)),
+        ]);
+        let opts = e2::BindOptions {
+            extra: vec![("encryption_pubkeys", enc)],
+            ..e2::BindOptions::default()
+        };
+        super::bodies::claim_with(b as &dyn FederationDirectory, owner, node, class, &opts).await;
     }
 
     async fn minter<B: FederationDirectory + Sync>(b: &B, s: &str) -> String {
@@ -1411,26 +1682,29 @@ pub(crate) mod key_bodies {
             .derived_key_id()
     }
 
+    /// The recipients of a seal at `scope` / `group` (a seed; read as `kr`).
     async fn self_family_granted<B>(b: &B, scope: &str, group: &str) -> Vec<String>
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        encrypt_and_cascade(b, scope, group, b"i39x content", None, None, None)
+        encrypt_and_cascade(b, scope, &kr(group), b"i39x content", None, None, None)
             .await
             .unwrap_or_else(|e| panic!("seal at {scope}: {e}"))
             .granted
     }
 
-    /// The room epoch a seal used, and that epoch's wrap recipients.
+    /// The room epoch a seal used, and that epoch's wrap recipients
+    /// (`cid` a seed; read as `kr`).
     async fn room_epoch<B>(b: &B, cid: &str, minter: &str) -> (u64, Vec<String>)
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        let r = encrypt_and_cascade_community(b, cid, b"i39x room", None, Some(minter))
+        let cid = kr(cid);
+        let r = encrypt_and_cascade_community(b, &cid, b"i39x room", None, Some(minter))
             .await
             .unwrap_or_else(|e| panic!("seal in {cid}: {e}"));
         let rec = b
-            .community_dek_member_grant_recipients(cid, &r.minter_key_id, r.epoch)
+            .community_dek_member_grant_recipients(&cid, &r.minter_key_id, r.epoch)
             .await
             .unwrap();
         (r.epoch, rec)
@@ -1464,31 +1738,36 @@ pub(crate) mod key_bodies {
         )
         .await
         .unwrap();
+        let (lk, pk) = (kr(&laptop), kr(&phone));
         let fg = self_family_granted(b, FAMILY, &fam).await;
         assert!(
-            fg.contains(&phone) && !fg.contains(&laptop),
+            fg.contains(&pk) && !fg.contains(&lk),
             "I393b family wraps: {fg:?}"
         );
+        // v62 (P5c update 5, CC rc21 3.3.7): a present allow list without
+        // the literal `"self"` entry excludes `self` for every class; the
+        // laptop's list names only `work`.
         let sg = self_family_granted(b, SELF, &owner).await;
         assert!(
-            sg.contains(&phone) && sg.contains(&laptop),
-            "I393b self follows the class: {sg:?}"
+            sg.contains(&pk) && !sg.contains(&lk),
+            "I393b a list without \"self\" excludes self: {sg:?}"
         );
         let m = minter(b, s).await;
         let (_, ar) = room_epoch(b, &adult, &m).await;
         assert!(
-            ar.contains(&phone) && !ar.contains(&laptop),
+            ar.contains(&pk) && !ar.contains(&lk),
             "I393b adulthub's epoch key: {ar:?}"
         );
         let (_, wr) = room_epoch(b, &work, &m).await;
         assert!(
-            wr.contains(&laptop),
+            wr.contains(&lk),
             "I393b the listed room's key reaches the laptop: {wr:?}"
         );
     }
 
-    /// **I394b** — a server-class agent and server get no self or family key,
-    /// but do get their owner's room key (CC 3.3.7).
+    /// **I394b** — a server gets no self or family key, an owned agent gets
+    /// self but no family key (P5c update 4), and both get their owner's room
+    /// key (CC 3.3.7).
     pub(crate) async fn i394b_server_class_keys<B>(b: &B, s: &str)
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -1509,16 +1788,23 @@ pub(crate) mod key_bodies {
         keyed_claim(b, &owner, &laptop, device_class::LAPTOP).await;
         room(d, &cid, &[&owner]).await;
         family(d, &fam, &[&owner]).await;
-        for (scope, group) in [(SELF, owner.as_str()), (FAMILY, fam.as_str())] {
-            let g = self_family_granted(b, scope, group).await;
-            assert!(
-                g.contains(&laptop) && !g.contains(&agent) && !g.contains(&server),
-                "I394b {scope}: no key for the server class: {g:?}"
-            );
-        }
+        let (ak, sk, lk) = (kr(&agent), kr(&server), kr(&laptop));
+        // v62 (P5c update 4): an `agent`-class device its owner OWNS is
+        // `OwnedAgent`: within its owner's `self` (no list), no `family` by
+        // default. The server class gets neither.
+        let g = self_family_granted(b, SELF, &owner).await;
+        assert!(
+            g.contains(&lk) && g.contains(&ak) && !g.contains(&sk),
+            "I394b self: the laptop and the owned agent, not the server: {g:?}"
+        );
+        let g = self_family_granted(b, FAMILY, &fam).await;
+        assert!(
+            g.contains(&lk) && !g.contains(&ak) && !g.contains(&sk),
+            "I394b family: no key for the server class or the owned agent: {g:?}"
+        );
         let (_, r) = room_epoch(b, &cid, &minter(b, s).await).await;
         assert!(
-            r.contains(&agent) && r.contains(&server) && r.contains(&laptop),
+            r.contains(&ak) && r.contains(&sk) && r.contains(&lk),
             "I394b the room key reaches every class: {r:?}"
         );
     }
@@ -1542,9 +1828,10 @@ pub(crate) mod key_bodies {
         keyed_claim(b, &owner, &phone, device_class::PHONE).await;
         room(d, &cid, &[&owner]).await;
         let m = minter(b, s).await;
+        let (lk, pk) = (kr(&laptop), kr(&phone));
         let (e0, r0) = room_epoch(b, &cid, &m).await;
         assert!(
-            r0.contains(&laptop),
+            r0.contains(&lk),
             "I392c precondition — the laptop holds e{e0}"
         );
         put(
@@ -1556,10 +1843,10 @@ pub(crate) mod key_bodies {
         let (e1, r1) = room_epoch(b, &cid, &m).await;
         assert!(e1 > e0, "I392c the deny rotated the epoch: e{e0} → e{e1}");
         assert!(
-            !r1.contains(&laptop) && r1.contains(&phone),
+            !r1.contains(&lk) && r1.contains(&pk),
             "I392c the new epoch's key skips the denied laptop: {r1:?}"
         );
-        let again = encrypt_and_cascade_community(b, &cid, b"i392c steady", None, Some(&m))
+        let again = encrypt_and_cascade_community(b, &kr(&cid), b"i392c steady", None, Some(&m))
             .await
             .unwrap();
         assert_eq!(
@@ -1607,35 +1894,36 @@ pub(crate) mod key_bodies {
         family(d, &fam, &[&owner]).await;
         let m = minter(b, s).await;
         set_node(b, m.clone());
+        let (lk, pk) = (kr(&laptop), kr(&phone));
         let deny = deny_all(b, &owner, &laptop).await;
-        let sealed = encrypt_and_cascade(b, FAMILY, &fam, b"i397e family", None, None, None)
+        let sealed = encrypt_and_cascade(b, FAMILY, &kr(&fam), b"i397e family", None, None, None)
             .await
             .unwrap();
         assert!(
-            sealed.granted.contains(&phone) && !sealed.granted.contains(&laptop),
+            sealed.granted.contains(&pk) && !sealed.granted.contains(&lk),
             "I397e precondition — the denied laptop gets no family key: {:?}",
             sealed.granted
         );
         let (e0, r0) = room_epoch(b, &cid, &m).await;
         assert!(
-            !r0.contains(&laptop) && r0.contains(&phone),
+            !r0.contains(&lk) && r0.contains(&pk),
             "I397e precondition — nor the room's e{e0}: {r0:?}"
         );
 
         super::bodies::withdraw_pub(d, &owner, &deny).await;
         assert!(
-            b.get_at_rest_grant(&sealed.at_rest_sha256, &laptop)
+            b.get_at_rest_grant(&sealed.at_rest_sha256, &lk)
                 .await
                 .unwrap()
                 .is_some(),
             "I397e the allowed laptop holds the family blob sealed while it was denied"
         );
         let held = b
-            .community_dek_member_grant_recipients(&cid, &m, e0)
+            .community_dek_member_grant_recipients(&kr(&cid), &m, e0)
             .await
             .unwrap();
         assert!(
-            held.contains(&laptop),
+            held.contains(&lk),
             "I397e and the room epoch minted while it was denied: {held:?}"
         );
     }
@@ -1666,25 +1954,26 @@ pub(crate) mod key_bodies {
         family(d, &fam, &[&owner]).await;
         let m = minter(b, s).await;
         set_node(b, m.clone());
+        let (lk, pk) = (kr(&laptop), kr(&phone));
         let (e0, r0) = room_epoch(b, &cid, &m).await;
         assert!(
-            r0.contains(&laptop),
+            r0.contains(&lk),
             "I397f precondition — the laptop holds e{e0}"
         );
-        let before = encrypt_and_cascade(b, FAMILY, &fam, b"i397f before", None, None, None)
+        let before = encrypt_and_cascade(b, FAMILY, &kr(&fam), b"i397f before", None, None, None)
             .await
             .unwrap();
         assert!(
-            before.granted.contains(&laptop),
+            before.granted.contains(&lk),
             "I397f precondition — and family"
         );
 
         deny_all(b, &owner, &laptop).await;
-        let after = encrypt_and_cascade(b, FAMILY, &fam, b"i397f after", None, None, None)
+        let after = encrypt_and_cascade(b, FAMILY, &kr(&fam), b"i397f after", None, None, None)
             .await
             .unwrap();
         assert!(
-            !after.granted.contains(&laptop) && after.granted.contains(&phone),
+            !after.granted.contains(&lk) && after.granted.contains(&pk),
             "I397f family content after the deny skips the laptop: {:?}",
             after.granted
         );
@@ -1694,7 +1983,7 @@ pub(crate) mod key_bodies {
             "I397f the deny rolled the room epoch: e{e0} → e{e1}"
         );
         assert!(
-            !r1.contains(&laptop) && r1.contains(&phone),
+            !r1.contains(&lk) && r1.contains(&pk),
             "I397f the new epoch skips the denied laptop: {r1:?}"
         );
     }
@@ -1717,7 +2006,8 @@ mod runners {
                         async fn $name() {
                             let Some(d) = $fresh.await else { return };
                             super::super::bodies::$name(&d as &dyn FederationDirectory, &suffix()).await
-                        }
+
+}
                     };
                 }
                 case!(i390_public_groups);
@@ -1729,7 +2019,6 @@ mod runners {
                 case!(i397_origin_and_refers_to);
                 case!(i398_receiver_agrees_with_the_cohort_view);
                 case!(i399_lists_intersect_until_withdrawn);
-                case!(i398f_a_rooted_trust_root_is_public);
                 $(case!($extra);)*
             }
         };
@@ -1950,13 +2239,15 @@ mod consent_change_runners {
 #[cfg(all(test, feature = "sqlite"))]
 mod codex_978_i505 {
     use crate::federation::accord_test_support as ops;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::replication_audience as ra;
+    use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::trust_root::{
         test_pre_rotation_commitment, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
         TRUST_CHARTER_DIMENSION,
     };
     use crate::federation::types::attestation_type::DELEGATES_TO;
-    use crate::federation::{FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
 
     /// **I505 — a family is public only by the charter its HEAD names** (Codex
     /// on #978; CC 3.2 T6): a live `trust:charter:v1` row the head does not
@@ -1966,15 +2257,44 @@ mod codex_978_i505 {
         let fid = format!("i505-family-{tag}");
         let (a, b) = (format!("i505-a-{tag}"), format!("i505-b-{tag}"));
         super::bodies::users(d, &[&a, &b]).await;
-        super::bodies::family(d, &fid, &[&a, &b]).await;
+        // Wave 2 (T1): the family is founded through the edition-2 door (both
+        // founders' voices) and held under its identity-ref.
+        let now = chrono::Utc::now();
+        let founding = ts::sign_family(
+            &a,
+            crate::federation::types::Family {
+                family_key_id: fid.clone(),
+                family_name: "household".into(),
+                members: [&a, &b]
+                    .iter()
+                    .map(|k| crate::federation::types::FamilyMember {
+                        key_id: (*k).clone(),
+                        joined_at: now - chrono::Duration::days(3),
+                        role: Some("founder".into()),
+                    })
+                    .collect(),
+                founded_at: now - chrono::Duration::days(3),
+                consensus_protocol: "founder_only".into(),
+                consensus_protocol_entrenched: false,
+                dissolved_at: None,
+                persist_row_hash: String::new(),
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+            },
+        );
+        e2::put_voices(d, &e2::family_voices(&founding, 1, None, e2::ms(now)))
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I505: the family founds: {e}"));
+        let fid_ref = e2::kid(&fid);
         assert!(
-            !ra::is_public_group(d, &fid).await.unwrap(),
+            !ra::is_public_group(d, &fid_ref).await.unwrap(),
             "{tag} I505: control — no charter, private"
         );
         // A live charter row, stored AHEAD of the version that adopts it.
         let id = format!("i505-charter-{tag}");
+        // v62 (E3): no self-reference: a `references_attestation_id` names a
+        // held row by its node-computed id, and this row has none yet.
         let env = serde_json::json!({
-            "references_attestation_id": id,
             "dimension": TRUST_CHARTER_DIMENSION,
             "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
             "pre_rotation_commitment": test_pre_rotation_commitment(&[
@@ -1984,46 +2304,40 @@ mod codex_978_i505 {
             .unwrap(),
         });
         let charter = ops::co_signed_trust_attestation(&id, &a, &fid, DELEGATES_TO, env, &[&b]);
-        d.put_attestation(SignedAttestation {
-            attestation: charter,
-        })
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I505: the charter row admits: {e}"));
+        // v62 (E3): the row id is node-computed; read it off the row.
+        let charter_id = charter.attestation_id.clone();
+        // The co-signer is a further voice, put after the row.
+        let voices =
+            crate::federation::edition2::fixture_switch::voices_of(&charter, &[b.as_str()]);
+        crate::federation::edition2::fixture_switch::put_signed(d, &charter)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I505: the charter row admits: {e}"));
+        for v in voices {
+            crate::federation::edition2::fixture_switch::put_statement(d, &v)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I505: the co-signer's voice: {e}"));
+        }
         let digest = d
-            .get_attestation(&id)
+            .get_attestation(&charter_id)
             .await
             .unwrap()
             .unwrap()
             .persist_row_hash;
         assert!(
-            !ra::is_public_group(d, &fid).await.unwrap(),
+            !ra::is_public_group(d, &fid_ref).await.unwrap(),
             "{tag} I505: a charter the head does not name widens nothing"
         );
-        // The version that names it.
-        let held = d.lookup_family(&fid).await.unwrap().unwrap();
-        let signed = crate::federation::types::SignedFamily {
-            family: {
-                let mut f = held.clone();
-                f.persist_row_hash = String::new();
-                f.prev_head_digest = held.persist_row_hash.clone();
-                f.charter_digest = digest;
-                f
-            },
-            authority_key_id: a.clone(),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            supersede_proof: None,
-            cosignatures: Vec::new(),
-        };
-        d.supersede_group_row(
-            crate::federation::cohort::Cohort::Family,
-            serde_json::to_value(&signed).unwrap(),
-            None,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I505: the naming version: {e}"));
+        // The version that names it: the roster's own row at the next
+        // version, naming the held head by `refs.head`, every founder voicing.
+        let mut next = founding.family.clone();
+        next.charter_digest = digest;
+        let next = ts::sign_family(&a, next);
+        let voices = e2::family_voices_naming_held(d, &next, e2::ms(chrono::Utc::now())).await;
+        e2::put_voices(d, &voices)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I505: the naming version: {e}"));
         assert!(
-            ra::is_public_group(d, &fid).await.unwrap(),
+            ra::is_public_group(d, &fid_ref).await.unwrap(),
             "{tag} I505: the head names the charter — public"
         );
     }

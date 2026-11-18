@@ -9,8 +9,9 @@
 //! authority, and only this node's door writes one, at admission, with the
 //! target held. So an honest non-producer `withdraws` that arrived first
 //! retires nothing on that node, while an in-order node retires. That order
-//! dependence is named and owned by v62 (its fold derives entitlement); these
-//! witnesses assert it as it is, not as it will be.
+//! dependence is named and owned by v62. v62 (E3): an early composer WAITS for
+//! its target (cut A), so it is judged when the target lands and both arrival
+//! orders now give the in-order verdict; the witnesses below assert that.
 //!
 //! - **I1600** (pure: the fold) — against each of the eight adverse classes
 //!   of CC 2.4.1.1 and a cosigned act, a subject's `withdraws` retires
@@ -39,12 +40,9 @@
 //!   withdraws first it is held with no rule, and the three readers of the
 //!   stored rule keep the row live, while the bytes plane's re-derivation
 //!   (which asks the door again at read time, I150) retires it.
-//! - **I1602** (sqlite, postgres) — a self-roster proposal's receipt (V199) is
-//!   written in the row's transaction: with the receipt's INSERT made to fail,
-//!   the proposal row is refused by `put_attestation`, by
-//!   `apply_replicated_attestation` and by the local roster gate
-//!   (`put_identity_occurrence`), and neither the row nor a receipt is held.
-//!   A re-offer lands both, and a later re-offer moves nothing.
+//! - **I1602** (deleted in v62, E3: the self-roster proposal row and its
+//!   V199 receipt are the earlier door's ledger; O1's `identity:occurrence`
+//!   counts voices with no proposal row or receipt, witnessed by O1 I3020.)
 //! - **I1603** (sqlite, postgres) — the stamp is the door's, never the
 //!   offered row's: a `withdraws` offered with a forged rule 1 or 5, through
 //!   `put_attestation` or `apply_replicated_attestation`, in either arrival
@@ -374,8 +372,8 @@ mod fold {
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::membership_acceptance_invariants::bodies::{found_community, reg};
-    use crate::federation::self_roster as sr;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, cohort_scope, identity_type};
     use crate::federation::{Attestation, Error, FederationDirectory, SignedAttestation};
@@ -404,29 +402,36 @@ pub(crate) mod bodies {
         r.subject_key_ids = vec![subject.to_owned()];
         ts::seal_row_in_place(by, &mut r);
         if let Some(c) = cosigner {
-            let (_h, classical, pqc) = ts::sign_envelope(c, &r.attestation_envelope);
-            r.additional_scrubs
-                .push(crate::federation::types::ScrubSig {
-                    scrub_key_id: c.to_owned(),
-                    scrub_signature_classical: classical,
-                    scrub_signature_pqc: pqc,
-                    cosigned_at: None,
-                });
+            // v62 (E3): a cosignature is a further edition-2 voice over the
+            // same statement, put after the row (`put`).
+            add_voice(&r, c);
         }
         r
     }
 
-    /// `issuer`'s `withdraws` of `target`.
+    /// The further voices `put` delivers after a row, by row id.
+    fn voices() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<Vec<u8>>>> {
+        static V: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Vec<Vec<u8>>>>,
+        > = std::sync::OnceLock::new();
+        V.get_or_init(Default::default)
+    }
+
+    /// `signer`'s voice over `row`'s statement, delivered with the row.
+    fn add_voice(row: &Attestation, signer: &str) {
+        let st = e2::carried_statement(row).expect("an edition-2 row carries its statement");
+        voices()
+            .lock()
+            .expect("voices")
+            .entry(row.attestation_id.clone())
+            .or_default()
+            .push(e2::voice_of(&st, signer));
+    }
+
+    /// `issuer`'s `withdraws` of `target`: v62 (E3) an edition-2 composer
+    /// carrying the target's family, `refs.target` = the target's row id.
     fn withdraws(issuer: &str, target: &Attestation) -> Attestation {
-        let env = serde_json::json!({
-            "references_attestation_id": target.attestation_id,
-            "withdrawal_reason": "I1601",
-        });
-        let mut w = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), issuer, issuer, &env);
-        w.attestation_type = attestation_type::WITHDRAWS.into();
-        w.weight = None;
-        ts::seal_row_in_place(issuer, &mut w);
-        w
+        e2::composer_of("withdraws", target, issuer)
     }
 
     async fn put(d: &dyn FederationDirectory, r: &Attestation) -> Result<(), Error> {
@@ -434,7 +439,17 @@ pub(crate) mod bodies {
             attestation: r.clone(),
         })
         .await
-        .map(|_| ())
+        .map(|_| ())?;
+        let pending = voices()
+            .lock()
+            .expect("voices")
+            .get(&r.attestation_id)
+            .cloned()
+            .unwrap_or_default();
+        for v in pending {
+            e2::put_statement(d, &v).await?;
+        }
+        Ok(())
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -444,8 +459,9 @@ pub(crate) mod bodies {
     }
 
     /// Deliver `target` and `w` in `order`. The target always lands; returns
-    /// the door's verdict on `w`. Withdraws first, the door has no target to
-    /// ask and admits it deferred.
+    /// the door's verdict on `w`. v62 (E3): withdraws first, a composer whose
+    /// target is not held WAITS (cut A): nothing is kept, and the re-offer
+    /// after the target lands is judged exactly as in order.
     async fn arrive(
         d: &dyn FederationDirectory,
         order: Order,
@@ -458,16 +474,16 @@ pub(crate) mod bodies {
                 put(d, w).await
             }
             Order::WithdrawsFirst => {
-                put(d, w)
-                    .await
-                    .expect("I1601: a withdraws whose target is not held is admitted deferred");
-                let held = d.get_attestation(&w.attestation_id).await.unwrap().unwrap();
-                assert_eq!(
-                    held.withdraws_admission_rule, None,
-                    "I1601: deferred, no rule"
+                let early = put(d, w).await;
+                assert!(
+                    d.get_attestation(&w.attestation_id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "I1601: a withdraws whose target is not held waits, kept nowhere: {early:?}"
                 );
                 put(d, target).await.expect("I1601: the target lands");
-                Ok(())
+                put(d, w).await
             }
         }
     }
@@ -505,7 +521,7 @@ pub(crate) mod bodies {
             let attester = held.attesting_key_id.clone();
             async move {
                 d.list_scores(
-                    caller,
+                    &e2::kid(caller),
                     crate::read::AttestationFilter {
                         attesting_key_id: Some(attester),
                         lifecycle,
@@ -556,10 +572,8 @@ pub(crate) mod bodies {
             let mod_act = about(&moderator, "moderation:rogue_vote:v1", &author, &room, None);
             let w = withdraws(&author, &mod_act);
             let verdict = arrive(d, order, &mod_act, &w).await;
-            if let Order::TargetFirst = order {
-                let e = verdict.expect_err("I1601: the door refuses it in order");
-                assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I1601: {e}");
-            }
+            let e = verdict.expect_err("I1601: the door refuses it, in either order");
+            assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I1601: {e}");
             assert_eq!(
                 readers(d, &author, &mod_act.attestation_id, &w.attestation_id).await,
                 [false; 4],
@@ -570,10 +584,8 @@ pub(crate) mod bodies {
             let cosigned = about(&member, PLAIN, &author, &room, Some(&moderator));
             let w = withdraws(&author, &cosigned);
             let verdict = arrive(d, order, &cosigned, &w).await;
-            if let Order::TargetFirst = order {
-                let e = verdict.expect_err("I1601: the door refuses it in order");
-                assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I1601: {e}");
-            }
+            let e = verdict.expect_err("I1601: the door refuses it, in either order");
+            assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I1601: {e}");
             assert_eq!(
                 readers(d, &author, &cosigned.attestation_id, &w.attestation_id).await,
                 [false; 4],
@@ -592,23 +604,16 @@ pub(crate) mod bodies {
                 "I1601 {what}: the producer's withdraws retires for every reader"
             );
 
-            // The subject withdraws a peer's plain row about them. In order
-            // the door stamps rule 2 and every reader retires it. Withdraws
-            // first, the held row is never re-stamped (FSD 5.8): it keeps no
-            // rule, so the three readers of the stored rule keep the row live
-            // on this node (#1218 H1: past the producer, only a stamp
-            // entitles), while the bytes plane, which asks the door again at
-            // read time (I150), retires it. The order dependence is v62's to
-            // close; this asserts it as it is.
+            // The subject withdraws a peer's plain row about them: the door
+            // stamps rule 2 and every reader retires it. v62 (E3): in either
+            // order, since an early composer waits for its target and is
+            // judged when it lands (the order dependence #1218 named is closed).
             let peer_row = about(&member, PLAIN, &author, &room, None);
             let w = withdraws(&author, &peer_row);
             arrive(d, order, &peer_row, &w)
                 .await
                 .expect("I1601: the subject withdraws a plain row");
-            let (rule, readers_say) = match order {
-                Order::TargetFirst => (Some(2), [true; 4]),
-                Order::WithdrawsFirst => (None, [false, false, true, false]),
-            };
+            let (rule, readers_say) = (Some(2), [true; 4]);
             assert_eq!(
                 d.get_attestation(&w.attestation_id)
                     .await
@@ -616,12 +621,12 @@ pub(crate) mod bodies {
                     .expect("held")
                     .withdraws_admission_rule,
                 rule,
-                "I1601 {what}: stamped only when the door saw the target"
+                "I1601 {what}: stamped by the door that saw the target"
             );
             assert_eq!(
                 readers(d, &author, &peer_row.attestation_id, &w.attestation_id).await,
                 readers_say,
-                "I1601 {what}: a plain row's subject withdraws it on the in-order node only \
+                "I1601 {what}: a plain row's subject withdraws it in either order \
                  ([fold, Live rule, bytes-plane re-derivation, SQL Live])"
             );
         }
@@ -665,8 +670,9 @@ pub(crate) mod bodies {
                 for forged in [1_u8, 5] {
                     let what = format!("{via:?} {order:?} forged {forged}");
                     let forge = |mut w: Attestation| {
+                        // v62 (E3): the rule is a column, not a member of the
+                        // statement, so the offered bytes are unchanged.
                         w.withdraws_admission_rule = Some(forged);
-                        ts::reseal(&mut w);
                         w
                     };
                     for (target, issuer) in [
@@ -689,26 +695,20 @@ pub(crate) mod bodies {
                                     .expect_err("I1603: the door refuses it, stamp or none");
                             }
                             Order::WithdrawsFirst => {
-                                deliver(d, via, &w).await.expect("I1603: admitted deferred");
-                                assert_eq!(
+                                // v62 (E3): the early composer waits; nothing,
+                                // and so no offered stamp, is kept.
+                                let early = deliver(d, via, &w).await;
+                                assert!(
                                     d.get_attestation(&w.attestation_id)
                                         .await
                                         .unwrap()
-                                        .expect("held")
-                                        .withdraws_admission_rule,
-                                    None,
-                                    "I1603 {what}: the offered stamp is not kept"
+                                        .is_none(),
+                                    "I1603 {what}: an early withdraws is kept nowhere: {early:?}"
                                 );
                                 deliver(d, via, &target).await.expect("I1603: the target");
-                                assert_eq!(
-                                    d.get_attestation(&w.attestation_id)
-                                        .await
-                                        .unwrap()
-                                        .expect("held")
-                                        .withdraws_admission_rule,
-                                    None,
-                                    "I1603 {what}: the held row is never re-stamped"
-                                );
+                                deliver(d, via, &w)
+                                    .await
+                                    .expect_err("I1603: re-offered, the door refuses it");
                             }
                         }
                         assert_eq!(
@@ -739,7 +739,11 @@ pub(crate) mod bodies {
             let mut binding =
                 ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner, &node);
             binding.subject_key_ids = vec![node.clone()];
-            ts::reseal(&mut binding);
+            // v62 (E3): re-sealed by its signer's SEED (`reseal` would sign as
+            // the stored identity-ref).
+            ts::seal_row_in_place(&owner, &mut binding);
+            // v62 (E3): an owner binding counts the node's own voice (C557).
+            add_voice(&binding, &node);
             let w = withdraws(&node, &binding);
             match order {
                 Order::TargetFirst => {
@@ -753,18 +757,23 @@ pub(crate) mod bodies {
                     );
                 }
                 Order::WithdrawsFirst => {
-                    put(d, &w)
-                        .await
-                        .expect("I1604: a withdraws whose target is not held is admitted");
-                    put(d, &binding).await.expect("I1604: the binding lands");
-                    assert_eq!(
+                    // v62 (E3): the early composer waits for its target; the
+                    // re-offer meets the same ceremony refusal as in order.
+                    let early = put(d, &w).await;
+                    assert!(
                         d.get_attestation(&w.attestation_id)
                             .await
                             .unwrap()
-                            .expect("held")
-                            .withdraws_admission_rule,
-                        None,
-                        "I1604: held unstamped"
+                            .is_none(),
+                        "I1604: an early withdraws is kept nowhere: {early:?}"
+                    );
+                    put(d, &binding).await.expect("I1604: the binding lands");
+                    let e = put(d, &w)
+                        .await
+                        .expect_err("I1604: re-offered, the door refuses it");
+                    assert!(
+                        matches!(e, Error::OwnershipReclaimRefused { .. }),
+                        "I1604: refused by the recovery gate: {e:?}"
                     );
                 }
             }
@@ -789,17 +798,17 @@ pub(crate) mod bodies {
             assert!(
                 crate::federation::admission::live_delegation_granters(
                     d,
-                    &node,
+                    &e2::kid(&node),
                     DelegationEdgeFilter::OwnerBindingOnly,
                 )
                 .await
                 .expect("granters")
-                .contains(&owner),
+                .contains(&e2::kid(&owner)),
                 "I1604 {what}: the owner-binding walk keeps the owner"
             );
             assert_eq!(
-                owner_of(d, &node).await.expect("owner_of"),
-                Some(owner.clone()),
+                owner_of(d, &e2::kid(&node)).await.expect("owner_of"),
+                Some(e2::kid(&owner)),
                 "I1604 {what}: the node is still owned"
             );
 
@@ -807,166 +816,17 @@ pub(crate) mod bodies {
             // attested to the node, as a binding's retraction is: the
             // owner-binding walk reads the retractions about its subject.
             let mut by_owner = withdraws(&owner, &binding);
-            by_owner.attested_key_id = node.clone();
+            by_owner.attested_key_id = e2::kid(&node);
             ts::seal_row_in_place(&owner, &mut by_owner);
             put(d, &by_owner)
                 .await
                 .expect("I1604: the owner withdraws its binding");
             assert_eq!(
-                owner_of(d, &node).await.expect("owner_of"),
+                owner_of(d, &e2::kid(&node)).await.expect("owner_of"),
                 None,
                 "I1604 {what}: the owner's withdraws ends the binding"
             );
         }
-    }
-
-    /// A self `f` holding its first key `d1`, and a third user key `d2`.
-    async fn one_key_self(d: &dyn FederationDirectory, tag: &str) -> [String; 3] {
-        let (f, d1, d2) = (
-            format!("i1602-f-{tag}"),
-            format!("i1602-d1-{tag}"),
-            format!("i1602-d2-{tag}"),
-        );
-        for k in [&f, &d1, &d2] {
-            ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
-        }
-        d.put_identity_occurrence(ts::signed_content_only_occurrence(&f, &f, &d1, ms_now()).await)
-            .await
-            .expect("I1602: at one key the addition lands");
-        [f, d1, d2]
-    }
-
-    fn ms_now() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .expect("ms")
-    }
-
-    async fn receipt(
-        d: &dyn FederationDirectory,
-        f: &str,
-        id: &str,
-    ) -> Option<crate::federation::self_roster::SelfRosterReceipt> {
-        d.list_open_self_roster_proposals(Some(f))
-            .await
-            .expect("receipts")
-            .into_iter()
-            .find(|r| r.proposal_id == id)
-    }
-
-    async fn held(d: &dyn FederationDirectory, id: &str) -> bool {
-        d.get_attestation(id).await.expect("read").is_some()
-    }
-
-    /// **I1602** — no proposal row without its receipt. `broken` makes the
-    /// receipt's INSERT fail (reads of the ledger still work, so nothing
-    /// before the row's transaction can fail first); `mended` restores it.
-    /// Three doors: a peer's proposal row through `put_attestation` and
-    /// through `apply_replicated_attestation`, and the local roster gate
-    /// (`put_identity_occurrence` → `self_roster::gate`), which reads the
-    /// ledger first and then puts the row.
-    pub(crate) async fn i1602_a_failed_receipt_fails_the_proposal<B, M>(
-        d: &dyn FederationDirectory,
-        tag: &str,
-        broken: B,
-        mended: M,
-    ) where
-        B: std::future::Future<Output = ()>,
-        M: std::future::Future<Output = ()>,
-    {
-        // A peer's proposal: d1 proposes d2 to self f.
-        let [f, d1, d2] = one_key_self(d, &format!("{tag}r")).await;
-        let signed = ts::signed_content_only_occurrence(&d1, &f, &d2, ms_now()).await;
-        let row = sr::proposal_row(&sr::Carried::Occurrence(signed)).expect("proposal row");
-        assert!(sr::is_proposal_row(&row), "I1602: fixture");
-        let id = row.attestation_id.clone();
-        // A local proposal: e1 proposes e2 to self g, at the gate.
-        let [g, e1, e2] = one_key_self(d, &format!("{tag}g")).await;
-        let local = ts::signed_content_only_occurrence(&e1, &g, &e2, ms_now()).await;
-        let local_id = sr::proposal_row(&sr::Carried::Occurrence(local.clone()))
-            .expect("proposal row")
-            .attestation_id;
-
-        broken.await;
-        d.put_attestation(SignedAttestation {
-            attestation: row.clone(),
-        })
-        .await
-        .expect_err("I1602: the door surfaces a failed receipt");
-        assert!(
-            !held(d, &id).await,
-            "I1602: no proposal without its receipt"
-        );
-        d.apply_replicated_attestation(SignedAttestation {
-            attestation: row.clone(),
-        })
-        .await
-        .expect_err("I1602: the replicated path surfaces it too");
-        assert!(!held(d, &id).await, "I1602: replicated, no row either");
-        let gated = d.put_identity_occurrence(local.clone()).await;
-        assert!(
-            !matches!(gated, Ok(()) | Err(Error::SelfRosterNotLanded { .. })),
-            "I1602: the gate surfaces a failed receipt, not a held proposal: {gated:?}"
-        );
-        assert!(
-            !held(d, &local_id).await,
-            "I1602: the gate holds no proposal without its receipt"
-        );
-        mended.await;
-        assert!(
-            receipt(d, &f, &id).await.is_none(),
-            "I1602: nothing was noted"
-        );
-        assert!(
-            receipt(d, &g, &local_id).await.is_none(),
-            "I1602: nor at the gate"
-        );
-
-        // A re-offer lands both.
-        let before = sr::roster_clock() - chrono::Duration::seconds(1);
-        let outcome = d
-            .apply_replicated_attestation(SignedAttestation {
-                attestation: row.clone(),
-            })
-            .await
-            .expect("I1602: the re-offer lands");
-        assert_eq!(
-            outcome,
-            crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
-            "I1602"
-        );
-        assert!(held(d, &id).await, "I1602: the row is held");
-        let first = receipt(d, &f, &id)
-            .await
-            .expect("I1602: the row brought its receipt");
-        assert_eq!(
-            first.identity_key_id, f,
-            "I1602: the receipt names the self"
-        );
-        assert!(first.received_at >= before, "I1602: {}", first.received_at);
-        match d.put_identity_occurrence(local).await {
-            Err(Error::SelfRosterNotLanded {
-                decision: "pending",
-                proposal_id,
-                ..
-            }) => assert_eq!(proposal_id, local_id, "I1602: the gate's proposal"),
-            other => panic!("I1602: the gate's re-offer holds a pending proposal: {other:?}"),
-        }
-        assert!(
-            receipt(d, &g, &local_id).await.is_some(),
-            "I1602: the gate's row brought its receipt"
-        );
-
-        // A later offer moves nothing: first seen wins.
-        d.put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect("I1602: an idempotent re-put");
-        assert_eq!(
-            receipt(d, &f, &id).await.map(|r| r.received_at),
-            Some(first.received_at),
-            "I1602: the first instant stands"
-        );
     }
 }
 
@@ -1019,77 +879,4 @@ mod runners {
     on_sqlite_and_postgres!(i1601, bodies::i1601_both_arrival_orders_agree);
     on_sqlite_and_postgres!(i1603, bodies::i1603_a_forged_stamp_is_never_kept);
     on_sqlite_and_postgres!(i1604, bodies::i1604_a_node_cannot_outrun_its_owner);
-
-    /// The receipt's INSERT is made to fail by a trigger, so every read of
-    /// the ledger (the self-roster plan's) still works.
-    #[cfg(feature = "sqlite")]
-    const BREAK_SQLITE: &str = "CREATE TRIGGER i1602_receipt_fails \
-        BEFORE INSERT ON federation_self_roster_proposals \
-        BEGIN SELECT RAISE(ABORT, 'I1602 injected receipt failure'); END;";
-    #[cfg(feature = "sqlite")]
-    const MEND_SQLITE: &str = "DROP TRIGGER i1602_receipt_fails;";
-    #[cfg(feature = "postgres")]
-    const BREAK_PG: &str = "CREATE FUNCTION cirislens.i1602_receipt_fails() RETURNS trigger \
-        LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'I1602 injected receipt failure'; END $$; \
-        CREATE TRIGGER i1602_receipt_fails \
-        BEFORE INSERT ON cirislens.federation_self_roster_proposals \
-        FOR EACH ROW EXECUTE FUNCTION cirislens.i1602_receipt_fails();";
-    #[cfg(feature = "postgres")]
-    const MEND_PG: &str = "DROP TRIGGER i1602_receipt_fails \
-        ON cirislens.federation_self_roster_proposals; \
-        DROP FUNCTION cirislens.i1602_receipt_fails();";
-
-    #[cfg(feature = "sqlite")]
-    async fn sql_sqlite(b: &crate::store::sqlite::SqliteBackend, sql: &str) {
-        b.conn_handle().lock().execute_batch(sql).unwrap();
-    }
-
-    #[cfg(feature = "postgres")]
-    async fn sql_pg(b: &crate::store::postgres::PostgresBackend, sql: &str) {
-        b.get_client()
-            .await
-            .unwrap()
-            .batch_execute(sql)
-            .await
-            .unwrap();
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i1602_sqlite() {
-        use crate::store::Backend as _;
-        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        Box::pin(bodies::i1602_a_failed_receipt_fails_the_proposal(
-            &b,
-            &tag("s"),
-            sql_sqlite(&b, BREAK_SQLITE),
-            sql_sqlite(&b, MEND_SQLITE),
-        ))
-        .await;
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    async fn i1602_postgres() {
-        use crate::store::Backend as _;
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            eprintln!("i1602 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
-            return;
-        };
-        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        Box::pin(bodies::i1602_a_failed_receipt_fails_the_proposal(
-            &b,
-            &tag("p"),
-            sql_pg(&b, BREAK_PG),
-            sql_pg(&b, MEND_PG),
-        ))
-        .await;
-        eprintln!("i1602 postgres: RAN");
-    }
 }

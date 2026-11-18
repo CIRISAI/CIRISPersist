@@ -70,18 +70,25 @@ pub(crate) mod bodies {
         let a = Node {
             backend: sa.as_ref(),
             signer: ts::local_signer(&alias_a),
-            key: engine_a.local_derived_key_id().await.unwrap(),
+            // v62 (E4; cut B): the node states its rows under its composite
+            // identity-ref.
+            key: ts::local_signer(&alias_a).federation_id().await,
             kem: kem(sa.load_or_init_content_kem_identity().await.unwrap()),
         };
         let b = Node {
             backend: sb.as_ref(),
             signer: ts::local_signer(&alias_b),
-            key: engine_b.local_derived_key_id().await.unwrap(),
+            key: ts::local_signer(&alias_b).federation_id().await,
             kem: kem(sb.load_or_init_content_kem_identity().await.unwrap()),
         };
         introduce(&[&a, &b], &[&alias_a, &alias_b]).await;
-        let comm = format!("em-comm-{run}");
-        let (alice, bob) = (format!("em-alice-{run}"), format!("em-bob-{run}"));
+        let comm = crate::federation::edition2::fixture_switch::kid(&format!("em-comm-{run}")); // v62 (E4): the typed row is keyed by identity-ref
+                                                                                                // v62 (E4): members are named by identity-ref (`e2::kid`); every
+                                                                                                // seed-taking fixture accepts it back.
+        let (alice, bob) = (
+            crate::federation::edition2::fixture_switch::kid(&format!("em-alice-{run}")),
+            crate::federation::edition2::fixture_switch::kid(&format!("em-bob-{run}")),
+        );
         seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))]).await;
         let (node_a, node_b) = (a.key.clone(), b.key.clone());
         Ladder {
@@ -648,7 +655,7 @@ pub(crate) mod bodies {
             &l.alice,
             &l.alice,
             serde_json::json!({
-                "dimension": "external_content:image:v1",
+                "dimension": "image:photo:v1", "subject_kind": "external_content", "sub_kind": "image",
                 "evidence_refs": [sha_hex],
                 "community_key_id": l.comm,
             }),
@@ -673,7 +680,7 @@ pub(crate) mod bodies {
             &l.alice,
             &l.alice,
             serde_json::json!({
-                "dimension": "external_content:image:v1",
+                "dimension": "image:photo:v1", "subject_kind": "external_content", "sub_kind": "image",
                 "evidence_refs": ["ab".repeat(32)],
                 "community_key_id": l.comm,
             }),
@@ -984,7 +991,7 @@ pub(crate) mod bodies {
             &l.alice,
             &l.alice,
             serde_json::json!({
-                "dimension": "external_content:image:v1",
+                "dimension": "image:photo:v1", "subject_kind": "external_content", "sub_kind": "image",
                 "evidence_refs": [sha_hex],
                 "community_key_id": l.comm,
             }),
@@ -1320,7 +1327,7 @@ pub(crate) mod room_1271 {
         let refs: Vec<&Node<'_, B>> = nodes.iter().collect();
         let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
         introduce(&refs, &alias_refs).await;
-        let comm = format!("r1271-comm-{run}");
+        let comm = crate::federation::edition2::fixture_switch::kid(&format!("r1271-comm-{run}")); // v62 (E4): the typed row is keyed by identity-ref
         let (alice, bob, carol) = (
             format!("r1271-alice-{run}"),
             format!("r1271-bob-{run}"),

@@ -13,8 +13,9 @@
 pub mod bodies {
     use crate::federation::blobs::BlobStorage;
     use crate::federation::community_dek::lifecycle_support as dek;
-    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
-    use crate::federation::operational::test_support as ops;
+    use crate::federation::edition2::fixture_switch as e2;
+
+    use crate::federation::room_roster_authority_invariants::bodies::{revoke_by, widen_by};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         identity_type, Community, CommunityMember, CommunityMembershipRevocation,
@@ -39,7 +40,10 @@ pub mod bodies {
         dek::seed_member(b, &alice, &format!("{alice}-occ")).await;
         dek::seed_member(b, &bob, &format!("{bob}-occ")).await;
         assert!(
-            b.lookup_public_key(&room).await.unwrap().is_none(),
+            b.lookup_public_key(&e2::kid(&room))
+                .await
+                .unwrap()
+                .is_none(),
             "{tag}: the room id is not a key"
         );
         let roster = [&alice, &bob]
@@ -53,7 +57,9 @@ pub mod bodies {
                     .then(|| crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
             })
             .collect();
-        b.put_community(ts::sign_community(
+        // v62 (E4, flip wave 2): the record is its `group:roster` voices
+        // (T1); the returned ids are the identity-refs the typed rows use.
+        let signed = ts::sign_community(
             &alice,
             Community {
                 prev_head_digest: String::new(),
@@ -66,10 +72,18 @@ pub mod bodies {
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
-        ))
+        );
+        e2::put_voices(
+            b,
+            &e2::community_voices(&signed, 1, None, ms(at("2026-01-01T00:00:00Z"))),
+        )
         .await
         .unwrap_or_else(|e| panic!("{tag}: a keyless room is admitted today: {e}"));
-        (room, alice, bob)
+        (e2::kid(&room), e2::kid(&alice), e2::kid(&bob))
+    }
+
+    fn ms(t: chrono::DateTime<chrono::Utc>) -> u64 {
+        u64::try_from(t.timestamp_millis()).expect("after the epoch")
     }
 
     fn revocation(
@@ -105,10 +119,11 @@ pub mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: seal before: {e}"));
-        b.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &alice,
+        revoke_by(
+            b,
+            &[&alice],
             revocation(&room, &bob, at("2026-02-01T00:00:00Z")),
-        ))
+        )
         .await
         .unwrap_or_else(|e| {
             panic!("{tag} I163: a room that is not a key must still be able to revoke: {e}")
@@ -142,37 +157,65 @@ pub mod bodies {
         );
 
         // The family twin: a keyless family (the doctrine) can revoke a seat.
-        let fam = format!("{tag}-fam");
+        // v62 (E4): its holders are `node` keys, so its rows are now-relative
+        // (CC 2.4.1.1: a node key's rows lapse with its record).
+        let fam_s = format!("{tag}-fam");
+        let fam = e2::kid(&fam_s);
         let holders: Vec<String> = (0..2).map(|i| format!("{tag}-h{i}")).collect();
         for h in &holders {
-            ops::register_typed_key(b, h, identity_type::NODE)
-                .await
-                .unwrap();
+            e2::put_key(b, h, &[identity_type::NODE]).await;
         }
         assert!(b.lookup_public_key(&fam).await.unwrap().is_none());
-        ops::seed_test_family(b, &fam, &holders, "quorum:2/2")
-            .await
-            .unwrap();
-        // v49.0.0 (#910): signed by the family's own `quorum:2/2` — both seats.
-        b.put_family_membership_revocation(
-            ts::sign_family_revocation_by_consensus(
-                b,
-                FamilyMembershipRevocation {
-                    family_key_id: fam.clone(),
-                    removed_identity_key_id: holders[1].clone(),
-                    removed_at: at("2026-02-01T00:00:00Z"),
-                    effective_at: at("2026-02-01T00:00:00Z"),
-                    reason: None,
-                    witness_set: Vec::new(),
-                    persist_row_hash: String::new(),
-                },
-            )
-            .await,
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let family = crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            family_key_id: fam_s.clone(),
+            family_name: format!("{tag} family"),
+            members: holders
+                .iter()
+                .enumerate()
+                .map(|(i, k)| crate::federation::types::FamilyMember {
+                    key_id: k.clone(),
+                    joined_at: now,
+                    role: (i == 0).then(|| "founder".to_owned()),
+                })
+                .collect(),
+            founded_at: now,
+            consensus_protocol: "quorum:2/2".to_owned(),
+            consensus_protocol_entrenched: false,
+            dissolved_at: None,
+            persist_row_hash: String::new(),
+        };
+        e2::put_voices(
+            b,
+            &e2::family_voices(&ts::sign_family(&holders[0], family), 1, None, ms(now)),
         )
         .await
-        .unwrap_or_else(|e| {
-            panic!("{tag} I163: a keyless family must be able to revoke a seat: {e}")
-        });
+        .unwrap_or_else(|e| panic!("{tag} I163: the family: {e}"));
+        let (head, _) = e2::held_head(b, &fam)
+            .await
+            .expect("I163: the family's head");
+        // v49.0.0 (#910): signed by the family's own `quorum:2/2` — both seats.
+        let signed = ts::sign_family_revocation_by_consensus(
+            b,
+            FamilyMembershipRevocation {
+                family_key_id: fam_s.clone(),
+                removed_identity_key_id: holders[1].clone(),
+                removed_at: now,
+                effective_at: now,
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        )
+        .await;
+        e2::put_voices(b, &e2::family_revocation_voices(&signed, Some(&head)))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{tag} I163: a keyless family must be able to revoke a seat: {e}")
+            });
         let seats: Vec<String> = b
             .active_family_members(&fam)
             .await
@@ -182,7 +225,7 @@ pub mod bodies {
             .collect();
         assert_eq!(
             seats,
-            vec![holders[0].clone()],
+            vec![e2::kid(&holders[0])],
             "{tag} I163: the seat is gone"
         );
     }
@@ -221,7 +264,7 @@ pub mod bodies {
         let alice = format!("{tag}-alice");
         let bob = format!("{tag}-bob");
         for k in [&alice, &bob] {
-            ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+            e2::put_key(d, k, &[identity_type::USER]).await;
         }
         let roster = [&alice, &bob]
             .into_iter()
@@ -234,7 +277,7 @@ pub mod bodies {
                     .then(|| crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
             })
             .collect();
-        d.put_community(ts::sign_community(
+        let signed = ts::sign_community(
             &alice,
             Community {
                 prev_head_digest: String::new(),
@@ -247,10 +290,14 @@ pub mod bodies {
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
-        ))
+        );
+        e2::put_voices(
+            d,
+            &e2::community_voices(&signed, 1, None, ms(at("2026-01-01T00:00:00Z"))),
+        )
         .await
         .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
-        (room, alice, bob)
+        (e2::kid(&room), e2::kid(&alice), e2::kid(&bob))
     }
 
     async fn roster(d: &dyn FederationDirectory, room: &str) -> Vec<String> {
@@ -265,152 +312,61 @@ pub mod bodies {
         v
     }
 
-    /// Replicate the room record from `a` to `b` the way a peer does: the
-    /// served signed record, applied through `put_community`.
-    async fn replicate_room(a: &dyn FederationDirectory, b: &dyn FederationDirectory, room: &str) {
-        let served = a.list_signed_communities_since(None, 100).await.unwrap();
-        let rec = served
-            .into_iter()
-            .map(|s| s.community)
-            .find(|s| s.community.community_key_id == room)
-            .expect("the room is served");
-        b.put_community(rec).await.unwrap();
-    }
-
-    /// **I164 — a widening converges.** Two directories; the record is
-    /// byte-identical on both before and after; the widening row, served by
-    /// A and applied on B, makes B's fold equal A's. A spec over the GROWN
-    /// RECORD (edge's v47 shape) is refused.
+    /// **I164 — a widening converges.** Two directories hold the same room
+    /// (the same founding statements); A widens carol; the same widening
+    /// statements reach B; B's fold equals A's, and neither RECORD moves
+    /// (growth rides the membership plane). A repeat of the widening is a
+    /// no-op that writes no second row.
+    ///
+    /// v62 (E4, flip wave 3): the legs about the earlier `AdmitSpec` (an
+    /// unsigned exact retry, #936; a scrub over the GROWN record, edge's v47
+    /// shape) and the signed-JSON since-read's resume pair are gone: an
+    /// edition-2 widening is its signers' voices, verified by the door, and
+    /// it is served by `edition2_statements_since`.
     pub async fn i164_a_widening_converges(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
         tag: &str,
     ) {
         let (room, alice, bob) = keyless_room_dir(a, tag).await;
-        let carol = format!("{tag}-carol");
+        let (room_b, _, _) = keyless_room_dir(b, tag).await;
+        assert_eq!(room, room_b, "{tag} I164: one room");
+        let carol = e2::kid(&format!("{tag}-carol"));
         for d in [a, b] {
-            ts::register_hybrid_key_as(d, &carol, &carol, identity_type::USER).await;
+            e2::put_key(d, &carol, &[identity_type::USER]).await;
         }
-        // B holds the original record, as a peer would.
-        for k in [&alice, &bob] {
-            ts::register_hybrid_key_as(b, k, k, identity_type::USER).await;
-        }
-        replicate_room(a, b, &room).await;
         let record_before_a = a.lookup_community(&room).await.unwrap().unwrap();
         let record_before_b = b.lookup_community(&room).await.unwrap().unwrap();
         assert_eq!(
             record_before_a, record_before_b,
-            "{tag} I164: same bytes on both nodes"
+            "{tag} I164: same record on both nodes"
         );
-
-        // A widens carol through the local door — the spec is over the widening row.
-        let member = CommunityMember {
-            key_id: carol.clone(),
-            joined_at: at("2026-03-01T00:00:00Z"),
-            role: None,
-        };
-        let spec = ts::widening_admit_spec(&alice, &room, &member);
-        let added = a
-            .add_community_member_consented(&room, member.clone(), &spec)
+        let grow = || widening(&room, &carol, at("2026-03-01T00:00:00Z"));
+        widen_by(a, &[&alice], grow())
             .await
             .unwrap_or_else(|e| panic!("{tag} I164: widen on A: {e}"));
-        assert!(added, "{tag} I164: a new row");
-        assert_eq!(
-            roster(a, &room).await,
-            vec![alice.clone(), bob.clone(), carol.clone()]
-        );
-        assert!(
-            !a.add_community_member_consented(&room, member.clone(), &spec)
-                .await
-                .unwrap(),
-            "{tag} I164: the byte-identical row is a no-op"
-        );
-        // v51.2.0 (CIRISPersist#936) — the exact retry is the no-op WHATEVER
-        // the spec: an identical widening on the plane means the member is
-        // active at that instant by construction, so no authority is asked
-        // for. v48 routed the byte-identical retry through the put door
-        // (an unsigned retry was refused `tier_unverified`) while a retry at
-        // a later instant passed authority-free — inverted from the pre-v48
-        // contract CIRISConformance pins (`test_263`).
-        let empty = crate::federation::cohort::AdmitSpec {
-            authority_key_id: String::new(),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            cosignatures: Vec::new(),
-        };
-        assert!(
-            !a.add_community_member_consented(&room, member.clone(), &empty)
-                .await
-                .unwrap_or_else(|e| panic!(
-                    "{tag} #936: an unsigned exact retry must be the idempotent no-op, got {e}"
-                )),
-            "{tag} #936: the unsigned exact retry is a no-op"
-        );
-        // The pre-v48 idempotency holds on the plane: a re-add of an ACTIVE
-        // member with a fresh `joined_at` is a no-op that writes no row (the
-        // fold is identical with or without it) — pg's Cut B graph DX test
-        // pins the same on the record's own members.
-        let later = CommunityMember {
-            key_id: carol.clone(),
-            joined_at: at("2026-03-05T00:00:00Z"),
-            role: None,
-        };
-        assert!(
-            !a.add_community_member_consented(
-                &room,
-                later.clone(),
-                &ts::widening_admit_spec(&alice, &room, &later)
-            )
+        let mut want = vec![alice.clone(), bob.clone(), carol.clone()];
+        want.sort();
+        assert_eq!(roster(a, &room).await, want, "{tag} I164: carol is in on A");
+        // The identical widening again: a no-op, no second row.
+        widen_by(a, &[&alice], grow())
             .await
-            .unwrap(),
-            "{tag} I164: re-adding an active member at a later instant is a no-op"
-        );
+            .unwrap_or_else(|e| panic!("{tag} I164: the identical widening is Ok: {e}"));
         assert_eq!(
             a.list_community_membership_widenings_for(&room)
                 .await
                 .unwrap()
                 .len(),
             1,
-            "{tag} I164: the no-op wrote no row"
-        );
-        // Bob is on the RECORD: the same no-op, for the same reason.
-        let bob_again = CommunityMember {
-            key_id: bob.clone(),
-            joined_at: at("2026-03-05T00:00:00Z"),
-            role: None,
-        };
-        assert!(
-            !a.add_community_member_consented(
-                &room,
-                bob_again.clone(),
-                &ts::widening_admit_spec(&alice, &room, &bob_again)
-            )
-            .await
-            .unwrap(),
-            "{tag} I164: re-adding a record member is a no-op"
+            "{tag} I164: the repeat wrote no row"
         );
         assert_eq!(
             a.lookup_community(&room).await.unwrap().unwrap(),
             record_before_a,
             "{tag} I164: the RECORD did not move on A — growth rides the plane"
         );
-
-        // The widening row travels; B applies it; B's fold = A's; B's record unchanged.
-        let served = a
-            .list_signed_community_membership_widenings_since(None, 100)
-            .await
-            .unwrap();
-        assert_eq!(
-            served.len(),
-            1,
-            "{tag} I164: one widening served: {served:?}"
-        );
-        let (resume_at, resume_id) = served[0].resume_pair();
-        assert!(
-            resume_id.contains(&carol),
-            "{tag} I164: the resume id names the member"
-        );
-        b.put_community_membership_widening_consented(served[0].widening.clone())
+        // The same widening reaches B.
+        widen_by(b, &[&alice], grow())
             .await
             .unwrap_or_else(|e| panic!("{tag} I164: the widening applies on B: {e}"));
         assert_eq!(
@@ -423,40 +379,6 @@ pub mod bodies {
             record_before_b,
             "{tag} I164: the RECORD did not move on B — no fork"
         );
-        // The cursor placed at the served row yields nothing more.
-        assert!(a
-            .list_signed_community_membership_widenings_since(Some((resume_at, resume_id)), 100)
-            .await
-            .unwrap()
-            .is_empty());
-
-        // A spec over the GROWN RECORD — edge's v47 shape — no longer verifies.
-        let dave = format!("{tag}-dave");
-        ts::register_hybrid_key_as(a, &dave, &dave, identity_type::USER).await;
-        let mut grown = a.lookup_community(&room).await.unwrap().unwrap();
-        let dave_member = CommunityMember {
-            key_id: dave.clone(),
-            joined_at: at("2026-03-02T00:00:00Z"),
-            role: None,
-        };
-        grown.members.push(dave_member.clone());
-        grown.persist_row_hash = String::new();
-        let (_h, classical, pqc) = ts::sign_envelope(&alice, &grown.signing_envelope());
-        let stale_spec = crate::federation::cohort::AdmitSpec {
-            authority_key_id: alice.clone(),
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-            cosignatures: Vec::new(),
-        };
-        let err = a
-            .add_community_member_consented(&room, dave_member, &stale_spec)
-            .await
-            .expect_err("I164: a scrub over the grown record is not a scrub over the widening");
-        assert!(
-            err.kind().contains("unverified") || err.to_string().contains("verify"),
-            "{tag} I164: refused for the signature: {err}"
-        );
-        assert_eq!(roster(a, &room).await, vec![alice, bob, carol]);
     }
 
     /// **I165 — order does not matter.** The four events applied in three
@@ -470,14 +392,10 @@ pub mod bodies {
         for (i, d) in dirs.iter().enumerate() {
             let tg = format!("{tag}-{i}");
             let (room, alice, _bob) = keyless_room_dir(*d, &tg).await;
-            let carol = format!("{tg}-carol");
-            ts::register_hybrid_key_as(*d, &carol, &carol, identity_type::USER).await;
-            let w1 = ts::sign_community_membership_widening(&alice, widening(&room, &carol, t1));
-            let r2 =
-                ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
-            let w3 = ts::sign_community_membership_widening(&alice, widening(&room, &carol, t3));
-            let r4 =
-                ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t4));
+            // v62 (E4, flip wave 2): carol is an edition-2 key; each event is
+            // its signers' `membership:{stage}` voices naming the roster's
+            // held version (the widenings with carol's consent held first).
+            let carol = e2::put_key(*d, &format!("{tg}-carol"), &[identity_type::USER]).await;
             let events: Vec<(&str, usize)> = match i {
                 0 => vec![("w", 1), ("r", 2), ("w", 3), ("r", 4)],
                 1 => vec![("r", 4), ("w", 3), ("r", 2), ("w", 1)],
@@ -485,21 +403,24 @@ pub mod bodies {
             };
             for (kind, n) in events {
                 match (kind, n) {
-                    ("w", 1) => {
-                        d.put_community_membership_widening_consented(w1.clone())
-                            .await
-                    }
-                    ("w", 3) => {
-                        d.put_community_membership_widening_consented(w3.clone())
-                            .await
-                    }
-                    ("r", 2) => d.put_community_membership_revocation(r2.clone()).await,
-                    _ => d.put_community_membership_revocation(r4.clone()).await,
+                    ("w", 1) => widen_by(*d, &[&alice], widening(&room, &carol, t1))
+                        .await
+                        .map(|_| ()),
+                    ("w", 3) => widen_by(*d, &[&alice], widening(&room, &carol, t3))
+                        .await
+                        .map(|_| ()),
+                    ("r", 2) => revoke_by(*d, &[&alice], revocation(&room, &carol, t2))
+                        .await
+                        .map(|_| ()),
+                    _ => revoke_by(*d, &[&alice], revocation(&room, &carol, t4))
+                        .await
+                        .map(|_| ()),
                 }
                 .unwrap_or_else(|e| panic!("{tg} I165: every row admits in every order: {e}"));
             }
-            // The exact repeat of r2 is a no-op (#861 kept); the fold is one.
-            d.put_community_membership_revocation(r2.clone())
+            // The exact repeat of r2 is a no-op (the same statements); the
+            // fold is one.
+            revoke_by(*d, &[&alice], revocation(&room, &carol, t2))
                 .await
                 .unwrap();
             assert_eq!(
@@ -606,18 +527,22 @@ pub mod bodies {
         use crate::federation::admission::{
             check_no_moderator_federate_admission, community_authority_set_for, MEMBER_ROLE_FOUNDER,
         };
-        let room = format!("{tag}-room");
-        let alice = format!("{tag}-alice");
-        let carol = format!("{tag}-carol");
+        // v62 (E4, flip wave 2): edition-2 keys, the record as its voices,
+        // carol's widening with her consent held first, the leavings as
+        // `membership:removal` voices; ids are identity-refs.
+        let room_s = format!("{tag}-room");
+        let alice = e2::kid(&format!("{tag}-alice"));
+        let carol = e2::kid(&format!("{tag}-carol"));
         for k in [&alice, &carol] {
-            ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+            e2::put_key(d, k, &[identity_type::USER]).await;
         }
-        d.put_community(ts::sign_community(
+        let room = e2::kid(&room_s);
+        let signed = ts::sign_community(
             &alice,
             Community {
                 prev_head_digest: String::new(),
                 charter_digest: String::new(),
-                community_key_id: room.clone(),
+                community_key_id: room_s.clone(),
                 community_name: "i166 room".into(),
                 members: vec![CommunityMember {
                     key_id: alice.clone(),
@@ -629,25 +554,31 @@ pub mod bodies {
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
-        ))
+        );
+        e2::put_voices(
+            d,
+            &e2::community_voices(&signed, 1, None, ms(at("2026-01-01T00:00:00Z"))),
+        )
         .await
         .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
         let record = d.lookup_community(&room).await.unwrap().unwrap();
         check_no_moderator_federate_admission(d, &record)
             .await
             .unwrap_or_else(|e| panic!("{tag} I166: control — founder alice moderates: {e}"));
-        let member = CommunityMember {
-            key_id: carol.clone(),
-            joined_at: at("2026-03-01T00:00:00Z"),
-            role: Some(MEMBER_ROLE_FOUNDER.into()),
-        };
-        d.add_community_member_consented(
-            &room,
-            member.clone(),
-            &ts::widening_admit_spec(&alice, &room, &member),
+        widen_by(
+            d,
+            &[&alice],
+            crate::federation::types::CommunityMembershipWidening {
+                community_key_id: room.clone(),
+                member_key_id: carol.clone(),
+                joined_at: at("2026-03-01T00:00:00Z"),
+                effective_at: at("2026-03-01T00:00:00Z"),
+                role: Some(MEMBER_ROLE_FOUNDER.into()),
+                persist_row_hash: String::new(),
+            },
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|e| panic!("{tag} I166: alice widens carol: {e}"));
         let record = d.lookup_community(&room).await.unwrap().unwrap();
         assert!(
             !record.members.iter().any(|m| m.key_id == carol),
@@ -669,10 +600,11 @@ pub mod bodies {
         );
 
         // alice leaves (carol remains a founder, so the last-founder rule holds).
-        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &alice,
+        revoke_by(
+            d,
+            &[&alice],
             revocation(&room, &alice, at("2026-04-01T00:00:00Z")),
-        ))
+        )
         .await
         .unwrap_or_else(|e| panic!("{tag} I166: alice leaves: {e}"));
         assert!(
@@ -683,10 +615,11 @@ pub mod bodies {
             "{tag} I166: the record still lists founder alice; the authority set must not"
         );
         // carol, the last member, leaves: the room is empty by the fold.
-        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &carol,
+        revoke_by(
+            d,
+            &[&carol],
             revocation(&room, &carol, at("2026-04-02T00:00:00Z")),
-        ))
+        )
         .await
         .unwrap_or_else(|e| panic!("{tag} I166: carol leaves: {e}"));
         assert!(
@@ -699,160 +632,11 @@ pub mod bodies {
         assert!(wrap.is_empty(), "{tag} I166: nobody is wrapped: {wrap:?}");
     }
 
-    /// **I167 — the since-read resumes across the three-part id.**
-    pub async fn i167_the_since_read_resumes_across_the_three_part_id(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        let (room, alice, bob) = keyless_room_dir(d, tag).await;
-        let t1 = at("2026-03-01T00:00:00Z");
-        let t2 = at("2026-03-02T00:00:00Z");
-        let t3 = at("2026-03-03T00:00:00Z");
-        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &alice,
-            revocation(&room, &bob, t1),
-        ))
-        .await
-        .unwrap();
-        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
-            &alice,
-            widening(&room, &bob, t2),
-        ))
-        .await
-        .unwrap();
-        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &alice,
-            revocation(&room, &bob, t3),
-        ))
-        .await
-        .unwrap();
-        let all = d
-            .list_signed_community_membership_revocations_since(None, 100)
-            .await
-            .unwrap();
-        let mine: Vec<_> = all
-            .iter()
-            .filter(|s| {
-                s.revocation
-                    .community_membership_revocation
-                    .community_key_id
-                    == room
-            })
-            .collect();
-        assert_eq!(
-            mine.len(),
-            2,
-            "{tag} I167: two removals of one member are two served rows"
-        );
-        let (at1, id1) = mine[0].resume_pair();
-        assert!(
-            id1.contains(&t1.to_rfc3339()) || id1.contains("2026-03-01"),
-            "{tag} I167: the id carries the instant: {id1}"
-        );
-        let rest = d
-            .list_signed_community_membership_revocations_since(Some((at1, id1)), 100)
-            .await
-            .unwrap();
-        let rest: Vec<_> = rest
-            .iter()
-            .filter(|s| {
-                s.revocation
-                    .community_membership_revocation
-                    .community_key_id
-                    == room
-            })
-            .collect();
-        assert_eq!(
-            rest.len(),
-            1,
-            "{tag} I167: the cursor between the two resumes at the second"
-        );
-        assert_eq!(
-            rest[0]
-                .revocation
-                .community_membership_revocation
-                .effective_at,
-            t3
-        );
-        assert!(
-            !roster(d, &room).await.contains(&bob),
-            "{tag} I167: bob is out after t3"
-        );
-        // Both removals are content-hash addressable and distinct. v61
-        // (CIRISPersist#991): each is its own `membership:removal:v1` row, an
-        // Attestation-kind entry (the framed kind is retired).
-        let mut seen = std::collections::BTreeSet::new();
-        for s in &mine {
-            let back = by_row_hash(
-                d,
-                crate::federation::group_plane::GroupSigned::CommunityRevocation(
-                    s.revocation.clone(),
-                ),
-                tag,
-            )
-            .await;
-            let crate::federation::group_plane::GroupSigned::CommunityRevocation(back) = back
-            else {
-                panic!("{tag} I167: a removal row carries its revocation")
-            };
-            assert!(
-                seen.insert(back.community_membership_revocation.effective_at),
-                "{tag} I167: each hash resolves to its own removal"
-            );
-        }
-        assert_eq!(seen.len(), 2);
-        // The widening is addressable the same way.
-        let served_w = d
-            .list_signed_community_membership_widenings_since(None, 100)
-            .await
-            .unwrap();
-        let w = served_w
-            .iter()
-            .find(|w| w.widening.community_membership_widening.community_key_id == room)
-            .expect("the widening is served");
-        let wback = by_row_hash(
-            d,
-            crate::federation::group_plane::GroupSigned::CommunityWidening(w.widening.clone()),
-            tag,
-        )
-        .await;
-        let crate::federation::group_plane::GroupSigned::CommunityWidening(mut wback) = wback
-        else {
-            panic!("{tag} I167: a widening row carries its widening")
-        };
-        let mut want = w.widening.clone();
-        want.community_membership_widening.persist_row_hash = String::new();
-        wback.community_membership_widening.persist_row_hash = String::new();
-        assert_eq!(wback, want, "{tag} I167: byte-exact by hash");
-    }
-
-    /// v61 (CIRISPersist#991) — the group-plane row a held roster event
-    /// minted, fetched by its Attestation-kind content hash, read back to the
-    /// object it carries.
-    async fn by_row_hash(
-        d: &dyn FederationDirectory,
-        signed: crate::federation::group_plane::GroupSigned,
-        tag: &str,
-    ) -> crate::federation::group_plane::GroupSigned {
-        let row = crate::federation::group_plane::plan_group_row(&signed)
-            .unwrap()
-            .expect("a hybrid-signed roster event has a row");
-        let held = d
-            .get_attestation(&row.attestation_id)
-            .await
-            .unwrap()
-            .unwrap_or_else(|| panic!("{tag} I167: the row {} is held", row.attestation_id));
-        let hash = crate::federation::wire_index::content_hash_of(&held).unwrap();
-        let bytes = d
-            .lookup_signed_record_by_content_hash("Attestation", &hash)
-            .await
-            .unwrap()
-            .unwrap_or_else(|| panic!("{tag} I167: row {hash} is addressable by hash"));
-        let back: crate::federation::Attestation = serde_json::from_slice(&bytes).unwrap();
-        crate::federation::group_plane::group_signed_of_row(&back)
-            .unwrap()
-            .expect("a group-plane row")
-    }
+    // v62 (E4, flip wave 3): I167 ("the since-read resumes across the
+    // three-part id") is DELETED: it witnesses the resume pair of the
+    // signed-JSON roster since-read (`list_signed_community_membership_
+    // revocations_since`), the earlier served wire. Edition-2 statements are
+    // served by `edition2_statements_since`, whose cursor is its own witness.
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -916,15 +700,6 @@ mod run {
                     super::super::bodies::i166_a_raw_roster_read_is_a_wrong_read(
                         &d as &dyn FederationDirectory,
                         &format!("i166-{}", super::suffix()),
-                    )
-                    .await
-                }
-                #[tokio::test]
-                async fn i167() {
-                    let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i167_the_since_read_resumes_across_the_three_part_id(
-                        &d as &dyn FederationDirectory,
-                        &format!("i167-{}", super::suffix()),
                     )
                     .await
                 }

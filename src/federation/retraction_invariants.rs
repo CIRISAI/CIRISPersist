@@ -7,18 +7,23 @@
 //!   attester's own `recants` retires the row; the subject's `withdraws`
 //!   still does (rule 2, the control). One predicate decides both the door
 //!   and the fold (`precedence::retraction_entitled`).
+//!
+//! v62.0.0 (the JSON cut): every row is an edition-2 statement
+//! (`edition2::fixture_switch`), keys are live by their `key:record`, ids are
+//! the identity-ref `kid(label)` and the node-computed row id `rid(row)`. A
+//! composer names its target by `refs.target`.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::precedence::retired_ids;
-    use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
     use crate::federation::types::{attestation_tier, attestation_type};
-    use crate::federation::{Attestation, Error, FederationDirectory, SignedAttestation};
+    use crate::federation::{Attestation, Error, FederationDirectory};
 
-    /// A federation-tier row signed by `signer` (sign → seal → reseal).
+    /// A federation-tier row signed by `signer`: the earlier-form shape,
+    /// mapped through its edition-2 statement (`e2::row_of`).
     fn row(
-        id: &str,
         signer: &str,
         target: &str,
         kind: &str,
@@ -26,9 +31,8 @@ pub(crate) mod bodies {
         subject_key_ids: Vec<String>,
     ) -> Attestation {
         let at = chrono::Utc::now();
-        let (och, ed_sig, pqc_sig) = ts::sign_envelope(signer, &envelope);
-        let mut r = Attestation {
-            attestation_id: id.to_owned(),
+        let shape = Attestation {
+            attestation_id: String::new(),
             attesting_key_id: signer.to_owned(),
             attested_key_id: target.to_owned(),
             attestation_type: kind.to_owned(),
@@ -36,9 +40,9 @@ pub(crate) mod bodies {
             asserted_at: at,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: signer.to_owned(),
             scrub_timestamp: at,
             pqc_completed_at: None,
@@ -50,38 +54,28 @@ pub(crate) mod bodies {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        ts::reseal(&mut r);
-        r
+        e2::row_of(&shape, signer)
     }
 
     /// A `scores` row by `attester` about `subject`, naming the subject.
-    fn about(id: &str, attester: &str, subject: &str) -> Attestation {
+    fn about(attester: &str, subject: &str) -> Attestation {
         row(
-            id,
             attester,
             subject,
             attestation_type::SCORES,
-            serde_json::json!({"dimension": "scores:i516:v1", "score": 0.5}),
+            serde_json::json!({"dimension": "trust:i516:v1", "score": 0.5, "confidence": 0.9}),
             vec![subject.to_owned()],
         )
     }
 
-    /// A structural composer of `kind` by `author` naming `target`.
-    fn composer(id: &str, author: &str, kind: &str, target: &str) -> Attestation {
-        row(
-            id,
-            author,
-            author,
-            kind,
-            serde_json::json!({"references_attestation_id": target}),
-            Vec::new(),
-        )
+    /// A structural composer of `kind` by `author` naming `target`
+    /// (`refs.target`).
+    fn composer(author: &str, kind: &str, target: &Attestation) -> Attestation {
+        e2::composer_of(kind, target, author)
     }
 
     async fn put(d: &dyn FederationDirectory, a: Attestation) -> Result<(), Error> {
-        d.put_attestation(SignedAttestation { attestation: a })
-            .await
-            .map(|_| ())
+        e2::put_signed(d, &a).await.map(|_| ())
     }
 
     /// Is `target` retired by the fold over `rows`?
@@ -93,15 +87,14 @@ pub(crate) mod bodies {
     /// **I520** (v53.1.2, CIRISPersist#984 row 13; v55.0.0 CIRISPersist#989)
     /// — **only the holder retracts its own holding claim.** The claim
     /// (`custody:ack:v1` since v55; the `holds_bytes` carrier before) is the
-    /// holder's
-    /// self-attestation. The fold's resolved-rule arm honoured a
-    /// `withdraws_admission_rule` stamp on ANY `withdraws`, and the door's
-    /// `holds_bytes` bypass left a replicated row's stamp in place, so a
-    /// third party's `withdraws` carrying a forged rule retired the holder's
-    /// claim in the fold while `list_holders` (which folds the holder's own
-    /// retractions only) still listed it. Now the stamp is refused at the door
-    /// by name, the fold never lets a rule retire a carrier, and the holder's
-    /// own `withdraws` retires it in both.
+    /// holder's self-attestation. A third party's `withdraws` of it is
+    /// refused at the door by name (v55.0.0, CIRISPersist#1007, I791) and is
+    /// inert in the fold when offered directly; the holder's own `withdraws`
+    /// retires it in both.
+    ///
+    /// v62.0.0: the leg over a replicated `withdraws_admission_rule` stamp is
+    /// deleted. The stamp was a column of the earlier-form row; an edition-2
+    /// statement carries no such column.
     pub(crate) async fn i520_only_the_holder_retracts_a_carrier(
         d: &dyn FederationDirectory,
         tag: &str,
@@ -110,96 +103,61 @@ pub(crate) mod bodies {
         use crate::federation::types::identity_type::NODE;
         let (holder, third) = (format!("i520-h-{tag}"), format!("i520-t-{tag}"));
         for k in [&holder, &third] {
-            ts::register_identity_key(d, k, NODE).await;
+            let _ = e2::put_key(d, k, &[NODE]).await;
         }
         let sha: [u8; 32] = {
             use sha2::Digest as _;
             sha2::Sha256::digest(tag.as_bytes()).into()
         };
-        let claim_id = format!("i520-hb-{tag}");
-        put(
-            d,
-            row(
-                &claim_id,
-                &holder,
-                &holder,
-                attestation_type::SCORES,
-                serde_json::json!({
-                    "dimension": crate::federation::custody_ack::CUSTODY_ACK_DIMENSION,
-                    "custody_state": "here",
-                    "evidence_refs": [hex::encode(sha)],
-                    "size": 4096,
-                    "score": 1.0,
-                    "confidence": 1.0,
-                }),
-                Vec::new(),
-            ),
-        )
-        .await
-        .expect("I520 the holder's claim");
+        let claim = row(
+            &holder,
+            &holder,
+            attestation_type::SCORES,
+            serde_json::json!({
+                "dimension": crate::federation::custody_ack::CUSTODY_ACK_DIMENSION,
+                "custody_state": "here",
+                "evidence_refs": [hex::encode(sha)],
+                "size": 4096,
+                "score": 1.0,
+                "confidence": 1.0,
+            }),
+            Vec::new(),
+        );
+        let claim_id = e2::rid(&claim);
+        put(d, claim.clone())
+            .await
+            .expect("I520 the holder's claim");
+        let holder_kid = e2::kid(&holder);
         let listed = || async {
             d.list_holders_sized(&sha)
                 .await
                 .unwrap()
                 .iter()
-                .any(|h| h.key_id == holder)
+                .any(|h| h.key_id == holder_kid)
         };
         assert!(listed().await, "I520 precondition — the holder is listed");
-        // A third party's withdraws carrying a (forged, replicated) resolved
-        // rule: refused at the door by name…
-        let mut forged = composer(
-            &format!("i520-tw-{tag}"),
-            &third,
-            attestation_type::WITHDRAWS,
-            &claim_id,
-        );
-        forged.withdraws_admission_rule = Some(3);
-        ts::reseal(&mut forged);
-        let r = put(d, forged.clone()).await;
+        // A third party's withdraws of the carrier: refused at the door by
+        // name.
+        let third_w = composer(&third, attestation_type::WITHDRAWS, &claim);
+        let r = put(d, third_w.clone()).await;
         assert!(
             r.as_ref().is_err_and(|e| e
                 .to_string()
                 .contains("custody_ack_withdraws_not_the_holder")),
-            "I520 a third party's withdraws of a holding claim is refused by name: {r:?}"
-        );
-        // v55.0.0 (CIRISPersist#1007, I791) — and UNSTAMPED too: only the
-        // holder retracts its claim; a takedown is the CC 2.3 tombstone.
-        let r = put(
-            d,
-            composer(
-                &format!("i520-tu-{tag}"),
-                &third,
-                attestation_type::WITHDRAWS,
-                &claim_id,
-            ),
-        )
-        .await;
-        assert!(
-            r.as_ref().is_err_and(|e| e
-                .to_string()
-                .contains("custody_ack_withdraws_not_the_holder")),
-            "I791 a third party's unstamped withdraws of a carrier is refused by name: {r:?}"
+            "I791 a third party's withdraws of a carrier is refused by name: {r:?}"
         );
         // …and inert in the fold even when offered directly (out of order).
         let stored = d.get_attestation(&claim_id).await.unwrap().expect("claim");
         assert!(
-            !retired(&[stored, forged], &claim_id),
-            "I520 the fold never lets a resolved rule retire a holding claim"
+            !retired(&[stored, third_w], &claim_id),
+            "I520 the fold never lets a third party retire a holding claim"
         );
         assert!(listed().await, "I520 the holder is still listed");
         // The holder's own withdraws retires it in the fold and the listing.
-        put(
-            d,
-            composer(
-                &format!("i520-hw-{tag}"),
-                &holder,
-                attestation_type::WITHDRAWS,
-                &claim_id,
-            ),
-        )
-        .await
-        .expect("I520 the holder withdraws its own claim");
-        let mine = d.all_attestations_by(&holder).await.unwrap();
+        put(d, composer(&holder, attestation_type::WITHDRAWS, &claim))
+            .await
+            .expect("I520 the holder withdraws its own claim");
+        let mine = d.all_attestations_by(&holder_kid).await.unwrap();
         assert!(
             retired(&mine, &claim_id),
             "I520 the holder's own withdraws retires it"
@@ -215,19 +173,16 @@ pub(crate) mod bodies {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
         let (attester, subject) = (format!("i516-k-{tag}"), format!("i516-s-{tag}"));
         for k in [&attester, &subject] {
-            ts::register_identity_key(d, k, USER).await;
+            let _ = e2::put_key(d, k, &[USER]).await;
         }
-        let t1 = format!("i516-t1-{tag}");
-        put(d, about(&t1, &attester, &subject))
+        let (attester_kid, subject_kid) = (e2::kid(&attester), e2::kid(&subject));
+        let t1_row = about(&attester, &subject);
+        let t1 = e2::rid(&t1_row);
+        put(d, t1_row.clone())
             .await
             .expect("I516 the row about the subject");
         // (a) the subject's recants: refused at the door by name…
-        let s_recants = composer(
-            &format!("i516-sr-{tag}"),
-            &subject,
-            attestation_type::RECANTS,
-            &t1,
-        );
+        let s_recants = composer(&subject, attestation_type::RECANTS, &t1_row);
         let r = put(d, s_recants.clone()).await;
         assert!(
             r.as_ref()
@@ -241,42 +196,30 @@ pub(crate) mod bodies {
             "I516 (a) the fold does not let a subject recant"
         );
         // (b) the attester's own recants retires it.
-        put(
-            d,
-            composer(
-                &format!("i516-kr-{tag}"),
-                &attester,
-                attestation_type::RECANTS,
-                &t1,
-            ),
-        )
-        .await
-        .expect("I516 (b) the attester recants its own row");
-        let rows = d.all_attestations_for(&subject).await.unwrap();
+        put(d, composer(&attester, attestation_type::RECANTS, &t1_row))
+            .await
+            .expect("I516 (b) the attester recants its own row");
+        let rows = d.all_attestations_for(&subject_kid).await.unwrap();
         let mut all = rows.clone();
-        all.extend(d.all_attestations_by(&attester).await.unwrap());
+        all.extend(d.all_attestations_by(&attester_kid).await.unwrap());
         assert!(
             retired(&all, &t1),
             "I516 (b) the attester's recants retires t1"
         );
         // (c) control: the subject's withdraws (rule 2) still retires a row.
-        let t2 = format!("i516-t2-{tag}");
-        put(d, about(&t2, &attester, &subject))
+        // A second row about the subject: a later instant, so a distinct id.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let t2_row = about(&attester, &subject);
+        let t2 = e2::rid(&t2_row);
+        assert_ne!(t1, t2, "I516 (c) a distinct second row");
+        put(d, t2_row.clone())
             .await
             .expect("I516 (c) a second row about the subject");
-        put(
-            d,
-            composer(
-                &format!("i516-sw-{tag}"),
-                &subject,
-                attestation_type::WITHDRAWS,
-                &t2,
-            ),
-        )
-        .await
-        .expect("I516 (c) the subject withdraws a row about them");
-        let mut all = d.all_attestations_for(&subject).await.unwrap();
-        all.extend(d.all_attestations_by(&subject).await.unwrap());
+        put(d, composer(&subject, attestation_type::WITHDRAWS, &t2_row))
+            .await
+            .expect("I516 (c) the subject withdraws a row about them");
+        let mut all = d.all_attestations_for(&subject_kid).await.unwrap();
+        all.extend(d.all_attestations_by(&subject_kid).await.unwrap());
         assert!(
             retired(&all, &t2),
             "I516 (c) the subject's withdraws retires t2"

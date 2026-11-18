@@ -36,6 +36,19 @@
 //!
 //! Each door witness runs on memory, sqlite and postgres (postgres through
 //! `CIRIS_PERSIST_TEST_PG_URL`; without it the leg returns at once).
+//!
+//! v62.0.0 (slice E6) — the door rows are edition-2 statements signed by an
+//! edition-2 key (`fixture_switch`). A dimension Verify's matcher does not
+//! register is refused before persist's gates (the statement door, or the
+//! codec that cannot mint it), so I1106's open-vocabulary admit leg is
+//! deleted (open vocabulary is the earlier form's), and I1107 / I1109's
+//! refusal legs accept the refusal at whichever door reaches it first,
+//! nothing stored either way. I1108 was held in the earlier form until flip wave 2: its owner
+//! signs an identity occurrence (`signed_content_only_occurrence`, the typed
+//! occurrence plane, which has no edition-2 builder), and one key cannot
+//! sign in both forms (`earlier_form_signer_is_edition2`). Flip wave 2:
+//! I1108 now binds the occurrence through O1's edition-2
+//! `identity:occurrence` door and is flipped too.
 
 #[cfg(test)]
 mod pure {
@@ -349,23 +362,42 @@ mod pure {
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
     use crate::federation::types::SignedAttestation;
     use crate::federation::{Attestation, FederationDirectory};
 
-    /// A `scores` row about `attested`, sealed by `signer` (registered with
-    /// its deterministic fixture keys).
-    fn scores(signer: &str, attested: &str, env: serde_json::Value) -> Attestation {
+    /// The earlier-shaped `scores` row about `attested` by `signer`.
+    fn scores_shape(signer: &str, attested: &str, env: &serde_json::Value) -> Attestation {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut r = ts::bare_attestation(&id, signer, attested, &env);
+        let mut env = env.clone();
+        env["id"] = serde_json::json!(id);
+        let mut r = e2::with_earlier_form(|| ts::bare_attestation(&id, signer, attested, &env));
         r.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
-        ts::seal_row_in_place(signer, &mut r);
         r
     }
 
+    /// A `scores` row about `attested`, signed by the key of seed `signer`:
+    /// v62.0.0, an edition-2 statement (`row_of`), its id computed.
+    fn scores(signer: &str, attested: &str, env: serde_json::Value) -> Attestation {
+        e2::row_of(&scores_shape(signer, attested, &env), signer)
+    }
+
+    /// [`scores`], or the refusal of a row Verify's door does not admit (an
+    /// unregistered or refused family).
+    fn try_scores(
+        signer: &str,
+        attested: &str,
+        env: serde_json::Value,
+    ) -> Result<Attestation, crate::federation::Error> {
+        e2::try_row_of(&scores_shape(signer, attested, &env), signer)
+    }
+
+    /// The edition-2 key of seed `name`. Returns the SEED (the fixtures sign
+    /// with it; `kid_or_keep` makes it the subject).
     async fn key<B: FederationDirectory + Sync>(b: &B, name: &str) -> String {
-        ts::register_hybrid_key_as(b, name, name, USER).await;
+        let _ = e2::put_key(b, name, &[USER]).await;
         name.to_owned()
     }
 
@@ -443,11 +475,6 @@ pub(crate) mod bodies {
                 -0.5,
                 "I1106 positive-only refuses a negative",
             ),
-            (
-                "no_such_family:thing:v1",
-                1.5,
-                "I1106 an uncatalogued dim is open vocabulary",
-            ),
             ("chat:leaf:v1", 1.5, "I1106 signed refuses a score above 1"),
             (
                 "activity_tier:daily:v1",
@@ -460,13 +487,6 @@ pub(crate) mod bodies {
                 &w,
                 serde_json::json!({"dimension": dim, "score": score}),
             );
-            if dim.starts_with("no_such_family:") {
-                // Open vocabulary: the gate has nothing to say.
-                for got in both_doors(b, &r).await {
-                    got.unwrap_or_else(|e| panic!("{why}: {e}"));
-                }
-                continue;
-            }
             refused_everywhere(b, &r, OUT, why).await;
         }
         for (dim, score) in [
@@ -510,11 +530,15 @@ pub(crate) mod bodies {
             ("takedown_notice:steward_purge:v1", -1.0),
             ("takedown_notice:steward_purge:v1:v1", -1.0),
         ] {
-            let r = scores(
+            // v62.0.0 — a family Verify's matcher does not resolve never
+            // mints: it is shut at the statement door, before persist's gate.
+            let Ok(r) = try_scores(
                 &w,
                 &w,
                 serde_json::json!({"dimension": dim, "score": score}),
-            );
+            ) else {
+                continue;
+            };
             refused_everywhere(
                 b,
                 &r,
@@ -525,13 +549,15 @@ pub(crate) mod bodies {
         }
     }
 
-    /// **I1108** — the ledger owner rule.
+    /// **I1108** — the ledger owner rule. v62.0.0 (flip wave 2): edition-2
+    /// keys and rows; the owner's occurrence is O1's two-voice
+    /// `identity:occurrence` bind; the delegation is an edition-2 edge.
     pub async fn i1108_ledger_owner_rule<B: FederationDirectory + Sync>(b: &B, s: &str) {
         let owner = key(b, &format!("i1108-owner-{s}")).await;
         let occ = key(b, &format!("i1108-occ-{s}")).await;
         let delegate = key(b, &format!("i1108-delegate-{s}")).await;
         let stranger = key(b, &format!("i1108-stranger-{s}")).await;
-        let lid = crate::ledgers::standard::derive_ledger_id(&owner, "usd", "1").unwrap();
+        let lid = crate::ledgers::standard::derive_ledger_id(&e2::kid(&owner), "usd", "1").unwrap();
         let head = |seq: u64| {
             serde_json::json!({
                 "dimension": "ledger:head:usd:v1",
@@ -553,17 +579,11 @@ pub(crate) mod bodies {
             .is_some());
 
         // A live occurrence of the owner admits.
-        b.put_identity_occurrence(
-            ts::signed_content_only_occurrence(
-                &owner,
-                &owner,
-                &occ,
-                chrono::Utc::now() - chrono::Duration::seconds(60),
-            )
-            .await,
+        let at = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("ms") - 60_000;
+        crate::federation::occurrence_consent_invariants::bodies::put_bind(
+            b, &owner, &occ, "phone", at,
         )
-        .await
-        .unwrap_or_else(|e| panic!("I1108 the occurrence binding: {e}"));
+        .await;
         let r = scores(&occ, &owner, head(2));
         b.put_attestation(SignedAttestation {
             attestation: r.clone(),
@@ -617,26 +637,37 @@ pub(crate) mod bodies {
             .await
             .unwrap_or_else(|e| panic!("I1109 CC's closed value {dim} admits: {e}"));
         }
-        let r = scores(
+        // v62.0.0 — a category outside the closed list is refused at the
+        // statement door (Verify's matcher) or at persist's vocabulary gate,
+        // whichever reaches it first; nothing is stored either way.
+        match try_scores(
             &w,
             &w,
             serde_json::json!({"dimension": "prohibited:gambling:v1", "score": -1.0}),
-        );
-        let e = b
-            .put_attestation(SignedAttestation {
-                attestation: r.clone(),
-            })
-            .await
-            .expect_err("I1109 a category outside the closed list");
-        assert!(
-            e.to_string().contains("namespace_vocab_value_unregistered"),
-            "I1109: {e}"
-        );
-        assert!(b
-            .get_attestation(&r.attestation_id)
-            .await
-            .unwrap()
-            .is_none());
+        ) {
+            Err(e) => assert!(
+                e.kind() == "federation_malformed_row"
+                    || e.to_string().contains("namespace_vocab_value_unregistered"),
+                "I1109: refused at the statement door, as a malformed row: {e}"
+            ),
+            Ok(r) => {
+                let e = b
+                    .put_attestation(SignedAttestation {
+                        attestation: r.clone(),
+                    })
+                    .await
+                    .expect_err("I1109 a category outside the closed list");
+                assert!(
+                    e.to_string().contains("namespace_vocab_value_unregistered"),
+                    "I1109: {e}"
+                );
+                assert!(b
+                    .get_attestation(&r.attestation_id)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+        }
     }
 
     #[cfg(test)]

@@ -1845,20 +1845,29 @@ pub trait BlobStorage: Send + Sync {
         media_type: Option<&'s str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
     where
-        Self: Sync,
+        Self: Sync + crate::federation::FederationDirectory,
     {
-        self.store_blob_local(
-            sha256,
-            BlobBody::Inline(bytes),
-            media_type,
-            crate::federation::types::cohort_scope::FEDERATION,
-            StorageFloor::resolved(crate::federation::types::cohort_scope::CryptoTier::Plaintext),
-            // #846 — this door carries no signer; unknown classifies as proxy
-            // (fail toward evictable), exactly as `store_blob_local_json`.
-            None,
-            // #984 — the commons names no group.
-            None,
-        )
+        async move {
+            self.store_blob_local(
+                sha256,
+                BlobBody::Inline(bytes),
+                media_type,
+                crate::federation::types::cohort_scope::FEDERATION,
+                StorageFloor::resolved(
+                    crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                ),
+                // #846 — this door carries no signer; unknown classifies as
+                // proxy (fail toward evictable), exactly as `store_blob_local_json`.
+                None,
+                // #984 — the commons names no group.
+                None,
+            )
+            .await?;
+            // v62.0.0 (wave P7; G0's fold) — the LocalOnly adopt of a commons
+            // blob: a trace row held on it re-folds and projects.
+            crate::ingest::refold_trace_blob(self, sha256).await;
+            Ok(())
+        }
     }
 
     /// #846 (`BLOB_REPLICATION.md` §6.1, I45/I51/I52) — **the adopt floor.**
@@ -4816,102 +4825,102 @@ pub(crate) async fn exercise_put_blob_admission_for_host<B>(backend: &B, host: &
 where
     B: BlobStorage + crate::federation::FederationDirectory,
 {
+    // v62.0.0 (JSON cut, critical path, E5) — the door is `put_blob_edition2`
+    // (T2.api §5): the holder's claim is an edition-2 `custody:{kind}`
+    // statement (`typed_fixtures::custody_statement`) by the holder's own
+    // `key:record` (a `user` key: from 0, no end), named by its identity-ref.
+    // The earlier arm (2) — a caller-supplied `original_content_hash` that
+    // does not cover the JCS envelope persist rebuilt — is gone with the JCS
+    // envelope; its edition-2 twin is a claim for another size, refused
+    // before any byte is stored (I3171).
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::group_fixtures::row_id_of;
+    use crate::federation::edition2::typed_fixtures as tf;
     use sha2::{Digest, Sha256};
     let digest = |bytes: &[u8]| -> [u8; 32] { Sha256::digest(bytes).into() };
+    let holder = e2::put_key(backend, host, &["user"]).await;
+    let ms_instant = |t: chrono::DateTime<chrono::Utc>| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis()).expect("ms")
+    };
 
-    // ── (1) AN UNBOUNDED-FUTURE HOLDER CLAIM IS REFUSED.
+    // ── (1) AN UNBOUNDED-FUTURE HOLDER CLAIM IS REFUSED, and leaves no bytes.
     let bytes = format!("skewed holder claim {suffix}").into_bytes();
     let sha = digest(&bytes);
-    let far_future = crate::federation::admission::truncate_to_substrate_resolution(
-        chrono::Utc::now() + chrono::Duration::days(365),
-    );
-    let skew_id = format!("blob-skew-{suffix}");
-    let att = sealed_put_blob_attestation(
+    let len = bytes.len() as u64;
+    let far_future = chrono::Utc::now() + chrono::Duration::days(365);
+    let skewed = tf::custody_statement(
+        &holder,
         &sha,
-        host,
-        host,
-        &skew_id,
-        far_future,
-        far_future,
-        bytes.len() as u64,
+        Some(len),
+        "federation",
+        None,
+        e2::ms(far_future),
     );
-    let err = backend
-        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, att)
+    backend
+        .put_blob_edition2(&sha, BlobBody::Inline(bytes.clone()), None, &skewed)
         .await
         .expect_err("put_blob must apply the future-skew bound (#656)");
     assert!(
-        err.to_string().contains("ahead of now"),
-        "the refusal is the SKEW arm specifically, not a binding arm: {err}"
-    );
-    assert!(
-        crate::federation::FederationDirectory::get_attestation(backend, &skew_id)
+        crate::federation::FederationDirectory::get_attestation(backend, &row_id_of(&skewed).hex())
             .await
             .expect("read")
             .is_none(),
         "verify-before-mutation: the refused holder claim wrote no attestation row"
     );
-
-    // ── (2) A HASH THAT DOES NOT COVER THE REBUILT ENVELOPE IS REFUSED.
-    let liar_id = format!("blob-liar-{suffix}");
-    let now = crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-    let mut lying =
-        sealed_put_blob_attestation(&sha, host, host, &liar_id, now, now, bytes.len() as u64);
-    lying.original_content_hash_hex = "00".repeat(32);
-    let err = backend
-        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, lying)
-        .await
-        .expect_err("put_blob must cross-check the declared hash against the rebuilt bytes (#656)");
     assert!(
-        err.to_string().contains("original_content_hash"),
-        "the refusal names the field that does not cover the stored bytes: {err}"
+        !backend.has_blob(&sha).await.expect("has_blob"),
+        "a refused claim leaves no bytes (I3178)"
     );
+
+    // ── (2) A CLAIM THAT DOES NOT DESCRIBE THESE BYTES IS REFUSED.
+    let now = chrono::Utc::now();
+    let wrong_size = tf::custody_statement(
+        &holder,
+        &sha,
+        Some(len + 1),
+        "federation",
+        None,
+        e2::ms(now),
+    );
+    backend
+        .put_blob_edition2(&sha, BlobBody::Inline(bytes.clone()), None, &wrong_size)
+        .await
+        .expect_err("put_blob must refuse a claim for another size (#656, I3171)");
+    assert!(!backend.has_blob(&sha).await.expect("has_blob"));
 
     // ── (3) CONTROL — an honest claim lands, and so does an honest one about
-    //        the PAST, which is the case `asserted_at` was added for.
-    let ok_id = format!("blob-ok-{suffix}");
-    let att = sealed_put_blob_attestation(&sha, host, host, &ok_id, now, now, bytes.len() as u64);
+    //        the PAST (two days back: a custody report is live for 72 h).
+    let honest = tf::custody_statement(&holder, &sha, Some(len), "federation", None, e2::ms(now));
     backend
-        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, att)
+        .put_blob_edition2(&sha, BlobBody::Inline(bytes.clone()), None, &honest)
         .await
         .expect("an honest holder claim still lands — legs 1 and 2 gate the door, not close it");
-
-    let week_ago = crate::federation::admission::truncate_to_substrate_resolution(
-        chrono::Utc::now() - chrono::Duration::days(7),
-    );
-    let past_id = format!("blob-past-{suffix}");
-    let att = sealed_put_blob_attestation(
+    let past_at = ms_instant(now - chrono::Duration::days(2));
+    let past = tf::custody_statement(
+        &holder,
         &sha,
-        host,
-        host,
-        &past_id,
-        week_ago,
-        now,
-        bytes.len() as u64,
+        Some(len),
+        "federation",
+        None,
+        e2::ms(past_at),
     );
     backend
-        .put_blob(&sha, BlobBody::Inline(bytes), None, att)
+        .put_blob_edition2(&sha, BlobBody::Inline(bytes), None, &past)
         .await
         .expect(
-            "a holder announcing bytes it has held for a week is making a claim about the week",
+            "a holder announcing bytes it has held for days is making a claim about those days",
         );
-    let row = crate::federation::FederationDirectory::get_attestation(backend, &past_id)
-        .await
-        .expect("read")
-        .expect("the past-dated holder attestation was written");
-    assert_eq!(row.asserted_at, week_ago, "the past instant is preserved");
+    let row =
+        crate::federation::FederationDirectory::get_attestation(backend, &row_id_of(&past).hex())
+            .await
+            .expect("read")
+            .expect("the past-dated holder claim was written");
+    assert_eq!(row.asserted_at, past_at, "the past instant is preserved");
     assert_eq!(
         row.tier,
         crate::federation::types::attestation_tier::FEDERATION,
         "and it is federation-tier, i.e. served and replicated — which is why the gate matters"
     );
-    crate::federation::admission::check_instant_binding(
-        &row,
-        chrono::Utc::now(),
-        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-    )
-    .expect("the stored row satisfies the gate the door now runs");
-    crate::federation::admission::check_row_column_binding(&row)
-        .expect("and the #643 mirror #652 stamps");
 }
 
 /// v3.5.0 (CIRISPersist#125) — extract the canonical
@@ -5751,7 +5760,6 @@ pub(crate) fn refuse_positioned_plaintext_chunks(
 
 #[cfg(all(test, feature = "sqlite"))]
 mod put_blob_binding_tests {
-    use super::*;
 
     /// **CIRISPersist#652 — the row `put_blob` mints must clear the doors
     /// `put_blob` skips.**
@@ -5770,107 +5778,59 @@ mod put_blob_binding_tests {
     /// a receiver would accept.
     #[tokio::test]
     async fn put_blob_mints_a_row_that_satisfies_both_binding_gates_652() {
+        // v62.0.0 (JSON cut, critical path, E5) — through `put_blob_edition2`
+        // (T2.api §5). The two binding gates `put_blob` used to skip
+        // (`check_instant_binding`, `check_row_column_binding`) read the JSON
+        // `row` mirror and signed instants of the earlier envelope; an
+        // edition-2 claim is admitted by the statement door, so what is left
+        // to witness is the row as STORED: its claim instant, its tier, its
+        // presence on the replication surface, and a peer admitting it.
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::group_fixtures::row_id_of;
+        use crate::federation::edition2::typed_fixtures as tf;
         use crate::federation::BlobStorage as _;
         use crate::federation::FederationDirectory as _;
         use crate::store::{Backend as _, SqliteBackend};
 
         let sq = SqliteBackend::open_in_memory().await.expect("open");
         sq.run_migrations().await.expect("migrations");
-        let holder = "h652";
-        crate::federation::tier_ingest::test_support::register_hybrid_key(&sq, holder).await;
+        let holder = e2::put_key(&sq, "h652", &["user"]).await;
 
-        // Inline bodies are hash-checked at the door, so the SHA is the
-        // payload's own.
         let payload = b"652-witness".to_vec();
         let sha: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&payload).into();
-        let attestation_id = uuid::Uuid::new_v4().to_string();
-        // Deliberately DISTINCT, and this is the point of the pair: the two
-        // used to be one value, with `asserted_at` populated from
-        // `scrub_timestamp`. A holder announcing bytes it has held for an hour
-        // is making a claim about the hour, not about the moment it reached
-        // for its key.
-        let asserted_at = crate::federation::admission::truncate_to_substrate_resolution(
-            chrono::Utc::now() - chrono::Duration::hours(1),
-        );
-        let scrub_timestamp =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-        let envelope = commons_claim_envelope(
+        // A claim about an hour ago: the CLAIM's instant, free to differ from
+        // when the bytes reached this door.
+        let asserted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis(),
+        )
+        .expect("ms");
+        let claim = tf::custody_statement(
+            &holder,
             &sha,
-            holder,
-            &attestation_id,
-            asserted_at,
-            payload.len() as u64,
+            Some(payload.len() as u64),
+            "federation",
+            None,
+            e2::ms(asserted_at),
         );
-        let canonical =
-            crate::verify::canonical::ceg_produce_canonicalize(&envelope).expect("canonicalize");
-        let (och, classical, pqc) =
-            crate::federation::tier_ingest::test_support::sign_envelope(holder, &envelope);
-        assert_eq!(
-            och,
-            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&canonical)),
-            "the test's own signing helper must hash the same bytes it signs"
-        );
-
-        sq.put_blob(
+        sq.put_blob_edition2(
             &sha,
             crate::federation::BlobBody::Inline(payload.clone()),
             None,
-            PutBlobAttestation {
-                attesting_key_id: holder.to_owned(),
-                attestation_id: attestation_id.clone(),
-                size: payload.len() as u64,
-                original_content_hash_hex: och,
-                scrub_signature_classical: classical,
-                scrub_signature_pqc: pqc,
-                scrub_key_id: holder.to_owned(),
-                scrub_timestamp,
-                asserted_at,
-            },
+            &claim,
         )
         .await
         .expect("#652: put_blob admits");
 
+        let id = row_id_of(&claim).hex();
         let stored = sq
-            .get_attestation(&attestation_id)
+            .get_attestation(&id)
             .await
             .expect("read back")
             .expect("#652: the holding claim was written");
-
-        // (1) THE TWO GATES `put_blob` NEVER ASKED.
-        crate::federation::admission::check_instant_binding(
-            &stored,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        )
-        .expect("#652/#598: the stored holding claim must carry its signed instants");
-        crate::federation::admission::check_row_column_binding(&stored)
-            .expect("#652/#643: the stored holding claim must carry its typed-column mirror");
-
-        // (2) `asserted_at` IS THE CLAIM'S INSTANT, not the signature's.
         assert_eq!(
             stored.asserted_at, asserted_at,
             "#652: the column must carry the instant the CLAIM was asserted"
         );
-        assert_ne!(
-            stored.asserted_at, stored.scrub_timestamp,
-            "#652: and it must be free to differ from when the signature was made — if these \
-             are forced equal the conflation is back, and this witness would not notice"
-        );
-
-        // (3) THE TIER IS STATED, AND THE ROW ACTUALLY REPLICATES.
-        //
-        // Being honest about what each half proves: the equality below is a
-        // PIN, not a differential — the schema default is `'federation'` too,
-        // so it cannot distinguish "the door chose this" from "the door said
-        // nothing and the column filled itself in". What it buys is that the
-        // value now travels through the builder, so a schema whose default
-        // ever changes fails HERE instead of silently republishing at a tier
-        // nobody picked.
-        //
-        // The leg with teeth is the one after it: `list_attestations_since` is
-        // the surface a peer PULLS, it filters on this tier, and it is the
-        // reason a wrong value is a mesh-wide event rather than a cosmetic
-        // one.
         assert_eq!(
             stored.tier,
             crate::federation::types::attestation_tier::FEDERATION,
@@ -5884,28 +5844,18 @@ mod put_blob_binding_tests {
             .await
             .expect("list_attestations_since");
         assert!(
-            since
-                .iter()
-                .any(|r| r.attestation.attestation_id == attestation_id),
-            "#652: the holder announcement must appear on the REPLICATION surface — that is              what makes the tier load-bearing rather than cosmetic, and what turned an              unbound row into something every peer in the mesh refused"
+            since.iter().any(|r| r.attestation.attestation_id == id),
+            "#652: the holder announcement must appear on the REPLICATION surface"
         );
 
-        // (4) THE WITNESS: the row survives the round-trip and is admissible
-        // through the REAL `put_attestation` at an INDEPENDENT directory —
-        // the door it always bypassed, on a corpus that never saw it. This is
-        // the assertion whose absence hid the defect: `put_blob` returned Ok
-        // the whole time.
+        // The row survives the round trip and an INDEPENDENT directory admits
+        // the statement it carries (the door it always bypassed).
         let peer = crate::store::test_backend::test_backend();
-        crate::federation::tier_ingest::test_support::register_hybrid_key(&peer, holder).await;
-        peer.put_attestation(crate::federation::SignedAttestation {
-            attestation: stored.clone(),
-        })
-        .await
-        .unwrap_or_else(|e| {
+        e2::put_key(&peer, "h652", &["user"]).await;
+        e2::put_signed(&peer, &stored).await.unwrap_or_else(|e| {
             panic!(
                 "#652: a commons holding claim is federation-scoped and therefore REPLICATES — \
-                 `list_attestations_since` serves exactly this tier. A row every peer refuses \
-                 is a blob announcement that announces nothing. Refusal: {e}"
+                 a row every peer refuses is a blob announcement that announces nothing: {e}"
             )
         });
     }
@@ -5941,57 +5891,33 @@ pub(crate) async fn exercise_put_blob_states_its_cohort_scope<B>(be: &B, tag: &s
 where
     B: BlobStorage + crate::federation::FederationDirectory,
 {
-    let holder = format!("{tag}-660-blobholder");
-    crate::federation::tier_ingest::test_support::register_hybrid_key(be, &holder).await;
-
+    // v62.0.0 (JSON cut, critical path, E5) — through `put_blob_edition2`
+    // (T2.api §5). The #643 column binding (`check_row_column_binding`) read
+    // the JSON `row` mirror, which an edition-2 row does not carry: the stored
+    // row IS the door's projection of the signed statement, so the property
+    // left is that the stated scope is the stored scope.
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::group_fixtures::row_id_of;
+    use crate::federation::edition2::typed_fixtures as tf;
+    let holder = e2::put_key(be, &format!("{tag}-660-blobholder"), &["user"]).await;
     let payload = format!("660-{tag}").into_bytes();
     let sha: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&payload).into();
-    let attestation_id = uuid::Uuid::new_v4().to_string();
-    let asserted_at =
-        crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-    let envelope = commons_claim_envelope(
-        &sha,
+    let claim = tf::custody_statement(
         &holder,
-        &attestation_id,
-        asserted_at,
-        payload.len() as u64,
-    );
-    let (och, classical, pqc) =
-        crate::federation::tier_ingest::test_support::sign_envelope(&holder, &envelope);
-
-    be.put_blob(
         &sha,
-        BlobBody::Inline(payload.clone()),
+        Some(payload.len() as u64),
+        crate::federation::types::cohort_scope::FEDERATION,
         None,
-        PutBlobAttestation {
-            attesting_key_id: holder.clone(),
-            attestation_id: attestation_id.clone(),
-            size: payload.len() as u64,
-            original_content_hash_hex: och,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-            scrub_key_id: holder.clone(),
-            scrub_timestamp: asserted_at,
-            asserted_at,
-        },
-    )
-    .await
-    .unwrap_or_else(|e| panic!("[{tag}] put_blob must admit an ordinary inline body: {e:?}"));
-
-    let stored = crate::federation::FederationDirectory::get_attestation(be, &attestation_id)
+        e2::ms(chrono::Utc::now()),
+    );
+    be.put_blob_edition2(&sha, BlobBody::Inline(payload), None, &claim)
         .await
-        .expect("read back")
-        .unwrap_or_else(|| panic!("[{tag}] the holding claim must have been written"));
-
-    // THE ASSERTION WITH TEETH: the stored columns must match the signed mirror.
-    // An INSERT that omits `cohort_scope` and lets the default fill it in reds
-    // here the moment the builder and the default stop coinciding.
-    crate::federation::admission::check_row_column_binding(&stored).unwrap_or_else(|e| {
-        panic!(
-            "[{tag}] the STORED holding claim must satisfy the #643 column binding — a \
-             column the INSERT never named cannot be one the signature covers: {e}"
-        )
-    });
+        .unwrap_or_else(|e| panic!("[{tag}] put_blob must admit an ordinary inline body: {e:?}"));
+    let stored =
+        crate::federation::FederationDirectory::get_attestation(be, &row_id_of(&claim).hex())
+            .await
+            .expect("read back")
+            .unwrap_or_else(|| panic!("[{tag}] the holding claim must have been written"));
     assert_eq!(
         stored.cohort_scope,
         crate::federation::types::cohort_scope::FEDERATION,
@@ -6692,77 +6618,23 @@ mod tests {
         }
     }
 
+    /// v62.0.0 (JSON cut, E5) — the announcing signer is `local_signer(key_id)`,
+    /// whose composite is `e2::signing_key(key_id)`; its edition-2 `key:record`
+    /// (`e2::put_key`) makes it live. The earlier JSON key rows (alias and
+    /// `<alias>-<fp>` derived id, an Ed25519 seed of `0x77`) are gone: the
+    /// signer's key id is its identity-ref (cut B's `derived_key_id`).
     #[cfg(feature = "sqlite")]
     async fn seed_signer_for(
         backend: &crate::store::sqlite::SqliteBackend,
         key_id: &str,
     ) -> std::sync::Arc<crate::signing::LocalSigner> {
-        use crate::federation::FederationDirectory;
-        use ed25519_dalek::SigningKey;
-        let signing_key = SigningKey::from_bytes(&[0x77; 32]);
-        let pubkey_b64 = {
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes())
-        };
-        let record = crate::federation::types::KeyRecord {
-            key_id: key_id.into(),
-            pubkey_ed25519_base64: pubkey_b64,
-            pubkey_ml_dsa_65_base64: None,
-            algorithm: crate::federation::types::algorithm::HYBRID.into(),
-            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
-            identity_ref: key_id.into(),
-            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
-            valid_until: None,
-            registration_envelope: serde_json::json!({"id": key_id}),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "c2lnbmF0dXJl".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            attestation_evidence: None,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        backend
-            .put_public_key(crate::federation::types::SignedKeyRecord {
-                record: record.clone(),
-            })
-            .await
-            .unwrap();
-        // v9.3.0 (#247) — put_blob_signing's holds_bytes scrub_key_id is
-        // the signer's DERIVED federation key_id; register that row too so
-        // the scrub FK resolves on a real node (alias ≠ derived id).
-        let derived = ciris_verify_core::fedcode::derive_key_id(
+        crate::federation::edition2::fixture_switch::put_key(
+            backend,
             key_id,
-            &signing_key.verifying_key().to_bytes(),
-        );
-        let mut derived_record = record;
-        derived_record.key_id = derived.clone();
-        derived_record.identity_ref = derived.clone();
-        derived_record.scrub_key_id = derived.clone();
-        derived_record.registration_envelope = serde_json::json!({ "id": derived });
-        backend
-            .put_public_key(crate::federation::types::SignedKeyRecord {
-                record: derived_record,
-            })
-            .await
-            .unwrap();
-        // §20.5 hybrid-only: an announcing fixture carries a real ML-DSA-65
-        // half, or the door refuses it (which is I80's job, not this test's).
-        let pqc = std::sync::Arc::new(
-            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], key_id)
-                .expect("mldsa seed length"),
-        );
-
-        std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
-            signing_key,
-            key_id.into(),
-            Some(pqc),
-            Some(key_id.to_owned()),
-        ))
+            &[crate::federation::types::identity_type::AGENT],
+        )
+        .await;
+        crate::federation::tier_ingest::test_support::local_signer(key_id)
     }
 
     #[cfg(feature = "sqlite")]

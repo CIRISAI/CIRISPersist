@@ -39,7 +39,7 @@ pub(crate) mod bodies {
     use crate::federation::ledger_projection_invariants::bodies::{signer, Signer};
     use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
     use crate::federation::types::{cohort_scope, identity_type, Attestation};
-    use crate::federation::{EmitAttestationInput, Error, FederationDirectory, SignedAttestation};
+    use crate::federation::{Error, FederationDirectory};
 
     /// A goal body, as an envelope: `scale`, the cohort for `cohort`, an
     /// M-1 alignment unless `alignment` says otherwise.
@@ -57,39 +57,54 @@ pub(crate) mod bodies {
         env
     }
 
-    fn input(ty: &str, env: serde_json::Value) -> EmitAttestationInput {
-        EmitAttestationInput::with_envelope(
-            ty,
-            EnvelopeCore::from_value(env).unwrap(),
-            cohort_scope::FEDERATION,
-        )
-    }
-
     /// Sign `env` as a `ty` row by `s`, WITHOUT putting it.
+    ///
+    /// v62.0.0 (JSON cut, E5) — an edition-2 statement through E0's codec
+    /// (`e2::row_of`), signed by the signer's composite (`s.id` is the
+    /// identity-ref `register_hybrid_key_as` minted for its alias; ASSUMES cut
+    /// B's `derived_key_id() == e2::kid(alias)`), asserted now at ms, at
+    /// `federation`, about the signer itself (as the emit path produced it).
+    /// The earlier form signed `stamp_and_canonicalize`'s JCS image.
     pub(crate) async fn sign(s: &Signer, ty: &str, env: serde_json::Value) -> Attestation {
-        let mut i = input(ty, env);
-        let key = s.signer.derived_key_id();
-        let canonical = crate::federation::attestation_emit::stamp_and_canonicalize(
-            &mut i,
-            &key,
-            chrono::Utc::now(),
+        use crate::federation::edition2::fixture_switch as e2;
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            chrono::Utc::now().timestamp_millis(),
         )
-        .unwrap();
-        let sig = s.signer.sign_hybrid(&canonical).await.unwrap();
-        crate::federation::attestation_emit::assemble(key, &canonical, sig, i)
-            .unwrap()
-            .0
+        .expect("ms");
+        let literal = Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: s.id.clone(),
+            attested_key_id: s.id.clone(),
+            attestation_type: ty.to_owned(),
+            weight: None,
+            asserted_at: at,
+            expires_at: None,
+            attestation_envelope: env,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: s.id.clone(),
+            scrub_timestamp: at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: cohort_scope::FEDERATION.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        e2::row_of(&literal, &s.id)
     }
 
+    /// v62.0.0 (E5) — the row's edition-2 statement through the one entry.
     pub(crate) async fn put<B>(b: &B, row: &Attestation) -> Result<(), Error>
     where
         B: FederationDirectory + Sync,
     {
-        b.put_attestation(SignedAttestation {
-            attestation: row.clone(),
-        })
-        .await
-        .map(|_| ())
+        crate::federation::edition2::fixture_switch::put_signed(b, row)
+            .await
+            .map(|_| ())
     }
 
     fn naming(target: &str, ty: &str, mut env: serde_json::Value) -> serde_json::Value {

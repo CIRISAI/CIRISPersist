@@ -39,6 +39,10 @@
 //! - **I1200 (the observation prune plan, unit)** — an empty batch plans
 //!   nothing; `transport_destinations` carries its keep predicate on both
 //!   dialects and postgres re-checks the age in the outer DELETE.
+//! - v62.0.0 (JSON cut, E7): I1193 (the signed JSON trust-grant door; a
+//!   trust grant is a `delegates_to` row, RULINGS) and I1201 (the earlier key
+//!   plane's `key:record:v1` attestation rows; an edition-2 key lives in
+//!   `ceg_statements`) are deleted.
 //! - **I1201 (the #1105 family-scoped holdings read)** — the page for a
 //!   key-plane family is exactly the `Attestation` hashes whose rows are
 //!   that family's `scores` rows, in hash order; paging on the hash
@@ -50,11 +54,40 @@ pub(crate) mod bodies {
     use crate::federation::consent_sweep_principals_invariants::bodies::{
         grant, put, row, withdraws,
     };
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{consent_role, identity_type::NODE};
-    use crate::federation::{
-        Attestation, Error, FederationDirectory, TrustGrant, TrustRelationship, TrustType,
-    };
+    use crate::federation::{Attestation, Error, FederationDirectory};
+
+    /// v62.0.0 (JSON cut, E7) — a dimension Verify's family matcher
+    /// registers (the fixtures' `x:v1` is not; an edition-2 row of it is
+    /// refused at the door).
+    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+
+    /// `owner` binds `node`: the owner's row, then the node's own statement
+    /// over it (RULINGS C557).
+    async fn bind_owner(d: &dyn FederationDirectory, owner: &str, node: &str) {
+        // The builder dates its binding 2026-05-01; the node's voice is a
+        // node-key row, which must be now-relative (CC 2.4.1.1): re-date and
+        // re-seal the binding before the voice is taken.
+        let mut ob = ts::owner_binding_attestation("", &e2::seed_of(owner), &e2::seed_of(node));
+        let at = crate::federation::admission::truncate_to_substrate_resolution(
+            Utc::now() - Duration::days(1),
+        );
+        ob.asserted_at = at;
+        ob.scrub_timestamp = at;
+        ob.attestation_envelope[crate::federation::envelope::paths::ASSERTED_AT] =
+            serde_json::Value::String(crate::federation::admission::render_signed_instant(at));
+        ts::reseal(&mut ob);
+        put(d, ob.clone()).await;
+        let voice = e2::voice_of(
+            &e2::carried_statement(&ob).expect("the binding carries its statement"),
+            node,
+        );
+        e2::put_statement(d, &voice)
+            .await
+            .expect("the node's voice on its owner binding");
+    }
     use chrono::{DateTime, Duration, Utc};
 
     fn at(secs: i64) -> DateTime<Utc> {
@@ -70,8 +103,7 @@ pub(crate) mod bodies {
 
     /// I1192 — the consent-role door.
     pub(crate) async fn i1192_consent_role(d: &dyn FederationDirectory, s: &str) {
-        let k = format!("i1192-k-{s}");
-        ts::register_identity_key(d, &k, NODE).await;
+        let k = e2::put_key(d, &format!("i1192-k-{s}"), &[NODE]).await;
         let role = consent_role::PARTNERED;
         d.set_consent_role(&k, Some(role))
             .await
@@ -125,112 +157,6 @@ pub(crate) mod bodies {
         );
     }
 
-    fn trust(
-        key: &str,
-        by: &str,
-        rel: TrustRelationship,
-        domains: Option<Vec<String>>,
-    ) -> TrustGrant {
-        TrustGrant {
-            key: key.to_owned(),
-            trust_type: TrustType::Partnered,
-            trust_relationship: rel,
-            trust_domains: domains,
-            trusted_by: by.to_owned(),
-            expires_at: None,
-        }
-    }
-
-    /// I1193 — the trust-grant door.
-    pub(crate) async fn i1193_grant_trust(d: &dyn FederationDirectory, s: &str) {
-        let steward = format!("i1193-steward-{s}");
-        let k = format!("i1193-k-{s}");
-        ts::register_hybrid_key(d, &steward).await;
-        ts::register_hybrid_key(d, &k).await;
-
-        let before = Utc::now();
-        d.grant_trust(ts::signed_trust_grant(trust(
-            &k,
-            &steward,
-            TrustRelationship::Direct,
-            None,
-        )))
-        .await
-        .expect("I1193: a granter-signed grant lands");
-        let after = Utc::now();
-        let held = d
-            .lookup_trust(&k)
-            .await
-            .unwrap()
-            .expect("I1193: the trust row");
-        assert_eq!(held.trusted_by, steward);
-        assert_eq!(held.trust_relationship, TrustRelationship::Direct);
-        // Postgres keeps microseconds, sqlite the RFC 3339 text: compare
-        // at the coarser of the two.
-        let ms = |t: DateTime<Utc>| t.timestamp_millis();
-        assert!(
-            ms(held.trusted_at) >= ms(before) - 1 && ms(held.trusted_at) <= ms(after) + 1,
-            "I1193: trusted_at is the door's clock: {} not in [{before}, {after}]",
-            held.trusted_at
-        );
-
-        // The authority gate runs before the shape: a grant whose signature
-        // does not cover it is refused even though its shape is valid.
-        let mut forged =
-            ts::signed_trust_grant(trust(&k, &steward, TrustRelationship::Direct, None));
-        forged.grant.trust_type = TrustType::Temporary;
-        assert!(
-            d.grant_trust(forged).await.is_err(),
-            "I1193: an unverified grant is refused"
-        );
-
-        for (bad, why) in [
-            (trust(&k, &k, TrustRelationship::Direct, None), "self-trust"),
-            (
-                trust(&k, &steward, TrustRelationship::Registry, None),
-                "registry without domains",
-            ),
-            (
-                trust(&k, &steward, TrustRelationship::Registry, Some(Vec::new())),
-                "registry with an empty domain list",
-            ),
-            (
-                trust(
-                    &k,
-                    &steward,
-                    TrustRelationship::Direct,
-                    Some(vec!["d".into()]),
-                ),
-                "direct with domains",
-            ),
-        ] {
-            invalid(d.grant_trust(ts::signed_trust_grant(bad)).await, why);
-        }
-        let still = d.lookup_trust(&k).await.unwrap().unwrap();
-        assert_eq!(
-            still.trust_type,
-            TrustType::Partnered,
-            "I1193: no refusal moved the row"
-        );
-        assert_eq!(still.trusted_by, steward);
-
-        let ghost = format!("i1193-ghost-{s}");
-        let m = invalid(
-            d.grant_trust(ts::signed_trust_grant(trust(
-                &ghost,
-                &steward,
-                TrustRelationship::Direct,
-                None,
-            )))
-            .await,
-            "I1193: a key never put",
-        );
-        assert!(
-            m.contains("does not exist"),
-            "I1193: names the missing row: {m}"
-        );
-    }
-
     fn grant_at(
         id: &str,
         author: &str,
@@ -238,6 +164,10 @@ pub(crate) mod bodies {
         for_key: Option<&str>,
         t: DateTime<Utc>,
     ) -> Attestation {
+        // E0.api v1.4 — the earlier-form helpers behind `grant` / `row` seed
+        // from the name, never from an identity-ref: pass the seed.
+        let author = e2::seed_of(author);
+        let author = author.as_str();
         let g = grant(id, author, peer, for_key, &["trace:"]);
         let mut r = row(
             id,
@@ -259,133 +189,144 @@ pub(crate) mod bodies {
     /// I1194 — the consent-peer and live-grant folds.
     pub(crate) async fn i1194_consent_folds(d: &dyn FederationDirectory, s: &str) {
         use crate::federation::types::identity_type::USER;
-        let alice = format!("i1194-alice-{s}");
-        let mallory = format!("i1194-mallory-{s}");
-        let node = format!("i1194-node-{s}");
-        let (p1, p2) = (format!("i1194-p1-{s}"), format!("i1194-p2-{s}"));
-        ts::register_identity_key(d, &alice, USER).await;
-        ts::register_identity_key(d, &mallory, USER).await;
-        for k in [&node, &p1, &p2] {
-            ts::register_identity_key(d, k, NODE).await;
+        // v62.0.0 (JSON cut, E7) — edition-2 keys (ids are identity-refs) and
+        // edition-2 rows (ids are node-computed): every expected order is
+        // computed from the held ids, never assumed from the names.
+        let alice = e2::put_key(d, &format!("i1194-alice-{s}"), &[USER]).await;
+        let mallory = e2::put_key(d, &format!("i1194-mallory-{s}"), &[USER]).await;
+        let node = e2::put_key(d, &format!("i1194-node-{s}"), &[NODE]).await;
+        let p1 = e2::put_key(d, &format!("i1194-p1-{s}"), &[NODE]).await;
+        let p2 = e2::put_key(d, &format!("i1194-p2-{s}"), &[NODE]).await;
+        bind_owner(d, &alice, &node).await;
+        // `p1` is granted twice by alice (a self grant and one for the node:
+        // two projection rows), so the peer read must dedup; `ga` and `gb`
+        // share their instant, so the id decides.
+        let mut minted = Vec::new();
+        for (label, peer, for_key, t) in [
+            ("i1194-g0", &p2, None, at(10)),
+            ("i1194-ga", &p1, None, at(20)),
+            ("i1194-gb", &p1, Some(node.as_str()), at(20)),
+        ] {
+            let g = grant_at(label, &alice, peer, for_key, t);
+            minted.push(g.attestation_id.clone());
+            put(d, g).await;
         }
-        put(
-            d,
-            ts::owner_binding_attestation(&format!("i1194-ob-{s}"), &alice, &node),
-        )
-        .await;
-        // Inserted oldest first and the higher peer first, so the
-        // projection's own order is neither the fold's sort nor its
-        // newest-first order. `p1` is granted twice by alice (a self grant
-        // and one for the node: two projection rows), so the peer read must
-        // dedup; `ga` and `gb` share their instant, so the id decides.
-        let g_old = format!("i1194-g0-{s}");
-        let (g_tie_a, g_tie_b) = (format!("i1194-ga-{s}"), format!("i1194-gb-{s}"));
-        put(d, grant_at(&g_old, &alice, &p2, None, at(10))).await;
-        put(d, grant_at(&g_tie_a, &alice, &p1, None, at(20))).await;
-        put(d, grant_at(&g_tie_b, &alice, &p1, Some(&node), at(20))).await;
+        let (g_old, g_tie_a, g_tie_b) = (minted[0].clone(), minted[1].clone(), minted[2].clone());
+        let mut peers = vec![p1.clone(), p2.clone()];
+        peers.sort();
         assert_eq!(
             d.list_consent_peers(&alice).await.unwrap(),
-            vec![p1.clone(), p2.clone()],
+            peers,
             "I1194: peers sorted, the twice-granted peer once"
         );
+        let mut ties = vec![g_tie_a.clone(), g_tie_b.clone()];
+        ties.sort();
+        ties.reverse();
+        let mut newest_first = ties;
+        newest_first.push(g_old.clone());
         assert_eq!(
             ids(d.list_live_consent_grants_by(&alice).await.unwrap()),
-            vec![g_tie_b.clone(), g_tie_a.clone(), g_old.clone()],
+            newest_first,
             "I1194: newest first, ties by id descending"
         );
 
-        let f_old = format!("i1194-f0-{s}");
-        let m_new = format!("i1194-m1-{s}");
-        put(d, grant_at(&f_old, &alice, &p2, Some(&node), at(30))).await;
-        put(d, grant_at(&m_new, &mallory, &p1, Some(&node), at(40))).await;
+        let f_old = grant_at("i1194-f0", &alice, &p2, Some(&node), at(30));
+        let m_new = grant_at("i1194-m1", &mallory, &p1, Some(&node), at(40));
+        let (f_old_id, m_new_id) = (f_old.attestation_id.clone(), m_new.attestation_id.clone());
+        put(d, f_old).await;
+        put(d, m_new).await;
+        let mut pairs = vec![
+            (alice.clone(), p1.clone()),
+            (alice.clone(), p2.clone()),
+            (mallory.clone(), p1.clone()),
+        ];
+        pairs.sort();
         assert_eq!(
             d.list_consent_peers_for(&node).await.unwrap(),
-            vec![
-                (alice.clone(), p1.clone()),
-                (alice.clone(), p2.clone()),
-                (mallory.clone(), p1.clone()),
-            ],
+            pairs,
             "I1194: (author, peer) pairs sorted"
         );
         assert_eq!(
             ids(d.list_live_consent_grants_for(&node).await.unwrap()),
-            vec![m_new.clone(), f_old.clone(), g_tie_b.clone()],
+            vec![m_new_id.clone(), f_old_id.clone(), g_tie_b.clone()],
             "I1194: the machine's live grants newest first"
         );
         // A withdrawn grant leaves both reads.
-        put(d, withdraws(&format!("i1194-w-{s}"), &mallory, &m_new)).await;
+        put(d, withdraws("", &e2::seed_of(&mallory), &m_new_id)).await;
         assert_eq!(
             ids(d.list_live_consent_grants_for(&node).await.unwrap()),
-            vec![f_old.clone(), g_tie_b.clone()]
+            vec![f_old_id.clone(), g_tie_b.clone()]
         );
-        assert_eq!(
-            d.list_consent_peers_for(&node).await.unwrap(),
-            vec![(alice.clone(), p1.clone()), (alice.clone(), p2.clone())]
-        );
+        let mut alice_pairs = vec![(alice.clone(), p1.clone()), (alice.clone(), p2.clone())];
+        alice_pairs.sort();
+        assert_eq!(d.list_consent_peers_for(&node).await.unwrap(), alice_pairs);
     }
 
     /// I1195 — the consent-revocation fold.
     pub(crate) async fn i1195_consent_revocations(d: &dyn FederationDirectory, s: &str) {
-        let subject = format!("i1195-subject-{s}");
-        let target = format!("i1195-target-{s}");
-        ts::register_identity_key(d, &subject, NODE).await;
-        ts::register_identity_key(d, &target, NODE).await;
+        // v62.0.0 (JSON cut, E7) — edition-2 keys; the signed rows' ids are
+        // node-computed, so "mine" is the set of ids this body minted, not a
+        // suffix of the run tag.
+        let subject = e2::put_key(d, &format!("i1195-subject-{s}"), &[NODE]).await;
+        let target = e2::put_key(d, &format!("i1195-target-{s}"), &[NODE]).await;
         // A second subject: the local upsert keeps one stance per signer
         // and dimension.
-        let subject2 = format!("i1195-subject2-{s}");
-        ts::register_identity_key(d, &subject2, NODE).await;
+        let subject2 = e2::put_key(d, &format!("i1195-subject2-{s}"), &[NODE]).await;
         let now = Utc::now();
-        let (r_old, r_new) = (format!("i1195-r0-{s}"), format!("i1195-r1-{s}"));
-        for (id, who, t) in [
-            (&r_old, &subject, now - Duration::minutes(10)),
-            (&r_new, &subject2, now - Duration::minutes(5)),
+        // v62.0.0 (E0.api v1.8) — each subject-side revocation is an edition-2
+        // `consent:state:revoked:v1` row at tier local, signed by the
+        // subject's composite and stored through the statement entry. Its id is
+        // node-computed: read it off the row.
+        let mut revoked = Vec::new();
+        for (label, who, t) in [
+            ("i1195-r0", &subject, now - Duration::minutes(10)),
+            ("i1195-r1", &subject2, now - Duration::minutes(5)),
         ] {
-            d.attestation_upsert_local(ts::bound_transit_revocation_input(
-                id,
+            let r = e2::transit_revocation_row(
+                label,
                 who,
                 &target,
                 vec![who.clone()],
                 crate::federation::types::cohort_scope::SELF,
                 t,
-                serde_json::json!({ "id": id }),
-            ))
-            .await
-            .expect("I1195: a subject-side revocation transits");
+                serde_json::json!({ "id": format!("{label}-{s}") }),
+            );
+            e2::put_signed(d, &r)
+                .await
+                .expect("I1195: a subject-side revocation transits");
+            revoked.push(r.attestation_id.clone());
         }
+        let (r_old, r_new) = (revoked[0].clone(), revoked[1].clone());
         // A producer's own `withdraws` (rule 1) is not a consent event.
-        let own = format!("i1195-own-{s}");
-        put(
-            d,
-            row(
-                &own,
-                &subject,
-                &subject,
-                serde_json::json!({"dimension": "x:v1"}),
-                vec![subject.clone()],
-                now,
-            ),
-        )
-        .await;
-        let w = format!("i1195-w-{s}");
-        put(d, withdraws(&w, &subject, &own)).await;
+        let own = row(
+            "",
+            &e2::seed_of(&subject),
+            &subject,
+            serde_json::json!({"dimension": DIMENSION, "label": "own"}),
+            vec![subject.clone()],
+            now,
+        );
+        let own_id = own.attestation_id.clone();
+        put(d, own).await;
+        let w = withdraws("", &e2::seed_of(&subject), &own_id);
+        let w_id = w.attestation_id.clone();
+        put(d, w).await;
         // A SUBJECT's `withdraws` of a row naming it (rule 2) is one.
-        let about = format!("i1195-about-{s}");
-        put(
-            d,
-            row(
-                &about,
-                &target,
-                &target,
-                serde_json::json!({"dimension": "x:v1"}),
-                vec![target.clone(), subject.clone()],
-                now,
-            ),
-        )
-        .await;
-        let w2 = format!("i1195-w2-{s}");
-        put(d, withdraws(&w2, &subject, &about)).await;
+        let about = row(
+            "",
+            &e2::seed_of(&target),
+            &target,
+            serde_json::json!({"dimension": DIMENSION, "label": "about"}),
+            vec![target.clone(), subject.clone()],
+            now,
+        );
+        let about_id = about.attestation_id.clone();
+        put(d, about).await;
+        let w2 = withdraws("", &e2::seed_of(&subject), &about_id);
+        let w2_id = w2.attestation_id.clone();
+        put(d, w2).await;
         assert_eq!(
-            d.get_attestation(&w2)
+            d.get_attestation(&w2_id)
                 .await
                 .unwrap()
                 .unwrap()
@@ -393,9 +334,17 @@ pub(crate) mod bodies {
             Some(2),
             "I1195: the fixture is a rule-2 withdraws"
         );
+        let minted = [
+            r_old.clone(),
+            r_new.clone(),
+            own_id.clone(),
+            w_id.clone(),
+            about_id.clone(),
+            w2_id.clone(),
+        ];
         let mine = |rows: Vec<Attestation>| -> Vec<String> {
             rows.into_iter()
-                .filter(|a| a.attestation_id.ends_with(s))
+                .filter(|a| minted.contains(&a.attestation_id))
                 .map(|a| a.attestation_id)
                 .collect()
         };
@@ -407,12 +356,12 @@ pub(crate) mod bodies {
         );
         let got = mine(all);
         assert!(
-            !got.contains(&w),
+            !got.contains(&w_id),
             "I1195: a rule-1 withdraws is not a consent revocation"
         );
         assert_eq!(
             got,
-            vec![w2.clone(), r_new.clone(), r_old.clone()],
+            vec![w2_id.clone(), r_new.clone(), r_old.clone()],
             "I1195: the subject's withdraws and both stances, newest first"
         );
         assert_eq!(
@@ -421,22 +370,21 @@ pub(crate) mod bodies {
                     .await
                     .unwrap()
             ),
-            vec![w2.clone(), r_new.clone()],
+            vec![w2_id.clone(), r_new.clone()],
             "I1195: since bounds the scan"
         );
     }
 
     /// I1197 — the reaper's selection.
     pub(crate) async fn i1197_expired(d: &dyn FederationDirectory, s: &str) {
-        let k = format!("i1197-k-{s}");
-        ts::register_identity_key(d, &k, NODE).await;
+        let k = e2::put_key(d, &format!("i1197-k-{s}"), &[NODE]).await;
         let now = Utc::now();
-        let mk = |id: &str, exp: DateTime<Utc>| {
+        let mk = |label: &str, exp: DateTime<Utc>| {
             let mut r = row(
-                id,
+                "",
+                &e2::seed_of(&k),
                 &k,
-                &k,
-                serde_json::json!({"dimension": "x:v1"}),
+                serde_json::json!({"dimension": DIMENSION, "label": label}),
                 vec![k.clone()],
                 now,
             );
@@ -445,18 +393,27 @@ pub(crate) mod bodies {
             ts::reseal(&mut r);
             r
         };
-        let early = format!("i1197-0-{s}");
-        let (tie_b, tie_a) = (format!("i1197-b-{s}"), format!("i1197-a-{s}"));
-        put(d, mk(&early, now + Duration::days(1))).await;
-        put(d, mk(&tie_b, now + Duration::days(2))).await;
-        put(d, mk(&tie_a, now + Duration::days(2))).await;
-        let mut w = withdraws(&format!("i1197-w-{s}"), &k, &early);
+        let (early_row, tie_1, tie_2) = (
+            mk("early", now + Duration::days(1)),
+            mk("tie-1", now + Duration::days(2)),
+            mk("tie-2", now + Duration::days(2)),
+        );
+        let early = early_row.attestation_id.clone();
+        // v62.0.0 (JSON cut, E7) — ties are by id, and the ids are computed:
+        // the expected order is the two ids sorted.
+        let mut ties = [tie_1.attestation_id.clone(), tie_2.attestation_id.clone()];
+        ties.sort();
+        for r in [early_row, tie_1, tie_2] {
+            put(d, r).await;
+        }
+        let mut w = withdraws("", &e2::seed_of(&k), &early);
         w.expires_at = Some(
             crate::federation::admission::truncate_to_substrate_resolution(now + Duration::days(1)),
         );
         ts::reseal(&mut w);
         let w_id = w.attestation_id.clone();
         put(d, w).await;
+        let minted = [early.clone(), ties[0].clone(), ties[1].clone()];
 
         // Expiry is strict: a row expiring AT the judged instant has not
         // expired yet.
@@ -482,10 +439,10 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         assert!(!full.contains(&w_id), "I1197: a withdraws is never offered");
-        let mine: Vec<&String> = full.iter().filter(|x| x.ends_with(s)).collect();
+        let mine: Vec<&String> = full.iter().filter(|x| minted.contains(x)).collect();
         assert_eq!(
             mine,
-            vec![&early, &tie_a, &tie_b],
+            vec![&early, &ties[0], &ties[1]],
             "I1197: expiry order, ties by id"
         );
         let mut walked = Vec::new();
@@ -510,7 +467,7 @@ pub(crate) mod bodies {
                 .await
                 .unwrap()
                 .iter()
-                .any(|x| x.ends_with(s)),
+                .any(|x| minted.contains(x)),
             "I1197: nothing of mine has expired yet"
         );
     }
@@ -544,91 +501,6 @@ pub(crate) mod bodies {
             (0, 2, 0),
             "I1198: {r:?}"
         );
-    }
-
-    /// I1201 — the #1105 family-scoped holdings read.
-    pub(crate) async fn i1201_key_plane_holdings(d: &dyn FederationDirectory, s: &str) {
-        for i in 0..3 {
-            ts::register_identity_key(d, &format!("i1201-k{i}-{s}"), NODE).await;
-        }
-        let k = format!("i1201-k0-{s}");
-        put(
-            d,
-            row(
-                &format!("i1201-x-{s}"),
-                &k,
-                &k,
-                serde_json::json!({"dimension": "x:v1"}),
-                vec![k.clone()],
-                Utc::now(),
-            ),
-        )
-        .await;
-        let all = d
-            .list_wire_hashes_since("Attestation", None, u32::MAX)
-            .await
-            .unwrap();
-        let mut by_family: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
-        for h in &all {
-            let bytes = d
-                .lookup_signed_record_by_content_hash("Attestation", h)
-                .await
-                .unwrap()
-                .expect("an advertised hash resolves");
-            let a: Attestation = serde_json::from_slice(&bytes).unwrap();
-            if a.attestation_type != crate::federation::types::attestation_type::SCORES {
-                continue;
-            }
-            let dim = crate::federation::admission::envelope_dimension(&a.attestation_envelope);
-            if let Some(f) = crate::federation::key_plane::HOLDINGS_FAMILIES
-                .into_iter()
-                .find(|f| Some(*f) == dim)
-            {
-                by_family.entry(f).or_default().push(h.clone());
-            }
-        }
-        assert!(
-            by_family.get("key:record:v1").is_some_and(|v| v.len() >= 3),
-            "I1201: the fixture holds key-record rows: {by_family:?}"
-        );
-        for family in crate::federation::key_plane::HOLDINGS_FAMILIES {
-            let mut want = by_family.remove(family).unwrap_or_default();
-            want.sort();
-            let got = d
-                .list_key_plane_wire_hashes_since(family, None, u32::MAX)
-                .await
-                .unwrap();
-            assert_eq!(
-                got, want,
-                "I1201: {family} is exactly its rows' hashes, hash order"
-            );
-            let mut paged = Vec::new();
-            let mut after: Option<String> = None;
-            loop {
-                let page = d
-                    .list_key_plane_wire_hashes_since(family, after.as_deref(), 1)
-                    .await
-                    .unwrap();
-                let Some(last) = page.last().cloned() else {
-                    break;
-                };
-                assert_eq!(page.len(), 1, "I1201: the limit holds");
-                paged.extend(page);
-                after = Some(last);
-            }
-            assert_eq!(
-                paged, want,
-                "I1201: paging on the hash reconstructs {family}"
-            );
-        }
-        for bad in ["consent:replication:v1", "trace:demo:v1", ""] {
-            match d.list_key_plane_wire_hashes_since(bad, None, 10).await {
-                Err(Error::InvalidArgument(m)) => {
-                    assert!(m.contains("not a key-plane family"), "I1201: {m}")
-                }
-                other => panic!("I1201: '{bad}' must be refused, got {other:?}"),
-            }
-        }
     }
 }
 
@@ -776,13 +648,17 @@ mod prune_postgres {
         };
         let run = uuid::Uuid::new_v4().simple().to_string();
         // `transport_destinations.occurrence_key_id` references a held key.
+        // v62.0.0 (JSON cut, E7) — an edition-2 key; its id is the
+        // identity-ref `e2::put_key` returns.
+        let mut occ = std::collections::BTreeMap::new();
         for k in ["assert", "seen", "signed"] {
-            crate::federation::tier_ingest::test_support::register_identity_key(
+            let id = crate::federation::edition2::fixture_switch::put_key(
                 &b,
                 &format!("i1200-{k}-{run}"),
-                crate::federation::types::identity_type::NODE,
+                &[crate::federation::types::identity_type::NODE],
             )
             .await;
+            occ.insert(k, id);
         }
         {
             let c = b.checkout().await.unwrap();
@@ -806,7 +682,7 @@ mod prune_postgres {
                      (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
                       admitted_at, signature) \
                      VALUES ($1, 'reticulum', $1, $2, $3, $2, $4)",
-                    &[&format!("i1200-{k}-{run}"), &day(1), &seen, &sig],
+                    &[&occ[k], &day(1), &seen, &sig],
                 )
                 .await
                 .unwrap();
@@ -855,21 +731,21 @@ mod prune_postgres {
             1,
             "I1200: only the unsigned observation"
         );
+        let mine: Vec<&String> = occ.values().collect();
         let left: Vec<String> = c
             .query(
-                "SELECT occurrence_key_id FROM cirislens.transport_destinations \
-                 WHERE occurrence_key_id LIKE 'i1200-%' ORDER BY 1",
+                "SELECT occurrence_key_id FROM cirislens.transport_destinations ORDER BY 1",
                 &[],
             )
             .await
             .unwrap()
             .iter()
-            .map(|r| r.get(0))
+            .map(|r| r.get::<_, String>(0))
+            .filter(|k| mine.contains(&k))
             .collect();
-        assert_eq!(
-            left,
-            vec![format!("i1200-assert-{run}"), format!("i1200-signed-{run}")]
-        );
+        let mut want = vec![occ["assert"].clone(), occ["signed"].clone()];
+        want.sort();
+        assert_eq!(left, want);
     }
 }
 
@@ -888,11 +764,6 @@ mod run {
                 async fn i1192_consent_role() {
                     let Some(d) = $fresh.await else { return };
                     b::i1192_consent_role(&d as &dyn FederationDirectory, &super::suffix()).await
-                }
-                #[tokio::test(flavor = "multi_thread")]
-                async fn i1193_grant_trust() {
-                    let Some(d) = $fresh.await else { return };
-                    b::i1193_grant_trust(&d as &dyn FederationDirectory, &super::suffix()).await
                 }
                 #[tokio::test(flavor = "multi_thread")]
                 async fn i1194_consent_folds() {
@@ -914,12 +785,6 @@ mod run {
                 async fn i1198_known_hashes() {
                     let Some(d) = $fresh.await else { return };
                     b::i1198_known_hashes(&d as &dyn FederationDirectory).await
-                }
-                #[tokio::test(flavor = "multi_thread")]
-                async fn i1201_key_plane_holdings() {
-                    let Some(d) = $fresh.await else { return };
-                    b::i1201_key_plane_holdings(&d as &dyn FederationDirectory, &super::suffix())
-                        .await
                 }
             }
         };

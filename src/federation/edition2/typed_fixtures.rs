@@ -75,8 +75,8 @@ fn ms(at: chrono::DateTime<chrono::Utc>) -> u64 {
 /// voice states the same payload, authored by the identity, naming the
 /// self-roster `head` it is counted over (`refs.head`, REQUIRED, CC27 item
 /// 2). `head: None` names the identity's CURRENT head on `dir`
-/// (`occurrence::current_roster_head`, O1 v7: the latest LANDED roster
-/// row, else the genesis key's `key:record` row); a test of an older or unheld head
+/// and tips (`occurrence::current_roster_heads`, O1 v8: the latest LANDED
+/// roster row(s), else the genesis key's `key:record` row); a test of an older or unheld head
 /// passes it. `further_heads` names the further tips the row merges
 /// (`refs.further_heads`; empty for none). The occurrence is the row's `sub`; the struct's key ids are
 /// seeds or E0 kids.
@@ -94,20 +94,43 @@ pub async fn occurrence_revocation_voice<D: crate::federation::FederationDirecto
     asserted_at_ms: u64,
 ) -> Vec<u8> {
     let identity = kid_or_keep(&rev.identity_key_id);
-    let head = match head {
-        Some(h) => *h,
-        None => super::occurrence::current_roster_head(dir, &identity)
-            .await
-            .expect("typed_fixtures: read the identity's current self-roster head")
-            .expect("typed_fixtures: the identity has a self-roster head (its genesis record)"),
+    // `None`: the identity's CURRENT tips on `dir` (O1 v8
+    // `occurrence::current_roster_heads`: the head and, when the roster is
+    // forked, the further tips the row merges).
+    let (head, further_heads): (RowId, Vec<RowId>) = match head {
+        Some(h) => (*h, further_heads.to_vec()),
+        None => {
+            let (h, tips) = super::occurrence::current_roster_heads(dir, &identity)
+                .await
+                .expect("typed_fixtures: read the identity's current self-roster heads")
+                .expect("typed_fixtures: the identity has a self-roster head (its genesis record)");
+            let further = if further_heads.is_empty() {
+                tips
+            } else {
+                further_heads.to_vec()
+            };
+            (h, further)
+        }
     };
     let mut r = rev.clone();
     r.identity_key_id = identity.clone();
     r.occurrence_key_id = kid_or_keep(&rev.occurrence_key_id);
     r.witness_set = rev.witness_set.iter().map(|w| kid_or_keep(w)).collect();
-    let p =
-        occurrence_revocation_payload(&r, &identity, None, &head, further_heads, asserted_at_ms)
-            .expect("typed_fixtures: occurrence revocation payload");
+    // A user self's revocation is counted (no `author`); a node's or
+    // agent's is authored by the identity (CC 3.1.3).
+    let user = dir
+        .lookup_public_key(&identity)
+        .await
+        .expect("typed_fixtures: read the identity's key")
+        .is_some_and(|k| {
+            crate::federation::types::identity_type::set_contains(
+                &k.identity_type,
+                crate::federation::types::identity_type::USER,
+            )
+        });
+    let author = (!user).then_some(identity.as_str());
+    let p = occurrence_revocation_payload(&r, author, None, &head, &further_heads, asserted_at_ms)
+        .expect("typed_fixtures: occurrence revocation payload");
     typed_statement(
         seed,
         as_identity.then_some(identity.as_str()),

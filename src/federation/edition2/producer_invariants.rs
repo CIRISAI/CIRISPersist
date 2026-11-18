@@ -770,12 +770,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn i2204_sqlite() {
         let d = tempfile::tempdir().unwrap();
-        b::i2204_delegations_in_ccs_families(
+        Box::pin(b::i2204_delegations_in_ccs_families(
             &sqlite_dsn(&d, "a"),
             &sqlite_dsn(&d, "b"),
             &sqlite_dsn(&d, "u"),
             &tag(),
-        )
+        ))
         .await;
     }
 
@@ -783,11 +783,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn i2205_sqlite() {
         let d = tempfile::tempdir().unwrap();
-        b::i2205_a_withdraws_carries_its_targets_family(
+        Box::pin(b::i2205_a_withdraws_carries_its_targets_family(
             &sqlite_dsn(&d, "a"),
             &sqlite_dsn(&d, "b"),
             &tag(),
-        )
+        ))
         .await;
     }
 
@@ -801,7 +801,12 @@ mod tests {
             eprintln!("i2205 postgres: SKIPPED");
             return;
         };
-        b::i2205_a_withdraws_carries_its_targets_family(&a, &bb, &tag()).await;
+        Box::pin(b::i2205_a_withdraws_carries_its_targets_family(
+            &a,
+            &bb,
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "sqlite")]
@@ -816,11 +821,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn i2206_sqlite() {
         let d = tempfile::tempdir().unwrap();
-        b::i2206_the_sweep_producers_are_statements(
+        Box::pin(b::i2206_the_sweep_producers_are_statements(
             &sqlite_dsn(&d, "a"),
             &sqlite_dsn(&d, "b"),
             &tag(),
-        )
+        ))
         .await;
     }
 
@@ -834,18 +839,18 @@ mod tests {
             eprintln!("i2206 postgres: SKIPPED");
             return;
         };
-        b::i2206_the_sweep_producers_are_statements(&a, &bb, &tag()).await;
+        Box::pin(b::i2206_the_sweep_producers_are_statements(&a, &bb, &tag())).await;
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i2208_sqlite() {
         let d = tempfile::tempdir().unwrap();
-        super::digest_bodies::i2208_a_digest_member_round_trips(
+        Box::pin(super::digest_bodies::i2208_a_digest_member_round_trips(
             &sqlite_dsn(&d, "a"),
             &sqlite_dsn(&d, "b"),
             &tag(),
-        )
+        ))
         .await;
     }
 
@@ -859,7 +864,12 @@ mod tests {
             eprintln!("i2208 postgres: SKIPPED");
             return;
         };
-        super::digest_bodies::i2208_a_digest_member_round_trips(&a, &bb, &tag()).await;
+        Box::pin(super::digest_bodies::i2208_a_digest_member_round_trips(
+            &a,
+            &bb,
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "postgres")]
@@ -873,15 +883,18 @@ mod tests {
             eprintln!("i2204 postgres: SKIPPED");
             return;
         };
-        b::i2204_delegations_in_ccs_families(&a, &bb, &u, &tag()).await;
+        Box::pin(b::i2204_delegations_in_ccs_families(&a, &bb, &u, &tag())).await;
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i2209_sqlite() {
         let d = tempfile::tempdir().unwrap();
-        super::serving_bodies::i2209_served_by_statement_and_row_id(&sqlite_dsn(&d, "a"), &tag())
-            .await;
+        Box::pin(super::serving_bodies::i2209_served_by_statement_and_row_id(
+            &sqlite_dsn(&d, "a"),
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "postgres")]
@@ -891,7 +904,11 @@ mod tests {
             eprintln!("i2209 postgres: SKIPPED");
             return;
         };
-        super::serving_bodies::i2209_served_by_statement_and_row_id(&a, &tag()).await;
+        Box::pin(super::serving_bodies::i2209_served_by_statement_and_row_id(
+            &a,
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "sqlite")]

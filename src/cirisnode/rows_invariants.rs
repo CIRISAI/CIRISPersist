@@ -58,8 +58,10 @@ pub(crate) mod bodies {
             alias.push('0');
         }
         let signer = ts::local_signer(&alias);
-        let id = signer.derived_key_id();
-        ts::register_hybrid_key_as(d, &id, &alias, USER).await;
+        // v62 (E4, wave 4): the key goes live as an edition-2 `key:record`;
+        // its id is the composite identity-ref the signer states rows under
+        // (`LocalSigner::federation_id`, cut B), which is `e2::kid(alias)`.
+        let id = crate::federation::edition2::fixture_switch::put_key(d, &alias, &[USER]).await;
         Who { signer, id }
     }
 
@@ -137,7 +139,10 @@ pub(crate) mod bodies {
         );
         assert_eq!(c.attesting_key_id, author.id);
         assert_eq!(c.tier, "federation");
-        assert!(c.scrub_signature_pqc.is_some(), "I1167: hybrid-signed");
+        assert!(
+            crate::federation::edition2::fixture_switch::carried_statement(&c).is_some(),
+            "I1167: the row carries its edition-2 statement (composite-signed)"
+        );
 
         // A vote on it: attested to its author.
         let vid = emit(
@@ -429,6 +434,7 @@ pub(crate) mod engine_bodies {
         let e = Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
             .await
             .unwrap();
+        // v62 (cut B): the engine's own `key:record`.
         e.register_self_federation_key(USER, None, None)
             .await
             .expect("register the engine's own key");
@@ -775,7 +781,11 @@ mod run {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1170_sqlite_engine() {
-        super::engine_bodies::i1170_a_takedown_notice_is_a_row("sqlite::memory:", &tag()).await;
+        Box::pin(super::engine_bodies::i1170_a_takedown_notice_is_a_row(
+            "sqlite::memory:",
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "postgres")]
@@ -784,7 +794,11 @@ mod run {
         let Some(dsn) = crate::test_pg::empty_dsn() else {
             return;
         };
-        super::engine_bodies::i1170_a_takedown_notice_is_a_row(&dsn, &tag()).await;
+        Box::pin(super::engine_bodies::i1170_a_takedown_notice_is_a_row(
+            &dsn,
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "sqlite")]

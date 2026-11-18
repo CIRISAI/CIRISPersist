@@ -56,7 +56,8 @@
 //!   bound under a community epoch: the room row's provenance
 //!   (`from_attestation`, epoch filled from the manifest pointer) reused for a
 //!   chunk is refused at the chunk door once the stream epoch's wrap is held,
-//!   nothing stored or bound; `for_stream_keyed_chunk` adopts every chunk
+//!   nothing bound (v62.0.0 wave GC7, I3920: its bytes KEPT and held back,
+//!   not served, until the chunk provenance's re-offer releases them); `for_stream_keyed_chunk` adopts every chunk
 //!   unbound, the DAG and the positional read both open, and the community
 //!   epoch counts the manifest alone.
 //! - **I759** (sqlite, postgres; #977) — the ordering gap: a stream-keyed
@@ -311,21 +312,35 @@ pub(crate) mod bodies {
         ));
     }
 
-    /// Remove bob from the room on A (his own resignation).
-    async fn remove_bob<B: FederationDirectory + Sync>(a: &B, comm: &str, bob: &str) {
-        let rev = ts::sign_community_membership_revocation(
-            bob,
+    /// Remove bob from the room on A (his own resignation). v62.0.0 (E3b):
+    /// his one `membership:removal` voice naming the room's held head (T1;
+    /// a self-removal needs no other voice), so it lands the typed row.
+    /// `bob_seed` is the seed `ladder` minted bob's identity-ref from
+    /// (`e2::kid`); the voice is signed by that seed, never from the kid.
+    async fn remove_bob<B: FederationDirectory + Sync>(a: &B, comm: &str, bob_seed: &str) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::group::MembershipRecord;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        let (head, _) = e2::held_head(a, comm)
+            .await
+            .expect("the room's held roster head");
+        let now = chrono::Utc::now();
+        let leave = MembershipRecord::CommunityRemoval(
             crate::federation::types::CommunityMembershipRevocation {
                 community_key_id: comm.to_owned(),
-                removed_identity_key_id: bob.to_owned(),
-                removed_at: chrono::Utc::now(),
-                effective_at: chrono::Utc::now(),
+                removed_identity_key_id: e2::kid(bob_seed),
+                removed_at: now,
+                effective_at: now,
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
             },
         );
-        a.put_community_membership_revocation(rev).await.unwrap();
+        let key = e2::signing_key(bob_seed);
+        match e2::put_voices(a, &e2::membership_voices(&leave, Some(&head), &[&key])).await {
+            Ok(StatementOutcome::Row { .. }) => {}
+            other => panic!("bob's self-removal lands: {other:?}"),
+        }
     }
 
     /// **I751** — see the module doc.
@@ -1302,7 +1317,8 @@ pub(crate) mod bodies {
         let chunks = l.ba.stream_chunks(&stream).await.unwrap().chunks;
 
         // (1) The manifest's provenance reused for a chunk is refused, and
-        // nothing is stored or bound.
+        // nothing is bound. v62.0.0 (wave GC7; I3920) — a fold condition:
+        // the bytes are KEPT, unbound, and held back (not servable).
         let first = &chunks[0];
         let e = l
             .engine_b
@@ -1327,8 +1343,14 @@ pub(crate) mod bodies {
         );
         assert_eq!(e.kind(), "blob_stream_keyed_chunk_community_epoch");
         assert!(
-            !l.bb.has_blob(&first.chunk_sha).await.unwrap(),
-            "I758 (1): nothing stored"
+            l.bb.has_blob(&first.chunk_sha).await.unwrap(),
+            "I3920 (1): the bytes are kept"
+        );
+        assert!(
+            !crate::federation::edition2::fold::bytes_servable(l.bb.as_ref(), &first.chunk_sha)
+                .await
+                .unwrap(),
+            "I3920 (1): kept but not served"
         );
         assert!(
             l.bb.community_dek_blob_epoch(&first.chunk_sha)
@@ -1373,6 +1395,13 @@ pub(crate) mod bodies {
                 )
                 .await
                 .unwrap_or_else(|e| panic!("I758 (2): chunk {}: {e}", c.seq));
+            assert!(
+                crate::federation::edition2::fold::bytes_servable(l.bb.as_ref(), &c.chunk_sha)
+                    .await
+                    .unwrap(),
+                "I3920 (2): chunk {} concludes and is served (the held one released)",
+                c.seq
+            );
             assert!(
                 l.bb.community_dek_blob_epoch(&c.chunk_sha)
                     .await

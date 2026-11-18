@@ -12,8 +12,8 @@
 //!
 //! - **I1746** (two nodes; sqlite and postgres) — the takedown delivered
 //!   through the planes. A is the author's node (it holds the `self` row and
-//!   the widening); B is a member's node and receives the widening through
-//!   `apply_replicated_attestation`. On B the room's founder takes the
+//!   the widening); B is a member's node and receives the widening's
+//!   statement through its statement door (v62). On B the room's founder takes the
 //!   message down and the founder's `takedown` deputy the file
 //!   (`community_standards`); both tombstones apply and withhold, and the
 //!   same notices apply on A. A plain member of the room and a founder of
@@ -32,10 +32,20 @@
 //!   not a widening to `federation` scope. `attestations_binding_content`
 //!   (the bytes plane, `subject_of_content`) is unchanged: it returns no
 //!   `supersedes` row.
+//!
+//! v62.0.0 (JSON cut, E12) — the rooms are founded by their members'
+//! `group:roster` voices (`make_group`, T1) and every key is an edition-2
+//! key named by identity-ref; a notice is the signer's `takedown_notice`
+//! statement (`doors_takedown_invariants::bodies::notice`); a row reaches the
+//! other node by its statement through the one entry (`e2::put_signed`, the
+//! door local and replicated rows share), never the JSON replicated door.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::doors_takedown_invariants::bodies::{delegate, notice, Claimant};
+    use crate::federation::doors_takedown_invariants::bodies::{
+        delegate, key_as, notice, Claimant,
+    };
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::room_roster_authority_invariants::bodies::make_group;
     use crate::federation::steward_purge::purge_withheld;
     use crate::federation::takedown_reversal_invariants::bodies::{ruling, sha_bytes, sha_hex};
@@ -154,11 +164,11 @@ pub(crate) mod bodies {
         w
     }
 
+    /// v62.0.0 (E12) — `row` delivered to `to`: its carried statement
+    /// through the receiver's statement door (one entry for local and
+    /// replicated rows), re-verified on the receiver's key plane.
     async fn deliver(to: &dyn FederationDirectory, row: &Attestation) {
-        let out = to
-            .apply_replicated_attestation(SignedAttestation {
-                attestation: row.clone(),
-            })
+        let out = e2::put_signed(to, row)
             .await
             .unwrap_or_else(|e| panic!("delivery of {}: {e}", row.attestation_id));
         assert!(
@@ -203,19 +213,14 @@ pub(crate) mod bodies {
         node_b: &str,
         s: &str,
     ) {
+        // v62.0.0 (E12) — each node key live on both directories, named by
+        // its identity-ref.
         for d in [a, b] {
             for n in [node_a, node_b] {
-                if d.lookup_public_key(n).await.unwrap().is_none() {
-                    ts::register_hybrid_key_as(
-                        d,
-                        n,
-                        n,
-                        crate::federation::types::identity_type::NODE,
-                    )
-                    .await;
-                }
+                key_as(d, n, crate::federation::types::identity_type::NODE).await;
             }
         }
+        let (node_a, node_b) = (&e2::kid(node_a), &e2::kid(node_b));
         let tag = format!("i1746-{s}");
         let other_tag = format!("i1746x-{s}");
         let mut room = String::new();
@@ -355,28 +360,29 @@ pub(crate) mod bodies {
             .notice_attestation_id
             .clone()
             .expect("a notice row");
-        let e = b
-            .put_attestation(SignedAttestation {
-                attestation: ruling(
-                    plain,
-                    &notice_row,
-                    "reversed",
-                    cohort_scope::COMMUNITY,
-                    &room,
-                ),
-            })
-            .await
-            .expect_err("I1746: a plain member does not rule");
+        let e = e2::put_signed(
+            b,
+            &ruling(
+                plain,
+                &notice_row,
+                "reversed",
+                cohort_scope::COMMUNITY,
+                &room,
+            ),
+        )
+        .await
+        .expect_err("I1746: a plain member does not rule");
         assert_eq!(e.kind(), "federation_delegated_scope_unauthorized", "{e}");
-        b.put_attestation(SignedAttestation {
-            attestation: ruling(
+        e2::put_signed(
+            b,
+            &ruling(
                 deputy,
                 &notice_row,
                 "reversed",
                 cohort_scope::COMMUNITY,
                 &room,
             ),
-        })
+        )
         .await
         .expect("I1746: the review deputy's reversal");
         assert!(
@@ -404,11 +410,9 @@ pub(crate) mod bodies {
         // A withdrawn placement binds nothing: the author withdraws the third
         // placement on A, and the withdraws reaches B.
         let w = withdraws(author, &gone, &room);
-        a.put_attestation(SignedAttestation {
-            attestation: w.clone(),
-        })
-        .await
-        .expect("I1746: the author withdraws the placement");
+        e2::put_signed(a, &w)
+            .await
+            .expect("I1746: the author withdraws the placement");
         deliver(
             b,
             &a.get_attestation(&w.attestation_id).await.unwrap().unwrap(),
@@ -441,19 +445,14 @@ pub(crate) mod bodies {
         node_b: &str,
         s: &str,
     ) {
+        // v62.0.0 (E12) — each node key live on both directories, named by
+        // its identity-ref.
         for d in [a, b] {
             for n in [node_a, node_b] {
-                if d.lookup_public_key(n).await.unwrap().is_none() {
-                    ts::register_hybrid_key_as(
-                        d,
-                        n,
-                        n,
-                        crate::federation::types::identity_type::NODE,
-                    )
-                    .await;
-                }
+                key_as(d, n, crate::federation::types::identity_type::NODE).await;
             }
         }
+        let (node_a, node_b) = (&e2::kid(node_a), &e2::kid(node_b));
         let tag = format!("i1750-{s}");
         let mut room = String::new();
         let mut keys = Vec::new();

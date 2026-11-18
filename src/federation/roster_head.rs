@@ -388,6 +388,15 @@ where
             return Ok(());
         }
     }
+    // v62.0.0 (wave GC5; CC 2.7.3) — the roster events (widenings,
+    // revocations, resignations) of the lineage are other rows: declared by
+    // the lineage and by each seat the record lists (a membership change's
+    // `sub` is its member), so the version re-folds when one lands. (G0 v4:
+    // no `family:` read keys.)
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(record.key_id()));
+    for k in record.seats().keys() {
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(k));
+    }
     let index = admissions(directory, record).await?;
     let keys = fold_disagreement_by(
         directory,
@@ -399,10 +408,16 @@ where
     if keys.is_empty() {
         return Ok(());
     }
-    Err(Error::LineageVersionDisagreesWithFold {
-        lineage_key_id: record.key_id().to_owned(),
-        keys,
-    })
+    // v62.0.0 (wave GC5; CC 2.7.3) — the version is HELD
+    // (`lineage_version_disagrees_with_fold`), concluding nothing; outside a
+    // fold attempt (the earlier-form door) it is the refusal it was.
+    Err(super::edition2::fold::hold(
+        super::edition2::fold::reason::LINEAGE_VERSION_DISAGREES_WITH_FOLD,
+        Error::LineageVersionDisagreesWithFold {
+            lineage_key_id: record.key_id().to_owned(),
+            keys,
+        },
+    ))
 }
 
 /// **Consequence (ii)** — a witnessed lineage's head that lags its roster: the

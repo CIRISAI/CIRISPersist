@@ -42,12 +42,48 @@ pub mod bodies {
         DELEGATION_SCOPE_GRANT, DELEGATION_SCOPE_LICENSE, DELEGATION_VALID_FROM_FIELD,
         DELEGATION_VALID_UNTIL_FIELD, MAX_MODERATION_DELEGATION_DEPTH,
     };
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::licensure::{status_set_for, LicensureStatus};
     use crate::federation::tier_ingest::test_support::reseal;
     use crate::federation::types::{attestation_type, identity_type};
     use crate::federation::{Attestation, Error, FederationDirectory};
     use chrono::{DateTime, Duration, SubsecRound, Utc};
     use std::collections::BTreeSet;
+
+    /// v62.0.0 — the fixtures follow the switch: edition 2 by default, the
+    /// earlier form inside a test HELD under it (`affiliation_licence`'s,
+    /// whose groups ride the typed plane). `key` becomes live.
+    pub(crate) async fn reg(dir: &dyn FederationDirectory, key: &str, types: &[&str]) {
+        if e2::emit_edition2() {
+            let _ = e2::put_key(dir, key, types).await;
+        } else {
+            register(dir, key, types).await;
+        }
+    }
+
+    /// The id a key-taking read names `x` by: its kid under edition 2, the
+    /// label in a held test.
+    pub(crate) fn key_id(x: &str) -> String {
+        if e2::emit_edition2() {
+            e2::kid_or_keep(x)
+        } else {
+            x.to_owned()
+        }
+    }
+
+    /// A key in a family name: its bare thumbprint under edition 2 (CC rc21;
+    /// P2b's gates compare by thumbprint), the label in a held test.
+    pub(crate) fn authority_segment(x: &str) -> String {
+        if e2::emit_edition2() {
+            e2::kid_thumb(x)
+        } else {
+            x.to_owned()
+        }
+    }
+
+    /// v62.0.0 — what [`put`] reports for a counted row the door HELD short
+    /// of its protocol (`StatementOutcome::Pending`).
+    pub(crate) const PENDING: &str = "edition2_held_pending";
 
     /// The refusal token the door must carry.
     pub(crate) const REFUSAL: &str = "licensure_delegator_not_authority";
@@ -75,7 +111,14 @@ pub mod bodies {
         for (k, v) in extra {
             envelope[*k] = v.clone();
         }
-        let mut row = signed_row(granter, recipient, attestation_type::DELEGATES_TO, envelope);
+        // v62.0.0: an earlier-form signing helper takes a SEED, never a kid
+        // (E0 v1.4); `make_group` hands back kids.
+        let mut row = signed_row(
+            &e2::seed_of(granter),
+            recipient,
+            attestation_type::DELEGATES_TO,
+            envelope,
+        );
         row.subject_key_ids = vec![recipient.to_owned()];
         row.asserted_at = asserted_at;
         row.scrub_timestamp = asserted_at;
@@ -96,7 +139,8 @@ pub mod bodies {
         let id = uuid::Uuid::new_v4().to_string();
         let mut envelope = serde_json::json!({
             "id": id,
-            "dimension": format!("licensure:{authority}:v1"),
+            // v62.0.0: a key in a family name is its bare thumbprint.
+            "dimension": format!("licensure:{}:v1", authority_segment(authority)),
             "status": status,
             "score": 1.0,
             "confidence": 0.9,
@@ -104,11 +148,201 @@ pub mod bodies {
         if let Some(d) = delegation_id {
             envelope["delegation_id"] = serde_json::Value::String(d.to_owned());
         }
-        let mut row = signed_row(issuer, holder, attestation_type::SCORES, envelope);
+        let mut row = signed_row(
+            &e2::seed_of(issuer),
+            holder,
+            attestation_type::SCORES,
+            envelope,
+        );
         row.asserted_at = asserted_at;
         row.scrub_timestamp = asserted_at;
         reseal(&mut row);
         row
+    }
+
+    /// v62.0.0 (CC 2.4.1.3, CLM-licence-authority-quorum) — the cosigners of
+    /// a COUNTED licence row, by its row id: each is one more edition-2 voice
+    /// over the row's payload, put after the row ([`put`]). Process-wide (the
+    /// affiliation runners use a multi-thread runtime).
+    static COSIGNERS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    /// Note `cosigners` (seeds or minted kids) as the further voices of
+    /// `row`, which [`put`] offers after the row.
+    pub(crate) fn note_cosigners(row: &Attestation, cosigners: &[&str]) {
+        COSIGNERS
+            .lock()
+            .expect("cosigners")
+            .entry(row.attestation_id.clone())
+            .or_default()
+            .extend(cosigners.iter().map(|c| (*c).to_owned()));
+    }
+
+    /// The authority community a `licensure:{thumb}:v1` row names, as the
+    /// store keys it (the identity-ref `authority_of` answers), when this node
+    /// holds a roster for it that is counted (any protocol but
+    /// `founder_only`, whose founder's row stands alone).
+    async fn counted_authority(
+        dir: &dyn FederationDirectory,
+        row: &Attestation,
+    ) -> Result<Option<String>, Error> {
+        let Some(dimension) = row
+            .attestation_envelope
+            .get("dimension")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(None);
+        };
+        // `authority_of` already answers the authority's identity-ref (P2's
+        // key-segment parser), so it is the group id as the store keys it.
+        let Some(authority) = crate::federation::licensure::authority_of(dimension) else {
+            return Ok(None);
+        };
+        let group = authority.to_string();
+        Ok(dir
+            .lookup_community(&group)
+            .await?
+            .filter(|c| {
+                c.consensus_protocol != crate::federation::types::consensus_protocol::FOUNDER_ONLY
+            })
+            .map(|_| group))
+    }
+
+    /// Offer `row` at its door, returning the row as offered and the door's
+    /// outcome (`None` for an earlier-form row through `put_attestation`).
+    ///
+    /// v62.0.0 (CC 2.4.1.3, CC 2.7.4, wave V1b): a licence under a COUNTED
+    /// authority community is restated as a counted row (no `author`,
+    /// `e2::counted_row_of`) naming the community's held roster version
+    /// (`refs.head`), so a short row is HELD (`Pending`) and each noted
+    /// cosigner's voice (`voices_of`) counts toward the protocol; every other
+    /// edition-2 row goes as its own statement.
+    pub(crate) async fn offer(
+        dir: &dyn FederationDirectory,
+        row: &Attestation,
+    ) -> Result<
+        (
+            Attestation,
+            Option<crate::federation::edition2::ingest::StatementOutcome>,
+        ),
+        Error,
+    > {
+        if e2::carried_statement(row).is_none() {
+            store(dir, row).await?;
+            return Ok((row.clone(), None));
+        }
+        let mut cosigners = COSIGNERS
+            .lock()
+            .expect("cosigners")
+            .get(&row.attestation_id)
+            .cloned()
+            .unwrap_or_default();
+        // v62.0.0 (wave V1b, CC 3.2 / C557): an owner binding lands only with
+        // the bound node's own voice; without it the door holds it Pending.
+        // One that names an affiliation (`community_id`) is COUNTED (CC ruling
+        // (a), V1b `check_owner_binding_counted`): it names the affiliation's
+        // held roster version as `refs.head`, and the members' voices count
+        // over it at the affiliation's protocol.
+        let mut row = row.clone();
+        if row.attestation_type == attestation_type::DELEGATES_TO
+            && crate::federation::admission::is_owner_binding_envelope(&row.attestation_envelope)
+        {
+            cosigners.push(e2::seed_of(&row.attested_key_id));
+            let named = row
+                .attestation_envelope
+                .get("community_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            if let Some(community) = named {
+                if row.attestation_envelope.get("refs").is_none() {
+                    if let Some((head, _)) = e2::held_head(dir, &community).await {
+                        let mut shape = row.clone();
+                        shape.attestation_envelope["refs"] =
+                            serde_json::json!({ "head": [2, [-16, head.hex()]] });
+                        row = e2::row_of(&shape, &e2::seed_of(&row.attesting_key_id));
+                    }
+                }
+            }
+        }
+        // v62.0.0 (CC 4.4.3.12, V1b officer arm): an affiliation's officer
+        // appointment (a `delegates_to` that is no owner binding, naming the
+        // affiliation as `community_id`), and a quorum's `withdraws` naming
+        // the affiliation, are COUNTED: no author (`e2::counted_row_of`),
+        // naming the affiliation's held roster version as `refs.head`; the
+        // members' voices count at its protocol.
+        let appointment_like = (row.attestation_type == attestation_type::DELEGATES_TO
+            && !crate::federation::admission::is_owner_binding_envelope(&row.attestation_envelope))
+            || row.attestation_type == attestation_type::WITHDRAWS;
+        if appointment_like && row.attestation_envelope.get("refs").is_none() {
+            let named = row
+                .attestation_envelope
+                .get("community_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            if let Some(community) = named {
+                if let Some((head, _)) = e2::held_head(dir, &community).await {
+                    let mut shape = row.clone();
+                    let mut refs = serde_json::json!({ "head": [2, [-16, head.hex()]] });
+                    // A `withdraws` keeps its target beside the head (the codec
+                    // writes `refs.target` itself only when no `refs` is given).
+                    if let Some(target) = shape
+                        .attestation_envelope
+                        .as_object_mut()
+                        .and_then(|o| o.remove("references_attestation_id"))
+                    {
+                        refs["target"] = serde_json::json!([2, [-16, target]]);
+                    }
+                    shape.attestation_envelope["refs"] = refs;
+                    let seed = e2::seed_of(&row.attesting_key_id);
+                    row = if row.attestation_type == attestation_type::WITHDRAWS {
+                        // V1b `check_counted_withdrawal`: the group's withdrawal
+                        // of a counted row is counted in the TARGET's family
+                        // (`self:delegates_to`); `community_id` was only this
+                        // fixture's marker, so it does not ride the payload.
+                        let target_id = shape.attestation_envelope["refs"]["target"][1][1]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                        let target = dir
+                            .get_attestation(&target_id)
+                            .await?
+                            .expect("the withdrawn appointment is held");
+                        if let Some(o) = shape.attestation_envelope.as_object_mut() {
+                            o.remove("community_id");
+                        }
+                        e2::row_of_statement(
+                            &e2::counted_statement_of_family(
+                                &shape,
+                                &seed,
+                                &e2::family_of(&target),
+                            ),
+                            &shape.tier,
+                        )
+                    } else {
+                        e2::counted_row_of(&shape, &seed)
+                    };
+                }
+            }
+        }
+        let row = match counted_authority(dir, &row).await? {
+            Some(group) => {
+                let (head, _) = e2::held_head(dir, &group)
+                    .await
+                    .expect("the authority's roster is held");
+                let mut shape = row.clone();
+                shape.attestation_envelope["refs"] =
+                    serde_json::json!({ "head": [2, [-16, head.hex()]] });
+                e2::counted_row_of(&shape, &e2::seed_of(&row.attesting_key_id))
+            }
+            None => row,
+        };
+        let mut out = e2::put_signed(dir, &row).await?;
+        let seeds: Vec<&str> = cosigners.iter().map(String::as_str).collect();
+        for voice in e2::voices_of(&row, &seeds) {
+            out = e2::put_statement(dir, &voice).await?;
+        }
+        Ok((row, Some(out)))
     }
 
     /// Store `row` and read it back AS STORED.
@@ -116,11 +350,17 @@ pub mod bodies {
         dir: &dyn FederationDirectory,
         row: &Attestation,
     ) -> Result<Attestation, Error> {
-        store(dir, row).await?;
-        Ok(dir
-            .get_attestation(&row.attestation_id)
-            .await?
-            .expect("a stored row reads back"))
+        let (row, out) = offer(dir, row).await?;
+        match dir.get_attestation(&row.attestation_id).await? {
+            Some(stored) => Ok(stored),
+            // v62.0.0: a counted row short of its protocol is HELD, not
+            // stored: no typed row reads back. Reported as a refusal so the
+            // `must_refuse*` witnesses see it; the outcome names the hold.
+            None => Err(Error::InvalidArgument(format!(
+                "{PENDING}: {} ({out:?})",
+                row.attestation_id
+            ))),
+        }
     }
 
     pub(crate) async fn must_put(
@@ -154,14 +394,14 @@ pub mod bodies {
     pub(crate) async fn keys(dir: &dyn FederationDirectory, tag: &str) -> (String, String) {
         let authority = format!("{tag}-board");
         let holder = format!("{tag}-holder");
-        register(dir, &authority, &[identity_type::USER]).await;
-        register(dir, &holder, &[identity_type::USER]).await;
+        reg(dir, &authority, &[identity_type::USER]).await;
+        reg(dir, &holder, &[identity_type::USER]).await;
         (authority, holder)
     }
 
     pub(crate) async fn officer(dir: &dyn FederationDirectory, tag: &str, name: &str) -> String {
         let k = format!("{tag}-{name}");
-        register(dir, &k, &[identity_type::PRIMITIVE]).await;
+        reg(dir, &k, &[identity_type::PRIMITIVE]).await;
         k
     }
 
@@ -217,7 +457,7 @@ pub mod bodies {
         )
         .await;
         assert_eq!(
-            status_set_for(dir, &holder, &board, Utc::now())
+            status_set_for(dir, &key_id(&holder), &key_id(&board), Utc::now())
                 .await
                 .expect("fold"),
             BTreeSet::from([LicensureStatus::Issued]),
@@ -389,7 +629,7 @@ pub mod bodies {
 
         // Kills: the fold resolving the CURRENT graph.
         assert_eq!(
-            status_set_for(dir, &holder, &board, Utc::now())
+            status_set_for(dir, &key_id(&holder), &key_id(&board), Utc::now())
                 .await
                 .expect("fold"),
             BTreeSet::from([LicensureStatus::Issued]),
@@ -596,8 +836,8 @@ pub mod bodies {
             async move {
                 reachable_under_scope(
                     dir,
-                    &owner,
-                    &to,
+                    &key_id(&owner),
+                    &key_id(&to),
                     DELEGATION_SCOPE_GRANT,
                     MAX_MODERATION_DELEGATION_DEPTH,
                 )
@@ -773,7 +1013,7 @@ pub mod bodies {
         )
         .await;
         assert_eq!(
-            status_set_for(dir, &holder, &board, Utc::now())
+            status_set_for(dir, &key_id(&holder), &key_id(&board), Utc::now())
                 .await
                 .expect("fold"),
             BTreeSet::from([LicensureStatus::Issued]),
@@ -783,7 +1023,7 @@ pub mod bodies {
         assert_eq!(
             licensure_issuance_at(
                 dir,
-                &resolve_licensure_authority(dir, &board)
+                &resolve_licensure_authority(dir, &key_id(&board))
                     .await
                     .expect("resolve"),
                 &two_hop,
@@ -913,7 +1153,7 @@ pub mod bodies {
 
         // ── list-by-authority: exactly the fold's verdict, per row ──
         let holder2 = format!("{tag}-holder2");
-        register(dir, &holder2, &[identity_type::USER]).await;
+        reg(dir, &holder2, &[identity_type::USER]).await;
         let direct = must_put(
             dir,
             &licence(
@@ -957,7 +1197,7 @@ pub mod bodies {
             "the board writes under a different authority id",
         )
         .await;
-        let listed = licences_issued_under(dir, &board)
+        let listed = licences_issued_under(dir, &key_id(&board))
             .await
             .expect("licences_issued_under");
         assert_eq!(
@@ -985,8 +1225,10 @@ pub mod bodies {
         )
         .await;
         assert!(
-            ids(&licences_issued_under(dir, &board).await.expect("list"))
-                .contains(&two_hop.attestation_id),
+            ids(&licences_issued_under(dir, &key_id(&board))
+                .await
+                .expect("list"))
+            .contains(&two_hop.attestation_id),
             "[{tag}] #1035/#1032: the list reads the same signed-instant verdict as the fold"
         );
     }
@@ -1003,7 +1245,7 @@ pub mod bodies {
         use crate::federation::types::consensus_protocol;
         let now = base();
         let holder = format!("{tag}-holder");
-        register(dir, &holder, &[identity_type::USER]).await;
+        reg(dir, &holder, &[identity_type::USER]).await;
 
         // A founder_only affiliation: alice founds it.
         let (aff, keys) = make_group(
@@ -1073,7 +1315,7 @@ pub mod bodies {
         )
         .await;
         assert_eq!(
-            status_set_for(dir, &holder, &aff, Utc::now())
+            status_set_for(dir, &key_id(&holder), &key_id(&aff), Utc::now())
                 .await
                 .expect("fold"),
             BTreeSet::from([LicensureStatus::Issued, LicensureStatus::Probation]),
@@ -1081,7 +1323,9 @@ pub mod bodies {
              non-founder's absorbing `revoked` is testimony and binds nobody"
         );
         assert_eq!(
-            ids(&licences_issued_under(dir, &aff).await.expect("list")),
+            ids(&licences_issued_under(dir, &key_id(&aff))
+                .await
+                .expect("list")),
             BTreeSet::from([by_officer.attestation_id, by_founder.attestation_id]),
             "[{tag}] #1036.1: the list-by-authority roots at the affiliation's founders"
         );
@@ -1143,7 +1387,7 @@ pub mod bodies {
         use crate::federation::types::consensus_protocol;
         let now = base();
         let holder = format!("{tag}-holder");
-        register(dir, &holder, &[identity_type::USER]).await;
+        reg(dir, &holder, &[identity_type::USER]).await;
         let (room, keys) = make_group(
             dir,
             &format!("{tag}-fo"),
@@ -1201,15 +1445,17 @@ pub mod bodies {
             "[{tag}] I604 precondition: the live record no longer names F"
         );
         assert_eq!(
-            status_set_for(dir, &holder, &room, Utc::now())
+            status_set_for(dir, &key_id(&holder), &key_id(&room), Utc::now())
                 .await
                 .expect("fold"),
             BTreeSet::from([LicensureStatus::Issued]),
             "[{tag}] I604: F's licence, signed while F was a founder, still binds"
         );
         assert!(
-            ids(&licences_issued_under(dir, &room).await.expect("list"))
-                .contains(&issued.attestation_id),
+            ids(&licences_issued_under(dir, &key_id(&room))
+                .await
+                .expect("list"))
+            .contains(&issued.attestation_id),
             "[{tag}] I604: the list-by-authority still finds F's licence"
         );
         // After the supersession F is no founder. F's new row, an absorbing
@@ -1237,15 +1483,17 @@ pub mod bodies {
             "[{tag}] I604: F's row after the supersession is not the authority's"
         );
         assert_eq!(
-            status_set_for(dir, &holder, &room, Utc::now())
+            status_set_for(dir, &key_id(&holder), &key_id(&room), Utc::now())
                 .await
                 .expect("fold"),
             BTreeSet::from([LicensureStatus::Issued]),
             "[{tag}] I604: F's later `revoked` binds nobody; the `t1` licence stands"
         );
         assert!(
-            !ids(&licences_issued_under(dir, &room).await.expect("list"))
-                .contains(&late.attestation_id),
+            !ids(&licences_issued_under(dir, &key_id(&room))
+                .await
+                .expect("list"))
+            .contains(&late.attestation_id),
             "[{tag}] I604: the list-by-authority does not carry F's later row"
         );
     }
@@ -1270,7 +1518,7 @@ pub mod bodies {
         use crate::federation::types::consensus_protocol;
         let now = base();
         let holder = format!("{tag}-holder");
-        register(dir, &holder, &[identity_type::USER]).await;
+        reg(dir, &holder, &[identity_type::USER]).await;
         let (room, _founders) = make_group(
             dir,
             &format!("{tag}-infra"),
@@ -1282,10 +1530,10 @@ pub mod bodies {
         )
         .await;
         // The community's id resolves to a key as well.
-        register(dir, &room, &[identity_type::SUBSTRATE_PERSIST]).await;
+        reg(dir, &room, &[identity_type::SUBSTRATE_PERSIST]).await;
         assert!(
             matches!(
-                resolve_licensure_authority(dir, &room)
+                resolve_licensure_authority(dir, &key_id(&room))
                     .await
                     .expect("resolve"),
                 crate::federation::admission::LicensureAuthority::Community(_)
@@ -1300,7 +1548,7 @@ pub mod bodies {
             Some(&uuid::Uuid::new_v4().to_string()),
             now - Duration::minutes(30),
         );
-        let authority = resolve_licensure_authority(dir, &room)
+        let authority = resolve_licensure_authority(dir, &key_id(&room))
             .await
             .expect("resolve");
         assert!(

@@ -13,8 +13,9 @@
 //!   `persist_row_hash`, the prior kept in `federation_group_versions`.
 //! - **I2995** a fork (a second version naming an older head) is held as a
 //!   tip beside the head (K1's `federation_group_tips`); the head stays.
-//! - **I2996** a version whose `refs.head` is not held waits (the retryable
-//!   `federation_withdraws_target_unheld`), and its voice is not kept.
+//! - **I2996** a version whose `refs.head` is not held yet is HELD
+//!   (`link_unheld`, `Pending`), its voices kept; when the head is
+//!   delivered, G0's write-time re-fold lands it with no re-offer.
 //! - **I2997** a version that does not follow its `refs.head`'s version (or a
 //!   later version with no `refs.head`) is `edition2_payload_invalid`.
 //! - **I2998** a counted removal short of the family's protocol is `Pending`
@@ -22,8 +23,9 @@
 //!   that meets it lands it, and the member leaves the active roster. The
 //!   replicated door (an offered id) admits a voice the same way.
 //! - **I2999** a widening meets the JSON door's own growth gate: with its
-//!   standing met but no acceptance held, it is refused
-//!   `membership_acceptance_unresolved` and its voice is not kept.
+//!   standing met but no acceptance held, it is HELD (v62.0.0 wave GC7,
+//!   CC 2.7.3: the acceptance is another row), reason
+//!   `membership_acceptance_unresolved`, its voice kept and no row.
 //! - **I3000** a community: its founding lands in `federation_communities`,
 //!   and a counted removal in `federation_community_membership_revocations`.
 //! - **I3001** while the head is forked (K1 holds the fork as a tip), the
@@ -206,10 +208,8 @@ pub(crate) async fn roster_body(d: &dyn FederationDirectory) {
     let o = put(d, &roster(&v2, 2, Some(&v1_id), 3_000, &b))
         .await
         .unwrap();
-    assert!(
-        landed(&o).is_some(),
-        "I2994 two of three meet majority: {o:?}"
-    );
+    let v2_id = landed(&o);
+    assert!(v2_id.is_some(), "I2994 two of three meet majority: {o:?}");
     let held2 = d.lookup_family(&gid).await.unwrap().unwrap();
     assert_eq!(held2.family_name, "fam two", "I2994 the head moved");
     assert_eq!(held2.consensus_protocol, "unanimous", "I2994 protocol");
@@ -248,28 +248,79 @@ pub(crate) async fn roster_body(d: &dyn FederationDirectory) {
         "I2995 the tip names version 1"
     );
 
-    // I2996 — an unheld head waits; the voice is not kept.
-    let v3 = family(&g, "fam three", "unanimous", &members);
-    let st = roster(&v3, 3, Some(&RowId([0x5a; 32])), 5_000, &a);
-    let e = put(d, &st).await.unwrap_err();
+    // I2996 — a version whose head is not held yet is HELD (`link_unheld`),
+    // its voices kept; when the head is delivered, the fold re-runs it and
+    // it lands with no re-offer (order independence).
+    let v2_id = v2_id.expect("I2996 v2 is the head");
+    let v3 = family(&g, "fam three", "majority", &members);
+    let v4 = family(&g, "fam four", "majority", &members);
+    // v3 extends the head v2 but is NOT delivered yet; v4 extends v3.
+    let v3_voices: Vec<Vec<u8>> = [&a, &b, &c]
+        .iter()
+        .map(|k| roster(&v3, 3, Some(&v2_id), 5_000, k))
+        .collect();
+    let v3_id = RowId::of_statement(&v3_voices[0]).unwrap();
+    let v4_voices: Vec<Vec<u8>> = [&a, &b]
+        .iter()
+        .map(|k| roster(&v4, 4, Some(&v3_id), 5_500, k))
+        .collect();
+    let v4_id = RowId::of_statement(&v4_voices[0]).unwrap();
+    for st in &v4_voices {
+        let o = put(d, st).await.unwrap_or_else(|e| {
+            panic!("I2996 a version naming an unheld head is held, not refused: {e:?}")
+        });
+        assert!(
+            matches!(o, StatementOutcome::Pending { .. }),
+            "I2996 held: {o:?}"
+        );
+    }
     assert_eq!(
-        e.kind(),
-        "federation_withdraws_target_unheld",
-        "I2996 waits"
+        d.edition2_voices(&v4_id).await.unwrap().len(),
+        2,
+        "I2996 both voices kept"
     );
-    let id = RowId::of_statement(&st).unwrap();
+    let why = super::fold::why_held(d, &v4_id)
+        .await
+        .unwrap()
+        .expect("I2996 a held reason");
+    assert_eq!(
+        why.reason,
+        super::fold::reason::LINK_UNHELD,
+        "I2996 held for its unheld head: {why:?}"
+    );
+    assert_eq!(
+        d.lookup_family(&gid).await.unwrap().unwrap().family_name,
+        "fam two",
+        "I2996 the head did not move"
+    );
+    // The head is delivered (unanimous at v2: all three voices). Its landing
+    // re-folds v4, which lands on its own.
+    for st in &v3_voices {
+        put(d, st).await.unwrap();
+    }
+    assert_eq!(
+        d.lookup_family(&gid).await.unwrap().unwrap().family_name,
+        "fam four",
+        "I2996 v4 landed when its head arrived, with no re-offer"
+    );
     assert!(
-        d.edition2_voices(&id).await.unwrap().is_empty(),
-        "I2996 not kept"
+        super::fold::why_held(d, &v4_id).await.unwrap().is_none(),
+        "I2996 no longer held"
     );
 
-    // I2997 — the version follows its head's.
-    let e = put(d, &roster(&v3, 5, Some(&v1_id), 5_000, &a))
-        .await
-        .unwrap_err();
+    // I2997 — the version follows its head's. v62.0.0 (wave GC5): the
+    // named version's number is another row's content: held, concluding
+    // nothing. A later version naming no head is the row's own bytes:
+    // refused.
+    let st = roster(&v3, 5, Some(&v1_id), 5_000, &a);
+    let o = put(d, &st).await.unwrap();
+    assert!(pending(&o), "I2997 held: {o:?}");
     assert_eq!(
-        reason(&e),
-        malformed_row::EDITION2_PAYLOAD_INVALID,
+        super::fold::why_held(d, &RowId::of_statement(&st).unwrap())
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(super::fold::reason::VERSION_DOES_NOT_FOLLOW.to_owned()),
         "I2997 version 5 after version 1"
     );
     let e = put(d, &roster(&v3, 2, None, 5_000, &a)).await.unwrap_err();
@@ -364,21 +415,25 @@ pub(crate) async fn membership_body(d: &dyn FederationDirectory) {
         persist_row_hash: String::new(),
     });
     let st = membership(&widening, &head3, &a);
-    let e = put(d, &st).await.unwrap_err();
+    let out = put(d, &st).await;
     assert!(
-        matches!(
-            &e,
-            Error::MembershipAcceptanceRefused { rule, .. }
-                if *rule == crate::federation::membership_acceptance::RULE_ACCEPTANCE_UNRESOLVED
-        ),
-        "I2999 the growth gate: {e:?}"
+        matches!(out, Ok(StatementOutcome::Pending { .. })),
+        "I2999 the growth gate holds: {out:?}"
+    );
+    assert_eq!(
+        super::fold::why_held(d, &RowId::of_statement(&st).unwrap())
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(crate::federation::membership_acceptance::RULE_ACCEPTANCE_UNRESOLVED.to_owned()),
+        "I2999 held, reason membership_acceptance_unresolved"
     );
     assert!(
-        d.edition2_voices(&RowId::of_statement(&st).unwrap())
+        !d.edition2_voices(&RowId::of_statement(&st).unwrap())
             .await
             .unwrap()
             .is_empty(),
-        "I2999 a refused voice is not kept"
+        "I2999 the held voice is kept"
     );
     assert!(
         d.list_family_membership_widenings_for(&gid3)

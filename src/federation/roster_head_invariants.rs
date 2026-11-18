@@ -31,15 +31,38 @@
 //! - **I459** (ii) an authorized accord `roster_change` decision anchored on the
 //!   held accord head, with its window closed, lags the head; one anchored on
 //!   another head, an unauthorized one, or one whose window is open does not.
+//!
+//! v62.0.0 (JSON cut, wave 3, E5) — **I457 and I459 are deleted** (lead's
+//! ruling 1: the accord's head is the genesis bundle in force; its standing
+//! majority and roster-change decisions are bundle/2): covered by C2's I2333 (a
+//! later bundle counts a strict majority) and C1's I2315 / I2316.
+//!
+//! v62.0.0 (JSON cut, E13) — **I450–I456 and I450b–d run on edition 2.** Every
+//! roster version is a `group:roster` row of version v+1 naming the held head
+//! by `refs.head` (T1.api §6), voiced by members of the prior roster; every
+//! revocation and widening is a counted `membership:{stage}` row naming the
+//! roster version it is counted over; a widening is preceded by the member's
+//! proposal and acceptance (T1.api §3). Keys are E0 identity-refs
+//! (`e2::put_key`), and every row a node signs is dated now-relative. The
+//! conferring family is founded by its holders' voices (the earlier fixture
+//! wrote it below the door through `put_family_local`); its charter is a
+//! counted `trust:charter:v1` row voiced by every holder. I450b–d moved from
+//! the earlier-form canonical room to an edition-2 trust-root-grade
+//! (`infrastructure`) room (`rooted_infrastructure_room_e2`): the floor they
+//! witness (the held head's instant) is the community arm's.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use ciris_crypto::composite::CompositeSigningKey;
+
     use crate::federation::canonical_community::root_witness_view;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::group::{GroupRecord, MembershipRecord};
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::lineage_witness::{
         LineageCosignOutcome, LineageCosignRefusal, LineageHeadCosign,
     };
-    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
-    use crate::federation::operational::test_support as ops;
+    use crate::federation::membership_acceptance::test_support::{acceptance_row, proposal_row};
     use crate::federation::roster_head::{
         fold_disagreement, roster_lag, LineageRecord, LINEAGE_HEAD_LAGS_ROSTER,
     };
@@ -48,7 +71,8 @@ pub(crate) mod bodies {
         INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE, TRUST_CHARTER_DIMENSION,
     };
     use crate::federation::types::{
-        attestation_type, identity_type, Family, FamilyMember, FamilyMembershipRevocation,
+        attestation_type, cohort_scope, identity_type, Community, CommunityMember,
+        CommunityMembershipRevocation, Family, FamilyMember, FamilyMembershipRevocation,
         FamilyMembershipWidening,
     };
     use crate::federation::{Error, FederationDirectory};
@@ -59,55 +83,170 @@ pub(crate) mod bodies {
         chrono::Duration::hours(h)
     }
 
-    /// Three registered holders; the distinguishing part LEADS the key id (the
-    /// test signer seeds from its first 32 bytes).
+    /// `t` at the millisecond the edition-2 payload carries.
+    fn at_ms(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
+            .expect("an instant")
+    }
+
+    /// One composite key per signer (a seed or an identity-ref E0 minted).
+    fn keys_of(signers: &[&str]) -> Vec<CompositeSigningKey> {
+        signers.iter().map(|s| e2::signing_key(s)).collect()
+    }
+
+    /// `put_voices`, asserting the typed row landed.
+    pub(crate) fn landed(out: Result<StatementOutcome, Error>, what: &str) {
+        match out {
+            Ok(StatementOutcome::Row { .. }) => {}
+            other => panic!("{what}: expected the row to land, got {other:?}"),
+        }
+    }
+
+    /// Three registered holders (`user`); returns their identity-refs.
     async fn holders(d: &dyn FederationDirectory, tag: &str) -> Vec<String> {
-        let keys: Vec<String> = (0..3).map(|i| format!("rh{i}-{tag}")).collect();
-        for k in &keys {
-            ops::register_typed_key(d, k, identity_type::NODE)
-                .await
-                .unwrap_or_else(|e| panic!("{tag}: register {k}: {e}"));
+        let mut keys = Vec::new();
+        for i in 0..3 {
+            keys.push(e2::put_key(d, &format!("rh{i}-{tag}"), &[identity_type::USER]).await);
         }
         keys
     }
 
+    /// A family founded by every holder's `group:roster` voice (version 1),
+    /// naming `charter` (empty: none). Returns its identity-ref.
+    async fn found(
+        d: &dyn FederationDirectory,
+        seed: &str,
+        keys: &[String],
+        charter: &str,
+    ) -> String {
+        let fam = e2::put_key(d, seed, &[identity_type::USER]).await;
+        let founded_at = at_ms(chrono::Utc::now() - hours(24));
+        let family = Family {
+            prev_head_digest: String::new(),
+            charter_digest: charter.to_owned(),
+            family_key_id: fam.clone(),
+            family_name: fam.clone(),
+            members: keys
+                .iter()
+                .map(|k| FamilyMember {
+                    key_id: k.clone(),
+                    joined_at: founded_at,
+                    role: Some("founder".to_owned()),
+                })
+                .collect(),
+            founded_at,
+            consensus_protocol: PROTOCOL.to_owned(),
+            consensus_protocol_entrenched: true,
+            dissolved_at: None,
+            persist_row_hash: String::new(),
+        };
+        let signers: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let k = keys_of(&signers);
+        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
+        landed(
+            e2::put_voices(
+                d,
+                &e2::roster_voices(
+                    &GroupRecord::Family(family),
+                    1,
+                    None,
+                    e2::ms(founded_at),
+                    &refs,
+                ),
+            )
+            .await,
+            &format!("the founding of {seed}"),
+        );
+        fam
+    }
+
     /// A conferring family: its founding head names a charter (`digest`).
     async fn conferring(d: &dyn FederationDirectory, tag: &str, keys: &[String]) -> String {
-        let fam = format!("rf-{tag}");
-        ops::seed_test_family_naming(d, &fam, keys, PROTOCOL, &"ab".repeat(32))
-            .await
-            .unwrap();
-        fam
+        found(d, &format!("rf-{tag}"), keys, &"ab".repeat(32)).await
     }
 
     async fn head(d: &dyn FederationDirectory, fam: &str) -> Family {
         d.lookup_family(fam).await.unwrap().expect("family held")
     }
 
-    /// `who` leaves `fam` on their own signature, effective `at`.
+    /// The held head of `group` (its version's row id and number).
+    async fn held(
+        d: &dyn FederationDirectory,
+        group: &str,
+    ) -> (crate::federation::edition2::names::RowId, u64) {
+        e2::held_head(d, group)
+            .await
+            .unwrap_or_else(|| panic!("{group}: a held edition-2 head"))
+    }
+
+    /// **The next version of a group** (T1.api §6): `record` at the held
+    /// head's version + 1 naming it by `refs.head`, one voice per signer,
+    /// asserted now. `Row` when it landed, `Pending` when short; an `Err` is
+    /// the door's refusal (nothing written).
+    pub(crate) async fn next_version(
+        d: &dyn FederationDirectory,
+        record: GroupRecord,
+        signers: &[&str],
+    ) -> Result<StatementOutcome, Error> {
+        let group = match &record {
+            GroupRecord::Family(f) => f.family_key_id.clone(),
+            GroupRecord::Community(c) => c.community_key_id.clone(),
+        };
+        let (h, v) = held(d, &group).await;
+        let k = keys_of(signers);
+        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
+        e2::put_voices(
+            d,
+            &e2::roster_voices(&record, v + 1, Some(&h), e2::ms(chrono::Utc::now()), &refs),
+        )
+        .await
+    }
+
+    /// A version of `fam` with `members`, naming the held head, voiced by
+    /// two of the three holders (the head's `quorum:2/3`).
+    async fn version(
+        d: &dyn FederationDirectory,
+        fam: &str,
+        members: Vec<FamilyMember>,
+        signers: &[&str],
+    ) -> Result<StatementOutcome, Error> {
+        let mut next = head(d, fam).await;
+        next.members = members;
+        next.prev_head_digest = String::new();
+        next.persist_row_hash = String::new();
+        next_version(d, GroupRecord::Family(next), signers).await
+    }
+
+    /// `who` leaves `fam` on their own voice, effective `at` (a self-removal
+    /// needs no one else's: `roster_event_standing`).
     async fn leave(
         d: &dyn FederationDirectory,
         fam: &str,
         who: &str,
         at: chrono::DateTime<chrono::Utc>,
     ) {
-        d.put_family_membership_revocation(ts::sign_family_membership_revocation(
-            who,
-            FamilyMembershipRevocation {
-                family_key_id: fam.to_owned(),
-                removed_identity_key_id: who.to_owned(),
-                removed_at: at,
-                effective_at: at,
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{who} leaves {fam}: {e}"));
+        let (h, _) = held(d, fam).await;
+        let at = at_ms(at);
+        let r = MembershipRecord::FamilyRemoval(FamilyMembershipRevocation {
+            family_key_id: fam.to_owned(),
+            removed_identity_key_id: who.to_owned(),
+            removed_at: at,
+            effective_at: at,
+            reason: None,
+            witness_set: vec![],
+            persist_row_hash: String::new(),
+        });
+        let k = keys_of(&[who]);
+        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
+        landed(
+            e2::put_voices(d, &e2::membership_voices(&r, Some(&h), &refs)).await,
+            &format!("{who} leaves {fam}"),
+        );
     }
 
-    /// `member` widened into `fam` with `role`, signed by `signers`.
+    /// `member` widened into `fam` with `role`, voiced by `signers`, after
+    /// the member's own consent (the proposal by `signers[0]` and the
+    /// member's acceptance, edition-2 rows: T1.api §3).
     async fn widen(
         d: &dyn FederationDirectory,
         fam: &str,
@@ -116,38 +255,29 @@ pub(crate) mod bodies {
         at: chrono::DateTime<chrono::Utc>,
         signers: &[&str],
     ) {
-        let w = FamilyMembershipWidening {
+        let at = at_ms(at);
+        let p = proposal_row(signers[0], cohort_scope::FAMILY, fam, member, role, at);
+        e2::put_signed(d, &p)
+            .await
+            .unwrap_or_else(|e| panic!("the proposal of {member}: {e}"));
+        e2::put_signed(d, &acceptance_row(member, &p, at))
+            .await
+            .unwrap_or_else(|e| panic!("{member}'s acceptance: {e}"));
+        let (h, _) = held(d, fam).await;
+        let w = MembershipRecord::FamilyWidening(FamilyMembershipWidening {
             family_key_id: fam.to_owned(),
             member_key_id: member.to_owned(),
             joined_at: at,
             effective_at: at,
             role: role.map(str::to_owned),
             persist_row_hash: String::new(),
-        };
-        let mut s = ts::sign_family_membership_widening(signers[0], w);
-        for c in &signers[1..] {
-            ts::cosign_family_membership_widening(&mut s, c);
-        }
-        d.put_family_membership_widening_consented(s)
-            .await
-            .unwrap_or_else(|e| panic!("{member} widened into {fam}: {e}"));
-    }
-
-    /// A version of `fam` with `members`, naming the held head, through the
-    /// local supersede door, signed by `signer`.
-    async fn version(
-        d: &dyn FederationDirectory,
-        fam: &str,
-        members: Vec<FamilyMember>,
-        signer: &str,
-    ) -> Result<u32, Error> {
-        let held = head(d, fam).await;
-        let mut next = held.clone();
-        next.members = members;
-        next.prev_head_digest = held.persist_row_hash.clone();
-        next.persist_row_hash = String::new();
-        d.supersede_family(ts::sign_family(signer, next), None)
-            .await
+        });
+        let k = keys_of(signers);
+        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
+        landed(
+            e2::put_voices(d, &e2::membership_voices(&w, Some(&h), &refs)).await,
+            &format!("{member} widened into {fam}"),
+        );
     }
 
     fn without(held: &Family, key: &str) -> Vec<FamilyMember> {
@@ -173,69 +303,71 @@ pub(crate) mod bodies {
             && e.kind() == crate::federation::roster_head::LINEAGE_VERSION_DISAGREES_WITH_FOLD
     }
 
+    /// The two holders who voice every version (the head's `quorum:2/3`).
+    fn two(keys: &[String]) -> [&str; 2] {
+        [keys[0].as_str(), keys[1].as_str()]
+    }
+
     /// **I450** — (i) an effective revocation the version does not reflect.
     pub async fn i450_a_version_reflects_a_revocation(d: &dyn FederationDirectory, tag: &str) {
         let keys = holders(d, tag).await;
         let fam = conferring(d, tag, &keys).await;
         leave(d, &fam, &keys[2], chrono::Utc::now() - hours(1)).await;
         let held = head(d, &fam).await;
-        let e = version(d, &fam, held.members.clone(), &keys[0])
+        let e = version(d, &fam, held.members.clone(), &two(&keys))
             .await
             .expect_err("a version still listing the leaver is refused");
         assert!(disagrees(&e, &keys[2]), "{tag} I450: {e:?}");
         assert_eq!(head(d, &fam).await, held, "{tag} I450: nothing written");
-        version(d, &fam, without(&held, &keys[2]), &keys[0])
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I450: the version dropping the seat: {e}"));
+        landed(
+            version(d, &fam, without(&held, &keys[2]), &two(&keys)).await,
+            &format!("{tag} I450: the version dropping the seat"),
+        );
     }
 
     /// **I451** — (i) a widening, and a re-role, the version does not reflect.
     pub async fn i451_a_version_reflects_a_widening(d: &dyn FederationDirectory, tag: &str) {
         let keys = holders(d, tag).await;
         let fam = conferring(d, tag, &keys).await;
-        let joiner = format!("rj-{tag}");
-        ops::register_typed_key(d, &joiner, identity_type::NODE)
-            .await
-            .unwrap();
+        let joiner = e2::put_key(d, &format!("rj-{tag}"), &[identity_type::USER]).await;
         widen(
             d,
             &fam,
             &joiner,
             Some("member"),
             chrono::Utc::now() - hours(1),
-            &[&keys[0], &keys[1]],
+            &two(&keys),
         )
         .await;
         let held = head(d, &fam).await;
-        let e = version(d, &fam, held.members.clone(), &keys[0])
+        let e = version(d, &fam, held.members.clone(), &two(&keys))
             .await
             .expect_err("a version without the widened seat is refused");
         assert!(disagrees(&e, &joiner), "{tag} I451 seat: {e:?}");
-        let e = version(d, &fam, with(&held, &joiner, Some("founder")), &keys[0])
+        let e = version(d, &fam, with(&held, &joiner, Some("founder")), &two(&keys))
             .await
             .expect_err("the seat with another role is refused");
         assert!(disagrees(&e, &joiner), "{tag} I451 role: {e:?}");
-        version(d, &fam, with(&held, &joiner, Some("member")), &keys[0])
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I451: the covering version: {e}"));
+        landed(
+            version(d, &fam, with(&held, &joiner, Some("member")), &two(&keys)).await,
+            &format!("{tag} I451: the covering version"),
+        );
     }
 
     /// **I452** — (i) judges only a witnessed lineage.
     pub async fn i452_only_a_witnessed_lineage_is_judged(d: &dyn FederationDirectory, tag: &str) {
         let keys = holders(d, tag).await;
-        let fam = format!("rn-{tag}");
-        ops::seed_test_family(d, &fam, &keys, PROTOCOL)
-            .await
-            .unwrap();
+        let fam = found(d, &format!("rn-{tag}"), &keys, "").await;
         leave(d, &fam, &keys[2], chrono::Utc::now() - hours(1)).await;
         let held = head(d, &fam).await;
         assert!(
             !LineageRecord::Family(&held).is_witnessed(),
             "{tag} I452: a head naming no charter is no lineage"
         );
-        version(d, &fam, held.members.clone(), &keys[0])
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I452: not judged: {e}"));
+        landed(
+            version(d, &fam, held.members.clone(), &two(&keys)).await,
+            &format!("{tag} I452: not judged"),
+        );
         assert!(
             roster_lag(d, &fam, chrono::Utc::now())
                 .await
@@ -247,15 +379,12 @@ pub(crate) mod bodies {
 
     /// **I453** — the one comparison on the community arm.
     pub async fn i453_the_community_arm(d: &dyn FederationDirectory, tag: &str) {
-        use crate::federation::types::{Community, CommunityMember, CommunityMembershipRevocation};
-        let keys: Vec<String> = (0..3).map(|i| format!("rc{i}-{tag}")).collect();
-        for k in &keys {
-            ops::register_typed_key(d, k, identity_type::USER)
-                .await
-                .unwrap();
+        let mut keys = Vec::new();
+        for i in 0..3 {
+            keys.push(e2::put_key(d, &format!("rc{i}-{tag}"), &[identity_type::USER]).await);
         }
-        let id = format!("rr-{tag}");
-        let founded_at = chrono::Utc::now() - hours(3);
+        let id = e2::put_key(d, &format!("rr-{tag}"), &[identity_type::USER]).await;
+        let founded_at = at_ms(chrono::Utc::now() - hours(3));
         let row = Community {
             community_key_id: id.clone(),
             community_name: id.clone(),
@@ -274,24 +403,40 @@ pub(crate) mod bodies {
             charter_digest: String::new(),
             persist_row_hash: String::new(),
         };
-        d.put_community(ts::sign_community(&keys[0], row))
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I453: the room: {e}"));
-        let at = chrono::Utc::now() - hours(1);
-        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &keys[2],
-            CommunityMembershipRevocation {
-                community_key_id: id.clone(),
-                removed_identity_key_id: keys[2].clone(),
-                removed_at: at,
-                effective_at: at,
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I453: the leave: {e}"));
+        let signers: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let k = keys_of(&signers);
+        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
+        landed(
+            e2::put_voices(
+                d,
+                &e2::roster_voices(
+                    &GroupRecord::Community(row),
+                    1,
+                    None,
+                    e2::ms(founded_at),
+                    &refs,
+                ),
+            )
+            .await,
+            &format!("{tag} I453: the room"),
+        );
+        let at = at_ms(chrono::Utc::now() - hours(1));
+        let (h, _) = held(d, &id).await;
+        let leave = MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
+            community_key_id: id.clone(),
+            removed_identity_key_id: keys[2].clone(),
+            removed_at: at,
+            effective_at: at,
+            reason: None,
+            witness_set: vec![],
+            persist_row_hash: String::new(),
+        });
+        let k2 = keys_of(&[keys[2].as_str()]);
+        let r2: Vec<&CompositeSigningKey> = k2.iter().collect();
+        landed(
+            e2::put_voices(d, &e2::membership_voices(&leave, Some(&h), &r2)).await,
+            &format!("{tag} I453: the leave"),
+        );
         let held = d.lookup_community(&id).await.unwrap().unwrap();
         let now = chrono::Utc::now();
         assert_eq!(
@@ -326,20 +471,22 @@ pub(crate) mod bodies {
         );
     }
 
-    /// A charter of `fam` scrubbed by every holder, carrying `extra`.
-    fn charter(
+    /// **A charter of `fam`** carrying `extra`: a counted `trust:charter:v1`
+    /// row `delegates_to(holder → fam)` (no `author`: the holders' act), its
+    /// first voice by `keys[0]` and one more voice per other holder (the
+    /// earlier co-scrubs). Returns its row id, the digest a version names.
+    async fn put_charter(
+        d: &dyn FederationDirectory,
         fam: &str,
-        id: &str,
         keys: &[String],
         extra: serde_json::Value,
-    ) -> crate::federation::Attestation {
+    ) -> String {
         let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[
             format!("{fam}-succ-a"),
             format!("{fam}-succ-b"),
         ])
         .unwrap();
         let mut env = serde_json::json!({
-            "references_attestation_id": id,
             "dimension": TRUST_CHARTER_DIMENSION,
             "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
             "pre_rotation_commitment": commitment,
@@ -349,15 +496,24 @@ pub(crate) mod bodies {
                 e.insert(k.clone(), v.clone());
             }
         }
-        let cosigners: Vec<&str> = keys[1..].iter().map(String::as_str).collect();
-        ops::co_signed_trust_attestation(
-            id,
-            &keys[0],
-            fam,
-            attestation_type::DELEGATES_TO,
-            env,
-            &cosigners,
-        )
+        let mut a = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), &keys[0], fam, &env);
+        a.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        let row = e2::counted_row_of(&a, &keys[0]);
+        e2::put_signed(d, &row)
+            .await
+            .unwrap_or_else(|e| panic!("the charter of {fam}: {e}"));
+        let others: Vec<&str> = keys[1..].iter().map(String::as_str).collect();
+        for v in e2::voices_of(&row, &others) {
+            e2::put_statement(d, &v)
+                .await
+                .unwrap_or_else(|e| panic!("a holder's voice on the charter of {fam}: {e}"));
+        }
+        let id = e2::rid(&row);
+        assert!(
+            d.get_attestation(&id).await.unwrap().is_some(),
+            "the charter of {fam} landed at its row id"
+        );
+        id
     }
 
     /// A family chartered with `extra` (a cadence, a quorum) and versioned to
@@ -368,18 +524,17 @@ pub(crate) mod bodies {
         keys: &[String],
         extra: serde_json::Value,
     ) -> String {
-        let fam = format!("rk-{tag}");
-        ops::seed_test_family(d, &fam, keys, PROTOCOL)
-            .await
-            .unwrap();
-        let c = charter(&fam, &format!("{fam}-charter"), keys, extra);
-        let digest = ops::charter_digest_of(&c);
-        d.put_attestation(crate::federation::SignedAttestation { attestation: c })
-            .await
-            .expect("charter admitted");
-        ops::version_family_naming_charter(d, &fam, &digest, keys)
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: the version naming the charter: {e}"));
+        let fam = found(d, &format!("rk-{tag}"), keys, "").await;
+        let digest = put_charter(d, &fam, keys, extra).await;
+        let mut next = head(d, &fam).await;
+        next.charter_digest = digest;
+        next.prev_head_digest = String::new();
+        next.persist_row_hash = String::new();
+        let signers: Vec<&str> = keys.iter().map(String::as_str).collect();
+        landed(
+            next_version(d, GroupRecord::Family(next), &signers).await,
+            &format!("{tag}: the version naming the charter"),
+        );
         fam
     }
 
@@ -437,18 +592,23 @@ pub(crate) mod bodies {
             "{tag} I454: served on the witness view"
         );
         let held = head(d, &fam).await;
-        version(d, &fam, without(&held, &keys[2]), &keys[0])
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I454: the covering version: {e}"));
+        landed(
+            version(d, &fam, without(&held, &keys[2]), &two(&keys)).await,
+            &format!("{tag} I454: the covering version"),
+        );
         assert!(
             roster_lag(d, &fam, later).await.unwrap().is_none(),
             "{tag} I454: the covering version clears the lag"
         );
     }
 
+    /// A witness's cosign of `fam`'s head: `witness` is its identity-ref, and
+    /// the signature is the witness SEED's hybrid pair (the material E0's
+    /// composite key for that seed carries).
     fn cosign(
         fam: &Family,
         witness: &str,
+        witness_seed: &str,
         signed_at: chrono::DateTime<chrono::Utc>,
     ) -> LineageHeadCosign {
         let mut c = LineageHeadCosign {
@@ -463,7 +623,7 @@ pub(crate) mod bodies {
         };
         let bytes = crate::verify::canonical::ceg_produce_canonicalize(&c.signing_envelope())
             .expect("cosign envelope canonicalizes");
-        let sig = ts::threshold_sign(witness, &bytes);
+        let sig = ts::threshold_sign(witness_seed, &bytes);
         c.signature_classical = sig.ed25519_signature_base64;
         c.signature_pqc = sig.mldsa65_signature_base64;
         c
@@ -472,8 +632,8 @@ pub(crate) mod bodies {
     /// **I455** — (ii) witnesses do not cosign a lagging head; with witnessed
     /// mode off the lag is only reported.
     pub async fn i455_a_lagging_head_is_not_cosigned(d: &dyn FederationDirectory, tag: &str) {
-        let witness = format!("rw-{tag}");
-        ts::register_hybrid_key_as(d, &witness, &witness, identity_type::WITNESS).await;
+        let witness_seed = format!("rw-{tag}");
+        let witness = e2::put_key(d, &witness_seed, &[identity_type::WITNESS]).await;
         for (mode, extra) in [
             ("on", serde_json::json!({ "witness_quorum": 2 })),
             ("off", serde_json::json!({})),
@@ -487,17 +647,27 @@ pub(crate) mod bodies {
             let lag = roster_lag(d, &fam, chrono::Utc::now()).await.unwrap();
             assert!(lag.is_some(), "{tag} I455: lags in either mode");
             let out = d
-                .put_lineage_head_cosign(cosign(&held, &witness, chrono::Utc::now()))
+                .put_lineage_head_cosign(cosign(&held, &witness, &witness_seed, chrono::Utc::now()))
                 .await
                 .unwrap();
             match mode {
                 "on" => {
+                    // v62.0.0 (wave GC3; CC 2.7, rc21 item 15) — kept, and
+                    // not counted toward the head's quorum.
                     assert_eq!(
                         out,
-                        LineageCosignOutcome::Refused {
+                        LineageCosignOutcome::KeptNotCounted {
                             reason: LineageCosignRefusal::HeadLagsRoster
                         },
-                        "{tag} I455: witnesses do not cosign a lagging head"
+                        "{tag} I455: a cosign on a lagging head is kept, not counted"
+                    );
+                    let view = root_witness_view(d, &fam, chrono::Utc::now())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        view.latest_cosign_at, None,
+                        "{tag} I455: the kept cosign counts for nothing"
                     );
                     assert_eq!(
                         LineageCosignRefusal::HeadLagsRoster.as_str(),
@@ -505,12 +675,18 @@ pub(crate) mod bodies {
                         "{tag} I455: the token CC names"
                     );
                     // The covering version is cosignable.
-                    version(d, &fam, without(&held, &keys[2]), &keys[0])
-                        .await
-                        .unwrap();
+                    landed(
+                        version(d, &fam, without(&held, &keys[2]), &two(&keys)).await,
+                        &format!("{tag} I455: the covering version"),
+                    );
                     let covered = head(d, &fam).await;
                     let out = d
-                        .put_lineage_head_cosign(cosign(&covered, &witness, chrono::Utc::now()))
+                        .put_lineage_head_cosign(cosign(
+                            &covered,
+                            &witness,
+                            &witness_seed,
+                            chrono::Utc::now(),
+                        ))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -559,205 +735,155 @@ pub(crate) mod bodies {
             "{tag} I456: the head still lists it"
         );
     }
-
-    /// **I457** — the accord's version counts a strict majority of its
-    /// STANDING roster.
-    pub async fn i457_a_standing_majority(d: &dyn FederationDirectory, tag: &str) {
-        let keys: Vec<String> = (0..5).map(|i| format!("rs{i}-{tag}")).collect();
-        for k in &keys {
-            ops::register_typed_key(d, k, identity_type::NODE)
-                .await
-                .unwrap();
-        }
-        let fam = format!("rm-{tag}");
-        ops::seed_test_family(d, &fam, &keys, PROTOCOL)
-            .await
-            .unwrap();
-        let env = serde_json::json!({ "family_key_id": fam, "members": [] });
-        let bytes = ciris_verify_core::accord_genesis::accord_family_signing_bytes(&env).unwrap();
-        let proof = |signers: &[&str]| crate::federation::types::GroupSupersedeProof {
-            prior_persist_row_hash: String::new(),
-            change_envelope: env.clone(),
-            quorum_signatures: signers
-                .iter()
-                .map(|k| ts::threshold_sign(k, &bytes))
-                .collect(),
-        };
-        let fam = fam.as_str();
-        let signed = |p: crate::federation::types::GroupSupersedeProof| async move {
-            crate::federation::tier_ingest::accord_standing_majority_signed(d, fam, &p)
-                .await
-                .unwrap()
-        };
-        assert!(
-            !signed(proof(&[&keys[0], &keys[1]])).await,
-            "{tag} I457: two of five is short of the standing majority"
-        );
-        assert!(
-            !signed(proof(&[&keys[0], &keys[0], &keys[1]])).await,
-            "{tag} I457: one key's two signatures count once"
-        );
-        assert!(
-            signed(proof(&[&keys[0], &keys[1], &keys[2]])).await,
-            "{tag} I457: three of five is the standing majority"
-        );
-        let outsider = format!("ro-{tag}");
-        ops::register_typed_key(d, &outsider, identity_type::NODE)
-            .await
-            .unwrap();
-        assert!(
-            !signed(proof(&[&keys[0], &keys[1], &outsider])).await,
-            "{tag} I457: a key off the roster counts nothing"
-        );
-    }
-
-    /// **I459** — (ii) an uncovered authorized accord roster change lags the
-    /// accord head.
-    pub async fn i459_an_uncovered_accord_decision_lags(d: &dyn FederationDirectory, tag: &str) {
-        use ciris_verify_core::accord_live_quorum::{AccordAction, AccordDecision, AccordProposal};
-        ops::register_genesis_accord_roster(d).await.unwrap();
-        crate::federation::genesis::seed_accord_family(d)
-            .await
-            .unwrap();
-        let accord = crate::federation::canonical_community::accord_family_key_id();
-        let held = head(d, accord).await;
-        let now = chrono::Utc::now();
-        let decide = |n: &str, anchor: &str, closes: chrono::DateTime<chrono::Utc>, ok: bool| {
-            let nonce = format!("{n}-{tag}");
-            let anchor = anchor.to_owned();
-            async move {
-                let proposal = AccordProposal {
-                    family_key_id: accord.to_owned(),
-                    action: AccordAction::RosterChange,
-                    nonce,
-                    window_until: closes.to_rfc3339(),
-                    prior_family_digest: anchor,
-                    payload_sha256: "cd".repeat(32),
-                };
-                d.put_accord_proposal(proposal.clone(), None).await.unwrap();
-                d.put_accord_decision(AccordDecision {
-                    proposal: proposal.clone(),
-                    live_set: vec![],
-                    yes: 2,
-                    no: 0,
-                    abstain: 0,
-                    authorized: ok,
-                })
-                .await
-                .unwrap();
-                proposal.digest()
-            }
-        };
-        decide("other", &"ef".repeat(32), now - hours(2), true).await;
-        decide("refused", &held.persist_row_hash, now - hours(2), false).await;
-        decide("open", &held.persist_row_hash, now + hours(2), true).await;
-        assert!(
-            roster_lag(d, accord, now).await.unwrap().is_none(),
-            "{tag} I459: another anchor, a refusal and an open window do not lag"
-        );
-        let digest = decide("due", &held.persist_row_hash, now - hours(2), true).await;
-        let lag = roster_lag(d, accord, now)
-            .await
-            .unwrap()
-            .expect("an authorized roster change on the head lags it");
-        assert_eq!(lag.uncovered_decisions, vec![digest], "{tag} I459");
-        assert!(lag.uncovered_keys.is_empty(), "{tag} I459");
-        assert_eq!(lag.head_digest, held.persist_row_hash, "{tag} I459");
-    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod backdated {
-    use crate::federation::canonical_community::{
-        self as cc, CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON,
-    };
+    use ciris_crypto::composite::CompositeSigningKey;
+
+    use super::bodies::{landed, next_version};
+    use crate::federation::canonical_community as cc;
     use crate::federation::canonical_community_invariants::bodies::{
-        canonical_row, founder_revocation_at, founders_supersede, signed, stand_up, widening_by,
-        with_member, FOUNDERS,
+        rooted_infrastructure_room_e2, SetNodeKey,
     };
-    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::group::{GroupRecord, MembershipRecord};
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::roster_head::roster_lag;
-    use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::identity_type;
+    use crate::federation::types::{
+        identity_type, Community, CommunityMember, CommunityMembershipRevocation,
+    };
     use crate::federation::{Error, FederationDirectory};
 
-    const NODE: &str = "bd-serve-node";
+    const NODE_SEED: &str = "bd-serve-node";
+    const ROOM_SEED: &str = "bd-infra-room";
+    const TAG: &str = "bd";
 
-    /// The canonical row born, a serve node widened in on the plane and
-    /// covered by v2, then a revocation of the node signed with an instant
-    /// BEFORE v2 and admitted after it. Returns the revocation's instant.
-    async fn backdated_revocation(d: &dyn FederationDirectory) -> chrono::DateTime<chrono::Utc> {
-        stand_up(d).await;
-        ts::register_hybrid_key_as(d, NODE, NODE, identity_type::NODE).await;
-        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
-            .await
-            .unwrap();
-        d.put_community_membership_widening_consented(widening_by(
-            &[FOUNDERS[0], FOUNDERS[1]],
-            NODE,
-            Some("member"),
-        ))
-        .await
-        .expect("the serve node joins");
-        let backdated = chrono::Utc::now();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        founders_supersede(
+    /// The founders `rooted_infrastructure_room_e2` seats (`{tag}-infra-f{i}`)
+    /// who voice every version and the revocation (the room's `quorum:2/3`).
+    fn founders() -> [String; 2] {
+        [format!("{TAG}-infra-f0"), format!("{TAG}-infra-f1")]
+    }
+
+    fn with_member(held: &Community, key: &str, role: &str) -> Community {
+        let mut c = without(held, key);
+        c.members.push(CommunityMember {
+            key_id: key.to_owned(),
+            joined_at: held.founded_at,
+            role: Some(role.to_owned()),
+        });
+        c
+    }
+
+    fn without(held: &Community, key: &str) -> Community {
+        let mut c = held.clone();
+        c.members.retain(|m| m.key_id != key);
+        c.prev_head_digest = String::new();
+        c.persist_row_hash = String::new();
+        c
+    }
+
+    async fn room_version(
+        d: &dyn FederationDirectory,
+        record: Community,
+    ) -> Result<StatementOutcome, Error> {
+        let [f0, f1] = founders();
+        next_version(
             d,
-            with_member(canonical_row(&FOUNDERS), NODE, "member"),
-            &[FOUNDERS[0], FOUNDERS[1]],
+            GroupRecord::Community(record),
+            &[f0.as_str(), f1.as_str()],
         )
         .await
-        .expect("v2 covers the join");
-        let v2 = cc::lookup_signed_community(d, CANON)
+    }
+
+    /// An edition-2 trust-root-grade (`infrastructure`) room with a serve
+    /// node widened in on the plane and covered by v2, then a revocation of
+    /// the node by two founders' voices, signed with an instant BEFORE v2 and
+    /// admitted after it. Returns the room, the node and the revocation's
+    /// instant.
+    async fn backdated_revocation<B>(b: &B) -> (String, String, chrono::DateTime<chrono::Utc>)
+    where
+        B: FederationDirectory + SetNodeKey + Sync,
+    {
+        let node = e2::put_key(b, NODE_SEED, &[identity_type::NODE]).await;
+        let room = rooted_infrastructure_room_e2(b, ROOM_SEED, &[NODE_SEED], TAG).await;
+        let d: &dyn FederationDirectory = b;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let backdated = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .expect("an instant");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let held = d.lookup_community(&room).await.unwrap().expect("the room");
+        landed(
+            room_version(d, with_member(&held, &node, "member")).await,
+            "v2 covers the join",
+        );
+        let v2 = cc::lookup_signed_community(d, &room)
             .await
             .unwrap()
             .unwrap();
         assert!(cc::head_instant(&v2) > backdated, "the row predates v2");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        d.put_community_membership_revocation(founder_revocation_at(
-            &[FOUNDERS[0], FOUNDERS[1]],
-            NODE,
-            backdated,
-        ))
-        .await
-        .expect("a revocation of the node dated before v2, admitted after it");
-        backdated
+        let (head, _) = e2::held_head(d, &room).await.expect("v2 is the held head");
+        let r = MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
+            community_key_id: room.clone(),
+            removed_identity_key_id: node.clone(),
+            removed_at: backdated,
+            effective_at: backdated,
+            reason: None,
+            witness_set: vec![],
+            persist_row_hash: String::new(),
+        });
+        let [f0, f1] = founders();
+        let keys: Vec<CompositeSigningKey> = [f0, f1].iter().map(|s| e2::signing_key(s)).collect();
+        let refs: Vec<&CompositeSigningKey> = keys.iter().collect();
+        landed(
+            e2::put_voices(d, &e2::membership_voices(&r, Some(&head), &refs)).await,
+            "a revocation of the node dated before v2, admitted after it",
+        );
+        (room, node, backdated)
     }
 
     /// **I450b** — (ii) a backdated revocation does not escape the lag: the
     /// held head is judged against the fold now, over the rows this node
     /// admitted after it, whatever instant they were signed with.
-    pub async fn i450b_a_backdated_row_lags(d: &dyn FederationDirectory) {
-        backdated_revocation(d).await;
-        let lag = roster_lag(d, CANON, chrono::Utc::now())
+    pub async fn i450b_a_backdated_row_lags<B>(b: &B)
+    where
+        B: FederationDirectory + SetNodeKey + Sync,
+    {
+        let (room, node, _) = backdated_revocation(b).await;
+        let lag = roster_lag(b, &room, chrono::Utc::now())
             .await
             .unwrap()
             .expect("the backdated revocation lags the head");
-        assert_eq!(lag.uncovered_keys, vec![NODE.to_owned()], "I450b");
+        assert_eq!(lag.uncovered_keys, vec![node], "I450b");
     }
 
     /// **I450c** — (i), which way it goes: a version that leaves the backdated
     /// revocation uncovered DISAGREES with the fold at its own instant and is
     /// refused; the version that drops the node is admitted and clears the lag.
-    pub async fn i450c_a_version_must_cover_a_backdated_row(d: &dyn FederationDirectory) {
-        backdated_revocation(d).await;
-        let e = founders_supersede(
-            d,
-            with_member(canonical_row(&FOUNDERS), NODE, "member"),
-            &[FOUNDERS[0], FOUNDERS[1]],
-        )
-        .await
-        .expect_err("a v3 still listing the revoked node is refused");
+    pub async fn i450c_a_version_must_cover_a_backdated_row<B>(b: &B)
+    where
+        B: FederationDirectory + SetNodeKey + Sync,
+    {
+        let (room, node, _) = backdated_revocation(b).await;
+        let d: &dyn FederationDirectory = b;
+        let held = d.lookup_community(&room).await.unwrap().unwrap();
+        let e = room_version(d, with_member(&held, &node, "member"))
+            .await
+            .expect_err("a v3 still listing the revoked node is refused");
         assert!(
             matches!(&e, Error::LineageVersionDisagreesWithFold { keys, .. }
-                if keys == &[NODE.to_owned()]),
+                if keys == std::slice::from_ref(&node)),
             "I450c: {e:?}"
         );
-        founders_supersede(d, canonical_row(&FOUNDERS), &[FOUNDERS[0], FOUNDERS[1]])
-            .await
-            .expect("v3 drops the node");
+        landed(
+            room_version(d, without(&held, &node)).await,
+            "v3 drops the node",
+        );
         assert!(
-            roster_lag(d, CANON, chrono::Utc::now())
+            roster_lag(d, &room, chrono::Utc::now())
                 .await
                 .unwrap()
                 .is_none(),
@@ -768,13 +894,16 @@ pub(crate) mod backdated {
     /// **I450d** — (ii) the cadence and `since` are timed from THIS node's
     /// admission, never from the row's signer-chosen instant: the lag names
     /// the admission instant, after the backdated one.
-    pub async fn i450d_the_lag_is_timed_from_admission(d: &dyn FederationDirectory) {
-        let backdated = backdated_revocation(d).await;
-        let lag = roster_lag(d, CANON, chrono::Utc::now())
+    pub async fn i450d_the_lag_is_timed_from_admission<B>(b: &B)
+    where
+        B: FederationDirectory + SetNodeKey + Sync,
+    {
+        let (room, _, backdated) = backdated_revocation(b).await;
+        let lag = roster_lag(b, &room, chrono::Utc::now())
             .await
             .unwrap()
             .expect("lags");
-        let v2 = cc::lookup_signed_community(d, CANON)
+        let v2 = cc::lookup_signed_community(b, &room)
             .await
             .unwrap()
             .unwrap();
@@ -843,10 +972,18 @@ mod pure {
         );
         let lw = code_of("src/federation/lineage_witness.rs");
         let b = body(&lw, "pub async fn admit_lineage_head_cosign");
+        // v62.0.0 (wave GC3; rc21 item 15) — the door keeps a lagging head's
+        // cosign uncounted, through the predicate the witnessed-head fold
+        // shares.
         assert!(
-            b.contains("roster_head::roster_lag(")
+            b.contains("head_lags_roster_at(")
                 && b.contains("LineageCosignRefusal::HeadLagsRoster"),
-            "I458: the cosign door refuses a lagging head"
+            "I458: the cosign door keeps a lagging head's cosign uncounted"
+        );
+        let h = body(&lw, "pub async fn head_lags_roster_at");
+        assert!(
+            h.contains("roster_head::roster_lag("),
+            "I458: the shared predicate reads the roster lag"
         );
         // The door RETURNS the count's verdict (its tail expression), so a
         // call whose result is dropped does not pass. While the accord is three
@@ -912,11 +1049,6 @@ mod run {
                     bodies::i456_the_removal_does_not_wait(&b, &suffix()).await
                 }
                 #[tokio::test]
-                async fn i457() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i457_a_standing_majority(&b, &suffix()).await
-                }
-                #[tokio::test]
                 async fn i450b() {
                     let Some(b) = $fresh.await else { return };
                     super::super::backdated::i450b_a_backdated_row_lags(&b).await
@@ -930,11 +1062,6 @@ mod run {
                 async fn i450d() {
                     let Some(b) = $fresh.await else { return };
                     super::super::backdated::i450d_the_lag_is_timed_from_admission(&b).await
-                }
-                #[tokio::test]
-                async fn i459() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i459_an_uncovered_accord_decision_lags(&b, &suffix()).await
                 }
             }
         };

@@ -80,7 +80,7 @@ where
     let detection = sign(
         det,
         "scores",
-        detection_statement_parts(&ev).expect("parts"),
+        detection_statement_parts(&ev, None).expect("parts"),
     );
     for d in [a, b] {
         put_statement(d, &detection, None, INGEST_TIER)

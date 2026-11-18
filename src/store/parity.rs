@@ -418,6 +418,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // consent write is "no key row", which the PLAN words as the refusal.
     ("store_planned_consent_role", Class::Plumbing),
     ("store_planned_trust_grant", Class::Plumbing),
+    // v62.0.0 (wave GC2) — the revocation's storage, now propagated ahead of
+    // the trust graph's re-fold.
+    ("store_trust_revocation", Class::Plumbing),
     ("read_consent_peer_rows", Class::Plumbing),
     ("read_live_consent_grant_candidates", Class::Plumbing),
     ("read_consent_revocation_candidates", Class::Plumbing),
@@ -429,7 +432,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("insert_held", Class::Plumbing),
     ("raced", Class::Plumbing),
     ("revocations_for_subject", Class::Plumbing),
-    ("check_revocation_bound_lowers", Class::Gate),
     ("revocation_row", Class::Plumbing),
     ("apply_key_plane_row", Class::Delegates),
     // v61 (CIRISPersist#991) — the group-plane door: the canonical-row check,
@@ -771,6 +773,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v59.0.0 (CIRISPersist#1106) — refuses a seated serve node's unilateral
     // transit-pair rotation before a quorum re-bind.
     ("check_serve_rotation", Class::Gate),
+    // v62.0.0 (wave GC4; CC rc21 item 12) — the same rule on THIS node's own
+    // seat rotation: the emitter's plain refusal.
+    ("refuse_own_serve_rotation", Class::Gate),
     // Refuses a re-bind row without the holder quorum.
     ("check_rebind_admission", Class::Gate),
     // After an admitted re-bind: applies the carried row through the
@@ -911,7 +916,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // self-report attester, asked beside the reserved-prefix gate with its
     // door: a refusal at the local door, reported at a peer's.
     ("check_substrate_self_report_attester_at", Class::Gate),
-    ("check_revocation_anti_rollback", Class::Gate),
     ("check_revocation_authority", Class::Gate),
     ("check_revocation_bound", Class::Gate),
     ("check_revocation_envelope_binding", Class::Gate),
@@ -1454,6 +1458,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // pointer read and the act-ref reload (storage), the at-open re-index.
     ("admit_row", Class::Gate),
     ("check_withdraws_target", Class::Gate),
+    // v62.0.0 (wave GC2) — the attestation door's same-file helper over the
+    // cosign target gate (it declares the target as a fold read first).
+    ("check_cosign_withdraws_target", Class::Delegates),
     ("check_community_record_window", Class::Gate),
     ("hold_if_short", Class::Gate),
     ("read_group_object", Class::Plumbing),

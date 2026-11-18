@@ -775,26 +775,41 @@ where
         .iter()
         .any(|t| t == crate::federation::types::identity_type::AGENT)
     {
+        // v62.0.0 (wave GC7; CC 2.7.3) — the agent's owner is read from
+        // ANOTHER row (its live owner binding): an absent or different owner
+        // HOLDS the statement (kept, concluding nothing) and re-folds when a
+        // binding about the agent lands or is withdrawn; never a refusal.
         let Some(owner) =
             crate::federation::admission::agent_owner_of(dir, &identity, row.asserted_at_ms)
                 .await?
         else {
-            return Err(refuse(
-                malformed_row::AGENT_OCCURRENCE_UNOWNED,
-                format!(
-                    "{OCCURRENCE_FAMILY}: the agent {identity} has no live owner binding \
-                     (`ownership:{{relation}}:agent:{{version}}`) at {}: its occurrence is \
-                     authored by its owner (CC 3.3.6)",
-                    row.asserted_at_ms
+            super::fold::reads(super::fold::Dep::key(identity.as_str()));
+            super::fold::reads(super::fold::Dep::key(author.as_str()));
+            return Err(super::fold::hold(
+                super::fold::reason::AGENT_OCCURRENCE_UNOWNED,
+                refuse(
+                    malformed_row::AGENT_OCCURRENCE_UNOWNED,
+                    format!(
+                        "{OCCURRENCE_FAMILY}: the agent {identity} has no live owner binding \
+                         (`ownership:{{relation}}:agent:{{version}}`) at {}: its occurrence is \
+                         authored by its owner (CC 3.3.6)",
+                        row.asserted_at_ms
+                    ),
                 ),
             ));
         };
         if author != owner {
-            return Err(refuse(
-                malformed_row::AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
-                format!(
-                    "{OCCURRENCE_FAMILY}: the agent {identity}'s occurrence is authored by \
-                     {author}, not by its owner {owner} (CC 3.3.6)"
+            super::fold::reads(super::fold::Dep::key(identity.as_str()));
+            super::fold::reads(super::fold::Dep::key(author.as_str()));
+            super::fold::reads(super::fold::Dep::key(owner.as_str()));
+            return Err(super::fold::hold(
+                super::fold::reason::AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
+                refuse(
+                    malformed_row::AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
+                    format!(
+                        "{OCCURRENCE_FAMILY}: the agent {identity}'s occurrence is authored by \
+                         {author}, not by its owner {owner} (CC 3.3.6)"
+                    ),
                 ),
             ));
         }
@@ -829,8 +844,24 @@ where
     let author_key = identity_ref(&row.kid);
     // The author's key is a live roster key of the author's identity (the
     // identity's, or the agent's owner's): the JSON door's rule.
-    crate::federation::admission::check_signer_acts_for(dir, &author_key, &bind_author, PLANE)
-        .await?;
+    // v62.0.0 (wave GC7; CC 2.7.3) — whether the author's key acts for the
+    // bind author reads the author's roster (other rows): a key not (yet) on
+    // it HOLDS the statement, re-folded when the roster changes. Any other
+    // error is returned as it was.
+    match crate::federation::admission::check_signer_acts_for(dir, &author_key, &bind_author, PLANE)
+        .await
+    {
+        Ok(()) => {}
+        Err(e @ Error::SignerDoesNotActFor { .. }) => {
+            super::fold::reads(super::fold::Dep::key(author_key.as_str()));
+            super::fold::reads(super::fold::Dep::key(bind_author.as_str()));
+            return Err(super::fold::hold(
+                super::fold::reason::SIGNER_NOT_ACTING_FOR,
+                e,
+            ));
+        }
+        Err(e) => return Err(e),
+    }
     crate::federation::operational::check_skew_bound(
         occurrence.asserted_at,
         crate::host::clock::now(),
@@ -849,7 +880,9 @@ where
         ));
     };
     if !crate::federation::self_roster::gate_edition2(dir, carried).await? {
-        return Ok(StatementOutcome::Voice {
+        // Held, concluding nothing yet (T1's `Pending`): short of its count,
+        // or waiting on a roster row it names. The fold re-plans it.
+        return Ok(StatementOutcome::Pending {
             row_id: row.row_id,
             new,
         });
@@ -1217,13 +1250,19 @@ where
     else {
         return Ok(None);
     };
-    // CC 3.3.6.4 (the CC 2.7 ruling): the roster row it names, required.
-    let Some(head) = names_of(&payload)
-        .ok()
-        .and_then(|n| super::names::single(&n, "head"))
-    else {
+    // CC 3.3.6.4 (the CC 2.7 ruling): the roster row it names, required;
+    // and the other tips it merges (CC rc21), in the order named.
+    let Ok(names) = names_of(&payload) else {
         return Ok(None);
     };
+    let Some(head) = super::names::single(&names, "head") else {
+        return Ok(None);
+    };
+    let further_heads: Vec<RowId> = names
+        .iter()
+        .filter(|n| n.role == "further_heads")
+        .map(|n| n.row)
+        .collect();
     Ok(Some(if family == OCCURRENCE_REVOCATION_FAMILY {
         Carried::Edition2Eviction {
             row_id,
@@ -1232,6 +1271,7 @@ where
             proposer,
             asserted_at,
             head,
+            further_heads,
         }
     } else {
         Carried::Edition2Occurrence {
@@ -1241,6 +1281,7 @@ where
             proposer,
             asserted_at,
             head,
+            further_heads,
         }
     }))
 }
@@ -1355,12 +1396,11 @@ where
     let iss = voice_iss(&payload).ok_or_else(unheld)?;
     let landing = lowest_voice_as(&voices, &iss).ok_or_else(unheld)?.clone();
     let keys = super::ingest::held_keys_for(dir, &landing).await?;
-    let admitted = super::door::admit_row(
-        &landing,
-        &keys,
-        Some(&row_id.0),
-        ciris_verify_core::edition2::family::SelectContext::default(),
-    )?;
+    // T2-fix1: Verify's cell for a user self's `identity:occurrence_revocation`
+    // reads `identity` (counted), so the landing statement is admitted under
+    // the family's context, as the door admits it.
+    let ctx = super::typed::family_context(dir, &landing).await?;
+    let admitted = super::door::admit_row(&landing, &keys, Some(&row_id.0), ctx)?;
     let mut statements = vec![landing.clone()];
     statements.extend(voices.into_iter().filter(|v| *v != landing));
     Ok((admitted, statements))
@@ -1449,40 +1489,71 @@ where
     })
 }
 
-/// v62.0.0 (wave O1; CC 3.3.6.4, the CC 2.7 ruling) — **the head a new
-/// roster row of `identity` names** (`refs.head`), as this node holds it:
-/// the self's latest LANDED roster row (an `identity:occurrence` bind or
+/// v62.0.0 (wave O1; CC 3.3.6.4, the CC 2.7 ruling, CC rc21) — **the heads
+/// a new roster row of `identity` names**, as this node holds them: the
+/// TIPS of the self's landed roster rows (an `identity:occurrence` bind or
 /// `identity:occurrence_revocation` of it, by this node's settled `lands_*`
-/// receipts, latest settled), else the genesis key's own `key:record` row
-/// (the lowest row id among the held records of that key). `None` when
-/// neither is held. For producers (Server) and the fixtures.
+/// receipts) that no other landed roster row names. The first is the
+/// latest settled (`refs.head`), the rest the other tips
+/// (`refs.further_heads`, a merge). With no landed roster row, the genesis
+/// key's own `key:record` row (the lowest row id among the held records of
+/// that key) and no further heads. `None` when neither is held. For
+/// producers (Server) and the fixtures.
 ///
 /// # Errors
 /// Directory read failures.
-pub async fn current_roster_head<F>(dir: &F, identity: &str) -> Result<Option<RowId>, Error>
+pub async fn current_roster_heads<F>(
+    dir: &F,
+    identity: &str,
+) -> Result<Option<(RowId, Vec<RowId>)>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let landed = |o: &Option<String>| {
-        o.as_deref()
-            .is_some_and(|o| o == "lands_quorum" || o == "lands_lone")
-    };
     let settled = match dir.list_settled_edition2_roster_proposals(identity).await {
         Ok(r) => r,
         Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
     };
-    for r in settled.iter().rev().filter(|r| landed(&r.outcome)) {
-        let Some(id) = hex::decode(&r.proposal_id)
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-            .map(RowId)
-        else {
-            continue;
-        };
-        if held_bind(dir, &id).await?.is_some() {
-            return Ok(Some(id));
+    let mut landed: Vec<(RowId, Vec<RowId>)> = Vec::new();
+    for r in settled.iter().filter(|r| {
+        r.outcome
+            .as_deref()
+            .is_some_and(|o| o == "lands_quorum" || o == "lands_lone")
+    }) {
+        if let Some(c) = carried_of_bind(dir, &r.proposal_id).await? {
+            use crate::federation::self_roster::Carried;
+            if let Carried::Edition2Occurrence {
+                row_id,
+                head,
+                further_heads,
+                ..
+            }
+            | Carried::Edition2Eviction {
+                row_id,
+                head,
+                further_heads,
+                ..
+            } = c
+            {
+                let mut named = vec![head];
+                named.extend(further_heads);
+                landed.push((row_id, named));
+            }
         }
+    }
+    let named: BTreeSet<RowId> = landed.iter().flat_map(|(_, n)| n.iter().copied()).collect();
+    // Tips, latest settled first.
+    let mut tips: Vec<RowId> = landed
+        .iter()
+        .rev()
+        .map(|(r, _)| *r)
+        .filter(|r| !named.contains(r))
+        .collect();
+    tips.dedup();
+    if let Some((first, rest)) = tips.split_first() {
+        let mut rest = rest.to_vec();
+        rest.sort();
+        return Ok(Some((*first, rest)));
     }
     let genesis = kid_of_identity_ref(identity);
     Ok(dir
@@ -1494,7 +1565,19 @@ where
         .iter()
         .filter(|st| genesis.is_some() && super::liveness::recorded_kid(st) == genesis)
         .filter_map(|st| RowId::of_statement(st))
-        .min())
+        .min()
+        .map(|g| (g, Vec::new())))
+}
+
+/// The first of [`current_roster_heads`] (`refs.head`).
+///
+/// # Errors
+/// Directory read failures.
+pub async fn current_roster_head<F>(dir: &F, identity: &str) -> Result<Option<RowId>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(current_roster_heads(dir, identity).await?.map(|(h, _)| h))
 }
 
 //  v62.0.0 (v62 P8) — the producer: a signer's voice over a bind
@@ -1525,7 +1608,7 @@ pub struct BindTerms {
     pub transport: Option<BindTransport>,
     /// `refs.head`, REQUIRED by CC rc21: the identity's current self-roster
     /// head (the first bind names the genesis key's `key:record` row).
-    /// Producers fill it with [`self_roster_head`].
+    /// Producers fill it with O1's [`current_roster_heads`].
     pub head: Option<RowId>,
     /// `refs.further_heads`, optional (a bind over a forked roster).
     pub further_heads: Vec<RowId>,
@@ -1636,57 +1719,6 @@ pub fn bind_payload(t: &BindTerms) -> Result<Value, Error> {
     }
     m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
     Ok(Value::Map(m))
-}
-
-/// v62.0.0 (v62 P8; CC rc21, `refs.head` of an occurrence bind) — **the
-/// identity's current self-roster head**, PROVISIONAL until O1's
-/// `self_roster::current_head` lands (then this delegates to it): the row
-/// id of the newest edition-2 bind held under `identity` (its signed
-/// listing's `edition2_row_id`), else the identity's genesis `key:record`
-/// row (its earliest held record by `asserted_at`). `None` when this node
-/// holds neither.
-///
-/// # Errors
-/// Directory reads.
-pub async fn self_roster_head<F>(dir: &F, identity: &str) -> Result<Option<RowId>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let newest_bind = dir
-        .list_signed_identity_occurrences_for(identity)
-        .await?
-        .into_iter()
-        .filter_map(|o| {
-            let hexed = o
-                .signed_envelope
-                .get("edition2_row_id")?
-                .as_str()?
-                .to_owned();
-            let id = <[u8; 32]>::try_from(hex::decode(hexed).ok()?.as_slice()).ok()?;
-            Some((o.identity_occurrence.asserted_at, RowId(id)))
-        })
-        .max_by_key(|(at, _)| *at)
-        .map(|(_, id)| id);
-    if newest_bind.is_some() {
-        return Ok(newest_bind);
-    }
-    let genesis = dir
-        .edition2_statements_about(
-            ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY,
-            identity,
-        )
-        .await?
-        .into_iter()
-        .filter_map(|st| {
-            let at = statement_parts(&st)?
-                .1
-                .get_text("asserted_at")
-                .and_then(Value::as_u64)?;
-            Some((at, RowId::of_statement(&st)?))
-        })
-        .min_by_key(|(at, _)| *at)
-        .map(|(_, id)| id);
-    Ok(genesis)
 }
 
 /// v62.0.0 (v62 P8) — **one voice of a bind, drafted for an external

@@ -189,6 +189,16 @@ pub(crate) trait AttestationStore:
     /// Snapshot the per-instance admission state.
     fn admission_cx(&self) -> AdmissionCx<'_>;
 
+    /// v62.0.0 (wave P7) — what this node can read of the trace blob
+    /// `sha256`: not held, open (its stored bytes and the trace JSON; a
+    /// sealed blob opened as this node), or held but sealed with no grant
+    /// here. What a `trace:complete:v1` row's projection reads
+    /// (`ingest::project_trace_row_from_held_blob`).
+    async fn open_trace_blob(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<crate::ingest::TraceBlobOpen, Error>;
+
     /// The attesting key's `identity_type`, `None` when this node holds no
     /// such key.
     async fn attesting_identity_type(&self, key_id: &str) -> Result<Option<String>, Error>;
@@ -349,6 +359,10 @@ where
         fold_at: row.asserted_at,
         received_at: crate::host::clock::now(),
     };
+    // v62.0.0 (wave GC2) — the door's one fold gate that runs AHEAD of the
+    // plan (a `withdraws`'s cosignature target) is asked again too, so a
+    // concluded withdrawal re-folds when its target lands.
+    check_cosign_withdraws_target(dir, row).await?;
     RECHECK
         .scope(
             (),
@@ -424,15 +438,9 @@ where
     }
     // v61.3.0 (CIRISPersist#1252) — a cosignature already sent is
     // irrevocable: a `withdraws` naming a `cosign:signature:v1` row is refused.
-    if attestation.attestation.attestation_type == super::types::attestation_type::WITHDRAWS {
-        if let Some(target_id) = super::precedence::references_attestation_id_from_envelope(
-            &attestation.attestation.attestation_envelope,
-        ) {
-            if let Some(target) = dir.get_attestation(target_id).await? {
-                super::cosign::check_withdraws_target(&target)?;
-            }
-        }
-    }
+    // v62.0.0 (wave GC2; CC 2.7.3) — the target is ANOTHER row: held, not
+    // refused, and re-folded when the target lands ([`check_cosign_withdraws_target`]).
+    check_cosign_withdraws_target(dir, &attestation.attestation).await?;
     let cosign_row = (super::cosign::is_cosign_row(&attestation.attestation)
         || attestation.attestation.attestation_type == super::types::attestation_type::WITHDRAWS)
         .then(|| attestation.attestation.clone());
@@ -492,7 +500,23 @@ where
                 if let (Some(offered), Some(revocation)) =
                     (&offered_withdrawal, &occurrence_withdrawal)
                 {
-                    super::self_roster::gate_withdrawal(dir, offered, revocation).await?;
+                    // v62.0.0 (wave GC2; CC 2.7.3) — whether the eviction lands
+                    // reads the self's roster and its proposal's answers (OTHER
+                    // rows): one that has not landed is HELD (reason
+                    // `self_roster_not_landed`, a core token) and re-folds when the
+                    // self's roster or an answer changes (`key:<identity>`).
+                    super::edition2::fold::reads(super::edition2::fold::Dep::key(
+                        &revocation.identity_key_id,
+                    ));
+                    super::self_roster::gate_withdrawal(dir, offered, revocation)
+                        .await
+                        .map_err(|e| match e {
+                            e @ Error::SelfRosterNotLanded { .. } => super::edition2::fold::hold(
+                                super::edition2::fold::reason::SELF_ROSTER_NOT_LANDED,
+                                e,
+                            ),
+                            other => other,
+                        })?;
                 }
                 execute_planned(dir, *planned).await?
             }
@@ -545,6 +569,66 @@ where
         }
     }
     outcome
+}
+
+/// v62.0.0 (wave GC2; CC 2.7.3) — **a `withdraws` naming a cosignature**:
+/// a cosignature already sent is irrevocable (CIRISPersist#1252), but the
+/// target is ANOTHER row, so this is a fold condition, never a refusal. The
+/// target is a declared read whether or not it is held (`row:<target>`), so a
+/// withdrawal admitted before its target lands is re-folded, and
+/// un-concluded, when the target turns out to be a cosignature; one that
+/// names a held cosignature is HELD with reason
+/// `cosign_signature_irrevocable`. A no-op for every other row.
+///
+/// # Errors
+/// The held refusal ([`super::cosign::check_withdraws_target`]); reads.
+async fn check_cosign_withdraws_target<D>(dir: &D, row: &Attestation) -> Result<(), Error>
+where
+    D: AttestationStore,
+{
+    if row.attestation_type != super::types::attestation_type::WITHDRAWS {
+        return Ok(());
+    }
+    let Some(target_id) =
+        super::precedence::references_attestation_id_from_envelope(&row.attestation_envelope)
+    else {
+        return Ok(());
+    };
+    if let Some(id) = row_id_of_hex(target_id) {
+        super::edition2::fold::reads(super::edition2::fold::Dep::Row(id));
+    }
+    if let Some(target) = dir.get_attestation(target_id).await? {
+        super::cosign::check_withdraws_target(&target).map_err(|e| {
+            super::edition2::fold::hold(
+                super::edition2::fold::reason::COSIGN_SIGNATURE_IRREVOCABLE,
+                e,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// An edition-2 row id from its hex spelling (`None` for an earlier-form id).
+fn row_id_of_hex(id: &str) -> Option<super::edition2::names::RowId> {
+    let b = hex::decode(id).ok()?;
+    <[u8; 32]>::try_from(b.as_slice())
+        .ok()
+        .map(super::edition2::names::RowId)
+}
+
+/// v62.0.0 (wave GC2) — the read key every change to this node's trust
+/// graph touches: the v1.3 trust plane's grant and revoke doors
+/// ([`super::consent_admit`]).
+pub(crate) const TRUST_GRAPH_KEY: &str = "trust:graph";
+
+/// v62.0.0 (wave GC2) — what the trust-threshold gate reads for `signer`:
+/// grants naming it (`key:<signer>`: a v1.3 grant door touches it, and an
+/// edition-2 trust edge about the signer touches it as its `sub`) and the
+/// whole graph its score walks ([`TRUST_GRAPH_KEY`], touched by the v1.3
+/// grant and revoke doors). (G0 v4: no `family:` read keys.)
+pub(crate) fn trust_graph_deps(signer: &str) -> [super::edition2::fold::Dep; 2] {
+    use super::edition2::fold::Dep;
+    [Dep::key(signer), Dep::key(TRUST_GRAPH_KEY)]
 }
 
 /// Store a planned row; an occupied id is decided by the #771 verdict.
@@ -729,8 +813,24 @@ where
         // the least; an unauthorized writer shouldn't learn about FK /
         // envelope-schema state past it. Free at the default threshold
         // 0 (short-circuits without dispatching to the resolver).
+        // v62.0.0 (wave GC2; CC 2.7.1, 2.7.3) — who this node trusts is a
+        // fold over its trust grants (OTHER rows): a signer below the
+        // threshold is HELD (reason `federation_trust_below_threshold`), and
+        // re-folds when a grant to it, or anywhere on the trust graph, lands
+        // or is revoked ([`trust_graph_deps`]).
         if let Some(gate) = &cx.admission_gate {
-            gate.check_federation(&row.attesting_key_id).await?;
+            for dep in trust_graph_deps(&row.attesting_key_id) {
+                super::edition2::fold::reads(dep);
+            }
+            gate.check_federation(&row.attesting_key_id)
+                .await
+                .map_err(|e| match e {
+                    e @ Error::TrustBelowThreshold { .. } => super::edition2::fold::hold(
+                        super::edition2::fold::reason::TRUST_BELOW_THRESHOLD,
+                        e,
+                    ),
+                    other => other,
+                })?;
         }
     }
 
@@ -1409,7 +1509,15 @@ where
     // v21.0.0 (#501) — the inbound trace projection, decomposed while the
     // row is still owned.
     let projected_trace =
-        crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
+        match crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope) {
+            Some(d) => Some(d),
+            // v62.0.0 (wave P7) — a `trace:complete:v1` ROW (the manifest form,
+            // the only form) projects from its blob when this node holds it:
+            // the content binding is checked here, before the write, and a
+            // blob that does not bind refuses the row by name. A blob not held
+            // yet projects on its arrival (`ingest::project_trace_rows_for_blob`).
+            None => crate::ingest::project_trace_row_from_held_blob(dir, &row).await?,
+        };
     // v57.0.0 (CIRISPersist#988 item 3) — the detection projection, read from
     // the row by the one function the rebuild calls too.
     let projected_detection = crate::derived::detection_row::project_detection_row(&row);
@@ -2386,3 +2494,10 @@ where
     }
     Ok(())
 }
+
+/// v62.0.0 (wave GC2; CC 2.7.3) — I3710–I3713: the attestation door's fold
+/// conversions (held, concluded on arrival, un-concluded on withdrawal, the
+/// same in either arrival order).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+#[path = "attestation_fold_invariants.rs"]
+mod attestation_fold_invariants;

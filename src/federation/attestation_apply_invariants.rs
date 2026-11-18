@@ -12,26 +12,39 @@
 //!   what it did, and a composer is read back (v61, CIRISPersist#1157: a
 //!   distinct same-triple composer is stored, never `Deduplicated`). Each `&&` of the predicate and of the
 //!   read-back guard turned into `||` reads a row it must not.
-//! - **I1341** — the write's error arm: a duplicate id the plan could not
-//!   see is the typed `StoreConflict` refusal, and any other write error
-//!   (an unregistered author) propagates as an error, never that refusal.
+//! - **I1341** — the write's error arm: a write error (an unregistered
+//!   author) propagates as an error, never the `StoreConflict` refusal.
+//!   v62.0.0: the duplicate-id leg (a rival mint under a peer-chosen id) is
+//!   deleted: an edition-2 row id is computed from the row, so a rival mint
+//!   is a different id, and a re-offer of the same row is the same bytes.
+//!
+//! v62.0.0 (slice E6) — every row is an edition-2 row (`fixture_switch`):
+//! `row_of` signs the earlier-shaped fixture, the author's key is its
+//! `key:record` (`put_key`), ids are node-computed, and a composer names its
+//! target by `refs.target` (`composer_of`).
 
-use crate::federation::attestation_apply::{
-    AttestationRefusalReason, ReplicatedAttestationOutcome,
-};
+use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
 use crate::federation::directory_double::FaultInjectingDirectory;
+use crate::federation::edition2::fixture_switch as e2;
 use crate::federation::types::{attestation_tier, attestation_type};
 use crate::federation::{read_probe, Attestation, FederationDirectory, SignedAttestation};
 use std::sync::Arc;
 
-/// A sealed federation-tier row of `attestation_type` by `author`, carrying
-/// `extra` in its envelope.
+/// A signed federation-tier row of `attestation_type` by the key of seed
+/// `author`, carrying `extra` in its envelope: the earlier-shaped fixture,
+/// signed as an edition-2 statement (`row_of`), so its id is computed. The
+/// dimension is a registered family (`capacity:{factor}`).
 fn sealed(id: &str, author: &str, ty: &str, extra: serde_json::Value) -> Attestation {
+    // v62.0.0 — an edition-2 row id is computed from the row, so two
+    // fixtures of one author and envelope are one row unless they differ:
+    // each call takes its own millisecond.
+    static TICK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
         .expect("fixture instant")
-        .with_timezone(&chrono::Utc);
+        .with_timezone(&chrono::Utc)
+        + chrono::Duration::milliseconds(TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let mut envelope = serde_json::json!({
-        "dimension": "identity_binding:v1",
+        "dimension": "capacity:integrity",
         "score": 1.0,
         "confidence": 0.9,
     });
@@ -40,7 +53,7 @@ fn sealed(id: &str, author: &str, ty: &str, extra: serde_json::Value) -> Attesta
             obj.insert(k.clone(), v.clone());
         }
     }
-    let mut row = Attestation {
+    let row = Attestation {
         attestation_id: id.to_owned(),
         attesting_key_id: author.to_owned(),
         attested_key_id: author.to_owned(),
@@ -63,8 +76,7 @@ fn sealed(id: &str, author: &str, ty: &str, extra: serde_json::Value) -> Attesta
         promoted_at: None,
         additional_scrubs: Vec::new(),
     };
-    crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut row);
-    row
+    e2::row_of(&row, author)
 }
 
 fn fresh_id() -> String {
@@ -75,15 +87,10 @@ fn scores(author: &str, extra: serde_json::Value) -> Attestation {
     sealed(&fresh_id(), author, attestation_type::SCORES, extra)
 }
 
-fn withdraws(id: &str, author: &str, target: &str) -> Attestation {
-    sealed(
-        id,
-        author,
-        attestation_type::WITHDRAWS,
-        serde_json::json!({
-            crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID: target,
-        }),
-    )
+/// A `withdraws` by `author` naming `target` (`refs.target`, the target's
+/// family).
+fn withdraws(author: &str, target: &Attestation) -> Attestation {
+    e2::composer_of(attestation_type::WITHDRAWS, target, author)
 }
 
 /// Apply `row` through `dir`; the outcome and how many times the apply read
@@ -121,7 +128,14 @@ async fn write_door_reads(dir: &dyn FederationDirectory, row: Attestation) -> us
 
 async fn i1340(dir: Arc<dyn FederationDirectory>, tag: &str) {
     let author = format!("i1340-author-{tag}");
-    crate::federation::tier_ingest::test_support::register_hybrid_key(&*dir, &author).await;
+    let _ = e2::put_key(
+        &*dir,
+        &author,
+        // v62.0.0 — a `user` key: its record covers every instant, and the
+        // fixtures are dated 2026-01-01 (E0 fixed-instant rule).
+        &[crate::federation::types::identity_type::USER],
+    )
+    .await;
     // The plan's one read on top of the write door's own.
     let planned = 1 + write_door_reads(&*dir, scores(&author, serde_json::json!({}))).await;
 
@@ -142,7 +156,7 @@ async fn i1340(dir: Arc<dyn FederationDirectory>, tag: &str) {
     let target = scores(&author, serde_json::json!({}));
     let target_id = target.attestation_id.clone();
     dir.apply_replicated_attestation(SignedAttestation {
-        attestation: target,
+        attestation: target.clone(),
     })
     .await
     .expect("target");
@@ -167,7 +181,7 @@ async fn i1340(dir: Arc<dyn FederationDirectory>, tag: &str) {
     // path's). v61 (CIRISPersist#1157, CC rc14 3.1.9.4): a DISTINCT row of
     // the same `(type, attester, reference)` triple is no replay — it is
     // stored and ranked read-time — so the read-back confirms an insert.
-    let (outcome, reads) = apply_counting(&*dir, withdraws(&fresh_id(), &author, &target_id)).await;
+    let (outcome, reads) = apply_counting(&*dir, withdraws(&author, &target)).await;
     assert_eq!(
         outcome,
         ReplicatedAttestationOutcome::Inserted,
@@ -178,8 +192,23 @@ async fn i1340(dir: Arc<dyn FederationDirectory>, tag: &str) {
         planned + 1,
         "{tag} I1340 a composer carrying a references target is read back"
     );
-    let second_id = fresh_id();
-    let (outcome, _) = apply_counting(&*dir, withdraws(&second_id, &author, &target_id)).await;
+    // A distinct composer of the same triple: another instant, so another
+    // row (and id).
+    let mut second = withdraws(&author, &target);
+    second.asserted_at += chrono::Duration::seconds(1);
+    if let Some(o) = second.attestation_envelope.as_object_mut() {
+        if o.contains_key("asserted_at") {
+            o.insert(
+                "asserted_at".to_owned(),
+                serde_json::json!(second
+                    .asserted_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            );
+        }
+    }
+    let second = e2::row_of(&second, &author);
+    let second_id = second.attestation_id.clone();
+    let (outcome, _) = apply_counting(&*dir, second).await;
     assert_eq!(
         outcome,
         ReplicatedAttestationOutcome::Inserted,
@@ -209,47 +238,10 @@ async fn i1340(dir: Arc<dyn FederationDirectory>, tag: &str) {
 }
 
 async fn i1341(dir: Arc<dyn FederationDirectory>, tag: &str) {
-    let author = format!("i1341-author-{tag}");
-    crate::federation::tier_ingest::test_support::register_hybrid_key(&*dir, &author).await;
-
-    // A duplicate id the plan could not see: the typed store conflict.
-    let id = fresh_id();
-    let first = sealed(
-        &id,
-        &author,
-        attestation_type::SCORES,
-        serde_json::json!({}),
-    );
-    dir.apply_replicated_attestation(SignedAttestation { attestation: first })
-        .await
-        .expect("first");
-    let rival = sealed(
-        &id,
-        &author,
-        attestation_type::SCORES,
-        serde_json::json!({"note": "i1341 rival mint"}),
-    );
-    let planless = FaultInjectingDirectory::new(dir.clone()).unsupported("get_attestation");
-    assert_eq!(
-        planless
-            .apply_replicated_attestation(SignedAttestation { attestation: rival })
-            .await
-            .expect("I1341 a store conflict is an outcome"),
-        ReplicatedAttestationOutcome::Refused {
-            reason: AttestationRefusalReason::StoreConflict
-        },
-        "{tag} I1341 duplicate id"
-    );
-
-    // Any other write error is an error, not that refusal: a row by an
-    // author this node holds no key for.
+    // A write error the door refuses is an error, not the store-conflict
+    // refusal: a row by an author this node holds no key for.
     let stranger = format!("i1341-unregistered-{tag}");
-    let unknown = sealed(
-        &fresh_id(),
-        &stranger,
-        attestation_type::SCORES,
-        serde_json::json!({}),
-    );
+    let unknown = scores(&stranger, serde_json::json!({}));
     let e = dir
         .apply_replicated_attestation(SignedAttestation {
             attestation: unknown,
@@ -276,7 +268,7 @@ mod sqlite {
     }
 
     #[tokio::test]
-    async fn i1341_only_a_duplicate_key_is_a_store_conflict() {
+    async fn i1341_a_refused_write_is_no_store_conflict() {
         i1341(dir(), "sqlite").await;
     }
 }
@@ -302,7 +294,7 @@ mod postgres {
     }
 
     #[tokio::test]
-    async fn i1341_only_a_duplicate_key_is_a_store_conflict() {
+    async fn i1341_a_refused_write_is_no_store_conflict() {
         let Some(d) = dir().await else { return };
         i1341(d, "postgres").await;
     }

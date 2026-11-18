@@ -16,6 +16,11 @@
 //!   deduplicated) and a response's `references_attestation_id` under
 //!   `refs.answers`, even though every producer's `drop` list names
 //!   `references_attestation_id`; the payloads pass the door's lists.
+//! - **I4000** (lead's ruling): the encoder states a free-form body's JSON
+//!   numbers by `body_number` (a float becomes a tag-4 decimal, an integral
+//!   number a plain integer); a float outside a body (and outside the
+//!   fixed-scale members) is still refused; a `hard_case` body likewise;
+//!   emit → door → mapping reads the body's numbers back exactly.
 //! - Round trip, store-backed (sqlite and postgres): a
 //!   `deferral:response:approved` emitted from its envelope, put through
 //!   `put_statement` and read back from the store, carries the same hex for
@@ -251,5 +256,82 @@ fn i3994_the_emit_side_states_row_names_under_refs() {
     assert!(
         payload_from_envelope(&bad, &dr, 7, None, &[]).is_err(),
         "I3994 refused"
+    );
+}
+
+/// I4000: bodies take decimals; everything else still refuses floats.
+#[test]
+fn i4000_a_body_states_its_numbers_exactly() {
+    let fam = "evidence:.suite:.kind:.cell:.prefix";
+    let n = |t: &str| -> serde_json::Value { serde_json::from_str(t).unwrap() };
+    let env = serde_json::json!({
+        "body": { "ratio": n("0.5"), "whole": n("2.0"), "big": n("1e2"), "list": [n("1.25")] },
+        "score": n("0.75"),
+    });
+    let p = payload_from_envelope(&env, fam, 7, None, &[]).unwrap();
+    let body = p.get_text("body").unwrap();
+    let tag = |e: u64, m: u64| {
+        Value::Tag(
+            4,
+            Box::new(Value::Array(vec![Value::Nint(e), Value::Uint(m)])),
+        )
+    };
+    // -1 is Nint(0), -2 is Nint(1).
+    assert_eq!(body.get_text("ratio"), Some(&tag(0, 5)), "I4000 0.5");
+    assert_eq!(body.get_text("whole"), Some(&Value::Uint(2)), "I4000 2.0");
+    assert_eq!(body.get_text("big"), Some(&Value::Uint(100)), "I4000 1e2");
+    assert_eq!(
+        body.get_text("list")
+            .and_then(Value::as_array)
+            .map(<[Value]>::to_vec),
+        Some(vec![tag(1, 125)]),
+        "I4000 nested"
+    );
+    assert_eq!(
+        p.get_text("score"),
+        Some(&Value::Uint(750_000)),
+        "I4000 fixed6 stays"
+    );
+    // Outside a body a float is still refused.
+    let bad = serde_json::json!({ "ratio": n("0.5") });
+    assert!(
+        payload_from_envelope(&bad, fam, 7, None, &[]).is_err(),
+        "I4000 refused"
+    );
+    // A hard_case body is a body.
+    let hc = family_id("hard_case:{kind}");
+    let env = serde_json::json!({ "hard_case": { "confidence_band": n("0.25") } });
+    let p = payload_from_envelope(&env, &hc, 7, None, &[]).unwrap();
+    assert_eq!(
+        p.get_text("hard_case")
+            .and_then(|b| b.get_text("confidence_band")),
+        Some(&tag(1, 25)),
+        "I4000 hard_case body"
+    );
+    // An unrepresentable body number is refused, never rounded.
+    let huge = serde_json::json!({ "body": { "x": n("0.123456789012345678901") } });
+    assert!(
+        payload_from_envelope(&huge, fam, 7, None, &[]).is_err(),
+        "I4000 unrepresentable"
+    );
+
+    // emit → door → mapping: the body's numbers read back exactly.
+    let k = key(223);
+    let mut keys = HeldKeys::new();
+    keys.insert_record(key_record(&k, &["user"], 0, None));
+    let env = serde_json::json!({
+        "dimension": "evidence:safety_battery:capture:a:b:v1",
+        "score": n("0.75"),
+        "body": { "ratio": n("1.25") },
+    });
+    let payload = payload_from_envelope(&env, fam, 5_000, Some(iref(&k).as_str()), &[]).unwrap();
+    let st = sign_row_statement(&k, &iref(&k), &iref(&k), "scores", fam, &payload, vec![]).unwrap();
+    let admitted = admit_row(&st, &keys, None, SelectContext::default())
+        .unwrap_or_else(|e| panic!("I4000 a body with a decimal admits: {e:?}"));
+    let a = attestation_of(&admitted, INGEST_TIER).unwrap();
+    assert_eq!(
+        a.attestation_envelope["body"]["ratio"].to_string(),
+        "1.25",
+        "I4000 round trip"
     );
 }

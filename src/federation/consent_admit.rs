@@ -259,7 +259,9 @@ where
     let row = plan_grant_trust(dir, signed, crate::host::clock::now()).await?;
     let key = row.key.clone();
     if dir.store_planned_trust_grant(row).await? {
-        Ok(())
+        // v62.0.0 (wave GC2; CC 2.7.3) — the trust graph changed: every row
+        // the trust-threshold gate held or concluded re-folds.
+        refold_trust_graph(dir, &key).await
     } else {
         Err(Error::InvalidArgument(format!(
             "federation_keys row {key} does not exist — call put_public_key first"
@@ -293,7 +295,29 @@ where
         }
     }
     dir.store_trust_revocation(&revocation.key, crate::host::clock::now())
+        .await?;
+    // v62.0.0 (wave GC2; CC 2.7.3) — a revoked grant may un-conclude a row
+    // the trust-threshold gate admitted.
+    refold_trust_graph(dir, &revocation.key).await
+}
+
+/// v62.0.0 (wave GC2; CC 2.7.3) — re-fold every row whose trust-threshold
+/// gate read the trust graph (`attestation_admit::trust_graph_deps`), after
+/// a grant on `key` was stored or revoked.
+///
+/// # Errors
+/// Storage failures.
+async fn refold_trust_graph<D>(dir: &D, key: &str) -> Result<(), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut touched = std::collections::BTreeSet::new();
+    for dep in super::attestation_admit::trust_graph_deps(key) {
+        touched.insert(dep.read_key());
+    }
+    super::edition2::fold::refold_touched(dir, touched)
         .await
+        .map(|_| ())
 }
 
 // ── reads ──────────────────────────────────────────────────────────────

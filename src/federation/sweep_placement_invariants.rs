@@ -34,10 +34,21 @@
 /// backend and (e) compares the three.
 #[cfg(test)]
 pub mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{NODE, USER};
     use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
     use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+
+    /// v62.0.0 (JSON cut, E5) — an edition-2 row id is computed, so the
+    /// fixture remembers each row's NAME by its stored id (process-wide: ids
+    /// are unique).
+    fn names() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+        static NAMES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, String>>,
+        > = std::sync::OnceLock::new();
+        NAMES.get_or_init(Default::default)
+    }
 
     /// A self FILE row's envelope (CIRISServer's self-files ladder): the
     /// filename and the blob pointer are the metadata that must not leave the
@@ -107,9 +118,11 @@ pub mod bodies {
                 envelope[k] = v.clone();
             }
         }
-        let (och, ed_sig, pqc_sig) = ts::sign_envelope(signer, &envelope);
-        let at = chrono::Utc::now();
-        let mut r = Attestation {
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .expect("ms");
+        let r = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: signer.to_owned(),
             attested_key_id: signer.to_owned(),
@@ -118,9 +131,9 @@ pub mod bodies {
             asserted_at: at,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: signer.to_owned(),
             scrub_timestamp: at,
             pqc_completed_at: None,
@@ -132,12 +145,24 @@ pub mod bodies {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        ts::reseal(&mut r);
-        r
+        // v62.0.0 (E5) — an edition-2 statement through E0's codec; the
+        // stored id is computed, so the name is remembered by it.
+        let row = e2::row_of(&r, signer);
+        names()
+            .lock()
+            .expect("names")
+            .insert(e2::rid(&row), id.to_owned());
+        row
     }
 
     async fn put(d: &dyn FederationDirectory, a: Attestation) {
         let id = a.attestation_id.clone();
+        if e2::carried_statement(&a).is_some() {
+            e2::put_signed(d, &a)
+                .await
+                .unwrap_or_else(|e| panic!("I186: put {id}: {e}"));
+            return;
+        }
         d.put_attestation(SignedAttestation { attestation: a })
             .await
             .unwrap_or_else(|e| panic!("I186: put {id}: {e}"));
@@ -184,16 +209,27 @@ pub mod bodies {
         let owner = format!("owner-{s}");
         ts::register_identity_key(d, &node, NODE).await;
         ts::register_hybrid_key_as(d, &owner, &owner, USER).await;
-        let (fam, members) = crate::federation::family_roster_invariants::bodies::make_family(
+        // v62.0.0 (E5) — keys named by identity-ref; the family founded by its
+        // member's roster voice (T1, through the switch-aware `found_family`).
+        let (node, owner) = (e2::kid(&node), e2::kid(&owner));
+        let fam_seed = format!("{s}-household");
+        let member_seed = format!("member-{s}");
+        crate::federation::membership_acceptance_invariants::bodies::reg(
             d,
-            s,
-            "household",
-            crate::federation::types::consensus_protocol::UNANIMOUS,
-            &["member"],
-            1,
+            &[&fam_seed, &member_seed],
         )
         .await;
-        let member = &members[0];
+        crate::federation::membership_acceptance_invariants::bodies::found_family(
+            d,
+            &fam_seed,
+            crate::federation::types::consensus_protocol::UNANIMOUS,
+            &[&member_seed],
+            &[],
+        )
+        .await
+        .expect("I186: the family");
+        let (fam, member) = (e2::kid(&fam_seed), e2::kid(&member_seed));
+        let member = &member;
 
         let id = |name: &str| format!("{name}-{s}");
         // (a) a self room: the owner's key names the room, under each alias —
@@ -340,10 +376,14 @@ pub mod bodies {
                 .expect("I186: candidate read");
             let Some(last) = page.last() else { break };
             cursor = Some(last.attestation_id.clone());
-            got.extend(
-                page.iter()
-                    .filter_map(|a| a.attestation_id.strip_suffix(&tail).map(str::to_owned)),
-            );
+            // v62.0.0 (E5) — the stored id names the row through the map.
+            let known = names().lock().expect("names").clone();
+            got.extend(page.iter().filter_map(|a| {
+                known
+                    .get(&a.attestation_id)
+                    .and_then(|n| n.strip_suffix(&tail))
+                    .map(str::to_owned)
+            }));
         }
         got.sort();
         got
@@ -499,10 +539,25 @@ mod run {
         let peer = format!("peer-{s}");
         ts::register_hybrid_key_as(&*dir, &owner, &owner, USER).await;
         ts::register_identity_key(&*dir, &peer, NODE).await;
-        // The node is a member of the owner's family.
-        let fam = format!("fam-{s}");
-        let joined: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
-        dir.put_family(ts::sign_family(
+        // v62.0.0 (JSON cut, E5) — cut B's engine key is the identity-ref of
+        // its composite, `local_signer(alias)`'s = `e2::signing_key(alias)`;
+        // deriving `kid(alias)` here lets the fixture sign as the node (its
+        // roster voice). The other keys are named by identity-ref.
+        use crate::federation::edition2::fixture_switch as e2;
+        assert_eq!(
+            node,
+            e2::kid(&format!("i186n-{s}")),
+            "the engine's key is its alias's"
+        );
+        let (owner, peer) = (e2::kid(&owner), e2::kid(&peer));
+        // The node is a member of the owner's family: both voice the founding
+        // roster (T1; a node/agent-signed row is now-relative).
+        let fam = e2::put_key(&*dir, &format!("fam-{s}"), &[USER]).await;
+        let joined = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            (chrono::Utc::now() - chrono::Duration::days(1)).timestamp_millis(),
+        )
+        .expect("ms");
+        let signed_family = ts::sign_family(
             &owner,
             Family {
                 prev_head_digest: String::new(),
@@ -525,7 +580,16 @@ mod run {
                 dissolved_at: None,
                 persist_row_hash: String::new(),
             },
-        ))
+        );
+        crate::federation::edition2::group_fixtures::put_voices(
+            &*dir,
+            &crate::federation::edition2::group_fixtures::family_voices(
+                &signed_family,
+                1,
+                None,
+                e2::ms(joined),
+            ),
+        )
         .await
         .expect("I186: family");
 

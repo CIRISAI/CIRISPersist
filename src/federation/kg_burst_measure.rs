@@ -5,16 +5,27 @@
 //!
 //! Every test is `#[ignore]`; run with `--ignored --nocapture`. Prints
 //! `KGBURST` lines. Not a witness of anything.
+//!
+//! v62.0.0 (E3b) — edition 2: kids everywhere, each room ONE `group:roster`
+//! version (T1 voices), each row an edition-2 statement (`produce_row` is
+//! the "sign" split, `admit_produced` the "put"), and the minter node
+//! member 0's by the OWNER RELATION (his owner binding + the node's own
+//! self-occurrence, [`own_node`]), never an occurrence of a person
+//! (`occurrence_binds_machine_to_person`). Member 0 is the SAME identity in
+//! both rooms, so the node has one owner. Device seeds lead with their
+//! distinguishing part (a signer seeds from a key id's first 32 bytes).
 
 #[cfg(test)]
 mod measure {
     use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::key_grant::{
         emit_key_grant_axis_with, plan_key_grant_emission, KeyGrantAxis,
     };
-    use crate::federation::key_grant_invariants::two_node::{node, Node};
+    use crate::federation::key_grant_fold_invariants::{found_room, occurrence, own_node};
+    use crate::federation::key_grant_invariants::two_node::{node_as, Node};
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::identity_type::USER;
+    use crate::federation::types::identity_type::{NODE, USER};
     use crate::federation::{BlobStorage, FederationDirectory};
     use std::cell::Cell;
     use std::rc::Rc;
@@ -33,36 +44,23 @@ mod measure {
         v[v.len() / 2]
     }
 
+    /// A device of `ident` (seeds): the occurrence key is registered so
+    /// `lookup_public_key` finds it (else the plan DEFERS the row). Every
+    /// occurrence carries the node's own content-KEM pubkeys: the hybrid
+    /// encapsulation costs the same for any recipient pubkey.
     async fn add_occurrence<B>(n: &Node<'_, B>, ident: &str, occ: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        // The occurrence key is registered so `lookup_public_key` finds it
-        // (else the plan DEFERS the row). Every occurrence carries the node's
-        // own content-KEM pubkeys: the hybrid encapsulation costs the same
-        // for any recipient pubkey.
-        if occ != n.key {
-            ts::register_hybrid_key_as(n.backend, occ, occ, USER).await;
-        }
-        n.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: ident.to_owned(),
-                occurrence_key_id: occ.to_owned(),
-                device_class: crate::federation::types::device_class::LAPTOP.into(),
-                hardware_attestation: None,
-                asserted_at: chrono::Utc::now(),
-                valid_until: None,
-                encryption_pubkeys: Some(n.kem.clone()),
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("occurrence {occ} of {ident}: {e}"));
+        occurrence(n, ident, occ, true).await;
     }
 
-    /// Seed a room: `members` identities x `devices` occurrences, member 0's
-    /// first occurrence is the minter node. `extra_absent` adds roster
-    /// members with no occurrence (the newcomer, seated later).
+    /// Seed a room (seeds; every `members` key already live, registered once
+    /// in [`one_run`]): `members` identities x `devices` devices, where
+    /// member 0's first device is the minter node (his by the owner relation,
+    /// bound once in [`one_run`]; nothing is written for it here).
+    /// `extra_absent` adds roster members with no occurrence (the newcomer,
+    /// seated later).
     async fn seed_room<B>(
         n: &Node<'_, B>,
         comm: &str,
@@ -74,46 +72,22 @@ mod measure {
     {
         ts::register_hybrid_key_as(n.backend, comm, comm, USER).await;
         for (i, ident) in members.iter().enumerate() {
-            ts::register_hybrid_key_as(n.backend, ident, ident, USER).await;
             for d in 0..devices {
-                let occ = if i == 0 && d == 0 {
-                    n.key.clone()
-                } else {
-                    format!("{ident}-dev{d}")
-                };
-                add_occurrence(n, ident, &occ).await;
+                if i == 0 && d == 0 {
+                    continue; // the minter node: owned, not an occurrence
+                }
+                add_occurrence(n, ident, &format!("dev{d}-{ident}")).await;
             }
         }
         for ident in extra_absent {
             ts::register_hybrid_key_as(n.backend, ident, ident, USER).await;
         }
-        let roster = members
+        let roster: Vec<&str> = members
             .iter()
             .chain(extra_absent.iter())
-            .map(|k| crate::federation::types::CommunityMember {
-                key_id: k.clone(),
-                joined_at: chrono::Utc::now(),
-                role: None,
-            })
+            .map(String::as_str)
             .collect();
-        n.backend
-            .put_community(ts::sign_community(
-                comm,
-                crate::federation::types::Community {
-                    prev_head_digest: String::new(),
-                    charter_digest: String::new(),
-                    community_key_id: comm.to_owned(),
-                    community_name: "burst room".into(),
-                    members: roster,
-                    founded_at: chrono::Utc::now(),
-                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
-                        .to_owned(),
-                    policy_blob: None,
-                    persist_row_hash: String::new(),
-                },
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("seed community {comm}: {e}"));
+        found_room(n, comm, "burst room", &roster, chrono::Utc::now()).await;
     }
 
     #[derive(Default, Debug, Clone)]
@@ -129,13 +103,13 @@ mod measure {
 
     /// Plan (timed separately, read-only), then the real emission
     /// (`emit_key_grant_axis_with`, the Engine's door) with an `emit_one`
-    /// that is `emit_with_local_signer` split into sign / assemble+put.
+    /// that is `emit_with_local_signer` split into sign / put.
     async fn emit_timed<B>(n: &Node<'_, B>, comm: &str, epoch: u64) -> Emit
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
         let axis = KeyGrantAxis::Epoch {
-            community_key_id: comm.to_owned(),
+            community_key_id: e2::kid(comm),
             minter_key_id: n.key.clone(),
             epoch,
         };
@@ -152,23 +126,22 @@ mod measure {
         let key = n.key.clone();
         let backend = n.backend;
         let t = Instant::now();
-        let out = emit_key_grant_axis_with(backend, &key, &axis, |mut input| {
-            let (sign, put, signer, key) = (sign.clone(), put.clone(), signer.clone(), key.clone());
+        // v62.0.0 (E3b) — `emit_with_local_signer` (cut B: `emit_statement`)
+        // split into sign (`produce_row`: the edition-2 statement) and put
+        // (`admit_produced`: the statement door).
+        let out = emit_key_grant_axis_with(backend, &key, &axis, |input| {
+            let (sign, put, signer) = (sign.clone(), put.clone(), signer.clone());
             async move {
                 let t0 = Instant::now();
-                let canonical = crate::federation::attestation_emit::stamp_and_canonicalize(
-                    &mut input,
-                    &key,
-                    chrono::Utc::now(),
-                )?;
-                let sig = signer
-                    .sign_hybrid(&canonical)
-                    .await
-                    .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+                let produced =
+                    crate::federation::attestation_emit::produce_row(backend, &signer, input, None)
+                        .await?;
                 sign.set(sign.get() + t0.elapsed());
                 let t1 = Instant::now();
-                let e = crate::federation::attestation_emit::assemble_and_put(
-                    backend, key, &canonical, sig, input,
+                let e = crate::federation::attestation_emit::admit_produced(
+                    backend,
+                    &produced,
+                    &produced.statement,
                 )
                 .await?;
                 put.set(put.get() + t1.elapsed());
@@ -206,15 +179,23 @@ mod measure {
         B: BlobStorage + FederationDirectory + Sync,
     {
         let rid = uuid::Uuid::new_v4().simple().to_string();
-        let n = node(backend, &format!("kgb-minter-{rid}")).await;
+        let alias = format!("kgb-minter-{rid}");
+        let n = node_as(backend, &alias, NODE).await;
+        let members: Vec<String> = (0..MEMBERS).map(|i| format!("kgb-m{i}-{rid}")).collect();
+        for m in &members {
+            ts::register_hybrid_key_as(backend, m, m, USER).await;
+        }
+        // Member 0 owns the minter node (one owner binding for both rooms).
+        own_node(&n, &alias, &members[0]).await;
 
         // ── baseline: first seal into a 1-member, 1-device room ─────────
         let base_comm = format!("kgb-base-{rid}");
-        seed_room(&n, &base_comm, &[format!("kgb-solo-{rid}")], 1, &[]).await;
+        seed_room(&n, &base_comm, &members[..1], 1, &[]).await;
         let t = Instant::now();
-        let r = encrypt_and_cascade_community(backend, &base_comm, b"x", None, Some(&n.key))
-            .await
-            .unwrap();
+        let r =
+            encrypt_and_cascade_community(backend, &e2::kid(&base_comm), b"x", None, Some(&n.key))
+                .await
+                .unwrap();
         let base_seal = t.elapsed();
         assert_eq!(r.granted.len(), 1);
         let base_emit = emit_timed(&n, &base_comm, r.epoch).await;
@@ -222,7 +203,7 @@ mod measure {
 
         // ── case 2: fresh epoch, 50 x 3 = 150 recipients ────────────────
         let comm = format!("kgb-room-{rid}");
-        let members: Vec<String> = (0..MEMBERS).map(|i| format!("kgb-m{i}-{rid}")).collect();
+        let comm_id = e2::kid(&comm);
         let newcomer = format!("kgb-new-{rid}");
         let t = Instant::now();
         seed_room(
@@ -235,7 +216,7 @@ mod measure {
         .await;
         let seed_t = t.elapsed();
         let t = Instant::now();
-        let r = encrypt_and_cascade_community(backend, &comm, b"x", None, Some(&n.key))
+        let r = encrypt_and_cascade_community(backend, &comm_id, b"x", None, Some(&n.key))
             .await
             .unwrap();
         let seal150 = t.elapsed();
@@ -247,7 +228,7 @@ mod measure {
 
         // A no-change seal in the same epoch (the content-seal floor).
         let t = Instant::now();
-        let r = encrypt_and_cascade_community(backend, &comm, b"y", None, Some(&n.key))
+        let r = encrypt_and_cascade_community(backend, &comm_id, b"y", None, Some(&n.key))
             .await
             .unwrap();
         let seal_nochange = t.elapsed();
@@ -255,10 +236,10 @@ mod measure {
 
         // ── case 1: the newcomer's 3 devices appear; next seal fills in ─
         for d in 0..DEVICES {
-            add_occurrence(&n, &newcomer, &format!("{newcomer}-dev{d}")).await;
+            add_occurrence(&n, &newcomer, &format!("dev{d}-{newcomer}")).await;
         }
         let t = Instant::now();
-        let r = encrypt_and_cascade_community(backend, &comm, b"z", None, Some(&n.key))
+        let r = encrypt_and_cascade_community(backend, &comm_id, b"z", None, Some(&n.key))
             .await
             .unwrap();
         let seal_fill = t.elapsed();

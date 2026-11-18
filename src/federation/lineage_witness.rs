@@ -151,6 +151,65 @@ pub enum LineageCosignOutcome {
         /// The rule.
         reason: LineageCosignRefusal,
     },
+    /// v62.0.0 (wave GC3; CC 2.7, rc21 item 15) — STORED, and it does not
+    /// count toward the head's quorum: the rule it fails reads OTHER rows
+    /// (the held versions, their founders, the roster), so the cosign is
+    /// kept, and the witnessed-head fold ([`effective_cosigns`],
+    /// [`witnesses_of`]) leaves it out by the same rule. A lagging head's
+    /// cosign therefore goes stale through the T4a freshness gate.
+    KeptNotCounted {
+        /// The rule it fails.
+        reason: LineageCosignRefusal,
+    },
+}
+
+/// v62.0.0 (wave GC3; CC 2.7, rc21 item 15) — **is `lineage`'s held head
+/// lagging its roster at `at`, with witnessed mode on?** The one predicate
+/// the door and the witnessed-head fold share. With witnessed mode off the
+/// lag is only reported, never counted against a cosign.
+pub async fn head_lags_roster_at<F>(
+    directory: &F,
+    lineage: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    let quorum = declared_witness_quorum(
+        crate::federation::canonical_community::charter_members_for(directory, lineage)
+            .await?
+            .and_then(|c| c.witness_quorum),
+    );
+    if !witnessed_mode_on(quorum) {
+        return Ok(false);
+    }
+    Ok(
+        crate::federation::roster_head::roster_lag(directory, lineage, at)
+            .await?
+            .is_some(),
+    )
+}
+
+/// v62.0.0 (wave GC3; CC 2.7, rc21 item 15) — keep a cosign whose rule
+/// reads other rows: store it, report [`LineageCosignOutcome::KeptNotCounted`]
+/// (or `Unchanged` on a repeat), and mark a running fold attempt with the
+/// rule's reason so an edition-2 door can say why it concludes nothing.
+async fn keep_not_counted<F>(
+    directory: &F,
+    cosign: &LineageHeadCosign,
+    reason: LineageCosignRefusal,
+    token: &'static str,
+) -> Result<LineageCosignOutcome, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    super::edition2::fold::note(token);
+    let inserted = directory.store_lineage_head_cosign(cosign).await?;
+    Ok(if inserted {
+        LineageCosignOutcome::KeptNotCounted { reason }
+    } else {
+        LineageCosignOutcome::Unchanged
+    })
 }
 
 /// **The cosign door** (FSD `TRUST_ROOT_RC6.md` §2.1) — every refusal in door
@@ -200,6 +259,18 @@ where
         WitnessStanding::NotValidAt => return refused(LineageCosignRefusal::WitnessNotValidAt),
         WitnessStanding::Counts { principal } => principal,
     };
+    // v62.0.0 (wave GC3; CC 2.7.3, rc21 item 15) — checks 3, 6, 7 and 7b
+    // read OTHER rows (the held lineage's versions and founders, their
+    // principals, the charter, the roster): declared for the fold, and each
+    // such cosign is KEPT and does not count (`keep_not_counted`); the
+    // witnessed-head fold excludes it by the same rules. The witness's own
+    // key plane (1–2), the signature (4) and the shape and skew (0, 8) stay
+    // refusals.
+    {
+        use super::edition2::fold::{reads, Dep};
+        reads(Dep::key(&cosign.lineage_key_id));
+        reads(Dep::key(&cosign.witness_key_id));
+    }
     // 3. independence: the witness's PERSON is not a founder of the lineage (on
     //    any version of the chain this node holds) — a family's members
     //    likewise. Judged at the principal, so a founder's second,
@@ -228,7 +299,13 @@ where
     if founder_principals.contains(&principal)
         || founders.iter().any(|f| f == &cosign.witness_key_id)
     {
-        return refused(LineageCosignRefusal::WitnessIsFounder);
+        return keep_not_counted(
+            directory,
+            cosign,
+            LineageCosignRefusal::WitnessIsFounder,
+            super::edition2::fold::reason::WITNESS_IS_FOUNDER,
+        )
+        .await;
     }
     // 4. the signature, hybrid-Strict over the domain-labelled envelope
     if crate::federation::tier_ingest::verify_envelope_hybrid_signature(
@@ -274,7 +351,13 @@ where
         Some((_, instant)) => {
             // 6. the head's signer-stamped instant, byte-exact as an instant
             if *instant != head_at {
-                return refused(LineageCosignRefusal::HeadInstantMismatch);
+                return keep_not_counted(
+                    directory,
+                    cosign,
+                    LineageCosignRefusal::HeadInstantMismatch,
+                    super::edition2::fold::reason::HEAD_INSTANT_MISMATCH,
+                )
+                .await;
             }
             // 7. a prior this node HOLDS must be an ancestor of the head
             if let Some(prior) = &cosign.prior_head_digest_sha256_hex {
@@ -285,7 +368,13 @@ where
                 let prior_pos = held_versions.iter().position(|(d, _)| d == prior);
                 if let Some(pp) = prior_pos {
                     if pp > head_pos {
-                        return refused(LineageCosignRefusal::PriorNotAncestor);
+                        return keep_not_counted(
+                            directory,
+                            cosign,
+                            LineageCosignRefusal::PriorNotAncestor,
+                            super::edition2::fold::reason::PRIOR_NOT_ANCESTOR,
+                        )
+                        .await;
                     }
                 }
                 // an unknown prior is stored: it may be the other head of an
@@ -301,23 +390,15 @@ where
                 .last()
                 .is_some_and(|(d, _)| d == &cosign.head_digest_sha256_hex);
             if is_held_head
-                && witnessed_mode_on(declared_witness_quorum(
-                    crate::federation::canonical_community::charter_members_for(
-                        directory,
-                        &cosign.lineage_key_id,
-                    )
-                    .await?
-                    .and_then(|c| c.witness_quorum),
-                ))
-                && crate::federation::roster_head::roster_lag(
-                    directory,
-                    &cosign.lineage_key_id,
-                    signed_at,
-                )
-                .await?
-                .is_some()
+                && head_lags_roster_at(directory, &cosign.lineage_key_id, signed_at).await?
             {
-                return refused(LineageCosignRefusal::HeadLagsRoster);
+                return keep_not_counted(
+                    directory,
+                    cosign,
+                    LineageCosignRefusal::HeadLagsRoster,
+                    super::edition2::fold::reason::LINEAGE_HEAD_LAGS_ROSTER,
+                )
+                .await;
             }
             LineageCosignOutcome::Inserted
         }
@@ -463,6 +544,14 @@ where
                         continue;
                     }
                 }
+            }
+            // v62.0.0 (wave GC3; CC 2.7, rc21 item 15) — a cosign on the held
+            // head that lagged its roster at the witness's instant is kept and
+            // does not count (the door's `HeadLagsRoster`, now a reason).
+            if pos + 1 == known.len()
+                && head_lags_roster_at(directory, &c.lineage_key_id, signed_at).await?
+            {
+                continue;
             }
         }
         out.push(EffectiveCosign {

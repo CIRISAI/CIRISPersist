@@ -19,27 +19,38 @@
 //!   upgrade (rows stored at V166, then migrated).
 //! - **I370** (sqlite) — the shipped bundle's unlabelled rows still seed and
 //!   charter the accord on a fresh node: pinned-bundle members, held by nobody.
+//!
+//! v62.0.0 (JSON cut, E5) — **I368 and I370 are deleted**: I368's row is a
+//! quorum co-scrubbed JSON charter (a co-scrub set over the JCS image), and
+//! I370 reads the baked bundle/1's `genesis-charter` row; bundle/2 names only
+//! key records and bindings (C2), and nothing of the earlier form carries.
+//! I366 and I367 are edition-2 rows: the keys are `key:record`s named by
+//! identity-ref, the rows are named by their computed ids.
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::operational::test_support as ops;
     use crate::federation::trust_root::{
         test_pre_rotation_commitment, trust_root_valid, trusted_roots_of, INFRA_ATTEST_SCOPE,
         INFRA_SERVE_SCOPE, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
     };
     use crate::federation::types::{attestation_type, identity_type};
-    use crate::federation::{FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
 
     pub(crate) fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..10].to_owned()
     }
 
+    /// v62.0.0 (E5) — the earlier form echoed the row's own chosen id as
+    /// `references_attestation_id`; an edition-2 row cannot name its own
+    /// computed id, so the label rides as the `id` member.
     fn charter_envelope(id: &str, root: &str, label: Option<&str>) -> serde_json::Value {
         let commitment =
             test_pre_rotation_commitment(&[format!("{root}-succ-a"), format!("{root}-succ-b")])
                 .expect("commitment");
         let mut env = serde_json::json!({
-            "references_attestation_id": id,
+            "id": id,
             "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
             "pre_rotation_commitment": commitment,
         });
@@ -51,19 +62,16 @@ pub(crate) mod bodies {
 
     /// Register `root` as a key root and put its self-directed charter with
     /// `label`. Returns the charter's id.
+    ///
+    /// v62.0.0 (E5) — the root is an edition-2 `key:record` (`node`; the
+    /// fixture's hardware evidence is not carried), named by its
+    /// identity-ref; the id returned is the charter's computed row id.
     pub(crate) async fn key_root(
         d: &dyn FederationDirectory,
         root: &str,
         label: Option<&str>,
     ) -> String {
-        ops::register_typed_key_with_evidence(
-            d,
-            root,
-            identity_type::NODE,
-            Some(ops::strongbox_evidence(chrono::Utc::now())),
-        )
-        .await
-        .expect("register the root");
+        e2::put_key(d, root, &[identity_type::NODE]).await;
         let id = uuid::Uuid::new_v4().to_string();
         let charter = ops::signed_trust_attestation(
             &id,
@@ -72,12 +80,10 @@ pub(crate) mod bodies {
             attestation_type::DELEGATES_TO,
             charter_envelope(&id, root, label),
         );
-        d.put_attestation(SignedAttestation {
-            attestation: charter,
-        })
-        .await
-        .expect("a self-directed delegates_to is stored whatever its label");
-        id
+        e2::put_signed(d, &charter)
+            .await
+            .expect("a self-directed delegates_to is stored whatever its label");
+        e2::rid(&charter)
     }
 
     /// Put `delegates_to(user → root)` with `label`. Returns its id.
@@ -91,8 +97,9 @@ pub(crate) mod bodies {
             .await
             .expect("register the user");
         let id = uuid::Uuid::new_v4().to_string();
+        // v62.0.0 (E5) — no self-reference (see `charter_envelope`).
         let mut env = serde_json::json!({
-            "references_attestation_id": id,
+            "id": id,
             "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
         });
         if let Some(l) = label {
@@ -100,23 +107,27 @@ pub(crate) mod bodies {
         }
         let row =
             ops::signed_trust_attestation(&id, user, root, attestation_type::DELEGATES_TO, env);
-        d.put_attestation(SignedAttestation { attestation: row })
+        e2::put_signed(d, &row)
             .await
             .expect("a delegates_to toward a key root is stored whatever its label");
-        id
+        e2::rid(&row)
     }
 
     pub async fn i366_an_unlabelled_self_charter_is_no_charter(d: &dyn FederationDirectory) {
         let s = suffix();
         let (bare, named) = (format!("i366-bare-{s}"), format!("i366-named-{s}"));
         key_root(d, &bare, None).await;
-        let v = trust_root_valid(d, "i366-probe", &bare).await.unwrap();
+        let v = trust_root_valid(d, "i366-probe", &e2::kid(&bare))
+            .await
+            .unwrap();
         assert!(
             !v.root_self_declares && !v.charter_has_recovery,
             "I366: a new unlabelled self-directed row is no charter: {v:?}"
         );
         key_root(d, &named, Some(TRUST_CHARTER_DIMENSION)).await;
-        let v = trust_root_valid(d, "i366-probe", &named).await.unwrap();
+        let v = trust_root_valid(d, "i366-probe", &e2::kid(&named))
+            .await
+            .unwrap();
         assert!(
             v.root_self_declares && v.charter_has_recovery,
             "I366 control: the labelled charter is one: {v:?}"
@@ -127,6 +138,8 @@ pub(crate) mod bodies {
         let s = suffix();
         let root = format!("i367-root-{s}");
         key_root(d, &root, Some(TRUST_CHARTER_DIMENSION)).await;
+        // v62.0.0 (E5) — keys are named by identity-ref from here on.
+        let root = e2::kid(&root);
         let now = chrono::Utc::now();
         for (user, label) in [
             (format!("i367-bare-{s}"), None),
@@ -136,6 +149,7 @@ pub(crate) mod bodies {
             ),
         ] {
             edge(d, &user, &root, label).await;
+            let user = e2::kid(&user);
             let v = trust_root_valid(d, &user, &root).await.unwrap();
             assert!(
                 !v.edge_exists && !v.valid && v.root_self_declares,
@@ -148,6 +162,7 @@ pub(crate) mod bodies {
         }
         let user = format!("i367-named-{s}");
         edge(d, &user, &root, Some(TRUST_ACCEPTS_DIMENSION)).await;
+        let user = e2::kid(&user);
         let v = trust_root_valid(d, &user, &root).await.unwrap();
         assert!(
             v.edge_exists && v.valid,
@@ -159,77 +174,10 @@ pub(crate) mod bodies {
             "I367 control"
         );
     }
-
-    pub async fn i368_an_unlabelled_holder_to_family_row_is_no_charter(
-        d: &dyn FederationDirectory,
-    ) {
-        let s = suffix();
-        let holders = |fam: &str| -> Vec<String> {
-            ["h1", "h2", "h3"]
-                .iter()
-                .map(|h| format!("{fam}-{h}"))
-                .collect()
-        };
-        // Control first: the labelled family charter is one.
-        let named = format!("i368-named-{s}");
-        let hs = holders(&named);
-        for h in &hs {
-            ops::register_typed_key(d, h, identity_type::ACCORD_HOLDER)
-                .await
-                .unwrap();
-        }
-        ops::seed_chartered_family_root_with_scrubs(d, &named, &hs, "i368-nobody", &[])
-            .await
-            .expect("the labelled family root");
-        let v = trust_root_valid(d, "i368-probe", &named).await.unwrap();
-        assert!(v.root_self_declares, "I368 control: {v:?}");
-
-        // The same row with no label, every seat scrubbing it.
-        let bare = format!("i368-bare-{s}");
-        let hs = holders(&bare);
-        for h in &hs {
-            ops::register_typed_key(d, h, identity_type::ACCORD_HOLDER)
-                .await
-                .unwrap();
-        }
-        ops::seed_test_family(d, &bare, &hs, "quorum:2/3")
-            .await
-            .expect("the family");
-        let id = uuid::Uuid::new_v4().to_string();
-        let cosigners: Vec<&str> = hs[1..].iter().map(String::as_str).collect();
-        let charter = ops::co_signed_trust_attestation(
-            &id,
-            &hs[0],
-            &bare,
-            attestation_type::DELEGATES_TO,
-            charter_envelope(&id, &bare, None),
-            &cosigners,
-        );
-        d.put_attestation(SignedAttestation {
-            attestation: charter,
-        })
-        .await
-        .expect("I368: stored as a delegation");
-        let v = trust_root_valid(d, "i368-probe", &bare).await.unwrap();
-        assert!(
-            !v.root_self_declares,
-            "I368: a new unlabelled holder → family row is no charter, quorum or not: {v:?}"
-        );
-        assert!(
-            crate::federation::canonical_community::charter_members_for(d, &bare)
-                .await
-                .unwrap()
-                .is_none(),
-            "I368: and carries no charter members"
-        );
-    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
-    #[cfg(feature = "sqlite")]
-    use crate::federation::FederationDirectory;
-
     macro_rules! runners {
         ($modname:ident, $fresh:expr) => {
             mod $modname {
@@ -247,14 +195,6 @@ mod run {
                 async fn i367() {
                     let Some(d) = $fresh.await else { return };
                     bodies::i367_an_unlabelled_edge_gives_no_acceptance(
-                        &d as &dyn FederationDirectory,
-                    )
-                    .await
-                }
-                #[tokio::test]
-                async fn i368() {
-                    let Some(d) = $fresh.await else { return };
-                    bodies::i368_an_unlabelled_holder_to_family_row_is_no_charter(
                         &d as &dyn FederationDirectory,
                     )
                     .await
@@ -281,78 +221,4 @@ mod run {
         b.run_migrations().await.unwrap();
         Some(b)
     });
-
-    /// **I370** — the shipped bundle on a fresh node. Its `genesis-charter`
-    /// (A1 → humanity-accord) carries no job label and this node never held
-    /// it before the rule: it is read as the accord's charter because it is a
-    /// member of the pinned bundle, and only for that reason.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i370_the_shipped_bundle_still_charters_the_accord_sqlite() {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        use crate::federation::genesis;
-        use crate::store::Backend as _;
-        if genesis::test_anchor_override_active() {
-            return; // a software anchor stands in for the shipped bundle
-        }
-        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        b.seed_genesis_accord_holders(&genesis::effective_accord_holder_records())
-            .await
-            .expect("holders");
-        genesis::seed_family_and_canonical(&b)
-            .await
-            .expect("the shipped plane seeds on a fresh node");
-        let family = crate::federation::canonical_community::accord_family_key_id();
-        let about = b.all_attestations_for(family).await.unwrap();
-        let charter = about
-            .iter()
-            .find(|a| a.attestation_id == "genesis-charter")
-            .expect("the baked charter is stored");
-        // v53.1.1 — the shipped bundle is the FINAL genesis, whose charter is
-        // labelled `trust:charter:v1`: the label charters it, and the
-        // bundle-only rule below is the belt the pinned-bundle membership
-        // still provides (the unlabelled arm stays witnessed on synthetic
-        // rows by I356–I369).
-        assert!(
-            !crate::federation::trust_root::names_no_trust_job(&charter.attestation_envelope),
-            "I370 precondition: the final genesis's charter is labelled"
-        );
-        assert!(
-            genesis::is_pinned_bundle_row(charter),
-            "I370: it is a pinned-bundle member"
-        );
-        assert!(
-            b.trust_direction_held_among(&["genesis-charter".to_owned()])
-                .await
-                .unwrap()
-                .is_empty(),
-            "I370: and not a row this node held before the rule"
-        );
-        let v = crate::federation::trust_root::trust_root_valid(&b, "i370-probe", family)
-            .await
-            .unwrap();
-        assert!(
-            v.root_self_declares && v.charter_has_recovery,
-            "I370: the accord is chartered: {v:?}"
-        );
-        // The same statement under another id is not a member.
-        let mut copy = charter.clone();
-        copy.attestation_id = "genesis-charter-copy".to_owned();
-        assert!(!genesis::is_pinned_bundle_row(&copy), "I370: id binds");
-        let mut moved = charter.clone();
-        moved.attested_key_id = "some-other-root".to_owned();
-        assert!(
-            !genesis::is_pinned_bundle_row(&moved),
-            "I370: subject binds"
-        );
-        let mut altered = charter.clone();
-        altered.attestation_envelope["scope"] = serde_json::json!(["infra:serve"]);
-        assert!(
-            !genesis::is_pinned_bundle_row(&altered),
-            "I370: content binds"
-        );
-    }
 }

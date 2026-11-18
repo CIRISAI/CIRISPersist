@@ -8,9 +8,9 @@
 //!   serves, answers "already held" through its door and counts on
 //!   `already_held_count`; the retired framed `Key` / `Revocation` kinds are
 //!   never indexed (v59.0.0).
-//! - **I231** — a differing body under a held id is not settled (the door
-//!   refuses it on its merits), and a held-but-purged row whose index entry
-//!   survives is not settled (it is admitted again).
+//! - **I231** — a held-but-purged row whose index entry survives is not
+//!   settled (it is admitted again). (v62: the "differing body under a held
+//!   id" leg is gone; an edition-2 id is computed from the signed bytes.)
 //! - **I233** — a three-node cycle A→B→C→A carried through the doors: the row
 //!   returns to its origin as "already held"; every hop serves the same hash.
 //! - **I234** — 1 000 re-offers of a held attestation from one peer all
@@ -37,15 +37,17 @@ pub(crate) mod bodies {
         t.with_nanosecond(t.nanosecond() / 1_000 * 1_000).unwrap()
     }
 
-    /// A sealed, federation-tier `scores` attestation by `author`.
+    /// A federation-tier `scores` attestation by `author`: the door's mapping
+    /// of `author`'s edition-2 statement (its id is node-computed; the
+    /// envelope's `id` is only a per-row salt).
     pub(crate) fn sealed_attestation(
         author: &str,
         dimension: &str,
     ) -> crate::federation::Attestation {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_micros();
-        let mut row = crate::federation::Attestation {
-            attestation_id: id.clone(),
+        let row = crate::federation::Attestation {
+            attestation_id: String::new(),
             attesting_key_id: author.to_owned(),
             attested_key_id: author.to_owned(),
             attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
@@ -69,8 +71,7 @@ pub(crate) mod bodies {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        ts::seal_row_in_place(author, &mut row);
-        row
+        crate::federation::edition2::fixture_switch::row_of(&row, author)
     }
 
     /// The bytes this node SERVES for the attestation `id` (what a peer
@@ -110,7 +111,7 @@ pub(crate) mod bodies {
 
         let att = sealed_attestation(&author, "trust:i230:v1");
         let att_id = att.attestation_id.clone();
-        dir.put_attestation(SignedAttestation { attestation: att })
+        crate::federation::edition2::fixture_switch::put_signed(dir, &att)
             .await
             .unwrap_or_else(|e| panic!("[{tag}] I230 seed attestation: {e}"));
         let cell = h3o::LatLng::new(37.0, -122.0)
@@ -132,7 +133,11 @@ pub(crate) mod bodies {
         ))
         .await
         .unwrap_or_else(|e| panic!("[{tag}] I230 seed location proof: {e}"));
-        dir.put_family(ts::sign_family(
+        // Wave 2 (T1): the family and the community are founded through the
+        // edition-2 door: the founding roster's voices (the author's and the
+        // listed member's), landing under `kid(fam)` / `kid(comm)`.
+        let e2_at = crate::federation::edition2::fixture_switch::ms(now);
+        let family = ts::sign_family(
             &author,
             crate::federation::types::Family {
                 prev_head_digest: String::new(),
@@ -150,10 +155,14 @@ pub(crate) mod bodies {
                 dissolved_at: None,
                 persist_row_hash: String::new(),
             },
-        ))
+        );
+        crate::federation::edition2::fixture_switch::put_voices(
+            dir,
+            &crate::federation::edition2::fixture_switch::family_voices(&family, 1, None, e2_at),
+        )
         .await
         .unwrap_or_else(|e| panic!("[{tag}] I230 seed family: {e}"));
-        dir.put_community(ts::sign_community(
+        let community = ts::sign_community(
             &author,
             crate::federation::types::Community {
                 prev_head_digest: String::new(),
@@ -170,7 +179,13 @@ pub(crate) mod bodies {
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
-        ))
+        );
+        crate::federation::edition2::fixture_switch::put_voices(
+            dir,
+            &crate::federation::edition2::fixture_switch::community_voices(
+                &community, 1, None, e2_at,
+            ),
+        )
         .await
         .unwrap_or_else(|e| panic!("[{tag}] I230 seed community: {e}"));
         let rev_id = uuid::Uuid::new_v4().to_string();
@@ -202,9 +217,16 @@ pub(crate) mod bodies {
             .unwrap()
             .into_iter()
             .filter(|(_, _, rk)| {
+                // Wave 2: the flipped planes name identity-refs.
+                let kids: Vec<String> = [&author, &member, &fam, &comm]
+                    .iter()
+                    .map(|k| crate::federation::edition2::fixture_switch::kid(k))
+                    .collect();
                 [&author, &member, &fam, &comm, &victim, &att_id, &rev_id]
                     .iter()
-                    .any(|id| rk.contains(id.as_str()))
+                    .map(|s| s.as_str())
+                    .chain(kids.iter().map(String::as_str))
+                    .any(|id| rk.contains(id))
             })
             .map(|(k, h, _)| (k.to_owned(), h))
             .collect();
@@ -283,27 +305,14 @@ pub(crate) mod bodies {
         let author = format!("i231-author-{tag}");
         ts::register_hybrid_key(dir, &author).await;
 
-        // (a) A differing body under a held id: refused on its merits.
+        // v62 (E3): leg (a), "a differing body under a held id", is deleted:
+        // an edition-2 row id is computed from what was signed, so a
+        // differing body is a different id, never the held one.
         let att = sealed_attestation(&author, "trust:i231:v1");
         let id = att.attestation_id.clone();
-        dir.put_attestation(SignedAttestation {
-            attestation: att.clone(),
-        })
-        .await
-        .unwrap();
-        let mut impostor = att.clone();
-        impostor.attestation_envelope["dimension"] = serde_json::json!("trust:i231-other:v1");
-        ts::seal_row_in_place(&author, &mut impostor);
-        let r = dir
-            .put_attestation(SignedAttestation {
-                attestation: impostor,
-            })
-            .await;
-        assert!(
-            r.is_err(),
-            "[{tag}] I231(a): a different body under a held id must be refused on its merits, \
-             never settled as held: {r:?}"
-        );
+        crate::federation::edition2::fixture_switch::put_signed(dir, &att)
+            .await
+            .unwrap();
 
         // (b) Held, then purged: the index entry survives the purge (the
         // rebuild is the repair), the row does not. Not settled — admitted.
@@ -406,7 +415,7 @@ pub(crate) mod bodies {
         ts::register_hybrid_key(dir, &author).await;
         let att = sealed_attestation(&author, "trust:i234:v1");
         let id = att.attestation_id.clone();
-        dir.put_attestation(SignedAttestation { attestation: att })
+        crate::federation::edition2::fixture_switch::put_signed(dir, &att)
             .await
             .unwrap();
         let (_, served) = served_attestation(dir, &id).await;

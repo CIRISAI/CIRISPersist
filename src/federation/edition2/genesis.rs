@@ -711,7 +711,10 @@ pub async fn genesis_in_force<F>(dir: &F) -> Result<GenesisInForce, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let voices = dir.edition2_objects(GENESIS_BUNDLE_TYP).await?;
+    // v62.0.0 (wave GC5; CC 2.6.1.11, 2.7.3) — only the voices of bundles
+    // that concluded: a bundle HELD short of its count is kept, never in
+    // force, never served, and never rooted by its own object id.
+    let (voices, _) = held_voices(dir).await?;
     if voices.is_empty() {
         return Ok(GenesisInForce::default());
     }
@@ -838,6 +841,97 @@ fn not_placed(object_id: Digest32, v: &GenesisVerdict) -> Option<NotPlaced> {
         detail,
         waiting,
     })
+}
+
+/// v62.0.0 (wave GC5; CC 2.6.1.11 "a count not yet met concludes nothing,
+/// and the bundle is held"; CC 2.7.3) — the bundle readings that HOLD the
+/// bundle's voices, concluding nothing: its count unmet (or a recovery's
+/// statement that does not count), its held predecessor not Valid, a named
+/// row unplaced or Invalid. Each reads another statement (a further
+/// holder's voice, the predecessor's reading, a named row), so it is a fold,
+/// never a refusal. Not held: a first bundle the reader's anchor does not
+/// select (the anchor is this node's own configuration, and a held first
+/// bundle would be rooted by its own id), and a holder's custody (the
+/// holder's own key plane).
+fn holds_bundle(i: &Inconclusive) -> bool {
+    matches!(
+        i,
+        Inconclusive::CountUnmet
+            | Inconclusive::Commitment(_)
+            | Inconclusive::PrevNotValid
+            | Inconclusive::RowUnplaced { .. }
+            | Inconclusive::RowInvalid { .. }
+    )
+}
+
+/// v62.0.0 (wave GC5) — the held bundle voices, split in two: the voices of
+/// bundles that concluded (Valid when stored), and of bundles HELD short
+/// (their object id is held in the fold, `ceg_fold_held`). Only the first
+/// are "held" to Verify's lineage reader: a held first bundle is rooted by
+/// its own object id, which a bundle that never concluded must not be.
+async fn held_voices<F>(dir: &F) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let all = dir.edition2_objects(GENESIS_BUNDLE_TYP).await?;
+    let mut short_of: BTreeMap<Digest32, bool> = BTreeMap::new();
+    let (mut concluded, mut short) = (Vec::new(), Vec::new());
+    for v in all {
+        let oid = cose_parts(&v)
+            .as_ref()
+            .and_then(voice_of)
+            .map(|(oid, _)| oid);
+        let is_short = match oid {
+            None => false,
+            Some(o) => match short_of.get(&o) {
+                Some(b) => *b,
+                None => {
+                    let b = dir.fold_held(&RowId(o)).await?.is_some();
+                    short_of.insert(o, b);
+                    b
+                }
+            },
+        };
+        if is_short {
+            short.push(v);
+        } else {
+            concluded.push(v);
+        }
+    }
+    Ok((concluded, short))
+}
+
+/// v62.0.0 (wave GC5; G0 v4) — record a bundle's fold state under its object
+/// id: plane `typed_final` (a count once met is final; a bundle is never
+/// un-concluded, CC 2.7.5), the local door, the ingest tier.
+async fn record_bundle<F>(
+    dir: &F,
+    object_id: Digest32,
+    held: Option<(String, String)>,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let id = RowId(object_id);
+    let read = super::fold::Dep::Row(id).read_key();
+    super::fold::arriving(
+        super::fold::Arrival {
+            row_id: id,
+            replicated: false,
+            tier: super::ingest::INGEST_TIER.to_owned(),
+            plane: super::fold::plane::TYPED_FINAL,
+            slot: read.clone(),
+        },
+        super::fold::record(
+            dir,
+            id,
+            GENESIS_BUNDLE_TYP,
+            super::ingest::INGEST_TIER,
+            held,
+            BTreeSet::from([read]),
+        ),
+    )
+    .await
 }
 
 fn error_of(n: &NotPlaced) -> Error {
@@ -1166,7 +1260,22 @@ where
             "no_voice: the statements carry no `ceg-genesis-bundle/2` voice",
         ));
     }
-    let held = dir.edition2_objects(GENESIS_BUNDLE_TYP).await?;
+    // v62.0.0 (wave GC5; CC 2.6.1.11) — the voices of a bundle held short
+    // are read again beside the offered ones (as offered: never rooted by
+    // their own id), so a count met one voice at a time concludes. Only the
+    // objects a voice of THIS offer names answer for it.
+    let (held, short) = held_voices(dir).await?;
+    let oids = |vs: &[Vec<u8>]| -> BTreeSet<Digest32> {
+        vs.iter()
+            .filter_map(|s| cose_parts(s).as_ref().and_then(voice_of).map(|(o, _)| o))
+            .collect()
+    };
+    let fresh = oids(offered.as_slice());
+    // The bundles this node stores (concluded, or held short): a bundle is
+    // held only on a lineage rooted here, never on an unrooted one.
+    let mut stored = oids(held.as_slice());
+    stored.extend(oids(short.as_slice()));
+    let offered: Vec<Vec<u8>> = short.into_iter().chain(offered).collect();
     let every: Vec<Vec<u8>> = held.iter().chain(offered.iter()).cloned().collect();
     let (rows, held_rows) = named_rows(dir, &every, &carried).await?;
     let roots = attestation_roots();
@@ -1182,12 +1291,45 @@ where
     // is refused whole.
     let mut plans = Vec::new();
     let mut refused = Vec::new();
+    // v62.0.0 (wave GC5) — the bundles held short: each one's kept voices
+    // and its reason (Verify's token, its detail).
+    let mut short_bundles: Vec<(Digest32, Vec<HeldObject>, String, String)> = Vec::new();
     for o in &reading.objects {
         if !o.offered {
             continue;
         }
         if let Some(n) = not_placed(o.reading.object_id, &o.reading.verdict) {
-            refused.push(n);
+            if let GenesisVerdict::Nothing(i) = &o.reading.verdict {
+                // Held only on a lineage this node roots: a later bundle
+                // whose predecessor it stores, or a first bundle whose
+                // count (judged after its anchor) is short.
+                let rooted = match o.prev {
+                    Some(p) => stored.contains(&p),
+                    None => matches!(i, Inconclusive::CountUnmet | Inconclusive::Commitment(_)),
+                };
+                if rooted && holds_bundle(i) {
+                    let objects: Vec<HeldObject> = o
+                        .kept
+                        .iter()
+                        .filter_map(|v| held_object(o.reading.object_id, v))
+                        .collect();
+                    if !objects.is_empty() {
+                        let oid = hex::encode(o.reading.object_id);
+                        short_bundles.push((
+                            o.reading.object_id,
+                            objects,
+                            i.token().to_owned(),
+                            format!(
+                                "{}: bundle {oid} is held and concludes nothing (CC 2.6.1.11)",
+                                n.detail.as_deref().unwrap_or(n.token)
+                            ),
+                        ));
+                    }
+                }
+            }
+            if fresh.contains(&o.reading.object_id) {
+                refused.push(n);
+            }
             continue;
         }
         let Some(p) = o.reading.verdict.placement() else {
@@ -1217,7 +1359,14 @@ where
         }
         placed.push(p.clone());
     }
-    if placed.is_empty() {
+    // v62.0.0 (wave GC5) — a bundle held short is kept, and its hold is
+    // recorded BEFORE its voices are written: a stored voice whose object
+    // is not fold-held reads as a concluded bundle (`held_voices`).
+    for (oid, objects, reason, detail) in &short_bundles {
+        record_bundle(dir, *oid, Some((reason.clone(), detail.clone()))).await?;
+        write.objects.extend(objects.iter().cloned());
+    }
+    if placed.is_empty() && short_bundles.is_empty() {
         return Err(refused.first().map_or_else(
             || {
                 refuse(
@@ -1267,14 +1416,31 @@ where
         )
         .await?;
     }
+    // v62.0.0 (wave GC5) — a bundle held short that this offer completed
+    // concludes: its hold is cleared (after the write, so its voices never
+    // read as concluded before they are stored).
+    for p in &placed {
+        let id = RowId(p.object_id);
+        if dir.fold_held(&id).await?.is_some() {
+            record_bundle(dir, p.object_id, None).await?;
+        }
+    }
     // v62.0.0 (wave G0; CC 2.7.3) — the bundle's rows are inputs like any
     // other: every held or concluded row whose fold read what they touch is
     // re-folded (they bypass `put_statement`, whose tail does this).
     let mut touched = std::collections::BTreeSet::new();
+    let mut own = std::collections::BTreeSet::new();
     for row in &write.rows {
         touched.extend(super::fold::touches(row));
+        own.insert(row.row_id);
     }
-    Box::pin(super::fold::refold_touched(dir, touched)).await?;
+    // v62.0.0 (wave GC5) — and the bundles themselves: a row that names a
+    // bundle (a seat re-bind's `refs.head`) re-folds when it is placed.
+    for p in &placed {
+        touched.insert(super::fold::Dep::Row(RowId(p.object_id)).read_key());
+    }
+    // fix4 — a row is never its own fold dependent.
+    Box::pin(super::fold::refold_touched_excluding(dir, touched, &own)).await?;
     let in_force = genesis_in_force(dir).await?;
     Ok(GenesisAdmission {
         placed,

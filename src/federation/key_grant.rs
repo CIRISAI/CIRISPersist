@@ -116,6 +116,7 @@ pub const KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED: &str = "x25519-mlkem768-aes2
 
 use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
 use crate::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
+use crate::federation::edition2::fold as e2fold;
 use crate::federation::self_collective::speaks_for;
 use crate::federation::types::cohort_scope;
 use crate::federation::{
@@ -1101,12 +1102,21 @@ pub async fn check_sealer(
     asserted_at: chrono::DateTime<chrono::Utc>,
     chain_instant: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
+    // v62.0.0 (wave GC8; CC 2.7.3) — every leg below past "the signer IS the
+    // minter" reads OTHER rows (delegations, the roster fold, occurrences,
+    // the blob / stream this node holds, owner bindings): each unmet leg is a
+    // fold condition. At the edition-2 door the row is HELD with the leg's
+    // token and re-folds when those rows change; outside a fold attempt (the
+    // emitter, the read path) each is the refusal it was.
+    e2fold::reads(e2fold::Dep::key(signer));
     match axis {
         KeyGrantAxis::Epoch {
             community_key_id,
             minter_key_id,
             ..
         } => {
+            e2fold::reads(e2fold::Dep::key(minter_key_id));
+            e2fold::reads(e2fold::Dep::key(community_key_id));
             // v54.0.0 (#1033, CC 2.4.1.2.1) — the minter, or a holder of a
             // live `grant`-scoped chain from the minter.
             if signer != minter_key_id
@@ -1118,22 +1128,29 @@ pub async fn check_sealer(
                 )
                 .await?
             {
-                return Err(refuse(
-                    KeyGrantRefusalReason::SignerNotMinter,
-                    format!(
-                        "signer {signer:?} is not the row's minter {minter_key_id:?} and holds no \
-                         live `grant`-scoped delegation from it; only M, or M's `grant` delegate, \
-                         issues a grant over M's counter (BLOB_REPLICATION.md §11; CC 2.4.1.2.1)"
+                return Err(e2fold::hold(
+                    e2fold::reason::gc8::SIGNER_NOT_MINTER,
+                    refuse(
+                        KeyGrantRefusalReason::SignerNotMinter,
+                        format!(
+                            "signer {signer:?} is not the row's minter {minter_key_id:?} and holds \
+                             no live `grant`-scoped delegation from it; only M, or M's `grant` \
+                             delegate, issues a grant over M's counter (BLOB_REPLICATION.md §11; \
+                             CC 2.4.1.2.1)"
+                        ),
                     ),
                 ));
             }
             if !is_active_member_at(dir, community_key_id, signer, asserted_at).await? {
-                return Err(refuse(
-                    KeyGrantRefusalReason::SignerNotActiveMember,
-                    format!(
-                        "signer {signer:?} is not an active member occurrence of community \
-                         {community_key_id:?} at {} per this node's roster fold",
-                        asserted_at.to_rfc3339()
+                return Err(e2fold::hold(
+                    e2fold::reason::gc8::SIGNER_NOT_ACTIVE_MEMBER,
+                    refuse(
+                        KeyGrantRefusalReason::SignerNotActiveMember,
+                        format!(
+                            "signer {signer:?} is not an active member occurrence of community \
+                             {community_key_id:?} at {} per this node's roster fold",
+                            asserted_at.to_rfc3339()
+                        ),
                     ),
                 ));
             }
@@ -1151,26 +1168,34 @@ pub async fn check_sealer(
             ..
         } => {
             let content = matches!(axis, KeyGrantAxis::Content { .. });
+            e2fold::reads(e2fold::Dep::key(owner_key_id));
             // The held-state leg first: where this node holds the content its
             // verdict is definitive (terminal), where the owner leg below may
             // only be an ordering gap (retryable).
             if let Some(held) = dir.key_grant_held_owner(axis).await? {
+                e2fold::reads(e2fold::Dep::key(&held));
                 if !may_issue_grant_for(dir, signer, &held, chain_instant).await? {
                     return Err(if content {
-                        refuse(
-                            KeyGrantRefusalReason::SignerNotAuthor,
-                            format!(
-                                "signer {signer:?} is neither the author {held:?} of blob {id} \
-                                 nor an active occurrence of them"
+                        e2fold::hold(
+                            e2fold::reason::gc8::SIGNER_NOT_AUTHOR,
+                            refuse(
+                                KeyGrantRefusalReason::SignerNotAuthor,
+                                format!(
+                                    "signer {signer:?} is neither the author {held:?} of blob \
+                                     {id} nor an active occurrence of them"
+                                ),
                             ),
                         )
                     } else {
-                        refuse(
-                            KeyGrantRefusalReason::SignerNotStreamOwner,
-                            format!(
-                                "signer {signer:?} does not speak for the owner {held:?} of \
-                                 stream {id:?} on this node; a stream's keys are \
-                                 granted by its single sender (CC 5.3.3.1)"
+                        e2fold::hold(
+                            e2fold::reason::gc8::SIGNER_NOT_STREAM_OWNER,
+                            refuse(
+                                KeyGrantRefusalReason::SignerNotStreamOwner,
+                                format!(
+                                    "signer {signer:?} does not speak for the owner {held:?} of \
+                                     stream {id:?} on this node; a stream's keys are \
+                                     granted by its single sender (CC 5.3.3.1)"
+                                ),
                             ),
                         )
                     });
@@ -1179,12 +1204,15 @@ pub async fn check_sealer(
             if scope == cohort_scope::SELF
                 && !may_issue_grant_for(dir, signer, owner_key_id, chain_instant).await?
             {
-                return Err(Error::SignerDoesNotActFor {
-                    attesting_key_id: signer.to_owned(),
-                    identity_key_id: owner_key_id.clone(),
-                    plane: KEY_GRANT_PLANE,
-                    reason: super::SignerNotActingReason::NotBound,
-                });
+                return Err(e2fold::hold(
+                    e2fold::reason::SIGNER_NOT_ACTING_FOR,
+                    Error::SignerDoesNotActFor {
+                        attesting_key_id: signer.to_owned(),
+                        identity_key_id: owner_key_id.clone(),
+                        plane: KEY_GRANT_PLANE,
+                        reason: super::SignerNotActingReason::NotBound,
+                    },
+                ));
             }
             Ok(())
         }
@@ -1304,18 +1332,28 @@ pub async fn check_key_grant_row_admission(
     // its old window.
     let now = crate::host::clock::now();
     if crate::federation::self_roster::outside_past_freshness_window(row.asserted_at, now)
-        && check_sealer(dir, signer, &parsed.axis, now, now)
+        && e2fold::unmarked(check_sealer(dir, signer, &parsed.axis, now, now))
             .await
             .is_err()
     {
-        return Err(Error::AssertedAtStale {
-            author: signer.to_owned(),
-            standing_for: parsed.axis.group_key_id().to_owned(),
-            plane: KEY_GRANT_PLANE,
-            asserted_at: row.asserted_at,
-            w_secs: crate::federation::self_roster::PAST_FRESHNESS_W_SECS,
-        });
+        // v62.0.0 (wave GC8) — the re-run of the sealer rule at receipt read
+        // the same rows (its marks discarded, its reads kept): a fold
+        // condition, held `asserted_at_stale`.
+        return Err(e2fold::hold(
+            e2fold::reason::gc8::ASSERTED_AT_STALE,
+            Error::AssertedAtStale {
+                author: signer.to_owned(),
+                standing_for: parsed.axis.group_key_id().to_owned(),
+                plane: KEY_GRANT_PLANE,
+                asserted_at: row.asserted_at,
+                w_secs: crate::federation::self_roster::PAST_FRESHNESS_W_SECS,
+            },
+        ));
     }
+    // v62.0.0 (wave GC8) — the audience is the recipient's occurrences, the
+    // group's roster and the owner's allow list: other rows.
+    e2fold::reads(e2fold::Dep::key(parsed.recipient()));
+    e2fold::reads(e2fold::Dep::key(parsed.axis.group_key_id()));
     if !recipient_may_hold_key(
         dir,
         parsed.axis.emission_cohort_scope(),
@@ -1330,8 +1368,18 @@ pub async fn check_key_grant_row_admission(
 }
 
 /// The `recipient_not_in_audience` refusal for `parsed`: one text for the
-/// per-row path and the emission fold.
+/// per-row path and the emission fold. v62.0.0 (wave GC8; CC 2.7.3) — a fold
+/// condition: marked on the running attempt (held, re-folds when the
+/// recipient's occurrence, the roster or the allow list lands); outside an
+/// attempt the plain refusal.
 fn recipient_not_in_audience(parsed: &KeyGrantRow) -> Error {
+    e2fold::hold(
+        e2fold::reason::gc8::RECIPIENT_NOT_IN_AUDIENCE,
+        recipient_not_in_audience_err(parsed),
+    )
+}
+
+fn recipient_not_in_audience_err(parsed: &KeyGrantRow) -> Error {
     refuse(
         KeyGrantRefusalReason::RecipientNotInAudience,
         format!(
@@ -1767,7 +1815,17 @@ where
         watermark,
         misbuilt: None,
     };
-    match check_sealer(backend.as_dyn_directory(), signer, axis, at, at).await {
+    // v62.0.0 (wave GC8; G0 v3 §4) — the emitter turns the refusal into a
+    // plan field: its marks are discarded.
+    match e2fold::unmarked(check_sealer(
+        backend.as_dyn_directory(),
+        signer,
+        axis,
+        at,
+        at,
+    ))
+    .await
+    {
         Ok(()) => {}
         Err(e @ (Error::KeyGrantRefused { .. } | Error::SignerDoesNotActFor { .. })) => {
             plan.sealer_refused = Some(e.to_string());
@@ -2271,7 +2329,7 @@ where
     B: BlobStorage + FederationDirectory + Sync,
 {
     use crate::federation::edition2::occurrence::{
-        bind_author, publish_bind, self_roster_head, BindTerms,
+        bind_author, current_roster_heads, publish_bind, BindTerms,
     };
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     let me = signer.federation_id().await;
@@ -2285,6 +2343,11 @@ where
              never by the node alone (CC 3.3.6)"
         )));
     }
+    // CC rc21: `refs.head` (+ `refs.further_heads`), the identity's current
+    // self-roster tips (O1's `current_roster_heads`).
+    let (head, further_heads) = current_roster_heads(backend, identity_key_id)
+        .await?
+        .map_or((None, Vec::new()), |(h, f)| (Some(h), f));
     let kem = backend
         .load_or_init_content_kem_identity()
         .await
@@ -2306,9 +2369,8 @@ where
             decode("ml_kem_768", &kem.ml_kem_768_pubkey_b64)?,
         )),
         transport: None,
-        // CC rc21: `refs.head`, the identity's current self-roster head.
-        head: self_roster_head(backend, identity_key_id).await?,
-        further_heads: Vec::new(),
+        head,
+        further_heads,
     };
     publish_bind(backend, Some(signer), author_signer, &terms).await
 }

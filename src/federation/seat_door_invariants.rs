@@ -24,61 +24,63 @@
 //! - **I1807** (sqlite, postgres) — the Engine door: `seat_community_member`
 //!   emits the newcomer's rows through the seal's emission path.
 
+//!
+//! v62.0.0 (E3b) — the room is edition 2 (the fold room's fixtures,
+//! [`key_grant_fold_invariants`](super::key_grant_fold_invariants)): kids
+//! everywhere, the roster as `group:roster` voices, a removal as
+//! `membership:removal` voices, and the minter node alice's by the OWNER
+//! RELATION (her owner binding + the node's own self-occurrence), never an
+//! occurrence of her (`occurrence_binds_machine_to_person`). Device seeds
+//! lead with their distinguishing part (a signer seeds from a key id's first
+//! 32 bytes).
+
 #![cfg(test)]
 
 use crate::federation::community_dek::orchestrate::{
     encrypt_and_cascade_community, read_for_community_viewer, seat_community_member,
     sweep_rotated_epochs,
 };
+use crate::federation::edition2::fixture_switch as e2;
 use crate::federation::key_grant::emit_epoch_key_grant_with_local_signer;
-use crate::federation::key_grant_invariants::two_node::{node, Node};
+use crate::federation::key_grant_fold_invariants::{found_room, leave, occurrence, own_node};
+use crate::federation::key_grant_invariants::two_node::{node_as, Node};
 use crate::federation::tier_ingest::test_support as ts;
-use crate::federation::types::identity_type::USER;
-use crate::federation::types::{
-    CommunityMember, CommunityMembershipRevocation, IdentityOccurrence,
-};
+use crate::federation::types::identity_type::{NODE, USER};
 use crate::federation::{BlobStorage, DekKeyState, FederationDirectory, GrantWrap};
 use std::collections::BTreeSet;
 
-async fn occurrence<B>(n: &Node<'_, B>, ident: &str, occ: &str, keyed: bool)
-where
-    B: BlobStorage + FederationDirectory + Sync,
-{
-    if occ != n.key {
-        ts::register_hybrid_key_as(n.backend, occ, occ, USER).await;
-    }
-    n.backend
-        .put_identity_occurrence_local(IdentityOccurrence {
-            identity_key_id: ident.to_owned(),
-            occurrence_key_id: occ.to_owned(),
-            device_class: crate::federation::types::device_class::LAPTOP.into(),
-            hardware_attestation: None,
-            asserted_at: chrono::Utc::now(),
-            valid_until: None,
-            encryption_pubkeys: keyed.then(|| n.kem.clone()),
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("occurrence {occ} of {ident}: {e}"));
+/// The seeds a [`Room`] was built from (the fixtures sign with seeds; the
+/// stored rows and every production query name their kids).
+pub(crate) struct RoomSeeds {
+    pub comm: String,
+    pub alice: String,
+    pub bob: String,
+    pub rex: String,
+    pub nina: String,
+    pub kay: String,
+    pub n_devs: Vec<String>,
+    pub k0: String,
 }
 
 /// A room whose roster already names the newcomers (`nina`, keyed devices;
 /// `kay`, a keyless device) — their devices are added after the first seal,
-/// so the seal finds them absent and the seat is what reaches them.
+/// so the seal finds them absent and the seat is what reaches them. Every
+/// field but `s` is a kid.
 pub(crate) struct Room {
     pub comm: String,
     pub bob: String,
-    pub rex: String,
     pub nina: String,
     pub kay: String,
     pub b0: String,
     pub r0: String,
     pub n_devs: Vec<String>,
     pub k0: String,
+    pub s: RoomSeeds,
 }
 
-pub(crate) async fn seed<B>(n: &Node<'_, B>, tag: &str) -> Room
+/// The seat room on the minter `n` (brought up from `node_seed`, a NODE key
+/// alice owns).
+pub(crate) async fn seed<B>(n: &Node<'_, B>, node_seed: &str, tag: &str) -> Room
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
@@ -93,46 +95,39 @@ where
     for m in [&alice, &bob, &rex, &nina, &kay] {
         ts::register_hybrid_key_as(n.backend, m, m, USER).await;
     }
-    let (b0, r0) = (format!("{bob}-d0"), format!("{rex}-d0"));
-    occurrence(n, &alice, &n.key, true).await;
+    let (b0, r0) = (format!("d0-{bob}"), format!("d0-{rex}"));
+    own_node(n, node_seed, &alice).await;
     occurrence(n, &bob, &b0, true).await;
     occurrence(n, &rex, &r0, true).await;
-    let roster = [&alice, &bob, &rex, &nina, &kay]
-        .iter()
-        .map(|k| CommunityMember {
-            key_id: (*k).clone(),
-            joined_at: chrono::Utc::now() - chrono::Duration::hours(1),
-            role: None,
-        })
-        .collect();
-    n.backend
-        .put_community(ts::sign_community(
-            &comm,
-            crate::federation::types::Community {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                community_key_id: comm.clone(),
-                community_name: "seat room".into(),
-                members: roster,
-                founded_at: chrono::Utc::now() - chrono::Duration::hours(1),
-                consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
-                    .to_owned(),
-                policy_blob: None,
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: seed community: {e}"));
+    found_room(
+        n,
+        &comm,
+        "seat room",
+        &[&alice, &bob, &rex, &nina, &kay],
+        chrono::Utc::now() - chrono::Duration::hours(1),
+    )
+    .await;
+    let n_devs = vec![format!("d0-{nina}"), format!("d1-{nina}")];
+    let k0 = format!("d0-{kay}");
     Room {
-        n_devs: vec![format!("{nina}-d0"), format!("{nina}-d1")],
-        k0: format!("{kay}-d0"),
-        comm,
-        bob,
-        rex,
-        nina,
-        kay,
-        b0,
-        r0,
+        comm: e2::kid(&comm),
+        bob: e2::kid(&bob),
+        nina: e2::kid(&nina),
+        kay: e2::kid(&kay),
+        b0: e2::kid(&b0),
+        r0: e2::kid(&r0),
+        n_devs: n_devs.iter().map(|d| e2::kid(d)).collect(),
+        k0: e2::kid(&k0),
+        s: RoomSeeds {
+            comm,
+            alice,
+            bob,
+            rex,
+            nina,
+            kay,
+            n_devs,
+            k0,
+        },
     }
 }
 
@@ -141,32 +136,37 @@ async fn newcomers_arrive<B>(n: &Node<'_, B>, room: &Room)
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    for d in &room.n_devs {
-        occurrence(n, &room.nina, d, true).await;
+    for d in &room.s.n_devs {
+        occurrence(n, &room.s.nina, d, true).await;
     }
-    occurrence(n, &room.kay, &room.k0, false).await;
+    occurrence(n, &room.s.kay, &room.s.k0, false).await;
 }
 
+/// `who` (a seed) leaves, effective now: their own voice plus alice's,
+/// nina's and kay's (never removed here), a majority of the roster outright
+/// whichever of rex / bob leaves.
 async fn remove<B>(n: &Node<'_, B>, room: &Room, who: &str)
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let at = chrono::Utc::now();
-    n.backend
-        .put_community_membership_revocation(ts::sign_community_membership_revocation(
-            who,
-            CommunityMembershipRevocation {
-                community_key_id: room.comm.clone(),
-                removed_identity_key_id: who.to_owned(),
-                removed_at: at,
-                effective_at: at,
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{who} leaves: {e}"));
+    let at = crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+    leave(
+        n,
+        &room.s.comm,
+        who,
+        at,
+        &[who, &room.s.alice, &room.s.nina, &room.s.kay],
+    )
+    .await;
+}
+
+/// The minter node of a seat witness: `{tag}-minter`, a NODE key.
+async fn minter<'a, B>(backend: &'a B, tag: &str) -> (Node<'a, B>, String)
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let alias = format!("{tag}-minter");
+    (node_as(backend, &alias, NODE).await, alias)
 }
 
 async fn recipients<B: BlobStorage + Sync>(
@@ -211,8 +211,8 @@ pub(crate) async fn i1803_nothing_due_wraps_never_mints<B>(backend: &B, tag: &st
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let n = node(backend, &format!("{tag}-minter")).await;
-    let room = seed(&n, tag).await;
+    let (n, alias) = minter(backend, tag).await;
+    let room = seed(&n, &alias, tag).await;
     let sealed = encrypt_and_cascade_community(backend, &room.comm, b"x", None, Some(&n.key))
         .await
         .unwrap();
@@ -296,7 +296,7 @@ where
         "{tag} I1803 (f): no rows"
     );
     // Not a member: not seated.
-    let stranger = format!("{tag}-stranger");
+    let stranger = e2::kid(&format!("{tag}-stranger"));
     let x = seat_community_member(backend, &room.comm, &n.key, &stranger, now)
         .await
         .unwrap();
@@ -309,14 +309,14 @@ pub(crate) async fn i1804_rotation_due_rotates_once_at_the_seat<B>(backend: &B, 
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let n = node(backend, &format!("{tag}-minter")).await;
-    let room = seed(&n, tag).await;
+    let (n, alias) = minter(backend, tag).await;
+    let room = seed(&n, &alias, tag).await;
     let e0 = encrypt_and_cascade_community(backend, &room.comm, b"x", None, Some(&n.key))
         .await
         .unwrap()
         .epoch;
     let _ = emitted_to(&n, &room, e0).await;
-    remove(&n, &room, &room.rex).await;
+    remove(&n, &room, &room.s.rex).await;
     newcomers_arrive(&n, &room).await;
     let now = chrono::Utc::now();
     let s = seat_community_member(backend, &room.comm, &n.key, &room.nina, now)
@@ -390,8 +390,8 @@ pub(crate) async fn i1805_only_this_minters_counter<B>(backend: &B, tag: &str)
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let n = node(backend, &format!("{tag}-minter")).await;
-    let room = seed(&n, tag).await;
+    let (n, alias) = minter(backend, tag).await;
+    let room = seed(&n, &alias, tag).await;
     newcomers_arrive(&n, &room).await;
     let other = format!("{tag}-other-minter");
     // A peer's epoch 3, as this node holds it after admitting its rows.
@@ -466,21 +466,21 @@ pub(crate) async fn i1806_the_empty_epoch_is_tolerated<B>(backend: &B, tag: &str
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let n = node(backend, &format!("{tag}-minter")).await;
-    let room = seed(&n, tag).await;
+    let (n, alias) = minter(backend, tag).await;
+    let room = seed(&n, &alias, tag).await;
     let first =
         encrypt_and_cascade_community(backend, &room.comm, b"e0 content", None, Some(&n.key))
             .await
             .unwrap();
     let e0 = first.epoch;
-    remove(&n, &room, &room.rex).await;
+    remove(&n, &room, &room.s.rex).await;
     newcomers_arrive(&n, &room).await;
     let e1 = seat_community_member(backend, &room.comm, &n.key, &room.nina, chrono::Utc::now())
         .await
         .unwrap()
         .epoch
         .unwrap();
-    remove(&n, &room, &room.bob).await;
+    remove(&n, &room, &room.s.bob).await;
     let s2 = seat_community_member(backend, &room.comm, &n.key, &room.nina, chrono::Utc::now())
         .await
         .unwrap();
@@ -617,7 +617,9 @@ async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
                     ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
                 },
             };
-            let room = seed(&n, alias).await;
+            // v62.0.0 (E3b): still held for P8 (the Engine producer); the
+            // engine's key must be a NODE alice owns for this seed.
+            let room = seed(&n, alias, alias).await;
             engine
                 .put_blob_scoped(COMMUNITY, Some(&room.comm), b"minutes", None, None)
                 .await
@@ -671,23 +673,34 @@ async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn i1807_sqlite() {
-    let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
-        .await
-        .unwrap();
-    i1807_engine_door(e, &alias).await;
+    Box::pin(
+        crate::federation::edition2::fixture_switch::with_earlier_form_async(async {
+            let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+            let e =
+                crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
+                    .await
+                    .unwrap();
+            i1807_engine_door(e, &alias).await;
+        }),
+    )
+    .await
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn i1807_postgres() {
-    let Some(dsn) = crate::test_pg::isolated_dsn() else {
-        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-        return;
-    };
-    let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), &dsn)
-        .await
-        .unwrap();
-    i1807_engine_door(e, &alias).await;
+    Box::pin(
+        crate::federation::edition2::fixture_switch::with_earlier_form_async(async {
+            let Some(dsn) = crate::test_pg::isolated_dsn() else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+            let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), &dsn)
+                .await
+                .unwrap();
+            i1807_engine_door(e, &alias).await;
+        }),
+    )
+    .await
 }

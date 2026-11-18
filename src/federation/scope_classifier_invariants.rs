@@ -224,12 +224,14 @@ pub mod bodies {
         let other = format!("i147-other-{s}");
         ts::register_identity_key(b, &writer, crate::federation::types::identity_type::USER).await;
         ts::register_identity_key(b, &other, crate::federation::types::identity_type::USER).await;
-        let kind =
-            |r: Result<crate::federation::AttestationOutcome, crate::federation::Error>| match r {
-                Err(crate::federation::Error::WriteScopeRefused(reason)) => reason.kind(),
-                Err(e) => panic!("I147: expected a typed scope refusal, got {e}"),
-                Ok(_) => "admitted",
-            };
+        let kind = |r: Result<
+            Option<crate::federation::edition2::ingest::StatementOutcome>,
+            crate::federation::Error,
+        >| match r {
+            Err(crate::federation::Error::WriteScopeRefused(reason)) => reason.kind(),
+            Err(e) => panic!("I147: expected a typed scope refusal, got {e}"),
+            Ok(_) => "admitted",
+        };
         for scope in [cs::COMMUNITY, cs::AFFILIATIONS] {
             let unseen = format!("i147-unseen-{scope}-{s}");
             assert_eq!(

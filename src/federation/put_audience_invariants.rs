@@ -3,41 +3,90 @@
 //!
 //! On a directory that has declared its node key, every replicated door asks
 //! the serve side's own question (`may_receive` for this node) before any
-//! door runs: on a NON-member's node a private room's content row, its
-//! `group:roster:v1` record row and its typed record are refused by name
-//! (`not_in_audience`) and leave nothing behind, through
-//! `apply_replicated_attestation`, `put_attestation_synced` and
-//! `apply_replicated_community`; on a MEMBER's node the same rows are
-//! admitted. A public room's record reaches a non-member. A TAMPERED copy
-//! of the room's row is verified first and refused
-//! `federation_federation_tier_unverified` on the non-member's node, never
-//! `not_in_audience` (the verdict is not asked of unverified bytes).
+//! door runs: on a NON-member's node a private room's content row and its
+//! record are refused and leave nothing behind; on a MEMBER's node the same
+//! are admitted. A public room's record reaches a non-member. A TAMPERED copy
+//! of the room's row is verified first and refused, never `not_in_audience`
+//! (the verdict is not asked of unverified bytes).
 //!
 //! I1625 (v61.1.0, CIRISPersist#1188) — a family's record names its own
 //! audience: on a node that holds nothing of the family, a node owned by a
-//! member the record lists may receive it (`Cohort`) and its replicated door
-//! admits it; a stranger's node may not.
+//! member the record lists receives it; a stranger's node does not.
+//!
+//! v62.0.0 (wave 3, slice E6) — the planes are edition 2. Keys are
+//! `key:record`s named by kid; a content row is an edition-2 row (its JSON
+//! door, `apply_replicated_attestation` / `put_attestation_synced`, still
+//! takes a row carrying its statement, with the audience gate in front);
+//! a group's record and membership events are T1's counted voices, and they
+//! travel as STATEMENTS (`edition2_statements_since` →
+//! `apply_replicated_statement`, [`sync`]). **The record legs that expect a
+//! refusal on a non-audience node DEPEND ON an audience gate at the
+//! edition-2 replicated door**: T1.md ("`apply_replicated_community`'s
+//! `not_in_audience` / degrade outcomes are not applied to statements") and
+//! base `edition2/` run no `may_receive`. Those asserts are marked
+//! "DEPENDS ON THE EDITION-2 AUDIENCE GATE"; they are red until it exists.
+
+/// Deliver every statement `from` holds to `to`, in `from`'s admission
+/// order, through the replicated statement door (`apply_replicated_statement`
+/// under each statement's computed row id). A statement waiting on a key
+/// `to` does not yet hold is retried on the next pass; a refusal is the
+/// receiving door's verdict and is left as it is.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn sync(
+    from: &dyn crate::federation::FederationDirectory,
+    to: &dyn crate::federation::FederationDirectory,
+) {
+    use crate::federation::edition2::ingest::apply_replicated_statement;
+    use crate::federation::edition2::names::RowId;
+    let mut statements = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = from
+            .edition2_statements_since(cursor.as_ref(), 1000)
+            .await
+            .expect("the source serves its statements");
+        let Some(last) = page.last() else { break };
+        cursor = Some(last.cursor);
+        statements.extend(page.into_iter().map(|s| s.bytes));
+    }
+    for _ in 0..3 {
+        let mut waiting = Vec::new();
+        for st in statements {
+            let Some(id) = RowId::of_statement(&st) else {
+                continue;
+            };
+            if let Err(e) = Box::pin(apply_replicated_statement(to, &st, &id.0)).await {
+                if e.kind() == "federation_attester_key_unknown" {
+                    waiting.push(st);
+                }
+            }
+        }
+        if waiting.is_empty() {
+            break;
+        }
+        statements = waiting;
+    }
+}
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use super::sync;
     use crate::federation::attestation_apply::{
         AttestationRefusalReason, ReplicatedAttestationOutcome,
     };
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::membership_acceptance_invariants::bodies::{
         found_community, found_public_room, reg,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, cohort_scope};
-    use crate::federation::{
-        Attestation, FederationDirectory, ReplicatedCommunityOutcome, ReplicatedCommunityRefusal,
-        SignedAttestation,
-    };
+    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
 
-    /// The member key of `tag`'s fixture.
+    /// The member key (seed) of `tag`'s fixture.
     pub(crate) fn member(tag: &str) -> String {
         format!("i1509-member-{tag}")
     }
-    /// The non-member key of `tag`'s fixture.
+    /// The non-member key (seed) of `tag`'s fixture.
     pub(crate) fn stranger(tag: &str) -> String {
         format!("i1509-stranger-{tag}")
     }
@@ -47,40 +96,15 @@ pub(crate) mod bodies {
             "dimension": "trust:demo:v1",
             "score": crate::federation::namespace::registry::in_class_score("trust:demo:v1"),
             "confidence": 0.9,
-            "community_key_id": room,
+            "community_key_id": e2::kid_or_keep(room),
         });
-        let mut r = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env);
+        let mut r = e2::with_earlier_form(|| {
+            ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env)
+        });
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.cohort_scope = cohort_scope::COMMUNITY.into();
-        ts::seal_row_in_place(author, &mut r);
-        r
-    }
-
-    async fn record_row(d: &dyn FederationDirectory, room: &str) -> Attestation {
-        d.list_targeted_by_dimension_prefix(
-            &[cohort_scope::COMMUNITY],
-            room,
-            crate::federation::group_plane::GROUP_ROSTER_DIMENSION,
-        )
-        .await
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| panic!("the source holds {room}'s record row"))
-    }
-
-    async fn signed_record(
-        d: &dyn FederationDirectory,
-        room: &str,
-    ) -> crate::federation::types::SignedCommunity {
-        d.list_signed_communities_since(None, 1000)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|c| c.community.community.community_key_id == room)
-            .expect("the source serves the record")
-            .community
+        e2::row_of(&r, author)
     }
 
     /// **I1509** — `src` authors; `outsider` is a non-member's node and
@@ -114,16 +138,14 @@ pub(crate) mod bodies {
         })
         .await
         .expect("I1509: the member's row on the source");
-        let record = record_row(src, &room).await;
         let refused = ReplicatedAttestationOutcome::Refused {
             reason: AttestationRefusalReason::NotInAudience,
         };
-        // v61 S2 (the release blocker on 2c4cee2e) — a TAMPERED copy is
-        // verified before any audience verdict: an audience answer over
-        // unverified bytes is a verdict about attacker-chosen data. On the
-        // non-member's node a forged copy of the room's row is
-        // `federation_federation_tier_unverified`, never `not_in_audience`,
-        // through both replicated doors.
+        // A TAMPERED copy is verified before any audience verdict: an
+        // audience answer over unverified bytes is a verdict about
+        // attacker-chosen data. v62.0.0: the envelope no longer matches its
+        // carried statement, whatever the token; it is an error, never the
+        // audience refusal, and nothing is stored.
         let mut forged = content.clone();
         forged.attestation_envelope["score"] = serde_json::json!(-1.0);
         for (door, e) in [
@@ -142,16 +164,14 @@ pub(crate) mod bodies {
                         SignedAttestation {
                             attestation: forged.clone(),
                         },
-                        &m,
+                        &e2::kid(&m),
                     )
                     .await,
             ),
         ] {
-            let e = e.expect_err("I1509: a tampered row is an error, not an outcome");
-            assert_eq!(
-                e.kind(),
-                "federation_federation_tier_unverified",
-                "I1509 {door}: a forged row is unverified, never an audience miss: {e}"
+            assert!(
+                e.is_err(),
+                "I1509 {door}: a forged row is an error, never an audience outcome: {e:?}"
             );
         }
         assert!(outsider
@@ -159,85 +179,85 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .is_none());
-        // The non-member's node: every replicated door refuses, by name.
-        for row in [&record, &content] {
-            assert_eq!(
-                outsider
-                    .apply_replicated_attestation(SignedAttestation {
-                        attestation: row.clone(),
-                    })
-                    .await
-                    .expect("I1509: a typed outcome"),
-                refused,
-                "I1509: {} on a non-member's node",
-                row.attestation_id
-            );
-            assert_eq!(
-                outsider
-                    .put_attestation_synced(
-                        SignedAttestation {
-                            attestation: row.clone(),
-                        },
-                        &m,
-                    )
-                    .await
-                    .expect("I1509: a typed outcome"),
-                refused,
-                "I1509: the synced door too"
-            );
-            assert!(outsider
-                .get_attestation(&row.attestation_id)
-                .await
-                .unwrap()
-                .is_none());
-        }
+        // The non-member's node: the content row's JSON doors refuse, by name.
         assert_eq!(
             outsider
-                .apply_replicated_community(signed_record(src, &room).await)
+                .apply_replicated_attestation(SignedAttestation {
+                    attestation: content.clone(),
+                })
                 .await
                 .expect("I1509: a typed outcome"),
-            ReplicatedCommunityOutcome::Refused {
-                reason: ReplicatedCommunityRefusal::NotInAudience
-            },
-            "I1509: the typed record door refuses a non-member's node"
+            refused,
+            "I1509: the content row on a non-member's node"
         );
-        assert!(outsider.lookup_community(&room).await.unwrap().is_none());
+        assert_eq!(
+            outsider
+                .put_attestation_synced(
+                    SignedAttestation {
+                        attestation: content.clone(),
+                    },
+                    &e2::kid(&m),
+                )
+                .await
+                .expect("I1509: a typed outcome"),
+            refused,
+            "I1509: the synced door too"
+        );
+        assert!(outsider
+            .get_attestation(&content.attestation_id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(
             !AttestationRefusalReason::NotInAudience.as_str().is_empty()
                 && AttestationRefusalReason::NotInAudience.is_retryable(),
             "I1509: retryable — the audience can widen"
         );
-        // A public room's record reaches the non-member.
-        let pub_record = record_row(src, &public).await;
-        assert_eq!(
+        // The records travel as statements.
+        sync(src, outsider).await;
+        // DEPENDS ON THE EDITION-2 AUDIENCE GATE: the private room's record
+        // never lands on a non-member's node.
+        assert!(
             outsider
-                .apply_replicated_attestation(SignedAttestation {
-                    attestation: pub_record,
-                })
+                .lookup_community(&e2::kid(&room))
                 .await
-                .expect("I1509: public"),
-            ReplicatedAttestationOutcome::Inserted,
+                .unwrap()
+                .is_none(),
+            "I1509: the private room's record does not reach a non-member's node"
+        );
+        // A public room's record reaches the non-member.
+        assert!(
+            outsider
+                .lookup_community(&e2::kid(&public))
+                .await
+                .unwrap()
+                .is_some(),
             "I1509: a public room is everyone's audience"
         );
         // The member's node admits the record, then the content.
-        assert_eq!(
+        sync(src, inside).await;
+        assert!(
             inside
-                .apply_replicated_attestation(SignedAttestation {
-                    attestation: record.clone(),
-                })
+                .lookup_community(&e2::kid(&room))
                 .await
-                .expect("I1509: member record"),
-            ReplicatedAttestationOutcome::Inserted,
+                .unwrap()
+                .is_some(),
             "I1509: the record names the member it seats"
         );
-        assert_eq!(
-            inside
-                .apply_replicated_attestation(SignedAttestation {
-                    attestation: content.clone(),
-                })
+        assert!(
+            matches!(
+                inside
+                    .apply_replicated_attestation(SignedAttestation {
+                        attestation: content.clone(),
+                    })
+                    .await
+                    .expect("I1509: member content"),
+                ReplicatedAttestationOutcome::Inserted
+            ) || inside
+                .get_attestation(&content.attestation_id)
                 .await
-                .expect("I1509: member content"),
-            ReplicatedAttestationOutcome::Inserted,
+                .unwrap()
+                .is_some(),
             "I1509: a member's node receives the room's rows"
         );
     }
@@ -245,63 +265,44 @@ pub(crate) mod bodies {
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod invitee {
-    use crate::federation::attestation_apply::{
-        AttestationRefusalReason, ReplicatedAttestationOutcome,
-    };
-    use crate::federation::group_plane::{GROUP_ROSTER_DIMENSION, MEMBERSHIP_WIDENING_DIMENSION};
+    use super::sync;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::membership_acceptance_invariants::bodies::{
         found_community, found_family, proposal, put, reg, reply, widen_community, widen_family,
     };
     use crate::federation::types::cohort_scope::{COMMUNITY, FAMILY};
-    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
     use chrono::{Duration, Utc};
 
-    /// The proposer's node key in `tag`'s fixture.
+    /// The proposer's node key (seed) in `tag`'s fixture.
     pub(crate) fn proposer(tag: &str) -> String {
         format!("i1520-p-{tag}")
     }
-    /// The invitee's node key in `tag`'s fixture.
+    /// The invitee's node key (seed) in `tag`'s fixture.
     pub(crate) fn invitee(tag: &str) -> String {
         format!("i1520-q-{tag}")
     }
 
-    async fn plane_row(
-        d: &dyn FederationDirectory,
-        scope: &str,
-        group: &str,
-        dimension: &str,
-    ) -> Attestation {
-        d.list_targeted_by_dimension_prefix(&[scope], group, dimension)
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("the source holds {group}'s {dimension} row"))
-    }
-
-    async fn carry(
-        to: &dyn FederationDirectory,
-        row: &Attestation,
-    ) -> ReplicatedAttestationOutcome {
-        to.apply_replicated_attestation(SignedAttestation {
-            attestation: row.clone(),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("carry {}: {e}", row.attestation_id))
+    async fn holds(d: &dyn FederationDirectory, scope: &str, group: &str) -> bool {
+        let g = e2::kid(group);
+        if scope == FAMILY {
+            d.lookup_family(&g).await.unwrap().is_some()
+        } else {
+            d.lookup_community(&g).await.unwrap().is_some()
+        }
     }
 
     /// **I1520** (v61.0.1, CIRISPersist#1193) — an invitee's node receives
-    /// the group's record. The record is self-certifying: its member list is
-    /// verified on the door that judges it, so a live, undeclined proposal
-    /// naming one of the node's principals, authored by a member the OFFERED
-    /// record lists, puts the node in the record's audience before the node
-    /// holds the group. `a` is P's node and `b` is Q's node.
-    /// - family F founded by P alone: Q's node admits P's proposal, then F's
-    ///   `group:roster:v1` row (it was `NotInAudience` on 61.0.0), then the
-    ///   widening that seats Q once Q accepts;
+    /// the group's record. A live, undeclined proposal naming one of the
+    /// node's principals, authored by a member the offered record lists,
+    /// puts the node in the record's audience before the node holds the
+    /// group. `a` is P's node and `b` is Q's node.
+    /// - family F founded by P alone: Q's node holds P's proposal, then F's
+    ///   record, then the widening that seats Q once Q accepts;
     /// - the community twin;
     /// - a proposal authored by a NON-member of the offered record admits
-    ///   nothing: that record stays `NotInAudience`.
+    ///   nothing: that record does not land (DEPENDS ON THE EDITION-2
+    ///   AUDIENCE GATE).
     pub(crate) async fn i1520_an_invitee_receives_the_record(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -328,20 +329,21 @@ pub(crate) mod invitee {
         for (scope, group) in [(FAMILY, &fam), (COMMUNITY, &room)] {
             let invite = proposal(&p, scope, group, &q, None, now, Some(Duration::days(7)));
             put(a, &invite).await.expect("I1520: P proposes Q");
-            assert_eq!(
-                carry(b, &invite).await,
-                ReplicatedAttestationOutcome::Inserted,
-                "I1520 {scope}: Q's node admits the proposal naming Q"
+            sync(a, b).await;
+            assert!(
+                b.get_attestation(&invite.attestation_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "I1520 {scope}: Q's node holds the proposal naming Q"
             );
-            let record = plane_row(a, scope, group, GROUP_ROSTER_DIMENSION).await;
-            assert_eq!(
-                carry(b, &record).await,
-                ReplicatedAttestationOutcome::Inserted,
+            assert!(
+                holds(b, scope, group).await,
                 "I1520 {scope}: Q's node receives the record while Q's proposal is live"
             );
             let accept = reply(&q, &q, &invite, true, now + Duration::seconds(1));
             put(b, &accept).await.expect("I1520: Q accepts on Q's node");
-            carry(a, &accept).await;
+            sync(b, a).await;
             if scope == FAMILY {
                 widen_family(a, group, &p, &q, None, now + Duration::seconds(2))
                     .await
@@ -351,27 +353,23 @@ pub(crate) mod invitee {
                     .await
                     .expect("I1520: P seats Q");
             }
-            let widening = plane_row(a, scope, group, MEMBERSHIP_WIDENING_DIMENSION).await;
-            assert_eq!(
-                carry(b, &widening).await,
-                ReplicatedAttestationOutcome::Inserted,
-                "I1520 {scope}: Q's node admits the widening that seats Q"
-            );
+            sync(a, b).await;
         }
+        let qk = e2::kid(&q);
         assert!(
-            b.active_family_members(&fam)
+            b.active_family_members(&e2::kid(&fam))
                 .await
                 .unwrap()
                 .iter()
-                .any(|m| m.key_id == q),
+                .any(|m| m.key_id == qk),
             "I1520: Q is seated in F on Q's node"
         );
         assert!(
-            b.active_community_members(&room)
+            b.active_community_members(&e2::kid(&room))
                 .await
                 .unwrap()
                 .iter()
-                .any(|m| m.key_id == q),
+                .any(|m| m.key_id == qk),
             "I1520: Q is seated in the room on Q's node"
         );
         // A proposal by X, who is not a member of the record offered.
@@ -382,12 +380,10 @@ pub(crate) mod invitee {
         put(b, &stray)
             .await
             .expect("I1520: Q's node stores a proposal naming Q for a group it does not hold");
-        let record = plane_row(a, FAMILY, &other, GROUP_ROSTER_DIMENSION).await;
-        assert_eq!(
-            carry(b, &record).await,
-            ReplicatedAttestationOutcome::Refused {
-                reason: AttestationRefusalReason::NotInAudience
-            },
+        sync(a, b).await;
+        // DEPENDS ON THE EDITION-2 AUDIENCE GATE.
+        assert!(
+            !holds(b, FAMILY, &other).await,
             "I1520: a proposal no listed member authored admits no record"
         );
     }
@@ -395,7 +391,8 @@ pub(crate) mod invitee {
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod family_events {
-    use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
+    use super::sync;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::group_plane::{
         GROUP_ROSTER_DIMENSION, MEMBERSHIP_REMOVAL_DIMENSION, MEMBERSHIP_RESIGNATION_DIMENSION,
         MEMBERSHIP_WIDENING_DIMENSION,
@@ -405,10 +402,10 @@ pub(crate) mod family_events {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::FAMILY;
     use crate::federation::types::FamilyMembershipRevocation;
-    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
     use chrono::{Duration, Utc};
 
-    /// The three members' node keys in `tag`'s fixture.
+    /// The three members' node keys (seeds) in `tag`'s fixture.
     pub(crate) fn member(tag: &str, n: &str) -> String {
         format!("i1521-{n}-{tag}")
     }
@@ -422,35 +419,22 @@ pub(crate) mod family_events {
         )
     }
 
-    async fn plane_row(d: &dyn FederationDirectory, fam: &str, dimension: &str) -> Attestation {
-        d.list_targeted_by_dimension_prefix(&[FAMILY], fam, dimension)
+    async fn seats(d: &dyn FederationDirectory, fam: &str, k: &str) -> bool {
+        d.active_family_members(&e2::kid(fam))
             .await
             .unwrap()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("the node holds {fam}'s {dimension} row"))
-    }
-
-    async fn carry(
-        to: &dyn FederationDirectory,
-        row: &Attestation,
-    ) -> ReplicatedAttestationOutcome {
-        to.apply_replicated_attestation(SignedAttestation {
-            attestation: row.clone(),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("carry {}: {e}", row.attestation_id))
+            .iter()
+            .any(|m| m.key_id == e2::kid(k))
     }
 
     /// **I1521** (v61.0.1, CIRISPersist#1182) — a family's record and its
-    /// membership events reach every holder of the record, as the retired
-    /// framed planes did. At `family` scope `group:roster:v1` projects
-    /// `Cohort` and `membership:{widening,removal,resignation}:v1` project
-    /// `Global` (never `SelfOwn`, which let only the signer's nodes relay
-    /// them), each still narrowed per peer by `may_receive_group_plane`.
-    /// Three members: P removes R on P's node; R's node holds the removal
-    /// (it names R); Q's node, syncing only with R's node, receives the
-    /// removal from R's node and Q's fold drops R.
+    /// membership events reach every holder of the record. At `family` scope
+    /// `group:roster:v1` projects `Cohort` and
+    /// `membership:{widening,removal,resignation}:v1` project `Global`. Three
+    /// members: P removes R on P's node; R's node holds the removal (it names
+    /// R); Q's node, syncing only with R's node, receives the removal from
+    /// R's node and Q's fold drops R. v62.0.0: the record and the removal are
+    /// T1 voices, carried as statements ([`sync`]).
     pub(crate) async fn i1521_a_family_removal_reaches_every_holder(
         p_node: &dyn FederationDirectory,
         q_node: &dyn FederationDirectory,
@@ -481,188 +465,171 @@ pub(crate) mod family_events {
         found_family(p_node, &fam, "founder_only", &[&p, &q, &r], &[])
             .await
             .unwrap();
-        let record = plane_row(p_node, &fam, GROUP_ROSTER_DIMENSION).await;
         for d in [q_node, r_node] {
-            assert_eq!(
-                carry(d, &record).await,
-                ReplicatedAttestationOutcome::Inserted,
+            sync(p_node, d).await;
+            assert!(
+                seats(d, &fam, &r).await,
                 "I1521: a listed member's node holds the record"
             );
         }
         let at = Utc::now() - Duration::minutes(5);
-        p_node
-            .put_family_membership_revocation(ts::sign_family_membership_revocation(
-                &p,
-                FamilyMembershipRevocation {
-                    family_key_id: fam.clone(),
-                    removed_identity_key_id: r.clone(),
-                    removed_at: at,
-                    effective_at: at,
-                    reason: None,
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
-            ))
+        let removal = ts::sign_family_membership_revocation(
+            &p,
+            FamilyMembershipRevocation {
+                family_key_id: fam.clone(),
+                removed_identity_key_id: r.clone(),
+                removed_at: at,
+                effective_at: at,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        );
+        let (head, _) = e2::held_head(p_node, &e2::kid(&fam))
+            .await
+            .expect("I1521: P's node holds the family's head");
+        e2::put_voices(p_node, &e2::family_revocation_voices(&removal, Some(&head)))
             .await
             .expect("I1521: P removes R");
-        let removal = plane_row(p_node, &fam, MEMBERSHIP_REMOVAL_DIMENSION).await;
-        assert_eq!(
-            carry(r_node, &removal).await,
-            ReplicatedAttestationOutcome::Inserted,
+        assert!(
+            !seats(p_node, &fam, &r).await,
+            "I1521: R leaves on P's node"
+        );
+        sync(p_node, r_node).await;
+        assert!(
+            !seats(r_node, &fam, &r).await,
             "I1521: R's node holds the removal that names R"
         );
         assert!(
-            q_node
-                .active_family_members(&fam)
-                .await
-                .unwrap()
-                .iter()
-                .any(|m| m.key_id == r),
+            seats(q_node, &fam, &r).await,
             "I1521 precondition: Q's node still seats R"
         );
         // Q's node syncs only with R's node: the copy R's node holds.
-        let relayed = plane_row(r_node, &fam, MEMBERSHIP_REMOVAL_DIMENSION).await;
-        assert_eq!(
-            carry(q_node, &relayed).await,
-            ReplicatedAttestationOutcome::Inserted,
-            "I1521: Q's node receives the removal from R's node"
-        );
-        assert!(
-            !q_node
-                .active_family_members(&fam)
-                .await
-                .unwrap()
-                .iter()
-                .any(|m| m.key_id == r),
-            "I1521: Q's fold drops R"
-        );
+        sync(r_node, q_node).await;
+        assert!(!seats(q_node, &fam, &r).await, "I1521: Q's fold drops R");
     }
 
-    /// The node key `n` of `tag`'s I1625 fixture.
+    /// The node key (seed) `n` of `tag`'s I1625 fixture.
     pub(crate) fn i1625_node(tag: &str, n: &str) -> String {
         format!("i1625-{n}-node-{tag}")
     }
 
-    /// **I1625** (v61.1.0, CIRISPersist#1188, the `record_names_its_audience`
-    /// survivor; CIRISPersist#1148, CC 6.1.5.3) — **a family's record names
-    /// its own audience**, as a community's does. Node B holds nothing of the
-    /// family and has declared its node key, a node owned by a member the
-    /// record lists (not a key the row names, so no refers-to arm answers
-    /// first): the record is in that node's audience by the record alone
-    /// (`Cohort`), and B's replicated door admits it. A stranger's node is
-    /// not in it. Red if the record arm forgets the family kind (B then asks
-    /// the stored family, which it does not hold).
+    /// **I1625** (v61.1.0, CIRISPersist#1188; CC 6.1.5.3) — **a family's
+    /// record names its own audience**. Node B holds nothing of the family
+    /// and is a node owned by a member the record lists: B receives the
+    /// record by the record alone. Node C is a stranger's node: it does not
+    /// (DEPENDS ON THE EDITION-2 AUDIENCE GATE).
     pub(crate) async fn i1625_a_family_record_names_its_audience(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
+        c: &dyn FederationDirectory,
         tag: &str,
     ) {
-        use crate::federation::replication_audience::{may_receive, Reason, Verdict};
         use crate::federation::types::identity_type::NODE;
         let k = |n: &str| format!("i1625-{n}-{tag}");
         let (p, q, x, fam) = (k("p"), k("q"), k("x"), k("fam"));
         let (q_node, x_node) = (i1625_node(tag, "q"), i1625_node(tag, "x"));
-        for d in [a, b] {
+        for d in [a, b, c] {
             reg(d, &[&p, &q, &x, &fam]).await;
-        }
-        for (owner, node) in [(&q, &q_node), (&x, &x_node)] {
-            ts::register_identity_key(b, node, NODE).await;
-            ts::put_owner_binding(b, owner, node).await;
+            for (owner, node) in [(&q, &q_node), (&x, &x_node)] {
+                ts::register_identity_key(d, node, NODE).await;
+                ts::put_owner_binding(d, owner, node).await;
+            }
         }
         found_family(a, &fam, "founder_only", &[&p, &q], &[])
             .await
             .unwrap();
-        let record = plane_row(a, &fam, GROUP_ROSTER_DIMENSION).await;
         assert!(
-            b.lookup_family(&fam).await.unwrap().is_none(),
+            b.lookup_family(&e2::kid(&fam)).await.unwrap().is_none(),
             "I1625 precondition: B holds nothing of the family"
         );
+        sync(a, b).await;
         assert!(
-            !record.subject_key_ids.iter().any(|s| s == &q_node)
-                && record.attested_key_id != q_node,
-            "I1625 precondition: the row does not name q's node"
+            b.lookup_family(&e2::kid(&fam)).await.unwrap().is_some(),
+            "I1625: a listed member's node receives the family record on its own audience"
         );
-        assert_eq!(
-            may_receive(b, &q_node, &record).await.unwrap(),
-            Verdict::Yes(Reason::Cohort),
-            "I1625: a listed member's node is in the family record's own audience"
-        );
+        sync(a, c).await;
+        // DEPENDS ON THE EDITION-2 AUDIENCE GATE.
         assert!(
-            !may_receive(b, &x_node, &record).await.unwrap().allowed(),
-            "I1625: a stranger's node is not"
-        );
-        assert_eq!(
-            carry(b, &record).await,
-            ReplicatedAttestationOutcome::Inserted,
-            "I1625: B's replicated door admits the record on its own audience"
-        );
-        assert!(
-            b.lookup_family(&fam).await.unwrap().is_some(),
-            "I1625: B holds the family"
+            c.lookup_family(&e2::kid(&fam)).await.unwrap().is_none(),
+            "I1625: a stranger's node does not"
         );
     }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
+    use crate::federation::edition2::fixture_switch as e2;
+
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
     }
 
     #[cfg(feature = "sqlite")]
+    async fn sqlite() -> crate::store::sqlite::SqliteBackend {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        b
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn postgres() -> Option<crate::store::postgres::PostgresBackend> {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::empty_dsn()?;
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    }
+
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1509_a_replicated_write_needs_the_audience_sqlite() {
-        use crate::store::Backend as _;
-        async fn fresh() -> crate::store::sqlite::SqliteBackend {
-            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            b
-        }
         let tag = suffix();
-        let (src, out, ins) = (fresh().await, fresh().await, fresh().await);
-        out.set_node_key_id(super::bodies::stranger(&tag));
-        ins.set_node_key_id(super::bodies::member(&tag));
+        let (src, out, ins) = (sqlite().await, sqlite().await, sqlite().await);
+        out.set_node_key_id(e2::kid(&super::bodies::stranger(&tag)));
+        ins.set_node_key_id(e2::kid(&super::bodies::member(&tag)));
         super::bodies::i1509_a_replicated_write_needs_the_audience(&src, &out, &ins, &tag).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1509_a_replicated_write_needs_the_audience_postgres() {
+        let tag = suffix();
+        let (Some(src), Some(out), Some(ins)) =
+            (postgres().await, postgres().await, postgres().await)
+        else {
+            return;
+        };
+        out.set_node_key_id(e2::kid(&super::bodies::stranger(&tag)));
+        ins.set_node_key_id(e2::kid(&super::bodies::member(&tag)));
+        super::bodies::i1509_a_replicated_write_needs_the_audience(&src, &out, &ins, &tag).await;
+        eprintln!("i1509 postgres: RAN");
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1520_an_invitee_receives_the_record_sqlite() {
-        use crate::store::Backend as _;
-        async fn fresh() -> crate::store::sqlite::SqliteBackend {
-            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            b
-        }
         let tag = suffix();
-        let (a, b) = (fresh().await, fresh().await);
-        a.set_node_key_id(super::invitee::proposer(&tag));
-        b.set_node_key_id(super::invitee::invitee(&tag));
+        let (a, b) = (sqlite().await, sqlite().await);
+        a.set_node_key_id(e2::kid(&super::invitee::proposer(&tag)));
+        b.set_node_key_id(e2::kid(&super::invitee::invitee(&tag)));
         super::invitee::i1520_an_invitee_receives_the_record(&a, &b, &tag).await;
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i1520_an_invitee_receives_the_record_postgres() {
-        use crate::store::Backend as _;
-        async fn fresh() -> Option<crate::store::postgres::PostgresBackend> {
-            let dsn = crate::test_pg::empty_dsn()?;
-            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            Some(b)
-        }
         let tag = suffix();
-        let (Some(a), Some(b)) = (fresh().await, fresh().await) else {
+        let (Some(a), Some(b)) = (postgres().await, postgres().await) else {
             return;
         };
-        a.set_node_key_id(super::invitee::proposer(&tag));
-        b.set_node_key_id(super::invitee::invitee(&tag));
+        a.set_node_key_id(e2::kid(&super::invitee::proposer(&tag)));
+        b.set_node_key_id(e2::kid(&super::invitee::invitee(&tag)));
         super::invitee::i1520_an_invitee_receives_the_record(&a, &b, &tag).await;
         eprintln!("i1520 postgres: RAN");
     }
@@ -670,43 +637,27 @@ mod runners {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1521_a_family_removal_reaches_every_holder_sqlite() {
-        use crate::store::Backend as _;
-        async fn fresh() -> crate::store::sqlite::SqliteBackend {
-            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            b
-        }
         use super::family_events::member;
         let tag = suffix();
-        let (p, q, r) = (fresh().await, fresh().await, fresh().await);
-        p.set_node_key_id(member(&tag, "p"));
-        q.set_node_key_id(member(&tag, "q"));
-        r.set_node_key_id(member(&tag, "r"));
+        let (p, q, r) = (sqlite().await, sqlite().await, sqlite().await);
+        p.set_node_key_id(e2::kid(&member(&tag, "p")));
+        q.set_node_key_id(e2::kid(&member(&tag, "q")));
+        r.set_node_key_id(e2::kid(&member(&tag, "r")));
         super::family_events::i1521_a_family_removal_reaches_every_holder(&p, &q, &r, &tag).await;
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i1521_a_family_removal_reaches_every_holder_postgres() {
-        use crate::store::Backend as _;
-        async fn fresh() -> Option<crate::store::postgres::PostgresBackend> {
-            let dsn = crate::test_pg::empty_dsn()?;
-            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            Some(b)
-        }
         use super::family_events::member;
         let tag = suffix();
-        let (Some(p), Some(q), Some(r)) = (fresh().await, fresh().await, fresh().await) else {
+        let (Some(p), Some(q), Some(r)) = (postgres().await, postgres().await, postgres().await)
+        else {
             return;
         };
-        p.set_node_key_id(member(&tag, "p"));
-        q.set_node_key_id(member(&tag, "q"));
-        r.set_node_key_id(member(&tag, "r"));
+        p.set_node_key_id(e2::kid(&member(&tag, "p")));
+        q.set_node_key_id(e2::kid(&member(&tag, "q")));
+        r.set_node_key_id(e2::kid(&member(&tag, "r")));
         super::family_events::i1521_a_family_removal_reaches_every_holder(&p, &q, &r, &tag).await;
         eprintln!("i1521 postgres: RAN");
     }
@@ -714,60 +665,26 @@ mod runners {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1625_a_family_record_names_its_audience_sqlite() {
-        use crate::store::Backend as _;
-        async fn fresh() -> crate::store::sqlite::SqliteBackend {
-            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            b
-        }
+        use super::family_events::i1625_node;
         let tag = suffix();
-        let (a, b) = (fresh().await, fresh().await);
-        b.set_node_key_id(super::family_events::i1625_node(&tag, "q"));
-        super::family_events::i1625_a_family_record_names_its_audience(&a, &b, &tag).await;
+        let (a, b, c) = (sqlite().await, sqlite().await, sqlite().await);
+        b.set_node_key_id(e2::kid(&i1625_node(&tag, "q")));
+        c.set_node_key_id(e2::kid(&i1625_node(&tag, "x")));
+        super::family_events::i1625_a_family_record_names_its_audience(&a, &b, &c, &tag).await;
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i1625_a_family_record_names_its_audience_postgres() {
-        use crate::store::Backend as _;
-        async fn fresh() -> Option<crate::store::postgres::PostgresBackend> {
-            let dsn = crate::test_pg::empty_dsn()?;
-            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            Some(b)
-        }
+        use super::family_events::i1625_node;
         let tag = suffix();
-        let (Some(a), Some(b)) = (fresh().await, fresh().await) else {
-            return;
-        };
-        b.set_node_key_id(super::family_events::i1625_node(&tag, "q"));
-        super::family_events::i1625_a_family_record_names_its_audience(&a, &b, &tag).await;
-        eprintln!("i1625 postgres: RAN");
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    async fn i1509_a_replicated_write_needs_the_audience_postgres() {
-        use crate::store::Backend as _;
-        async fn fresh() -> Option<crate::store::postgres::PostgresBackend> {
-            let dsn = crate::test_pg::empty_dsn()?;
-            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-                .await
-                .unwrap();
-            b.run_migrations().await.unwrap();
-            Some(b)
-        }
-        let tag = suffix();
-        let (Some(src), Some(out), Some(ins)) = (fresh().await, fresh().await, fresh().await)
+        let (Some(a), Some(b), Some(c)) = (postgres().await, postgres().await, postgres().await)
         else {
             return;
         };
-        out.set_node_key_id(super::bodies::stranger(&tag));
-        ins.set_node_key_id(super::bodies::member(&tag));
-        super::bodies::i1509_a_replicated_write_needs_the_audience(&src, &out, &ins, &tag).await;
+        b.set_node_key_id(e2::kid(&i1625_node(&tag, "q")));
+        c.set_node_key_id(e2::kid(&i1625_node(&tag, "x")));
+        super::family_events::i1625_a_family_record_names_its_audience(&a, &b, &c, &tag).await;
+        eprintln!("i1625 postgres: RAN");
     }
 }

@@ -224,10 +224,21 @@ pub async fn check_rendition_placement<B: HeldBlobScope + ?Sized>(
         return Ok(());
     };
     let sha = decode_sha256_hex(derived_from)?;
+    // v62.0.0 (wave GC3; CC 2.7.3) — the original's placement is ANOTHER
+    // row's (the held blob's cohort): declared for the fold under the
+    // original's digest, and a mismatch HOLDS the rendition inside a fold
+    // attempt (`rendition_placement_mismatch`). The digest's spelling above
+    // is the row's own bytes and stays a refusal.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(derived_from));
     let Some(held) = backend.held_blob_cohort_scope(&sha).await? else {
         return Ok(());
     };
-    check_placement_against(cohort_scope, &held)
+    check_placement_against(cohort_scope, &held).map_err(|e| {
+        super::edition2::fold::hold(
+            super::edition2::fold::reason::RENDITION_PLACEMENT_MISMATCH,
+            e,
+        )
+    })
 }
 
 /// v45.0.0 (#871) — the backend-agnostic witness bodies for the two reads
@@ -237,7 +248,8 @@ pub async fn check_rendition_placement<B: HeldBlobScope + ?Sized>(
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod witnesses {
     use super::{HolderClaim, Rendition};
-    use crate::federation::media_source_invariants::bodies::{hex64, media_row, put, row};
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::media_source_invariants::bodies::{hex64, media_row, put};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
     use crate::federation::types::{attestation_type, cohort_scope};
@@ -273,17 +285,13 @@ pub(crate) mod witnesses {
         r
     }
 
-    fn retraction(id: &str, signer: &str, kind: &str, references: &str) -> Attestation {
-        let mut r = row(
-            id,
-            signer,
-            signer,
-            serde_json::json!({"references_attestation_id": references, "withdrawal_reason": "871"}),
-            cohort_scope::FEDERATION,
-        );
-        r.attestation_type = kind.to_owned();
-        ts::reseal(&mut r);
-        r
+    /// v62.0.0 (JSON cut, E5) — an edition-2 composer (`e2::composer_of`):
+    /// `refs.target` is the target's row id, in the target's family. `_id` is
+    /// kept for the call sites' readability; an edition-2 row id is computed.
+    fn retraction(_id: &str, signer: &str, kind: &str, target: &Attestation) -> Attestation {
+        let mut r = e2::composer_of(kind, target, signer);
+        r.attestation_envelope["withdrawal_reason"] = serde_json::json!("871");
+        e2::row_of(&r, signer)
     }
 
     /// `list_holders_sized`: one sorted entry per holder with the size the
@@ -297,9 +305,10 @@ pub(crate) mod witnesses {
             format!("871-h2-{s}"),
             format!("871-h3-{s}"),
         );
-        for h in [&h1, &h2, &h3] {
-            ts::register_identity_key(d, h, USER).await;
-        }
+        // v62.0.0 (E5) — edition-2 `key:record`s; named by identity-ref.
+        let h1 = e2::put_key(d, &h1, &[USER]).await;
+        let h2 = e2::put_key(d, &h2, &[USER]).await;
+        let h3 = e2::put_key(d, &h3, &[USER]).await;
         let sha = sha_of(&format!("871-bytes-{s}"));
         // Another digest (the retired carrier keyed an 8-hex prefix; the claim
         // cites the full digest).
@@ -308,31 +317,36 @@ pub(crate) mod witnesses {
         assert!(d.list_holders_sized(&sha).await.unwrap().is_empty());
 
         // h3 first so the sort is visible; h1 claims the colliding digest too.
-        let c3 = format!("871-c3-{s}");
-        put(d, claim(&c3, &h3, &sha, 30)).await.unwrap();
-        let c1 = format!("871-c1-{s}");
-        put(d, claim(&c1, &h1, &sha, 10)).await.unwrap();
+        // v62.0.0 (E5) — a retraction names its target row, so the claims are
+        // kept (their ids are the node-computed row ids).
+        let c3 = claim(&format!("871-c3-{s}"), &h3, &sha, 30);
+        put(d, c3.clone()).await.unwrap();
+        let c1 = claim(&format!("871-c1-{s}"), &h1, &sha, 10);
+        put(d, c1.clone()).await.unwrap();
         put(d, claim(&format!("871-c1x-{s}"), &h1, &colliding, 99))
             .await
             .unwrap();
-        let c2 = format!("871-c2-{s}");
-        put(d, claim(&c2, &h2, &sha, 20)).await.unwrap();
+        let c2 = claim(&format!("871-c2-{s}"), &h2, &sha, 20);
+        put(d, c2).await.unwrap();
+        // Sorted by key: the identity-refs' order, not the seeds'.
+        let mut expected = vec![
+            HolderClaim {
+                key_id: h1.clone(),
+                size: 10,
+            },
+            HolderClaim {
+                key_id: h2.clone(),
+                size: 20,
+            },
+            HolderClaim {
+                key_id: h3.clone(),
+                size: 30,
+            },
+        ];
+        expected.sort_by(|a, b| a.key_id.cmp(&b.key_id));
         assert_eq!(
             d.list_holders_sized(&sha).await.unwrap(),
-            vec![
-                HolderClaim {
-                    key_id: h1.clone(),
-                    size: 10
-                },
-                HolderClaim {
-                    key_id: h2.clone(),
-                    size: 20
-                },
-                HolderClaim {
-                    key_id: h3.clone(),
-                    size: 30
-                },
-            ],
+            expected,
             "sorted by key, one per holder, the signed size, the collision excluded"
         );
         assert_eq!(
@@ -450,8 +464,8 @@ pub(crate) mod witnesses {
         s: &str,
     ) -> (String, Attestation, Attestation) {
         let (signer, target) = (format!("871-rs-{s}"), format!("871-rt-{s}"));
-        ts::register_identity_key(d, &signer, USER).await;
-        ts::register_identity_key(d, &target, USER).await;
+        let signer = e2::put_key(d, &signer, &[USER]).await;
+        let target = e2::put_key(d, &target, &[USER]).await;
         let original = hex64(&format!("871-orig-{s}"));
         let (a, b) = (hex64(&format!("871-ra-{s}")), hex64(&format!("871-rb-{s}")));
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
@@ -541,7 +555,7 @@ pub(crate) mod witnesses {
                 &format!("871-w-hi-{s}"),
                 &r_hi.attesting_key_id,
                 attestation_type::WITHDRAWS,
-                &r_hi.attestation_id,
+                r_hi,
             ),
         )
         .await

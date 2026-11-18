@@ -22,27 +22,49 @@
 //!   record written before v52.0.0 keeps its bytes and signing envelope.
 
 /// The backend-agnostic bodies.
+///
+/// v62.0.0 (JSON-cut slice E4, flip wave 3; T1.api.md §6) — every version is
+/// its own `group:roster` row: it names the version it extends by
+/// `refs.head`, and each quorum signer is one voice over the same payload.
+/// The door builds the change envelope itself (plus `dissolved_at`) and
+/// counts the voices at the held head's protocol. A version short of the
+/// protocol is KEPT as voices with no new head (`StatementOutcome::Pending`).
+/// B learns a version by receiving the same statements (one entry, local or
+/// replicated). Legs that only an earlier-form proof object could express
+/// (a caller-supplied "quorum", a stored `dissolved_at` the quorum did not
+/// sign, a forged threshold signature under another member id) cannot be
+/// built and are gone (T1 §6 table).
 #[cfg(test)]
 pub mod bodies {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    use crate::federation::cohort::Cohort;
+    use crate::federation::edition2::fixture_switch as e2;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    use crate::federation::edition2::ingest::StatementOutcome;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::tier_ingest::test_support as ts;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::types::identity_type;
     use crate::federation::types::{consensus_protocol, Family, FamilyMember};
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    use crate::federation::{Error, FederationDirectory, SignedFamily};
+    use crate::federation::{Error, FederationDirectory};
 
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().expect("rfc3339")
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn ms(t: chrono::DateTime<chrono::Utc>) -> u64 {
+        u64::try_from(t.timestamp_millis()).expect("after the epoch")
+    }
+
     struct World {
+        /// The family id: an identity-ref (`e2::kid`), as the typed row is
+        /// keyed.
         id: String,
+        /// The members: identity-refs (every seed-taking fixture accepts
+        /// them back).
         keys: Vec<String>,
-        /// v53.0.0 (CC 3.2 T6) — the founding version's hash: every amendment
-        /// below supersedes it and names it as `prev_head_digest`.
+        /// v53.0.0 (CC 3.2 T6) — the founding version's hash.
         founding_hash: String,
     }
 
@@ -69,84 +91,61 @@ pub mod bodies {
         }
     }
 
+    /// The `user` keys (no record end: the fixed 2026 instants stay live)
+    /// and the founding version, on both directories.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn world(a: &dyn FederationDirectory, b: &dyn FederationDirectory, tag: &str) -> World {
         let keys: Vec<String> = ["alice", "bob", "carol"]
             .iter()
-            .map(|n| format!("{n}-{tag}"))
+            .map(|n| e2::kid(&format!("{n}-{tag}")))
             .collect();
         for d in [a, b] {
             for k in &keys {
-                ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+                e2::put_key(d, k, &[identity_type::USER]).await;
             }
         }
         let mut w = World {
-            id: format!("{tag}-fam"),
+            id: e2::kid(&format!("{tag}-fam")),
             keys,
             founding_hash: String::new(),
         };
         let all: Vec<&String> = w.keys.iter().collect();
-        let founding = ts::sign_family(&w.keys[0], family(&w, &all, "household"));
+        let founding = e2::family_voices(
+            &ts::sign_family(&w.keys[0], family(&w, &all, "household")),
+            1,
+            None,
+            ms(at("2026-01-01T00:00:00Z")),
+        );
         for d in [a, b] {
-            d.put_family(founding.clone())
+            e2::put_voices(d, &founding)
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: founding: {e}"));
         }
-        w.founding_hash = a
-            .lookup_family(&w.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .persist_row_hash;
+        w.founding_hash = held(a, &w.id).await.persist_row_hash;
         w
     }
 
-    /// The change envelope for `members` (protocol unchanged), with an
-    /// optional `dissolved_at`, signed by `signers`.
+    /// The next version of `w` as held on `d`: `rec`, one voice per signer,
+    /// naming the held head (T1 §6).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn change(
-        a: &dyn FederationDirectory,
+    async fn version(
+        d: &dyn FederationDirectory,
         w: &World,
-        members: &[&String],
-        dissolved_at: Option<chrono::DateTime<chrono::Utc>>,
+        rec: &Family,
         signers: &[&String],
-    ) -> (
-        serde_json::Value,
-        Vec<ciris_verify_core::threshold::ThresholdSignature>,
-    ) {
-        let ids: Vec<String> = members.iter().map(|k| (*k).clone()).collect();
-        let mut env = a
-            .build_membership_change_envelope(
-                Cohort::Family,
-                &w.id,
-                &ids,
-                false,
-                Some(consensus_protocol::MAJORITY),
-            )
-            .await
-            .expect("build change");
-        if let Some(t) = dissolved_at {
-            env.as_object_mut()
-                .unwrap()
-                .insert("dissolved_at".into(), t.to_rfc3339().into());
-        }
-        let bytes = ciris_verify_core::jcs::canonicalize(&env).unwrap();
-        let sigs = signers
-            .iter()
-            .map(|k| ts::threshold_sign(k, &bytes))
-            .collect();
-        (env, sigs)
-    }
-
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn served(d: &dyn FederationDirectory, id: &str) -> SignedFamily {
-        d.list_signed_families_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.family.family.family_key_id == id)
-            .expect("served family")
-            .family
+        asserted: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<Vec<u8>> {
+        use crate::federation::edition2::group::GroupRecord;
+        let (head, v) = e2::held_head(d, &w.id).await.expect("a held head");
+        let keys: Vec<_> = signers.iter().map(|k| e2::signing_key(k)).collect();
+        let refs: Vec<&_> = keys.iter().collect();
+        e2::roster_voices(
+            &GroupRecord::Family(e2::family_with_kids(rec)),
+            v + 1,
+            Some(&head),
+            ms(asserted),
+            &refs,
+        )
     }
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -159,21 +158,42 @@ pub mod bodies {
         matches!(e, Error::GroupDissolved { .. }) && e.kind() == "federation_group_dissolved"
     }
 
+    /// A version that did NOT move the head: kept short of the protocol
+    /// (`Pending`), or refused by the self-leave arm.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn not_landed(r: Result<StatementOutcome, Error>, what: &str) {
+        match r {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            Ok(other) => panic!("{what}: landed ({other:?})"),
+            Err(e) => {
+                let m = e.to_string();
+                assert!(
+                    m.contains("not authorized") || m.contains("self-leave"),
+                    "{what}: {e}"
+                );
+            }
+        }
+    }
+
     const DISSOLVED: &str = "2026-09-30T12:00:00Z";
 
-    /// Dissolve `w` on `a` with alice + bob (a majority of three).
+    /// The dissolution version of `w` (alice + bob, a majority of three),
+    /// landed on `a`; returns its statements for B.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn dissolve_on_a(a: &dyn FederationDirectory, w: &World, tag: &str) -> SignedFamily {
+    async fn dissolve_on_a(a: &dyn FederationDirectory, w: &World, tag: &str) -> Vec<Vec<u8>> {
         let (alice, bob) = (&w.keys[0], &w.keys[1]);
         let all: Vec<&String> = w.keys.iter().collect();
-        let t = at(DISSOLVED);
-        let (env, sigs) = change(a, w, &all, Some(t), &[alice, bob]).await;
         let mut rec = family(w, &all, "household");
-        rec.dissolved_at = Some(t);
-        a.supersede_family_with_quorum(ts::sign_family(alice, rec), env, sigs)
+        rec.dissolved_at = Some(at(DISSOLVED));
+        let voices = version(a, w, &rec, &[alice, bob], at(DISSOLVED)).await;
+        let out = e2::put_voices(a, &voices)
             .await
             .unwrap_or_else(|e| panic!("{tag}: A's quorum dissolution: {e}"));
-        served(a, &w.id).await
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "{tag}: A's dissolution lands: {out:?}"
+        );
+        voices
     }
 
     /// **I280** — a quorum dissolution replicates.
@@ -186,11 +206,7 @@ pub mod bodies {
         let w = world(a, b, tag).await;
         assert_eq!(a.active_family_members(&w.id).await.unwrap().len(), 3);
         let dissolved = dissolve_on_a(a, &w, tag).await;
-        assert!(
-            dissolved.supersede_proof.is_some(),
-            "{tag} I280: served with its proof"
-        );
-        b.put_family(dissolved)
+        e2::put_voices(b, &dissolved)
             .await
             .unwrap_or_else(|e| panic!("{tag} I280: B applies the dissolution: {e}"));
         for (d, who) in [(a, "A"), (b, "B")] {
@@ -225,37 +241,28 @@ pub mod bodies {
         let t = at(DISSOLVED);
         let mut rec = family(&w, &all, "household");
         rec.dissolved_at = Some(t);
-        // One signature: below the family's majority.
-        let (env, sigs) = change(a, &w, &all, Some(t), &[alice]).await;
-        let e = a
-            .supersede_family_with_quorum(ts::sign_family(alice, rec.clone()), env, sigs)
+        // One voice: below the family's majority — kept, no new head.
+        let out = e2::put_voices(a, &version(a, &w, &rec, &[alice], t).await)
             .await
-            .expect_err("one signature does not dissolve a majority family");
-        assert!(e.to_string().contains("not authorized"), "{tag} I281: {e}");
-        // The plain door: no quorum at all.
-        let e = a
-            .supersede_family(
-                ts::sign_family(alice, rec.clone()),
-                Some(serde_json::json!({ "quorum_signatures": "trust me" })),
-            )
-            .await
-            .expect_err("the plain supersede door never dissolves");
+            .unwrap_or_else(|e| panic!("{tag} I281: a lone voice is kept: {e}"));
         assert!(
-            e.to_string().contains("only a quorum-verified amendment"),
-            "{tag} I281: a caller-supplied authorization is no quorum: {e}"
+            matches!(out, StatementOutcome::Pending { .. }),
+            "{tag} I281: one voice does not dissolve a majority family: {out:?}"
         );
         // A founding record that arrives dissolved.
         let fresh = World {
-            id: format!("{tag}-born-dissolved"),
+            id: e2::kid(&format!("{tag}-born-dissolved")),
             keys: w.keys.clone(),
             founding_hash: String::new(),
         };
         let mut born = family(&fresh, &all, "household");
         born.dissolved_at = Some(t);
-        let e = a
-            .put_family(ts::sign_family(alice, born))
-            .await
-            .expect_err("a family is never founded dissolved");
+        let e = e2::put_voices(
+            a,
+            &e2::family_voices(&ts::sign_family(alice, born), 1, None, ms(t)),
+        )
+        .await
+        .expect_err("a family is never founded dissolved");
         assert!(
             e.to_string().contains("cannot be dissolved"),
             "{tag} I281: {e}"
@@ -263,39 +270,13 @@ pub mod bodies {
         // A dissolution that also renames: not terminal-only.
         let mut renamed = rec.clone();
         renamed.family_name = "renamed on the way out".into();
-        let (env, sigs) = change(a, &w, &all, Some(t), &[alice, bob]).await;
-        let e = a
-            .supersede_family_with_quorum(ts::sign_family(alice, renamed), env, sigs)
+        let e = e2::put_voices(a, &version(a, &w, &renamed, &[alice, bob], t).await)
             .await
             .expect_err("a dissolution changes nothing but dissolved_at");
         assert!(
             e.to_string().contains("changes nothing but dissolved_at"),
             "{tag} I281: {e}"
         );
-        // A dissolved record whose envelope the quorum signed WITHOUT a
-        // dissolution (verify-A-store-B), on A and on B's apply.
-        let (env, sigs) = change(a, &w, &all, None, &[alice, bob]).await;
-        let e = a
-            .supersede_family_with_quorum(ts::sign_family(alice, rec.clone()), env, sigs)
-            .await
-            .expect_err("the stored dissolution is the one the quorum signed");
-        assert!(e.to_string().contains("dissolved_at"), "{tag} I281: {e}");
-        let genuine = change(a, &w, &all, Some(t), &[alice, bob]).await;
-        let mut forged = ts::sign_family(alice, {
-            let mut r = rec.clone();
-            r.dissolved_at = Some(at("2026-10-01T00:00:00Z"));
-            r
-        });
-        forged.supersede_proof = Some(crate::federation::GroupSupersedeProof {
-            prior_persist_row_hash: held(b, &w.id).await.persist_row_hash,
-            change_envelope: genuine.0,
-            quorum_signatures: genuine.1,
-        });
-        let e = b
-            .put_family(forged)
-            .await
-            .expect_err("B refuses a dissolution instant the quorum did not sign");
-        assert!(e.to_string().contains("dissolved_at"), "{tag} I281: {e}");
         for (d, who) in [(a, "A"), (b, "B")] {
             assert!(
                 held(d, &w.id).await.dissolved_at.is_none(),
@@ -315,49 +296,42 @@ pub mod bodies {
         let w = world(a, b, tag).await;
         let (alice, bob, carol) = (&w.keys[0], &w.keys[1], &w.keys[2]);
         let all: Vec<&String> = w.keys.iter().collect();
-        // B applies the dissolution, then is offered a later amendment that
-        // every member signed.
         // Before: a member may place a row at the family.
         a.check_write_cohort_scope_for(alice, "i282", "family", Some(&w.id))
             .await
             .unwrap_or_else(|e| panic!("{tag} I282: a member places a row at a live family: {e}"));
         let dissolved = dissolve_on_a(a, &w, tag).await;
-        b.put_family(dissolved.clone()).await.unwrap();
+        e2::put_voices(b, &dissolved).await.unwrap();
         // After: no row is placed at it, whoever writes it — by name.
         let e = a
             .check_write_cohort_scope_for(alice, "i282", "family", Some(&w.id))
             .await
             .expect_err("no row is placed at a dissolved family");
         assert!(is_dissolved_refusal(&e), "{tag} I282: {e:?}");
-        // The identical dissolved record again: the idempotent no-op.
-        b.put_family(dissolved)
+        // The identical dissolution again: the idempotent no-op.
+        e2::put_voices(b, &dissolved)
             .await
             .unwrap_or_else(|e| panic!("{tag} I282: the identical re-offer is Ok: {e}"));
-        // A further amendment on A, signed by everyone: refused by name.
-        let (env, sigs) = change(a, &w, &all, None, &[alice, bob, carol]).await;
-        let e = a
-            .supersede_family_with_quorum(
-                ts::sign_family(alice, family(&w, &all, "revived")),
-                env.clone(),
-                sigs.clone(),
+        // A further version, voiced by everyone: refused by name, on A and B.
+        let now = chrono::Utc::now();
+        for (d, who) in [(a, "A"), (b, "B")] {
+            let e = e2::put_voices(
+                d,
+                &version(
+                    d,
+                    &w,
+                    &family(&w, &all, "revived"),
+                    &[alice, bob, carol],
+                    now,
+                )
+                .await,
             )
             .await
             .expect_err("a dissolved family admits no amendment");
-        assert!(is_dissolved_refusal(&e), "{tag} I282: {e:?}");
-        // …and on B's apply, the same.
-        let mut revived = ts::sign_family(alice, family(&w, &all, "revived"));
-        revived.supersede_proof = Some(crate::federation::GroupSupersedeProof {
-            prior_persist_row_hash: held(b, &w.id).await.persist_row_hash,
-            change_envelope: env,
-            quorum_signatures: sigs,
-        });
-        let e = b
-            .put_family(revived)
-            .await
-            .expect_err("B refuses an amendment of a dissolved family");
-        assert!(is_dissolved_refusal(&e), "{tag} I282: {e:?}");
+            assert!(is_dissolved_refusal(&e), "{tag} I282 on {who}: {e:?}");
+        }
         // A membership revocation naming the dissolved family.
-        let now = chrono::Utc::now();
+        let (head, _) = e2::held_head(a, &w.id).await.expect("held");
         let rev = ts::sign_family_membership_revocation(
             carol,
             crate::federation::types::FamilyMembershipRevocation {
@@ -370,30 +344,14 @@ pub mod bodies {
                 persist_row_hash: String::new(),
             },
         );
-        let e = a
-            .put_family_membership_revocation(rev)
+        let e = e2::put_voices(a, &e2::family_revocation_voices(&rev, Some(&head)))
             .await
             .expect_err("no roster row names a dissolved family");
         assert!(is_dissolved_refusal(&e), "{tag} I282: {e:?}");
         assert_eq!(held(a, &w.id).await.dissolved_at, Some(at(DISSOLVED)));
     }
 
-    /// Carol's own amendment removing only herself.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn carol_leaves(
-        a: &dyn FederationDirectory,
-        w: &World,
-    ) -> (
-        Family,
-        serde_json::Value,
-        Vec<ciris_verify_core::threshold::ThresholdSignature>,
-    ) {
-        let (alice, bob, carol) = (&w.keys[0], &w.keys[1], &w.keys[2]);
-        let (env, sigs) = change(a, w, &[alice, bob], None, &[carol]).await;
-        (family(w, &[alice, bob], "household"), env, sigs)
-    }
-
-    /// **I283** — a self-leave is admitted on the leaver's signature alone.
+    /// **I283** — a self-leave is admitted on the leaver's voice alone.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i283_a_self_leave_needs_only_the_leaver(
         a: &dyn FederationDirectory,
@@ -401,13 +359,23 @@ pub mod bodies {
         tag: &str,
     ) {
         let w = world(a, b, tag).await;
-        let carol = &w.keys[2];
-        let (rec, env, sigs) = carol_leaves(a, &w).await;
-        a.supersede_family_with_quorum(ts::sign_family(carol, rec), env, sigs)
+        let (alice, bob, carol) = (&w.keys[0], &w.keys[1], &w.keys[2]);
+        let leave = version(
+            a,
+            &w,
+            &family(&w, &[alice, bob], "household"),
+            &[carol],
+            chrono::Utc::now(),
+        )
+        .await;
+        let out = e2::put_voices(a, &leave)
             .await
-            .unwrap_or_else(|e| panic!("{tag} I283: carol leaves on her own signature: {e}"));
-        let left = served(a, &w.id).await;
-        b.put_family(left)
+            .unwrap_or_else(|e| panic!("{tag} I283: carol leaves on her own voice: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "{tag} I283: the leave lands: {out:?}"
+        );
+        e2::put_voices(b, &leave)
             .await
             .unwrap_or_else(|e| panic!("{tag} I283: B applies carol's leave: {e}"));
         for (d, who) in [(a, "A"), (b, "B")] {
@@ -419,7 +387,7 @@ pub mod bodies {
                 .collect();
             assert_eq!(
                 members,
-                vec![w.keys[0].clone(), w.keys[1].clone()],
+                vec![alice.clone(), bob.clone()],
                 "{tag} I283: {who} holds the roster without carol"
             );
             assert!(
@@ -433,7 +401,9 @@ pub mod bodies {
         }
     }
 
-    /// **I284** — the self-leave arm admits nothing but a self-leave.
+    /// **I284** — the self-leave arm admits nothing but a self-leave: each
+    /// version below is kept short of the protocol or refused, and the head
+    /// does not move.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i284_the_leave_arm_admits_only_a_leave(
         a: &dyn FederationDirectory,
@@ -442,69 +412,55 @@ pub mod bodies {
     ) {
         let w = world(a, b, tag).await;
         let (alice, bob, carol) = (&w.keys[0], &w.keys[1], &w.keys[2]);
-        let refused = |e: &Error| {
-            let m = e.to_string();
-            m.contains("not authorized") || m.contains("self-leave")
-        };
-        // Carol removes BOB, on her own signature.
-        let (env, sigs) = change(a, &w, &[alice, carol], None, &[carol]).await;
-        let e = a
-            .supersede_family_with_quorum(
-                ts::sign_family(carol, family(&w, &[alice, carol], "household")),
-                env,
-                sigs,
+        let now = chrono::Utc::now();
+        // Carol removes BOB, on her own voice.
+        not_landed(
+            e2::put_voices(
+                a,
+                &version(
+                    a,
+                    &w,
+                    &family(&w, &[alice, carol], "household"),
+                    &[carol],
+                    now,
+                )
+                .await,
             )
-            .await
-            .expect_err("one member cannot remove another");
-        assert!(refused(&e), "{tag} I284 (removes bob): {e}");
+            .await,
+            &format!("{tag} I284 (removes bob)"),
+        );
         // Carol leaves AND renames the family.
-        let (env, sigs) = change(a, &w, &[alice, bob], None, &[carol]).await;
-        let e = a
-            .supersede_family_with_quorum(
-                ts::sign_family(carol, family(&w, &[alice, bob], "carol's rename")),
-                env,
-                sigs,
+        not_landed(
+            e2::put_voices(
+                a,
+                &version(
+                    a,
+                    &w,
+                    &family(&w, &[alice, bob], "carol's rename"),
+                    &[carol],
+                    now,
+                )
+                .await,
             )
-            .await
-            .expect_err("a leave changes nothing but the leaver's seat");
-        assert!(refused(&e), "{tag} I284 (renames): {e}");
+            .await,
+            &format!("{tag} I284 (renames)"),
+        );
         // Carol leaves AND re-roles alice.
         let mut reroled = family(&w, &[alice, bob], "household");
         reroled.members[0].role = Some("founder".into());
-        let (env, sigs) = change(a, &w, &[alice, bob], None, &[carol]).await;
-        let e = a
-            .supersede_family_with_quorum(ts::sign_family(carol, reroled), env, sigs)
-            .await
-            .expect_err("a leave touches no other seat");
-        assert!(refused(&e), "{tag} I284 (re-roles): {e}");
-        // Carol's leave signed by BOB (not the leaver).
-        let (env, sigs) = change(a, &w, &[alice, bob], None, &[bob]).await;
-        let e = a
-            .supersede_family_with_quorum(
-                ts::sign_family(bob, family(&w, &[alice, bob], "household")),
-                env,
-                sigs,
+        not_landed(
+            e2::put_voices(a, &version(a, &w, &reroled, &[carol], now).await).await,
+            &format!("{tag} I284 (re-roles)"),
+        );
+        // Carol's leave voiced by BOB (not the leaver), on B.
+        not_landed(
+            e2::put_voices(
+                b,
+                &version(b, &w, &family(&w, &[alice, bob], "household"), &[bob], now).await,
             )
-            .await
-            .expect_err("only the leaver authorizes a leave");
-        assert!(refused(&e), "{tag} I284 (not the leaver): {e}");
-        // On B's apply: a leave record whose signature is bob's under carol's
-        // member id.
-        let (rec, env, _) = carol_leaves(a, &w).await;
-        let bytes = ciris_verify_core::jcs::canonicalize(&env).unwrap();
-        let mut forged_sig = ts::threshold_sign(bob, &bytes);
-        forged_sig.member_id = carol.clone();
-        let mut offered = ts::sign_family(carol, rec);
-        offered.supersede_proof = Some(crate::federation::GroupSupersedeProof {
-            prior_persist_row_hash: held(b, &w.id).await.persist_row_hash,
-            change_envelope: env,
-            quorum_signatures: vec![forged_sig],
-        });
-        let e = b
-            .put_family(offered)
-            .await
-            .expect_err("B verifies the leaver's own key");
-        assert!(refused(&e), "{tag} I284 (forged leaver sig): {e}");
+            .await,
+            &format!("{tag} I284 (not the leaver)"),
+        );
         for d in [a, b] {
             assert_eq!(
                 held(d, &w.id).await.members.len(),

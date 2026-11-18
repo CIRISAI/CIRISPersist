@@ -1523,7 +1523,7 @@ mod tests {
 pub(crate) mod test_support {
     use super::*;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
+    use crate::federation::FederationDirectory;
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn ts(s: &str) -> DateTime<Utc> {
@@ -1550,40 +1550,6 @@ pub(crate) mod test_support {
             binding_provenance: BindingProvenance::Rooted,
             epoch,
             retired_at: None,
-        }
-    }
-
-    /// A `federation_keys` fixture with REAL hybrid pubkeys (so the #443
-    /// signature gate can verify envelopes signed by the matching signer).
-    /// `put_public_key` does not itself hybrid-verify the registration, so
-    /// the scrub fields stay placeholders — only the PUBKEYS must be real.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    fn fixture_key(key_id: &str, ed_pk: String, mldsa_pk: Option<String>) -> KeyRecord {
-        KeyRecord {
-            key_id: key_id.into(),
-            pubkey_ed25519_base64: ed_pk,
-            pubkey_ml_dsa_65_base64: mldsa_pk,
-            algorithm: crate::federation::types::algorithm::HYBRID.into(),
-            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
-            identity_ref: key_id.into(),
-            valid_from: ts("2026-05-01T00:00:00Z"),
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": key_id }),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "c2lnbmF0dXJl".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: ts("2026-05-01T00:00:00Z"),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-            attestation_evidence: Some(
-                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                ),
-            ),
-            consent_role: None,
-            additional_scrubs: Vec::new(),
         }
     }
 
@@ -1697,721 +1663,887 @@ pub(crate) mod test_support {
         );
     }
 
-    /// **The authenticated-apply + tombstone matrix** for
-    /// `put_signed_transport_destination`, with REAL hybrid crypto:
-    /// - a valid self-signed route is admitted (`Inserted`), its
-    ///   `binding_provenance` honored from the VERIFIED envelope;
-    /// - a byte-identical replay is `Unchanged`;
-    /// - a forged signature / an unrelated-but-registered signer / a typed
-    ///   projection diverging from the envelope are each `Err` (fail-closed);
-    /// - an acts-for occurrence key of the subject is admitted;
-    /// - an older `(epoch, asserted_at)` replay is `Refused`; a same-clock
-    ///   fork is `Refused`;
-    /// - a signed RETIREMENT (`retired_at`, higher epoch) supersedes; the
-    ///   retired route disappears from every `list_*` read but keeps
-    ///   gossiping via the signed reads; older gossip cannot resurrect it;
-    /// - a trusted-local put that supersedes a signed row drops the stored
-    ///   signature container.
+    /// v62.0.0 (wave E8) — **the edition-2 bind builders** the route matrices
+    /// share. A route is no longer a signed object of its own: it is the
+    /// `transport_destination` member of an `identity:occurrence` bind
+    /// (`edition2::occurrence`), projected into `transport_destinations` after
+    /// the bind's write commits (#446). A bind is the occurrence key's own
+    /// statement (`iss` = `sub` = the occurrence) and the author's (the
+    /// identity, or an agent's owner) over ONE payload; each voice is signed by
+    /// an E0 seed key ([`crate::federation::edition2::fixture_switch`]).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) mod e2bind {
+        use chrono::{DateTime, Utc};
+        use ciris_verify_core::cde::{self, Value};
+        use ciris_verify_core::edition2::sign_row_statement;
+
+        use crate::federation::edition2::door::AdmittedRow;
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::{
+            held_keys_for, StatementOutcome, STATEMENT_MEMBER,
+        };
+        use crate::federation::edition2::occurrence::OCCURRENCE_FAMILY;
+        use crate::federation::self_at_login::TransportDestination;
+        use crate::federation::types::{IdentityOccurrence, IdentityOccurrenceRevocation};
+        use crate::federation::{Error, FederationDirectory};
+
+        /// The Reticulum application name every fixture route announces.
+        pub(crate) const APP: &str = "ciris.federation";
+
+        /// This node's clock, POSIX ms. Node and agent keys sign rows dated
+        /// relative to it (their records end, CC 2.4.1.1).
+        pub(crate) fn now_ms() -> u64 {
+            e2::ms(crate::host::clock::now())
+        }
+
+        /// The instant of `ms`.
+        pub(crate) fn at(ms: u64) -> DateTime<Utc> {
+            DateTime::<Utc>::from_timestamp_millis(i64::try_from(ms).expect("ms in range"))
+                .expect("a representable instant")
+        }
+
+        /// A CBOR map of text keys, in the deterministic order.
+        pub(crate) fn map(mut m: Vec<(&str, Value)>) -> Value {
+            m.sort_by_key(|(k, _)| cde::encode(&Value::Text((*k).to_owned())));
+            Value::Map(
+                m.into_iter()
+                    .map(|(k, v)| (Value::Text(k.to_owned()), v))
+                    .collect(),
+            )
+        }
+
+        /// A `transport_destination` member (CC 3.3.6.2: exactly five
+        /// members) over these two link keys, its `destination_hash` derived
+        /// (CC 3.3.6.3); and the route destination it projects (#512: the
+        /// hash, canonical hex).
+        pub(crate) fn transport(x25519: [u8; 32], ed25519: [u8; 32]) -> (Value, String) {
+            let aspects = vec!["announce".to_owned(), "v1".to_owned()];
+            let dest = ciris_verify_core::transport_binding::compute_destination_hash(
+                APP, &aspects, &x25519, &ed25519,
+            )
+            .expect("a destination hash");
+            let member = map(vec![
+                ("reticulum_x25519_pubkey", Value::Bytes(x25519.to_vec())),
+                ("reticulum_ed25519_pubkey", Value::Bytes(ed25519.to_vec())),
+                ("destination_hash", Value::Bytes(dest.to_vec())),
+                ("app_name", Value::Text(APP.to_owned())),
+                (
+                    "aspects",
+                    Value::Array(aspects.into_iter().map(Value::Text).collect()),
+                ),
+            ]);
+            (member, hex::encode(dest))
+        }
+
+        /// [`transport`] from a fill byte: link x25519 `[tag; 32]`, link
+        /// ed25519 `[tag + 1; 32]`.
+        pub(crate) fn transport_tag(tag: u8) -> (Value, String) {
+            transport([tag; 32], [tag.wrapping_add(1); 32])
+        }
+
+        /// An `encryption_pubkeys` member (exactly `x25519` 32 bytes and
+        /// `ml_kem_768` 1184 bytes).
+        pub(crate) fn encryption(x25519: [u8; 32], ml_kem_768: &[u8]) -> Value {
+            map(vec![
+                ("x25519", Value::Bytes(x25519.to_vec())),
+                ("ml_kem_768", Value::Bytes(ml_kem_768.to_vec())),
+            ])
+        }
+
+        /// One bind: what its payload states. Keys are E0 seeds (or kids).
+        #[derive(Clone, Debug)]
+        pub(crate) struct Bind {
+            pub(crate) author: String,
+            pub(crate) identity: String,
+            pub(crate) occurrence: String,
+            pub(crate) device_class: &'static str,
+            pub(crate) asserted_at_ms: u64,
+            pub(crate) valid_until_ms: Option<u64>,
+            pub(crate) extra: Vec<(&'static str, Value)>,
+        }
+
+        impl Bind {
+            /// A bind of `occurrence` under `identity`, authored by `author`
+            /// (the identity itself; an agent identity's owner).
+            pub(crate) fn new(
+                author: &str,
+                identity: &str,
+                occurrence: &str,
+                device_class: &'static str,
+                asserted_at_ms: u64,
+            ) -> Self {
+                Bind {
+                    author: author.to_owned(),
+                    identity: identity.to_owned(),
+                    occurrence: occurrence.to_owned(),
+                    device_class,
+                    asserted_at_ms,
+                    valid_until_ms: None,
+                    extra: Vec::new(),
+                }
+            }
+
+            /// One more payload member.
+            #[must_use]
+            pub(crate) fn with(mut self, member: &'static str, value: Value) -> Self {
+                self.extra.push((member, value));
+                self
+            }
+
+            /// The bind's end (`valid_until`, half-open).
+            #[must_use]
+            pub(crate) fn until(mut self, valid_until_ms: u64) -> Self {
+                self.valid_until_ms = Some(valid_until_ms);
+                self
+            }
+
+            /// The payload every voice of this bind signs.
+            pub(crate) fn payload(&self) -> Value {
+                let mut m = vec![
+                    ("asserted_at", Value::Uint(self.asserted_at_ms)),
+                    ("author", Value::Text(e2::kid(&self.author))),
+                    ("identity_key_id", Value::Text(e2::kid(&self.identity))),
+                    ("occurrence_key_id", Value::Text(e2::kid(&self.occurrence))),
+                    ("device_class", Value::Text(self.device_class.to_owned())),
+                ];
+                if let Some(u) = self.valid_until_ms {
+                    m.push(("valid_until", Value::Uint(u)));
+                }
+                for (k, v) in &self.extra {
+                    m.push((*k, v.clone()));
+                }
+                map(m)
+            }
+
+            /// `signer`'s statement over this bind, as `iss` (a seed or kid).
+            pub(crate) fn voice(&self, signer: &str, iss: &str) -> Vec<u8> {
+                sign_row_statement(
+                    &e2::signing_key(signer),
+                    &e2::kid(iss),
+                    &e2::kid(&self.occurrence),
+                    "scores",
+                    OCCURRENCE_FAMILY,
+                    &self.payload(),
+                    vec![],
+                )
+                .expect("e2bind: sign a bind voice")
+            }
+
+            /// The occurrence key's own statement (`iss` = `sub`).
+            pub(crate) fn own_voice(&self) -> Vec<u8> {
+                self.voice(&self.occurrence, &self.occurrence)
+            }
+
+            /// The author's statement, by the author's own key.
+            pub(crate) fn author_voice(&self) -> Vec<u8> {
+                self.voice(&self.author, &self.author)
+            }
+
+            /// The voices in the door's order; the self pair has one.
+            pub(crate) fn voices(&self) -> Vec<Vec<u8>> {
+                if e2::kid(&self.author) == e2::kid(&self.occurrence) {
+                    vec![self.own_voice()]
+                } else {
+                    vec![self.own_voice(), self.author_voice()]
+                }
+            }
+        }
+
+        /// One statement through the one entry (`ingest::put_statement`).
+        ///
+        /// # Errors
+        /// The door's refusal.
+        pub(crate) async fn put(
+            dir: &dyn FederationDirectory,
+            statement: &[u8],
+        ) -> Result<StatementOutcome, Error> {
+            Box::pin(e2::put_statement(dir, statement)).await
+        }
+
+        /// These voices, in order; the last outcome. A replay re-offers the
+        /// SAME bytes: a composite signature is randomized, so signing the
+        /// bind again is a new statement of the same row.
+        ///
+        /// # Panics
+        /// A voice is refused.
+        pub(crate) async fn put_voices(
+            dir: &dyn FederationDirectory,
+            voices: &[Vec<u8>],
+        ) -> StatementOutcome {
+            let mut last = None;
+            for v in voices {
+                last = Some(
+                    put(dir, v)
+                        .await
+                        .unwrap_or_else(|e| panic!("e2bind: a bind voice refused: {e}")),
+                );
+            }
+            last.expect("e2bind: a bind has a voice")
+        }
+
+        /// A bind's voices, freshly signed, in order; the last outcome.
+        ///
+        /// # Panics
+        /// A voice is refused.
+        pub(crate) async fn put_bind(dir: &dyn FederationDirectory, b: &Bind) -> StatementOutcome {
+            put_voices(dir, &b.voices()).await
+        }
+
+        /// The stable reason of a refusal: a malformed row's token, else the
+        /// error kind.
+        pub(crate) fn reason(e: &Error) -> String {
+            match e {
+                Error::MalformedRow { reason, .. } => (*reason).to_owned(),
+                other => other.kind().to_owned(),
+            }
+        }
+
+        /// Is `o` a `Row` outcome with this `new`?
+        pub(crate) fn is_row(o: &StatementOutcome, new: bool) -> bool {
+            matches!(o, StatementOutcome::Row { new: n, .. } if *n == new)
+        }
+
+        /// The live routes of `occurrence` (a seed or kid).
+        pub(crate) async fn routes(
+            dir: &dyn FederationDirectory,
+            occurrence: &str,
+        ) -> Vec<TransportDestination> {
+            dir.list_transport_destinations_for(&e2::kid(occurrence))
+                .await
+                .expect("route read")
+        }
+
+        /// The held occurrence row of `occurrence` under `identity`.
+        pub(crate) async fn held(
+            dir: &dyn FederationDirectory,
+            identity: &str,
+            occurrence: &str,
+        ) -> Option<IdentityOccurrence> {
+            let occ = e2::kid(occurrence);
+            dir.list_identity_occurrences_for(&e2::kid(identity))
+                .await
+                .expect("occurrence read")
+                .into_iter()
+                .find(|o| o.occurrence_key_id == occ)
+        }
+
+        /// The author statement the signed occurrence listing serves for
+        /// `occurrence` under `identity` (`signed_envelope.ceg_statement`,
+        /// O1's listing), if any: what a peer receives and re-verifies.
+        pub(crate) async fn served(
+            dir: &dyn FederationDirectory,
+            identity: &str,
+            occurrence: &str,
+        ) -> Option<Vec<u8>> {
+            let occ = e2::kid(occurrence);
+            dir.list_signed_identity_occurrences_for(&e2::kid(identity))
+                .await
+                .expect("signed occurrence read")
+                .into_iter()
+                .find(|s| s.identity_occurrence.occurrence_key_id == occ)
+                .and_then(|s| {
+                    s.signed_envelope
+                        .get(STATEMENT_MEMBER)
+                        .and_then(serde_json::Value::as_str)
+                        .map(|h| hex::decode(h).expect("ceg_statement is hex"))
+                })
+        }
+
+        /// A held statement through the door again (the verifier IS the
+        /// door), over the keys this directory holds for it.
+        ///
+        /// # Errors
+        /// The door's refusal.
+        pub(crate) async fn readmit(
+            dir: &dyn FederationDirectory,
+            statement: &[u8],
+        ) -> Result<AdmittedRow, Error> {
+            let keys = held_keys_for(dir, statement).await?;
+            e2::try_admit(statement, &keys)
+        }
+
+        /// A payload member of a statement, as bytes.
+        pub(crate) fn payload_bytes(statement: &[u8], member: &str) -> Option<Vec<u8>> {
+            crate::federation::edition2::liveness::statement_parts(statement).and_then(|(_, p)| {
+                p.get_text(member)
+                    .and_then(Value::as_bytes)
+                    .map(<[u8]>::to_vec)
+            })
+        }
+
+        /// One voice of an `identity:occurrence_revocation` row (T2):
+        /// `signer` as the identity, revoking at `revoked_at_ms`.
+        pub(crate) async fn revocation_voice(
+            dir: &dyn crate::federation::FederationDirectory,
+            signer: &str,
+            identity: &str,
+            occurrence: &str,
+            revoked_at_ms: u64,
+        ) -> Vec<u8> {
+            e2::occurrence_revocation_voice(
+                dir,
+                signer,
+                true,
+                &IdentityOccurrenceRevocation {
+                    identity_key_id: identity.to_owned(),
+                    occurrence_key_id: occurrence.to_owned(),
+                    revoked_at: at(revoked_at_ms),
+                    effective_at: at(revoked_at_ms),
+                    reason: None,
+                    witness_set: Vec::new(),
+                    persist_row_hash: String::new(),
+                },
+                None,
+                &[],
+                revoked_at_ms,
+            )
+            .await
+        }
+    }
+
+    /// v62.0.0 (wave E8; was the #443 signed route matrix) — **the route a
+    /// bind projects, under forgery, replay, rotation and retirement**,
+    /// through the edition-2 `identity:occurrence` door, on sqlite and
+    /// postgres. A user `alice` binds her `phone` (a user-typed device key);
+    /// every route assertion reads the projected `transport_destinations`.
+    ///
+    /// - **I3310** the phone's own statement alone is a `Voice` and binds
+    ///   nothing; alice's statement over the same payload lands the bind
+    ///   (`Row`, new) and projects one `Rooted` route at the bind's instant.
+    /// - **I3312** a forged statement (a flipped signature byte) is refused
+    ///   `edition2_statement_invalid`; **I3313** mallory's key signing as alice
+    ///   is refused `kid_not_of_iss`; **I3314** an author statement with no
+    ///   occurrence-key voice held is refused, retryable,
+    ///   `federation_attester_key_unknown`; **I3315** mallory authoring a bind
+    ///   of alice's identity is refused `edition2_payload_invalid`. Each binds
+    ///   nothing and moves no route.
+    /// - **I3311** re-offering the same statements is the SAME row id and is
+    ///   idempotent (`Row`, `new = false`): never a second route.
+    /// - **I3316** rotation: the phone itself, acting for alice (its live
+    ///   occurrence seats it as a key of alice), signs a newer bind with a new
+    ///   transport; the route follows it.
+    /// - **I3317** a replayed OLDER bind cannot displace the newer one: the
+    ///   newest route wins. **I3318** a same-instant fork (a different
+    ///   transport at the held bind's `asserted_at`) displaces nothing.
+    /// - **I3319** retirement: `identity:occurrence_revocation`, voiced by a
+    ///   strict majority of alice's roster (alice and the phone), removes the
+    ///   route from every `list_*` read; the bind and the revocation stay held
+    ///   (they gossip as statements; no route is on the signed route plane).
+    /// - **I3320** after the revocation a replayed older bind resurrects
+    ///   nothing, nor does a stale local route put; a NEWER bind re-establishes
+    ///   the route.
+    /// - **I3321** a local route refresh moves neither the bind's statements
+    ///   nor its instant: the served statement still re-admits (#541's
+    ///   invariant, edition 2).
+    /// - **I3322** a member outside the family's payload (an earlier-form
+    ///   `binding_provenance` token) is refused `edition2_payload_invalid`,
+    ///   never read as `Rooted`; nothing is stored.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn run_signed_transport_route_matrix(
         dir: &dyn FederationDirectory,
         suffix: &str,
     ) {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
-        use ciris_verify_core::self_at_login::HybridSigningIdentity;
-        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
-        use TransportDestinationApplyOutcome as Outcome;
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::malformed_row as mr;
+        use crate::federation::types::device_class::{LAPTOP, PHONE};
+        use crate::federation::types::OccurrenceTransportBinding;
+        use ciris_verify_core::cde::Value;
+        use e2bind::{
+            at, held, is_row, put, put_bind, put_voices, readmit, reason, revocation_voice, routes,
+            served, transport_tag, Bind,
+        };
 
-        let alice_id = format!("sig-alice-{suffix}");
-        let phone_id = format!("sig-alice-phone-{suffix}");
-        let mallory_id = format!("sig-mallory-{suffix}");
-
-        // Box the hybrid signers and build them BEFORE any await — a multi-KiB
-        // ML-DSA signer held across an await inlines into the caller's future
-        // and overflows the 2MB test stack.
-        let alice = Box::new(HybridSigningIdentity::new(
-            &alice_id,
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let phone = Box::new(HybridSigningIdentity::new(
-            &phone_id,
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let mallory = Box::new(HybridSigningIdentity::new(
-            &mallory_id,
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        for (id, ident) in [
-            (&alice_id, alice.as_ref()),
-            (&phone_id, phone.as_ref()),
-            (&mallory_id, mallory.as_ref()),
-        ] {
-            let member = ident.directory_member().unwrap();
-            dir.put_public_key(SignedKeyRecord {
-                record: fixture_key(
-                    id,
-                    member.ed25519_public_key_base64.clone(),
-                    member.mldsa65_public_key_base64.clone(),
-                ),
-            })
-            .await
-            .expect("register fixture key");
+        let alice = format!("sig-alice-{suffix}");
+        let phone = format!("sig-alice-phone-{suffix}");
+        let laptop = format!("sig-alice-laptop-{suffix}");
+        let mallory = format!("sig-mallory-{suffix}");
+        for k in [&alice, &phone, &laptop, &mallory] {
+            e2::put_key(dir, k, &["user"]).await;
         }
-        // Bind the phone key as an occurrence of alice, so it may act-for
-        // routes whose subject is alice.
-        dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
-            identity_key_id: alice_id.clone(),
-            occurrence_key_id: phone_id.clone(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
-            hardware_attestation: None,
-            asserted_at: ts("2026-06-01T00:00:00Z"),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .expect("bind acts-for occurrence");
+        let ph = e2::kid(&phone);
+        let now = e2bind::now_ms();
+        let t = |mins: u64| now - mins * 60_000;
 
-        // The envelope IS the serialized typed row (minus the unsigned
-        // last_seen_at, which route() leaves None) — projection ≡ envelope by
-        // construction; the gate re-derives every field from the envelope.
-        let mut r1 = route(&alice_id, "reticulum", "d1", 0, "2026-06-10T00:00:00Z");
-        r1.binding_provenance = BindingProvenance::Advisory;
-        let (env1, sig1) =
-            produce_signed_identity_occurrence(alice.as_ref(), serde_json::to_value(&r1).unwrap())
-                .await
-                .unwrap();
-        let s1 = SignedTransportDestination {
-            transport_destination: r1.clone(),
-            attesting_key_id: alice_id.clone(),
-            signed_envelope: env1.clone(),
-            signature: sig1.clone(),
-        };
-
-        // (1) Valid self-signed → Inserted; provenance honored from the
-        // VERIFIED envelope (Advisory in, Advisory stored — no unauthenticated
-        // Rooted upgrade possible).
-        assert_eq!(
-            dir.put_signed_transport_destination(&s1).await.unwrap(),
-            Outcome::Inserted
+        // I3310 — the phone's own statement alone binds nothing.
+        let (td1, d1) = transport_tag(0x10);
+        let b1 = Bind::new(&alice, &alice, &phone, PHONE, t(60)).with("transport_destination", td1);
+        let (own1, auth1) = (b1.own_voice(), b1.author_voice());
+        let out = put(dir, &own1).await.expect("I3310: the own voice");
+        assert!(
+            matches!(out, StatementOutcome::Voice { new: true, .. }),
+            "I3310: the occurrence key's own statement is held as a voice: {out:?}"
         );
-        let rows = dir
-            .list_transport_destinations_for(&alice_id)
+        assert!(
+            routes(dir, &phone).await.is_empty(),
+            "I3310: a voice alone projects no route"
+        );
+
+        // I3312 — a forged statement: alice's voice with a flipped signature
+        // byte (the COSE_Sign1 signature is its last member).
+        let mut forged = auth1.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        let e = put(dir, &forged)
             .await
-            .unwrap();
+            .expect_err("I3312: a forged statement");
+        assert_eq!(reason(&e), mr::EDITION2_STATEMENT_INVALID, "I3312: {e}");
+
+        // I3313 — mallory's key signing as alice over the same payload.
+        let e = put(dir, &b1.voice(&mallory, &alice))
+            .await
+            .expect_err("I3313: a key not of alice signing as alice");
+        assert_eq!(reason(&e), mr::KID_NOT_OF_ISS, "I3313: {e}");
+
+        // I3314 — an author statement with no occurrence-key voice held.
+        let b_laptop = Bind::new(&alice, &alice, &laptop, LAPTOP, t(60))
+            .with("transport_destination", transport_tag(0x60).0);
+        let e = put(dir, &b_laptop.author_voice())
+            .await
+            .expect_err("I3314: the author before the occurrence key");
+        assert_eq!(
+            reason(&e),
+            "federation_attester_key_unknown",
+            "I3314: retryable, naming the occurrence key: {e}"
+        );
+        assert!(
+            held(dir, &alice, &laptop).await.is_none(),
+            "I3314: nothing bound"
+        );
+        assert!(routes(dir, &laptop).await.is_empty(), "I3314: no route");
+
+        // I3315 — mallory authoring a bind of alice's identity.
+        let b_m = Bind::new(&mallory, &alice, &phone, PHONE, t(60))
+            .with("transport_destination", transport_tag(0x61).0);
+        let e = put(dir, &b_m.author_voice())
+            .await
+            .expect_err("I3315: an identity is bound by itself");
+        assert_eq!(reason(&e), mr::EDITION2_PAYLOAD_INVALID, "I3315: {e}");
+
+        assert!(
+            held(dir, &alice, &phone).await.is_none() && routes(dir, &phone).await.is_empty(),
+            "I3312-I3315: the refusals bound nothing and projected nothing"
+        );
+
+        // I3310 — alice's statement lands the bind and projects the route.
+        let out = put(dir, &auth1).await.expect("I3310: alice's statement");
+        assert!(is_row(&out, true), "I3310: the bind lands: {out:?}");
+        let rows = routes(dir, &phone).await;
+        assert_eq!(rows.len(), 1, "I3310: one projected route: {rows:?}");
+        assert_eq!(
+            rows[0].transport_kind,
+            OccurrenceTransportBinding::TRANSPORT_KIND
+        );
+        assert_eq!(rows[0].destination, d1);
+        assert_eq!(rows[0].binding_provenance, BindingProvenance::Rooted);
+        assert_eq!(rows[0].asserted_at, at(t(60)));
+
+        // I3311 — the same statements again: one row id, idempotent.
+        assert_eq!(
+            e2::row_id_of(&own1),
+            e2::row_id_of(&auth1),
+            "I3311: two voices of one row"
+        );
+        let out = put(dir, &own1).await.expect("I3311: own voice again");
+        assert!(
+            matches!(out, StatementOutcome::Voice { new: false, .. }),
+            "I3311: {out:?}"
+        );
+        let out = put(dir, &auth1).await.expect("I3311: alice's voice again");
+        assert!(is_row(&out, false), "I3311: Row, not new: {out:?}");
+        let rows = routes(dir, &phone).await;
+        assert_eq!(rows.len(), 1, "I3311: never a second route");
+        assert_eq!(rows[0].destination, d1);
+
+        // I3316 — rotation: the phone, acting for alice, signs a newer bind.
+        let (td2, d2) = transport_tag(0x20);
+        let b2 = Bind::new(&alice, &alice, &phone, PHONE, t(50)).with("transport_destination", td2);
+        let auth2 = b2.voice(&phone, &alice);
+        put(dir, &b2.own_voice()).await.expect("I3316: own voice");
+        let out = put(dir, &auth2)
+            .await
+            .expect("I3316: the phone signs as alice through its occurrence");
+        assert!(is_row(&out, true), "I3316: {out:?}");
+        let rows = routes(dir, &phone).await;
+        assert_eq!(rows.len(), 1, "I3316: superseded in place");
+        assert_eq!(
+            rows[0].destination, d2,
+            "I3316: the route follows the newest bind"
+        );
+        assert_eq!(rows[0].asserted_at, at(t(50)));
+        assert_eq!(
+            served(dir, &alice, &phone).await.as_deref(),
+            Some(auth2.as_slice())
+        );
+
+        // I3317 — a replayed OLDER bind cannot displace the newer one.
+        put(dir, &own1).await.expect("I3317: old own voice");
+        let out = put(dir, &auth1).await.expect("I3317: old author voice");
+        assert!(is_row(&out, false), "I3317: {out:?}");
+        assert_eq!(
+            routes(dir, &phone).await[0].destination,
+            d2,
+            "I3317: the newest route wins"
+        );
+
+        // I3318 — a same-instant fork displaces nothing (fail-closed, never
+        // last-writer-wins).
+        let (td_fork, d_fork) = transport_tag(0x2F);
+        let fork =
+            Bind::new(&alice, &alice, &phone, PHONE, t(50)).with("transport_destination", td_fork);
+        let out = put_bind(dir, &fork).await;
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "I3318: {out:?}"
+        );
+        let rows = routes(dir, &phone).await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].binding_provenance, BindingProvenance::Advisory);
-
-        // (2) Byte-identical replay → Unchanged.
+        assert_eq!(rows[0].destination, d2, "I3318: the fork is not the route");
+        assert_ne!(d_fork, d2);
         assert_eq!(
-            dir.put_signed_transport_destination(&s1).await.unwrap(),
-            Outcome::Unchanged
+            served(dir, &alice, &phone).await.as_deref(),
+            Some(auth2.as_slice())
         );
 
-        // (3) Forged signature → Err; row untouched.
-        let mut bad = s1.clone();
-        bad.signature.ed25519_signature_base64 = B64.encode([0u8; 64]);
-        let err = dir
-            .put_signed_transport_destination(&bad)
+        // I3319 — retirement: alice's roster is {alice, phone}; a strict
+        // majority (both) revokes the phone's occurrence.
+        let rv_alice = revocation_voice(dir, &alice, &alice, &phone, t(40)).await;
+        let rv_phone = revocation_voice(dir, &phone, &alice, &phone, t(40)).await;
+        let out = put(dir, &rv_alice)
             .await
-            .expect_err("forged signature must be rejected");
-        assert_eq!(err.kind(), "federation_signature_invalid");
-
-        // (4) Unrelated-but-REGISTERED signer: mallory validly signs the
-        // victim's envelope with her own key → signer_acts_for rejects.
-        let (m_env, m_sig) = produce_signed_identity_occurrence(
-            mallory.as_ref(),
-            serde_json::to_value(&r1).unwrap(),
-        )
-        .await
-        .unwrap();
-        let err = dir
-            .put_signed_transport_destination(&SignedTransportDestination {
-                transport_destination: r1.clone(),
-                attesting_key_id: mallory_id.clone(),
-                signed_envelope: m_env,
-                signature: m_sig,
-            })
-            .await
-            .expect_err("a peer's route assertion for a victim must be rejected");
-        // v54.1.0 (#1042 follow-up) — the signature verifies; mallory is not
-        // (yet) an occurrence of alice: the signer-acts-for refusal, typed.
-        assert_eq!(err.kind(), "federation_signer_not_acting_for");
-
-        // (5) Divergent typed projection (envelope says d1, typed claims
-        // attacker-dest) → Err.
-        let mut divergent = s1.clone();
-        divergent.transport_destination.destination = "attacker-dest".into();
-        let err = dir
-            .put_signed_transport_destination(&divergent)
-            .await
-            .expect_err("typed projection diverging from the envelope must be rejected");
-        assert!(format!("{err}").contains("diverges"), "got {err}");
-        // ... including a provenance-only divergence (the AV-42 upgrade).
-        let mut prov_divergent = s1.clone();
-        prov_divergent.transport_destination.binding_provenance = BindingProvenance::Rooted;
-        let err = dir
-            .put_signed_transport_destination(&prov_divergent)
-            .await
-            .expect_err("typed Rooted over an Advisory envelope must be rejected");
-        assert!(format!("{err}").contains("diverges"), "got {err}");
-
-        // (6) Acts-for: the phone key (a bound occurrence of alice) signs the
-        // epoch-1 rotation → Superseded.
-        let r2 = route(&alice_id, "reticulum", "d2", 1, "2026-06-11T00:00:00Z");
-        let (env2, sig2) =
-            produce_signed_identity_occurrence(phone.as_ref(), serde_json::to_value(&r2).unwrap())
-                .await
-                .unwrap();
-        let s2 = SignedTransportDestination {
-            transport_destination: r2.clone(),
-            attesting_key_id: phone_id.clone(),
-            signed_envelope: env2,
-            signature: sig2,
-        };
-        assert_eq!(
-            dir.put_signed_transport_destination(&s2).await.unwrap(),
-            Outcome::Superseded
+            .expect("I3319: alice's revocation voice");
+        assert!(
+            matches!(out, StatementOutcome::Pending { new: true, .. }),
+            "I3319: one of two roster keys is short: {out:?}"
         );
-
-        // (7) Older (epoch, asserted_at) replay → Refused (never an error).
-        assert!(matches!(
-            dir.put_signed_transport_destination(&s1).await.unwrap(),
-            Outcome::Refused { .. }
-        ));
-
-        // (8) Same (epoch, asserted_at), DIFFERENT content → Refused
-        // (a same-clock fork is fail-closed, not last-writer-wins).
-        let fork = route(&alice_id, "reticulum", "d2-fork", 1, "2026-06-11T00:00:00Z");
-        let (fork_env, fork_sig) = produce_signed_identity_occurrence(
-            alice.as_ref(),
-            serde_json::to_value(&fork).unwrap(),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            dir.put_signed_transport_destination(&SignedTransportDestination {
-                transport_destination: fork.clone(),
-                attesting_key_id: alice_id.clone(),
-                signed_envelope: fork_env,
-                signature: fork_sig,
-            })
-            .await
-            .unwrap(),
-            Outcome::Refused { .. }
-        ));
-
-        // (9) Signed RETIREMENT: retired_at set, higher epoch → Superseded.
-        let mut tomb = route(&alice_id, "reticulum", "d2", 2, "2026-06-12T00:00:00Z");
-        tomb.retired_at = Some(ts("2026-06-12T00:00:00Z"));
-        let (tomb_env, tomb_sig) = produce_signed_identity_occurrence(
-            alice.as_ref(),
-            serde_json::to_value(&tomb).unwrap(),
-        )
-        .await
-        .unwrap();
         assert_eq!(
-            dir.put_signed_transport_destination(&SignedTransportDestination {
-                transport_destination: tomb.clone(),
-                attesting_key_id: alice_id.clone(),
-                signed_envelope: tomb_env.clone(),
-                signature: tomb_sig,
-            })
-            .await
-            .unwrap(),
-            Outcome::Superseded
+            routes(dir, &phone).await.len(),
+            1,
+            "I3319: nothing retired short"
         );
-        // Retired ⇒ gone from every list_* read...
-        assert!(dir
-            .list_transport_destinations_for(&alice_id)
+        let out = put(dir, &rv_phone)
             .await
-            .unwrap()
-            .is_empty());
+            .expect("I3319: the phone's revocation voice");
+        assert!(is_row(&out, true), "I3319: the majority lands it: {out:?}");
+        assert!(
+            routes(dir, &phone).await.is_empty(),
+            "I3319: the revoked occurrence's route is retired"
+        );
         assert!(!dir
             .list_all_transport_destinations()
             .await
             .unwrap()
             .iter()
-            .any(|r| r.occurrence_key_id == alice_id));
+            .any(|r| r.occurrence_key_id == ph));
         assert!(dir
-            .list_transport_destinations_by_destination("d2")
+            .list_transport_destinations_by_destination(&d2)
             .await
             .unwrap()
             .iter()
-            .all(|r| r.occurrence_key_id != alice_id));
-        // ...but the tombstone keeps gossiping via the signed reads,
-        // byte-exact.
-        let signed_rows = dir
-            .list_signed_transport_destinations_for(&alice_id)
-            .await
-            .unwrap();
-        assert_eq!(signed_rows.len(), 1, "tombstones must gossip");
-        assert_eq!(signed_rows[0].signed_envelope, tomb_env);
-        assert!(signed_rows[0].transport_destination.retired_at.is_some());
-        let records = dir
-            .list_signed_records(
-                crate::federation::namespace::ReplicatedKind::TransportDestination,
-                &alice_id,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            records.len(),
-            1,
-            "list_signed_records carries the tombstone"
+            .all(|r| r.occurrence_key_id != ph));
+        assert!(
+            dir.list_signed_transport_destinations_for(&ph)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I3319: a projected route is local; the occurrence plane carries it"
         );
-        let round_trip: SignedTransportDestination =
-            serde_json::from_value(records[0].canonical_json.clone()).unwrap();
-        assert_eq!(round_trip.signed_envelope, tomb_env);
+        assert_eq!(
+            served(dir, &alice, &phone).await.as_deref(),
+            Some(auth2.as_slice()),
+            "I3319: the bind keeps gossiping as its statements"
+        );
+        assert_eq!(
+            dir.edition2_voices(&e2::row_id_of(&rv_alice))
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "I3319: both revocation voices are held"
+        );
 
-        // (10) A replayed OLDER live put cannot resurrect the retired route.
-        assert!(matches!(
-            dir.put_signed_transport_destination(&s2).await.unwrap(),
-            Outcome::Refused { .. }
-        ));
-        assert!(dir
-            .list_transport_destinations_for(&alice_id)
-            .await
-            .unwrap()
-            .is_empty());
-        // ...and neither can a stale LOCAL put (silent no-op).
+        // I3320 — a replayed older bind resurrects nothing...
+        put(dir, &own1).await.expect("I3320: old own voice");
+        let out = put(dir, &auth1).await.expect("I3320: old author voice");
+        assert!(is_row(&out, false), "I3320: {out:?}");
+        assert!(routes(dir, &phone).await.is_empty(), "I3320: still retired");
+        // ...nor does a stale LOCAL put (a silent no-op).
         dir.put_transport_destination(&route(
-            &alice_id,
-            "reticulum",
+            &ph,
+            OccurrenceTransportBinding::TRANSPORT_KIND,
             "d-necromancer",
-            1,
+            0,
             "2026-07-01T00:00:00Z",
         ))
         .await
         .unwrap();
-        assert!(dir
-            .list_transport_destinations_for(&alice_id)
-            .await
-            .unwrap()
-            .is_empty());
-
-        // (11) v21.4.0 (#515) — SIGNED WINS THE SHARED KEY: a trusted-local
-        // put, even at a HIGHER epoch, can NEITHER resurrect a signed
-        // retirement NOR demote the signature container. The tombstone was
-        // signed intent; an unsigned writer carries nothing that outranks
-        // it. (Pre-#515 this leg asserted the opposite — the local put
-        // re-established the route and dropped the signature — which is
-        // exactly the demotion recipe the live canonical hit.)
-        dir.put_transport_destination(&route(
-            &alice_id,
-            "reticulum",
-            "d3",
-            3,
-            "2026-06-13T00:00:00Z",
-        ))
-        .await
-        .unwrap();
         assert!(
-            dir.list_transport_destinations_for(&alice_id)
-                .await
-                .unwrap()
-                .is_empty(),
-            "an unsigned put must not resurrect a signed retirement"
+            routes(dir, &phone).await.is_empty(),
+            "I3320: a stale local put"
         );
+        // ...while a NEWER bind re-establishes the route.
+        let (td3, d3) = transport_tag(0x30);
+        let b3 = Bind::new(&alice, &alice, &phone, PHONE, t(30)).with("transport_destination", td3);
+        let v3 = b3.voices();
+        let out = put_voices(dir, &v3).await;
+        assert!(is_row(&out, true), "I3320: {out:?}");
+        let rows = routes(dir, &phone).await;
+        assert_eq!(rows.len(), 1, "I3320: re-established");
+        assert_eq!(rows[0].destination, d3);
+
+        // I3321 — a local liveness refresh of the route at a later clock
+        // moves neither the bind's statements nor its instant.
+        let mut refresh = rows[0].clone();
+        refresh.asserted_at = at(t(20));
+        dir.put_transport_destination(&refresh).await.unwrap();
+        let st = served(dir, &alice, &phone)
+            .await
+            .expect("I3321: the bind is served");
+        assert_eq!(st, v3[1], "I3321: the served statement is the bind's");
+        readmit(dir, &st)
+            .await
+            .expect("I3321: a peer re-admits the served statement after a local write");
         assert_eq!(
-            dir.list_signed_transport_destinations_for(&alice_id)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "the signed tombstone keeps gossiping"
+            held(dir, &alice, &phone).await.expect("held").asserted_at,
+            at(t(30)),
+            "I3321: the bind's own instant is authoritative"
         );
 
-        // (12) Re-establishment comes SIGNED: an epoch-3 signed rotation by
-        // the bound occurrence re-opens the route through the signed plane.
-        let r3 = route(&alice_id, "reticulum", "d3", 3, "2026-06-13T00:00:00Z");
-        let (env3, sig3) =
-            produce_signed_identity_occurrence(phone.as_ref(), serde_json::to_value(&r3).unwrap())
-                .await
-                .unwrap();
-        let s3 = SignedTransportDestination {
-            transport_destination: r3.clone(),
-            attesting_key_id: phone_id.clone(),
-            signed_envelope: env3,
-            signature: sig3,
-        };
-        assert!(matches!(
-            dir.put_signed_transport_destination(&s3).await.unwrap(),
-            Outcome::Superseded | Outcome::Inserted
-        ));
-        let rows = dir
-            .list_transport_destinations_for(&alice_id)
+        // I3322 — a member outside the family's payload refuses by name.
+        let bad = Bind::new(&alice, &alice, &phone, PHONE, t(10))
+            .with("transport_destination", transport_tag(0x70).0)
+            .with("binding_provenance", Value::Text("ROOTED".into()));
+        let e = put(dir, &bad.own_voice())
             .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].destination, "d3");
+            .expect_err("I3322: an unknown member");
+        assert_eq!(reason(&e), mr::EDITION2_PAYLOAD_INVALID, "I3322: {e}");
         assert_eq!(
-            dir.list_signed_transport_destinations_for(&alice_id)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "the signed re-establishment replaces the tombstone on the signed plane"
-        );
-
-        // (13) v21.17.1 (#541) — THE PRESERVE SET MUST EQUAL THE VERIFIED SET.
-        // An unsigned SAME-CONTENT liveness refresh at a later clock — exactly
-        // what edge's announce write-through issues every round — sails
-        // through #515's guard, because #515 only compared destination + both
-        // transport pubkeys. Pre-#541 it then rewrote the typed `asserted_at`
-        // (and `epoch` / `binding_provenance` / `retired_at`) while preserving
-        // the signature and the byte-exact envelope, desynchronising the row
-        // from its own signature. `verify_signed_transport_destination` checks
-        // all nine of those fields, so every peer refused the replicated row
-        // with `typed asserted_at diverges from the signed envelope` — and the
-        // #393 item-2 gate, which needs that binding to attribute inbound
-        // frames, then dropped everything from the sender. That is how the
-        // trace plane went dark while every component reported healthy.
-        // Note this was not a rare interleaving: the monotonic guard REQUIRES
-        // `excluded.asserted_at > stored.asserted_at`, so every refresh the
-        // guard accepted corrupted the row BY CONSTRUCTION.
-        dir.put_transport_destination(&route(
-            &alice_id,
-            "reticulum",
-            "d3",
-            3,
-            "2026-06-14T00:00:00Z",
-        ))
-        .await
-        .unwrap();
-        let signed_rows = dir
-            .list_signed_transport_destinations_for(&alice_id)
-            .await
-            .unwrap();
-        assert_eq!(signed_rows.len(), 1);
-        let env_asserted = signed_rows[0]
-            .signed_envelope
-            .get("asserted_at")
-            .and_then(|v| v.as_str())
-            .expect("the signed envelope carries asserted_at");
-        assert_eq!(
-            ts(env_asserted),
-            signed_rows[0].transport_destination.asserted_at,
-            "an unsigned liveness refresh must NEVER desynchronise a signed row \
-             from its own envelope — the signature and the fields it attests to \
-             move as one unit (#541)"
-        );
-        assert_eq!(
-            signed_rows[0].transport_destination.asserted_at,
-            ts("2026-06-13T00:00:00Z"),
-            "the SIGNED clock is authoritative: an unsigned writer must not \
-             advance a signed row's asserted_at (#541)"
-        );
-        assert_eq!(
-            signed_rows[0].transport_destination.epoch, 3,
-            "nor its epoch (#541)"
-        );
-
-        // (14) v21.17.1 (#541) — close the loop with the REAL verifier, not a
-        // field comparison: after the unsigned refresh, the row read back through
-        // the replication path must still pass `verify_signed_transport_destination`.
-        // (A hand-rolled field check rebuilds the two-lists problem inside the test;
-        // the verifier IS the list.)
-        crate::federation::admission::verify_signed_transport_destination(dir, &signed_rows[0])
-            .await
-            .expect(
-                "an unsigned liveness refresh must leave a signed transport_destination \
-                 still verifiable by a remote peer (#541)",
-            );
-
-        // (15) I279 (v52.0.0) — an UNKNOWN provenance token in the signed
-        // envelope refuses. Until v52 it read as `Rooted`, matched the typed
-        // `Rooted` row, and was admitted as authoritative.
-        let r_bad = route(&alice_id, "i279", "d-bad", 0, "2026-06-20T00:00:00Z");
-        let mut env_bad = serde_json::to_value(&r_bad).unwrap();
-        env_bad["binding_provenance"] = serde_json::json!("ROOTED");
-        let (env_bad, sig_bad) = produce_signed_identity_occurrence(alice.as_ref(), env_bad)
-            .await
-            .unwrap();
-        let bad = SignedTransportDestination {
-            transport_destination: r_bad,
-            attesting_key_id: alice_id.clone(),
-            signed_envelope: env_bad,
-            signature: sig_bad,
-        };
-        let e = dir
-            .put_signed_transport_destination(&bad)
-            .await
-            .expect_err("I279: an unknown provenance token must refuse, never read as Rooted");
-        assert!(
-            e.to_string().contains("binding_provenance"),
-            "I279: refused by name: {e}"
-        );
-        assert!(
-            dir.list_transport_destinations_for(&alice_id)
-                .await
-                .unwrap()
-                .iter()
-                .all(|r| r.transport_kind != "i279"),
-            "I279: nothing stored"
+            routes(dir, &phone).await[0].destination,
+            d3,
+            "I3322: nothing stored"
         );
     }
 
-    /// v21.17.1 (CIRISPersist#541) — THE INVARIANT, mechanically: no sequence of
-    /// local writes may render a signed row unverifiable by a remote peer. This
-    /// is the `identity_occurrence` half of the class the transport matrix's leg
-    /// 13/14 pins for `transport_destination` — insert a signed row, apply an
-    /// arbitrary unsigned local write on the same key at an ADVANCED clock (an
-    /// equal-clock write proves nothing: the monotonic guard no-ops it), read
-    /// back through the real `list_signed_*` replication path, and re-run the
-    /// family's `verify_signed_*` asserting it STILL passes. Run identically
-    /// across memory + sqlite + postgres (the audit found the backends
-    /// disagreeing). Also pins the fail-OPEN KEM gap (now closed) and the
-    /// memory/sqlite double-revoke asymmetry.
+    /// v62.0.0 (wave E8; was the #541 signed-row-survives-local-write
+    /// invariant) — **no local write renders a bind unverifiable**, and the
+    /// first revocation to land fixes the instants, on sqlite and postgres.
+    ///
+    /// - **I3323** a bind carrying a transport destination and the
+    ///   content-KEM pair; then the engine's trusted-local self-write on the
+    ///   SAME pair at an advanced clock, content-only (`transport_binding`
+    ///   and `encryption_pubkeys` absent, as the login co-admit writes it).
+    ///   The bind is untouched (O1: the local door never overwrites an
+    ///   edition-2 bind): the signed listing serves the same author
+    ///   statement, it re-admits through the door, and the typed row still
+    ///   equals what the statement states.
+    /// - **I3324** the occurrence revoked (a strict majority of the roster);
+    ///   a second revocation of the same pair at other instants is admitted
+    ///   but moves nothing: one revocation, the first's `effective_at`. The
+    ///   trusted-local door refuses a second revocation of the pair.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn exercise_signed_row_survives_local_write(
         dir: &dyn FederationDirectory,
         suffix: &str,
     ) {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
-        use ciris_verify_core::self_at_login::HybridSigningIdentity;
-        use ciris_verify_core::transport_binding::{
-            compute_destination_hash, produce_signed_identity_occurrence,
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::types::device_class::PHONE;
+        use e2bind::{
+            at, encryption, held, is_row, put, put_voices, readmit, revocation_voice, served,
+            transport, Bind,
         };
 
-        let alice_id = format!("io-alice-{suffix}");
-        let phone_id = format!("io-phone-{suffix}");
+        let alice = format!("io-alice-{suffix}");
+        let phone = format!("io-phone-{suffix}");
+        for k in [&alice, &phone] {
+            e2::put_key(dir, k, &["user"]).await;
+        }
+        let (a, ph) = (e2::kid(&alice), e2::kid(&phone));
+        let now = e2bind::now_ms();
+        let t = |mins: u64| now - mins * 60_000;
 
-        // Box the signer + build BEFORE any await (2MB test-stack guard).
-        let alice = Box::new(HybridSigningIdentity::new(
-            &alice_id,
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let member = alice.directory_member().unwrap();
-        dir.put_public_key(SignedKeyRecord {
-            record: fixture_key(
-                &alice_id,
-                member.ed25519_public_key_base64.clone(),
-                member.mldsa65_public_key_base64.clone(),
-            ),
-        })
-        .await
-        .expect("register identity key");
-        dir.put_public_key(SignedKeyRecord {
-            record: fixture_key(&phone_id, B64.encode([9u8; 32]), None),
-        })
-        .await
-        .expect("register occurrence key");
+        let (td, _) = transport([0x01; 32], [0x02; 32]);
+        let b = Bind::new(&alice, &alice, &phone, PHONE, t(60))
+            .with("transport_destination", td)
+            .with(
+                "encryption_pubkeys",
+                encryption([0x03; 32], &[0x11u8; 1184]),
+            );
+        let voices = b.voices();
+        assert!(
+            is_row(&put_voices(dir, &voices).await, true),
+            "I3323: the bind lands"
+        );
 
-        // A signed identity_occurrence carrying BOTH a transport_binding and the
-        // content-KEM pair — the envelope is authoritative, the typed row mirrors it.
-        let transport_ed = [0x01u8; 32];
-        let transport_x = [0x02u8; 32];
-        let content_x = [0x03u8; 32];
-        let ml_kem = vec![0x11u8; 1184];
-        let app = "ciris.federation";
-        let aspects = vec!["announce".to_string(), "v1".to_string()];
-        let dest_hash =
-            compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
-        let envelope = serde_json::json!({
-            // v31.0.0 (CIRISVerify 13.1.0) - `attesting_key_id` is BOUND into the
-            // signed bytes. It is a `SignedIdentityOccurrence` field living
-            // OUTSIDE them, so nothing tied the signer named on the wrapper to
-            // the signer the envelope is about: Mallory could re-present a
-            // victim's genuine envelope under her own transport destination and
-            // the signature still verified. Verify now refuses the pair as
-            // SubjectMismatch. Same spelling as verify's own fixture.
-            "attesting_key_id": alice_id,
-            "identity_key_id": alice_id,
-            "occurrence_key_id": phone_id,
-            "transport_destination": {
-                "reticulum_x25519_pubkey": B64.encode(transport_x),
-                "reticulum_ed25519_pubkey": B64.encode(transport_ed),
-                "destination_hash": B64.encode(dest_hash),
-                "app_name": app,
-                "aspects": aspects,
-            },
-            "encryption_pubkeys": {
-                "x25519_base64": B64.encode(content_x),
-                "ml_kem_768_base64": B64.encode(&ml_kem),
-            },
-            "asserted_at": "2026-06-14T00:00:00.000Z",
-        });
-        let (signed_envelope, signature) =
-            produce_signed_identity_occurrence(alice.as_ref(), envelope)
-                .await
-                .unwrap();
-        let typed = |x: &[u8], kem: &[u8]| crate::federation::IdentityOccurrence {
-            identity_key_id: alice_id.clone(),
-            occurrence_key_id: phone_id.clone(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
-            hardware_attestation: None,
-            asserted_at: ts("2026-06-14T00:00:00Z"),
-            valid_until: None,
-            encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
-                x25519_base64: B64.encode(x),
-                ml_kem_768_base64: B64.encode(kem),
-            }),
-            transport_binding: Some(crate::federation::types::OccurrenceTransportBinding {
-                reticulum_x25519_pubkey_base64: B64.encode(transport_x),
-                reticulum_ed25519_pubkey_base64: B64.encode(transport_ed),
-                destination_hash_base64: B64.encode(dest_hash),
-                app_name: app.into(),
-                aspects: aspects.clone(),
-            }),
-            persist_row_hash: String::new(),
+        // The statement and the typed row it projects, as one unit.
+        let check = |what: &'static str| {
+            let author_voice = voices[1].clone();
+            let (alice, phone) = (alice.clone(), phone.clone());
+            async move {
+                let st = served(dir, &alice, &phone)
+                    .await
+                    .unwrap_or_else(|| panic!("({suffix}) {what}: the bind is served"));
+                assert_eq!(st, author_voice, "({suffix}) {what}: the same statement");
+                let admitted = readmit(dir, &st).await.unwrap_or_else(|e| {
+                    panic!("({suffix}) {what}: the served statement must re-admit: {e}")
+                });
+                let stated = crate::federation::edition2::occurrence::read_payload(&admitted)
+                    .expect("the bind's payload reads");
+                let row = held(dir, &alice, &phone).await.expect("the bind is held");
+                assert!(
+                    row.transport_binding.is_some(),
+                    "({suffix}) {what}: the transport binding is held"
+                );
+                assert_eq!(
+                    (
+                        &row.transport_binding,
+                        &row.encryption_pubkeys,
+                        row.asserted_at
+                    ),
+                    (
+                        &stated.transport_binding,
+                        &stated.encryption_pubkeys,
+                        stated.asserted_at
+                    ),
+                    "({suffix}) {what}: the typed row is what the statement states"
+                );
+            }
         };
-        let signed = crate::federation::SignedIdentityOccurrence {
-            identity_occurrence: typed(&content_x, &ml_kem),
-            attesting_key_id: alice_id.clone(),
-            signed_envelope: signed_envelope.clone(),
-            signature: signature.clone(),
-        };
-        dir.put_identity_occurrence(signed.clone())
-            .await
-            .expect("signed identity_occurrence admits");
-        crate::federation::admission::verify_signed_identity_occurrence(dir, &signed)
-            .await
-            .expect("baseline: the stored signed occurrence verifies");
+        Box::pin(check("I3323 baseline")).await;
 
-        // THE ATTACK — an unsigned local self-write on the SAME key at an advanced
-        // clock, content-only (transport_binding: None), exactly like engine.rs's
-        // login/DEK co-admit. Pre-#541 this NULLed the envelope-covered columns
-        // while keeping the signature; the replicated row then diverged.
+        // THE ATTACK — the trusted-local self-write on the same pair, later,
+        // content-only.
         dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
-            identity_key_id: alice_id.clone(),
-            occurrence_key_id: phone_id.clone(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
+            identity_key_id: a.clone(),
+            occurrence_key_id: ph.clone(),
+            device_class: PHONE.into(),
             hardware_attestation: None,
-            asserted_at: ts("2026-06-20T00:00:00Z"),
+            asserted_at: at(t(10)),
             valid_until: None,
             encryption_pubkeys: None,
             transport_binding: None,
             persist_row_hash: String::new(),
         })
         .await
-        .expect("the content-only local self-write is accepted (no-op on the signed row)");
-
-        // Read back through the REAL replication path and re-run the REAL verifier.
-        let rows = dir
-            .list_signed_identity_occurrences_for(&alice_id)
-            .await
-            .expect("signed read");
-        assert_eq!(rows.len(), 1, "({suffix}) the signed occurrence survives");
-        assert!(
-            rows[0].identity_occurrence.transport_binding.is_some(),
-            "({suffix}) the local write must NOT have NULLed the signed transport_binding"
-        );
-        crate::federation::admission::verify_signed_identity_occurrence(dir, &rows[0])
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "({suffix}) a signed identity_occurrence must remain verifiable after any \
-                     unsigned local write — got {e}"
-                )
-            });
-
-        // The fail-OPEN KEM gap, now closed: a typed row whose ml_kem_768 diverges
-        // from the signed envelope (x25519 unchanged) must be REJECTED. Pre-#541
-        // the verifier compared only x25519 and silently ACCEPTED this.
-        let kem_diverged = crate::federation::SignedIdentityOccurrence {
-            identity_occurrence: typed(&content_x, &[0x22u8; 1184]),
-            attesting_key_id: alice_id.clone(),
-            signed_envelope,
-            signature,
-        };
-        let err =
-            crate::federation::admission::verify_signed_identity_occurrence(dir, &kem_diverged)
+        .expect("I3323: the content-only local self-write is accepted (a no-op on the bind)");
+        assert_eq!(
+            dir.list_signed_identity_occurrences_for(&a)
                 .await
-                .expect_err("({suffix}) a diverged content-KEM key must fail closed (#541)");
-        assert!(
-            format!("{err}").contains("diverges"),
-            "({suffix}) KEM divergence rejected as a divergence: {err}"
+                .unwrap()
+                .len(),
+            1,
+            "({suffix}) I3323: the bind survives"
         );
+        Box::pin(check("I3323 after the local write")).await;
 
-        // The double-revoke asymmetry: a second local revocation on the same key
-        // is REFUSED on every backend (memory used to silently overwrite
-        // effective_at — "the whole attack").
-        let rev = |secs: i64| crate::federation::types::IdentityOccurrenceRevocation {
-            identity_key_id: alice_id.clone(),
-            occurrence_key_id: phone_id.clone(),
-            revoked_at: ts("2026-07-01T00:00:00Z") + chrono::Duration::seconds(secs),
-            effective_at: ts("2026-07-01T00:00:00Z") + chrono::Duration::seconds(secs),
-            reason: None,
-            witness_set: Vec::new(),
-            persist_row_hash: String::new(),
-        };
-        dir.put_identity_occurrence_revocation_local(rev(0))
+        // I3324 — the first revocation to land fixes the instants.
+        let r1 = revocation_voice(dir, &alice, &alice, &phone, t(40)).await;
+        let r2 = revocation_voice(dir, &phone, &alice, &phone, t(40)).await;
+        assert!(matches!(
+            put(dir, &r1).await.expect("I3324: first voice"),
+            StatementOutcome::Pending { .. }
+        ));
+        assert!(
+            is_row(&put(dir, &r2).await.expect("I3324: second voice"), true),
+            "I3324: the roster majority lands the revocation"
+        );
+        put(
+            dir,
+            &revocation_voice(dir, &alice, &alice, &phone, t(20)).await,
+        )
+        .await
+        .expect("I3324: a later revocation of a revoked pair is admitted");
+        let revs: Vec<_> = dir
+            .list_identity_occurrence_revocations_for(&a)
             .await
-            .expect("first local revocation admits");
-        dir.put_identity_occurrence_revocation_local(rev(100))
-            .await
-            .expect_err(
-                "({suffix}) a second local revocation on the same key must be refused (#541)",
-            );
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.occurrence_key_id == ph)
+            .collect();
+        assert_eq!(
+            revs.len(),
+            1,
+            "({suffix}) I3324: one revocation of the pair"
+        );
+        assert_eq!(
+            revs[0].effective_at,
+            at(t(40)),
+            "({suffix}) I3324: the first revocation's instant stands"
+        );
+        dir.put_identity_occurrence_revocation_local(
+            crate::federation::types::IdentityOccurrenceRevocation {
+                identity_key_id: a.clone(),
+                occurrence_key_id: ph.clone(),
+                revoked_at: at(t(5)),
+                effective_at: at(t(5)),
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        )
+        .await
+        .expect_err("I3324: a second local revocation of the pair is refused (#541)");
     }
 
-    /// **The #446 composite-projection matrix** (trusted-local occurrence
-    /// plane; the signed plane is covered by the sqlite gate test, which
-    /// shares the same projection code path). Invariant: every ACCEPTED
-    /// occurrence carrying a `transport_binding` has its route materialized
-    /// in `transport_destinations` as a LOCAL derived row — visible to the
-    /// plain reads, invisible to the signed replication read (no
-    /// double-carriage) — superseding on the occurrence's own asserted_at
-    /// clock, retired by the occurrence's revocation, and revived by a newer
-    /// occurrence.
+    /// v62.0.0 (wave E8; was the #446 composite-projection matrix) — **every
+    /// landed bind carrying a transport destination projects its route**, as
+    /// a LOCAL derived row (the plain reads see it, the signed route plane
+    /// never carries it), on the bind's own clock; on sqlite and postgres.
+    ///
+    /// - **I3325** (1) the route is materialized exactly (kind, the
+    ///   destination hash as hex, both link keys, `Rooted`, epoch 0, the
+    ///   bind's instant); (2) a newer bind supersedes it in place; a replayed
+    ///   older bind displaces nothing; (3) the occurrence's revocation retires
+    ///   it; (4) a newer bind revives it.
+    /// - **I3326** an agent's occurrence binds the AGENT's own identity,
+    ///   authored by its owner, with the agent key's own voice: it lands and
+    ///   projects NO route (an agent is reached through its node, CC 3.4.7.3
+    ///   Clause A). The same agent key under the owner's (a person's)
+    ///   identity is refused `occurrence_binds_machine_to_person`, as
+    ///   `agent` and as `laptop`.
+    /// - **I3327** the window is half-open: a bind whose `valid_until` is
+    ///   ahead projects its route; a bind whose `valid_until` has passed
+    ///   projects none. (Depends on O1's fix: the projection and the route
+    ///   reads honour `valid_until`, half-open.)
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn run_binding_projection_matrix(dir: &dyn FederationDirectory, suffix: &str) {
-        use crate::federation::types::{
-            device_class, IdentityOccurrence, IdentityOccurrenceRevocation,
-            OccurrenceTransportBinding,
-        };
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::malformed_row as mr;
+        use crate::federation::types::device_class::{AGENT, LAPTOP, PHONE};
+        use crate::federation::types::OccurrenceTransportBinding;
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use e2bind::{
+            at, held, is_row, put, put_bind, put_voices, reason, revocation_voice, routes,
+            transport_tag, Bind,
+        };
 
         let identity = format!("proj-id-{suffix}");
         let occ = format!("proj-occ-{suffix}");
         for k in [&identity, &occ] {
-            let ed = B64.encode([0x22u8; 32]);
-            dir.put_public_key(SignedKeyRecord {
-                record: fixture_key(k, ed, None),
-            })
-            .await
-            .expect("register projection fixture key");
+            e2::put_key(dir, k, &["user"]).await;
         }
+        let o = e2::kid(&occ);
+        let now = e2bind::now_ms();
+        let t = |mins: u64| now - mins * 60_000;
 
-        let binding = |tag: u8| OccurrenceTransportBinding {
-            reticulum_x25519_pubkey_base64: B64.encode([tag; 32]),
-            reticulum_ed25519_pubkey_base64: B64.encode([tag.wrapping_add(1); 32]),
-            destination_hash_base64: B64.encode([tag; 16]),
-            app_name: "ciris.federation".into(),
-            aspects: vec!["announce".into()],
-        };
-        let occ_row = |asserted: &str, tag: u8| IdentityOccurrence {
-            identity_key_id: identity.clone(),
-            occurrence_key_id: occ.clone(),
-            device_class: device_class::AGENT.into(),
-            hardware_attestation: None,
-            asserted_at: ts(asserted),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: Some(binding(tag)),
-            persist_row_hash: String::new(),
-        };
-
-        // (1) Accepted local put with a binding → the route is MATERIALIZED:
-        // reticulum kind, dest + both transport pubkeys from the binding,
-        // Rooted from context, (epoch=0, asserted_at=occurrence clock).
-        dir.put_identity_occurrence_local(occ_row("2026-07-01T00:00:00Z", 0x10))
-            .await
-            .expect("(1) local occurrence put");
-        let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
-        assert_eq!(rows.len(), 1, "(1) exactly one projected route");
+        // (1) The route is materialized from the landed bind.
+        let (td1, d1) = transport_tag(0x10);
+        let b1 =
+            Bind::new(&identity, &identity, &occ, PHONE, t(60)).with("transport_destination", td1);
+        let v1 = b1.voices();
+        assert!(
+            is_row(&put_voices(dir, &v1).await, true),
+            "I3325 (1) the bind lands"
+        );
+        let rows = routes(dir, &occ).await;
+        assert_eq!(rows.len(), 1, "I3325 (1) exactly one projected route");
         let r = &rows[0];
+        assert_eq!(r.occurrence_key_id, o);
         assert_eq!(r.transport_kind, OccurrenceTransportBinding::TRANSPORT_KIND);
-        // v21.3.0 (#512) — the projected destination is canonical HEX.
-        assert_eq!(r.destination, hex::encode([0x10u8; 16]));
+        assert_eq!(
+            r.destination, d1,
+            "I3325 (1) the hash, canonical hex (#512)"
+        );
         assert_eq!(
             r.transport_x25519_pubkey_base64.as_deref(),
             Some(B64.encode([0x10u8; 32]).as_str())
@@ -2422,56 +2554,133 @@ pub(crate) mod test_support {
         );
         assert_eq!(r.binding_provenance, BindingProvenance::Rooted);
         assert_eq!(r.epoch, 0);
-        assert_eq!(r.asserted_at, ts("2026-07-01T00:00:00Z"));
-        // No double-carriage: the projected row is LOCAL-derived, so the
-        // signed replication read must not emit it (the occurrence plane is
-        // the single replication authority for this route).
+        assert_eq!(r.asserted_at, at(t(60)));
         assert!(
-            dir.list_signed_transport_destinations_for(&occ)
+            dir.list_signed_transport_destinations_for(&o)
                 .await
                 .unwrap()
                 .is_empty(),
-            "(1) a projected route must not replicate on the route plane"
+            "I3325 (1) a projected route never replicates on the route plane"
         );
 
-        // (2) A newer occurrence supersedes the projection in lockstep.
-        dir.put_identity_occurrence_local(occ_row("2026-07-02T00:00:00Z", 0x20))
-            .await
-            .expect("(2) newer local occurrence put");
-        let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
-        assert_eq!(rows.len(), 1, "(2) superseded in place, never a 2nd row");
-        assert_eq!(rows[0].destination, hex::encode([0x20u8; 16]));
+        // (2) A newer bind supersedes in lockstep; an older one replayed
+        // displaces nothing.
+        let (td2, d2) = transport_tag(0x20);
+        let b2 =
+            Bind::new(&identity, &identity, &occ, PHONE, t(50)).with("transport_destination", td2);
+        assert!(is_row(&put_bind(dir, &b2).await, true), "I3325 (2)");
+        let rows = routes(dir, &occ).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "I3325 (2) superseded in place, never a 2nd row"
+        );
+        assert_eq!(rows[0].destination, d2);
+        assert!(
+            is_row(&put_voices(dir, &v1).await, false),
+            "I3325 (2) replay"
+        );
+        assert_eq!(
+            routes(dir, &occ).await[0].destination,
+            d2,
+            "I3325 (2) the newest route wins"
+        );
 
-        // (3) De-projection: revoking the occurrence retires the projected
-        // route — a revoked occurrence must not leave a live routable peer.
-        dir.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: identity.clone(),
-            occurrence_key_id: occ.clone(),
-            revoked_at: ts("2026-07-03T00:00:00Z"),
-            effective_at: ts("2026-07-03T00:00:00Z"),
-            reason: None,
-            witness_set: vec![identity.clone()],
-            persist_row_hash: String::new(),
-        })
+        // (3) De-projection: the occurrence's revocation (the roster
+        // {identity, occ}, both voices) retires the route.
+        put(
+            dir,
+            &revocation_voice(dir, &identity, &identity, &occ, t(40)).await,
+        )
         .await
-        .expect("(3) local occurrence revocation");
+        .expect("I3325 (3) first revocation voice");
+        let out = put(
+            dir,
+            &revocation_voice(dir, &occ, &identity, &occ, t(40)).await,
+        )
+        .await
+        .expect("I3325 (3) second revocation voice");
+        assert!(is_row(&out, true), "I3325 (3) {out:?}");
         assert!(
-            dir.list_transport_destinations_for(&occ)
-                .await
-                .unwrap()
-                .is_empty(),
-            "(3) the projected route must be retired with its occurrence"
+            routes(dir, &occ).await.is_empty(),
+            "I3325 (3) the route is retired with its occurrence"
         );
 
-        // (4) A NEWER occurrence re-materializes (revives) the route — the
-        // (epoch, asserted_at) guard supersedes the retired row and clears
-        // retired_at.
-        dir.put_identity_occurrence_local(occ_row("2026-07-04T00:00:00Z", 0x30))
-            .await
-            .expect("(4) re-established occurrence put");
-        let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
-        assert_eq!(rows.len(), 1, "(4) a newer occurrence revives the route");
-        assert_eq!(rows[0].destination, hex::encode([0x30u8; 16]));
+        // (4) A NEWER bind revives the route.
+        let (td3, d3) = transport_tag(0x30);
+        let b3 =
+            Bind::new(&identity, &identity, &occ, PHONE, t(30)).with("transport_destination", td3);
+        assert!(is_row(&put_bind(dir, &b3).await, true), "I3325 (4)");
+        let rows = routes(dir, &occ).await;
+        assert_eq!(rows.len(), 1, "I3325 (4) a newer bind revives the route");
+        assert_eq!(rows[0].destination, d3);
+
+        // I3326 — an agent: its own identity, its owner authoring.
+        let owner = format!("proj-owner-{suffix}");
+        let agent = format!("proj-agent-{suffix}");
+        let agent_key = format!("proj-agent-key-{suffix}");
+        e2::put_key(dir, &owner, &["user"]).await;
+        e2::put_key(dir, &agent, &["agent"]).await;
+        e2::put_key(dir, &agent_key, &["agent"]).await;
+        for class in [AGENT, LAPTOP] {
+            let under_person = Bind::new(&owner, &owner, &agent_key, class, t(25))
+                .with("transport_destination", transport_tag(0x41).0);
+            let e = put(dir, &under_person.own_voice())
+                .await
+                .expect_err("I3326: an agent key under a person");
+            assert_eq!(
+                reason(&e),
+                mr::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+                "I3326 ({class}): {e}"
+            );
+        }
+        assert!(
+            held(dir, &owner, &agent_key).await.is_none(),
+            "I3326: nothing bound"
+        );
+        e2::put_agent_owner_binding(dir, &owner, &agent, t(40)).await;
+        let b_agent = Bind::new(&owner, &agent, &agent_key, AGENT, t(20))
+            .with("transport_destination", transport_tag(0x40).0);
+        assert!(
+            is_row(&put_bind(dir, &b_agent).await, true),
+            "I3326: the owner's statement and the agent key's own land the bind"
+        );
+        assert!(
+            held(dir, &agent, &agent_key).await.is_some(),
+            "I3326: bound under the agent's own identity"
+        );
+        assert!(
+            routes(dir, &agent_key).await.is_empty(),
+            "I3326: an agent's occurrence projects no route"
+        );
+
+        // I3327 — the window is half-open. A bind still in force projects its
+        // route...
+        let live_id = format!("proj-live-id-{suffix}");
+        let live_occ = format!("proj-live-occ-{suffix}");
+        let exp_id = format!("proj-exp-id-{suffix}");
+        let exp_occ = format!("proj-exp-occ-{suffix}");
+        for k in [&live_id, &live_occ, &exp_id, &exp_occ] {
+            e2::put_key(dir, k, &["user"]).await;
+        }
+        let live = Bind::new(&live_id, &live_id, &live_occ, PHONE, t(10))
+            .until(now + 3_600_000)
+            .with("transport_destination", transport_tag(0x50).0);
+        assert!(is_row(&put_bind(dir, &live).await, true), "I3327 live bind");
+        assert_eq!(
+            routes(dir, &live_occ).await.len(),
+            1,
+            "I3327: a bind in force projects its route"
+        );
+        // ...and a bind whose `valid_until` has passed projects none.
+        let expired = Bind::new(&exp_id, &exp_id, &exp_occ, PHONE, t(120))
+            .until(t(60))
+            .with("transport_destination", transport_tag(0x51).0);
+        put_bind(dir, &expired).await;
+        assert!(
+            routes(dir, &exp_occ).await.is_empty(),
+            "I3327: an occurrence past its valid_until has no route"
+        );
     }
 
     /// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 rc8) — an envelope value for a
@@ -2511,709 +2720,163 @@ pub(crate) mod test_support {
         );
     }
 
-    /// **The transit KEX matrix** (v56.0.0, CIRISPersist#1077), run on the
-    /// memory, sqlite and postgres backends. Every envelope is REALLY signed by
-    /// a registered key that may act for the route, so each refusal is the
-    /// pair rule's and not the signature gate's.
+    /// v62.0.0 slice E1 (CIRISPersist#1274; CC rc20 3.3.6.2), rewritten in
+    /// wave E8 onto the edition-2 bind — **the X-Wing matrix**, run on sqlite
+    /// and postgres (`rc20_rules_invariants`). A node binds its own key (the
+    /// self pair: one statement, `server`), carrying its transport
+    /// destination and the X-Wing keys at the payload's top level; every
+    /// refusal is the X-Wing rule's at the `identity:occurrence` door.
     ///
-    /// - **I1011** a well-formed pair admits; the envelope is stored verbatim;
-    ///   `list_signed_transport_destinations_for` / `_since` and the
-    ///   content-hash point read re-serve it with the member intact; the
-    ///   accessor reads the pair back.
-    /// - **I1012** (backend leg) one member alone, an empty pair, and wrong
-    ///   lengths (31, 33, 1183, 1185) refuse by name; the stored row is
-    ///   untouched. A row with neither member admits and reads `None`.
-    /// - **I1014** rotation rides `(epoch, asserted_at)`: a higher epoch with a
-    ///   new pair supersedes; the older row is then `Refused`.
-    /// - **I1015** a same-clock re-sign that changes only the pair is
-    ///   `Refused` (the projection is equal, the content is not), and the exact
-    ///   replay stays `Unchanged`.
-    /// - **I1016** key separation: a transit x25519 equal to the row's own
-    ///   Reticulum link x25519 refuses (`transit_kex_key_reuse`).
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub(crate) async fn run_transit_kex_matrix(dir: &dyn FederationDirectory, suffix: &str) {
-        use crate::federation::malformed_row as mr;
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
-        use ciris_verify_core::self_at_login::HybridSigningIdentity;
-        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
-        use TransportDestinationApplyOutcome as Outcome;
-
-        let relay_id = format!("tkex-relay-{suffix}");
-        let relay = Box::new(HybridSigningIdentity::new(
-            &relay_id,
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let member = relay.directory_member().unwrap();
-        dir.put_public_key(SignedKeyRecord {
-            record: fixture_key(
-                &relay_id,
-                member.ed25519_public_key_base64.clone(),
-                member.mldsa65_public_key_base64.clone(),
-            ),
-        })
-        .await
-        .expect("register relay key");
-
-        let sign = |row: TransportDestination, m: Option<serde_json::Value>| {
-            let env = envelope_with_transit_kex(&row, m);
-            let relay = relay.as_ref();
-            let relay_id = relay_id.clone();
-            async move {
-                let (env, sig) = produce_signed_identity_occurrence(relay, env)
-                    .await
-                    .expect("sign route envelope");
-                SignedTransportDestination {
-                    transport_destination: row,
-                    attesting_key_id: relay_id,
-                    signed_envelope: env,
-                    signature: sig,
-                }
-            }
-        };
-        let kind = "reticulum";
-
-        // I1012 — the v55 shape: neither member admits, accessor reads None.
-        let r0 = route(&relay_id, kind, "d0", 0, "2026-10-13T00:00:00Z");
-        let s0 = sign(r0.clone(), None).await;
-        assert_eq!(
-            dir.put_signed_transport_destination(&s0).await.unwrap(),
-            Outcome::Inserted,
-            "I1012: a row with no pair admits (v55 shape)"
-        );
-        assert_eq!(s0.transit_kex_pair().unwrap(), None);
-
-        // I1011 — a well-formed pair admits and is served verbatim.
-        let r1 = route(&relay_id, kind, "d1", 1, "2026-10-13T01:00:00Z");
-        let s1 = sign(r1.clone(), Some(transit_kex_member(0x11, 0x22))).await;
-        assert_eq!(
-            dir.put_signed_transport_destination(&s1).await.unwrap(),
-            Outcome::Superseded,
-            "I1011: a pair-bearing row supersedes the pairless one"
-        );
-        let held = dir
-            .list_signed_transport_destinations_for(&relay_id)
-            .await
-            .unwrap();
-        assert_eq!(held.len(), 1);
-        assert_eq!(
-            held[0].signed_envelope, s1.signed_envelope,
-            "I1011: the envelope is stored and re-served verbatim (_for)"
-        );
-        let pair = held[0]
-            .transit_kex_pair()
-            .unwrap()
-            .expect("I1011: pair reads back");
-        assert_eq!(pair.x25519, [0x11; TRANSIT_KEX_X25519_LEN]);
-        assert!(pair.ml_kem_768.iter().all(|b| *b == 0x22));
-        assert_eq!(
-            held[0].rooted_transit_kex_pair().unwrap(),
-            Some(pair.clone())
-        );
-        let served = dir
-            .list_signed_transport_destinations_since(None, 10_000)
-            .await
-            .unwrap();
-        let mine: Vec<_> = served
-            .iter()
-            .filter(|s| s.destination.transport_destination.occurrence_key_id == relay_id)
-            .collect();
-        assert_eq!(mine.len(), 1);
-        assert_eq!(
-            mine[0].destination, s1,
-            "I1011: the serve cursor re-serves the exact signed row (_since)"
-        );
-        assert_eq!(
-            mine[0].destination.transit_kex_pair().unwrap(),
-            Some(pair.clone())
-        );
-        let hash = crate::federation::wire_index::content_hash_of(&s1).unwrap();
-        let bytes = dir
-            .lookup_signed_record_by_content_hash("TransportDestination", &hash)
-            .await
-            .unwrap()
-            .expect("I1011: the pair-bearing row is point-readable by its content hash");
-        assert_eq!(bytes, serde_json::to_vec(&s1).unwrap());
-        let back: SignedTransportDestination = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back.transit_kex_pair().unwrap(), Some(pair.clone()));
-
-        // I1012 — malformed pairs refuse by name, each REALLY signed; the
-        // stored row is untouched.
-        let x_ok = B64.encode([0x33u8; TRANSIT_KEX_X25519_LEN]);
-        let m_ok = B64.encode(vec![0x44u8; TRANSIT_KEX_ML_KEM_768_LEN]);
-        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
-            (
-                "x25519 alone",
-                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: x_ok }),
-                mr::TRANSIT_KEX_HALF_PAIR,
-            ),
-            (
-                "ml_kem alone",
-                serde_json::json!({ TRANSIT_KEX_ML_KEM_768_MEMBER: m_ok }),
-                mr::TRANSIT_KEX_HALF_PAIR,
-            ),
-            (
-                "empty pair",
-                serde_json::json!({}),
-                mr::TRANSIT_KEX_HALF_PAIR,
-            ),
-            (
-                "x25519 31",
-                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: B64.encode([1u8; 31]), TRANSIT_KEX_ML_KEM_768_MEMBER: m_ok }),
-                mr::TRANSIT_KEX_WRONG_LENGTH,
-            ),
-            (
-                "x25519 33",
-                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: B64.encode([1u8; 33]), TRANSIT_KEX_ML_KEM_768_MEMBER: m_ok }),
-                mr::TRANSIT_KEX_WRONG_LENGTH,
-            ),
-            (
-                "ml_kem 1183",
-                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: x_ok, TRANSIT_KEX_ML_KEM_768_MEMBER: B64.encode(vec![1u8; 1183]) }),
-                mr::TRANSIT_KEX_WRONG_LENGTH,
-            ),
-            (
-                "ml_kem 1185",
-                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: x_ok, TRANSIT_KEX_ML_KEM_768_MEMBER: B64.encode(vec![1u8; 1185]) }),
-                mr::TRANSIT_KEX_WRONG_LENGTH,
-            ),
-            (
-                "null member",
-                serde_json::Value::Null,
-                mr::ENVELOPE_MEMBER_INVALID,
-            ),
-        ];
-        for (i, (what, m, reason)) in cases.into_iter().enumerate() {
-            let r = route(
-                &relay_id,
-                kind,
-                "bad",
-                50 + i as u64,
-                "2026-10-13T02:00:00Z",
-            );
-            let s = sign(r, Some(m)).await;
-            let e = dir
-                .put_signed_transport_destination(&s)
-                .await
-                .expect_err(what);
-            expect_route_malformed(&e, reason, &format!("I1012 {what}"));
-        }
-        let still = dir
-            .list_signed_transport_destinations_for(&relay_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            still[0], s1,
-            "I1012: refusals leave the stored row untouched"
-        );
-
-        // I1016 — key separation: transit x25519 == the row's RNS link x25519.
-        let mut r_reuse = route(&relay_id, kind, "reuse", 90, "2026-10-13T02:00:00Z");
-        r_reuse.transport_x25519_pubkey_base64 = Some(B64.encode([0x55u8; 32]));
-        let s_reuse = sign(r_reuse.clone(), Some(transit_kex_member(0x55, 0x66))).await;
-        let e = dir
-            .put_signed_transport_destination(&s_reuse)
-            .await
-            .expect_err("I1016: transit x25519 reusing the link key");
-        expect_route_malformed(&e, mr::TRANSIT_KEX_KEY_REUSE, "I1016");
-        // ... while the transport ed25519 and the signer's ed25519 are a
-        // different algorithm (CC 3.3.6.1: not byte-comparable), so an equal
-        // 32 bytes there is NOT an admission refusal; the resolver
-        // (`transit_kex_pair_for`) judges every key at use.
-        let mut r_ed = route(&relay_id, kind, "reuse-ed", 89, "2026-10-13T02:00:00Z");
-        r_ed.transport_ed25519_pubkey_base64 = Some(B64.encode([0x57u8; 32]));
-        let s_ed = sign(r_ed, Some(transit_kex_member(0x57, 0x66))).await;
-        assert_eq!(
-            dir.put_signed_transport_destination(&s_ed).await.unwrap(),
-            Outcome::Superseded,
-            "I1016: the in-row duty is the link key only"
-        );
-        // ... a distinct link key on the same row admits (the check is the
-        // equality, not the presence of a link key).
-        r_reuse.transport_x25519_pubkey_base64 = Some(B64.encode([0x56u8; 32]));
-        let s_sep = sign(r_reuse, Some(transit_kex_member(0x55, 0x66))).await;
-        assert_eq!(
-            dir.put_signed_transport_destination(&s_sep).await.unwrap(),
-            Outcome::Superseded,
-            "I1016: a transit x25519 distinct from the link key admits"
-        );
-        // I1014 — rotation: a higher epoch with a new pair supersedes.
-        let r2 = route(&relay_id, kind, "d2", 100, "2026-10-13T03:00:00Z");
-        let s2 = sign(r2.clone(), Some(transit_kex_member(0x77, 0x88))).await;
-        assert_eq!(
-            dir.put_signed_transport_destination(&s2).await.unwrap(),
-            Outcome::Superseded,
-            "I1014: a higher epoch with a new pair supersedes"
-        );
-        let now = dir
-            .list_signed_transport_destinations_for(&relay_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            now[0].transit_kex_pair().unwrap().unwrap().x25519,
-            [0x77; TRANSIT_KEX_X25519_LEN],
-            "I1014: the rotated pair is the one served"
-        );
-        // ... and the older pair-bearing row is Refused, as today.
-        assert!(
-            matches!(
-                dir.put_signed_transport_destination(&s1).await.unwrap(),
-                Outcome::Refused { .. }
-            ),
-            "I1014: an older row cannot roll the pair back"
-        );
-        // ... nor can the epoch-90 row it superseded.
-        assert!(matches!(
-            dir.put_signed_transport_destination(&s_sep).await.unwrap(),
-            Outcome::Refused { .. }
-        ));
-
-        // I1015 — same (epoch, asserted_at), same projection, different pair:
-        // a fork, Refused; the stored pair is unchanged.
-        let s2_fork = sign(r2.clone(), Some(transit_kex_member(0x99, 0xAA))).await;
-        assert_eq!(s2_fork.transport_destination, s2.transport_destination);
-        assert!(
-            matches!(
-                dir.put_signed_transport_destination(&s2_fork)
-                    .await
-                    .unwrap(),
-                Outcome::Refused { .. }
-            ),
-            "I1015: a same-clock re-sign that changes only the pair is a fork"
-        );
-        // ... and a same-clock re-sign that DROPS the pair is the same fork.
-        let s2_drop = sign(r2.clone(), None).await;
-        assert!(matches!(
-            dir.put_signed_transport_destination(&s2_drop)
-                .await
-                .unwrap(),
-            Outcome::Refused { .. }
-        ));
-        let now = dir
-            .list_signed_transport_destinations_for(&relay_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            now[0], s2,
-            "I1015: the stored row is still the first epoch-100 row"
-        );
-        // ... while the exact replay, and a re-signature of the SAME envelope
-        // (ML-DSA is randomized, so the signature bytes differ), stay Unchanged.
-        assert_eq!(
-            dir.put_signed_transport_destination(&s2).await.unwrap(),
-            Outcome::Unchanged
-        );
-        let s2_resig = sign(r2, Some(transit_kex_member(0x77, 0x88))).await;
-        assert_eq!(
-            dir.put_signed_transport_destination(&s2_resig)
-                .await
-                .unwrap(),
-            Outcome::Unchanged,
-            "I1015: same pair, same projection, fresh signature is idempotent"
-        );
-    }
-
-    /// **The transit KEX resolver matrix** (v56.0.0, CIRISPersist#1078, CC
-    /// 3.3.6.2 rc8), run on memory, sqlite and postgres:
-    /// [`transit_kex_pair_for`] judged over the rows as held.
-    ///
-    /// - **I1017** a clean pair on a live Rooted binding resolves to it.
-    /// - **I1018** a pair whose x25519 equals the occurrence's content-KEM
-    ///   x25519 resolves to `None`; likewise its ML-KEM-768 against the
-    ///   content-KEM ML-KEM-768.
-    /// - **I1019** a pair whose x25519 equals the OWNER identity's federation
-    ///   ed25519 (a key on the occurrence, not in the route row, so admission
-    ///   cannot see it) resolves to `None`.
-    /// - **I1020** an `Advisory` binding resolves to `None`.
-    /// - **I1021** a node with no binding resolves to `None`.
-    /// - **I1022** two live Rooted bindings carrying different pairs resolve
-    ///   to `None`; a retired binding's pair is never used.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub(crate) async fn run_transit_kex_resolver_matrix(
-        dir: &dyn FederationDirectory,
-        suffix: &str,
-    ) {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
-        use ciris_verify_core::self_at_login::HybridSigningIdentity;
-        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
-        use TransportDestinationApplyOutcome as Outcome;
-
-        let owner_id = format!("tkr-owner-{suffix}");
-        let owner = Box::new(HybridSigningIdentity::new(
-            &owner_id,
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let owner_member = owner.directory_member().unwrap();
-        dir.put_public_key(SignedKeyRecord {
-            record: fixture_key(
-                &owner_id,
-                owner_member.ed25519_public_key_base64.clone(),
-                owner_member.mldsa65_public_key_base64.clone(),
-            ),
-        })
-        .await
-        .expect("register owner key");
-
-        // One node per scenario: a registered hybrid key, bound as an
-        // occurrence of the owner with content-KEM keys from `kem` fills.
-        let mut nodes = Vec::new();
-        for (tag, kem_x, kem_m) in [
-            ("clean", 0xC1u8, 0xC2u8),
-            ("kemx", 0xD1, 0xD2),
-            ("kemm", 0xE1, 0xE2),
-            ("ownerkey", 0xF1, 0xF2),
-            ("adv", 0xB1, 0xB2),
-            ("none", 0xA1, 0xA2),
-            ("two", 0x91, 0x92),
-        ] {
-            let id = format!("tkr-{tag}-{suffix}");
-            let ident = Box::new(HybridSigningIdentity::new(
-                &id,
-                Ed25519Signer::random().unwrap(),
-                MlDsa65Signer::new().unwrap(),
-            ));
-            let m = ident.directory_member().unwrap();
-            dir.put_public_key(SignedKeyRecord {
-                record: fixture_key(
-                    &id,
-                    m.ed25519_public_key_base64.clone(),
-                    m.mldsa65_public_key_base64.clone(),
-                ),
-            })
-            .await
-            .expect("register node key");
-            dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
-                identity_key_id: owner_id.clone(),
-                occurrence_key_id: id.clone(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
-                hardware_attestation: None,
-                asserted_at: ts("2026-10-01T00:00:00Z"),
-                valid_until: None,
-                encryption_pubkeys: Some(crate::federation::types::EncryptionPubkeys {
-                    x25519_base64: B64.encode([kem_x; 32]),
-                    ml_kem_768_base64: B64.encode(vec![kem_m; TRANSIT_KEX_ML_KEM_768_LEN]),
-                }),
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
-            .await
-            .expect("bind node occurrence");
-            nodes.push((tag, id, ident));
-        }
-        let node = |tag: &str| {
-            let (_, id, ident) = nodes.iter().find(|(t, _, _)| *t == tag).unwrap();
-            (id.clone(), ident.as_ref())
-        };
-        async fn put(
-            dir: &dyn FederationDirectory,
-            ident: &HybridSigningIdentity,
-            row: TransportDestination,
-            member: Option<serde_json::Value>,
-        ) -> Outcome {
-            let env = envelope_with_transit_kex(&row, member);
-            let (env, sig) = produce_signed_identity_occurrence(ident, env)
-                .await
-                .unwrap();
-            dir.put_signed_transport_destination(&SignedTransportDestination {
-                transport_destination: row.clone(),
-                attesting_key_id: row.occurrence_key_id.clone(),
-                signed_envelope: env,
-                signature: sig,
-            })
-            .await
-            .expect("admit route")
-        }
-        let at = "2026-10-13T00:00:00Z";
-
-        // I1017 — a clean pair resolves.
-        let (id, ident) = node("clean");
-        put(
-            dir,
-            ident,
-            route(&id, "reticulum", "d", 1, at),
-            Some(transit_kex_member(0x01, 0x02)),
-        )
-        .await;
-        let got = transit_kex_pair_for(dir, &id)
-            .await
-            .unwrap()
-            .expect("I1017: clean pair resolves");
-        assert_eq!(got.x25519, [0x01; TRANSIT_KEX_X25519_LEN]);
-
-        // I1018 — equal to the occurrence's content-KEM x25519 / ML-KEM-768.
-        let (id, ident) = node("kemx");
-        assert_eq!(
-            put(
-                dir,
-                ident,
-                route(&id, "reticulum", "d", 1, at),
-                Some(transit_kex_member(0xD1, 0x03))
-            )
-            .await,
-            Outcome::Inserted,
-            "I1018: admission cannot see the occurrence's keys and admits"
-        );
-        assert_eq!(
-            transit_kex_pair_for(dir, &id).await.unwrap(),
-            None,
-            "I1018: a transit x25519 equal to the content-KEM x25519 is no valid pair"
-        );
-        let (id, ident) = node("kemm");
-        put(
-            dir,
-            ident,
-            route(&id, "reticulum", "d", 1, at),
-            Some(transit_kex_member(0x04, 0xE2)),
-        )
-        .await;
-        assert_eq!(
-            transit_kex_pair_for(dir, &id).await.unwrap(),
-            None,
-            "I1018: a transit ML-KEM-768 equal to the content-KEM ML-KEM-768 is no valid pair"
-        );
-
-        // I1019 — equal to the owner identity's federation ed25519.
-        let (id, ident) = node("ownerkey");
-        let mut m = transit_kex_member(0x00, 0x05);
-        m[TRANSIT_KEX_X25519_MEMBER] =
-            serde_json::Value::String(owner_member.ed25519_public_key_base64.clone());
-        put(dir, ident, route(&id, "reticulum", "d", 1, at), Some(m)).await;
-        assert_eq!(transit_kex_pair_for(dir, &id).await.unwrap(), None, "I1019");
-
-        // I1020 — an Advisory binding never supplies a hop key.
-        let (id, ident) = node("adv");
-        let mut r = route(&id, "reticulum", "d", 1, at);
-        r.binding_provenance = BindingProvenance::Advisory;
-        put(dir, ident, r, Some(transit_kex_member(0x06, 0x07))).await;
-        assert_eq!(transit_kex_pair_for(dir, &id).await.unwrap(), None, "I1020");
-
-        // I1021 — no binding at all.
-        let (id, _) = node("none");
-        assert_eq!(transit_kex_pair_for(dir, &id).await.unwrap(), None, "I1021");
-        assert_eq!(
-            transit_kex_pair_for(dir, &format!("tkr-unknown-{suffix}"))
-                .await
-                .unwrap(),
-            None,
-            "I1021: an unknown node"
-        );
-
-        // I1022 — two live Rooted bindings disagree ⇒ None; once one is
-        // retired, the other's pair resolves.
-        let (id, ident) = node("two");
-        put(
-            dir,
-            ident,
-            route(&id, "reticulum", "d", 1, at),
-            Some(transit_kex_member(0x08, 0x09)),
-        )
-        .await;
-        put(
-            dir,
-            ident,
-            route(&id, "websocket", "wss://n", 1, at),
-            Some(transit_kex_member(0x0A, 0x0B)),
-        )
-        .await;
-        assert_eq!(
-            transit_kex_pair_for(dir, &id).await.unwrap(),
-            None,
-            "I1022: ambiguous"
-        );
-        let mut retired = route(&id, "websocket", "wss://n", 2, "2026-10-13T01:00:00Z");
-        retired.retired_at = Some(ts("2026-10-13T01:00:00Z"));
-        put(dir, ident, retired, Some(transit_kex_member(0x0A, 0x0B))).await;
-        let got = transit_kex_pair_for(dir, &id)
-            .await
-            .unwrap()
-            .expect("I1022: retired pair ignored");
-        assert_eq!(got.x25519, [0x08; TRANSIT_KEX_X25519_LEN]);
-    }
-
-    /// v62.0.0 slice E1 (CIRISPersist#1274; CC rc20 3.3.6.2) — **the X-Wing
-    /// matrix**, run on sqlite and postgres (`rc20_rules_invariants`). Every
-    /// envelope is REALLY signed by a registered key that may act for the
-    /// route, so each refusal is the X-Wing rule's.
-    ///
-    /// - **I1872** both members admit, are stored verbatim and read back by the
-    ///   typed accessors as 1216 bytes split 1184 / 32; a wrong length (1215,
-    ///   1217, 0) refuses `xwing_pubkey_wrong_length`; `null` and non-base64
-    ///   refuse `envelope_member_invalid`; a same-clock re-sign that changes
-    ///   only an X-Wing member is `Refused` (a fork), never kept as the old key.
-    /// - **I1873** the per-half reuse refusals, bytes 0..1184 and 1184..1216,
-    ///   against every other key on the row: the earlier-form pair's halves,
-    ///   the link x25519, the transport ed25519, the signer's pinned Ed25519,
-    ///   `encryption_pubkeys`, and the other X-Wing key (named under the hop
-    ///   key's token). The stored row never moves.
+    /// - **I1872 / I3328** both members admit; the held statement the signed
+    ///   occurrence listing serves is the one put, and its members read back
+    ///   as 1216 bytes split 1184 / 32; a wrong length (1215, 1217, 0) refuses
+    ///   `xwing_pubkey_wrong_length`; a member that is not a byte string
+    ///   (text, `null`, a map) refuses `edition2_payload_invalid`.
+    /// - **I1873 / I3329** the per-half reuse refusals, bytes 0..1184 and
+    ///   1184..1216, against every other key on the row: the Reticulum link
+    ///   x25519 and ed25519, the signer's own Ed25519, `encryption_pubkeys`
+    ///   (both halves), and the other X-Wing key (named under the hop key's
+    ///   token). The held bind never moves.
+    /// - **I3330** a same-instant re-bind that changes only an X-Wing key
+    ///   displaces nothing (the held bind is still served); the exact replay
+    ///   is idempotent (`Row`, `new = false`).
+    /// - **I3331** (depends on O1's fix) the resolvers read the bind: a
+    ///   non-seat node's `transit_xwing_pubkey_for` and
+    ///   `onion_hop_xwing_pubkey_for` answer its held bind's keys.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn run_xwing_matrix(dir: &dyn FederationDirectory, suffix: &str) {
+        use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::malformed_row as mr;
+        use crate::federation::types::device_class::SERVER;
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
-        use ciris_verify_core::self_at_login::HybridSigningIdentity;
-        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
-        use TransportDestinationApplyOutcome as Outcome;
+        use ciris_verify_core::cde::Value;
+        use e2bind::{
+            encryption, is_row, map, payload_bytes, put, reason, routes, served, transport, Bind,
+        };
 
-        let relay_id = format!("xwing-relay-{suffix}");
-        let relay = Box::new(HybridSigningIdentity::new(
-            &relay_id,
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let member = relay.directory_member().unwrap();
-        let signer_ed = B64.decode(&member.ed25519_public_key_base64).unwrap();
-        dir.put_public_key(SignedKeyRecord {
-            record: fixture_key(
-                &relay_id,
-                member.ed25519_public_key_base64.clone(),
-                member.mldsa65_public_key_base64.clone(),
-            ),
-        })
-        .await
-        .expect("register relay key");
-        let xw = |m: &[u8], x: &[u8]| -> serde_json::Value {
-            let mut k = m.to_vec();
-            k.extend_from_slice(x);
-            serde_json::Value::String(B64.encode(k))
-        };
-        let sign = |row: TransportDestination, extra: Vec<(&'static str, serde_json::Value)>| {
-            let mut env = envelope_with_transit_kex(&row, None);
-            for (k, v) in extra {
-                env.as_object_mut().unwrap().insert(k.into(), v);
-            }
-            let relay = relay.as_ref();
-            let relay_id = relay_id.clone();
-            async move {
-                let (env, sig) = produce_signed_identity_occurrence(relay, env)
+        let relay = format!("xwing-relay-{suffix}");
+        let relay_kid = e2::put_key(dir, &relay, &["node"]).await;
+        let signer_ed = B64
+            .decode(
+                dir.lookup_public_key(&relay_kid)
                     .await
-                    .expect("sign route envelope");
-                SignedTransportDestination {
-                    transport_destination: row,
-                    attesting_key_id: relay_id,
-                    signed_envelope: env,
-                    signature: sig,
-                }
-            }
-        };
-        let kind = "reticulum";
+                    .unwrap()
+                    .expect("the relay's key is held")
+                    .pubkey_ed25519_base64,
+            )
+            .expect("the relay's Ed25519 half");
+        let now = e2bind::now_ms();
+        let t = |mins: u64| now - mins * 60_000;
+
+        let xw = |m: &[u8], x: &[u8]| Value::Bytes([m, x].concat());
         let t_m = vec![0xA1u8; XWING_ML_KEM_768_LEN];
         let t_x = [0xA2u8; XWING_X25519_LEN];
         let h_m = vec![0xB1u8; XWING_ML_KEM_768_LEN];
         let h_x = [0xB2u8; XWING_X25519_LEN];
+        let link = [0x55u8; 32];
+        let ted = [0x56u8; 32];
+        let enc_x = [0x57u8; 32];
+        let enc_m = vec![0x58u8; XWING_ML_KEM_768_LEN];
+        let (td, _) = transport(link, ted);
+        let node_bind = |asserted_at_ms: u64| {
+            Bind::new(&relay, &relay, &relay, SERVER, asserted_at_ms)
+                .with("transport_destination", td.clone())
+        };
 
-        // I1872 — both members admit and read back.
-        let r1 = route(&relay_id, kind, "d1", 1, "2026-11-01T01:00:00Z");
-        let s1 = sign(
-            r1,
-            vec![
-                (TRANSIT_KEX_PUBKEYS_MEMBER, transit_kex_member(0x11, 0x22)),
-                (TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x)),
-                (ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x)),
-            ],
-        )
-        .await;
-        assert_eq!(
-            dir.put_signed_transport_destination(&s1).await.unwrap(),
-            Outcome::Inserted,
-            "I1872: a row carrying both X-Wing keys admits"
+        // I1872 / I3328 — both members admit and read back from the held
+        // statement.
+        let s1 = node_bind(t(60))
+            .with(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x))
+            .with(ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x))
+            .own_voice();
+        assert!(
+            is_row(&put(dir, &s1).await.expect("I1872: the bind"), true),
+            "I1872: a bind carrying both X-Wing keys lands"
         );
-        let held = dir
-            .list_signed_transport_destinations_for(&relay_id)
+        let held = served(dir, &relay, &relay)
             .await
-            .unwrap();
-        assert_eq!(held[0], s1, "I1872: stored verbatim");
-        let t = held[0]
-            .transit_xwing_pubkey()
-            .unwrap()
-            .expect("I1872: transit key");
+            .expect("I3328: the bind is served");
+        assert_eq!(held, s1, "I3328: the held statement is the one put");
+        let t_key = XWingPublicKey::from_bytes(
+            &payload_bytes(&held, TRANSIT_XWING_PUBKEY_MEMBER).expect("I1872: transit key"),
+        )
+        .expect("I1872: 1216 bytes");
         assert_eq!(
-            t.ml_kem_768(),
+            t_key.ml_kem_768(),
             t_m.as_slice(),
             "I1872: pk_M is bytes 0..1184"
         );
-        assert_eq!(t.x25519(), &t_x[..], "I1872: pk_X is bytes 1184..1216");
-        let h = held[0]
-            .onion_hop_xwing_pubkey()
-            .unwrap()
-            .expect("I1872: hop key");
-        assert_eq!(h.ml_kem_768(), h_m.as_slice());
-        assert_eq!(h.x25519(), &h_x[..]);
+        assert_eq!(t_key.x25519(), &t_x[..], "I1872: pk_X is bytes 1184..1216");
+        let h_key = XWingPublicKey::from_bytes(
+            &payload_bytes(&held, ONION_HOP_XWING_PUBKEY_MEMBER).expect("I1872: hop key"),
+        )
+        .expect("I1872: 1216 bytes");
+        assert_eq!(h_key.ml_kem_768(), h_m.as_slice());
+        assert_eq!(h_key.x25519(), &h_x[..]);
         assert_eq!(
-            held[0].transit_kex_pair().unwrap().unwrap().x25519,
-            [0x11; 32],
-            "I1872: the earlier-form pair still reads beside the X-Wing key"
+            routes(dir, &relay).await.len(),
+            1,
+            "I3328: the node's bind projects its route"
         );
 
-        // I1872 — malformed members refuse by name; the stored row stands.
-        let mut n = 10u64;
+        // I1872 — malformed members refuse by name; the held bind stands.
         for member_name in [TRANSIT_XWING_PUBKEY_MEMBER, ONION_HOP_XWING_PUBKEY_MEMBER] {
-            for (what, v, reason) in [
+            for (what, v, why) in [
                 (
                     "1215 bytes",
-                    serde_json::Value::String(B64.encode(vec![7u8; 1215])),
+                    Value::Bytes(vec![7u8; 1215]),
                     mr::XWING_PUBKEY_WRONG_LENGTH,
                 ),
                 (
                     "1217 bytes",
-                    serde_json::Value::String(B64.encode(vec![7u8; 1217])),
+                    Value::Bytes(vec![7u8; 1217]),
                     mr::XWING_PUBKEY_WRONG_LENGTH,
                 ),
                 (
                     "empty",
-                    serde_json::Value::String(String::new()),
+                    Value::Bytes(Vec::new()),
                     mr::XWING_PUBKEY_WRONG_LENGTH,
                 ),
-                ("null", serde_json::Value::Null, mr::ENVELOPE_MEMBER_INVALID),
+                ("null", Value::Null, mr::EDITION2_PAYLOAD_INVALID),
                 (
-                    "not base64",
-                    serde_json::Value::String("@@@".into()),
-                    mr::ENVELOPE_MEMBER_INVALID,
+                    "text",
+                    Value::Text(B64.encode(vec![7u8; XWING_PUBKEY_LEN])),
+                    mr::EDITION2_PAYLOAD_INVALID,
                 ),
                 (
-                    "an object",
-                    serde_json::json!({ "x25519_base64": "AA==" }),
-                    mr::ENVELOPE_MEMBER_INVALID,
+                    "a map",
+                    map(vec![("x25519", Value::Bytes(vec![0u8; 32]))]),
+                    mr::EDITION2_PAYLOAD_INVALID,
                 ),
             ] {
-                n += 1;
-                let r = route(&relay_id, kind, "bad", n, "2026-11-01T02:00:00Z");
-                let s = sign(r, vec![(member_name, v)]).await;
-                let e = dir
-                    .put_signed_transport_destination(&s)
-                    .await
-                    .expect_err(what);
-                expect_route_malformed(&e, reason, &format!("I1872 {member_name} {what}"));
+                let st = node_bind(t(55)).with(member_name, v).own_voice();
+                let e = put(dir, &st).await.expect_err(what);
+                assert_eq!(reason(&e), why, "I1872 {member_name} {what}: {e}");
             }
         }
 
-        // I1873 — per-half reuse against every other key on the row.
-        let pair_m = vec![0x22u8; XWING_ML_KEM_768_LEN];
-        let link = [0x55u8; 32];
-        let ted = [0x56u8; 32];
-        let enc_x = [0x57u8; 32];
+        // I1873 / I3329 — per-half reuse against every other key on the row.
         /// `(what, member, key, extra members, refusal reason)`.
         type ReuseCase<'a> = (
             &'a str,
             &'static str,
-            serde_json::Value,
-            Vec<(&'static str, serde_json::Value)>,
+            Value,
+            Vec<(&'static str, Value)>,
             &'a str,
         );
+        let with_transit = || vec![(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x))];
         let cases: Vec<ReuseCase> = vec![
             (
-                "transit pk_M = the earlier pair's ML-KEM",
+                "transit pk_M = encryption_pubkeys.ml_kem_768",
                 TRANSIT_XWING_PUBKEY_MEMBER,
-                xw(&pair_m, &t_x),
+                xw(&enc_m, &t_x),
                 vec![],
                 mr::TRANSIT_XWING_ML_KEM_768_REUSE,
             ),
             (
-                "transit pk_X = the earlier pair's x25519",
+                "transit pk_X = encryption_pubkeys.x25519",
                 TRANSIT_XWING_PUBKEY_MEMBER,
-                xw(&t_m, &[0x11u8; 32]),
+                xw(&t_m, &enc_x),
                 vec![],
                 mr::TRANSIT_XWING_X25519_REUSE,
             ),
@@ -3225,7 +2888,7 @@ pub(crate) mod test_support {
                 mr::TRANSIT_XWING_X25519_REUSE,
             ),
             (
-                "transit pk_X = the transport ed25519",
+                "transit pk_X = the link ed25519",
                 TRANSIT_XWING_PUBKEY_MEMBER,
                 xw(&t_m, &ted),
                 vec![],
@@ -3242,20 +2905,20 @@ pub(crate) mod test_support {
                 "hop pk_M = the transit pk_M",
                 ONION_HOP_XWING_PUBKEY_MEMBER,
                 xw(&t_m, &h_x),
-                vec![(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x))],
+                with_transit(),
                 mr::ONION_HOP_ML_KEM_768_REUSE,
             ),
             (
                 "hop pk_X = the transit pk_X",
                 ONION_HOP_XWING_PUBKEY_MEMBER,
                 xw(&h_m, &t_x),
-                vec![(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x))],
+                with_transit(),
                 mr::ONION_HOP_X25519_REUSE,
             ),
             (
-                "hop pk_M = the earlier pair's ML-KEM",
+                "hop pk_M = encryption_pubkeys.ml_kem_768",
                 ONION_HOP_XWING_PUBKEY_MEMBER,
-                xw(&pair_m, &h_x),
+                xw(&enc_m, &h_x),
                 vec![],
                 mr::ONION_HOP_ML_KEM_768_REUSE,
             ),
@@ -3263,10 +2926,7 @@ pub(crate) mod test_support {
                 "hop pk_X = encryption_pubkeys.x25519",
                 ONION_HOP_XWING_PUBKEY_MEMBER,
                 xw(&h_m, &enc_x),
-                vec![(
-                    "encryption_pubkeys",
-                    serde_json::json!({ "x25519_base64": B64.encode(enc_x), "ml_kem_768_base64": B64.encode(vec![0x58u8; 1184]) }),
-                )],
+                vec![],
                 mr::ONION_HOP_X25519_REUSE,
             ),
             (
@@ -3277,80 +2937,75 @@ pub(crate) mod test_support {
                 mr::ONION_HOP_X25519_REUSE,
             ),
         ];
-        for (what, member_name, key, mut extra, reason) in cases {
-            n += 1;
-            let mut r = route(&relay_id, kind, "reuse", n, "2026-11-01T03:00:00Z");
-            r.transport_x25519_pubkey_base64 = Some(B64.encode(link));
-            r.transport_ed25519_pubkey_base64 = Some(B64.encode(ted));
-            extra.push((TRANSIT_KEX_PUBKEYS_MEMBER, transit_kex_member(0x11, 0x22)));
-            extra.push((member_name, key));
-            let s = sign(r, extra).await;
-            let e = dir
-                .put_signed_transport_destination(&s)
-                .await
-                .expect_err(what);
-            expect_route_malformed(&e, reason, &format!("I1873 {what}"));
+        for (what, member_name, key, extra, why) in cases {
+            let mut b = node_bind(t(50)).with("encryption_pubkeys", encryption(enc_x, &enc_m));
+            for (k, v) in extra {
+                b = b.with(k, v);
+            }
+            let st = b.with(member_name, key).own_voice();
+            let e = put(dir, &st).await.expect_err(what);
+            assert_eq!(reason(&e), why, "I1873 {what}: {e}");
         }
         assert_eq!(
-            dir.list_signed_transport_destinations_for(&relay_id)
-                .await
-                .unwrap()[0],
-            s1,
-            "I1872/I1873: refusals leave the stored row untouched"
+            served(dir, &relay, &relay).await.as_deref(),
+            Some(s1.as_slice()),
+            "I1872/I1873: refusals leave the held bind untouched"
         );
-        // The control: distinct halves on a row carrying every other key admit.
-        n += 1;
-        let mut r = route(&relay_id, kind, "ok", n, "2026-11-01T04:00:00Z");
-        r.transport_x25519_pubkey_base64 = Some(B64.encode(link));
-        r.transport_ed25519_pubkey_base64 = Some(B64.encode(ted));
-        let ok = sign(
-            r.clone(),
-            vec![
-                (TRANSIT_KEX_PUBKEYS_MEMBER, transit_kex_member(0x11, 0x22)),
-                (TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x)),
-                (ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x)),
-            ],
-        )
-        .await;
-        assert_eq!(
-            dir.put_signed_transport_destination(&ok).await.unwrap(),
-            Outcome::Superseded,
-            "I1873 control: separated keys admit"
-        );
-        // I1872 — a same-clock re-sign that changes only an X-Wing key is a fork.
-        let fork = sign(
-            r,
-            vec![
-                (TRANSIT_KEX_PUBKEYS_MEMBER, transit_kex_member(0x11, 0x22)),
-                (TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &[0xA3u8; 32])),
-                (ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x)),
-            ],
-        )
-        .await;
+
+        // The control: separated halves on a row carrying every other key
+        // land, and supersede.
+        let ok = node_bind(t(40))
+            .with("encryption_pubkeys", encryption(enc_x, &enc_m))
+            .with(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x))
+            .with(ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x))
+            .own_voice();
         assert!(
-            matches!(
-                dir.put_signed_transport_destination(&fork).await.unwrap(),
-                Outcome::Refused { .. }
-            ),
-            "I1872: a same-clock re-sign changing only the X-Wing key is refused"
+            is_row(&put(dir, &ok).await.expect("I1873 control"), true),
+            "I1873 control: separated keys land"
         );
         assert_eq!(
-            dir.put_signed_transport_destination(&ok).await.unwrap(),
-            Outcome::Unchanged,
-            "I1872: the exact replay is Unchanged"
+            served(dir, &relay, &relay).await.as_deref(),
+            Some(ok.as_slice())
         );
-        // The resolver: a node that is not a seated serve node needs no
-        // re-bind; its Rooted binding's key resolves.
-        assert!(!crate::federation::transport_rebind::is_seated_serve_node(
-            &relay_id
-        ));
+
+        // I3330 — a same-instant re-bind changing only an X-Wing key is not
+        // the held bind; the exact replay is idempotent.
+        let fork = node_bind(t(40))
+            .with("encryption_pubkeys", encryption(enc_x, &enc_m))
+            .with(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &[0xA3u8; 32]))
+            .with(ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x))
+            .own_voice();
+        put(dir, &fork)
+            .await
+            .expect("I3330: the fork is a well-formed bind");
         assert_eq!(
-            transit_xwing_pubkey_for(dir, &relay_id)
+            served(dir, &relay, &relay).await.as_deref(),
+            Some(ok.as_slice()),
+            "I3330: a same-instant fork displaces nothing"
+        );
+        assert!(
+            is_row(&put(dir, &ok).await.expect("I3330: replay"), false),
+            "I3330: the exact replay is Row, not new"
+        );
+
+        // I3331 (depends on O1's fix: the resolvers read edition-2 binds) — a
+        // node that is not a seat: its held bind's X-Wing keys resolve, the
+        // cross-row rule passed (every other key on the row is distinct).
+        assert_eq!(
+            transit_xwing_pubkey_for(dir, &relay_kid)
                 .await
                 .unwrap()
                 .map(|k| k.as_bytes().to_vec()),
             Some([t_m.as_slice(), &t_x[..]].concat()),
-            "I1872: a non-seat's Rooted X-Wing transit key resolves"
+            "I3331: a non-seat's bind transit key resolves"
+        );
+        assert_eq!(
+            crate::federation::edition2::occurrence::onion_hop_xwing_pubkey_for(dir, &relay_kid)
+                .await
+                .unwrap()
+                .map(|k| k.as_bytes().to_vec()),
+            Some([h_m.as_slice(), &h_x[..]].concat()),
+            "I3331: a non-seat's bind onion hop key resolves"
         );
     }
 }

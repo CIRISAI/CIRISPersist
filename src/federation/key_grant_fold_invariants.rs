@@ -28,20 +28,35 @@
 //!   scope the roster folded at an instant before a removal still seats the
 //!   removed member and one after does not, exactly as unmemoized.
 
+//!
+//! v62.0.0 (E3b) — the room is edition 2: keys are `kid(seed)`, the roster
+//! is ONE `group:roster` version (T1 voices), the removal is
+//! `membership:removal` voices, and the MINTER node is alice's by the OWNER
+//! RELATION (CC rc21 way (d): a node key is never bound under a person,
+//! `occurrence_binds_machine_to_person`): her owner binding (her statement
+//! plus the node's voice) and the node's OWN self-occurrence `(node, node)`
+//! carrying its class and content-KEM keys (O1 `put_bind`; P5c: the owner
+//! gives WHO, the self-occurrence WHAT KIND). The person devices stay on the
+//! trusted-local occurrence door (user keys), keyed by kids. Every device
+//! seed LEADS with its distinguishing part (`d0-{bob}`): a test signer seeds
+//! from a key id's first 32 bytes.
+
 #![cfg(test)]
 
 use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+use crate::federation::edition2::fixture_switch as e2;
+use crate::federation::edition2::ingest::StatementOutcome;
 use crate::federation::key_grant::{
     check_key_grant_row_admission, emit_key_grant_axis_with_local_signer, recipient_may_hold_key,
     EmissionFold, KeyGrantAxis, KeyGrantRow,
 };
-use crate::federation::key_grant_invariants::two_node::{node, sign_row_unstored_at, Node};
-use crate::federation::tier_ingest::test_support as ts;
-use crate::federation::types::identity_type::USER;
-use crate::federation::types::{
-    CommunityMember, CommunityMembershipRevocation, IdentityOccurrence,
-    IdentityOccurrenceRevocation,
+use crate::federation::key_grant_invariants::two_node::{
+    community_removal_voices, encryption_member, node, node_as, owner_binding_voices,
+    sign_row_unstored_at, Node,
 };
+use crate::federation::tier_ingest::test_support as ts;
+use crate::federation::types::identity_type::{NODE, USER};
+use crate::federation::types::{CommunityMember, IdentityOccurrence, IdentityOccurrenceRevocation};
 use crate::federation::{BlobStorage, Error, FederationDirectory, GrantWrap};
 
 /// The verdict as a comparable token: `ok`, or the typed refusal's reason.
@@ -54,17 +69,18 @@ fn verdict(r: &Result<(), Error>) -> String {
     }
 }
 
-async fn occurrence<B>(n: &Node<'_, B>, ident: &str, occ: &str, keyed: bool)
+/// A PERSON's device (both user keys): `occ`'s key live, and the
+/// trusted-local occurrence `(kid(ident), kid(occ))`, keyed with the node's
+/// content-KEM pubkeys when `keyed`. Both arguments are seeds.
+pub(crate) async fn occurrence<B>(n: &Node<'_, B>, ident: &str, occ: &str, keyed: bool)
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    if occ != n.key {
-        ts::register_hybrid_key_as(n.backend, occ, occ, USER).await;
-    }
+    ts::register_hybrid_key_as(n.backend, occ, occ, USER).await;
     n.backend
         .put_identity_occurrence_local(IdentityOccurrence {
-            identity_key_id: ident.to_owned(),
-            occurrence_key_id: occ.to_owned(),
+            identity_key_id: e2::kid(ident),
+            occurrence_key_id: e2::kid(occ),
             device_class: crate::federation::types::device_class::LAPTOP.into(),
             hardware_attestation: None,
             asserted_at: chrono::Utc::now(),
@@ -77,9 +93,118 @@ where
         .unwrap_or_else(|e| panic!("occurrence {occ} of {ident}: {e}"));
 }
 
+/// v62.0.0 (E3b) — **the minter node is `owner`'s**, by the owner relation:
+/// `owner`'s owner binding for the node (her `delegates_to` statement,
+/// re-dated a minute back so the node-typed key's own record covers it,
+/// then the node's own voice: `owner_of` requires it), and the node's OWN
+/// self-occurrence (author = identity = occurrence = the node; one
+/// statement), `server` class, carrying the node's content-KEM keys so a
+/// fan-out can wrap to it. `node_seed` is the alias `n` was brought up from
+/// (`node_as(.., NODE)`); `owner` is a seed.
+pub(crate) async fn own_node<B>(n: &Node<'_, B>, node_seed: &str, owner: &str)
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    assert_eq!(
+        e2::kid(node_seed),
+        n.key,
+        "fixture: the node's key is its alias's identity-ref"
+    );
+    let bound_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    for v in owner_binding_voices(owner, node_seed, bound_at) {
+        e2::put_statement(n.backend, &v)
+            .await
+            .unwrap_or_else(|e| panic!("{owner}'s owner binding for {node_seed}: {e}"));
+    }
+    let opts = e2::BindOptions {
+        extra: vec![encryption_member(&n.kem)],
+        ..e2::BindOptions::default()
+    };
+    match e2::put_bind(
+        n.backend,
+        node_seed,
+        node_seed,
+        node_seed,
+        crate::federation::types::device_class::SERVER,
+        &opts,
+    )
+    .await
+    {
+        Ok(StatementOutcome::Row { .. }) => {}
+        other => panic!("{node_seed}'s own self-occurrence: {other:?}"),
+    }
+}
+
+/// v62.0.0 (E3b) — **found the community `comm`** (a seed, its key live) as
+/// ONE `group:roster` version (T1): the authority's statement and every
+/// listed member's voice, founded at `founded_at` (user keys only, so a
+/// past instant is the author's to state). `members` are seeds; the stored
+/// roster names their kids.
+pub(crate) async fn found_room<B>(
+    n: &Node<'_, B>,
+    comm: &str,
+    name: &str,
+    members: &[&str],
+    founded_at: chrono::DateTime<chrono::Utc>,
+) where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let founded_at = crate::federation::admission::truncate_to_substrate_resolution(founded_at);
+    let signed = ts::sign_community(
+        comm,
+        crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            community_key_id: comm.to_owned(),
+            community_name: name.to_owned(),
+            members: members
+                .iter()
+                .map(|k| CommunityMember {
+                    key_id: (*k).to_owned(),
+                    joined_at: founded_at,
+                    role: None,
+                })
+                .collect(),
+            founded_at,
+            consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY.to_owned(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        },
+    );
+    match e2::put_voices(
+        n.backend,
+        &e2::community_voices(&signed, 1, None, e2::ms(founded_at)),
+    )
+    .await
+    {
+        Ok(StatementOutcome::Row { .. }) => {}
+        other => panic!("found {comm}: {other:?}"),
+    }
+}
+
+/// v62.0.0 (E3b) — **`who` leaves `comm`**, effective `at`: the
+/// `membership:removal` voices naming the held head, `who`'s own among
+/// `signers` (seeds; enough of the roster to meet the majority outright).
+/// Asserts the removal landed.
+pub(crate) async fn leave<B>(
+    n: &Node<'_, B>,
+    comm: &str,
+    who: &str,
+    at: chrono::DateTime<chrono::Utc>,
+    signers: &[&str],
+) where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let voices = community_removal_voices(n.backend, comm, who, at, at, signers).await;
+    match e2::put_voices(n.backend, &voices).await {
+        Ok(StatementOutcome::Row { .. }) => {}
+        other => panic!("{who} leaves {comm}: {other:?}"),
+    }
+}
+
 /// The fixture room, sealed once (so every keyed occurrence holds a wrap),
 /// THEN a member removed and a device revoked: the wraps stay, the audience
-/// moves.
+/// moves. Every id is a kid.
 pub(crate) struct Room {
     pub comm: String,
     pub axis: KeyGrantAxis,
@@ -97,13 +222,14 @@ pub(crate) struct Room {
     pub removed_at: chrono::DateTime<chrono::Utc>,
 }
 
-pub(crate) async fn seed_room<B>(n: &Node<'_, B>, tag: &str) -> Room
+/// The fold room on the minter `n` (brought up from `node_seed` as a NODE).
+pub(crate) async fn seed_room<B>(n: &Node<'_, B>, node_seed: &str, tag: &str) -> Room
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
     let run = uuid::Uuid::new_v4().simple().to_string();
     let comm = format!("{tag}-comm-{run}");
-    let alice = format!("{tag}-alice-{run}"); // the minter's identity
+    let alice = format!("{tag}-alice-{run}"); // the minter's owner
     let bob = format!("{tag}-bob-{run}");
     let eve = format!("{tag}-eve-{run}"); // a device revoked
     let rex = format!("{tag}-rex-{run}"); // removed
@@ -112,11 +238,11 @@ where
     for m in [&alice, &bob, &eve, &rex, &kay] {
         ts::register_hybrid_key_as(n.backend, m, m, USER).await;
     }
-    let (b0, b1) = (format!("{bob}-d0"), format!("{bob}-d1"));
-    let (e0, e1) = (format!("{eve}-d0"), format!("{eve}-d1"));
-    let r0 = format!("{rex}-d0");
-    let k0 = format!("{kay}-d0");
-    occurrence(n, &alice, &n.key, true).await;
+    let (b0, b1) = (format!("d0-{bob}"), format!("d1-{bob}"));
+    let (e0, e1) = (format!("d0-{eve}"), format!("d1-{eve}"));
+    let r0 = format!("d0-{rex}");
+    let k0 = format!("d0-{kay}");
+    own_node(n, node_seed, &alice).await;
     for (m, o) in [
         (&bob, &b0),
         (&bob, &b1),
@@ -127,35 +253,26 @@ where
         occurrence(n, m, o, true).await;
     }
     occurrence(n, &kay, &k0, false).await;
-    let roster = [&alice, &bob, &eve, &rex, &kay]
-        .iter()
-        .map(|k| CommunityMember {
-            key_id: (*k).clone(),
-            joined_at: chrono::Utc::now() - chrono::Duration::hours(1),
-            role: None,
-        })
-        .collect();
-    n.backend
-        .put_community(ts::sign_community(
-            &comm,
-            crate::federation::types::Community {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                community_key_id: comm.clone(),
-                community_name: "fold room".into(),
-                members: roster,
-                founded_at: chrono::Utc::now() - chrono::Duration::hours(1),
-                consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
-                    .to_owned(),
-                policy_blob: None,
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: seed community: {e}"));
-    let sealed = encrypt_and_cascade_community(n.backend, &comm, b"x", None, Some(&n.key))
+    found_room(
+        n,
+        &comm,
+        "fold room",
+        &[&alice, &bob, &eve, &rex, &kay],
+        chrono::Utc::now() - chrono::Duration::hours(1),
+    )
+    .await;
+    let comm_id = e2::kid(&comm);
+    let sealed = encrypt_and_cascade_community(n.backend, &comm_id, b"x", None, Some(&n.key))
         .await
         .unwrap();
+    let (b0, b1, e0, e1, r0, k0) = (
+        e2::kid(&b0),
+        e2::kid(&b1),
+        e2::kid(&e0),
+        e2::kid(&e1),
+        e2::kid(&r0),
+        e2::kid(&k0),
+    );
     for o in [&n.key, &b0, &b1, &e0, &e1, &r0] {
         assert!(
             sealed.granted.contains(o),
@@ -167,51 +284,50 @@ where
         !sealed.granted.contains(&k0),
         "{tag}: the keyless occurrence is excluded fail-secure"
     );
-    // Now the audience moves under the wraps: rex leaves, eve revokes d1.
-    let removed_at = chrono::Utc::now() - chrono::Duration::seconds(2);
-    n.backend
-        .put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &rex,
-            CommunityMembershipRevocation {
-                community_key_id: comm.clone(),
-                removed_identity_key_id: rex.clone(),
-                removed_at,
-                effective_at: removed_at,
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: rex leaves: {e}"));
+    // Now the audience moves under the wraps: rex leaves (his own voice and
+    // three more members', a majority of five outright), eve revokes d1.
+    let removed_at = crate::federation::admission::truncate_to_substrate_resolution(
+        chrono::Utc::now() - chrono::Duration::seconds(2),
+    );
+    leave(n, &comm, &rex, removed_at, &[&rex, &alice, &bob, &eve]).await;
     n.backend
         .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: eve.clone(),
+            identity_key_id: e2::kid(&eve),
             occurrence_key_id: e1.clone(),
             // After the occurrence was asserted (a revocation older than the
             // occurrence it names is re-established past), in effect now.
             revoked_at: chrono::Utc::now(),
             effective_at: chrono::Utc::now(),
             reason: None,
-            witness_set: vec![eve.clone()],
+            witness_set: vec![e2::kid(&eve)],
             persist_row_hash: String::new(),
         })
         .await
         .unwrap_or_else(|e| panic!("{tag}: eve revokes d1: {e}"));
     Room {
         axis: KeyGrantAxis::Epoch {
-            community_key_id: comm.clone(),
+            community_key_id: comm_id.clone(),
             minter_key_id: n.key.clone(),
             epoch: sealed.epoch,
         },
-        comm,
+        comm: comm_id,
         live: vec![n.key.clone(), b0, b1, e0],
         removed_dev: r0,
         revoked_dev: e1,
         keyless_occ: k0,
-        removed: rex,
+        removed: e2::kid(&rex),
         removed_at,
     }
+}
+
+/// The minter node of a fold witness: `{tag}-minter`, a NODE key (an owner
+/// binding targets only a node, #851).
+async fn minter<'a, B>(backend: &'a B, tag: &str) -> (Node<'a, B>, String)
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let alias = format!("{tag}-minter");
+    (node_as(backend, &alias, NODE).await, alias)
 }
 
 fn row_to(axis: &KeyGrantAxis, recipient: &str) -> KeyGrantRow {
@@ -230,10 +346,11 @@ pub(crate) async fn i1800_the_fold_judges_as_the_gate<B>(backend: &B, tag: &str)
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let n = node(backend, &format!("{tag}-minter")).await;
-    let room = seed_room(&n, tag).await;
-    let stranger = format!("{tag}-stranger-{}", uuid::Uuid::new_v4().simple());
-    ts::register_hybrid_key_as(backend, &stranger, &stranger, USER).await;
+    let (n, alias) = minter(backend, tag).await;
+    let room = seed_room(&n, &alias, tag).await;
+    let stranger_seed = format!("{tag}-stranger-{}", uuid::Uuid::new_v4().simple());
+    ts::register_hybrid_key_as(backend, &stranger_seed, &stranger_seed, USER).await;
+    let stranger = e2::kid(&stranger_seed);
     let mut candidates: Vec<String> = room.live.clone();
     candidates.extend([
         room.removed_dev.clone(),
@@ -278,18 +395,16 @@ where
         "signer_not_minter",
     ];
     assert_eq!(expect, want, "{tag} I1800: the per-row oracle");
-    let got = fold
-        .clone()
-        .scope(async {
-            let mut got = Vec::new();
-            for r in rows.iter().chain([&foreign]) {
-                got.push(verdict(
-                    &check_key_grant_row_admission(dir, &r.attestation).await,
-                ));
-            }
-            got
-        })
-        .await;
+    let got = Box::pin(fold.clone().scope(async {
+        let mut got = Vec::new();
+        for r in rows.iter().chain([&foreign]) {
+            got.push(verdict(
+                &check_key_grant_row_admission(dir, &r.attestation).await,
+            ));
+        }
+        got
+    }))
+    .await;
     assert_eq!(
         got, expect,
         "{tag} I1800: inside the emission fold every row gets the per-row verdict"
@@ -316,15 +431,13 @@ where
         at + chrono::Duration::milliseconds(7),
     )
     .await;
-    let (control, guarded) = corrupt
-        .clone()
-        .scope(async {
-            (
-                verdict(&check_key_grant_row_admission(dir, &at_fold.attestation).await),
-                verdict(&check_key_grant_row_admission(dir, &elsewhen.attestation).await),
-            )
-        })
-        .await;
+    let (control, guarded) = Box::pin(corrupt.clone().scope(async {
+        (
+            verdict(&check_key_grant_row_admission(dir, &at_fold.attestation).await),
+            verdict(&check_key_grant_row_admission(dir, &elsewhen.attestation).await),
+        )
+    }))
+    .await;
     assert_eq!(
         control, "ok",
         "{tag} I1800 control: a row of the fold's signer and instant takes the fold's answer"
@@ -345,8 +458,8 @@ pub(crate) async fn i1801_the_emission_admits_what_the_rule_admits<B>(backend: &
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let n = node(backend, &format!("{tag}-minter")).await;
-    let room = seed_room(&n, tag).await;
+    let (n, alias) = minter(backend, tag).await;
+    let room = seed_room(&n, &alias, tag).await;
     let set = crate::federation::key_grant::build_set_for_axis(backend, &room.axis)
         .await
         .unwrap()
@@ -427,8 +540,8 @@ pub(crate) async fn i1802_the_memo_keeps_each_instant<B>(backend: &B, tag: &str)
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let n = node(backend, &format!("{tag}-minter")).await;
-    let room = seed_room(&n, tag).await;
+    let (n, alias) = minter(backend, tag).await;
+    let room = seed_room(&n, &alias, tag).await;
     let c = backend
         .lookup_community(&room.comm)
         .await

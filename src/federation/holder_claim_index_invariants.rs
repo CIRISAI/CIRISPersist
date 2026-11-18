@@ -124,9 +124,12 @@ pub(crate) mod bodies {
         use crate::federation::types::cohort_scope::COMMUNITY;
         let author = node_as(b, &format!("i113b-author-{s}"), NODE).await;
         let adopter = node_as(b, &format!("i113b-adopter-{s}"), NODE).await;
-        let comm = format!("i113b-comm-{s}");
+        let comm_s = format!("i113b-comm-{s}");
         let member = format!("i113b-member-{s}");
-        seed_community_everywhere(&[&adopter], &comm, &[(&member, Some(&adopter))]).await;
+        // v62.0.0 (JSON cut, E7) — E6's flipped helper takes SEEDS; the room
+        // is read back as its identity-ref.
+        seed_community_everywhere(&[&adopter], &comm_s, &[(&member, Some(&adopter))]).await;
+        let comm = crate::federation::edition2::fixture_switch::kid(&comm_s);
         let envelope = seal(
             &fresh_dek().unwrap(),
             format!("i113b sealed bytes {s}").as_bytes(),
@@ -209,6 +212,42 @@ pub(crate) mod bodies {
         delivered
     }
 
+    /// v62.0.0 (JSON cut, E7; cut B) — deliver A's edition-2 plane to B the
+    /// way a peer pulls it: A's filtered serve listing for `requester`
+    /// (`edition2::serve::statements_served_to`, cursor by cursor), each
+    /// statement through B's one entry (`edition2::ingest::put_statement`).
+    /// Returns how many statements landed a NEW row or key on B. Nothing is
+    /// hand-copied: a statement A does not serve never arrives.
+    pub(crate) async fn deliver_statement_plane<B>(a: &B, b: &B, requester: &str) -> usize
+    where
+        B: FederationDirectory + Sync,
+    {
+        use crate::federation::edition2::ingest::StatementOutcome as O;
+        let mut delivered = 0usize;
+        let mut cursor = None;
+        loop {
+            let page = crate::federation::edition2::serve::statements_served_to(
+                a,
+                cursor.as_ref(),
+                256,
+                Some(requester),
+            )
+            .await
+            .unwrap();
+            let Some(next) = page.next else { break };
+            cursor = Some(next);
+            for st in page.statements {
+                match crate::federation::edition2::fixture_switch::put_statement(b, &st.bytes).await
+                {
+                    Ok(O::Row { new: true, .. } | O::KeyPlane { new: true, .. }) => delivered += 1,
+                    Ok(_) => {}
+                    Err(e) => panic!("B refused a statement A served: {e}"),
+                }
+            }
+        }
+        delivered
+    }
+
     /// **I113c — the production path, two nodes: A writes a community blob
     /// exactly as `Engine::put_blob_scoped` does (the chat body's shape);
     /// B learns the holder ONLY through A's advertised hashes and point
@@ -232,14 +271,16 @@ pub(crate) mod bodies {
             NODE,
         )
         .await;
-        let comm = format!("i113c-comm-{s}");
+        let comm_s = format!("i113c-comm-{s}");
         let (alice, bob) = (format!("i113c-alice-{s}"), format!("i113c-bob-{s}"));
         seed_community_everywhere(
             &[&na, &nb],
-            &comm,
+            &comm_s,
             &[(&alice, Some(&na)), (&bob, Some(&nb))],
         )
         .await;
+        // v62.0.0 (JSON cut, E7) — the room is read back as its identity-ref.
+        let comm = crate::federation::edition2::fixture_switch::kid(&comm_s);
 
         // A writes the chat body: sealed under the community DEK, announced.
         let put = put_blob_scoped(
@@ -264,8 +305,9 @@ pub(crate) mod bodies {
             "I113c: B knows no holder yet"
         );
 
-        // B pulls A's Attestation plane the way edge does.
-        let delivered = deliver_attestation_plane(a, b).await;
+        // B pulls A's statement plane the way a peer does (v62: the edition-2
+        // serve listing replaces the JSON wire-hash plane).
+        let delivered = deliver_statement_plane(a, b, &nb.key).await;
         assert!(
             delivered >= 1,
             "I113c: at least the holder claim crossed ({delivered})"

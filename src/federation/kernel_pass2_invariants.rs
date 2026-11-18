@@ -306,7 +306,21 @@ mod runners {
                         .await
                         .unwrap();
                     b.run_migrations().await.unwrap();
-                    Box::pin($body(&b, &tag("s"))).await;
+                    // EARLIER-FORM door witnesses: the bodies found the
+                    // family through `put_family` (`family_admit::
+                    // put_family_planned`, which refuses at CP2) and version
+                    // it through `supersede_family` (`group_amendment::
+                    // supersede_family_signed`). The edition-2 door is T1's
+                    // `edition2::group::put_group_statement`; its witnesses
+                    // are `group_invariants` I2995, I3001, I3005 (a fork is a
+                    // tip) and I2996 (an unheld head; per the lead's ruling T1
+                    // keeps that voice). F0 deletes these runners with the
+                    // earlier-form family doors at CP2; I2812's goes as soon
+                    // as T1's updated I2996 lands.
+                    crate::federation::edition2::fixture_switch::with_earlier_form_async(Box::pin(
+                        $body(&b, &tag("s")),
+                    ))
+                    .await;
                 }
 
                 #[cfg(feature = "postgres")]
@@ -324,7 +338,21 @@ mod runners {
                         .await
                         .unwrap();
                     b.run_migrations().await.unwrap();
-                    Box::pin($body(&b, &tag("p"))).await;
+                    // EARLIER-FORM door witnesses: the bodies found the
+                    // family through `put_family` (`family_admit::
+                    // put_family_planned`, which refuses at CP2) and version
+                    // it through `supersede_family` (`group_amendment::
+                    // supersede_family_signed`). The edition-2 door is T1's
+                    // `edition2::group::put_group_statement`; its witnesses
+                    // are `group_invariants` I2995, I3001, I3005 (a fork is a
+                    // tip) and I2996 (an unheld head; per the lead's ruling T1
+                    // keeps that voice). F0 deletes these runners with the
+                    // earlier-form family doors at CP2; I2812's goes as soon
+                    // as T1's updated I2996 lands.
+                    crate::federation::edition2::fixture_switch::with_earlier_form_async(Box::pin(
+                        $body(&b, &tag("p")),
+                    ))
+                    .await;
                     eprintln!("{} postgres: RAN", stringify!($name));
                 }
             }

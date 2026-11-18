@@ -3,11 +3,22 @@
 //! includes the self-collective without a consent row; the retroactive
 //! re-grant reaches a device admitted after the write; the puller asks the
 //! MINTER, never `list_holders`.
+//!
+//! v62.0.0 (the JSON cut): keys are live by their edition-2 `key:record`
+//! (`edition2::fixture_switch::put_key`) and named by `kid(label)`; an owner
+//! binding is the owner's row plus the node's voice. I137's family leg is its
+//! own test, through the edition-2 group door (wave T1). I138/I139's node
+//! set-up rides other slices' two-node fixtures
+//! (`key_grant_invariants::two_node`, `epoch_minter_invariants`) and the
+//! Engine's own key: since cut B (4deb020f) an engine's key is its
+//! composite's identity-ref (`local_derived_key_id`), so they run on
+//! edition 2: the owner by kid, owner bindings voiced by the engine's alias.
 
 #![cfg(any(feature = "sqlite", feature = "postgres"))]
 
 #[cfg(test)]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::key_grant_invariants::two_node::{introduce_as, Node};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{self, CryptoTier};
@@ -52,43 +63,86 @@ pub(crate) mod bodies {
         .unwrap_or_else(|e| panic!("bind {identity} through {occurrence}: {e}"));
     }
 
+    /// A key named as the store holds it: its kid under edition 2, the label
+    /// in a test held under the earlier form.
+    fn sid(x: &str) -> String {
+        if e2::emit_edition2() {
+            e2::kid_or_keep(x)
+        } else {
+            x.to_owned()
+        }
+    }
+
+    /// `owner` (a seed) owns `node` (a seed): the owner binding row, then the
+    /// node's voice over it.
+    pub(crate) async fn own(d: &dyn FederationDirectory, owner: &str, node: &str) {
+        own_seeded(d, owner, node, node).await;
+    }
+
+    /// `owner` (a seed) owns the key `node` (a kid or a seed), whose voice
+    /// is signed by `node_seed` (an engine's alias: its composite is
+    /// `signing_key(alias)`, its id `kid(alias)`).
+    pub(crate) async fn own_seeded(
+        d: &dyn FederationDirectory,
+        owner: &str,
+        node: &str,
+        node_seed: &str,
+    ) {
+        let row = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner, node);
+        e2::put_signed(d, &row)
+            .await
+            .unwrap_or_else(|e| panic!("{owner} owns {node}: {e}"));
+        let st = e2::carried_statement(&row).expect("a mapped row carries its statement");
+        e2::put_statement(d, &e2::voice_of(&st, node_seed))
+            .await
+            .unwrap_or_else(|e| panic!("{node}'s voice on its owner binding: {e}"));
+    }
+
     /// **I137 — the send set includes the self-collective, without a
     /// consent row; and only where the plane is `SelfOwn`.**
     pub(crate) async fn i137_the_send_set_is_the_self_collective(
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        let (owner, node_a, node_b, peer) = (
+        let (owner_s, node_a_s, node_b_s, peer_s) = (
             format!("i137-owner-{s}"),
             format!("i137-node-a-{s}"),
             format!("i137-node-b-{s}"),
             format!("i137-peer-{s}"),
         );
-        for k in [&owner, &peer] {
-            ts::register_identity_key(d, k, USER).await;
+        for k in [&owner_s, &peer_s] {
+            let _ = e2::put_key(d, k, &[USER]).await;
         }
-        for k in [&node_a, &node_b] {
-            ts::register_identity_key(d, k, crate::federation::types::identity_type::NODE).await;
+        for k in [&node_a_s, &node_b_s] {
+            let _ = e2::put_key(d, k, &[crate::federation::types::identity_type::NODE]).await;
         }
+        let (owner, node_a, node_b) = (e2::kid(&owner_s), e2::kid(&node_a_s), e2::kid(&node_b_s));
         bind(d, &node_a, &node_a, None).await;
         bind(d, &owner, &node_a, None).await;
         bind(d, &owner, &node_b, None).await;
         // The nodes are OWNED (a live delegates_to owner binding — every node
         // has exactly one human owner); the phone is an occurrence only: a
         // KEM target, not a replication endpoint (edge §6.1).
-        ts::put_owner_binding(d, &owner, &node_a).await;
-        ts::put_owner_binding(d, &owner, &node_b).await;
-        let phone = format!("i137-phone-{s}");
-        ts::register_identity_key(d, &phone, USER).await;
+        own(d, &owner_s, &node_a_s).await;
+        own(d, &owner_s, &node_b_s).await;
+        let phone_s = format!("i137-phone-{s}");
+        let _ = e2::put_key(d, &phone_s, &[USER]).await;
+        let phone = e2::kid(&phone_s);
         bind(d, &owner, &phone, None).await;
         // v53.0.0 (#963, CC 3.3.7) — a node the owner OWNS but never bound as
         // an occurrence is not one of the owner's devices: it receives none of
         // the owner's self content (it still SENDS — its principal is its
         // owner by `owner_of`). Before v53 ownership alone was the endpoint
         // fact (#884).
-        let node_c = format!("i137-node-c-{s}");
-        ts::register_identity_key(d, &node_c, crate::federation::types::identity_type::NODE).await;
-        ts::put_owner_binding(d, &owner, &node_c).await;
+        let node_c_s = format!("i137-node-c-{s}");
+        let _ = e2::put_key(
+            d,
+            &node_c_s,
+            &[crate::federation::types::identity_type::NODE],
+        )
+        .await;
+        own(d, &owner_s, &node_c_s).await;
+        let node_c = e2::kid(&node_c_s);
         let consent = crate::federation::consent_by_humans::consent_peers_by_principals(d, &node_a)
             .await
             .unwrap();
@@ -142,23 +196,50 @@ pub(crate) mod bodies {
             community_set, consent,
             "I137: a community plane's set is the consent set, unchanged"
         );
-        // family: a family member's device is in the FAMILY set and not in the SELF set.
-        let (member, member_node, fam) = (
-            format!("i137-member-{s}"),
-            format!("i137-member-node-{s}"),
-            format!("i137-fam-{s}"),
+    }
+
+    /// **I137 (family leg)** — a family member's device is in the FAMILY send
+    /// set and not in the SELF set. v62.0.0: split out of
+    /// [`i137_the_send_set_is_the_self_collective`] and run HELD under the
+    /// earlier form: the family record rides the typed family plane, which
+    /// has no edition-2 projection yet. Every fixture here follows the switch
+    /// (`register_identity_key`, `put_owner_binding`, `sign_family`).
+    pub(crate) async fn i137_the_family_set_reaches_a_family_members_device(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let (owner, node_a, node_b) = (
+            format!("i137f-owner-{s}"),
+            format!("i137f-node-a-{s}"),
+            format!("i137f-node-b-{s}"),
         );
-        ts::register_identity_key(d, &member, USER).await;
-        ts::register_identity_key(
-            d,
-            &member_node,
-            crate::federation::types::identity_type::NODE,
-        )
-        .await;
-        bind(d, &member, &member_node, None).await;
-        ts::put_owner_binding(d, &member, &member_node).await;
-        ts::register_identity_key(d, &fam, USER).await;
-        d.put_family(ts::sign_family(
+        let (member, member_node, fam) = (
+            format!("i137f-member-{s}"),
+            format!("i137f-member-node-{s}"),
+            format!("i137f-fam-{s}"),
+        );
+        for k in [&owner, &member, &fam] {
+            ts::register_identity_key(d, k, USER).await;
+        }
+        for k in [&node_a, &node_b, &member_node] {
+            ts::register_identity_key(d, k, crate::federation::types::identity_type::NODE).await;
+        }
+        bind(d, &sid(&owner), &sid(&node_a), None).await;
+        bind(d, &sid(&owner), &sid(&node_b), None).await;
+        bind(d, &sid(&member), &sid(&member_node), None).await;
+        for (o, n) in [
+            (&owner, &node_a),
+            (&owner, &node_b),
+            (&member, &member_node),
+        ] {
+            // Under edition 2 the binding carries the node's voice (`own`).
+            if e2::emit_edition2() {
+                own(d, o, n).await;
+            } else {
+                ts::put_owner_binding(d, o, n).await;
+            }
+        }
+        let signed = ts::sign_family(
             &fam,
             crate::federation::Family {
                 prev_head_digest: String::new(),
@@ -183,27 +264,37 @@ pub(crate) mod bodies {
                 dissolved_at: None,
                 persist_row_hash: String::new(),
             },
-        ))
+        );
+        // v62.0.0 (wave T1): the family lands through the edition-2 group
+        // door as its founders' voices; held, through the typed door.
+        if e2::emit_edition2() {
+            let voices =
+                e2::family_voices_naming_held(d, &signed, e2::ms(chrono::Utc::now())).await;
+            e2::put_voices(d, &voices).await.unwrap();
+        } else {
+            d.put_family(signed).await.unwrap();
+        }
+        let family_set = crate::federation::self_collective::send_set_for(
+            d,
+            &sid(&node_a),
+            cohort_scope::FAMILY,
+        )
         .await
         .unwrap();
-        let family_set =
-            crate::federation::self_collective::send_set_for(d, &node_a, cohort_scope::FAMILY)
-                .await
-                .unwrap();
         assert!(
-            family_set.contains(&member_node),
+            family_set.contains(&sid(&member_node)),
             "I137: a family member's device is in the family set: {family_set:?}"
         );
         assert!(
-            family_set.contains(&node_b),
+            family_set.contains(&sid(&node_b)),
             "I137: and so is the owner's other device"
         );
         let self_set =
-            crate::federation::self_collective::send_set_for(d, &node_a, cohort_scope::SELF)
+            crate::federation::self_collective::send_set_for(d, &sid(&node_a), cohort_scope::SELF)
                 .await
                 .unwrap();
         assert!(
-            !self_set.contains(&member_node),
+            !self_set.contains(&sid(&member_node)),
             "I137: a family member's device is NOT in the self set"
         );
     }
@@ -247,6 +338,9 @@ pub(crate) mod bodies {
         let owner = format!("i139-owner-{run}");
         ts::register_hybrid_key_as(l.ba.as_ref(), &owner, &owner, USER).await;
         ts::register_hybrid_key_as(l.bb.as_ref(), &owner, &owner, USER).await;
+        // v62.0.0 (cut B): the owner is live as its kid; reads and the self
+        // write name it so.
+        let owner = e2::kid(&owner);
         let kem_a = {
             let id = l.ba.load_or_init_content_kem_identity().await.unwrap();
             EncryptionPubkeys {
@@ -403,11 +497,15 @@ pub(crate) mod bodies {
         )
         .await;
         // The owner, with A as the only occurrence, on both nodes.
-        let owner = format!("sc-owner-{run}");
+        // v62.0.0 (cut B): the owner is live as its kid (`owner`), signed by
+        // its seed (`owner_s`); a node's key is its engine's identity-ref
+        // (`local_derived_key_id`), voiced by its alias.
+        let owner_s = format!("sc-owner-{run}");
+        let owner = e2::kid(&owner_s);
         for n in [&a, &b] {
-            ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
+            ts::register_hybrid_key_as(n.backend, &owner_s, &owner_s, USER).await;
             bind(n.backend, &owner, &a.key, Some(a.kem.clone())).await;
-            ts::put_owner_binding(n.backend, &owner, &a.key).await;
+            own_seeded(n.backend, &owner_s, &a.key, &alias_a).await;
         }
         let r = engine_a
             .put_blob_scoped(
@@ -423,7 +521,7 @@ pub(crate) mod bodies {
         // Now B becomes an occurrence of the owner (on both nodes), AFTER the write.
         for n in [&a, &b] {
             bind(n.backend, &owner, &b.key, Some(b.kem.clone())).await;
-            ts::put_owner_binding(n.backend, &owner, &b.key).await;
+            own_seeded(n.backend, &owner_s, &b.key, &alias_b).await;
         }
         assert!(
             crate::federation::self_collective::send_set_for(
@@ -575,6 +673,15 @@ mod run {
                 async fn i137() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i137_the_send_set_is_the_self_collective(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i137_family() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i137_the_family_set_reaches_a_family_members_device(
+                        &b,
+                        &super::suffix(),
+                    )
+                    .await
                 }
             }
         };

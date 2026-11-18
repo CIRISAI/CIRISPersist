@@ -596,8 +596,21 @@ pub async fn verify_family_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    if signed.family.family_key_id
-        == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+    // v62.0.0 (wave GC8; CC 2.7.3) — whether a version of the reserved
+    // accord id is admitted reads the HELD accord (its head, its standing
+    // roster, its members' key records, the recovery and roster-change
+    // decisions): a fold condition, held with
+    // `federation_constitutional_family_reserved` and re-folded when the
+    // accord's rows change. The id is the row's own bytes; nothing else here
+    // is the signer's key plane.
+    let reserved = signed.family.family_key_id
+        == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    if reserved {
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(
+            ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
+        ));
+    }
+    if reserved
         && !is_accord_head_version(directory, signed).await?
         // v53.0.0 (CC 4.2.6) — the door's second admitted shape: a holder's
         // own seat rotated under their pre-committed recovery key. A version
@@ -612,10 +625,13 @@ where
             .await?
             .is_none()
     {
-        return Err(Error::ConstitutionalFamilyReserved {
-            family_key_id: signed.family.family_key_id.clone(),
-            attesting_key_id: signed.authority_key_id.clone(),
-        });
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::gc8::CONSTITUTIONAL_FAMILY_RESERVED,
+            Error::ConstitutionalFamilyReserved {
+                family_key_id: signed.family.family_key_id.clone(),
+                attesting_key_id: signed.authority_key_id.clone(),
+            },
+        ));
     }
     // v53.0.0 (CC 4.2.6, R2c ruling (a)) — every accord version, whichever
     // shape, names a charter whose recovery commitments cover exactly its
@@ -974,33 +990,14 @@ where
     .await
 }
 
-/// The [`Error::LocationAuthorityUnauthorized`] `rule` token for *"this node
-/// holds no `delegates_to(subject → authority)` at all"* (v37.0.0,
-/// CIRISPersist#734).
-///
-/// **This is the RETRYABLE one, and the distinction is the whole point of the
-/// field.** Federation delivers rows out of order, so a legitimate delegate's
-/// proof can arrive before the `delegates_to` that authorizes it, and persist
-/// holds no deferral queue for location proofs — the refusal returns to the
-/// caller and the row is gone unless the caller re-submits. A caller seeing
-/// this token should retry once the authorizing edge has replicated; a caller
-/// seeing either sibling token below should not, because those mean the edge
-/// IS here and it is dead.
-pub const LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE: &str =
-    "location_authority_no_delegation_edge";
-
-/// The [`Error::LocationAuthorityUnauthorized`] `rule` token for *"the
-/// `delegates_to` is here and has been retracted"* — a substantive verdict, not
-/// a delivery-order artifact (v37.0.0, CIRISPersist#734).
-pub const LOCATION_AUTHORITY_RULE_DELEGATION_RETRACTED: &str =
-    "location_authority_delegation_retracted";
-
-/// The [`Error::LocationAuthorityUnauthorized`] `rule` token for *"the
-/// `delegates_to` is here and has lapsed"* — `expires_at` passed, or the CC
-/// 3.4.12 adult-incapacity `valid_until` lapsed. A substantive verdict
-/// (v37.0.0, CIRISPersist#734).
-pub const LOCATION_AUTHORITY_RULE_DELEGATION_EXPIRED: &str =
-    "location_authority_delegation_expired";
+/// v62.0.0 (wave GC8; CC 4.5.9.1 rc21, ruling 10) — the
+/// [`Error::LocationAuthorityUnauthorized`] `rule` token for *"the proof's
+/// attester is not its subject"*. A DOOR refusal on the row's own bytes
+/// (`authority_key_id != subject_key_id`): "no delegation mints one", so no
+/// other row can change it and it is never retryable. It replaces the three
+/// delegate-arm tokens (`location_authority_no_delegation_edge`,
+/// `_delegation_retracted`, `_delegation_expired`), removed with the arm.
+pub const LOCATION_AUTHORITY_RULE_NOT_SUBJECT: &str = "location_authority_not_subject";
 
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
 /// [`SignedLocationProof`](super::SignedLocationProof). Structural mirror of
@@ -1080,43 +1077,27 @@ where
 /// [`verify_location_proof_admission`], split out so the rule has one name and
 /// one body.
 ///
-/// Admits when `authority` IS `subject` (self-knowledge, the ordinary case) or
-/// when [`topology::live_delegate_standing`](super::topology::live_delegate_standing)
-/// finds a live `delegates_to(subject → authority)`. Every other outcome is
-/// [`Error::LocationAuthorityUnauthorized`], carrying the classified `rule`
-/// token so the caller can tell a delivery-order artifact
-/// ([`LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE`], retryable) from a verdict.
+/// v62.0.0 (wave GC8; CC 4.5.9.1 rc21, ruling 10) — **the subject alone.** A
+/// location is self-knowledge, and "no delegation mints one" (CC 4.5.9.1): a
+/// proof whose attester is not its subject is Invalid at the door, read from
+/// the row's own bytes. The delegate arm (a live `delegates_to(subject →
+/// authority)` admitting a third party's proof) is REMOVED: it was a fold the
+/// text forbids. Nothing here reads another row.
 async fn check_location_authority<F>(
-    directory: &F,
+    _directory: &F,
     subject: &str,
     authority: &str,
 ) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    // Self-assertion — the subject speaking about itself. No read needed, and
-    // it must hold even for a subject that has never issued an attestation.
     if authority == subject {
         return Ok(());
     }
-    use super::topology::DelegateStanding;
-    let standing = super::topology::live_delegate_standing(
-        directory,
-        subject,
-        authority,
-        crate::host::clock::now(),
-    )
-    .await?;
-    let rule = match standing {
-        DelegateStanding::Live => return Ok(()),
-        DelegateStanding::NoEdge => LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE,
-        DelegateStanding::Retracted => LOCATION_AUTHORITY_RULE_DELEGATION_RETRACTED,
-        DelegateStanding::Expired => LOCATION_AUTHORITY_RULE_DELEGATION_EXPIRED,
-    };
     Err(Error::LocationAuthorityUnauthorized {
         subject_key_id: subject.to_owned(),
         offered_authority_key_id: authority.to_owned(),
-        rule,
+        rule: LOCATION_AUTHORITY_RULE_NOT_SUBJECT,
     })
 }
 
@@ -4234,20 +4215,16 @@ pub mod test_support {
     /// The hole: E4 verified that the scrub signature matched
     /// `authority_key_id`'s registered pubkeys and stopped, so any registered
     /// key in the federation could assert a location for any subject and get a
-    /// valid, admitted, wrong row. The rule that closes it is the operator's:
-    /// *"the key is the subject itself or its delegates, no one else could know
-    /// where the subject is."*
+    /// valid, admitted, wrong row. The rule that closes it (CC 4.5.9.1, rc21):
+    /// the proof's attester IS its subject; "no delegation mints one".
     ///
     /// | # | witness | what it pins |
     /// |---|---|---|
     /// | a | subject signs its own proof ⇒ ADMITTED | the ordinary case still works; the gate is not a wall |
-    /// | b | a LIVE delegate signs ⇒ ADMITTED | the delegation leg is reachable, not decorative |
-    /// | c | a REGISTERED third party with a VALID signature ⇒ REFUSED | **the hole.** Not "unregistered keys fail" — E4 already covered that |
-    /// | d | the refused row is NOT stored | verify-before-mutation (AV-9) |
-    /// | e | `withdraws` on the delegation ⇒ REFUSED, `..._retracted` | liveness clause (2)/(3), and the token is a VERDICT |
-    /// | f | `recants` on the delegation ⇒ REFUSED, `..._retracted` | the two retraction verbs are wire-distinct and both kill |
-    /// | g | expired delegation ⇒ REFUSED, `..._expired` | liveness clause (4) |
-    /// | h | proof BEFORE its `delegates_to` ⇒ `..._no_delegation_edge`, then the SAME proof ADMITS once the edge lands | the out-of-order answer: the refusal is transient and the token says so |
+    /// | b | a LIVE delegate signs ⇒ REFUSED `..._not_subject` (v62, CC 4.5.9.1 ruling 10: no delegation mints one) | the delegate arm is gone |
+    /// | c | a REGISTERED third party with a VALID signature ⇒ REFUSED `..._not_subject` | **the hole.** Not "unregistered keys fail" — E4 already covered that |
+    /// | d | the refused rows are NOT stored | verify-before-mutation (AV-9) |
+    /// | e | withdrawn / recanted / lapsed / late delegations ⇒ the same door refusal, in either arrival order | the answer reads the row's bytes only |
     ///
     /// Leg (c) is the one that has to be built carefully. The third party is
     /// registered through the same `register_hybrid_key` every other key uses
@@ -4256,12 +4233,9 @@ pub mod test_support {
     /// authority leg. A witness that seeded an unregistered key would prove
     /// only that `SignatureInvalid` still fires.
     ///
-    /// Legs (e)/(f)/(g) assert the `rule` TOKEN, not merely that a refusal
-    /// occurred. The token is the caller's retry signal: `..._no_delegation_edge`
-    /// may be a delivery-order artifact and is worth retrying, the other two are
-    /// verdicts. A witness blind to which token came back would pass under a gate
-    /// that reported every refusal as retryable, which is the same-outcome-through-
-    /// the-wrong-mechanism shape.
+    /// Every refused leg asserts the `rule` TOKEN, `location_authority_not_subject`:
+    /// a door refusal on the row's own bytes, never retryable. The three
+    /// delegate-arm tokens were removed with the arm (v62.0.0, ruling 10).
     ///
     /// `tag` must be ≤ ~20 chars and is placed AFTER the distinguishing prefix
     /// on every key id: [`seed_for`] truncates at 32 bytes, so two ids sharing a
@@ -4305,22 +4279,27 @@ pub mod test_support {
         .await
         .unwrap_or_else(|e| panic!("({tag}) (a) the subject may assert its OWN location: {e}"));
 
-        // ── (b) a live delegate speaks for it.
+        // ── (b) v62.0.0 (wave GC8; CC 4.5.9.1 rc21, ruling 10) — a LIVE
+        //        delegate is NOT an authority: "no delegation mints one". The
+        //        proof's attester is not its subject, which is the row's own
+        //        bytes: Invalid at the door, `location_authority_not_subject`.
         put_delegates_to(dir, &subject, &delegate, None).await?;
-        dir.put_location_proof(sign_location_proof(
+        let delegated = sign_location_proof(
             &delegate,
             location_proof_at(&subject, "2026-06-09T01:00:00Z"),
-        ))
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "({tag}) (b) a LIVE delegate may assert the subject's \
-                                    location: {e}"
-            )
-        });
+        );
+        let err = dir
+            .put_location_proof(delegated.clone())
+            .await
+            .expect_err("(b) a delegate's proof of the subject is refused at the door");
+        let (_, got_authority, rule) = expect_location_authority_refusal(&err, "b");
+        assert_eq!(got_authority, delegate, "({tag}) (b) names the attester");
+        assert_eq!(
+            rule, "location_authority_not_subject",
+            "({tag}) (b) the delegate arm is removed: a door refusal on the bytes"
+        );
 
-        // ── (c) THE HOLE. A registered third party, a valid signature, no
-        //        delegation. Admitted before this cut.
+        // ── (c) A registered third party, a valid signature, no delegation.
         assert!(
             dir.lookup_public_key(&third).await?.is_some(),
             "({tag}) (c) the third party must be genuinely REGISTERED, or this leg \
@@ -4342,8 +4321,8 @@ pub mod test_support {
             "({tag}) (c) the refusal must NAME the authority that was offered"
         );
         assert_eq!(
-            got_rule, "location_authority_no_delegation_edge",
-            "({tag}) (c) a third party with no edge at all gets the ABSENT token"
+            got_rule, "location_authority_not_subject",
+            "({tag}) (c) the same door token: not the subject"
         );
         assert_eq!(
             err.kind(),
@@ -4355,12 +4334,13 @@ pub mod test_support {
         let stored = dir.list_location_proofs_for(&subject).await?;
         assert_eq!(
             stored.len(),
-            2,
-            "({tag}) (d) exactly the two ADMITTED proofs are stored — the refused \
-             third-party row must not be present: {stored:?}"
+            1,
+            "({tag}) (d) exactly the subject's own proof is stored: {stored:?}"
         );
 
-        // ── (e) a WITHDRAWN delegation confers nothing.
+        // ── (e) the answer never depends on another row: a delegation that
+        //        lands, is withdrawn, recanted or lapses changes nothing, in
+        //        either arrival order.
         let w_edge = put_delegates_to(dir, &subject, &withdrawn, None).await?;
         put_retraction(
             dir,
@@ -4370,37 +4350,8 @@ pub mod test_support {
             attestation_type::WITHDRAWS,
         )
         .await?;
-        let err = dir
-            .put_location_proof(sign_location_proof(
-                &withdrawn,
-                location_proof_at(&subject, "2026-06-09T03:00:00Z"),
-            ))
-            .await
-            .expect_err("(e) a withdrawn delegation must not confer authority");
-        let (_, _, rule) = expect_location_authority_refusal(&err, "e");
-        assert_eq!(
-            rule, "location_authority_delegation_retracted",
-            "({tag}) (e) a retracted edge is a VERDICT, never the retryable \
-             absent-edge token"
-        );
-
-        // ── (f) `recants` is the other retraction verb and must kill too.
         let r_edge = put_delegates_to(dir, &subject, &recanted, None).await?;
         put_retraction(dir, &subject, &recanted, &r_edge, attestation_type::RECANTS).await?;
-        let err = dir
-            .put_location_proof(sign_location_proof(
-                &recanted,
-                location_proof_at(&subject, "2026-06-09T04:00:00Z"),
-            ))
-            .await
-            .expect_err("(f) a recanted delegation must not confer authority");
-        let (_, _, rule) = expect_location_authority_refusal(&err, "f");
-        assert_eq!(
-            rule, "location_authority_delegation_retracted",
-            "({tag}) (f) `recants` and `withdraws` are wire-distinct and BOTH kill"
-        );
-
-        // ── (g) an EXPIRED delegation confers nothing.
         put_delegates_to(
             dir,
             &subject,
@@ -4408,51 +4359,38 @@ pub mod test_support {
             Some(crate::host::clock::now() - chrono::Duration::hours(1)),
         )
         .await?;
-        let err = dir
-            .put_location_proof(sign_location_proof(
-                &expired,
-                location_proof_at(&subject, "2026-06-09T05:00:00Z"),
-            ))
-            .await
-            .expect_err("(g) a lapsed delegation must not confer authority");
-        let (_, _, rule) = expect_location_authority_refusal(&err, "g");
-        assert_eq!(
-            rule, "location_authority_delegation_expired",
-            "({tag}) (g) a lapsed edge is a VERDICT, never the retryable \
-             absent-edge token"
-        );
-
-        // ── (h) THE OUT-OF-ORDER LEG. A legitimate delegate's proof arrives
-        //        BEFORE the `delegates_to` that authorizes it. Persist holds no
-        //        deferral queue for location proofs, so the row is refused and
-        //        dropped — but the refusal carries the RETRYABLE token, and the
-        //        byte-identical proof is admitted once the edge lands. That is
-        //        the whole contract: persist does not retry for you, and it
-        //        tells you that retrying is worth it.
+        for (who, at) in [
+            (&withdrawn, "2026-06-09T03:00:00Z"),
+            (&recanted, "2026-06-09T04:00:00Z"),
+            (&expired, "2026-06-09T05:00:00Z"),
+        ] {
+            let err = dir
+                .put_location_proof(sign_location_proof(who, location_proof_at(&subject, at)))
+                .await
+                .expect_err("(e) never the subject");
+            let (_, _, rule) = expect_location_authority_refusal(&err, "e");
+            assert_eq!(rule, "location_authority_not_subject", "({tag}) (e) {who}");
+        }
+        // The proof first, the edge after: the same refusal.
         let late_proof =
             sign_location_proof(&late, location_proof_at(&subject, "2026-06-09T06:00:00Z"));
-        let err = dir
+        let first = dir
             .put_location_proof(late_proof.clone())
             .await
-            .expect_err("(h) the authorizing edge has not arrived yet");
-        let (_, _, rule) = expect_location_authority_refusal(&err, "h");
-        assert_eq!(
-            rule, "location_authority_no_delegation_edge",
-            "({tag}) (h) an authorizer that has NOT ARRIVED must be reported as \
-             absent — this token is the caller's signal that a retry is worth \
-             making, and reporting a verdict here is how a legitimate row gets \
-             permanently dropped"
-        );
+            .expect_err("(e) before the edge");
         put_delegates_to(dir, &subject, &late, None).await?;
-        dir.put_location_proof(late_proof)
+        let second = dir
+            .put_location_proof(late_proof)
             .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "({tag}) (h) the SAME proof must be admitted once \
-                                        the authorizing edge lands — the refusal above is \
-                                        transient, not a verdict: {e}"
-                )
-            });
+            .expect_err("(e) after the edge: the same");
+        assert_eq!(
+            expect_location_authority_refusal(&first, "e").2,
+            expect_location_authority_refusal(&second, "e").2,
+            "({tag}) (e) arrival order changes nothing"
+        );
+        // The delegate's refused proof was not stored either.
+        let _ = delegated;
+        assert_eq!(dir.list_location_proofs_for(&subject).await?.len(), 1);
         Ok(())
     }
 
@@ -5103,20 +5041,19 @@ mod tests {
     //! v9.0.0 (CIRISPersist#237) — the CC 5.3.2.4.3.1 federation-tier
     //! ingest-gate matrix, run identically against sqlite and (when
     //! `CIRIS_PERSIST_TEST_PG_URL` is set) postgres via [`run_tier_ingest_matrix`].
-    //! Test (b) — federation-tier with the ML-DSA-65 half MISSING ⇒
-    //! REJECTED + NOT stored — is the load-bearing CC 5.3.2.4.3.1 guard;
-    //! test (e) — LOCAL-tier without PQC ⇒ ADMITTED — proves the
-    //! breaking-boundary exemption (local-tier producers are not
-    //! over-rejected).
+    //!
+    //! v62.0.0 (the JSON cut): a row is an edition-2 statement under one
+    //! composite signature, which is atomic. The earlier legs over a missing
+    //! or tampered ML-DSA-65 half and a local-tier row deferring it (hybrid
+    //! pending) are deleted: there is no half to drop. What stays is the
+    //! gate's two ends: a row by a live key is admitted and readable, and a
+    //! row by a key the node does not hold is refused, typed and retryable,
+    //! and not stored.
 
-    use super::test_support::{hybrid_pubkeys, sign_envelope};
     use crate::engine::Engine;
-    use crate::federation::types::{
-        algorithm, attestation_tier, attestation_type, cohort_scope, identity_type,
-    };
-    use crate::federation::{
-        Attestation, FederationDirectory, KeyRecord, SignedAttestation, SignedKeyRecord,
-    };
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::types::{attestation_tier, attestation_type, identity_type};
+    use crate::federation::{Attestation, FederationDirectory};
     use crate::signing::LocalSigner;
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
@@ -5131,218 +5068,61 @@ mod tests {
         ))
     }
 
-    /// Register `key_id` with REAL deterministic hybrid pubkeys (the
-    /// conformant state) via the directory's `put_public_key`. The
-    /// registration row's own scrub-signature fields are placeholders —
-    /// `put_public_key` does not hybrid-verify the registration (that gate
-    /// is `register_federation_key`); only the PUBKEYS must be real for
-    /// the federation-tier ingest gate to verify attestations.
-    pub async fn register_hybrid_key(dir: &dyn FederationDirectory, key_id: &str) {
-        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
-        let now = chrono::Utc::now();
-        let rec = KeyRecord {
-            key_id: key_id.to_owned(),
-            pubkey_ed25519_base64: ed_pk,
-            pubkey_ml_dsa_65_base64: mldsa_pk,
-            algorithm: algorithm::HYBRID.to_owned(),
-            identity_type: identity_type::AGENT.to_owned(),
-            identity_ref: key_id.to_owned(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": key_id }),
-            original_content_hash: "deadbeef".to_owned(),
-            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.to_owned(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-            attestation_evidence: Some(
-                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                ),
-            ),
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        dir.put_public_key(SignedKeyRecord { record: rec })
-            .await
-            .expect("register hybrid key");
-        super::test_support::register_edition2_twin(dir, key_id, identity_type::AGENT).await;
-    }
-
-    /// Build a `scores` Attestation by `attester` over a fresh envelope.
-    /// `sign` controls whether the envelope is hybrid-signed (true) or
-    /// carries placeholder/partial signatures. `tier` lets (e) write a
-    /// local-tier row.
-    fn att(attester: &str, attested: &str, id: &str, tier: &str) -> Attestation {
-        let envelope = serde_json::json!({
-            "id": id,
-            "dimension": "identity_binding:v1",
-            "score": 1.0,
-            "confidence": 0.9,
+    /// A federation-tier `scores` row by `attester` about itself, as the
+    /// edition-2 statement's mapped row. `id` is the earlier-form id the
+    /// codec drops; the row id is node-computed.
+    fn att(attester: &str, id: &str) -> Attestation {
+        let mut a = e2::with_earlier_form(|| {
+            super::test_support::bare_attestation(
+                id,
+                attester,
+                attester,
+                &serde_json::json!({
+                    "dimension": "evidence:safety_battery:capture:a:b:v1",
+                    "score": 1.0,
+                    "confidence": 0.9,
+                }),
+            )
         });
-        let (och, classical, pqc) = sign_envelope(attester, &envelope);
-        let mut sealed_row_ = Attestation {
-            // attestation_id is `::uuid`-cast on the PG write path — use a
-            // real UUID (project_test_fixtures_uuid_vs_uuid_like); `id` is
-            // carried in the signed envelope for per-case uniqueness.
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            attesting_key_id: attester.to_owned(),
-            attested_key_id: attested.to_owned(),
-            attestation_type: attestation_type::SCORES.to_owned(),
-            weight: Some(1.0),
-            asserted_at: chrono::Utc::now(),
-            expires_at: None,
-            attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-            scrub_key_id: attester.to_owned(),
-            scrub_timestamp: chrono::Utc::now(),
-            pqc_completed_at: Some(chrono::Utc::now()),
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: if tier == attestation_tier::LOCAL {
-                cohort_scope::SELF.to_owned()
-            } else {
-                attestation_tier::FEDERATION.to_owned()
-            },
-            tier: tier.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(attester, &mut sealed_row_);
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+        a.attestation_type = attestation_type::SCORES.to_owned();
+        a.tier = attestation_tier::FEDERATION.to_owned();
+        a
     }
 
-    /// The full CC 5.3.2.4.3.1 ingest-gate matrix, backend-agnostic — runs
-    /// directly against a [`FederationDirectory`] so it covers the memory
-    /// backend too (it runs there in production), not only the engine-wrapped
-    /// sqlite + postgres backends.
+    /// The ingest gate's two ends, backend-agnostic.
     async fn run_tier_ingest_matrix(dir: &dyn FederationDirectory, tag: &str) {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
         let attester = format!("ti-attester-{tag}");
-        let attested = format!("ti-attested-{tag}");
-        register_hybrid_key(dir, &attester).await;
-        register_hybrid_key(dir, &attested).await;
+        let _ = e2::put_key(dir, &attester, &[identity_type::USER]).await;
 
-        // (a) federation-tier with a VALID hybrid sig → ADMITTED + readable.
-        let a = att(
-            &attester,
-            &attested,
-            &format!("ti-a-{tag}"),
-            attestation_tier::FEDERATION,
-        );
-        let a_id = a.attestation_id.clone();
-        dir.put_attestation(SignedAttestation { attestation: a })
+        // (a) a row by a live key → ADMITTED + readable.
+        let a = e2::put_row(dir, &att(&attester, &format!("ti-a-{tag}")), &attester).await;
+        let by = dir
+            .all_attestations_by(&e2::kid(&attester))
             .await
-            .expect("(a) valid hybrid federation-tier row must be admitted");
-        let by = dir.all_attestations_by(&attester).await.expect("list");
+            .expect("list");
         assert!(
-            by.iter().any(|r| r.attestation_id == a_id),
+            by.iter().any(|r| r.attestation_id == a.attestation_id),
             "(a) admitted row must be readable"
         );
 
-        // (b) federation-tier with the ML-DSA-65 half MISSING (classical-
-        // only) → REJECTED + NOT stored. THE load-bearing CC 5.3.2.4.3.1 guard.
-        let mut b = att(
-            &attester,
-            &attested,
-            &format!("ti-b-{tag}"),
-            attestation_tier::FEDERATION,
-        );
-        let b_id = b.attestation_id.clone();
-        b.scrub_signature_pqc = None; // drop the PQC half
-        b.pqc_completed_at = None;
-        let err = dir
-            .put_attestation(SignedAttestation { attestation: b })
-            .await
-            .expect_err("(b) classical-only federation-tier row must be REJECTED");
-        assert_eq!(
-            err.kind(),
-            "federation_federation_tier_unverified",
-            "(b) rejection must be the tier-ingest gate"
-        );
-        assert!(
-            dir.get_attestation(&b_id).await.expect("get").is_none(),
-            "(b) rejected row must NOT be stored (fail-secure)"
-        );
-
-        // (c) federation-tier with a TAMPERED ML-DSA-65 half → REJECTED.
-        let mut c = att(
-            &attester,
-            &attested,
-            &format!("ti-c-{tag}"),
-            attestation_tier::FEDERATION,
-        );
-        let c_id = c.attestation_id.clone();
-        // Re-sign a DIFFERENT envelope to get a valid-length-but-wrong PQC
-        // sig, then keep the original envelope/hash → the PQC half no
-        // longer verifies over the real bound input.
-        let (_, _, wrong_pqc) = sign_envelope(
-            &attester,
-            &serde_json::json!({ "id": "not-the-real-envelope" }),
-        );
-        c.scrub_signature_pqc = wrong_pqc;
-        let err = dir
-            .put_attestation(SignedAttestation { attestation: c })
-            .await
-            .expect_err("(c) tampered ML-DSA-65 must be REJECTED");
-        assert_eq!(err.kind(), "federation_federation_tier_unverified");
-        assert!(dir.get_attestation(&c_id).await.expect("get").is_none());
-
-        // (d) federation-tier from an UNREGISTERED attester → REJECTED
-        // (no pubkeys to verify against). On the postgres/sqlite backends
-        // the FK check also rejects an unknown attester, but the tier-
-        // ingest gate (which runs there too, with the resolved-but-here
-        // unregistered key) fails first with its own typed error on the
-        // memory backend ordering; either way the row is not stored. We
-        // assert non-storage + a rejection.
+        // (d) a row by a key the node does not hold → REJECTED, retryable,
+        // and not stored.
         let unreg = format!("ti-unreg-{tag}");
-        let d = att(
-            &unreg,
-            &attested,
-            &format!("ti-d-{tag}"),
+        let d = e2::row_of_statement(
+            &e2::statement_of(&att(&unreg, &format!("ti-d-{tag}")), &unreg),
             attestation_tier::FEDERATION,
         );
         let d_id = d.attestation_id.clone();
-        let err = dir
-            .put_attestation(SignedAttestation { attestation: d })
+        let err = e2::put_signed(dir, &d)
             .await
-            .expect_err("(d) unregistered attester must be REJECTED");
-        // v54.1.0 (#1042) — whichever check meets the unknown signer first
-        // (the ingest gate or the backend's attester lookup), the refusal is
-        // the typed, retryable ordering gap, never a verdict on the bytes.
+            .expect_err("(d) an unheld signer must be REJECTED");
         assert_eq!(
             err.kind(),
             "federation_attester_key_unknown",
             "(d) unexpected rejection kind: {err}"
         );
         assert!(dir.get_attestation(&d_id).await.expect("get").is_none());
-
-        // (e) LOCAL-tier row WITHOUT a PQC half → ADMITTED (the exemption;
-        // proves we don't over-reject local-tier). cohort_scope=self is
-        // required at local tier by the existing v4.0 read-gate.
-        let mut e = att(
-            &attester,
-            &attester,
-            &format!("ti-e-{tag}"),
-            attestation_tier::LOCAL,
-        );
-        let e_id = e.attestation_id.clone();
-        e.scrub_signature_pqc = None; // local-tier may defer the signature
-        e.pqc_completed_at = None;
-        dir.put_attestation(SignedAttestation { attestation: e })
-            .await
-            .expect("(e) local-tier row without PQC must be ADMITTED (CC 5.3.2.2 exemption)");
-        assert!(
-            dir.get_attestation(&e_id).await.expect("get").is_some(),
-            "(e) admitted local-tier row must be stored"
-        );
     }
 
     #[cfg(feature = "sqlite")]

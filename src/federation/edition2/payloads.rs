@@ -561,7 +561,7 @@ pub const FAMILIES: &[FamilyPayload] = &[
         voices: &[
             Voice { from: "scrub_signature_* under the agent's occurrence key", becomes: "the deferring agent's statement" },
         ],
-        table: "federation_attestations (answered by a deferral:response)",
+        table: "federation_attestations (answered by a deferral:response; routed by community_id, the pair room: a two-person community record, CC FINAL)",
     },
     FamilyPayload {
         family: "deferral:response:{outcome}",
@@ -574,12 +574,28 @@ pub const FAMILIES: &[FamilyPayload] = &[
             m("deferral_id", Ty::Tstr, R, "deferral_id (rc21, CC ruling): the deferral answered, as the agent named it; the response correlates on it"),
         ],
         refs: &[
-            RefRole { role: "answers", presence: R, from: "the deferral:request answered (rc21; earlier references_attestation_id, never refs.target). The routing room rides community_id (TODO pending CC: CC has not confirmed the routing member)" },
+            RefRole { role: "answers", presence: R, from: "the deferral:request answered (rc21; earlier references_attestation_id, never refs.target). The pair room rides community_id (FINAL, CC: a two-person community record; no room member)" },
         ],
         voices: &[
             Voice { from: "scrub_signature_* under the WA's key", becomes: "the Wise Authority's statement" },
         ],
         table: "federation_attestations (read by the identity_amendment gate)",
+    },
+    FamilyPayload {
+        family: "location_proof:{version}",
+        replaces: "the location_proof subject_kind (CC 3.3.3; wire location_proof:v1, a scores row)",
+        authorship: "authored by the subject alone (subject-only: iss = sub, CC 4.5.9)",
+        sub: "the subject's identity-ref (earlier subject_key_id; equals iss)",
+        members: &[
+            m("cell_id", Ty::Tstr, R, "cell_id: the H3 cell, lowercase hex (CC 2.6.6)"),
+            m("cell_resolution", Ty::Uint, R, "cell_resolution: at most 7, rough-only (CC 2.6.6.1)"),
+            m("attestation_evidence", Ty::Bstr, O, "attestation_evidence (earlier base64): a hardware-attested location claim"),
+        ],
+        refs: &[],
+        voices: &[
+            Voice { from: "scrub_signature_* under the subject's key", becomes: "the subject's statement" },
+        ],
+        table: "federation_attestations (read by a geographic roster version that cites it, CC 3.2)",
     },
     FamilyPayload {
         family: "transport:canonical_rebind",
@@ -730,6 +746,201 @@ pub fn digest_json(v: &Value) -> Option<serde_json::Value> {
     hexes.map(serde_json::Value::Array)
 }
 
+/// v62.0.0 (wave P1e; CC ruling) — **a number in a free-form body, as
+/// CBOR**: the EXACT decimal of the source JSON number's text (never via
+/// `f64`; persist builds `serde_json` with `arbitrary_precision`, so the
+/// number keeps its token).
+///
+/// - An integral value is a plain CBOR integer: `2.0` → `2`, `1e2` → `100`,
+///   `-3` → `-3`.
+/// - A non-integral value is CBOR tag 4, `[exponent, mantissa]`, normalised:
+///   a negative exponent and a mantissa NOT divisible by 10. `0.5` →
+///   `4([-1, 5])`, `1.25` → `4([-2, 125])`, `-0.050` → `4([-2, -5])`.
+/// - A mantissa outside `i64`, an integral value outside the CBOR integer
+///   range (`-2^64 ..= 2^64 - 1`), or an exponent that cannot be read is
+///   refused `body_number_unrepresentable`.
+///
+/// Fixed-scale MEMBERS (`score`, `confidence`, `weight`) are NOT this:
+/// they stay fixed6 integers (CC 2.6.1.5). The reader's check is
+/// [`check_body_numbers`].
+///
+/// # Errors
+/// `body_number_unrepresentable` (`federation_malformed_row`).
+pub fn body_number(n: &serde_json::Number) -> Result<Value, Error> {
+    let text = n.to_string();
+    let refuse = |why: &str| {
+        Error::malformed_row(
+            PLANE,
+            crate::federation::malformed_row::BODY_NUMBER_UNREPRESENTABLE,
+            format!("body number {text}: {why}"),
+        )
+    };
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, text.as_str()),
+    };
+    let (num, exp) = match rest.find(['e', 'E']) {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, "0"),
+    };
+    let exp: i64 = exp
+        .strip_prefix('+')
+        .unwrap_or(exp)
+        .parse()
+        .map_err(|_| refuse("its exponent cannot be read"))?;
+    let (int_part, frac_part) = match num.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (num, ""),
+    };
+    let digits_ok = |d: &str| d.bytes().all(|b| b.is_ascii_digit());
+    if int_part.is_empty() || !digits_ok(int_part) || !digits_ok(frac_part) {
+        return Err(refuse("not a JSON number"));
+    }
+    // The decimal digits and the power of ten they scale by.
+    let mut digits: String = format!("{int_part}{frac_part}")
+        .trim_start_matches('0')
+        .to_owned();
+    let frac_len = i64::try_from(frac_part.len()).map_err(|_| refuse("too many digits"))?;
+    let mut exponent = exp
+        .checked_sub(frac_len)
+        .ok_or_else(|| refuse("its exponent is out of range"))?;
+    if digits.is_empty() {
+        return Ok(Value::Uint(0));
+    }
+    // Normalise: no trailing zero in the mantissa.
+    while digits.ends_with('0') {
+        digits.pop();
+        exponent = exponent
+            .checked_add(1)
+            .ok_or_else(|| refuse("its exponent is out of range"))?;
+    }
+    if digits.len() > 38 {
+        return Err(refuse("its mantissa is outside i64"));
+    }
+    let magnitude: i128 = digits
+        .parse()
+        .map_err(|_| refuse("its mantissa is outside i64"))?;
+    let signed = if negative { -magnitude } else { magnitude };
+    if exponent >= 0 {
+        // Integral: mantissa × 10^exponent, a plain CBOR integer.
+        let scale = u32::try_from(exponent)
+            .ok()
+            .and_then(|e| 10i128.checked_pow(e))
+            .ok_or_else(|| refuse("an integral value outside the CBOR integer range"))?;
+        let v = signed
+            .checked_mul(scale)
+            .ok_or_else(|| refuse("an integral value outside the CBOR integer range"))?;
+        return int_value(v)
+            .ok_or_else(|| refuse("an integral value outside the CBOR integer range"));
+    }
+    let mantissa = i64::try_from(signed).map_err(|_| refuse("its mantissa is outside i64"))?;
+    let (Some(e), Some(m)) = (
+        int_value(i128::from(exponent)),
+        int_value(i128::from(mantissa)),
+    ) else {
+        return Err(refuse("its mantissa is outside i64"));
+    };
+    Ok(Value::Tag(4, Box::new(Value::Array(vec![e, m]))))
+}
+
+/// v62.0.0 (wave P1e; lead's ruling) — the FREE-FORM BODY subtrees, where a
+/// JSON number states through [`body_number`] (a float becomes a tag-4
+/// decimal) instead of being refused: `(family, member)`, `*` for every
+/// family. The CDDL's `body`, and `hard_case:{kind}`'s `hard_case` body
+/// (P3). A producer whose family carries another free-form body appends it.
+pub const BODY_MEMBERS: &[(&str, &str)] = &[("*", "body"), ("hard_case:{kind}", "hard_case")];
+
+/// v62.0.0 (wave P1e) — is `member` a free-form body of a payload of
+/// `family_id` (the header's family id)?
+#[must_use]
+pub fn is_body_member(family_id: &str, member: &str) -> bool {
+    BODY_MEMBERS.iter().any(|(fam, m)| {
+        *m == member
+            && (*fam == "*" || ciris_verify_core::namespace_match::family_id(fam) == family_id)
+    })
+}
+
+/// v62.0.0 (wave P1e) — **the decoder's inverse of [`body_number`]**: a
+/// normalised tag-4 decimal `[exponent, mantissa]` as the EXACT JSON number
+/// it states (`4([-2, 125])` → `1.25`), its text built from the digits,
+/// never via `f64` (`arbitrary_precision` keeps the token). `None` for a
+/// value that is not a normalised decimal.
+#[must_use]
+pub fn json_number_of_decimal(v: &Value) -> Option<serde_json::Number> {
+    let Value::Tag(4, inner) = v else {
+        return None;
+    };
+    let [e, m] = inner.as_array()? else {
+        return None;
+    };
+    let (e, m) = (e.as_i64()?, m.as_i64()?);
+    if e >= 0 || m == 0 || m % 10 == 0 {
+        return None;
+    }
+    let negative = m < 0;
+    let digits = m.unsigned_abs().to_string();
+    let places = usize::try_from(e.unsigned_abs()).ok()?;
+    let text = if digits.len() > places {
+        let (int, frac) = digits.split_at(digits.len() - places);
+        format!("{int}.{frac}")
+    } else {
+        format!("0.{}{digits}", "0".repeat(places - digits.len()))
+    };
+    let text = if negative { format!("-{text}") } else { text };
+    serde_json::from_str(&text).ok()
+}
+
+/// An integer as a CBOR integer value, if it fits (`-2^64 ..= 2^64 - 1`).
+fn int_value(v: i128) -> Option<Value> {
+    if v >= 0 {
+        u64::try_from(v).ok().map(Value::Uint)
+    } else {
+        // -1 - n for a negative v.
+        u64::try_from(-(v + 1)).ok().map(Value::Nint)
+    }
+}
+
+/// v62.0.0 (wave P1e; CC ruling) — **the reader's check of decimal
+/// numbers**: every CBOR tag 4 anywhere in `v` is `[exponent, mantissa]`
+/// with a negative exponent, a mantissa not divisible by 10 (and not zero),
+/// both integers. A non-normalised decimal (`4([-1, 50])`, `4([0, 3])`) is
+/// refused: one value has one spelling. The door runs it at the schema step
+/// (with the payload's common members, [`check_by_id`]).
+///
+/// # Errors
+/// `edition2_payload_invalid`, naming the decimal.
+pub fn check_body_numbers(v: &Value) -> Result<(), Error> {
+    fn walk(v: &Value) -> Result<(), String> {
+        match v {
+            Value::Tag(4, inner) => {
+                let ok = match inner.as_array() {
+                    Some([e, m]) => match (e.as_i64(), m.as_i64()) {
+                        (Some(e), Some(m)) => e < 0 && m != 0 && m % 10 != 0,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if ok {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "a decimal (tag 4) that is not normalised (a negative exponent, a \
+                         mantissa not divisible by 10): {inner:?}"
+                    ))
+                }
+            }
+            Value::Tag(_, inner) => walk(inner),
+            Value::Array(a) => a.iter().try_for_each(walk),
+            Value::Map(m) => m.iter().try_for_each(|(k, x)| {
+                walk(k)?;
+                walk(x)
+            }),
+            _ => Ok(()),
+        }
+    }
+    walk(v).map_err(refuse)
+}
+
 /// The `also` roles of `refs`, a closed registry (CC 2.6.1.3, the CDDL's
 /// `also-role`), as [`names_of`] spells them.
 pub const ALSO_ROLES: &[&str] = &["also:ack", "also:cites"];
@@ -819,6 +1030,10 @@ pub const PROSE_RULES: &[(&str, &str)] = &[
     (
         "takedown_notice:{basis}",
         "a `steward_purge` notice is counted: it carries no `author`",
+    ),
+    (
+        "location_proof:{version}",
+        "`cell_resolution` is at most 7 (rough-only, CC 2.6.6.1); `cell_id` is lowercase hex",
     ),
     (
         "custody:{kind}",
@@ -1110,6 +1325,9 @@ pub fn check_composer(row_type: &str, payload: &Value) -> Result<(), Error> {
 /// # Errors
 /// `edition2_payload_invalid`, as [`check`] / [`check_composer`].
 pub fn check_by_id(family_id: &str, row_type: &str, payload: &Value) -> Result<(), Error> {
+    // v62.0.0 (wave P1e; CC ruling) — every decimal in the payload is
+    // normalised, on every family and every row type.
+    check_body_numbers(payload)?;
     if COMPOSER_ROW_TYPES.contains(&row_type) {
         return check_composer(row_type, payload);
     }
@@ -1141,10 +1359,21 @@ fn dimension_has(payload: &Value, leaf: &str) -> bool {
 /// `dimension`, or with one of another family (a cosign state's payload
 /// is the event's).
 fn leaf_of<'a>(family_id: &str, payload: &'a Value) -> Option<&'a str> {
-    let stem = family_id.split(':').next()?;
+    // v62.0.0 (triage 1) — the leaf is the dimension's segment at the
+    // position of the family's FIRST parameter, after every literal segment
+    // before it matches: `deferral:response:{outcome}` reads `approved` from
+    // `deferral:response:approved:v1`, not `response`. (The first-segment
+    // reading held only for one-literal families.)
+    let pattern: Vec<&str> = family_id.split(':').collect();
+    let at = pattern
+        .iter()
+        .position(|s| s.starts_with('{') || s.starts_with('.'))?;
     let d = text_of(payload, "dimension")?;
-    let mut segs = d.split(':');
-    (segs.next() == Some(stem)).then(|| segs.next()).flatten()
+    let segs: Vec<&'a str> = d.split(':').collect();
+    if segs.len() <= at || pattern[..at] != segs[..at] {
+        return None;
+    }
+    Some(segs[at])
 }
 
 fn required(p: Presence, payload: &Value) -> bool {
@@ -1317,6 +1546,21 @@ fn check_prose(family_id: &str, payload: &Value, names: &[Name]) -> Result<(), S
                 return Err(format!(
                     "refs.also.cites names exactly one row, the approving response, not {cited}"
                 ));
+            }
+        }
+        "location_proof:{version}" => {
+            let res = payload.get_text("cell_resolution").and_then(Value::as_u64);
+            if res.is_some_and(|r| r > 7) {
+                return Err(format!(
+                    "cell_resolution {res:?} is finer than 7: a location proof is rough-only (CC 2.6.6.1)"
+                ));
+            }
+            let cell = payload
+                .get_text("cell_id")
+                .and_then(Value::as_text)
+                .unwrap_or("");
+            if cell.is_empty() || !cell.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err("cell_id is the H3 cell in lowercase hex".into());
             }
         }
         "custody:{kind}" => {

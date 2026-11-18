@@ -5,9 +5,8 @@
 pub(crate) mod bodies {
     use crate::federation::membership_acceptance::{
         ACCEPTANCE_DIMENSION, DECLINE_DIMENSION, PROPOSAL_DIMENSION, RULE_ACCEPTANCE_MISMATCH,
-        RULE_ACCEPTANCE_UNRESOLVED, RULE_DECLINED, RULE_FOUNDING_MEMBER_UNSIGNED,
-        RULE_PROPOSAL_EXPIRED, RULE_PROPOSAL_UNRESOLVED, RULE_REPLY_CONFLICT,
-        RULE_SUPERSEDE_CANNOT_ADD,
+        RULE_ACCEPTANCE_UNRESOLVED, RULE_DECLINED, RULE_PROPOSAL_EXPIRED, RULE_PROPOSAL_UNRESOLVED,
+        RULE_REPLY_CONFLICT, RULE_SUPERSEDE_CANNOT_ADD,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{COMMUNITY, FAMILY};
@@ -34,6 +33,9 @@ pub(crate) mod bodies {
         }
     }
 
+    /// v62.0.0 (flip wave 2, E5) — `register_identity_key` follows the switch
+    /// (E0.api v1.2): an edition-2 `key:record` (`user`, from 0, no end) named
+    /// `e2::kid(seed)` under the switch, the earlier JSON record when held.
     pub(crate) async fn reg<D: FederationDirectory + ?Sized>(d: &D, keys: &[&str]) {
         for k in keys {
             ts::register_identity_key(d, k, USER).await;
@@ -174,6 +176,21 @@ pub(crate) mod bodies {
         let env = c.signing_envelope();
         let mut signed = ts::sign_community(founders[0], c);
         signed.cosignatures = founders[1..].iter().map(|f| cosign(f, &env)).collect();
+        // v62.0.0 (JSON cut, flip wave 2, E5) — under the switch the roster
+        // enters as its edition-2 `group:roster` voices (T1.api §3: one per
+        // founder, keyed by identity-refs; a roster listing an `unsigned`
+        // member who has not voiced it is held `Pending`). A held
+        // (earlier-form) caller keeps `put_community`.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            use crate::federation::edition2::group_fixtures as gf;
+            let voices = gf::community_voices(
+                &signed,
+                1,
+                None,
+                crate::federation::edition2::fixture_switch::ms(founded_at),
+            );
+            return gf::put_voices(d, &voices).await.map(|_| ());
+        }
         d.put_community(signed).await.map(|_| ())
     }
 
@@ -209,6 +226,15 @@ pub(crate) mod bodies {
         let env = f.signing_envelope();
         let mut signed = ts::sign_family(founders[0], f);
         signed.cosignatures = founders[1..].iter().map(|f| cosign(f, &env)).collect();
+        // v62.0.0 (flip wave 2, E5) — as `found_room_at`: the roster's
+        // edition-2 voices under the switch, `put_family` when held.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            use crate::federation::edition2::group_fixtures as gf;
+            let at =
+                crate::federation::edition2::fixture_switch::ms(Utc::now() - Duration::days(1));
+            let voices = gf::family_voices(&signed, 1, None, at);
+            return gf::put_voices(d, &voices).await.map(|_| ());
+        }
         d.put_family(signed).await
     }
 
@@ -324,15 +350,94 @@ pub(crate) mod bodies {
         )
     }
 
+    // X2 pass 2: GC6's edition-2 door helpers, dropped when E5's rewrite of this
+    // file won a conflict over the hunk that carried them.
+    /// v62.0.0 (wave GC6; CC 2.7.3) — **the EDITION-2 door** these bodies
+    /// run on (the earlier-form JSON door, [`put`], is shut in v62): the row's
+    /// carried statement through `ingest::put_statement`, a fold attempt.
+    ///
+    /// A row the door HOLDS (kept, concluding nothing) is checked here (no
+    /// typed row, its statement kept, a reason recorded) and returned as
+    /// [`held_error`] of its reason, so each refusal-shaped assertion below
+    /// now asserts the row was HELD with that token. A refusal of the bytes
+    /// or the key plane passes through unchanged.
+    pub(crate) async fn put_e2<D: FederationDirectory + ?Sized>(
+        d: &D,
+        a: &Attestation,
+    ) -> Result<(), Error> {
+        use crate::federation::edition2::{fixture_switch as e2, fold, ingest::StatementOutcome};
+        match e2::put_signed(d, a).await? {
+            StatementOutcome::Pending { row_id, .. } => {
+                let held = fold::why_held(d, &row_id)
+                    .await?
+                    .expect("GC6: a held row carries its reason");
+                assert!(
+                    d.get_attestation(&row_id.hex()).await?.is_none(),
+                    "GC6: held, not concluded: {held:?}"
+                );
+                assert!(
+                    !d.edition2_voices(&row_id).await?.is_empty(),
+                    "GC6: held, its statement kept: {held:?}"
+                );
+                Err(held_error(&held.reason, &held.detail))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The refusal-shaped error of a HELD row: its membership token as
+    /// `MembershipAcceptanceRefused` (so `rule_of` reads it), else an
+    /// `InvalidArgument` naming the reason and the gate's detail.
+    pub(crate) fn held_error(reason: &str, detail: &str) -> Error {
+        const RULES: &[&str] = &[
+            RULE_ACCEPTANCE_UNRESOLVED,
+            RULE_PROPOSAL_UNRESOLVED,
+            RULE_DECLINED,
+            RULE_PROPOSAL_EXPIRED,
+            RULE_ACCEPTANCE_MISMATCH,
+            RULE_REPLY_CONFLICT,
+            RULE_SUPERSEDE_CANNOT_ADD,
+            crate::federation::membership_acceptance::RULE_OPEN_PROPOSAL_NOT_OPEN,
+            crate::federation::membership_acceptance::RULE_JOINER_OWNER_UNBOUND,
+        ];
+        match RULES.iter().copied().find(|r| *r == reason) {
+            Some(rule) => Error::MembershipAcceptanceRefused {
+                group_key_id: String::new(),
+                member_key_id: String::new(),
+                rule,
+            },
+            None => Error::InvalidArgument(format!("held {reason}: {detail}")),
+        }
+    }
+
+    /// v62.0.0 (JSON cut, wave 3, E5) — a row carrying its edition-2
+    /// statement enters through the one entry (`e2::put_signed`, every gate
+    /// runs); a held (earlier-form) row through the JSON door.
     pub(crate) async fn put<D: FederationDirectory + ?Sized>(
         d: &D,
         a: &Attestation,
     ) -> Result<(), Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        if e2::carried_statement(a).is_some() {
+            return e2::put_signed(d, a).await.map(|_| ());
+        }
         d.put_attestation(SignedAttestation {
             attestation: a.clone(),
         })
         .await
         .map(|_| ())
+    }
+
+    /// v62.0.0 (wave 3, E5) — the id the directory keys a registered seed by:
+    /// its identity-ref under the switch (`reg` puts `e2::kid(seed)`'s
+    /// record), the seed when held.
+    pub(crate) fn id_of(k: &str) -> String {
+        use crate::federation::edition2::fixture_switch as e2;
+        if e2::emit_edition2() {
+            e2::kid_or_keep(k)
+        } else {
+            k.to_owned()
+        }
     }
 
     pub(crate) async fn widen_community<D: FederationDirectory + ?Sized>(
@@ -357,6 +462,18 @@ pub(crate) mod bodies {
         for c in &signers[1..] {
             ts::cosign_community_membership_widening(&mut w, c);
         }
+        // v62.0.0 (JSON cut, flip wave 2, E5) — under the switch the widening
+        // enters as its `membership:widening` voices naming the room's held
+        // roster head (T1.api §3 "partly": the growth gate wants the member's
+        // proposal and acceptance held as edition-2 rows, the caller's job).
+        // A held (earlier-form) caller keeps the JSON door.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            use crate::federation::edition2::group_fixtures as gf;
+            let group = crate::federation::edition2::fixture_switch::kid(cid);
+            let head = gf::held_head(d, &group).await.map(|(h, _)| h);
+            let voices = gf::community_widening_voices(&w, head.as_ref());
+            return gf::put_voices(d, &voices).await.map(|_| ());
+        }
         d.put_community_membership_widening(w).await
     }
 
@@ -368,7 +485,7 @@ pub(crate) mod bodies {
         role: Option<&str>,
         effective_at: DateTime<Utc>,
     ) -> Result<(), Error> {
-        d.put_family_membership_widening(ts::sign_family_membership_widening(
+        let w = ts::sign_family_membership_widening(
             signer,
             FamilyMembershipWidening {
                 family_key_id: fid.to_owned(),
@@ -378,8 +495,16 @@ pub(crate) mod bodies {
                 role: role.map(str::to_owned),
                 persist_row_hash: String::new(),
             },
-        ))
-        .await
+        );
+        // v62.0.0 (flip wave 2, E5) — as `widen_community`.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            use crate::federation::edition2::group_fixtures as gf;
+            let group = crate::federation::edition2::fixture_switch::kid(fid);
+            let head = gf::held_head(d, &group).await.map(|(h, _)| h);
+            let voices = gf::family_widening_voices(&w, head.as_ref());
+            return gf::put_voices(d, &voices).await.map(|_| ());
+        }
+        d.put_family_membership_widening(w).await
     }
 
     async fn active_in_community<D: FederationDirectory + ?Sized>(
@@ -411,6 +536,9 @@ pub(crate) mod bodies {
             format!("i210-x-{s}"),
         );
         reg(d, &[&cid, &founder, &k, &stranger]).await;
+        // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
+        let (cid, founder, k, stranger) =
+            (id_of(&cid), id_of(&founder), id_of(&k), id_of(&stranger));
         found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .expect("I210: the founder founds the room");
@@ -423,7 +551,7 @@ pub(crate) mod bodies {
             Utc::now(),
             Some(Duration::days(7)),
         );
-        put(d, &p)
+        put_e2(d, &p)
             .await
             .expect("I210: the founder's proposal is admitted");
         let reads = |caller: &str| {
@@ -497,6 +625,9 @@ pub(crate) mod bodies {
             format!("i211-x-{s}"),
         );
         reg(d, &[&cid, &founder, &k, &stranger]).await;
+        // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
+        let (cid, founder, k, stranger) =
+            (id_of(&cid), id_of(&founder), id_of(&k), id_of(&stranger));
         found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
@@ -511,105 +642,35 @@ pub(crate) mod bodies {
         );
         // ahead of its proposal: retryable, then admitted once it lands
         let early = reply(&k, &k, &p, true, Utc::now());
-        let e = put(d, &early)
+        let e = put_e2(d, &early)
             .await
             .expect_err("I211: a reply ahead of its proposal");
         assert_eq!(rule_of(&e), RULE_PROPOSAL_UNRESOLVED, "I211: {e}");
         assert!(crate::federation::membership_acceptance::is_retryable_rule(
             rule_of(&e)
         ));
-        put(d, &p).await.unwrap();
+        put_e2(d, &p).await.unwrap();
         // a stranger replying as K (their own signature, K's name): mismatch
         let forged = reply(&stranger, &k, &p, true, Utc::now());
-        let e = put(d, &forged).await.expect_err("I211: a stranger's reply");
+        let e = put_e2(d, &forged)
+            .await
+            .expect_err("I211: a stranger's reply");
         // refused BY NAME at the reply arm (the signer does not act for the
         // invitee), not left to a later, unrelated standing gate
         assert_eq!(rule_of(&e), RULE_ACCEPTANCE_MISMATCH, "I211: {e:?}");
         // a stranger replying as themselves: not the invitee
         let own = reply(&stranger, &stranger, &p, true, Utc::now());
-        let e = put(d, &own).await.expect_err("I211: a non-invitee's reply");
+        let e = put_e2(d, &own)
+            .await
+            .expect_err("I211: a non-invitee's reply");
         assert_eq!(rule_of(&e), RULE_ACCEPTANCE_MISMATCH, "I211: {e}");
-        put(d, &early)
+        put_e2(d, &early)
             .await
             .expect("I211: the invitee's acceptance is admitted on retry");
         assert!(
             !active_in_community(d, &cid, &k).await,
             "I211: accepting is not joining"
         );
-    }
-
-    // ── I212 ──────────────────────────────────────────────────────────────
-    /// **I212 — a growth needs the member's acceptance (founder_only, both
-    /// planes); a role change of an active member needs none.**
-    /// **I1495 (CIRISPersist#1151, the sunset)** — a v60 peer's
-    /// `membership:proposal` and `membership:acceptance` carry `"role": null`
-    /// when no role is offered. They are admitted, read as no role, and the
-    /// growth they authorise lands as a plain member. A `null` on any OTHER
-    /// member of the same rows is still refused `envelope_member_null`.
-    pub async fn i1495_a_v60_null_role_is_read_as_absent<D: FederationDirectory + ?Sized>(
-        d: &D,
-        s: &str,
-    ) {
-        let (cid, founder, k) = (
-            format!("i1495-c-{s}"),
-            format!("i1495-f-{s}"),
-            format!("i1495-k-{s}"),
-        );
-        reg(d, &[&cid, &founder, &k]).await;
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
-            .await
-            .unwrap();
-        let now = Utc::now();
-        let mut p = proposal(
-            &founder,
-            COMMUNITY,
-            &cid,
-            &k,
-            None,
-            now,
-            Some(Duration::days(7)),
-        );
-        p.attestation_envelope["role"] = serde_json::Value::Null;
-        ts::seal_row_in_place(&founder, &mut p);
-
-        let mut other = p.clone();
-        other.attestation_envelope["note"] = serde_json::Value::Null;
-        ts::seal_row_in_place(&founder, &mut other);
-        let e = put(d, &other)
-            .await
-            .expect_err("I1495: a null on another member of the row is refused");
-        assert!(
-            matches!(
-                &e,
-                Error::MalformedRow { reason, .. }
-                    if *reason == crate::federation::malformed_row::ENVELOPE_MEMBER_NULL
-            ) && e.to_string().contains("`note`"),
-            "I1495: {e}"
-        );
-
-        put(d, &p)
-            .await
-            .expect("I1495: a v60 proposal with role null is admitted");
-        let mut a = reply(&k, &k, &p, true, now);
-        a.attestation_envelope["role"] = serde_json::Value::Null;
-        ts::seal_row_in_place(&k, &mut a);
-        put(d, &a)
-            .await
-            .expect("I1495: a v60 acceptance with role null is admitted");
-        let held = d
-            .get_attestation(&p.attestation_id)
-            .await
-            .unwrap()
-            .expect("I1495: the proposal is held");
-        assert_eq!(
-            held.attestation_envelope["role"],
-            serde_json::Value::Null,
-            "I1495: the signed bytes are kept as written"
-        );
-        widen_community(d, &cid, &[&founder], &k, None, now)
-            .await
-            .expect("I1495: the null role reads as no role, so the role-less growth matches");
-        assert!(active_in_community(d, &cid, &k).await, "I1495: K is in");
     }
 
     pub async fn i212_growth_needs_acceptance<D: FederationDirectory + ?Sized>(d: &D, s: &str) {
@@ -621,6 +682,14 @@ pub(crate) mod bodies {
             format!("i212-j-{s}"),
         );
         reg(d, &[&cid, &fid, &founder, &k, &j]).await;
+        // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
+        let (cid, fid, founder, k, j) = (
+            id_of(&cid),
+            id_of(&fid),
+            id_of(&founder),
+            id_of(&k),
+            id_of(&j),
+        );
         found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
@@ -639,8 +708,8 @@ pub(crate) mod bodies {
             now,
             Some(Duration::days(7)),
         );
-        put(d, &p).await.unwrap();
-        put(d, &reply(&k, &k, &p, true, now)).await.unwrap();
+        put_e2(d, &p).await.unwrap();
+        put_e2(d, &reply(&k, &k, &p, true, now)).await.unwrap();
         widen_community(d, &cid, &[&founder], &k, None, now)
             .await
             .expect("I212: with the acceptance the widening is admitted");
@@ -674,11 +743,12 @@ pub(crate) mod bodies {
         // member at all, and is refused whatever the membership gate says;
         // a non-founder member is refused by the proposer rule
         let pk = proposal(&k, FAMILY, &fid, &j, None, now, Some(Duration::days(7)));
-        put(d, &pk)
+        put_e2(d, &pk)
             .await
             .expect_err("I212: a non-member's family proposal");
         let m = format!("i212-m-{s}");
         reg(d, &[&m]).await;
+        let m = id_of(&m);
         let pm = proposal(
             &founder,
             FAMILY,
@@ -688,8 +758,8 @@ pub(crate) mod bodies {
             now,
             Some(Duration::days(7)),
         );
-        put(d, &pm).await.unwrap();
-        put(d, &reply(&m, &m, &pm, true, now)).await.unwrap();
+        put_e2(d, &pm).await.unwrap();
+        put_e2(d, &reply(&m, &m, &pm, true, now)).await.unwrap();
         widen_family(d, &fid, &founder, &m, None, now)
             .await
             .expect("I212: a member (not a founder) joins the family");
@@ -716,8 +786,8 @@ pub(crate) mod bodies {
             now,
             Some(Duration::days(7)),
         );
-        put(d, &pf).await.unwrap();
-        put(d, &reply(&j, &j, &pf, true, now)).await.unwrap();
+        put_e2(d, &pf).await.unwrap();
+        put_e2(d, &reply(&j, &j, &pf, true, now)).await.unwrap();
         widen_family(d, &fid, &founder, &j, None, now)
             .await
             .expect("I212: the family widening with an acceptance");
@@ -732,6 +802,8 @@ pub(crate) mod bodies {
             format!("i213-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
+        // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
+        let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
         found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
@@ -745,11 +817,11 @@ pub(crate) mod bodies {
             now,
             Some(Duration::days(7)),
         );
-        put(d, &p).await.unwrap();
-        put(d, &reply(&k, &k, &p, false, now))
+        put_e2(d, &p).await.unwrap();
+        put_e2(d, &reply(&k, &k, &p, false, now))
             .await
             .expect("I213: K declines");
-        let e = put(d, &reply(&k, &k, &p, true, now))
+        let e = put_e2(d, &reply(&k, &k, &p, true, now))
             .await
             .expect_err("I213: an acceptance after the decline");
         assert_eq!(rule_of(&e), RULE_REPLY_CONFLICT, "I213: {e}");
@@ -771,9 +843,9 @@ pub(crate) mod bodies {
             now,
             Some(Duration::days(7)),
         );
-        put(d, &p2).await.unwrap();
-        put(d, &reply(&k, &k, &p2, true, now)).await.unwrap();
-        let e = put(d, &reply(&k, &k, &p2, false, now))
+        put_e2(d, &p2).await.unwrap();
+        put_e2(d, &reply(&k, &k, &p2, true, now)).await.unwrap();
+        let e = put_e2(d, &reply(&k, &k, &p2, false, now))
             .await
             .expect_err("I213: a decline after the acceptance");
         assert_eq!(rule_of(&e), RULE_REPLY_CONFLICT, "I213: {e}");
@@ -785,6 +857,7 @@ pub(crate) mod bodies {
         // and the answer is EXPIRED, not declined
         let j = format!("i213-j-{s}");
         reg(d, &[&j]).await;
+        let j = id_of(&j);
         let pa = proposal(
             &founder,
             COMMUNITY,
@@ -794,8 +867,8 @@ pub(crate) mod bodies {
             now,
             Some(Duration::days(7)),
         );
-        put(d, &pa).await.unwrap();
-        put(d, &reply(&j, &j, &pa, false, now)).await.unwrap();
+        put_e2(d, &pa).await.unwrap();
+        put_e2(d, &reply(&j, &j, &pa, false, now)).await.unwrap();
         let t0 = now - Duration::days(20);
         let pb = proposal(
             &founder,
@@ -806,8 +879,8 @@ pub(crate) mod bodies {
             t0,
             Some(Duration::days(7)),
         );
-        put(d, &pb).await.unwrap();
-        put(d, &reply(&j, &j, &pb, true, t0)).await.unwrap();
+        put_e2(d, &pb).await.unwrap();
+        put_e2(d, &reply(&j, &j, &pb, true, t0)).await.unwrap();
         let e = widen_community(d, &cid, &[&founder], &j, None, now)
             .await
             .expect_err("I213: growth past the accepted invitation's expiry");
@@ -826,15 +899,29 @@ pub(crate) mod bodies {
             format!("i214-m-{s}"),
         );
         reg(d, &[&cid, &founder, &k, &j, &m]).await;
+        // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
+        let (cid, founder, k, j, m) = (
+            id_of(&cid),
+            id_of(&founder),
+            id_of(&k),
+            id_of(&j),
+            id_of(&m),
+        );
         found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let t0 = Utc::now() - Duration::days(20);
         for ttl in [None, Some(Duration::seconds(0)), Some(Duration::days(31))] {
-            let e = put(d, &proposal(&founder, COMMUNITY, &cid, &k, None, t0, ttl))
+            let e = put_e2(d, &proposal(&founder, COMMUNITY, &cid, &k, None, t0, ttl))
                 .await
                 .expect_err("I214: a proposal with no / zero / >30-day TTL");
-            assert!(matches!(e, Error::InvalidArgument(_)), "I214: {e:?}");
+            // v62.0.0 (wave GC6) — the TTL is the row's own bytes: refused
+            // (never held), by the gate or by the edition-2 payload check.
+            assert!(
+                matches!(e, Error::InvalidArgument(ref m) if !m.starts_with("held "))
+                    || matches!(e, Error::MalformedRow { .. }),
+                "I214: {e:?}"
+            );
         }
         // proposal at t0, live 7 days (expired now)
         let p = proposal(
@@ -846,9 +933,9 @@ pub(crate) mod bodies {
             t0,
             Some(Duration::days(7)),
         );
-        put(d, &p).await.unwrap();
+        put_e2(d, &p).await.unwrap();
         // the acceptance signed after the expiry
-        put(d, &reply(&k, &k, &p, true, t0 + Duration::days(8)))
+        put_e2(d, &reply(&k, &k, &p, true, t0 + Duration::days(8)))
             .await
             .unwrap();
         let e = widen_community(d, &cid, &[&founder], &k, None, t0 + Duration::days(1))
@@ -865,8 +952,8 @@ pub(crate) mod bodies {
             t0,
             Some(Duration::days(7)),
         );
-        put(d, &pj).await.unwrap();
-        put(d, &reply(&j, &j, &pj, true, t0 + Duration::days(1)))
+        put_e2(d, &pj).await.unwrap();
+        put_e2(d, &reply(&j, &j, &pj, true, t0 + Duration::days(1)))
             .await
             .unwrap();
         let e = widen_community(d, &cid, &[&founder], &j, None, t0 + Duration::days(9))
@@ -887,8 +974,8 @@ pub(crate) mod bodies {
             now,
             Some(Duration::days(7)),
         );
-        put(d, &pm).await.unwrap();
-        put(d, &reply(&m, &m, &pm, true, now)).await.unwrap();
+        put_e2(d, &pm).await.unwrap();
+        put_e2(d, &reply(&m, &m, &pm, true, now)).await.unwrap();
         let mut w = ts::bare_attestation(
             &uuid::Uuid::new_v4().to_string(),
             &founder,
@@ -902,7 +989,7 @@ pub(crate) mod bodies {
         w.attestation_type = attestation_type::WITHDRAWS.into();
         w.weight = None;
         ts::seal_row_in_place(&founder, &mut w);
-        put(d, &w)
+        put_e2(d, &w)
             .await
             .expect("I214: the proposer withdraws the proposal");
         let e = widen_community(d, &cid, &[&founder], &m, None, now)
@@ -920,6 +1007,8 @@ pub(crate) mod bodies {
             format!("i215-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
+        // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
+        let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
         found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
@@ -933,11 +1022,11 @@ pub(crate) mod bodies {
             now,
             Some(Duration::days(7)),
         );
-        put(d, &p).await.unwrap();
+        put_e2(d, &p).await.unwrap();
         // a wrong hash
         let mut bad = p.clone();
         bad.original_content_hash = "00".repeat(32);
-        let e = put(d, &reply(&k, &k, &bad, true, now))
+        let e = put_e2(d, &reply(&k, &k, &bad, true, now))
             .await
             .expect_err("I215: a reply binding another hash");
         assert_eq!(rule_of(&e), RULE_ACCEPTANCE_MISMATCH, "I215: {e}");
@@ -945,11 +1034,11 @@ pub(crate) mod bodies {
         let mut r = reply(&k, &k, &p, true, now);
         r.attestation_envelope["role"] = "moderator".into();
         ts::seal_row_in_place(&k, &mut r);
-        let e = put(d, &r)
+        let e = put_e2(d, &r)
             .await
             .expect_err("I215: a reply accepting another role");
         assert_eq!(rule_of(&e), RULE_ACCEPTANCE_MISMATCH, "I215: {e}");
-        put(d, &reply(&k, &k, &p, true, now)).await.unwrap();
+        put_e2(d, &reply(&k, &k, &p, true, now)).await.unwrap();
         // the growth at another role than offered
         let e = widen_community(d, &cid, &[&founder], &k, Some("moderator"), now)
             .await
@@ -963,6 +1052,12 @@ pub(crate) mod bodies {
     // ── I216 ──────────────────────────────────────────────────────────────
     /// **I216 — a founding record admits only the members who signed it.**
     pub async fn i216_founding_signers<D: FederationDirectory + ?Sized>(d: &D, s: &str) {
+        // v62.0.0 (JSON cut, E5) — on edition 2 a founding roster is its
+        // founders' voices (T1.api §1): a roster listing a member who has not
+        // voiced it is kept `Pending` and lands nothing (it is no longer
+        // refused by name). The forged-co-signature arm and the served
+        // `cosignatures` count are earlier-form proof shapes (T1.api §6
+        // "delete"): a voice is a statement the door verifies.
         let (c1, c2, f1, f2, founder, cofounder, k) = (
             format!("i216-c1-{s}"),
             format!("i216-c2-{s}"),
@@ -973,65 +1068,33 @@ pub(crate) mod bodies {
             format!("i216-k-{s}"),
         );
         reg(d, &[&c1, &c2, &f1, &f2, &founder, &cofounder, &k]).await;
-        let e = found_community(d, &c1, "majority", &[&founder], &[&k])
+        found_community(d, &c1, "majority", &[&founder], &[&k])
             .await
-            .expect_err("I216: an unsigned founding member");
-        assert_eq!(rule_of(&e), RULE_FOUNDING_MEMBER_UNSIGNED, "I216: {e}");
+            .expect("I216: an unsigned founding member leaves the roster pending");
         assert!(
-            d.lookup_community(&c1).await.unwrap().is_none(),
+            d.lookup_community(&id_of(&c1)).await.unwrap().is_none(),
             "I216: nothing stored"
         );
         found_community(d, &c2, "majority", &[&founder, &cofounder], &[])
             .await
             .expect("I216: every founding member signed");
-        let e = found_family(d, &f1, "majority", &[&founder], &[&k])
+        assert!(
+            d.lookup_community(&id_of(&c2)).await.unwrap().is_some(),
+            "I216: the fully voiced room lands"
+        );
+        found_family(d, &f1, "majority", &[&founder], &[&k])
             .await
-            .expect_err("I216: an unsigned founding family member");
-        assert_eq!(rule_of(&e), RULE_FOUNDING_MEMBER_UNSIGNED, "I216: {e}");
-        // a forged co-signature is refused, never counted as consent
-        {
-            let f = Family {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                family_key_id: f2.clone(),
-                family_name: "forged".into(),
-                members: [&founder, &cofounder]
-                    .iter()
-                    .map(|k| FamilyMember {
-                        key_id: (*k).clone(),
-                        joined_at: ms(Utc::now()),
-                        role: Some("founder".into()),
-                    })
-                    .collect(),
-                founded_at: ms(Utc::now()),
-                consensus_protocol: "majority".into(),
-                consensus_protocol_entrenched: false,
-                dissolved_at: None,
-                persist_row_hash: String::new(),
-            };
-            let mut signed = ts::sign_family(&founder, f);
-            signed.cosignatures[0].scrub_signature_classical =
-                signed.scrub_signature_classical.clone();
-            d.put_family(signed)
-                .await
-                .expect_err("I216: a forged founding co-signature");
-            assert!(
-                d.lookup_family(&f2).await.unwrap().is_none(),
-                "I216: nothing stored"
-            );
-        }
+            .expect("I216: an unsigned founding family member leaves it pending");
+        assert!(
+            d.lookup_family(&id_of(&f1)).await.unwrap().is_none(),
+            "I216: nothing stored"
+        );
         found_family(d, &f2, "majority", &[&founder, &cofounder], &[])
             .await
             .expect("I216: a co-signed family founding");
-        let fam = d.list_signed_families_since(None, 1000).await.unwrap();
-        let served = fam
-            .iter()
-            .find(|f| f.family.family.family_key_id == f2)
-            .expect("I216: the family is served");
-        assert_eq!(
-            served.family.cosignatures.len(),
-            1,
-            "I216: the co-signature is persisted and served (V162)"
+        assert!(
+            d.lookup_family(&id_of(&f2)).await.unwrap().is_some(),
+            "I216: the fully voiced family lands"
         );
     }
 
@@ -1044,6 +1107,8 @@ pub(crate) mod bodies {
             format!("i217-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
+        // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
+        let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
         found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
@@ -1055,13 +1120,36 @@ pub(crate) mod bodies {
             role: None,
         });
         c.community_name = "renamed".into();
-        let e = d
-            .supersede_community(ts::sign_community(&founder, c.clone()), None)
+        // v62.0.0 (wave 3, E5) — under the switch a supersede is the roster's
+        // next version naming the held head (T1.api §6), voiced by the founder;
+        // when held, the JSON supersede door.
+        let supersede = |c: crate::federation::types::Community| {
+            let (cid, founder) = (cid.clone(), founder.clone());
+            async move {
+                use crate::federation::edition2::fixture_switch as e2;
+                use crate::federation::edition2::group_fixtures as gf;
+                if e2::emit_edition2() {
+                    let (head, version) = gf::held_head(d, &cid).await.expect("I217: a held head");
+                    let voices = gf::community_voices(
+                        &ts::sign_community(&founder, c),
+                        version + 1,
+                        Some(&head),
+                        e2::ms(Utc::now()),
+                    );
+                    gf::put_voices(d, &voices).await.map(|_| ())
+                } else {
+                    d.supersede_community(ts::sign_community(&founder, c), None)
+                        .await
+                        .map(|_| ())
+                }
+            }
+        };
+        let e = supersede(c.clone())
             .await
             .expect_err("I217: a supersede adding K");
         assert_eq!(rule_of(&e), RULE_SUPERSEDE_CANNOT_ADD, "I217: {e}");
         c.members.pop();
-        d.supersede_community(ts::sign_community(&founder, c), None)
+        supersede(c)
             .await
             .expect("I217: a supersede renaming only is admitted");
     }
@@ -1078,6 +1166,8 @@ pub(crate) mod bodies {
             format!("i218-k-{s}"),
         );
         reg(d, &[&cid, &a, &b, &c, &k]).await;
+        // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
+        let (cid, a, b, c, k) = (id_of(&cid), id_of(&a), id_of(&b), id_of(&c), id_of(&k));
         found_community(d, &cid, "majority", &[&a, &b, &c], &[])
             .await
             .unwrap();
@@ -1085,16 +1175,23 @@ pub(crate) mod bodies {
         let p = proposal(&a, COMMUNITY, &cid, &k, None, now, Some(Duration::days(7)));
         put(d, &p).await.expect("I218: one inviter proposes");
         put(d, &reply(&k, &k, &p, true, now)).await.unwrap();
-        let e = widen_community(d, &cid, &[&a], &k, None, now)
+        // v62.0.0 (wave 3, E5) — one voice of three is kept `Pending` (T1.api
+        // §6: a quorum short does not move the head); the second voice of the
+        // same widening completes it.
+        widen_community(d, &cid, &[&a], &k, None, now)
             .await
-            .expect_err("I218: one signature of three");
+            .expect("I218: one signature of three is held, pending the group");
         assert!(
-            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
-            "I218: accepted, awaiting the group: {e:?}"
+            !active_in_community(d, &cid, &k).await,
+            "I218: accepted, awaiting the group"
         );
         widen_community(d, &cid, &[&a, &b], &k, None, now)
             .await
             .expect("I218: at the group's majority it admits");
+        assert!(
+            active_in_community(d, &cid, &k).await,
+            "I218: the majority lands the growth"
+        );
     }
 
     // ── I219 ──────────────────────────────────────────────────────────────
@@ -1104,6 +1201,35 @@ pub(crate) mod bodies {
     /// admits both — and B refuses the widening before the acceptance exists
     /// there, exactly as A's local door would.
     pub async fn i219_two_nodes<D: FederationDirectory + ?Sized>(a: &D, b: &D, s: &str) {
+        // v62.0.0 (JSON cut, E5) — the two nodes exchange edition-2
+        // STATEMENTS through cut B's FILTERED serve path
+        // (`edition2::serve::statements_served_to`, with the receiver as the
+        // requester; the store's raw `edition2_statements_since` is never a
+        // serve surface); the receiver puts each through its own door. Every
+        // key is named by its identity-ref.
+        use crate::federation::edition2::fixture_switch as e2;
+        async fn replicate<D: FederationDirectory + ?Sized>(from: &D, to: &D, requester: &str) {
+            let mut cursor = None;
+            loop {
+                let page = crate::federation::edition2::serve::statements_served_to(
+                    from,
+                    cursor.as_ref(),
+                    1000,
+                    Some(requester),
+                )
+                .await
+                .expect("I219: serve statements");
+                for st in &page.statements {
+                    e2::put_statement(to, &st.bytes)
+                        .await
+                        .unwrap_or_else(|e| panic!("I219: a replicated statement: {e}"));
+                }
+                match page.next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+        }
         let (cid, founder, k) = (
             format!("i219-c-{s}"),
             format!("i219-f-{s}"),
@@ -1115,6 +1241,7 @@ pub(crate) mod bodies {
         found_community(a, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
+        let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
         let now = Utc::now();
         let p = proposal(
             &founder,
@@ -1126,49 +1253,36 @@ pub(crate) mod bodies {
             Some(Duration::days(7)),
         );
         put(a, &p).await.unwrap();
-        // B holds no roster for the room: the subject-apply arm stores it
+        // B holds no roster for the room: the subject's node stores the proposal.
         assert!(b.lookup_community(&cid).await.unwrap().is_none());
-        b.apply_replicated_attestation(SignedAttestation {
-            attestation: a.get_attestation(&p.attestation_id).await.unwrap().unwrap(),
-        })
-        .await
-        .expect("I219: K's node stores the proposal addressed to K");
+        e2::put_signed(b, &p)
+            .await
+            .expect("I219: K's node stores the proposal addressed to K");
         let acc = reply(&k, &k, &p, true, now);
         put(b, &acc).await.expect("I219: K accepts on its own node");
-        a.apply_replicated_attestation(SignedAttestation {
-            attestation: b
-                .get_attestation(&acc.attestation_id)
-                .await
-                .unwrap()
-                .unwrap(),
-        })
-        .await
-        .expect("I219: A admits K's acceptance");
+        e2::put_signed(a, &acc)
+            .await
+            .expect("I219: A admits K's acceptance");
         widen_community(a, &cid, &[&founder], &k, None, now)
             .await
             .expect("I219: A admits the growth");
-        // B gets the room; the widening (A's door already admitted it) is
-        // judged again on B, and passes because the acceptance is held there
-        let room = a
-            .list_signed_communities_since(None, 1000)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|c| c.community.community.community_key_id == cid)
-            .expect("A serves the room");
-        b.put_community(room.community)
-            .await
-            .expect("I219: B takes the room");
-        widen_community(b, &cid, &[&founder], &k, None, now)
-            .await
-            .expect("I219: B admits the growth too");
-        assert!(active_in_community(b, &cid, &k).await);
+        // B gets the room and the growth as A's statements; the widening is
+        // judged again on B, and passes because the acceptance is held there.
+        // The requester is B's node (its node key when set, else K, whose
+        // node B is).
+        let requester = b.node_key_id().unwrap_or_else(|| k.clone());
+        replicate(a, b, &requester).await;
+        assert!(
+            active_in_community(b, &cid, &k).await,
+            "I219: B admits the growth too"
+        );
         // a third member, invited on A but whose acceptance never reached B:
-        // B refuses the replicated growth, retryably
+        // B refuses the growth, retryably
         let j = format!("i219-j-{s}");
         for n in [a, b] {
             reg(n, &[&j]).await;
         }
+        let j = id_of(&j);
         let pj = proposal(
             &founder,
             COMMUNITY,
@@ -1178,8 +1292,8 @@ pub(crate) mod bodies {
             now,
             Some(Duration::days(7)),
         );
-        put(a, &pj).await.unwrap();
-        put(a, &reply(&j, &j, &pj, true, now)).await.unwrap();
+        put_e2(a, &pj).await.unwrap();
+        put_e2(a, &reply(&j, &j, &pj, true, now)).await.unwrap();
         widen_community(a, &cid, &[&founder], &j, None, now)
             .await
             .unwrap();
@@ -1208,11 +1322,6 @@ mod run {
                 async fn i211() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i211_the_reply_arm(&b, &bodies::suffix()).await
-                }
-                #[tokio::test]
-                async fn i1495() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i1495_a_v60_null_role_is_read_as_absent(&b, &bodies::suffix()).await
                 }
                 #[tokio::test]
                 async fn i212() {

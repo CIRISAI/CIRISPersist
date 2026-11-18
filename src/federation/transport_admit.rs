@@ -97,6 +97,14 @@ pub(crate) fn held_destination_verdict(
         return DestinationVerdict::Answer(Outcome::Unchanged);
     }
     if held.signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) {
+        // v62.0.0 (wave GC8; CC 2.7.2) — one signer ordering its OWN rows:
+        // the later signed `(epoch, asserted_at)` is the slot's state
+        // whichever arrives first (an older row arriving second is answered
+        // here; arriving first, it is overwritten), so the stored state is
+        // already order-independent. Under a fold attempt the older row is
+        // marked `destination_superseded` (kept, concluding nothing); this
+        // earlier-form door answers `Refused` as before.
+        super::edition2::fold::note(super::edition2::fold::reason::gc8::DESTINATION_SUPERSEDED);
         return DestinationVerdict::Answer(Outcome::Refused {
             reason: format!(
                 "incoming (epoch {}, asserted_at {}) does not supersede stored SIGNED (epoch {}, \
@@ -184,7 +192,17 @@ pub(crate) async fn put_signed_transport_destination_planned<D: TransportStore>(
     super::admission::verify_signed_transport_destination(dir, signed).await?;
     // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's
     // bundle-pinned transit pair rotates by holder quorum, not alone.
-    super::transport_rebind::check_serve_rotation(dir, signed).await?;
+    // v62.0.0 (wave GC4; CC rc21 items 12, 13) — THIS node's own seat
+    // rotation (the binding is about this node's key) is the emitter's act:
+    // a plain refusal (`refuse_own_serve_rotation`). Any other node's
+    // rotation is a receipt: kept and not counted
+    // (`check_serve_rotation`, held inside a fold attempt).
+    if dir.node_key_id().as_deref() == Some(signed.transport_destination.occurrence_key_id.as_str())
+    {
+        super::transport_rebind::refuse_own_serve_rotation(dir, signed).await?;
+    } else {
+        super::transport_rebind::check_serve_rotation(dir, signed).await?;
+    }
     let d = &signed.transport_destination;
     let envelope_json = serde_json::to_string(&signed.signed_envelope)
         .map_err(|e| Error::Backend(format!("signed_envelope: {e}")))?;

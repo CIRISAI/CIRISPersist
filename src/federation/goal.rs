@@ -402,7 +402,11 @@ pub fn goal_body_of(row: &Attestation) -> Option<GoalBody> {
 ///    Otherwise [`Error::InvalidArgument`]: a foreign or body-less supersedes
 ///    would occupy the declarer's §6.1 replay slot on that row and never
 ///    amend it. A target not held yet is admitted; the projection folds it
-///    when the target lands.
+///    when the target lands. v62.0.0 (wave GC7; CC 2.7.3): this clause reads
+///    another row, so under a fold attempt it HOLDS the row (reason
+///    `goal_amendment_not_declarers`) rather than refusing it, and the read
+///    of the target is declared, so the row re-folds when the target arrives
+///    or changes; outside an attempt it is the refusal it was.
 ///
 /// `withdraws` / `recants` need no goal rule: the plane's entitlement rule
 /// (`precedence::retraction_entitled`) already confines them to the
@@ -443,6 +447,16 @@ pub async fn check_goal_row_admission(
     else {
         return Ok(());
     };
+    // v62.0.0 (wave GC7; CC 2.7.3) — the named target is another row: the
+    // verdict below is a FOLD condition. Declaring the read makes the row
+    // re-fold when the target lands, concludes or is withdrawn, so a
+    // supersedes that concluded while its target was not held is re-asked
+    // (and un-concluded if it is not the declarer's amendment): the answer
+    // is the same whichever of the two arrived first.
+    super::edition2::fold::reads(
+        super::edition2::fold::Dep::row_hex(target_id)
+            .unwrap_or_else(|| super::edition2::fold::Dep::key(target_id)),
+    );
     let Some(target) = dir.get_attestation(target_id).await? else {
         return Ok(());
     };
@@ -450,12 +464,15 @@ pub async fn check_goal_row_admission(
         return Ok(());
     }
     if !carries_goal || target.attesting_key_id != row.attesting_key_id {
-        return Err(Error::InvalidArgument(format!(
-            "supersedes {} names goal row {target_id} but is not its declarer's amendment \
-             (attester {}, declarer {}; a goal amendment carries the whole goal body on \
-             goal:{{scale}}:v1)",
-            row.attestation_id, row.attesting_key_id, target.attesting_key_id
-        )));
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::GOAL_AMENDMENT_NOT_DECLARERS,
+            Error::InvalidArgument(format!(
+                "supersedes {} names goal row {target_id} but is not its declarer's amendment \
+                 (attester {}, declarer {}; a goal amendment carries the whole goal body on \
+                 goal:{{scale}}:v1)",
+                row.attestation_id, row.attesting_key_id, target.attesting_key_id
+            )),
+        ));
     }
     Ok(())
 }

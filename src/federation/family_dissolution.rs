@@ -23,6 +23,7 @@
 //!
 //! Every check re-derives from the receiving node's own held record.
 
+use super::edition2::fold::{self, reason, Dep};
 use super::types::Family;
 use super::{Error, FederationDirectory};
 
@@ -30,12 +31,21 @@ use super::{Error, FederationDirectory};
 pub const DISSOLVED_AT_MEMBER: &str = "dissolved_at";
 
 /// Refuse when `family` is dissolved.
+///
+/// v62.0.0 (wave GC7; CC 2.7.3) — `family` is the HELD record, another row
+/// than the one being judged: the refusal is a fold condition. Under a fold
+/// attempt the row is held (reason `group_dissolved`) and re-folds when the
+/// family's record changes; outside one it is the refusal it was.
 pub fn refuse_if_dissolved(family: &Family) -> Result<(), Error> {
+    fold::reads(Dep::key(&family.family_key_id));
     match family.dissolved_at {
-        Some(dissolved_at) => Err(Error::GroupDissolved {
-            group_key_id: family.family_key_id.clone(),
-            dissolved_at,
-        }),
+        Some(dissolved_at) => Err(fold::hold(
+            reason::GROUP_DISSOLVED,
+            Error::GroupDissolved {
+                group_key_id: family.family_key_id.clone(),
+                dissolved_at,
+            },
+        )),
         None => Ok(()),
     }
 }
@@ -46,6 +56,9 @@ pub async fn refuse_if_held_family_dissolved<F>(dir: &F, family_key_id: &str) ->
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave GC7) — read even when absent: a dissolution that lands
+    // later re-folds the row.
+    fold::reads(Dep::key(family_key_id));
     match dir.lookup_family(family_key_id).await? {
         Some(f) => refuse_if_dissolved(&f),
         None => Ok(()),
@@ -95,21 +108,29 @@ pub fn check_dissolution_matches_envelope(
 }
 
 /// A dissolution changes nothing but `dissolved_at`.
+///
+/// v62.0.0 (wave GC7; CC 2.7.3) — `stored` is the head the dissolution
+/// supersedes (another row): held, reason `dissolution_not_terminal_only`,
+/// under a fold attempt.
 pub fn check_dissolve_is_terminal_only(stored: &Family, offered: &Family) -> Result<(), Error> {
     if offered.dissolved_at.is_none() {
         return Ok(());
     }
+    fold::reads(Dep::key(&stored.family_key_id));
     let same = stored.family_name == offered.family_name
         && stored.founded_at == offered.founded_at
         && stored.consensus_protocol == offered.consensus_protocol
         && stored.consensus_protocol_entrenched == offered.consensus_protocol_entrenched
         && stored.members == offered.members;
     if !same {
-        return Err(Error::InvalidArgument(format!(
-            "family {}: a dissolution is terminal and changes nothing but dissolved_at \
-             (CIRISPersist#956)",
-            offered.family_key_id
-        )));
+        return Err(fold::hold(
+            reason::DISSOLUTION_NOT_TERMINAL_ONLY,
+            Error::InvalidArgument(format!(
+                "family {}: a dissolution is terminal and changes nothing but dissolved_at \
+                 (CIRISPersist#956)",
+                offered.family_key_id
+            )),
+        ));
     }
     Ok(())
 }
@@ -175,17 +196,28 @@ where
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
         .ok_or_else(|| refuse("the change envelope is missing `supersedes`"))?;
+    // v62.0.0 (wave GC7; CC 2.7.3) — the claimed prior roster is compared
+    // with the HELD head (another row) and the leaver's key record is looked
+    // up (a link that waits): both hold under a fold attempt and re-fold when
+    // the family or the leaver's key changes. The envelope's own shape and
+    // the signature stay refusals.
+    fold::reads(Dep::key(&stored.family_key_id));
+    fold::reads(Dep::key(leaver));
     let held: Vec<&str> = stored.members.iter().map(|m| m.key_id.as_str()).collect();
     if claimed_prior != held {
-        return Err(refuse(
-            "supersedes.prior_member_key_ids does not match the held roster",
+        return Err(fold::hold(
+            reason::PRIOR_ROSTER_MISMATCH,
+            refuse("supersedes.prior_member_key_ids does not match the held roster"),
         ));
     }
     let Some(sig) = signatures.iter().find(|s| s.member_id == leaver) else {
         return Err(refuse("the leaver did not sign"));
     };
     let Some(rec) = dir.lookup_public_key(leaver).await? else {
-        return Err(refuse("the leaver's key is not registered here"));
+        return Err(fold::hold(
+            reason::LINK_UNHELD,
+            refuse("the leaver's key is not registered here"),
+        ));
     };
     let member = ThresholdMember {
         member_id: rec.key_id,

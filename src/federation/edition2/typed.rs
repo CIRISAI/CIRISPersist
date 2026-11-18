@@ -29,7 +29,8 @@
 //!   decided by the self-roster's two-path decision
 //!   (`self_roster::gate_edition2`, O1): the quorum path over the held
 //!   voices signed as the self by live roster keys, else the lone path after
-//!   `W_self`. Each voice's signing key must act for the identity. Short,
+//!   `W_self`. Each voice is signed as the identity (the door's key-of-issuer
+//!   check admits only its keys at the statement's instant). Short,
 //!   the voice is kept ([`StatementOutcome::Pending`]); the decision lands
 //!   the revocation.
 //! - **`takedown_notice:steward_purge`**: every voice is kept
@@ -51,7 +52,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ciris_verify_core::cde::{self, Value};
-use ciris_verify_core::edition2::{hash_digest_value, identity_ref, is_identity_ref};
+use ciris_verify_core::edition2::{hash_digest_value, is_identity_ref};
 use ciris_verify_core::namespace_match;
 use sha2::Digest as _;
 
@@ -142,6 +143,78 @@ pub fn typed_plane_of(row_type: &str, family: &str) -> Option<TypedPlane> {
         .iter()
         .find(|(prefix, _)| namespace_match::family_id(prefix) == family)
         .map(|(_, plane)| *plane)
+}
+
+/// v62.0.0 (T2-fix1; CC 3.1.3) — **the selector context a typed family's
+/// authorship cell reads**, which Verify's door cannot know from the bytes
+/// alone (`SelectContext` keys left `None` read unknown, and an undecided
+/// cell is `authorship_undetermined`):
+///
+/// - `identity:occurrence_revocation` (`identity=user => counted ;
+///   authored`): `identity` = the identity_type set of the identity the row
+///   concerns (`identity_key_id`), from its held key record. A key not held
+///   yet waits (the retryable unknown signer, naming it).
+/// - `takedown_notice:{basis}` (`leaf=steward_purge => counted ;
+///   group=affiliations & seats=one => counted ; authored`): `group` from the
+///   payload's `cohort_scope` when it names a group scope; a notice placed
+///   at no group has no deciding seats (`seats = 0`), so the affiliation arm
+///   reads false rather than unknown; an `affiliations` notice's seats are
+///   the held head's members.
+/// - every other family: the default (the door derives `act`).
+///
+/// # Errors
+/// The retryable unknown signer for an identity whose key is not held;
+/// directory reads.
+pub async fn family_context<F>(
+    dir: &F,
+    bytes: &[u8],
+) -> Result<ciris_verify_core::edition2::family::SelectContext, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use ciris_verify_core::edition2::family::{select::Group, SelectContext};
+    let mut ctx = SelectContext::default();
+    let Some((protected, payload)) = super::liveness::statement_parts(bytes) else {
+        return Ok(ctx);
+    };
+    let Some(family) = protected.get_int(-70002).and_then(Value::as_text) else {
+        return Ok(ctx);
+    };
+    if family == namespace_match::family_id(OCCURRENCE_REVOCATION_PREFIX) {
+        if let Some(identity) = text_of(&payload, "identity_key_id") {
+            let Some(key) = dir.lookup_public_key(identity).await? else {
+                return Err(Error::unknown_signer(identity, PLANE));
+            };
+            ctx.identity = Some(
+                key.identity_type
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            );
+        }
+    } else if family == namespace_match::family_id(TAKEDOWN_PREFIX) {
+        let group = match text_of(&payload, "cohort_scope") {
+            Some(cs::FAMILY) => Some(Group::Family),
+            Some(cs::COMMUNITY) => Some(Group::Community),
+            Some(cs::AFFILIATIONS) => Some(Group::Affiliations),
+            _ => None,
+        };
+        ctx.group = group;
+        ctx.seats = match group {
+            None => Some(0),
+            Some(Group::Affiliations) => match text_of(&payload, "community_id") {
+                Some(c) => dir
+                    .lookup_community(c)
+                    .await?
+                    .map(|head| u64::try_from(head.members.len()).unwrap_or(u64::MAX)),
+                None => None,
+            },
+            Some(_) => None,
+        };
+    }
+    Ok(ctx)
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -695,9 +768,10 @@ where
     })
 }
 
-/// **`identity:occurrence_revocation`** (v62.0.0, wave T2 + O1's S1b): the
-/// signing key acts for the identity (the carrier's `check_signer_acts_for`;
-/// refused otherwise, not kept). (A) a node or agent identity lands on one
+/// **`identity:occurrence_revocation`** (v62.0.0, wave T2 + O1's S1b): every
+/// voice is signed AS the identity (refused otherwise, not kept), so the
+/// door's key-of-issuer check has already admitted only a key of the
+/// identity at the statement's instant; no current-roster read is made. (A) a node or agent identity lands on one
 /// voice. (B) a user self's eviction is a roster change and runs the
 /// self-roster's ONE two-path decision (`self_roster::gate_edition2` over
 /// `occurrence::carried_of_bind`): the quorum path counts every held voice
@@ -717,8 +791,18 @@ where
     use crate::federation::occurrence_revocation_carrier::is_single_signer_identity;
     let revocation = occurrence_revocation_of(row)?;
     let identity = revocation.identity_key_id.clone();
-    let signer = identity_ref(&row.kid);
-    crate::federation::admission::check_signer_acts_for(dir, &signer, &identity, PLANE).await?;
+    // Every voice is signed AS the identity: the door's key-of-issuer check
+    // then admits only a key of the identity at the statement's own instant
+    // (its record, or a live occurrence seat). No current-roster read here
+    // (G0's named-past rule): who COUNTS is the roster at the heads the row
+    // names (`self_roster::gate_edition2` over `roster_at_heads`).
+    if row.iss != identity {
+        return Err(invalid(format!(
+            "{OCCURRENCE_REVOCATION_PREFIX}: a voice is signed as the identity {identity:?}, \
+             not as {:?}",
+            row.iss
+        )));
+    }
     let single_signer = is_single_signer_identity(dir, &identity).await?;
     // Stored FIRST: the self-roster's gate counts the held voices.
     let new = dir.put_edition2_statement(row).await?;
@@ -796,9 +880,18 @@ where
         revocation.scrub_signature_classical.clone(),
     );
     let vouch = Vouch::over(&revocation.revocation_envelope, voices)?;
+    // v62.0.0 (wave GC4; CC 2.6.1.9, 2.7.3) — a count short of its
+    // authority is HELD `count_short` (the door's fold attempt keeps the
+    // voice, `ingest::put_admitted_row`). It was returned as a plain error,
+    // so the first voice was refused and the row could never gather its
+    // count (G2 cluster 3). The door's own refusals (bytes, key plane) stay
+    // refusals; a gate inside `put_revocation` that marks its condition
+    // holds the row with its own reason.
     match run_vouched(vouch, dir.put_revocation(SignedRevocation { revocation })).await? {
         Landing::Landed => {}
-        Landing::Short(e) => return Err(e),
+        Landing::Short(e) => {
+            return Err(super::fold::hold(super::fold::reason::COUNT_SHORT, e));
+        }
     }
     let new = dir.put_edition2_statement(row).await?;
     Ok(StatementOutcome::Row {
@@ -841,6 +934,11 @@ where
         return Err(Error::unknown_signer(&row.iss, PLANE));
     };
     let receipt = delivery_receipt_of(row, &subscriber)?;
+    // v62.0.0 (wave GC4; CC 2.7.3) — the receipt door's JOIN and
+    // equivocation steps read other rows (the stream, the subscriber's other
+    // receipts): they run inside the door's fold attempt
+    // (`ingest::put_admitted_row`), so a step that marks its condition holds
+    // the statement instead of losing it. (Their owner converts them.)
     dir.put_delivery_receipt_edition2(receipt).await?;
     put_attestation_row(dir, row, tier).await
 }
@@ -1117,8 +1215,9 @@ fn refs_naming(role: &str, row: &RowId) -> Value {
 }
 
 /// v62.0.0 (wave T2; CC 3.3.6.4, CC27 item 2) — **the payload of an
-/// `identity:occurrence_revocation` row**, authored by `author` (the
-/// revoker's identity: every voice states the same payload), naming the
+/// `identity:occurrence_revocation` row**: `author` is the identity for an
+/// authored row (a node's or agent's), `None` for a user self's counted row
+/// (CC 3.1.3); every voice states the same payload, naming the
 /// self-roster head it is counted over (`refs.head`, REQUIRED by CC's
 /// ruling): the identity's last landed bind or eviction, or the genesis
 /// key's own `key:record` row before any. The proposal's thresholds are
@@ -1132,7 +1231,7 @@ fn refs_naming(role: &str, row: &RowId) -> Value {
 /// An instant before 1970.
 pub fn occurrence_revocation_payload(
     revocation: &IdentityOccurrenceRevocation,
-    author: &str,
+    author: Option<&str>,
     reason_code: Option<u64>,
     head: &RowId,
     further_heads: &[RowId],
@@ -1140,13 +1239,18 @@ pub fn occurrence_revocation_payload(
 ) -> Result<Value, Error> {
     let mut m = vec![
         ("asserted_at", Value::Uint(asserted_at_ms)),
-        ("author", text(author)),
         ("identity_key_id", text(&revocation.identity_key_id)),
         ("occurrence_key_id", text(&revocation.occurrence_key_id)),
         ("revoked_at", ms_of(revocation.revoked_at)?),
         ("effective_at", ms_of(revocation.effective_at)?),
         ("refs", self_roster_refs(head, further_heads)),
     ];
+    // CC 3.1.3 (`identity=user => counted ; authored`): a user self's
+    // revocation is counted and carries no `author`; a node's or agent's is
+    // authored (CC 2.6.1.3).
+    if let Some(a) = author {
+        m.push(("author", text(a)));
+    }
     if let Some(code) = reason_code {
         m.push(("reason", Value::Uint(code)));
     }

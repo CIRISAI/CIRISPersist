@@ -67,6 +67,7 @@
 #[cfg(test)]
 pub(crate) mod bodies {
     use crate::federation::blob_tombstone::{binding_state, BindingState};
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::epoch_minter_invariants::bodies::Pick;
     use crate::federation::nested_manifest_invariants::bodies::{pair, Pair};
     use crate::federation::tier_ingest::test_support as ts;
@@ -74,7 +75,6 @@ pub(crate) mod bodies {
     use crate::federation::types::cohort_scope::{self, CryptoTier};
     use crate::federation::{
         AdoptDisposition, BlobBody, BlobError, BlobProvenance, BlobStorage, FederationDirectory,
-        SignedAttestation,
     };
 
     /// The test seam that edits V176 rows directly (see each backend's
@@ -233,15 +233,17 @@ pub(crate) mod bodies {
                 "tier": "invisible_encrypted", "stream_id": s
             });
         }
-        let mut row = ts::bare_attestation(id, owner, owner, &env);
+        // v62 (E4): the earlier-shaped literal, then the owner's edition-2
+        // statement of it through the statement door. The row id is the
+        // node's (`e2::rid`); `id` is only a label.
+        let mut row = e2::with_earlier_form(|| ts::bare_attestation(id, owner, owner, &env));
         row.attestation_type = attestation_type::SCORES.into();
         row.cohort_scope = "federation".into();
         row.subject_key_ids = vec![owner.to_owned()];
-        ts::seal_row_in_place(owner, &mut row);
-        b.put_attestation(SignedAttestation { attestation: row })
+        let stored = e2::try_put_row(b, &row, owner)
             .await
             .unwrap_or_else(|e| panic!("bind {id}: {e}"));
-        id.to_owned()
+        e2::rid(&stored)
     }
 
     async fn withdraw<B>(b: &B, id: &str, owner: &str, target: &str)
@@ -251,11 +253,17 @@ pub(crate) mod bodies {
         let env = serde_json::json!({
             "references_attestation_id": target, "withdrawal_reason": "CC 2.3",
         });
-        let mut w = ts::bare_attestation(id, owner, owner, &env);
+        // v62 (E4): a composer carries its TARGET's family (RULINGS,
+        // `composer_family_mismatch`), named through `refs.target`.
+        let t = b
+            .get_attestation(target)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("withdraw {id}: the target {target} is held"));
+        let mut w = e2::with_earlier_form(|| ts::bare_attestation(id, owner, owner, &env));
         w.attestation_type = attestation_type::WITHDRAWS.into();
         w.cohort_scope = "federation".into();
-        ts::seal_row_in_place(owner, &mut w);
-        b.put_attestation(SignedAttestation { attestation: w })
+        e2::put_statement(b, &e2::statement_of_family(&w, owner, &e2::family_of(&t)))
             .await
             .unwrap_or_else(|e| panic!("withdraw {id}: {e}"));
     }
@@ -848,7 +856,7 @@ pub(crate) mod bodies {
             (0, 1),
             "{fin:?}"
         );
-        assert_eq!(fin.voided, vec![format!("attestation:i823-file-{run}")]);
+        assert_eq!(fin.voided, vec![format!("attestation:{row}")]);
         assert!(
             !p.sb.has_blob(&root).await.unwrap(),
             "I823 the manifest goes"
@@ -1183,11 +1191,10 @@ pub(crate) mod bodies {
         // A live row by a stranger names the SAME stream in its pointer member
         // but binds bytes of its own: it relates nothing.
         let stranger = format!("i485-stranger-{run}");
-        ts::register_hybrid_key_as(
+        e2::put_key(
             p.sb.as_ref(),
             &stranger,
-            &stranger,
-            crate::federation::types::identity_type::USER,
+            &[crate::federation::types::identity_type::USER],
         )
         .await;
         bind(
@@ -1515,7 +1522,7 @@ pub(crate) mod i598 {
         run: &str,
         pick: Pick<PostgresBackend>,
     ) {
-        let p = pair(dsn_a, dsn_b, run, pick, "i598").await;
+        let p = Box::pin(pair(dsn_a, dsn_b, run, pick, "i598")).await;
         let stream = format!("i598-{run}");
         for i in 0..3u64 {
             p.a.put_blob_chunk_scoped(
@@ -1576,12 +1583,12 @@ pub(crate) mod i598 {
             eprintln!("i598 postgres: no base DSN — SKIPPED");
             return;
         };
-        i598_an_append_after_the_comparison_is_not_linked(
+        Box::pin(i598_an_append_after_the_comparison_is_not_linked(
             &a,
             &b,
             &uuid::Uuid::new_v4().simple().to_string()[..12],
             (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone()) as Pick<_>,
-        )
+        ))
         .await;
         eprintln!("i598 postgres: RAN");
     }

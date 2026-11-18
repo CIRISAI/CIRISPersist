@@ -29,17 +29,23 @@
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::operational::test_support::{
-        establish_trust_root, signed_trust_attestation,
+        establish_e2_trust_root, signed_trust_attestation,
     };
-    use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::trust_root::{
         capability_roots_to_trusted_root, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
         TRUST_CONFERS_DIMENSION,
     };
     use crate::federation::types::{attestation_type, identity_type as it};
-    use crate::federation::{FederationDirectory, SignedAttestation};
+    use crate::federation::FederationDirectory;
 
+    /// v62 (E4, wave 7): every id is an identity-ref or a row id. `user` is
+    /// THIS node (the runner sets the backend's node key: the asking party
+    /// of a trust walk is the node), `root` is the edition-2 root
+    /// community's identity-ref (E9's `establish_e2_trust_root`: founded by
+    /// the bundle's holders, chartered, accepted by the node, conferring on
+    /// `subject`), and `grant` is the conferral's node-computed row id.
     pub(crate) struct Fx {
         pub(crate) user: String,
         pub(crate) root: String,
@@ -49,14 +55,20 @@ pub(crate) mod bodies {
 
     pub(crate) async fn fixture(d: &dyn FederationDirectory, tag: &str) -> Fx {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
-        let user = format!("gs-user-{tag}");
-        let root = format!("gs-root-{tag}");
-        let subject = format!("gs-subject-{tag}");
-        ts::register_hybrid_key_as(d, &user, &user, it::NODE).await;
-        ts::register_hybrid_key_as(d, &subject, &subject, it::NODE).await;
-        establish_trust_root(d, &user, &root, &subject, INFRA_SERVE_SCOPE)
-            .await
-            .expect("the #536 fixture stands up the root and the grant");
+        let user = d
+            .node_key_id()
+            .expect("the runner sets the node key (set_node_key_id(e2::put_key(..)))");
+        let subject_seed = format!("gs-subject-{tag}");
+        let subject = e2::put_key(d, &subject_seed, &[it::NODE]).await;
+        let root = establish_e2_trust_root(
+            d,
+            &format!("gs-root-{tag}"),
+            &subject_seed,
+            INFRA_SERVE_SCOPE,
+        )
+        .await
+        .expect("the edition-2 fixture stands up the root and the grant")
+        .root;
         let grant = d
             .all_attestations_for(&subject)
             .await
@@ -81,6 +93,8 @@ pub(crate) mod bodies {
     }
 
     /// `by` writes a `supersedes` on `target` carrying a conferral body.
+    /// Returns the successor's node-computed row id (v62: `id` is only a
+    /// fixture label; an edition-2 row id is computed, `e2::rid`).
     pub(crate) async fn supersede(
         d: &dyn FederationDirectory,
         id: &str,
@@ -88,7 +102,7 @@ pub(crate) mod bodies {
         subject: &str,
         target: &str,
         scope: &str,
-    ) -> Result<(), crate::federation::Error> {
+    ) -> Result<String, crate::federation::Error> {
         let row = signed_trust_attestation(
             id,
             by,
@@ -100,9 +114,7 @@ pub(crate) mod bodies {
                 "scope": [scope],
             }),
         );
-        d.put_attestation(SignedAttestation { attestation: row })
-            .await
-            .map(|_| ())
+        e2::put_signed(d, &row).await.map(|_| e2::rid(&row))
     }
 
     pub(crate) async fn withdraw(
@@ -122,7 +134,7 @@ pub(crate) mod bodies {
                 "dimension": TRUST_CONFERS_DIMENSION,
             }),
         );
-        d.put_attestation(SignedAttestation { attestation: row })
+        e2::put_signed(d, &row)
             .await
             .unwrap_or_else(|e| panic!("the root withdraws {target}: {e}"));
     }
@@ -137,10 +149,9 @@ pub(crate) mod bodies {
     /// **I383** — the successor confers, and it is the grant the walk names.
     pub(crate) async fn i383_the_successor_confers(d: &dyn FederationDirectory, tag: &str) {
         let fx = fixture(d, tag).await;
-        let succ = format!("gs-succ-{tag}");
-        supersede(
+        let succ = supersede(
             d,
-            &succ,
+            &format!("gs-succ-{tag}"),
             &fx.root,
             &fx.subject,
             &fx.grant,
@@ -154,10 +165,16 @@ pub(crate) mod bodies {
             "I383 the successor confers; the superseded grant is not the live candidate"
         );
         // A second rotation: the chain's head confers.
-        let succ2 = format!("gs-succ2-{tag}");
-        supersede(d, &succ2, &fx.root, &fx.subject, &succ, INFRA_SERVE_SCOPE)
-            .await
-            .expect("I383 a second rotation is admitted");
+        let succ2 = supersede(
+            d,
+            &format!("gs-succ2-{tag}"),
+            &fx.root,
+            &fx.subject,
+            &succ,
+            INFRA_SERVE_SCOPE,
+        )
+        .await
+        .expect("I383 a second rotation is admitted");
         assert_eq!(
             walk(d, &fx, INFRA_SERVE_SCOPE).await.as_deref(),
             Some(succ2.as_str()),
@@ -168,10 +185,9 @@ pub(crate) mod bodies {
     /// **I384** — a successor that changes the scope narrows it.
     pub(crate) async fn i384_a_changed_scope_narrows(d: &dyn FederationDirectory, tag: &str) {
         let fx = fixture(d, tag).await;
-        let succ = format!("gs-narrow-{tag}");
-        supersede(
+        let succ = supersede(
             d,
-            &succ,
+            &format!("gs-narrow-{tag}"),
             &fx.root,
             &fx.subject,
             &fx.grant,
@@ -194,10 +210,9 @@ pub(crate) mod bodies {
     /// **I385** — a `withdraws` kills at once; nothing is revived.
     pub(crate) async fn i385_withdraws_kills_at_once(d: &dyn FederationDirectory, tag: &str) {
         let fx = fixture(d, tag).await;
-        let succ = format!("gs-wsucc-{tag}");
-        supersede(
+        let succ = supersede(
             d,
-            &succ,
+            &format!("gs-wsucc-{tag}"),
             &fx.root,
             &fx.subject,
             &fx.grant,
@@ -235,7 +250,7 @@ pub(crate) mod bodies {
     ) {
         let fx = fixture(d, tag).await;
         let foreign = format!("gs-foreign-{tag}");
-        ts::register_hybrid_key_as(d, &foreign, &foreign, it::NODE).await;
+        e2::put_key(d, &foreign, &[it::NODE]).await;
         // The door may or may not admit it; either way the walk must ignore it.
         let _ = supersede(
             d,
@@ -260,11 +275,16 @@ pub(crate) mod bodies {
         // the first root's grant is not a grant of its own (only a root
         // rotates its own grants), so it confers nothing either.
         let other_subject = format!("gs-osubj-{tag}");
-        let root2 = format!("gs-root2-{tag}");
-        ts::register_hybrid_key_as(d, &other_subject, &other_subject, it::NODE).await;
-        establish_trust_root(d, &fx.user, &root2, &other_subject, INFRA_SERVE_SCOPE)
-            .await
-            .expect("I386 a second trusted root");
+        e2::put_key(d, &other_subject, &[it::NODE]).await;
+        let root2 = establish_e2_trust_root(
+            d,
+            &format!("gs-root2-{tag}"),
+            &other_subject,
+            INFRA_SERVE_SCOPE,
+        )
+        .await
+        .expect("I386 a second trusted root")
+        .root;
         let _ = supersede(
             d,
             &format!("gs-r2succ-{tag}"),
@@ -321,6 +341,15 @@ mod runners {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        // v62 (E4): the asking party of the trust walk is THIS node.
+        b.set_node_key_id(
+            crate::federation::edition2::fixture_switch::put_key(
+                &b,
+                "gs-node",
+                &[crate::federation::types::identity_type::NODE],
+            )
+            .await,
+        );
         Some(b)
     });
 
@@ -332,6 +361,15 @@ mod runners {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        // v62 (E4): the asking party of the trust walk is THIS node.
+        b.set_node_key_id(
+            crate::federation::edition2::fixture_switch::put_key(
+                &b,
+                "gs-node",
+                &[crate::federation::types::identity_type::NODE],
+            )
+            .await,
+        );
         Some(b)
     });
 }

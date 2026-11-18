@@ -1060,7 +1060,7 @@ mod tests {
 mod ingest_gate_proof {
     use super::*;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    use crate::federation::tier_ingest::test_support::{register_hybrid_key, sign_envelope};
+    use crate::federation::edition2::fixture_switch as e2;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::tier_ingest::verify_federation_tier_ingest;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -1088,20 +1088,23 @@ mod ingest_gate_proof {
         ]
     }
 
+    /// v62.0.0 — a registered family (`capacity:{factor}`): the edition-2
+    /// door refuses an unregistered dimension.
     fn header(id: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id,
-            "dimension": "identity_binding:v1",
+            "dimension": "capacity:integrity",
             "score": 1.0,
             "confidence": 0.9,
         })
     }
 
+    /// The row of `envelope` signed by the key of seed `attester`: v62.0.0,
+    /// an edition-2 statement (`row_of`), its id computed.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn row(attester: &str, envelope: serde_json::Value) -> Attestation {
-        let (och, classical, pqc) = sign_envelope(attester, &envelope);
         let now = chrono::Utc::now();
-        let mut sealed_row_ = Attestation {
+        let sealed_row_ = Attestation {
             // `::uuid`-cast on the PG write path — a real UUID, per the
             // uuid_like() fixture lesson.
             attestation_id: uuid::Uuid::new_v4().to_string(),
@@ -1112,9 +1115,9 @@ mod ingest_gate_proof {
             asserted_at: now,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: attester.to_owned(),
             scrub_timestamp: now,
             pqc_completed_at: Some(now),
@@ -1126,9 +1129,7 @@ mod ingest_gate_proof {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(attester, &mut sealed_row_);
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+        e2::row_of(&sealed_row_, attester)
     }
 
     /// **ERASABLE: total erasure changes nothing the wire looks at.** Mint,
@@ -1138,7 +1139,12 @@ mod ingest_gate_proof {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn erasable_survives_erasure(dir: &dyn FederationDirectory, tag: &str) -> Attestation {
         let attester = format!("erasable-attester-{tag}");
-        register_hybrid_key(dir, &attester).await;
+        let _ = e2::put_key(
+            dir,
+            &attester,
+            &[crate::federation::types::identity_type::AGENT],
+        )
+        .await;
 
         let (envelope, mut set) =
             seal(&header(&format!("erasable-{tag}")), &erasable_members()).unwrap();
@@ -1215,8 +1221,17 @@ mod ingest_gate_proof {
     /// on.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[cfg(feature = "sqlite")]
-    async fn a_peer_admits_the_erased_row(peer: &dyn FederationDirectory, erased: &Attestation) {
-        register_hybrid_key(peer, &erased.attesting_key_id).await;
+    async fn a_peer_admits_the_erased_row(
+        peer: &dyn FederationDirectory,
+        erased: &Attestation,
+        attester_seed: &str,
+    ) {
+        let _ = e2::put_key(
+            peer,
+            attester_seed,
+            &[crate::federation::types::identity_type::AGENT],
+        )
+        .await;
         peer.put_attestation(SignedAttestation {
             attestation: erased.clone(),
         })
@@ -1253,7 +1268,12 @@ mod ingest_gate_proof {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn sealed_erasure_is_refused(dir: &dyn FederationDirectory, tag: &str) {
         let attester = format!("sealed-attester-{tag}");
-        register_hybrid_key(dir, &attester).await;
+        let _ = e2::put_key(
+            dir,
+            &attester,
+            &[crate::federation::types::identity_type::AGENT],
+        )
+        .await;
 
         let mut envelope = header(&format!("sealed-{tag}"));
         envelope.as_object_mut().unwrap().insert(
@@ -1277,19 +1297,13 @@ mod ingest_gate_proof {
         let err = verify_federation_tier_ingest(dir, &att)
             .await
             .expect_err("erasing inside a signed envelope must be refused");
-        assert_eq!(err.kind(), "federation_federation_tier_unverified");
         let msg = err.to_string();
-        // The gate refuses — and the refusal names a SIGNATURE failure, not the
-        // hash mismatch #573 and §7.3 both expected. Pinned, because the
-        // ordering is the finding: it means a lawful erasure of a sealed object
-        // is reported to every peer as a forgery against the erasing
-        // authority's own key.
-        assert!(
-            msg.contains("signature verification failed"),
-            "expected the hybrid-signature branch (it runs before the hash \
-             cross-check); if this moved, the operator-facing story for a sealed \
-             redaction moved with it: {msg}"
-        );
+        // v62.0.0 (slice E6) — the earlier-form pin (the hybrid-signature
+        // branch, `federation_federation_tier_unverified` "signature
+        // verification failed") is deleted: an edition-2 row is refused for
+        // its envelope no longer matching its carried statement, whatever the
+        // token. What stays is the claim: the edit is refused, and the refusal
+        // cannot tell a lawful erasure from a tamper.
         assert!(
             !msg.contains("redact") && !msg.contains("erasu"),
             "the refusal cannot tell an operator a lawful erasure from a tamper — \
@@ -1363,7 +1377,7 @@ mod ingest_gate_proof {
             .expect("peer engine");
         let (o, p) = (origin.federation_directory(), peer.federation_directory());
         let erased = erasable_survives_erasure(&*o, "sqlite").await;
-        a_peer_admits_the_erased_row(&*p, &erased).await;
+        a_peer_admits_the_erased_row(&*p, &erased, "erasable-attester-sqlite").await;
         sealed_erasure_is_refused(&*o, "sqlite").await;
     }
 

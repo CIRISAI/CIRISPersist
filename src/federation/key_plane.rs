@@ -1039,9 +1039,10 @@ pub(crate) trait KeyPlaneStore: super::attestation_admit::AttestationStore {
 /// resolved from this node's directory (an unheld revoker is the retryable
 /// [`Error::AttesterKeyUnknown`] — the order rule); the moderation authority
 /// for revoking another's key; the closed region set; the scrub-time skew
-/// ceiling; the per-subject anti-rollback floor; the signed history bound;
-/// and **`revoked_after` only lowering**
-/// ([`check_revocation_bound_lowers`](super::register::check_revocation_bound_lowers)).
+/// ceiling; and the signed history bound. v62.0.0 (CC rc21 item 18): no
+/// longer the per-subject anti-rollback floor or the "bound only lowers"
+/// refusal; every revocation held stands, and the reader takes the minimum
+/// bound.
 pub(crate) async fn plan_put_revocation<D>(
     dir: &D,
     revocation: super::types::Revocation,
@@ -1081,7 +1082,29 @@ where
     // from this node's directory.
     super::verify_revocation_admission(dir, &row).await?;
     // v30.8.0 (CIRISPersist#596 item 1) — revoking another's key is moderation.
-    super::admission::check_revocation_authority(dir, &row).await?;
+    // v62.0.0 (wave GC7; CC 2.7.3) — the moderation authority reads other
+    // rows (seats, delegations): declared, so the row re-folds when they
+    // change.
+    {
+        use super::edition2::fold::{reads, Dep};
+        reads(Dep::key(&row.revoking_key_id));
+        if let Some(k) = &row.revoked_key_id {
+            reads(Dep::key(k));
+        }
+    }
+    // G0 v4: a held key-plane statement is skipped by the key-plane reader
+    // (`held_keys_for_kid`), so the moderation authority (other rows) HOLDS
+    // the revocation under a fold attempt; any other error is returned as
+    // it was.
+    super::admission::check_revocation_authority(dir, &row)
+        .await
+        .map_err(|e| match e {
+            e @ Error::DelegatedScopeUnauthorized { .. } => super::edition2::fold::hold(
+                super::edition2::fold::reason::REVOCATION_UNAUTHORIZED,
+                e,
+            ),
+            e => e,
+        })?;
     super::check_observed_region(&row.observed_region)?;
     // v31.0.0 (CIRISPersist#659) — the anti-rollback dual, before the floor.
     super::admission::check_revocation_scrub_skew(
@@ -1089,19 +1112,21 @@ where
         received_at,
         super::admission::DEFAULT_MAX_TOUCH_SKEW,
     )?;
-    // v52.0.0 (#784) — per SUBJECT, and the subject is the digest.
-    let held = dir
-        .revocations_for_subject(&row.revoked_key_sha256_ed25519_raw)
-        .await?;
-    super::admission::check_revocation_anti_rollback(
-        &row.revoked_key_sha256_ed25519_raw,
-        held.iter().map(|r| r.scrub_timestamp).max(),
-        row.scrub_timestamp,
-    )?;
+    // v62.0.0 (wave GC7; CC rc21 item 18, CC 5.3.2.3 l.281) — "No
+    // revocation is refused for another, and none is withdrawn: every one
+    // held stands." The per-subject anti-rollback floor (v52, #784) and the
+    // `revoked_after`-only-lowers refusal (v58, #991) both compared the
+    // offered revocation with the OTHER revocations held for its subject, so
+    // the verdict depended on which arrived first. Both are gone from the
+    // door: every revocation that passes its own bytes and its revoker's key
+    // plane is kept and stands. The reader already takes the MINIMUM bound
+    // over every held revocation of the subject (`register`'s held-revocation
+    // fold), so a raised bound is kept and loses the merge, and an older
+    // scrub instant can only revoke more, never re-open anything. The
+    // scrub-time CEILING above stays: it reads only this row and this node's
+    // clock (local, CC 2.7.9).
     // v25.1.0 (CIRISPersist#570 ask 4) — the signed, coherent history bound.
     super::check_revocation_bound(&row)?;
-    // v58.0.0 (CIRISPersist#991, CC 2.4.1.1) — and it only ever lowers.
-    super::register::check_revocation_bound_lowers(&held, &row)?;
     row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
     let plane = revocation_row(&row)?;
     Ok(PlannedRevocation {
@@ -1336,15 +1361,30 @@ impl PlannedKeyRecord {
             Self::Insert {
                 record,
                 on_held: OnHeld::Conflict,
-            } if held_hash.is_some_and(|h| h != record.persist_row_hash) => {
-                Err(Error::Conflict(format!(
+            } if held_hash.is_some_and(|h| h != record.persist_row_hash) => Err(rival_key_record(
+                &record.key_id,
+                Error::Conflict(format!(
                     "key_id {} already exists with different content",
                     record.key_id
-                )))
-            }
+                )),
+            )),
             _ => Ok(()),
         }
     }
+}
+
+/// v62.0.0 (wave GC7; CC rc21 items 17/18, CC 5.3.2.3 l.282) — **the one
+/// site where a rival `key:record` for a held `key_id` is answered.** The
+/// ruling: "two rotations of one key are both kept, and a reader reads them
+/// as 2.7.7 rule 2 states". Under a fold attempt (every edition-2 door) the
+/// rival is HELD, reason `key_record_rival`: its statement is kept, the
+/// held record stays the key's, and G0 v4's `ingest::held_keys_for_kid`
+/// skips the held rival, so it is never read as the key's. The read of the
+/// key is declared, so the rival re-folds when the key's plane changes.
+/// Outside an attempt (the earlier-form JSON door) it is the refusal it was.
+fn rival_key_record(key_id: &str, err: Error) -> Error {
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(key_id));
+    super::edition2::fold::hold(super::edition2::fold::reason::KEY_RECORD_RIVAL, err)
 }
 
 /// What [`plan_key_record_write`] decided.
@@ -1414,6 +1454,12 @@ async fn plan_key_put(
     dir.hardware_attestation_policy()
         .admit_key_record(&row, received_at)?;
     admit_consent_role(&mut row)?;
+    // v62.0.0 (wave GC7; CC 2.7.3) — the role-conferral gates below read the
+    // accord roster and conferral rows (other rows); they mark their own
+    // reasons (admission.rs, GC1). The record's own key and its granter are
+    // declared here so a held record re-folds when either changes.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&row.key_id));
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&row.scrub_key_id));
     super::admission::check_canonical_role_admission(dir, &row).await?;
     super::admission::check_infra_attest_role_admission(dir, &row).await?;
     super::admission::check_co_steward_role_admission(dir, &row).await?;
@@ -1427,14 +1473,17 @@ async fn plan_key_put(
         Some(held) => {
             let swap = held.pubkey_ed25519_base64 != row.pubkey_ed25519_base64
                 || held.pubkey_ml_dsa_65_base64 != row.pubkey_ml_dsa_65_base64;
-            Err(super::register::key_record_conflict(
+            Err(rival_key_record(
                 &row.key_id,
-                if swap {
-                    super::register::KeyRecordConflictReason::PubkeyChange
-                } else {
-                    super::register::KeyRecordConflictReason::SameKeyDifferentRecord
-                },
-                "already exists with different content",
+                super::register::key_record_conflict(
+                    &row.key_id,
+                    if swap {
+                        super::register::KeyRecordConflictReason::PubkeyChange
+                    } else {
+                        super::register::KeyRecordConflictReason::SameKeyDifferentRecord
+                    },
+                    "already exists with different content",
+                ),
             ))
         }
         None => Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Insert {
@@ -1571,11 +1620,19 @@ async fn plan_key_supersede(
     super::admission::check_infra_attest_role_admission(dir, &row).await?;
     super::admission::check_co_steward_role_admission(dir, &row).await?;
     super::admission::check_privileged_identity_type_admission(dir, &row).await?;
+    // v62.0.0 (wave GC7; CC 2.7.3) — the supersede policy reads the live
+    // accord roster and its co-scrubs (other rows): declared.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&row.key_id));
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(&row.scrub_key_id));
     if !super::register::verify_canonical_supersede(dir, &existing, &row).await? {
-        return Err(Error::Conflict(format!(
-            "supersede_canonical_record {}: supersede policy refused",
-            row.key_id
-        )));
+        // G0 v4 — held under a fold attempt (the held record stays the key's).
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::SUPERSEDE_POLICY_REFUSED,
+            Error::Conflict(format!(
+                "supersede_canonical_record {}: supersede policy refused",
+                row.key_id
+            )),
+        ));
     }
     Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Rewrite {
         record: row,
@@ -1777,27 +1834,6 @@ where
         Ok(KeyRecordWritten::Settled) => Ok(O::Unchanged),
         Err(e) => typed(e),
     }
-}
-
-/// Test support: the canonical supersede door alone (the replicated apply
-/// reaches it only through its classification), outcome as the apply reports
-/// it.
-#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
-pub(crate) async fn supersede_canonical_planned<D>(
-    dir: &D,
-    record: super::SignedKeyRecord,
-) -> Result<super::register::ReplicatedKeyOutcome, Error>
-where
-    D: KeyPlaneStore,
-{
-    use super::register::ReplicatedKeyOutcome as O;
-    let write = KeyRecordWrite::SupersedeCanonical {
-        record: record.record,
-    };
-    Ok(match key_record_write_planned(dir, write).await? {
-        KeyRecordWritten::Written => O::Superseded,
-        KeyRecordWritten::Settled => O::Unchanged,
-    })
 }
 
 /// What a key's `key:record:v1` row becomes after a write to its record.
@@ -2219,7 +2255,7 @@ pub async fn key_records_on_the_plane(
     allow(dead_code)
 )]
 pub(crate) mod test_support {
-    use super::super::types::{ServedIdentityOccurrence, ServedKeyRecord};
+    use super::super::types::ServedIdentityOccurrence;
     use super::super::{Error, FederationDirectory};
 
     async fn all_rows(
@@ -2237,54 +2273,6 @@ pub(crate) mod test_support {
                 break;
             }
         }
-        Ok(out)
-    }
-
-    /// Every `key:record:v1` row served past `since` — `(admitted_at, key_id)`
-    /// of the row's serve position — as the record it carries.
-    pub(crate) async fn served_key_records(
-        d: &dyn FederationDirectory,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedKeyRecord>, Error> {
-        let mut out: Vec<ServedKeyRecord> = all_rows(d)
-            .await?
-            .into_iter()
-            .filter_map(|s| {
-                super::key_record_of_row(&s.attestation).map(|record| ServedKeyRecord {
-                    record,
-                    admitted_at: s.admitted_at,
-                })
-            })
-            .filter(|s| {
-                since
-                    .as_ref()
-                    .is_none_or(|c| (s.admitted_at, s.record.key_id.clone()) > *c)
-            })
-            .collect();
-        out.sort_by_key(ServedKeyRecord::resume_pair);
-        out.truncate(limit as usize);
-        Ok(out)
-    }
-
-    /// Every `key:revocation:v1` row served, as the revocation it carries.
-    pub(crate) async fn served_revocations(
-        d: &dyn FederationDirectory,
-        limit: u32,
-    ) -> Result<Vec<super::super::types::ServedRevocation>, Error> {
-        let mut out: Vec<super::super::types::ServedRevocation> = all_rows(d)
-            .await?
-            .into_iter()
-            .filter_map(|s| {
-                super::revocation_of_row(&s.attestation).map(|revocation| {
-                    super::super::types::ServedRevocation {
-                        revocation,
-                        admitted_at: s.admitted_at,
-                    }
-                })
-            })
-            .collect();
-        out.truncate(limit as usize);
         Ok(out)
     }
 

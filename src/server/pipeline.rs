@@ -146,6 +146,9 @@ pub const KIND_SCHEMA_VERSION: &str = "pipeline_invariant_schema_version";
 pub const KIND_EDGE_SIGNATURE: &str = "pipeline_invariant_edge_signature";
 /// Inner agent CompleteTrace signature failed verify.
 pub const KIND_INNER_SIGNATURE: &str = "pipeline_invariant_inner_signature";
+/// v62.0.0 (wave P7) — the body is not JSON, or not a `PipelineEnvelope`
+/// (once any row-form trace event is expanded).
+pub const KIND_ENVELOPE_MALFORMED: &str = "pipeline_invariant_envelope_malformed";
 /// `pii_scrubbed=false` despite `stages_executed.contains("scrub")`.
 pub const KIND_PII_SCRUBBED: &str = "pipeline_invariant_pii_scrubbed";
 /// `sidecar.classifications.len()` != inner envelope component count.
@@ -181,11 +184,57 @@ const ROLE_SECRETS_WRITER: &str = "cirislens_secrets_writer";
 /// a CIRISLens edge. See module-level doc for the full pipeline.
 pub async fn post_pipeline_ingest<F>(
     State(state): State<AppState<F>>,
-    Json(envelope): Json<PipelineEnvelope>,
+    body: axum::body::Bytes,
 ) -> Response
 where
     F: FederationDirectory + Backend + 'static,
 {
+    // 0. v62.0.0 (wave P7) — the body as sent. The edge signs these bytes'
+    //    JSON (less `edge_signature`), and an inner event may carry its trace
+    //    as a `trace:complete:v1` row plus the trace blob (`statement` +
+    //    `trace_blob`, no inline `trace`): the typed envelope is parsed from
+    //    a copy with each such blob expanded into its `trace`
+    //    (`ingest::expand_trace_blobs`, the persister's own step 1), while
+    //    the edge signature is checked over, and the queue receives, the
+    //    envelope EXACTLY as sent.
+    let raw: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return invariant_response(
+                KIND_ENVELOPE_MALFORMED,
+                format!("the body is not JSON: {e}"),
+            )
+        }
+    };
+    let mut typed_value = raw.clone();
+    if let Some(inner) = raw.get("envelope") {
+        let inner_bytes = serde_json::to_vec(inner).unwrap_or_default();
+        match crate::ingest::expand_trace_blobs(&inner_bytes) {
+            Ok(Some(crate::ingest::ExpandedBatch {
+                rewritten: Some(rewritten),
+                ..
+            })) => match serde_json::from_slice(&rewritten) {
+                Ok(v) => typed_value["envelope"] = v,
+                Err(e) => {
+                    return invariant_response(
+                        KIND_ENVELOPE_MALFORMED,
+                        format!("expanded inner envelope: {e}"),
+                    )
+                }
+            },
+            Ok(_) => {}
+            Err(e) => return invariant_response(e.kind(), format!("{e}")),
+        }
+    }
+    let envelope: PipelineEnvelope = match serde_json::from_value(typed_value) {
+        Ok(env) => env,
+        Err(e) => {
+            return invariant_response(
+                KIND_ENVELOPE_MALFORMED,
+                format!("not a PipelineEnvelope: {e}"),
+            )
+        }
+    };
     // 1. Schema version gate (FSD §4.3 invariant 1).
     if envelope.pipeline_schema_version != PipelineEnvelope::SCHEMA_VERSION_V1 {
         return invariant_response(
@@ -204,7 +253,7 @@ where
     // signed over `canonical(envelope || sidecar)` excluding its own
     // signature block (else the hash would depend on itself). Persist
     // owns the strip rule; the edge mirrors it.
-    let canonical_bytes = match canonicalize_for_edge_signing(&envelope) {
+    let canonical_bytes = match canonicalize_raw_for_edge_signing(&raw) {
         Ok(b) => b,
         Err(detail) => return invariant_response(KIND_EDGE_SIGNATURE, detail),
     };
@@ -455,7 +504,10 @@ where
     // bytes on the queue message envelope; the persister logs it at
     // debug level today and lands the persister-side consumption in a
     // v1.1.x follow-up (see module doc).
-    let inner_bytes = match serde_json::to_vec(&envelope.envelope) {
+    // v62.0.0 (wave P7) — the inner envelope as SENT (a row-form event keeps
+    // its `statement` and `trace_blob`; the persister checks the blob's
+    // bytes against the row, so they must reach it unchanged).
+    let inner_bytes = match serde_json::to_vec(&raw["envelope"]) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "inner BatchEnvelope serialize failed");
@@ -585,9 +637,20 @@ fn invariant_response(kind: &'static str, detail: String) -> Response {
 /// when the peer rolls forward. No stored corpus goes dark.
 ///
 /// [#714]: https://github.com/CIRISAI/CIRISPersist/issues/714
+#[cfg(test)]
 fn canonicalize_for_edge_signing(envelope: &PipelineEnvelope) -> Result<Vec<u8>, String> {
-    let mut value = serde_json::to_value(envelope)
+    let value = serde_json::to_value(envelope)
         .map_err(|e| format!("serialize envelope for canonicalize: {e}"))?;
+    canonicalize_raw_for_edge_signing(&value)
+}
+
+/// v62.0.0 (wave P7) — [`canonicalize_for_edge_signing`] over the envelope
+/// JSON as received: the route checks the edge signature over what the edge
+/// sent (a row-form trace event's `statement` / `trace_blob` included), never
+/// over a re-serialisation of the typed struct. For an envelope that is a
+/// serialised `PipelineEnvelope` the two agree byte for byte.
+fn canonicalize_raw_for_edge_signing(envelope: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let mut value = envelope.clone();
     if let Some(obj) = value.as_object_mut() {
         obj.remove("edge_signature");
     }
@@ -1029,6 +1092,93 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
+    /// v62.0.0 (wave P7) — sign a RAW envelope value the way the edge does
+    /// (the route checks the signature over the body as sent).
+    async fn sign_edge_raw(value: &mut serde_json::Value) {
+        use ciris_keyring::PqcSigner as _;
+        let canonical = canonicalize_raw_for_edge_signing(value).expect("canonicalize");
+        let ed_sig = SigningKey::from_bytes(&EDGE_SEED)
+            .sign(&canonical)
+            .to_bytes();
+        let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
+        bound.extend_from_slice(&canonical);
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = edge_mldsa().sign(&bound).await.expect("ml-dsa sign");
+        value["edge_signature"]["ed25519"] = serde_json::json!(BASE64.encode(ed_sig));
+        value["edge_signature"]["ml_dsa_65"] = serde_json::json!(BASE64.encode(&pqc_sig));
+    }
+
+    async fn post_raw(app: &Router, value: &serde_json::Value) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/pipeline/ingest")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_vec(value).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The well-formed envelope with its first event in the ROW form:
+    /// `statement` + `trace_blob` (the trace's bytes), no inline `trace`.
+    /// `blob_of` builds the blob from the trace object.
+    async fn row_form_envelope(
+        blob_of: impl FnOnce(&serde_json::Value) -> Vec<u8>,
+    ) -> serde_json::Value {
+        let env = make_signed_pipeline_envelope(make_signed_batch(2)).await;
+        let mut value = serde_json::to_value(&env).unwrap();
+        let event = &mut value["envelope"]["events"][0];
+        let trace = event["trace"].clone();
+        let obj = event.as_object_mut().unwrap();
+        obj.remove("trace");
+        obj.insert(
+            "statement".into(),
+            serde_json::json!(BASE64.encode(b"a statement the persister checks")),
+        );
+        obj.insert(
+            "trace_blob".into(),
+            serde_json::json!(BASE64.encode(blob_of(&trace))),
+        );
+        sign_edge_raw(&mut value).await;
+        value
+    }
+
+    /// **I3484** (v62.0.0, wave P7) — the Lens route accepts a row-form trace
+    /// event (`statement` + `trace_blob`, no inline `trace`): it parses, the
+    /// edge signature is checked over the body as sent, and the batch is
+    /// queued with the event unchanged (the persister's statement door checks
+    /// the row against the blob's bytes).
+    #[tokio::test]
+    async fn i3484_pipeline_ingest_accepts_the_row_form() {
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let value = row_form_envelope(|t| crate::ingest::canonical_trace_blob(t).unwrap()).await;
+        let (status, body) = post_raw(&app, &value).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "I3484: the row form is accepted: {body}"
+        );
+    }
+
+    /// **I3485** (v62.0.0, wave P7) — a row-form event whose blob carries a
+    /// signature member of its own is refused at the route by name.
+    #[tokio::test]
+    async fn i3485_pipeline_ingest_refuses_a_signed_blob() {
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let value = row_form_envelope(|t| serde_json::to_vec(t).unwrap()).await;
+        let (status, body) = post_raw(&app, &value).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "I3485: {body}");
+        assert!(
+            body.contains(crate::ingest::TRACE_BLOB_CARRIES_SIGNATURE),
+            "I3485: refused by name: {body}"
+        );
+    }
+
     /// FSD §4.3 invariant 1: unknown schema version rejected.
     #[tokio::test]
     async fn pipeline_ingest_rejects_unknown_schema_version() {
@@ -1257,73 +1407,6 @@ mod tests {
         );
     }
 
-    /// v37.0.0 — `HybridPolicy::Strict` on the edge ingest write path.
-    ///
-    /// A classical-only edge — one whose `federation_keys` row has no
-    /// `pubkey_ml_dsa_65`, sending no `ml_dsa_65` signature half — was
-    /// ACCEPTED through v36.x under `Ed25519Fallback`. It is refused now.
-    /// The canonicalization is current and the Ed25519 signature is valid
-    /// over the right bytes; PQC absence is the only defect.
-    ///
-    /// Note the shape: `HybridPendingRejected` is reachable only when the
-    /// KEY ROW is hybrid-pending. If the row HAS a PQC pubkey and the
-    /// envelope omits the signature, `verify_hybrid`'s both-or-neither
-    /// pairing fires first and yields `PqcFieldsMustBeBoth` instead —
-    /// pinned separately by
-    /// [`pqc_sig_omitted_against_hybrid_complete_key_is_rejected`].
-    #[tokio::test]
-    async fn ed25519_only_edge_signature_is_rejected_under_strict() {
-        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
-        // A v36-era edge: registered, role-tagged, but classical-only —
-        // `add_public_key` writes `pubkey_ml_dsa_65 = None` and we
-        // deliberately do NOT call `set_pqc_pubkey`.
-        const LEGACY_EDGE_KEY_ID: &str = "cirislens-edge-test-legacy";
-        backend.add_public_key(
-            LEGACY_EDGE_KEY_ID,
-            SigningKey::from_bytes(&EDGE_SEED).verifying_key(),
-        );
-        backend.set_roles(
-            LEGACY_EDGE_KEY_ID,
-            vec!["cirislens_pipeline_writer".to_owned()],
-        );
-
-        let batch = make_signed_batch(1);
-        let mut env = make_signed_pipeline_envelope(batch).await;
-        env.edge_key_id = LEGACY_EDGE_KEY_ID.into();
-        env.edge_pqc_key_id = None;
-        // Re-sign classical-only over the CURRENT (JCS) bytes.
-        let canonical = canonicalize_for_edge_signing(&env).expect("canonicalize");
-        env.edge_signature.ed25519 = BASE64.encode(
-            SigningKey::from_bytes(&EDGE_SEED)
-                .sign(&canonical)
-                .to_bytes(),
-        );
-        env.edge_signature.ml_dsa_65 = None;
-
-        let (status, body) = post_envelope(&app, &env).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        let err = body.expect_error();
-        assert_eq!(err.kind, KIND_EDGE_SIGNATURE);
-        // HAND-WRITTEN: the exact upstream refusal, so this reds if the
-        // policy silently drifts back to a soft posture.
-        assert!(
-            err.detail
-                .contains("hybrid-pending row rejected by Strict policy"),
-            "expected the Strict refusal; got: {}",
-            err.detail
-        );
-        assert!(
-            err.detail.contains("HybridPolicy::Strict") && err.detail.contains("ml_dsa_65"),
-            "rejection detail must name the policy flip and the missing half; got: {}",
-            err.detail
-        );
-        assert!(
-            err.detail.contains("not a key-validity problem"),
-            "rejection detail must rule OUT the key; got: {}",
-            err.detail
-        );
-    }
-
     /// v37.0.0 (CIRISPersist#716) — the OTHER half of the flag day's real
     /// semantics: a V1-signed **all-ASCII** envelope STILL VERIFIES.
     ///
@@ -1380,12 +1463,11 @@ mod tests {
     /// v37.0.0 — a hybrid-COMPLETE key that omits the PQC signature half
     /// is refused as `PqcFieldsMustBeBoth`, not `HybridPendingRejected`.
     ///
-    /// Distinct from [`ed25519_only_edge_signature_is_rejected_under_strict`]:
-    /// there the KEY ROW is classical-only. Here the row carries a PQC
-    /// pubkey and the SENDER dropped the half — a downgrade attempt
-    /// against a hybrid-capable identity. Both must refuse, and the
-    /// details must differ, or an operator cannot tell "this edge never
-    /// registered PQC" from "something stripped the PQC half in flight".
+    /// The row carries a PQC pubkey and the SENDER dropped the half — a
+    /// downgrade against a hybrid-capable identity — so it must refuse with
+    /// the both-or-neither detail. (v62.0.0: the classical-only key-row
+    /// sibling witnessed a hybrid-pending row, an earlier-form state, and is
+    /// deleted.)
     #[tokio::test]
     async fn pqc_sig_omitted_against_hybrid_complete_key_is_rejected() {
         let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;

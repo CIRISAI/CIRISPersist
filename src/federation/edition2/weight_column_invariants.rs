@@ -421,17 +421,31 @@ fn i2927_the_deadmission_dimension_is_registered() {
     .expect("I2927 a de-admission payload passes the revocation list");
 }
 
+/// A node's key record runs a bounded window (Verify: a `node` record states
+/// `valid_until`, at most 365 days; one without it is `key_not_valid`).
+const NODE_WINDOW_MS: u64 = 30 * 86_400_000;
+
 /// I2927: an edition-2 de-admission is admitted, and the gate reads it.
 async fn deadmission_body(d: &dyn FederationDirectory) {
     use crate::federation::admission::{check_peer_deadmission, PEER_DEADMISSION_DIMENSION};
     use ciris_verify_core::namespace_match::family_id;
     let (node, peer) = (key(165), key(166));
-    put_statement(d, &key_record(&node, &["node"], 0, None), None, INGEST_TIER)
-        .await
-        .unwrap_or_else(|e| panic!("I2927 node record: {e:?}"));
-    put_statement(d, &key_record(&peer, &["node"], 0, None), None, INGEST_TIER)
-        .await
-        .unwrap_or_else(|e| panic!("I2927 peer record: {e:?}"));
+    put_statement(
+        d,
+        &key_record(&node, &["node"], 0, Some(NODE_WINDOW_MS)),
+        None,
+        INGEST_TIER,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("I2927 node record: {e:?}"));
+    put_statement(
+        d,
+        &key_record(&peer, &["node"], 0, Some(NODE_WINDOW_MS)),
+        None,
+        INGEST_TIER,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("I2927 peer record: {e:?}"));
     let payload = map(vec![
         ("asserted_at", Value::Uint(5_000)),
         ("author", Value::Text(iref(&node))),

@@ -698,9 +698,23 @@ pub(crate) async fn officer_appointment_body(d: &dyn FederationDirectory) {
     // group's counted one waits until the quorum at the head it names, and a
     // non-member's voice never completes it; met, the seat ends.
     let lone = e2::composer_of(attestation_type::WITHDRAWS, &held, m3);
+    // v62.0.0 (wave GC1; CC 2.7.3) — its standing reads the target: HELD
+    // `withdraws_not_admitted`, kept and concluding nothing.
+    let o = e2::put_signed(d, &lone)
+        .await
+        .expect("I3296 a lone member's retraction is kept (held)");
     assert!(
-        e2::put_signed(d, &lone).await.is_err(),
-        "I3296 a lone member's retraction of a counted appointment never lands"
+        pending(&o) && d.get_attestation(&e2::rid(&lone)).await.unwrap().is_none(),
+        "I3296 a lone member's retraction of a counted appointment never lands: {o:?}"
+    );
+    assert_eq!(
+        super::fold::why_held(d, &super::names::RowId(e2::rid_digest(&lone)))
+            .await
+            .unwrap()
+            .map(|h| h.reason)
+            .as_deref(),
+        Some(super::fold::reason::WITHDRAWS_NOT_ADMITTED),
+        "I3296 held, and says why"
     );
     let mut w = held.clone();
     w.attestation_type = attestation_type::WITHDRAWS.to_owned();
@@ -866,27 +880,49 @@ pub(crate) async fn licence_withdrawal_body(d: &dyn FederationDirectory) {
         e2::counted_statement_of_family(&w, seed, &family)
     };
 
-    // The licensee's own withdrawal: refused, counted or authored.
-    assert!(
-        e2::put_statement(d, &withdrawal(holder)).await.is_err(),
-        "I3297 the licensee's own counted withdrawal is refused (CLM-licence-contest)"
-    );
-    assert!(
-        e2::put_signed(
-            d,
-            &e2::composer_of(attestation_type::WITHDRAWS, &held, holder)
-        )
+    // The licensee's own withdrawal: never concludes, counted or authored.
+    // v62.0.0 (wave GC1; CC 2.7.3) — its standing reads the target: each is
+    // HELD `withdraws_not_admitted` (kept, no typed row), never refused.
+    let held_not_admitted = |o: &StatementOutcome, id: String, what: &str| {
+        assert!(pending(o), "{what}: held: {o:?}");
+        id
+    };
+    let lw = withdrawal(holder);
+    let o = e2::put_statement(d, &lw)
         .await
-        .is_err(),
-        "I3297 the licensee's own withdrawal is refused (CLM-licence-contest)"
+        .expect("I3297 the licensee's counted withdrawal is kept (held)");
+    let lw_id = held_not_admitted(
+        &o,
+        super::names::RowId::of_statement(&lw)
+            .expect("I3297 a row statement")
+            .hex(),
+        "I3297 the licensee's own counted withdrawal never lands (CLM-licence-contest)",
     );
-    // A lone member's authored withdrawal: refused.
-    assert!(
-        e2::put_signed(d, &e2::composer_of(attestation_type::WITHDRAWS, &held, m3))
-            .await
-            .is_err(),
-        "I3297 a lone member's retraction of a counted licence never lands"
+    let la = e2::composer_of(attestation_type::WITHDRAWS, &held, holder);
+    let o = e2::put_signed(d, &la)
+        .await
+        .expect("I3297 the licensee's authored withdrawal is kept (held)");
+    let la_id = held_not_admitted(
+        &o,
+        e2::rid(&la),
+        "I3297 the licensee's own withdrawal never lands (CLM-licence-contest)",
     );
+    // A lone member's authored withdrawal: never lands.
+    let lm = e2::composer_of(attestation_type::WITHDRAWS, &held, m3);
+    let o = e2::put_signed(d, &lm)
+        .await
+        .expect("I3297 a lone member's withdrawal is kept (held)");
+    let lm_id = held_not_admitted(
+        &o,
+        e2::rid(&lm),
+        "I3297 a lone member's retraction of a counted licence never lands",
+    );
+    for id in [&lw_id, &la_id, &lm_id] {
+        assert!(
+            d.get_attestation(id).await.unwrap().is_none(),
+            "I3297 {id} concludes nothing"
+        );
+    }
     // The group's counted withdrawal: Pending, a non-member never completes
     // it, the quorum lands it.
     let wst = withdrawal(m1);

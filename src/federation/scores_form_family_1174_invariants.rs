@@ -38,10 +38,20 @@
 //! - **I1596** (unit) [`trace_family_token`](super::admission::trace_family_token):
 //!   the family in either form, else the envelope dimension (the #473 reach
 //!   over composers and typed rows is unchanged).
+//!
+//! v62.0.0 (slice E6) — **the classic form is gone.** An edition-2 statement's
+//! row type is one of Verify's five (`scores`, `delegates_to`, `supersedes`,
+//! `withdraws`, `recants`) and its family is the protected header's -70002,
+//! so a family can no longer ride the type slot: every backend leg runs the
+//! one form left (`scores`, the family in `dimension`, the header's family
+//! resolved from it). Keys are edition-2 `key:record`s (`put_key`): a fixture
+//! signs with the SEED, every comparison reads the KID. The unit legs (I1590,
+//! I1595, I1596) keep both forms: they witness the pure classifier, which
+//! still reads a typed row.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::admission::steward_liveness_test_support::register;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::test_support::DeclaresNode;
     use crate::federation::hard_case::{self, HardCaseEvent, HardCaseFilter};
     use crate::federation::tier_ingest::test_support as ts;
@@ -50,22 +60,20 @@ pub(crate) mod bodies {
     };
     use crate::federation::{Attestation, Error, FederationDirectory, SignedAttestation};
 
-    /// The two forms a family rides.
+    /// The form a family rides. v62.0.0: `scores` only (see the header).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Form {
-        /// The family in the `attestation_type` slot.
-        Classic,
         /// `attestation_type = scores`, the family in the envelope `dimension`.
         Scores,
     }
 
-    /// Both forms, in the order every leg runs them.
-    pub(crate) const FORMS: [Form; 2] = [Form::Classic, Form::Scores];
+    /// The forms every leg runs.
+    pub(crate) const FORMS: [Form; 1] = [Form::Scores];
 
-    /// A sealed, federation-tier, self-scoped row of `family` in `form`, by
-    /// `signer` about `about`, naming `subjects`, with `extra` merged into its
-    /// envelope. The classic twin carries NO `dimension`, so its family is
-    /// reachable through the type slot alone.
+    /// A federation-tier, self-scoped row of `family` in `form`, signed by the
+    /// key of seed `signer` about `about`, naming `subjects`, with `extra`
+    /// merged into its envelope: an edition-2 row (`row_of`), its id
+    /// computed.
     pub(crate) fn row(
         form: Form,
         family: &str,
@@ -73,28 +81,28 @@ pub(crate) mod bodies {
         about: &str,
         subjects: &[&str],
         extra: &serde_json::Value,
-        id: Option<String>,
     ) -> Attestation {
-        let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let id = uuid::Uuid::new_v4().to_string();
         let mut env = serde_json::json!({ "id": id });
         if let Some(members) = extra.as_object() {
             for (k, v) in members {
                 env[k.as_str()] = v.clone();
             }
         }
-        if form == Form::Scores {
-            env["dimension"] = serde_json::json!(family);
+        match form {
+            Form::Scores => env["dimension"] = serde_json::json!(family),
         }
-        let mut r = ts::bare_attestation(&id, signer, about, &env);
-        r.attestation_type = match form {
-            Form::Classic => family.to_owned(),
-            Form::Scores => attestation_type::SCORES.to_owned(),
-        };
+        let mut r = e2::with_earlier_form(|| ts::bare_attestation(&id, signer, about, &env));
+        r.attestation_type = attestation_type::SCORES.to_owned();
         r.weight = None;
         r.cohort_scope = cohort_scope::SELF.to_owned();
-        r.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
-        ts::seal_row_in_place(signer, &mut r);
-        r
+        r.subject_key_ids = subjects.iter().map(|s| e2::kid_or_keep(s)).collect();
+        e2::row_of(&r, signer)
+    }
+
+    /// Register the key of `seed` with `types`; its kid.
+    async fn register(d: &dyn FederationDirectory, seed: &str, types: &[&str]) -> String {
+        e2::put_key(d, seed, types).await
     }
 
     async fn put(d: &dyn FederationDirectory, r: Attestation) -> Result<(), Error> {
@@ -160,7 +168,7 @@ pub(crate) mod bodies {
         for form in FORMS {
             refused(
                 d,
-                row(form, FAMILY, &service, &service, &[], &score, None),
+                row(form, FAMILY, &service, &service, &[], &score),
                 "federation_dimension_rejected",
                 crate::federation::invariant::INVARIANT_SELF_EMISSION_REASON,
                 &format!("I1591 {form:?}: a service attesting its own liveness"),
@@ -168,7 +176,7 @@ pub(crate) mod bodies {
             .await;
             admitted(
                 d,
-                row(form, FAMILY, &monitor, &service, &[], &score, None),
+                row(form, FAMILY, &monitor, &service, &[], &score),
                 &format!("I1591 {form:?}: a monitor's row about another service"),
             )
             .await;
@@ -189,10 +197,10 @@ pub(crate) mod bodies {
         let agent = format!("i1592-agent-{tag}");
         let victim = format!("i1592-victim-{tag}");
         b.declare_node_key_for_test(&node);
-        register(d, &author, &[it::SUBSTRATE_PERSIST]).await;
+        let author_kid = register(d, &author, &[it::SUBSTRATE_PERSIST]).await;
         register(d, &node_key, &[it::NODE]).await;
         register(d, &agent, &[it::AGENT]).await;
-        register(d, &victim, &[it::USER]).await;
+        let victim_kid = register(d, &victim, &[it::USER]).await;
         let none = serde_json::json!({});
 
         // A third-party event with a body the projection reads, written at the
@@ -202,7 +210,7 @@ pub(crate) mod bodies {
             let event = HardCaseEvent {
                 event_id: format!("i1592-{tag}-{n}"),
                 kind: hard_case::kind::CONSENT_SLA_BREACH.to_owned(),
-                target_key_id: Some(victim.clone()),
+                target_key_id: Some(victim_kid.clone()),
                 subject_key_id: None,
                 detail: serde_json::json!({ "sla_days": 30 }),
                 emitted_at: chrono::DateTime::<chrono::Utc>::from_timestamp(1_790_000_000, 0)
@@ -212,25 +220,26 @@ pub(crate) mod bodies {
             let body = hard_case::hard_case_envelope(&event).expect("envelope")
                 [hard_case::BODY_MEMBER]
                 .clone();
-            let id = hard_case::hard_case_attestation_id(&event.event_id);
+            // v62.0.0 — no id is offered: an edition-2 row id is computed
+            // (the projection's derived-id fence, see E6.md's findings).
             let mut extra = serde_json::Map::new();
             extra.insert(hard_case::BODY_MEMBER.to_owned(), body);
-            (event.event_id, id, serde_json::Value::Object(extra))
+            (event.event_id, serde_json::Value::Object(extra))
         };
 
         for form in FORMS {
             refused(
                 d,
-                row(form, &family, &agent, &agent, &[], &none, None),
+                row(form, &family, &agent, &agent, &[], &none),
                 "federation_reserved_prefix_emitter_mismatch",
                 it::SUBSTRATE_PERSIST,
                 &format!("I1592 {form:?}: an agent key as a hard_case emitter"),
             )
             .await;
-            let (event_id, id, body) = about_victim(&format!("{form:?}-refused"));
+            let (event_id, body) = about_victim(&format!("{form:?}-refused"));
             refused(
                 d,
-                row(form, &family, &author, &victim, &[], &body, Some(id)),
+                row(form, &family, &author, &victim, &[], &body),
                 "federation_reserved_prefix_emitter_mismatch",
                 delegation_scope::INFRA_RECORD_HARD_CASE,
                 &format!("I1592 {form:?}: a hard_case row about another party, no conferral"),
@@ -242,13 +251,13 @@ pub(crate) mod bodies {
             );
             admitted(
                 d,
-                row(form, &family, &author, &author, &[], &none, None),
+                row(form, &family, &author, &author, &[], &none),
                 &format!("I1592 {form:?}: a substrate_persist key's row about itself"),
             )
             .await;
             admitted(
                 d,
-                row(form, &family, &node_key, &node_key, &[], &none, None),
+                row(form, &family, &node_key, &node_key, &[], &none),
                 &format!("I1592 {form:?}: a node key's row about itself (the hard_case door)"),
             )
             .await;
@@ -258,24 +267,27 @@ pub(crate) mod bodies {
             d,
             &node,
             &root,
-            &author,
+            &author_kid,
             delegation_scope::INFRA_RECORD_HARD_CASE,
         )
         .await;
         for form in FORMS {
-            let (event_id, id, body) = about_victim(&format!("{form:?}-conferred"));
+            let (event_id, body) = about_victim(&format!("{form:?}-conferred"));
             admitted(
                 d,
-                row(form, &family, &author, &victim, &[], &body, Some(id)),
+                row(form, &family, &author, &victim, &[], &body),
                 &format!("I1592 {form:?}: a conferred hard_case row about another party"),
             )
             .await;
+            // DEPENDS ON P3: the hard_case projection's derived-id fence
+            // (`project_hard_case_row`) never matches an edition-2 row's
+            // computed id, so this leg is red until P3 moves the fence.
             if form == Form::Scores {
                 let event = listed(d, &event_id)
                     .await
                     .expect("I1592: the conferred scores row projects");
                 assert_eq!(
-                    event.emitter_key_id, author,
+                    event.emitter_key_id, author_kid,
                     "I1592: the emitter is the row's signer"
                 );
             }
@@ -298,7 +310,7 @@ pub(crate) mod bodies {
         for form in FORMS {
             // v61.1.0 (as ruled) — refused at this node's own write door; a
             // peer's such row is reported, not refused, until v62 (I1607).
-            let r = row(form, FAMILY, &persist, &other, &[], &score, None);
+            let r = row(form, FAMILY, &persist, &other, &[], &score);
             let id = r.attestation_id.clone();
             let err = d
                 .put_attestation_authored(SignedAttestation { attestation: r })
@@ -317,13 +329,13 @@ pub(crate) mod bodies {
             assert!(!held(d, &id).await, "I1593 {form:?}: not stored");
             admitted(
                 d,
-                row(form, FAMILY, &persist, &persist, &[], &score, None),
+                row(form, FAMILY, &persist, &persist, &[], &score),
                 &format!("I1593 {form:?}: a substrate self-report about itself"),
             )
             .await;
             refused(
                 d,
-                row(form, FAMILY, &agent, &agent, &[], &score, None),
+                row(form, FAMILY, &agent, &agent, &[], &score),
                 "federation_reserved_prefix_emitter_mismatch",
                 it::SUBSTRATE_PERSIST,
                 &format!("I1593 {form:?}: an agent key's substrate self-report"),
@@ -346,8 +358,8 @@ pub(crate) mod bodies {
         const FAMILY: &str = "system:health:n_eff_measurable:v1";
         let persist = format!("i1607-persist-{tag}");
         let other = format!("i1607-other-{tag}");
-        register(d, &persist, &[it::SUBSTRATE_PERSIST]).await;
-        register(d, &other, &[it::USER]).await;
+        let persist_kid = register(d, &persist, &[it::SUBSTRATE_PERSIST]).await;
+        let other_kid = register(d, &other, &[it::USER]).await;
         let score = serde_json::json!({ "score": 1.0 });
         let stem = crate::federation::row_type::type_stem(FAMILY);
         let count = || {
@@ -358,13 +370,13 @@ pub(crate) mod bodies {
         };
         for form in FORMS {
             let before = count();
-            let r = row(form, FAMILY, &persist, &other, &[], &score, None);
+            let r = row(form, FAMILY, &persist, &other, &[], &score);
             let id = r.attestation_id.clone();
             put(d, r)
                 .await
                 .unwrap_or_else(|e| panic!("I1607 {form:?}: a peer's row is admitted: {e}"));
             assert!(held(d, &id).await, "I1607 {form:?}: held");
-            let r = row(form, FAMILY, &persist, &other, &[], &score, None);
+            let r = row(form, FAMILY, &persist, &other, &[], &score);
             let id = r.attestation_id.clone();
             let outcome = d
                 .apply_replicated_attestation(SignedAttestation { attestation: r })
@@ -385,8 +397,8 @@ pub(crate) mod bodies {
         let err = d
             .attestation_insert_local(crate::federation::types::LocalAttestationInput {
                 attestation_id: None,
-                attesting_key_id: persist.clone(),
-                attested_key_id: Some(other.clone()),
+                attesting_key_id: persist_kid.clone(),
+                attested_key_id: Some(other_kid.clone()),
                 attestation_type: attestation_type::SCORES.to_owned(),
                 weight: None,
                 expires_at: None,
@@ -422,7 +434,7 @@ pub(crate) mod bodies {
         for form in FORMS {
             refused(
                 d,
-                row(form, FAMILY, &agent, &agent, &[&other], &score, None),
+                row(form, FAMILY, &agent, &agent, &[&other], &score),
                 "federation_trace_dimension_invalid",
                 "trace_summary:",
                 &format!("I1594 {form:?}: a summary whose signer is not its subject"),
@@ -430,7 +442,7 @@ pub(crate) mod bodies {
             .await;
             admitted(
                 d,
-                row(form, FAMILY, &agent, &agent, &[&agent], &score, None),
+                row(form, FAMILY, &agent, &agent, &[&agent], &score),
                 &format!("I1594 {form:?}: a summary naming its own signer"),
             )
             .await;

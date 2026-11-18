@@ -22,14 +22,14 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::affiliation_config::AFFILIATION_COUNTERSIGN_MISSING;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::membership_acceptance_invariants::bodies::{
-        found_community, found_family, found_room_with_blob, proposal, put, reg, reply,
+        found_community, found_family, found_room_with_blob, id_of, proposal, put, reg, reply,
         widen_community,
     };
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{
-        attestation_type, cohort_scope, CommunityMembershipRevocation, ScrubSig,
-    };
+    use crate::federation::types::{attestation_type, cohort_scope, CommunityMembershipRevocation};
     use crate::federation::{Attestation, Error, FederationDirectory};
     use chrono::{DateTime, Duration, Utc};
 
@@ -78,13 +78,17 @@ pub(crate) mod bodies {
             .unwrap_or_else(|e| panic!("seat {m}: {e}"));
     }
 
-    async fn remove(
+    /// The `membership:removal` voices of `m`'s removal from `cid` (v62.0.0,
+    /// E3b): signed by `signers[0]`, each further signer one more voice over
+    /// the same payload, counted over the room's held roster head (T1.api
+    /// §3).
+    async fn removal_voices(
         d: &dyn FederationDirectory,
         cid: &str,
         signers: &[&str],
         m: &str,
         at: DateTime<Utc>,
-    ) -> Result<(), Error> {
+    ) -> Vec<Vec<u8>> {
         let mut r = ts::sign_community_membership_revocation(
             signers[0],
             CommunityMembershipRevocation {
@@ -100,7 +104,16 @@ pub(crate) mod bodies {
         for c in &signers[1..] {
             ts::cosign_community_membership_revocation(&mut r, c);
         }
-        d.put_community_membership_revocation(r).await
+        let head = e2::held_head(d, &e2::kid(cid)).await.map(|(h, _)| h);
+        e2::community_revocation_voices(&r, head.as_ref())
+    }
+
+    /// A removal landed: every voice put, the last one landing the row.
+    fn landed(out: Result<StatementOutcome, Error>, what: &str) {
+        match out {
+            Ok(StatementOutcome::Row { .. }) => {}
+            other => panic!("{what}: expected the removal to land, got {other:?}"),
+        }
     }
 
     pub(crate) fn affiliation(official: Option<&str>) -> serde_json::Value {
@@ -116,6 +129,12 @@ pub(crate) mod bodies {
     }
 
     /// **I1513** — the one-voice countersign.
+    ///
+    /// v62.0.0 (E3b) — on the edition-2 door a removal is one counted row and
+    /// each signer is one voice over it. The seat's voice alone is kept
+    /// `Pending` (short of the countersign); the designated official's voice
+    /// over the same row completes it and it lands. Ids are the identity-refs
+    /// the directory keys the registered seeds by (`id_of`, E5).
     pub(crate) async fn i1513_one_voice_needs_a_countersign(d: &dyn FederationDirectory, s: &str) {
         let k = |n: &str| format!("i1513-{n}-{s}");
         let (f, g, official, m, n, solo, pair) = (
@@ -128,6 +147,15 @@ pub(crate) mod bodies {
             k("pair"),
         );
         reg(d, &[&f, &g, &official, &m, &n, &solo, &pair]).await;
+        let (f, g, official, m, n, solo, pair) = (
+            id_of(&f),
+            id_of(&g),
+            id_of(&official),
+            id_of(&m),
+            id_of(&n),
+            id_of(&solo),
+            id_of(&pair),
+        );
         found_room_with_blob(
             d,
             &solo,
@@ -141,18 +169,35 @@ pub(crate) mod bodies {
         let at = Utc::now() - Duration::hours(1);
         seat(d, &solo, &f, &m, at).await;
         seat(d, &solo, &f, &n, at + Duration::minutes(1)).await;
-        let e = remove(d, &solo, &[&f], &m, at + Duration::minutes(5))
-            .await
-            .expect_err("I1513: the one seat alone");
-        assert_eq!(rule(&e), AFFILIATION_COUNTERSIGN_MISSING, "I1513: {e}");
+        let voices =
+            removal_voices(d, &solo, &[&f, &official], &m, at + Duration::minutes(5)).await;
+        assert_eq!(
+            voices.len(),
+            2,
+            "I1513: the seat's voice and the official's"
+        );
+        match e2::put_voices(d, &voices[..1]).await {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            other => panic!(
+                "I1513: the one seat alone is kept short of the countersign \
+                 ({AFFILIATION_COUNTERSIGN_MISSING}), got {other:?}"
+            ),
+        }
         assert!(active(d, &solo, &m).await, "I1513: still a member");
-        remove(d, &solo, &[&f, &official], &m, at + Duration::minutes(6))
-            .await
-            .expect("I1513: the seat with the designated official");
+        landed(
+            e2::put_voices(d, &voices[1..]).await,
+            "I1513: the designated official's voice completes the seat's",
+        );
         assert!(!active(d, &solo, &m).await, "I1513: removed");
-        remove(d, &solo, &[&n], &n, at + Duration::minutes(7))
-            .await
-            .expect("I1513: a resignation needs no countersign");
+        landed(
+            e2::put_voices(
+                d,
+                &removal_voices(d, &solo, &[&n], &n, at + Duration::minutes(7)).await,
+            )
+            .await,
+            "I1513: a resignation needs no countersign",
+        );
+        assert!(!active(d, &solo, &n).await, "I1513: n resigned");
         // Two seats decide under their own protocol.
         found_room_with_blob(
             d,
@@ -165,9 +210,15 @@ pub(crate) mod bodies {
         .await
         .unwrap();
         seat(d, &pair, &f, &m, at).await;
-        remove(d, &pair, &[&f], &m, at + Duration::minutes(5))
-            .await
-            .expect("I1513: a body of two seats");
+        landed(
+            e2::put_voices(
+                d,
+                &removal_voices(d, &pair, &[&f], &m, at + Duration::minutes(5)).await,
+            )
+            .await,
+            "I1513: a body of two seats",
+        );
+        assert!(!active(d, &pair, &m).await, "I1513: removed from the pair");
     }
 
     /// The `group:roster:v1` row of `cid`.
@@ -184,8 +235,50 @@ pub(crate) mod bodies {
         .expect("the record row")
     }
 
-    /// A `withdraws` of `target` by `signers` (base + additional scrubs).
-    fn withdraw(target: &Attestation, cid: &str, scope: &str, signers: &[&str]) -> Attestation {
+    /// A composer row (`kind`: `withdraws` / `recants` / `supersedes`) of
+    /// `target` carrying `env`, as edition 2 states it: the first signer's
+    /// row (the target's family, `refs.target` from
+    /// `references_attestation_id`) and each further signer's VOICE over the
+    /// same statement. A cosign is a counted voice, never a scrub on the row.
+    pub(crate) fn composer_voices(
+        kind: &str,
+        target: &Attestation,
+        env: &serde_json::Value,
+        scope: &str,
+        signers: &[&str],
+    ) -> (Attestation, Vec<Vec<u8>>) {
+        // The skeleton only: the switch is off while it is built, so the
+        // statement below is the one signing step.
+        let mut w = e2::with_earlier_form(|| ts::bare_attestation("", signers[0], signers[0], env));
+        w.attestation_type = kind.to_owned();
+        w.weight = None;
+        w.cohort_scope = scope.to_owned();
+        let st = e2::statement_of_family(&w, signers[0], &e2::family_of(target));
+        let row = e2::row_of_statement(&st, &w.tier);
+        let voices = signers[1..].iter().map(|k| e2::voice_of(&st, k)).collect();
+        (row, voices)
+    }
+
+    /// Put a composer's row, then its further voices (each counted by the
+    /// door against the target's protocol).
+    pub(crate) async fn put_voiced(
+        d: &dyn FederationDirectory,
+        voiced: &(Attestation, Vec<Vec<u8>>),
+    ) -> Result<(), Error> {
+        put(d, &voiced.0).await?;
+        for v in &voiced.1 {
+            e2::put_statement(d, v).await?;
+        }
+        Ok(())
+    }
+
+    /// A `withdraws` of `target` by `signers` (the row + the further voices).
+    fn withdraw(
+        target: &Attestation,
+        cid: &str,
+        scope: &str,
+        signers: &[&str],
+    ) -> (Attestation, Vec<Vec<u8>>) {
         let member = if scope == cohort_scope::FAMILY {
             "family_key_id"
         } else {
@@ -195,29 +288,7 @@ pub(crate) mod bodies {
             "references_attestation_id": target.attestation_id,
             member: cid,
         });
-        let mut w = ts::bare_attestation(
-            &uuid::Uuid::new_v4().to_string(),
-            signers[0],
-            signers[0],
-            &env,
-        );
-        w.attestation_type = attestation_type::WITHDRAWS.into();
-        w.weight = None;
-        w.cohort_scope = scope.to_owned();
-        ts::seal_row_in_place(signers[0], &mut w);
-        w.additional_scrubs = signers[1..]
-            .iter()
-            .map(|k| {
-                let (_h, c, p) = ts::sign_envelope(k, &w.attestation_envelope);
-                ScrubSig {
-                    cosigned_at: None,
-                    scrub_key_id: (*k).to_owned(),
-                    scrub_signature_classical: c,
-                    scrub_signature_pqc: p,
-                }
-            })
-            .collect();
-        w
+        composer_voices(attestation_type::WITHDRAWS, target, &env, scope, signers)
     }
 
     /// **I1514** — dissolution is the cosigned withdraws of the record.
@@ -232,15 +303,24 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         let rec = record_row(d, &room, cohort_scope::COMMUNITY).await;
-        let e = put(d, &withdraw(&rec, &room, cohort_scope::COMMUNITY, &[&a]))
-            .await
-            .expect_err("I1514: one voice of two");
+        // Edition 2: a counted row short of its count waits (or is refused
+        // by the protocol); either way one voice of two dissolves nothing.
+        if let Err(e) = put_voiced(d, &withdraw(&rec, &room, cohort_scope::COMMUNITY, &[&a])).await
+        {
+            assert!(
+                matches!(e, Error::RosterAuthorityUnauthorized { .. }),
+                "I1514: {e:?}"
+            );
+        }
         assert!(
-            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
-            "I1514: {e:?}"
+            crate::federation::group_plane::community_dissolved_at(d, &room)
+                .await
+                .unwrap()
+                .is_none(),
+            "I1514: one voice of two dissolves nothing"
         );
         assert!(active(d, &room, &a).await, "I1514: not dissolved");
-        put(
+        put_voiced(
             d,
             &withdraw(&rec, &room, cohort_scope::COMMUNITY, &[&a, &b]),
         )
@@ -270,7 +350,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         let frec = record_row(d, &fam, cohort_scope::FAMILY).await;
-        put(d, &withdraw(&frec, &fam, cohort_scope::FAMILY, &[&a]))
+        put_voiced(d, &withdraw(&frec, &fam, cohort_scope::FAMILY, &[&a]))
             .await
             .expect_err("I1514: a family dissolves by its amendment");
     }
@@ -300,18 +380,16 @@ pub(crate) mod bodies {
             .unwrap();
         let rec = record_row(a, &room, cohort_scope::COMMUNITY).await;
         // The stranger's `withdraws` reaches B first: no target, no rule.
-        let mut early = ts::bare_attestation(
-            &uuid::Uuid::new_v4().to_string(),
-            &stranger,
-            &stranger,
+        let (early, _) = composer_voices(
+            attestation_type::WITHDRAWS,
+            &rec,
             &serde_json::json!({
                 "references_attestation_id": rec.attestation_id,
                 "withdrawal_reason": "I1623",
             }),
+            cohort_scope::FEDERATION,
+            &[&stranger],
         );
-        early.attestation_type = attestation_type::WITHDRAWS.into();
-        early.weight = None;
-        ts::seal_row_in_place(&stranger, &mut early);
         put(b, &early)
             .await
             .expect("I1623: a withdraws whose target is not held is admitted deferred");
@@ -361,7 +439,7 @@ pub(crate) mod bodies {
             "I1623: the seats stand"
         );
         // The control: the founders' cosigned withdraws, stamped by B's door.
-        put(
+        put_voiced(
             b,
             &withdraw(&rec, &room, cohort_scope::COMMUNITY, &[&f, &g]),
         )
