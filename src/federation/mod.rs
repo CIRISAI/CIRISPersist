@@ -13689,6 +13689,12 @@ pub mod malformed_row {
     /// (`federation::edition2::liveness::KeyOwnership`). The same token
     /// CIRISVerify's reader uses.
     pub const KID_NOT_OF_ISS: &str = "kid_not_of_iss";
+    /// v62.0.0 (JSON-cut slice A; CC 2.6.1, CC-READING(next-edition)) — an
+    /// edition-2 payload of a mapped family breaks its member list
+    /// (`federation::edition2::payloads`): a required member missing, a
+    /// member of the wrong type, or a member the family does not carry. The
+    /// message names the member.
+    pub const EDITION2_PAYLOAD_INVALID: &str = "edition2_payload_invalid";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -13732,6 +13738,7 @@ pub mod malformed_row {
         GENESIS_BUNDLE_READER_UNAVAILABLE,
         EARLIER_FORM_SIGNER_IS_EDITION2,
         KID_NOT_OF_ISS,
+        EDITION2_PAYLOAD_INVALID,
     ];
 }
 

@@ -17,6 +17,7 @@
 //! | one rule set, two codecs: the statement mapped onto persist's typed row and its gates | [`ingest`] |
 //! | the read models: an edition-2 key and its honoured revocations projected into `federation_keys` / `federation_revocations`; the cross-form refusal | [`projection`] |
 //! | producing: an edition-2 row or object signed with persist's own composite signer | [`produce`] |
+//! | the payload members of each mapped family (the source of `docs/EDITION2_PAYLOADS.md`) | [`payloads`] |
 //!
 //! **The rule this module keeps (CC 2.6.1.12).** A node of this form reads and
 //! writes this form only. An object of the earlier form (CC 8.11, a JSON object
@@ -33,6 +34,7 @@ pub mod genesis;
 pub mod ingest;
 pub mod liveness;
 pub mod names;
+pub mod payloads;
 pub mod produce;
 pub mod projection;
 pub mod store;
@@ -53,6 +55,8 @@ mod ingest_invariants;
 mod key_chain_invariants;
 #[cfg(test)]
 mod liveness_invariants;
+#[cfg(test)]
+mod payloads_invariants;
 #[cfg(test)]
 mod produce_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
