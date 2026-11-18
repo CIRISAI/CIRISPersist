@@ -287,14 +287,6 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
         Some(at(1_000)),
         "I2000: the composite is complete at signing"
     );
-    assert!(
-        !d.list_hybrid_pending_keys(1_000)
-            .await
-            .unwrap()
-            .iter()
-            .any(|r| r.id == ik),
-        "I2000: the PQC sweep never offers a projection"
-    );
     let ev = first.attestation_evidence.clone().expect("I2000: evidence");
     assert_eq!(ev["chain"], serde_json::json!([]), "I2000: evidence shape");
     let row_before = raw

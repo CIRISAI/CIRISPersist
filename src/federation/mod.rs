@@ -1147,7 +1147,7 @@ pub use types::{consent_role, device_class, identity_type};
 pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
     CommunityMembershipWidening, CommunityRosterSigners, EmitAttestationInput, EncryptionPubkeys,
-    Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence,
+    Family, FamilyMember, FamilyMembershipRevocation, IdentityOccurrence,
     IdentityOccurrenceRevocation, KeyRecord, KnownHashEviction, KnownWireHash, LocationProof,
     PeerMetadataRow, PeerPolicyBlob, Revocation, ServedAttestation, ServedCommunity,
     ServedCommunityMembershipRevocation, ServedCommunityMembershipWidening, ServedFamily,
@@ -9196,39 +9196,6 @@ pub trait FederationDirectory: Send + Sync {
     // The two signature-only siblings below attach no key material, so their
     // signature really is verified at the consumer's policy layer on read.
 
-    /// Attach the PQC components to a hybrid-pending federation_keys row.
-    /// Updates pubkey_ml_dsa_65_base64 + scrub_signature_pqc + pqc_completed_at.
-    /// Errors if the row is already PQC-complete.
-    ///
-    /// v31.0.0 (CIRISPersist#657) — REFUSES unless the row's already-signed
-    /// `registration_envelope` binds the ML-DSA-65 pubkey being attached and
-    /// the post-attach row hybrid-Strict-verifies. See
-    /// [`admission::check_key_pqc_attachment`](crate::federation::admission::check_key_pqc_attachment)
-    /// for why a row that bound `pubkey_ml_dsa_65_base64: null` may not attach
-    /// one afterwards.
-    async fn attach_key_pqc_signature(
-        &self,
-        key_id: &str,
-        pubkey_ml_dsa_65_base64: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error>;
-
-    /// Attach the PQC signature to a hybrid-pending
-    /// `federation_attestations` row. Attestations don't have their
-    /// own pubkey — they reference the existing
-    /// `federation_keys.scrub_key_id`'s pubkey for verification.
-    ///
-    /// v31.0.0 (CIRISPersist#657) — implementations MUST re-index
-    /// `signed_wire_index` after the UPDATE. Three serialized columns move, so
-    /// the wire content hash moves with them; this is the #547/#640 stale-index
-    /// class, which was fixed at [`Self::attach_key_pqc_signature`] and not
-    /// here.
-    async fn attach_attestation_pqc_signature(
-        &self,
-        attestation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error>;
-
     /// v4.6 (CIRISPersist#171 phase 2) — fetch a single attestation row
     /// by id (any tier). `None` if absent. Used by `Engine::attestation_
     /// promote` to load the `local` row's envelope before signing.
@@ -9347,34 +9314,6 @@ pub trait FederationDirectory: Send + Sync {
             now,
         )))
     }
-
-    // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
-    //
-    // Per V004's schema header §"Phase transitions":
-    //   "Pre-flip rows that are still pending get walked through the
-    //    upgrade pipeline."
-    // These three methods feed that pipeline. Persist's PyO3
-    // `Engine.run_pqc_sweep()` walks each batch and drives cold-path
-    // PQC fill-in for rows authored before the writer was configured
-    // with a PQC local signer (or where the per-write cold-path failed
-    // transiently). Idempotent at the consumer level —
-    // `attach_*_pqc_signature` already guards against double-fill via
-    // `WHERE pqc_completed_at IS NULL`.
-
-    /// Return up to `limit` `federation_keys` rows where
-    /// `pqc_completed_at IS NULL`, ordered oldest first by
-    /// `valid_from`. Returns `(key_id, registration_envelope,
-    /// scrub_signature_classical)` triples sufficient to reconstruct
-    /// the cold-path bound-signature input.
-    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error>;
-
-    /// Return up to `limit` `federation_attestations` rows where
-    /// `pqc_completed_at IS NULL`, ordered oldest first by
-    /// `asserted_at`.
-    async fn list_hybrid_pending_attestations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error>;
 
     // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
     //

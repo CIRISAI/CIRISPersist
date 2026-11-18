@@ -429,6 +429,18 @@ mod run {
                 "fn list_hybrid_pending_revocations",
                 "fn sweep_revocations",
                 "AttachRevocationPqcSignature",
+                // v62.0.0 — the whole PQC cold path (a composite is atomic).
+                "fn attach_key_pqc_signature",
+                "fn attach_attestation_pqc_signature",
+                "def attach_key_pqc_signature",
+                "def attach_attestation_pqc_signature",
+                "fn list_hybrid_pending_keys",
+                "fn list_hybrid_pending_attestations",
+                "fn run_pqc_sweep",
+                "def run_pqc_sweep",
+                "pqc_sweep_on_init",
+                "fn cold_path_pqc_sign",
+                "HybridPendingRow",
             ] {
                 assert!(
                     !code.contains(gone),

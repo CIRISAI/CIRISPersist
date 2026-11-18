@@ -692,36 +692,6 @@ impl crate::federation::group_plane::GroupPlaneStore for PostgresBackend {
 /// Storage only: the selections are `federation::sweep_plan`'s.
 #[async_trait::async_trait]
 impl crate::federation::sweep_plan::SweepStore for PostgresBackend {
-    async fn read_hybrid_pending(
-        &self,
-        selection: crate::federation::sweep_plan::HybridPendingSelection,
-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let rows = pg_query_statement(
-            &**client,
-            selection.render(crate::federation::attestation_query::Dialect::Postgres),
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("read_hybrid_pending: {e}")))?;
-        rows.into_iter()
-            .map(|row| {
-                let mk_err = crate::federation::Error::Backend;
-                Ok(crate::federation::HybridPendingRow {
-                    id: row.safe_get_with("row_id", mk_err)?,
-                    // v31.0.0 (#644) — TEXT since V122.
-                    envelope: pg_envelope_value(
-                        &row.safe_get_with::<String, _, _, _>("envelope", mk_err)?,
-                        "envelope",
-                    )?,
-                    classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
-                })
-            })
-            .collect()
-    }
-
     async fn read_expired_attestation_ids(
         &self,
         selection: crate::federation::sweep_plan::ExpiredSelection,
@@ -4247,7 +4217,6 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
             | P::Rewrite { record, .. }
             | P::Replace { record, .. }
             | P::RehydrateScrubs { record } => Some(pg_key_columns(record)?),
-            P::CompletePqc { .. } => None,
         };
         self.rehome_legacy_key_plane().await?;
         let mut client = self
@@ -4439,32 +4408,6 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
                     .map_err(|e| failed("replace", e))?
                 }
             }
-            (
-                P::CompletePqc {
-                    key_id,
-                    pubkey_ml_dsa_65_base64,
-                    scrub_signature_pqc,
-                    completed_at,
-                    persist_row_hash,
-                },
-                _,
-            ) => tx
-                .execute(
-                    "UPDATE cirislens.federation_keys \
-                     SET pubkey_ml_dsa_65_base64 = $1, scrub_signature_pqc = $2, \
-                         pqc_completed_at = $3, persist_row_hash = $4, mutated_at = $6 \
-                     WHERE key_id = $5 AND pqc_completed_at IS NULL",
-                    &[
-                        pubkey_ml_dsa_65_base64,
-                        scrub_signature_pqc,
-                        completed_at,
-                        persist_row_hash,
-                        key_id,
-                        &position,
-                    ],
-                )
-                .await
-                .map_err(|e| failed("complete pqc", e))?,
             (P::RehydrateScrubs { record: r }, Some(c)) => tx
                 .execute(
                     "UPDATE cirislens.federation_keys SET additional_scrubs = $3, mutated_at = $4 \
@@ -14399,41 +14342,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(triples.len() as u64)
     }
 
-    async fn attach_key_pqc_signature(
-        &self,
-        key_id: &str,
-        pubkey_ml_dsa_65_base64: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), crate::federation::Error> {
-        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
-        crate::federation::key_plane::key_record_write_planned(
-            self,
-            crate::federation::key_plane::KeyRecordWrite::AttachPqc {
-                key_id,
-                pubkey_ml_dsa_65_base64,
-                scrub_signature_pqc,
-            },
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// v56.0.0 (CIRISPersist#934 step 1) — the decision is
-    /// [`plan_attach_attestation_pqc_signature`](crate::federation::attestation_admit::plan_attach_attestation_pqc_signature),
-    /// shared by all three backends; this backend stores it.
-    async fn attach_attestation_pqc_signature(
-        &self,
-        attestation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), crate::federation::Error> {
-        crate::federation::attestation_admit::attach_attestation_pqc_planned(
-            self,
-            attestation_id,
-            scrub_signature_pqc,
-        )
-        .await
-    }
-
     async fn get_attestation(
         &self,
         attestation_id: &str,
@@ -14810,34 +14718,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 })
             })
             .collect()
-    }
-
-    async fn list_hybrid_pending_keys(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
-        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
-            self,
-            crate::federation::sweep_plan::HybridPlane::Keys,
-            limit,
-        )
-        .await?;
-        Ok(rows)
-    }
-
-    async fn list_hybrid_pending_attestations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
-        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
-            self,
-            crate::federation::sweep_plan::HybridPlane::Attestations,
-            limit,
-        )
-        .await?;
-        Ok(rows)
     }
 
     // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
@@ -21265,62 +21145,6 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             .await
             .map(|_| ())
             .map_err(|e| crate::federation::Error::Backend(format!("withdraws depth repair: {e}")))
-    }
-
-    async fn store_pqc_completion(
-        &self,
-        completion: crate::federation::attestation_admit::PqcCompletion,
-    ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
-        // THREE served columns; the serve position moves with them.
-        let admitted_at = self
-            .next_plane_position(&client, "federation_attestations")
-            .await?;
-        let n = client
-            .execute(
-                "UPDATE cirislens.federation_attestations \
-                 SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3, \
-                     admitted_at = $5 \
-                 WHERE attestation_id = $4 AND pqc_completed_at IS NULL",
-                &[
-                    &completion.scrub_signature_pqc,
-                    &completion.pqc_completed_at,
-                    &completion.persist_row_hash,
-                    &completion.attestation_id,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_attestations row {} was concurrently completed",
-                completion.attestation_id
-            )));
-        }
-        // v59.1.2 — the re-index checks out its own client (the boot PQC
-        // sweep reaches this door).
-        drop(client);
-        // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. The
-        // hybrid-completion write moves three serialized columns, so it moves
-        // the wire content hash. Postgres rounds `pqc_completed_at` to
-        // microseconds, which is exactly why the shared helper re-reads the row
-        // rather than hashing the in-memory value.
-        self.index_stored_record(
-            "Attestation",
-            &crate::federation::wire_index::record_key(&[(
-                "attestation_id",
-                &completion.attestation_id,
-            )]),
-        )
-        .await?;
-        Ok(())
     }
 
     async fn store_planned_local_attestation(
@@ -31673,37 +31497,6 @@ mod tests {
         .await;
     }
 
-    /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
-    /// the STORED envelope. No production door can do this (both v31 gates
-    /// refuse the shape), so the seam reaches the pool directly.
-    #[cfg(feature = "sqlite")]
-    #[async_trait::async_trait]
-    impl crate::federation::migration::test_support::LegacyRowInstaller for PostgresBackend {
-        async fn downgrade_to_v30(&self, attestation_id: &str) {
-            let row = crate::federation::FederationDirectory::get_attestation(self, attestation_id)
-                .await
-                .expect("read")
-                .expect("downgrade_to_v30: row must exist");
-            // v31.0.0 (#644) — attestation_envelope is TEXT since V122.
-            let envelope = pg_envelope_text(
-                &crate::federation::migration::test_support::v30_envelope(
-                    &row.attestation_envelope,
-                ),
-                "attestation_envelope",
-            )
-            .expect("serialize");
-            let client = self.get_client().await.expect("client");
-            client
-                .execute(
-                    "UPDATE cirislens.federation_attestations SET attestation_envelope = $2 \
-                     WHERE attestation_id = $1",
-                    &[&attestation_id, &envelope],
-                )
-                .await
-                .expect("downgrade_to_v30 update");
-        }
-    }
-
     /// v31.0.0 (CIRISPersist#650) — the recursive load-bearing walk over a
     /// CYCLIC graph, postgres arm. Shared exercise body with memory + sqlite.
     #[tokio::test]
@@ -31718,48 +31511,6 @@ mod tests {
         let tag = format!("pg650c{}", uuid_like());
         crate::federation::load_bearing::test_support::exercise_load_bearing_closure(
             &backend, &tag,
-        )
-        .await;
-    }
-
-    /// v31.0.0 (CIRISPersist#650) — THE PINNED GAP: a v30-shaped row can STILL
-    /// land after the migration, through the transit-revocation door. Postgres
-    /// arm; shared body with memory + sqlite.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn a_v30_row_cannot_land_after_migration_postgres_650() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        let tag = format!("pg650g{}", uuid_like());
-        crate::federation::migration::test_support::exercise_a_v30_row_cannot_land_after_migration(
-            &backend, &tag,
-        )
-        .await;
-    }
-
-    /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration, postgres arm.
-    /// Shared exercise body with sqlite; the peer is an in-memory SQLite
-    /// (one postgres database per test process, so a second postgres corpus is
-    /// not available — and the receiving stack is backend-symmetric by
-    /// construction, with its own parity witnesses).
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    #[cfg(feature = "sqlite")]
-    async fn v31_migration_postgres_650() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let origin = PostgresBackend::connect(&dsn).await.expect("connect");
-        origin.run_migrations().await.expect("migrations run");
-        let peer = crate::store::test_backend::test_backend();
-        let tag = format!("pg650{}", uuid_like());
-        crate::federation::migration::test_support::exercise_v31_migration(
-            &origin, &origin, &peer, &tag,
         )
         .await;
     }
@@ -42110,110 +41861,6 @@ mod tests {
         assert_eq!(got.withdraws_admission_rule, Some(2));
     }
 
-    /// v4.6.0 (CIRISPersist#171/#176) — live-PG coverage for the
-    /// deferred-PQC completion path (`attach_attestation_pqc_signature` /
-    /// `attach_revocation_pqc_signature`), the sweep `Engine.run_pqc_sweep`
-    /// drives via PyO3. Previously tested ONLY on the in-memory backend,
-    /// whose string-keyed map never exercised the `attestation_id`/`uuid`
-    /// driver serialization — so a `&str`-bound `$N::uuid` param (which
-    /// panics with "error serializing parameter 0" on real Postgres) went
-    /// undetected. This test closes that gap for both attach paths.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn pg_attach_pqc_for_attestation_and_revocation() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        use crate::federation::FederationDirectory;
-
-        let steward = format!("pg-attach-steward-{}", uuid_like());
-        let target = format!("pg-attach-target-{}", uuid_like());
-        backend
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: pg_admission_key(
-                    &steward,
-                    "registry",
-                    crate::federation::types::identity_type::STEWARD,
-                ),
-            })
-            .await
-            .unwrap();
-        backend
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: pg_admission_key(
-                    &target,
-                    "primitive-a",
-                    crate::federation::types::identity_type::AGENT,
-                ),
-            })
-            .await
-            .unwrap();
-
-        // Federation-tier, PQC-pending attestation (real UUID id).
-        let att = pg_scores_attestation(&steward, &target, &steward, "identity_binding:v1");
-        let att_id = att.attestation_id.clone();
-        backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: att })
-            .await
-            .unwrap();
-        backend
-            .attach_attestation_pqc_signature(&att_id, "att-pqc-sig")
-            .await
-            .expect("attach attestation PQC sig must serialize the uuid param");
-        let after = backend
-            .get_attestation(&att_id)
-            .await
-            .unwrap()
-            .expect("row");
-        assert!(
-            after.is_pqc_complete(),
-            "attestation PQC-complete after attach"
-        );
-
-        // Same for a federation revocation (real UUID id; valid 64-hex
-        // original_content_hash — the revocation path hex-decodes it).
-        let now = chrono::Utc::now();
-        let rev_id = uuid::Uuid::new_v4().to_string();
-        // v31.0.0 (#659) — sealed through the one shared producer.
-        let rev = crate::federation::tier_ingest::test_support::seal_revocation(
-            crate::federation::Revocation {
-                revocation_id: rev_id.clone(),
-                revoked_key_id: Some(target.clone()),
-                revoked_key_sha256_ed25519_raw:
-                    crate::federation::tier_ingest::test_support::subject_digest_of(&target),
-                revoking_key_id: steward.clone(),
-                reason: Some("test".into()),
-                revoked_at: now,
-                effective_at: now,
-                revocation_envelope: serde_json::json!({"id": rev_id}),
-                original_content_hash: String::new(),
-                scrub_signature_classical: String::new(),
-                scrub_signature_pqc: None,
-                scrub_key_id: steward.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                observed_region: crate::federation::verify_coord::region::US.into(),
-                revoked_after: None,
-                persist_row_hash: String::new(),
-            },
-        );
-        grant_slash(&backend, &steward).await;
-        backend
-            .put_revocation(crate::federation::SignedRevocation { revocation: rev })
-            .await
-            .unwrap();
-        // v58.0.0 (CIRISPersist#991) — a revocation is hybrid at its door.
-        let revs = backend.revocations_for(&target).await.unwrap();
-        assert!(
-            revs.iter()
-                .any(|r| r.revocation_id == rev_id && r.is_pqc_complete()),
-            "revocation is PQC-complete as admitted"
-        );
-    }
-
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_put_attestation_accepts_accord_dimension_from_accord_holder() {
@@ -50787,49 +50434,6 @@ mod tests {
         )
         .await
         .expect("654 roster-growth authorization exercise");
-    }
-
-    /// v31.0.0 (CIRISPersist#657) — the cold-path PQC fill-in is GATED, on
-    /// postgres. One shared body across memory / sqlite / postgres; see
-    /// [`crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated`].
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn attach_key_pqc_is_gated_postgres_657() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated(
-            &backend,
-            // The distinguishing part leads; `seed_for` truncates at 32 bytes.
-            &format!("{}-pg657", uuid::Uuid::new_v4().simple()),
-        )
-        .await
-        .expect("657 attach-gate exercise");
-    }
-
-    /// v31.0.0 (CIRISPersist#657) — the ATTESTATION plane's instance of the
-    /// #547/#640 stale-index class, on postgres. The tag leads with the
-    /// distinguishing part: `tier_ingest::test_support::seed_for` truncates
-    /// key_ids at 32 bytes, and a uuid-bearing suffix would collapse the
-    /// exercise's `owner-`/`node-` identities into ONE key.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn attestation_wire_index_follows_pqc_attach_postgres_657() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        crate::federation::operational::test_support::exercise_attestation_wire_index_follows_pqc_attach(
-            &backend,
-            &format!("{}-pg657", uuid::Uuid::new_v4().simple()),
-        )
-        .await
-        .expect("657 attestation wire-index exercise");
     }
 
     // ── v53.1.5 — the two-phase trace listing (I531, postgres) ─────────

@@ -201,7 +201,6 @@ class Engine:
         identity_dir: str | None = None,
         keystore_alias: str | None = None,
         create_identity_if_missing: bool = False,
-        pqc_sweep_on_init: bool = True,
         replication_sweeper_enabled: bool = True,
         cache_mode: str | None = None,
         max_cache_bytes: str | None = None,
@@ -2094,12 +2093,6 @@ class Engine:
     # ONTOLOGICAL  (descriptive)
     # Varying one of these changes who this node, this key, or this identity IS.
     # ==============================================================
-
-    def attach_attestation_pqc_signature(self, attestation_id: str, scrub_signature_pqc: str) -> None:
-        """(derived) ontological — Federation directory: attach PQC signature to a hybrid-pending federation_attestations row."""
-
-    def attach_key_pqc_signature(self, key_id: str, pubkey_ml_dsa_65_base64: str, scrub_signature_pqc: str) -> None:
-        """(derived) ontological — Federation directory: attach the cold-path PQC signature to a hybrid-pending federation_keys row. See docs/FEDERATION_DIRECTORY.md §"Trust contract..."""
 
     def canonical_bootstrap_hints(self) -> str:
         """(derived) ontological — v13.6.0 (CIRISPersist#402, CIRISEdge#296) — the accord-attested bootstrap dial set as a compact JSON list edge consumes directly:"""
@@ -4025,9 +4018,6 @@ class Engine:
         from production ``requirements.txt`` (CIRISAgent#763 Phase 5
         close-out — the LAST raw-SQL gap in CIRISAgent 2.9.0).
         """
-
-    def run_pqc_sweep(self, batch_size: int = 1000) -> dict[str, Any]:
-        """(derived) procedural — v0.3.2 (CIRISPersist#11) — Walk hybrid-pending federation rows across federation_keys / federation_attestations / federation_revocations and drive..."""
 
     def scheduled_task_list_due(
         self,

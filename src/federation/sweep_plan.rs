@@ -6,11 +6,7 @@
 //! both, so the selection lived in three places in two languages, and the
 //! copies drifted:
 //!
-//! - the PQC sweep's selection (`list_hybrid_pending_keys` /
-//!   `_attestations`, the rows the cold-path PQC fill walks): a negative
-//!   `limit` returned nothing on memory, EVERY row on sqlite (`LIMIT -1` is
-//!   no limit) and an error on postgres; ties on the order instant were
-//!   unordered on the SQL backends;
+//! - the PQC sweep's selection (deleted in v62.0.0 with the cold path);
 //! - the reaper's selection (`list_expired_attestation_ids`): the
 //!   never-offered types spelled as a SQL literal twice and as a Rust
 //!   predicate once; `ORDER BY expires_at` with no tie-break, so the
@@ -45,103 +41,10 @@
 use chrono::{DateTime, Utc};
 
 use super::attestation_query::{Bind, Dialect, Statement};
-use super::types::{attestation_type, HybridPendingRow, KnownHashEviction};
+use super::types::{attestation_type, KnownHashEviction};
 use super::Error;
 
 // ── the PQC sweep's selection ─────────────────────────────────────────
-
-/// Which table the PQC sweep walks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HybridPlane {
-    /// `federation_keys`, oldest `valid_from` first.
-    Keys,
-    /// `federation_attestations`, oldest `asserted_at` first.
-    Attestations,
-}
-
-/// **The PQC sweep's selection**: the rows whose ML-DSA-65 half is still
-/// pending (`pqc_completed_at IS NULL`), oldest first by the plane's
-/// instant, ties by id, at most `limit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HybridPendingSelection {
-    /// The table.
-    pub(crate) plane: HybridPlane,
-    /// The page size, at least 1.
-    pub(crate) limit: i64,
-}
-
-/// Plan a PQC-sweep page: `None` when `limit` asks for no rows (zero or
-/// negative), so no backend reads anything. Before v60 sqlite read every
-/// row for a negative limit and postgres refused it.
-#[must_use]
-pub(crate) fn plan_hybrid_pending(
-    plane: HybridPlane,
-    limit: i64,
-) -> Option<HybridPendingSelection> {
-    let limit = u64::try_from(limit)
-        .ok()
-        .and_then(std::num::NonZeroU64::new)?;
-    Some(HybridPendingSelection {
-        plane,
-        limit: i64::try_from(limit.get()).unwrap_or(i64::MAX),
-    })
-}
-
-#[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
-impl HybridPendingSelection {
-    /// The one statement, for `dialect`: `id`, envelope TEXT, classical
-    /// signature, in the selection's order, `LIMIT ?1`.
-    #[must_use]
-    pub(crate) fn render(&self, dialect: Dialect) -> Statement {
-        let (table, id, envelope, instant) = match self.plane {
-            HybridPlane::Keys => (
-                "federation_keys",
-                "key_id",
-                "registration_envelope",
-                "valid_from",
-            ),
-            HybridPlane::Attestations => (
-                "federation_attestations",
-                "attestation_id",
-                "attestation_envelope",
-                "asserted_at",
-            ),
-        };
-        let (schema, id_expr, id_order, ph) = match dialect {
-            Dialect::Sqlite => ("", id.to_owned(), id.to_owned(), "?1"),
-            Dialect::Postgres => (
-                "cirislens.",
-                format!("{id}::text"),
-                format!("{id}::text COLLATE \"C\""),
-                "$1",
-            ),
-        };
-        Statement {
-            sql: format!(
-                "SELECT {id_expr} AS row_id, {envelope} AS envelope, scrub_signature_classical \
-                 FROM {schema}{table} WHERE pqc_completed_at IS NULL \
-                 ORDER BY {instant} ASC, {id_order} ASC LIMIT {ph}"
-            ),
-            binds: vec![Bind::Int(self.limit)],
-        }
-    }
-}
-
-/// The PQC sweep's page (`list_hybrid_pending_keys` /
-/// `list_hybrid_pending_attestations`): the plan, then the executor.
-pub(crate) async fn list_hybrid_pending_planned<D>(
-    dir: &D,
-    plane: HybridPlane,
-    limit: i64,
-) -> Result<Vec<HybridPendingRow>, Error>
-where
-    D: SweepStore + ?Sized,
-{
-    match plan_hybrid_pending(plane, limit) {
-        Some(selection) => dir.read_hybrid_pending(selection).await,
-        None => Ok(Vec::new()),
-    }
-}
 
 // ── the reaper's selection ────────────────────────────────────────────
 
@@ -283,13 +186,6 @@ where
 /// Storage only.
 #[async_trait::async_trait]
 pub(crate) trait SweepStore: Send + Sync {
-    /// Run the PQC-sweep page: [`HybridPendingSelection::render`] on SQL,
-    /// [`HybridPendingSelection::cut`] on memory.
-    async fn read_hybrid_pending(
-        &self,
-        selection: HybridPendingSelection,
-    ) -> Result<Vec<HybridPendingRow>, Error>;
-
     /// Run the reaper page: [`ExpiredSelection::render`] on SQL,
     /// [`ExpiredSelection::cut`] on memory.
     async fn read_expired_attestation_ids(

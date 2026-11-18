@@ -165,8 +165,6 @@ Engine	apply_replicated_accord_evidence	deontic
 Engine	apply_replicated_attestation	deontic
 Engine	apply_replicated_key_grant	deontic
 Engine	apply_replicated_key_record	deontic
-Engine	attach_attestation_pqc_signature	ontological
-Engine	attach_key_pqc_signature	ontological	
 Engine	attestation_insert_local	empirical	
 Engine	attestation_insert_local_many	empirical	
 Engine	attestation_upsert_local	empirical	
@@ -574,7 +572,6 @@ Engine	row_type_report_json	empirical
 Engine	run_consent_expiry_sweep_json	procedural	
 Engine	run_deletion_window_watch_json	procedural	
 Engine	run_legacy_graph_migration	procedural	
-Engine	run_pqc_sweep	procedural	
 Engine	run_retention	testimonial	erasure_effect
 Engine	runtime_handle_capsule	structural	
 Engine	scheduled_task_list_due	procedural	
@@ -790,7 +787,7 @@ Engine	purge_notice_signing_payload_json	nomological
 Engine	put_plaintext_dag_chunk	deontic
 Engine	finalize_blob_chunks_signing_json	deontic
 # v61 (CC 2.6.2) — the open-time instant-form pass on demand, beside
-# run_pqc_sweep: a maintenance pass that re-signs this node's own rows; what
+# the (since-deleted) run_pqc_sweep: a maintenance pass that re-signs this node's own rows; what
 # stands is decided by the pass, not by calling it.
 Engine	settle_instant_forms_json	procedural
 # v61.3.0 (CIRISPersist#1252) — the cosign sweep acts (lands, expires, ends a

@@ -117,8 +117,7 @@ pub use crate::outbound::{
 // SignedAttestation / SignedRevocation envelopes need the wire
 // shapes.
 pub use crate::federation::{
-    Attestation, HybridPendingRow, KeyRecord, Revocation, SignedAttestation, SignedKeyRecord,
-    SignedRevocation,
+    Attestation, KeyRecord, Revocation, SignedAttestation, SignedKeyRecord, SignedRevocation,
 };
 
 // Atomic-claim primitive (v1.0.0; CIRISAgent#756 concern #2). Returned

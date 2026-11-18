@@ -531,12 +531,6 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
-        // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
-        // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
-        // `Backend` has no signer; this is the first point at which the backend
-        // and the signing key exist together. Idempotent, resumable, and never
-        // boot-fatal — see `federation::migration`.
-        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
         Ok(engine)
     }
 
@@ -618,13 +612,6 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
-        // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
-        // pre-genesis node usually has nothing to migrate (no identity ⇒ no
-        // authorship), and the routine returns early in that case; but a node
-        // that HAS an identity and no trust root still owns rows, and
-        // withholding the migration from this constructor would make the
-        // corpus's shape depend on which constructor the host happened to use.
-        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
         Ok(engine)
     }
 
@@ -6617,9 +6604,7 @@ impl Engine {
 
     /// CIRISPersist#848 (`BLOB_REPLICATION.md` §16, I66) — **resolve
     /// the V145 minter sentinel to this node's own key**, at construction,
-    /// the first moment the backend and the signer exist together — beside
-    /// `run_v31_migration_at_boot`, which needs the signer for the same
-    /// reason. Runs before any read; a sentinel that survives aborts the
+    /// the first moment the backend and the signer exist together. Runs before any read; a sentinel that survives aborts the
     /// boot. Idempotent: a no-op on every boot but the first after V145.
     /// #848 (I66) — **resolve V145's minter sentinel before the first door
     /// that reads or writes the community-DEK plane.** The DSN constructors
