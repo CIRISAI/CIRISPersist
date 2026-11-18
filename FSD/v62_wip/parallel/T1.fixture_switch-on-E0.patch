@@ -1,0 +1,11 @@
+--- a/src/federation/edition2/fixture_switch.rs	2026-11-18 12:03:45.742779948 -0600
++++ b/src/federation/edition2/fixture_switch.rs	2026-11-18 12:03:45.746662256 -0600
+@@ -2266,3 +2266,8 @@
+         Box::pin(exercise_put_key_and_row(&b)).await;
+     }
+ }
++
++// v62.0.0 (wave T1) — the typed-plane builders' edition-2 twins
++// (`family_voices`, `community_voices`, `family_revocation_voices`, ...,
++// `put_voices`, `row_id_of`), so a held test reaches them as `e2::..`.
++pub use super::group_fixtures::*;

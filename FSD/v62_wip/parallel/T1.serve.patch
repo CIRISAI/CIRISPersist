@@ -1,0 +1,468 @@
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 688fb18..b35e852 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -47,6 +47,7 @@ pub mod genesis;
+ pub mod group;
+ #[cfg(any(test, feature = "test-anchor"))]
+ pub mod group_fixtures;
++pub mod group_serve;
+ pub mod halt;
+ pub mod ingest;
+ pub mod liveness;
+@@ -80,6 +81,8 @@ mod genesis_store_invariants;
+ mod group_codec_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod group_invariants;
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod group_serve_invariants;
+ #[cfg(test)]
+ mod halt_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+diff --git a/src/federation/edition2/serve.rs b/src/federation/edition2/serve.rs
+index 28d80c0..06b52db 100644
+--- a/src/federation/edition2/serve.rs
++++ b/src/federation/edition2/serve.rs
+@@ -25,8 +25,14 @@
+ //!
+ //! Key-plane statements (`key:record`, `key:revocation`) and signed objects
+ //! (genesis bundle voices) are public and always served. A voice of a row
+-//! follows its row. A statement whose row this node does not hold (a voice
+-//! held alone) is withheld: fail closed.
++//! follows its row. v62.0.0 (wave T1) — a statement that maps to NO
++//! attestation row (a group voice, which lands in its typed table; a counted
++//! row still gathering voices; another statement-only family) is judged from
++//! the statement itself ([`super::group_serve::servable_without_row`]): a
++//! group voice by the group's members at the head it names, the member it
++//! names and the founders; any other by the scope its payload states, and
++//! withheld when it states none (fail closed). The purge plane applies to it
++//! as to a row.
+ //!
+ //! The serve paths: [`statements_served_to`] (the listing, behind
+ //! `Engine::edition2_statements_served_to`), [`super::store::lookup_by_id`]
+@@ -100,7 +106,19 @@ where
+     };
+     let rid = rid.hex();
+     let Some(row) = dir.get_attestation(&rid).await? else {
+-        return Ok(false);
++        // v62.0.0 (wave T1) — no attestation row: judged from the statement.
++        if dir
++            .purge_tombstoned("attestation", &rid)
++            .await
++            .unwrap_or(None)
++            .is_some()
++        {
++            return Ok(false);
++        }
++        return Box::pin(super::group_serve::servable_without_row(
++            dir, statement, requester,
++        ))
++        .await;
+     };
+     if row.tier != crate::federation::types::attestation_tier::FEDERATION
+         || !row_type_served(&row.attestation_type)
+diff --git a/src/federation/edition2/group_serve.rs b/src/federation/edition2/group_serve.rs
+new file mode 100644
+index 0000000..4bbe70c
+--- /dev/null
++++ b/src/federation/edition2/group_serve.rs
+@@ -0,0 +1,221 @@
++//! v62.0.0 (wave T1) — **who is served a statement that maps to no
++//! attestation row.**
++//!
++//! [`super::serve::servable_to`] decides a statement's audience from the
++//! attestation row it maps to. Several families keep their statements in
++//! `ceg_statements` ONLY, with no `federation_attestations` row:
++//! - the group planes (`group:roster`, and `membership:{stage}` at
++//!   `widening` / `removal`), which land in their typed tables
++//!   ([`super::group`]);
++//! - a counted row whose voices are still short of its protocol
++//!   (`StatementOutcome::Pending`);
++//! - other statement-only families (cosign voices, admission units, ...).
++//!
++//! Withholding all of them, the old rule, meant a group never replicated:
++//! the member's node could not learn its own roster. This module decides the
++//! audience from the statement itself, with the same rules the JSON group
++//! plane used (`replication_audience::may_receive_group_plane`):
++//!
++//! - **a group voice** is served to:
++//!   - the group's audience as this node holds it: a public group's to every
++//!     peer; otherwise the members' nodes, live invitees' nodes, and the node
++//!     of the member the row names (for a removal, the removed member);
++//!   - AND the members at the roster head the row names (`refs.head`), the
++//!     members a roster version itself lists (a founding or a version still
++//!     gathering voices must reach the members who are to sign it), and the
++//!     held record's founders.
++//!
++//!   "Node of" is the principal fold (`self_collective::principals_of`).
++//! - **any other statement** follows the scope it states (the CC 2.1
++//!   `cohort_scope` payload member):
++//!   - a commons scope is served to anyone;
++//!   - a self / family / room scope only to a requester in its audience
++//!     (`replication::hold::is_audience`, with the target from the payload's
++//!     cohort-target member);
++//!   - a statement that states no scope is withheld (fail closed).
++//!
++//! Anonymous reads (no requester) are served the commons only, as before.
++
++use std::collections::BTreeSet;
++
++use ciris_verify_core::cde::Value;
++
++use super::group::{
++    group_plane_of, membership_of, roster_view, roster_view_of_statement, GroupPlane,
++};
++use super::ingest::json_of;
++use super::liveness::statement_parts;
++use crate::federation::types::cohort_scope as cs;
++use crate::federation::{Error, FederationDirectory};
++
++/// The listed members' key ids of a `group:roster` payload.
++fn listed_members(payload: &Value) -> BTreeSet<String> {
++    payload
++        .get_text("members")
++        .and_then(Value::as_array)
++        .map(|a| {
++            a.iter()
++                .filter_map(|m| m.get_text("key").and_then(Value::as_text))
++                .map(str::to_owned)
++                .collect()
++        })
++        .unwrap_or_default()
++}
++
++/// **May `requester` be served a statement this node holds no attestation
++/// row for?** See the module doc. Called by `serve::servable_to` after its
++/// purge check.
++///
++/// # Errors
++/// Directory reads.
++pub async fn servable_without_row<F>(
++    dir: &F,
++    statement: &[u8],
++    requester: Option<&str>,
++) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let Some((protected, payload)) = statement_parts(statement) else {
++        return Ok(false);
++    };
++    let text = |label: i64| protected.get_int(label).and_then(Value::as_text);
++    let (Some(row_type), Some(family)) = (text(-70001), text(-70002)) else {
++        return Ok(false);
++    };
++    let claims = protected.get_int(15);
++    let sub = claims.and_then(|c| c.get_int(2)).and_then(Value::as_text);
++    let iss = claims.and_then(|c| c.get_int(1)).and_then(Value::as_text);
++    if let Some(plane) = group_plane_of(row_type, family, &payload) {
++        let Some(sub) = sub else {
++            return Ok(false);
++        };
++        return Box::pin(group_servable(dir, plane, sub, &payload, requester)).await;
++    }
++    let Some(iss) = iss else {
++        return Ok(false);
++    };
++    scope_servable(dir, iss, &payload, requester).await
++}
++
++/// A group voice's audience.
++async fn group_servable<F>(
++    dir: &F,
++    plane: GroupPlane,
++    sub: &str,
++    payload: &Value,
++    requester: Option<&str>,
++) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let Some(peer) = requester else {
++        return Ok(false);
++    };
++    // What the row names: its group, the member it names, the head it is
++    // counted over, the members it lists. A payload that does not read is
++    // served to no one (it was admitted, so this is unreachable in practice).
++    let (kind, group, named, head, mut party) = match plane {
++        GroupPlane::Roster => {
++            let Ok(v) = roster_view(sub, payload) else {
++                return Ok(false);
++            };
++            let listed = listed_members(payload);
++            (v.kind, v.group, None, v.head, listed)
++        }
++        GroupPlane::Widening | GroupPlane::Removal => {
++            let Ok((v, _)) = membership_of(plane, sub, payload) else {
++                return Ok(false);
++            };
++            (v.kind, v.group, Some(v.member), v.head, BTreeSet::new())
++        }
++    };
++    if crate::federation::replication_audience::may_receive_group_plane(
++        dir,
++        peer,
++        kind.as_str(),
++        &group,
++        named.as_deref(),
++    )
++    .await?
++    .allowed()
++    {
++        return Ok(true);
++    }
++    // The members at the named head.
++    if let Some(h) = head {
++        if let Some(st) = dir.edition2_voices(&h).await?.first() {
++            if let Ok(v) = roster_view_of_statement(st) {
++                if v.group == group && v.kind == kind {
++                    party.extend(listed_members(&v.payload));
++                }
++            }
++        }
++    }
++    // The held record's founders.
++    let founder = Some(crate::federation::admission::MEMBER_ROLE_FOUNDER);
++    match kind {
++        crate::federation::group_plane::GroupKind::Family => {
++            if let Some(f) = dir.lookup_family(&group).await? {
++                party.extend(
++                    f.members
++                        .into_iter()
++                        .filter(|m| m.role.as_deref() == founder)
++                        .map(|m| m.key_id),
++                );
++            }
++        }
++        crate::federation::group_plane::GroupKind::Community => {
++            if let Some(c) = dir.lookup_community(&group).await? {
++                party.extend(
++                    c.members
++                        .into_iter()
++                        .filter(|m| m.role.as_deref() == founder)
++                        .map(|m| m.key_id),
++                );
++            }
++        }
++    }
++    if party.is_empty() {
++        return Ok(false);
++    }
++    if party.contains(peer) {
++        return Ok(true);
++    }
++    let principals = crate::federation::self_collective::principals_of(dir, peer).await?;
++    Ok(principals.iter().any(|p| party.contains(p)))
++}
++
++/// Any other statement-only row: the scope its payload states.
++async fn scope_servable<F>(
++    dir: &F,
++    iss: &str,
++    payload: &Value,
++    requester: Option<&str>,
++) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let Some(scope) = payload.get_text("cohort_scope").and_then(Value::as_text) else {
++        return Ok(false);
++    };
++    let placement = cs::Scope::parse(scope).map(cs::Scope::placement);
++    match (placement, requester) {
++        (Some(cs::Placement::Commons), _) => Ok(true),
++        (None, _) | (Some(_), None) => Ok(false),
++        (Some(_), Some(peer)) => {
++            let envelope = json_of(payload);
++            let target =
++                crate::federation::admission::envelope_cohort_target(&envelope).unwrap_or(None);
++            crate::federation::replication::hold::is_audience(
++                dir,
++                scope,
++                target,
++                iss,
++                |author| author == peer,
++                peer,
++            )
++            .await
++        }
++    }
++}
+diff --git a/src/federation/edition2/group_serve_invariants.rs b/src/federation/edition2/group_serve_invariants.rs
+new file mode 100644
+index 0000000..ba63ce1
+--- /dev/null
++++ b/src/federation/edition2/group_serve_invariants.rs
+@@ -0,0 +1,172 @@
++//! v62.0.0 (wave T1) — **a group's statements replicate to its members**, on
++//! sqlite and postgres. A group voice maps to no attestation row
++//! ([`super::group`]); `serve::servable_to` decides its audience from the
++//! statement ([`super::group_serve`]).
++//!
++//! - **I3006** a founding roster voice still gathering voices (`Pending`)
++//!   is served to the members it lists, so they can sign it; it is not
++//!   served to a stranger, nor to an anonymous read.
++//! - **I3007** a landed roster is served to a member and not to a stranger
++//!   (E4's I1488 shape).
++//! - **I3008** a removal is served to the removed member (the member it
++//!   names) and to a member, and not to a stranger.
++
++use chrono::{TimeZone, Utc};
++use ciris_crypto::composite::CompositeSigningKey;
++use ciris_verify_core::cde::Value;
++
++use super::door_invariants::fixture::{iref, key, key_record};
++use super::group::{
++    membership_payload, roster_payload, GroupRecord, MembershipRecord, GROUP_ROSTER_PREFIX,
++    MEMBERSHIP_PREFIX,
++};
++use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
++use super::serve::servable_to;
++use crate::federation::types::{Family, FamilyMember, FamilyMembershipRevocation};
++use crate::federation::FederationDirectory;
++
++type K = CompositeSigningKey;
++
++fn at(ms: i64) -> chrono::DateTime<Utc> {
++    Utc.timestamp_millis_opt(ms).single().unwrap()
++}
++
++fn sign(k: &K, sub: &str, prefix: &str, p: &Value) -> Vec<u8> {
++    ciris_verify_core::edition2::sign_row_statement(
++        k,
++        &iref(k),
++        sub,
++        "scores",
++        &ciris_verify_core::namespace_match::family_id(prefix),
++        p,
++        vec![],
++    )
++    .unwrap()
++}
++
++async fn put(d: &dyn FederationDirectory, st: &[u8]) -> StatementOutcome {
++    put_statement(d, st, None, INGEST_TIER).await.unwrap()
++}
++
++async fn served(d: &dyn FederationDirectory, st: &[u8], to: Option<&K>) -> bool {
++    let peer = to.map(iref);
++    servable_to(d, st, peer.as_deref()).await.unwrap()
++}
++
++pub(crate) async fn body(d: &dyn FederationDirectory) {
++    let (a, b, c, stranger, g) = (key(211), key(212), key(213), key(214), key(215));
++    for k in [&a, &b, &c, &stranger] {
++        put_statement(d, &key_record(k, &["user"], 0, None), None, INGEST_TIER)
++            .await
++            .unwrap();
++    }
++    let gid = iref(&g);
++    let record = GroupRecord::Family(Family {
++        family_key_id: gid.clone(),
++        family_name: "served".into(),
++        members: [&a, &b, &c]
++            .iter()
++            .map(|k| FamilyMember {
++                key_id: iref(k),
++                joined_at: at(1_000),
++                role: None,
++            })
++            .collect(),
++        founded_at: at(1_000),
++        consensus_protocol: "majority".into(),
++        consensus_protocol_entrenched: false,
++        dissolved_at: None,
++        prev_head_digest: String::new(),
++        charter_digest: String::new(),
++        persist_row_hash: String::new(),
++    });
++    let p = roster_payload(&record, 1, None, 2_000).unwrap();
++    let voices: Vec<Vec<u8>> = [&a, &b, &c]
++        .iter()
++        .map(|k| sign(k, &gid, GROUP_ROSTER_PREFIX, &p))
++        .collect();
++
++    // I3006 — pending, served to the members it lists.
++    let o = put(d, &voices[0]).await;
++    assert!(matches!(o, StatementOutcome::Pending { .. }), "I3006 {o:?}");
++    assert!(
++        d.get_attestation(&super::names::RowId::of_statement(&voices[0]).unwrap().hex())
++            .await
++            .unwrap()
++            .is_none(),
++        "I3006 a group voice maps to no attestation row"
++    );
++    assert!(
++        served(d, &voices[0], Some(&b)).await,
++        "I3006 a listed member"
++    );
++    assert!(
++        !served(d, &voices[0], Some(&stranger)).await,
++        "I3006 a stranger"
++    );
++    assert!(!served(d, &voices[0], None).await, "I3006 anonymous");
++
++    // I3007 — landed, served to a member and not to a stranger.
++    put(d, &voices[1]).await;
++    let o = put(d, &voices[2]).await;
++    let StatementOutcome::Row { row_id: head, .. } = o else {
++        panic!("I3007 landed: {o:?}");
++    };
++    for v in &voices {
++        assert!(served(d, v, Some(&a)).await, "I3007 a member");
++        assert!(served(d, v, Some(&c)).await, "I3007 a member");
++        assert!(!served(d, v, Some(&stranger)).await, "I3007 a stranger");
++    }
++
++    // I3008 — a removal, served to the removed member.
++    let removal = MembershipRecord::FamilyRemoval(FamilyMembershipRevocation {
++        family_key_id: gid.clone(),
++        removed_identity_key_id: iref(&c),
++        removed_at: at(5_000),
++        effective_at: at(5_000),
++        reason: None,
++        witness_set: Vec::new(),
++        persist_row_hash: String::new(),
++    });
++    let mp = membership_payload(&removal, Some(&head)).unwrap();
++    let rv: Vec<Vec<u8>> = [&a, &b]
++        .iter()
++        .map(|k| sign(k, &iref(&c), MEMBERSHIP_PREFIX, &mp))
++        .collect();
++    put(d, &rv[0]).await;
++    let o = put(d, &rv[1]).await;
++    assert!(
++        matches!(o, StatementOutcome::Row { .. }),
++        "I3008 landed: {o:?}"
++    );
++    for v in &rv {
++        assert!(served(d, v, Some(&c)).await, "I3008 the removed member");
++        assert!(served(d, v, Some(&a)).await, "I3008 a member");
++        assert!(!served(d, v, Some(&stranger)).await, "I3008 a stranger");
++    }
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3006_i3008_group_voices_served_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3006_i3008_group_voices_served_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}

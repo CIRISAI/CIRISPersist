@@ -1,0 +1,3878 @@
+diff --git a/docs/EDITION2_PAYLOADS.md b/docs/EDITION2_PAYLOADS.md
+index 91fd2069..1934adc6 100644
+--- a/docs/EDITION2_PAYLOADS.md
++++ b/docs/EDITION2_PAYLOADS.md
+@@ -2,23 +2,48 @@
+ 
+ **Status: CC-READING(next-edition).** CC adopted this reading (`FSD/v62_docs/RULINGS.md`, "Families and payloads"): each family's edition-2 payload carries the earlier record's members one to one, in the deterministic encoding (CDE, CC 2.6.1.2), with no embedded signed object. The statements are the authority. What the earlier form carried as a co-signature (a co-scrub, a roster cosignature, a quorum or threshold signature set) is now a further statement over the same payload: a counted voice (CC 2.6.1.9), never a payload member.
+ 
+-The tables below are rendered from `ciris_persist::federation::edition2::payloads::FAMILIES`, the member lists persist's door checks (`payloads::check`, refusal `edition2_payload_invalid`). A witness (I2102) keeps this file equal to them.
++**CC's corrections (v62.0.0).** CC checked these nine families against its text (`manifests/family_payloads_v2.cddl`, read with `signed_object_v2.cddl`). Where the text differed from this table, the text won:
++
++- a roster version names the version it extends by `refs.head`, not `refs.prev` (which is a signer's own series);
++- the charter rides `refs.also.cites`: the `also` roles are a closed registry of two, `ack` and `cites`;
++- `consensus_protocol_entrenched` is a `bool`, and absent reads `false`;
++- `group:roster` gains `cohort_subkind`, `cohort_subkind_payload` and `membership` (`private` | `public`, absent reads public);
++- the membership stages this table maps are the counted leaves, `widening` and `removal`, each counted over `refs.head` (required); the other four stages' forward payloads are OPEN;
++- `reason` is a uint code from a closed registry, never text; free text rides `body.note`;
++- the cosign states are `pending` | `signature`, closed, and neither carries a member of its own. There is no `lineage_head` state: the lineage-head cosignature is no row (CC 3.4.10, CC 5.3.1), and its edition-2 form is OPEN;
++- a takedown's `legal_basis` is CC 3.3.2's closed set of eleven and equals the leaf, and `perceptual_hash` and `counter_notice_channel` join it;
++- a custody report carries no `expires_at` member, and one that carries it is refused even though the envelope admits the member on other families (it is live 72 hours from its instant, CC 3.1.3.3). It carries no `cohort` member either: its scope is the CC 2.1 members `community_id` / `family_id`. Its `evidence_refs` holds exactly one digest;
++- a key grant's `owner` is required on content and stream, its `epoch` on epoch and stream, and its `wrap_algorithm` is the v2 wire string only. Its target alias is the CC 2.1 member, not a family member;
++- a delivery receipt carries no inner signed object: the length-prefixed preimage the subscriber signed is the earlier form's (CC 8.11.30);
++- `identity:occurrence_revocation` names its two keys `identity_key_id` and `occurrence_key_id`, the occurrence record's own names, one to one (CC's naming ruling);
++- `amendment_digest` (on `deferral:response:approved` and `identity_amendment`) is a hash digest, `[-16, bstr .size 32]`.
++
++A payload that breaks any of these is refused `edition2_payload_invalid`. v62.0.0 (wave P1d): the edition-2 door enforces these lists, with its pure gates and before any directory read, on the local and the replicated door alike (`door::pure_statement_gates` → `payloads::check_by_id`, by the header's family id).
++
++The tables below are rendered from `ciris_persist::federation::edition2::payloads::FAMILIES` and its rule tables (`LEAVES`, `CLOSED_VALUES`, `PROSE_RULES`, `COMMON`, `HASH_DIGEST_MEMBERS`). They are the member lists persist's door checks (`payloads::check`, refusal `edition2_payload_invalid`). A witness (I2102) keeps this file equal to them.
+ 
+ ## Conventions
+ 
+-- **Common members**, carried by every row and not repeated below (CC 2.6.1.3):
++- **Common members**, which any row may carry and which are not repeated below (CC 2.6.1.3, the CDDL's `attestation-envelope`, and the CC 2.1 members that CC 2.6.1.4 maps to "payload members of the same names"):
+   - `asserted_at`: `uint (ms)`, required;
+   - `author`: `identity-ref`, present on an authored family only;
+   - `dimension`: `tstr`, the family instance, required where the family id has a parameter (for example `membership:widening:v1` under `membership:{stage}`). A member marked "required when `dimension` is `x`" is required when `x` is a segment of `dimension`;
+-  - `refs`: a map of `row-ref`s; the roles each family carries are listed as `refs.<role>` rows.
++  - `refs`: a map of `row-ref`s; the roles each family carries are listed as `refs.<role>` rows, and `refs.also.<role>` takes only `ack` or `cites`;
++  - `reason`: `uint`, a code from a closed registry (0 = unspecified);
++  - `body`: a map; its `note` is the one free-text member, at most 2048 bytes;
++  - `evidence_refs`: `[+ hash-digest]`, a sequence in the order signed;
++  - `valid_from`, `valid_until`, `expires_at`: `uint (ms)`;
++  - `cohort_scope`, `community_id`, `family_id`, `subject_key_ids`, `delivery_mode`: the CC 2.1 visibility, revocability and delivery axes;
++  - the envelope's `seat_commitment`, `score`, `confidence`, `weight`, `passed`, `total` and `salt`.
+ - **Conversions**, everywhere:
+   - an instant (RFC 3339 text) becomes `uint (ms)` (CC 2.6.2);
+   - a key id becomes an `identity-ref` (CC 2.6.1.1);
+   - a reference to a held row (`persist_row_hash`, `attestation_id`, a `*_digest`) becomes a `row-ref` under `refs`, computed by the node (CC 2.6.1.3);
+-  - a SHA-256 digest carried as hex becomes a hash digest, `[-16, bstr .size 32]` (the form Verify's door reads; the earlier gates' 64-hex strings are its projection);
+-  - a set (`[* …]`) is sorted by each element's deterministic encoding and has no duplicates;
++  - a SHA-256 digest carried as hex becomes a hash digest, `[-16, bstr .size 32]` (the form Verify's door reads; the earlier gates' 64-hex strings are its projection, for the members listed under "Hash-digest members");
++  - a set (`[* …]`) is sorted by each element's deterministic encoding and has no duplicates; a sequence (`[+ …]`) keeps its signed order;
+   - `persist_row_hash`, `original_content_hash`, the `scrub_*` members, `scrub_key_id`, `scrub_timestamp`, `pqc_completed_at` and `observed_region` are gone: the row id and the statements replace them.
+ - **`bool`** (`consensus_protocol_entrenched`) is the one member outside uint / bstr / tstr / identity-ref / row-ref. Absent reads as `false`.
++- **`ceg-value`** marks a member whose type the text leaves OPEN (`perceptual_hash`).
+ 
+ ## Families
+ 
+@@ -35,22 +60,30 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
+ | `group_kind` | `tstr` | required | the record's kind: "family" \| "community" |
+ | `group` | `identity-ref` | required | Family.family_key_id / Community.community_key_id (equals sub) |
+ | `name` | `tstr` | required | Family.family_name / Community.community_name |
+-| `version` | `uint` | required | federation_group_versions.version |
+-| `members` | `[* roster-member]` | required | Family.members / Community.members |
++| `version` | `uint` | required | federation_group_versions.version (a consistency check only) |
++| `members` | `[* roster-member]` | required | Family.members / Community.members (a set) |
+ | `founded_at` | `uint (ms)` | required | founded_at |
+ | `consensus_protocol` | `tstr` | required | consensus_protocol |
+-| `consensus_protocol_entrenched` | `bool` | optional | Family.consensus_protocol_entrenched (absent: false) |
++| `consensus_protocol_entrenched` | `bool` | optional | Family.consensus_protocol_entrenched (absent reads false) |
+ | `dissolved_at` | `uint (ms)` | optional | Family.dissolved_at |
+-| `policy` | `map` | optional | Community.policy_blob (cohort_scope among its members) |
+-| `refs.prev` | `row-ref` | optional | prev_head_digest (the predecessor version's persist_row_hash); absent on version 1 |
+-| `refs.also:charter` | `row-ref` | optional | charter_digest (the trust:charter:v1 row in force) |
++| `policy` | `map` | optional | Community.policy_blob (an open map) |
++| `cohort_subkind` | `tstr` | optional | a community's discriminator (CC 3.2; earlier: policy_blob.cohort_subkind) |
++| `cohort_subkind_payload` | `map` | optional | a community's Option<SubkindPayload> (CC 3.2) |
++| `membership` | `tstr` | optional | a community's founding row: "private" \| "public" (CC 3.1.3.2; absent reads public) |
++| `refs.head` | `row-ref` | optional | prev_head_digest: the version this one extends (CC 3.2 T6); absent on version 1, present on every later one |
++| `refs.also.cites` | `row-ref` | optional | charter_digest: the trust:charter row in force, placed by its family |
++
++Rules beyond the list (refused `edition2_payload_invalid`):
++
++- `membership` is one of `private`, `public`
++- `refs.head` is absent on version 1 and present on every later version
+ 
+ | earlier-form co-signature (not a payload member) | now |
+ |---|---|
+ | scrub_signature_classical / scrub_signature_pqc under authority_key_id | the group key's own statement |
+ | cosignatures (RosterCosignature) | one statement per listed member over the same payload |
+ | supersede_proof.quorum_signatures (ThresholdSignature) | the predecessor roster's holders' statements, counted at its consensus_protocol |
+-| SignedCommunity.lineage | nothing carried: each prior version is its own held row, named by refs.prev |
++| SignedCommunity.lineage | nothing carried: each prior version is its own held row, named by refs.head |
+ 
+ ### `membership:{stage}`
+ 
+@@ -58,6 +91,7 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
+ - **Authorship:** counted (stages widening, removal)
+ - **`sub`:** the member's identity-ref
+ - **Lands in:** federation_{family,community}_membership_{revocations,widenings}
++- **Leaves mapped:** `widening`, `removal` (another leaf's payload is OPEN, not this table's)
+ 
+ | member | CBOR type | presence | maps from |
+ |---|---|---|---|
+@@ -67,58 +101,83 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
+ | `removed_at` | `uint (ms)` | required when `dimension` is `removal` | MembershipRevocation.removed_at |
+ | `joined_at` | `uint (ms)` | required when `dimension` is `widening` | MembershipWidening.joined_at |
+ | `effective_at` | `uint (ms)` | required | effective_at |
+-| `reason` | `tstr` | optional | MembershipRevocation.reason |
++| `valid_until` | `uint (ms)` | optional | a time-boxed guest's widening (CC 3.3.4) |
++| `reason` | `uint` | optional | MembershipRevocation.reason, as a code of the closed registry (free text: body.note) |
+ | `role` | `tstr` | optional | MembershipWidening.role |
+ | `witness_set` | `[* identity-ref]` | optional | MembershipRevocation.witness_set (vouching key ids, not signatures) |
+-| `refs.head` | `row-ref` | optional | the roster version the change is counted over (earlier: the signed instant) |
++| `refs.head` | `row-ref` | required | the roster version the change is counted over (CC 2.6.1.9; earlier: the signed instant) |
++| `refs.also.cites` | `row-ref` | optional | a widening: the acceptance it spends (CC 3.1.3.2); a node's widening has none |
+ 
+ | earlier-form co-signature (not a payload member) | now |
+ |---|---|
+ | scrub_signature_* under authority_key_id | the proposer's statement |
+ | cosignatures (RosterCosignature) | the roster members' statements, counted at the group's consensus_protocol |
+ 
++### `identity:occurrence`
++
++- **Replaces:** SignedIdentityOccurrence / IdentityOccurrence (an identity:occurrence:v1 row)
++- **Authorship:** authored (by a live roster key of the identity); the occurrence key's own statement is a second voice, role occurrence_key (party sub)
++- **`sub`:** the occurrence key's identity-ref (occurrence_key_id)
++- **Lands in:** federation_identity_occurrences (+ federation_identity_occurrence_history, transport_destinations)
++
++| member | CBOR type | presence | maps from |
++|---|---|---|---|
++| `identity_key_id` | `identity-ref` | required | identity_key_id (equals author) |
++| `occurrence_key_id` | `identity-ref` | required | occurrence_key_id (equals sub) |
++| `device_class` | `tstr` | required | device_class: phone \| laptop \| server \| embedded \| agent \| service |
++| `hardware_attestation` | `bstr` | optional | hardware_attestation (base64 in the earlier form) |
++| `transport_destination` | `map` | optional | transport_destination: exactly reticulum_x25519_pubkey (bstr 32), reticulum_ed25519_pubkey (bstr 32), app_name (tstr), aspects ([* tstr]), destination_hash (bstr 16, derived per CC 3.3.6.3) |
++| `transit_xwing_pubkey` | `bstr` | optional | transport_destination's transit_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2) |
++| `onion_hop_xwing_pubkey` | `bstr` | optional | transport_destination's onion_hop_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2) |
++| `onion_relay` | `map` | optional | exactly {"opt_out": true}, on a node that opts out of relaying (CC 3.3.6.2) |
++| `encryption_pubkeys` | `map` | optional | encryption_pubkeys: exactly x25519 (bstr 32) and ml_kem_768 (bstr 1184) |
++| `build_manifest_hash` | `hash-digest [-16, bstr .size 32]` | optional | build_manifest_hash |
++| `valid_until` | `uint (ms)` | optional | valid_until (absent: indefinite; present: later than asserted_at) |
++| `refs.also.cites` | `row-ref` | optional | build_manifest_ref: the provenance:build_manifest:{target} row |
++
++| earlier-form co-signature (not a payload member) | now |
++|---|---|
++| SignedIdentityOccurrence.signature (TransportBindingSignature) under attesting_key_id | the author's statement: a live roster key of the identity (iss = identity_key_id) |
++| none (the earlier form carried no proof of possession) | the occurrence key's own statement over the same payload (iss = sub), required before the author's |
++| the self-roster door's assent rows (objection:assent:v1) | further roster keys' statements as the identity over the same payload, a strict majority of the live roster counted |
++
+ ### `identity:occurrence_revocation`
+ 
+-- **Replaces:** FramedOccurrenceRevocation / IdentityOccurrenceRevocation (an identity:occurrence_revocation:v1 row)
++- **Replaces:** IdentityOccurrenceRevocation (an identity:occurrence_revocation:v1 row; no framed object is embedded)
+ - **Authorship:** counted for a user self (identity=user), else authored
+ - **`sub`:** the occurrence's identity-ref
+ - **Lands in:** federation_identity_occurrence_revocations
+ 
+ | member | CBOR type | presence | maps from |
+ |---|---|---|---|
+-| `identity` | `identity-ref` | required | identity_key_id |
+-| `occurrence` | `identity-ref` | required | occurrence_key_id (equals sub) |
++| `identity_key_id` | `identity-ref` | required | identity_key_id (the occurrence record's own name, CC ruling v62) |
++| `occurrence_key_id` | `identity-ref` | required | occurrence_key_id (equals sub) |
+ | `revoked_at` | `uint (ms)` | required | revoked_at |
+ | `effective_at` | `uint (ms)` | required | effective_at (may be later than asserted_at) |
+-| `reason` | `tstr` | optional | reason |
++| `reason` | `uint` | optional | reason, as a code of the closed registry (free text: body.note) |
+ | `witness_set` | `[* identity-ref]` | optional | witness_set |
+ 
+ | earlier-form co-signature (not a payload member) | now |
+ |---|---|
+-| FramedOccurrenceRevocation.signature (TransportBindingSignature) under attesting_key_id | the revoker's statement |
++| FramedOccurrenceRevocation.signature (TransportBindingSignature) under attesting_key_id | the revoker's statement (the statement's signer) |
+ | the row's additional_scrubs (roster cosigs, user self) | the roster members' statements, a strict majority counted |
+ 
+ ### `cosign:{state}`
+ 
+-- **Replaces:** LineageHeadCosign (state `lineage_head`); cosign:pending:v1 / cosign:signature:v1 rows
++- **Replaces:** cosign:pending:v1 / cosign:signature:v1 rows (the states are closed: pending \| signature)
+ - **Authorship:** authored
+-- **`sub`:** the lineage's identity-ref (lineage_head); the group's (pending, signature)
+-- **Lands in:** federation_lineage_head_cosigns (lineage_head); ceg_statements only (pending, signature)
++- **`sub`:** the event's sub (the group's identity-ref)
++- **Lands in:** ceg_statements only
++- **Leaves (closed):** `pending`, `signature`
++- **Payload:** the event's own; its members are checked under the event's family
+ 
+-| member | CBOR type | presence | maps from |
+-|---|---|---|---|
+-| `lineage` | `identity-ref` | required when `dimension` is `lineage_head` | LineageHeadCosign.lineage_key_id |
+-| `head_asserted_at` | `uint (ms)` | required when `dimension` is `lineage_head` | LineageHeadCosign.head_asserted_at |
+-| `event_family` | `tstr` | required when `dimension` is `pending` | cosign event_family |
+-| `group_kind` | `tstr` | required when `dimension` is `pending` | cosign group_kind |
+-| `refs.head` | `row-ref` | required when `dimension` is `lineage_head` | head_digest_sha256_hex (the head's persist_row_hash) |
+-| `refs.prev` | `row-ref` | optional | prior_head_digest_sha256_hex |
+-| `refs.target` | `row-ref` | required when `dimension` is `pending` | pending: the event (embedded `event`, now named); signature: quorum_key (the pending row) |
++Members of its own: none.
+ 
+ | earlier-form co-signature (not a payload member) | now |
+ |---|---|
+-| signature_classical / signature_pqc under witness_key_id | the witness's statement (iss); signed_at is asserted_at |
+-| cosign:signature row's scrub + additional_scrubs | a further statement over the event's own row (CC 2.6.1.9); the signature state carries no member of its own |
++| cosign:pending row's embedded event and the primary's signature over its signing bytes | the primary's statement over the event's own payload and header, named by the event's row id; no member of its own |
++| cosign:signature row's scrub + additional_scrubs | a further statement over the event's own payload (CC 2.6.1.9); no member of its own |
++| LineageHeadCosign (signature_classical / signature_pqc under witness_key_id) | no row and no state of this family: the ciris.lineage_head_cosign.v1 object (CC 3.4.10, CC 5.3.1), its edition-2 form OPEN |
+ 
+ ### `revocation:{entity_type}:{reason}`
+ 
+@@ -132,7 +191,6 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
+ | `revoked_at` | `uint (ms)` | required | revoked_at |
+ | `effective_at` | `uint (ms)` | required | effective_at |
+ | `revoked_after` | `uint (ms)` | optional | revoked_after |
+-| `reason` | `tstr` | optional | reason (free text; the {reason} leaf is the coded one) |
+ | `refs.target` | `row-ref` | optional | the revoked row, when the entity is a row (no earlier field: revoked_key_id named keys only) |
+ 
+ | earlier-form co-signature (not a payload member) | now |
+@@ -142,23 +200,32 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
+ ### `takedown_notice:{basis}`
+ 
+ - **Replaces:** StewardPurgeNotice (envelope members, notice_terms)
+-- **Authorship:** counted for leaf steward_purge, else authored
++- **Authorship:** authored, but counted for leaf steward_purge and for group=affiliations & seats=one (CC 4.4.3.12)
+ - **`sub`:** the claimant's identity-ref
+ - **Lands in:** ceg_statements (the notice; its id is the row id); purge_executions when the purge runs
++- **Leaves (closed):** `dmca512`, `dsa_article16`, `tvec_terrorist`, `ncmec_csam`, `gifct_cip`, `community_standards`, `perceptual_hash_csam`, `osa_illegal_content`, `avmsd_age_inappropriate`, `court_order`, `steward_purge`
+ 
+ | member | CBOR type | presence | maps from |
+ |---|---|---|---|
+-| `legal_basis` | `tstr` | required | legal_basis (also the {basis} leaf) |
++| `legal_basis` | `tstr` | required | legal_basis (CC 3.3.2's closed set; equals the {basis} leaf) |
+ | `claimant` | `identity-ref` | required | claimant_key_id |
+ | `content_sha256` | `hash-digest [-16, bstr .size 32]` | required | content_sha256 (the selection digest) |
+ | `content_holders` | `[* identity-ref]` | required | content_holder_key_ids |
+ | `claim_text` | `tstr` | required | claim_text |
+ | `good_faith_statement` | `tstr` | required | good_faith_statement |
+ | `jurisdiction` | `tstr` | required | jurisdiction |
+-| `evidence_refs` | `[* hash-digest]` | optional | evidence_refs (the dry-run ledger digests) |
++| `evidence_refs` | `[+ hash-digest]` | optional | evidence_refs (the dry-run ledger digests; a URI reference is OPEN) |
++| `perceptual_hash` | `ceg-value` | optional | perceptual_hash (CC 3.3.2; its type is OPEN) |
++| `counter_notice_channel` | `tstr` | optional | counter_notice_channel (CC 3.3.2) |
+ | `selection_counts` | `map` | optional | selection_counts |
+ | `expires_at` | `uint (ms)` | optional | expires_at |
+ 
++Rules beyond the list (refused `edition2_payload_invalid`):
++
++- `legal_basis` is one of `dmca512`, `dsa_article16`, `tvec_terrorist`, `ncmec_csam`, `gifct_cip`, `community_standards`, `perceptual_hash_csam`, `osa_illegal_content`, `avmsd_age_inappropriate`, `court_order`, `steward_purge`
++- `legal_basis` equals the `{basis}` leaf of `dimension`
++- a `steward_purge` notice is counted: it carries no `author`
++
+ | earlier-form co-signature (not a payload member) | now |
+ |---|---|
+ | cosignatures (ThresholdSignature, one per founder) | the stewards' statements, counted |
+@@ -173,10 +240,14 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
+ | member | CBOR type | presence | maps from |
+ |---|---|---|---|
+ | `custody_state` | `tstr` | required | custody_state: "here" \| "none" |
+-| `evidence_refs` | `[* hash-digest]` | required | evidence_refs (blob sha256) |
++| `evidence_refs` | `[+ hash-digest]` | required | evidence_refs: exactly one, the blob's address digest |
+ | `size` | `uint` | required when `custody_state` is `here` | size |
+-| `cohort` | `identity-ref` | required | community_id / family_key_id |
+-| `expires_at` | `uint (ms)` | required | the row's expires_at (asserted_at + 72 h) |
++
++Rules beyond the list (refused `edition2_payload_invalid`):
++
++- `custody_state` is one of `here`, `none`
++- `evidence_refs` holds exactly one digest, the blob's address
++- `expires_at` is not a member: a report is live 72 hours from its `asserted_at` (CC 3.1.3.3)
+ 
+ Co-signatures now counted voices: none (the author's statement alone).
+ 
+@@ -190,16 +261,18 @@ Co-signatures now counted voices: none (the author's statement alone).
+ | member | CBOR type | presence | maps from |
+ |---|---|---|---|
+ | `axis` | `tstr` | required | axis: "epoch" \| "content" \| "stream" (also the {axis} leaf) |
+-| `wrap_algorithm` | `tstr` | required | GrantWrap.wrap_algorithm |
++| `wrap_algorithm` | `tstr` | required | GrantWrap.wrap_algorithm (the v2 wire string only) |
+ | `wrapped_dek` | `bstr` | required | GrantWrap.wrapped_dek |
+ | `community` | `identity-ref` | required when `axis` is `epoch` | community_key_id |
+-| `community_id` | `tstr` | optional | community_id |
+ | `minter` | `identity-ref` | required when `axis` is `epoch` | minter_key_id |
+-| `epoch` | `uint` | optional | epoch (epoch and stream axes) |
++| `epoch` | `uint` | required when `axis` is `epoch` or `stream` | epoch |
+ | `at_rest_sha256` | `hash-digest [-16, bstr .size 32]` | required when `axis` is `content` | at_rest_sha256 |
+-| `owner` | `identity-ref` | optional | owner_key_id (content and stream axes) |
++| `owner` | `identity-ref` | required when `axis` is `content` or `stream` | owner_key_id (the axis identity, CC 3.3.2) |
+ | `stream_id` | `tstr` | required when `axis` is `stream` | stream_id |
+-| `cohort` | `identity-ref` | optional | the cohort target (community_id / family_key_id) |
++
++Rules beyond the list (refused `edition2_payload_invalid`):
++
++- `wrap_algorithm` is one of `x25519_mlkem768_aes256_gcm_hkdf_sha256`
+ 
+ Co-signatures now counted voices: none (the author's statement alone).
+ 
+@@ -214,12 +287,12 @@ Co-signatures now counted voices: none (the author's statement alone).
+ |---|---|---|---|
+ | `stream_id` | `tstr` | required | stream_id (also the {stream_id} leaf) |
+ | `epoch` | `uint` | required | epoch |
+-| `k` | `uint` | required | k (the chunk index acknowledged) |
++| `k` | `uint` | required | K (the chunk index acknowledged; CBOR member names are lowercase) |
+ | `chunk_root` | `hash-digest [-16, bstr .size 32]` | required | chunk_root |
+ 
+ | earlier-form co-signature (not a payload member) | now |
+ |---|---|
+-| signature (HybridSignature over the binary receipt bytes) | the subscriber's composite statement; the receipt store's HybridSignature is filled from its two halves |
++| signature (HybridSignature over the length-prefixed ciris-delivery-receipt/v1 bytes) | the subscriber's composite statement over the payload; no inner signed object (the earlier layout is CC 8.11.30); the receipt store's HybridSignature is filled from its two halves |
+ 
+ ### `roster-member` (an entry of `group:roster`'s `members`)
+ 
+@@ -228,4 +301,11 @@ Co-signatures now counted voices: none (the author's statement alone).
+ | `key` | `identity-ref` | required | FamilyMember/CommunityMember.key_id |
+ | `joined_at` | `uint (ms)` | required | FamilyMember/CommunityMember.joined_at |
+ | `role` | `tstr` | optional | FamilyMember/CommunityMember.role |
++
++### Every mapped family
++
++- **Common members** (any family): `asserted_at`, `author`, `body`, `cohort_scope`, `community_id`, `confidence`, `delivery_mode`, `dimension`, `evidence_refs`, `expires_at`, `family_id`, `passed`, `reason`, `refs`, `salt`, `score`, `seat_commitment`, `subject_key_ids`, `total`, `valid_from`, `valid_until`, `weight`
++- **Hash-digest members** (any family; the earlier gates read each as 64 hex): `evidence_refs`, `carried`, `seat_commitment`, `amendment_digest`
++- every `refs.also` role is `ack` or `cites` (a closed registry, CC 2.6.1.3)
++- `body.note`, when present, is text of at most 2048 bytes
+ <!-- END rendered -->
+diff --git a/scripts/gen_directory_double.py b/scripts/gen_directory_double.py
+index 6971f699..250e510f 100644
+--- a/scripts/gen_directory_double.py
++++ b/scripts/gen_directory_double.py
+@@ -89,6 +89,22 @@ DELEGATED_DEFAULTS = (
+     # the trust-root reads ask it for every unlabelled `delegates_to`, so
+     # through the double it must reach the backend's held set.
+     "trust_direction_held_among",
++    # v62.0.0 (wave P1c) — the edition-2 statement store's leaves: each
++    # defaulted "none held" / a `Backend` refusal, overridden by sqlite and
++    # postgres, composing no trait method. Before this, the double answered
++    # every edition-2 read with the default, so a fault injected on the key
++    # plane (`edition2_statements_about`) was never observed and a witness
++    # counting the door's reads through the double could not fail.
++    # `key_edition` stays out: its default is a composition over
++    # `lookup_public_key`.
++    "edition2_statements_about",
++    "edition2_voices",
++    "edition2_rows_naming",
++    "edition2_objects",
++    "put_edition2_object",
++    "put_edition2_statement",
++    "upsert_edition2_key_projection",
++    "edition2_statements_since",
+ )
+ 
+ # NOT_DELEGATED — an `Unsupported`-bodied default the double must NOT delegate,
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index 35475526..e425a7f2 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -19566,6 +19566,43 @@ pub fn check_delivery_mode_vocabulary(envelope: &serde_json::Value) -> Result<()
+ /// model this door's stamp to do that, and a second spelling of a projection
+ /// that drifts is precisely how #643 and #598 each acquired their defect.
+ pub fn check_envelope_size_admission(envelope: &serde_json::Value) -> Result<(), Error> {
++    // v62.0.0 (wave P1c) — a row mapped from an edition-2 statement carries
++    // the statement under `ceg_statement`
++    // ([`STATEMENT_MEMBER`](super::edition2::ingest::STATEMENT_MEMBER)), as
++    // hex. Its envelope is DERIVED: a pure function of that statement
++    // (`edition2::ingest::attestation_of`, checked equal by
++    // `verify_carried`), so its size is the statement's, bounded by
++    // construction. The cap is therefore the statement's own bytes, the
++    // edition-2 door's
++    // ([`MAX_STATEMENT_BYTES`](super::edition2::door::MAX_STATEMENT_BYTES)),
++    // and the earlier-form envelope cap is not applied again: counting the
++    // derived envelope refused statements under the door cap (the hex copy
++    // doubled it, and a byte-string member is hex in the projection too). An
++    // envelope with no carried statement (every earlier-form JSON row) is
++    // measured exactly as before.
++    let carried = envelope
++        .as_object()
++        .and_then(|o| o.get(super::edition2::ingest::STATEMENT_MEMBER));
++    // A carried member that is not text is not a carried statement: the
++    // whole envelope is measured, and `verify_carried` names the fault.
++    if let Some(hex) = carried.and_then(serde_json::Value::as_str) {
++        let cap = super::edition2::door::MAX_STATEMENT_BYTES;
++        // Two hex digits per statement byte; an odd length rounds up.
++        let statement_bytes = hex.len().div_ceil(2);
++        if statement_bytes > cap {
++            return Err(Error::EnvelopeTooLarge {
++                bytes: statement_bytes,
++                cap,
++            });
++        }
++        return Ok(());
++    }
++    check_envelope_canonical_size(envelope)
++}
++
++/// The canonical (JCS) size of `envelope` against
++/// [`MAX_ATTESTATION_ENVELOPE_BYTES`].
++fn check_envelope_canonical_size(envelope: &serde_json::Value) -> Result<(), Error> {
+     let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope).map_err(|e| {
+         Error::malformed_row(
+             "attestation",
+diff --git a/src/federation/attestation_admit.rs b/src/federation/attestation_admit.rs
+index 9a72c73e..e3bb6bac 100644
+--- a/src/federation/attestation_admit.rs
++++ b/src/federation/attestation_admit.rs
+@@ -590,6 +590,16 @@ where
+     let cx = dir.admission_cx();
+     let mut row = attestation.attestation;
+ 
++    // v62.0.0 (wave P1c) — a row carrying an edition-2 statement must be
++    // exactly what that statement derives, checked FIRST: pure (no read, no
++    // signature, no canonicalization of the offered envelope). A carrying
++    // row's envelope is sized by its statement, not by the earlier-form cap
++    // (`admission::check_envelope_size_admission`), so a forged envelope
++    // beside a small valid statement is refused here, before any gate pays
++    // for it. `verify_carried` still judges the statement at tier 3. A no-op
++    // for a row that carries none.
++    crate::federation::edition2::ingest::check_carried_projection(&row)?;
++
+     // ── AV-76 TIER 0 — the free prologue ────────────────────────
+     // Neither check below reads the row's content or touches the
+     // substrate. Before v22.0.0 (CIRISPersist#543 finding 4) the memory
+diff --git a/src/federation/directory_double.rs b/src/federation/directory_double.rs
+index f3b0c6f3..df7ecf30 100644
+--- a/src/federation/directory_double.rs
++++ b/src/federation/directory_double.rs
+@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
+     }
+ }
+ 
+-// 141 delegations, generated. Every one: fault first, then delegate.
++// 149 delegations, generated. Every one: fault first, then delegate.
+ #[async_trait::async_trait]
+ impl FederationDirectory for FaultInjectingDirectory {
+     async fn adopt_genesis_reanchor(
+@@ -271,6 +271,51 @@ impl FederationDirectory for FaultInjectingDirectory {
+         }
+         self.inner.drop_cosign_rows(quorum_key).await
+     }
++    async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, Error> {
++        if let Some(e) = self.faulted("edition2_objects") {
++            return Err(e);
++        }
++        self.inner.edition2_objects(typ).await
++    }
++    async fn edition2_rows_naming(
++        &self,
++        named: &edition2::names::RowId,
++        role: &str,
++    ) -> Result<Vec<edition2::names::RowId>, Error> {
++        if let Some(e) = self.faulted("edition2_rows_naming") {
++            return Err(e);
++        }
++        self.inner.edition2_rows_naming(named, role).await
++    }
++    async fn edition2_statements_about(
++        &self,
++        family: &str,
++        sub: &str,
++    ) -> Result<Vec<Vec<u8>>, Error> {
++        if let Some(e) = self.faulted("edition2_statements_about") {
++            return Err(e);
++        }
++        self.inner.edition2_statements_about(family, sub).await
++    }
++    async fn edition2_statements_since(
++        &self,
++        cursor: Option<&edition2::store::StatementCursor>,
++        limit: u32,
++    ) -> Result<Vec<edition2::store::ServedStatement>, Error> {
++        if let Some(e) = self.faulted("edition2_statements_since") {
++            return Err(e);
++        }
++        self.inner.edition2_statements_since(cursor, limit).await
++    }
++    async fn edition2_voices(
++        &self,
++        row_id: &edition2::names::RowId,
++    ) -> Result<Vec<Vec<u8>>, Error> {
++        if let Some(e) = self.faulted("edition2_voices") {
++            return Err(e);
++        }
++        self.inner.edition2_voices(row_id).await
++    }
+     async fn enter_mesh(
+         &self,
+         attestation_id: &str,
+@@ -1293,6 +1338,24 @@ impl FederationDirectory for FaultInjectingDirectory {
+         }
+         self.inner.put_community_membership_widening(widening).await
+     }
++    async fn put_edition2_object(
++        &self,
++        object: &edition2::store::HeldObject,
++    ) -> Result<bool, Error> {
++        if let Some(e) = self.faulted("put_edition2_object") {
++            return Err(e);
++        }
++        self.inner.put_edition2_object(object).await
++    }
++    async fn put_edition2_statement(
++        &self,
++        row: &edition2::door::AdmittedRow,
++    ) -> Result<bool, Error> {
++        if let Some(e) = self.faulted("put_edition2_statement") {
++            return Err(e);
++        }
++        self.inner.put_edition2_statement(row).await
++    }
+     async fn put_family(&self, family: SignedFamily) -> Result<(), Error> {
+         if let Some(e) = self.faulted("put_family") {
+             return Err(e);
+@@ -1513,6 +1576,15 @@ impl FederationDirectory for FaultInjectingDirectory {
+     fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
+         self.inner.trust_root_standing_cache()
+     }
++    async fn upsert_edition2_key_projection(
++        &self,
++        set: &edition2::projection::ProjectionSet,
++    ) -> Result<(), Error> {
++        if let Some(e) = self.faulted("upsert_edition2_key_projection") {
++            return Err(e);
++        }
++        self.inner.upsert_edition2_key_projection(set).await
++    }
+     async fn vote_window_first_held(
+         &self,
+         action_id: &str,
+diff --git a/src/federation/edition2/door.rs b/src/federation/edition2/door.rs
+index ee8e32bf..f91806a3 100644
+--- a/src/federation/edition2/door.rs
++++ b/src/federation/edition2/door.rs
+@@ -7,6 +7,12 @@
+ //! 1. **Form** ([`input_form`]). Bytes that are not a tag-18 `COSE_Sign1` are
+ //!    refused [`token::EARLIER_FORM_OBJECT`]. That covers a JSON object of the
+ //!    earlier form, and bytes in no form. Nothing is parsed for standing.
++//!    v62.0.0 (wave P1c) — then **the size**: a statement over
++//!    [`MAX_STATEMENT_BYTES`] is refused `federation_envelope_too_large`.
++//!    Steps 1 and 2 are [`pure_statement_gates`]: a pure function of the
++//!    bytes, which every door runs BEFORE its first directory read (the
++//!    signer's key plane, a roster), as the JSON doors run their pure tier
++//!    (AV-76). A statement that can never be admitted buys no read.
+ //! 2. **Edition-1 row-refs.** A `row-ref` of edition 1 anywhere in `refs` is
+ //!    refused [`token::ROW_REF_EDITION_1`]. This is structural, so the
+ //!    answer does not depend on which keys are held. Verify's reader admits
+@@ -218,21 +224,42 @@ fn door_context(bytes: &[u8], mut ctx: SelectContext) -> SelectContext {
+     ctx
+ }
+ 
+-/// Judge one edition-2 row statement at a door (steps 1 to 5).
++/// v62.0.0 (wave P1c) — the largest edition-2 statement a door reads, in
++/// bytes: [`MAX_ATTESTATION_ENVELOPE_BYTES`](crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES),
++/// the attestation plane's one size cap. The signed thing is the sized
++/// thing (CC#38's rule): the bytes as received, which the store keeps and
++/// forwards as they are.
++pub const MAX_STATEMENT_BYTES: usize = crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES;
++
++/// v62.0.0 (wave P1c) — **the door's pure gates** (steps 1 and 2), a function
++/// of the bytes alone: no directory read and no signature check. In order:
+ ///
+-/// `offered_id` is an id the carrier names the row by, if any. It is
+-/// compared with the computed one, and never used.
++/// 1. the form ([`require_statement_form`]);
++/// 2. the size: over [`MAX_STATEMENT_BYTES`] is `federation_envelope_too_large`;
++/// 3. the decode: bytes that are no `COSE_Sign1` are
++///    [`token::STATEMENT_INVALID`], named by Verify's reader over `keys` (the
++///    decode fault does not depend on which keys are held);
++/// 4. a signed object that is not a row is [`token::NOT_A_ROW`];
++/// 5. an edition-1 row-ref is [`token::ROW_REF_EDITION_1`];
++/// 6. v62.0.0 (wave P1d) — the payload of a family with a member list
++///    ([`super::payloads`], by the header's family id) keeps that list:
++///    `edition2_payload_invalid` otherwise.
++///
++/// [`super::ingest::put_statement`] runs these before it reads the signer's
++/// key plane or a roster (AV-76: a statement that can never be admitted
++/// buys no directory read); [`admit_row`] runs them again at its head.
++/// Verify's verdict (step 3) and everything after it are unchanged.
+ ///
+ /// # Errors
+-/// The door's named refusals (module docs). A statement that waits on a key
+-/// is `Error::AttesterKeyUnknown` (retryable).
+-pub fn admit_row(
+-    bytes: &[u8],
+-    keys: &dyn KeyOwnership,
+-    offered_id: Option<&Digest32>,
+-    ctx: SelectContext,
+-) -> Result<AdmittedRow, Error> {
++/// The refusals above.
++pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyOwnership) -> Result<(), Error> {
+     require_statement_form(bytes)?;
++    if bytes.len() > MAX_STATEMENT_BYTES {
++        return Err(Error::EnvelopeTooLarge {
++            bytes: bytes.len(),
++            cap: MAX_STATEMENT_BYTES,
++        });
++    }
+     let Some((protected, payload)) = statement_parts(bytes) else {
+         // Not even a decodable COSE_Sign1: Verify's reader names the fault.
+         let why = match ciris_verify_core::edition2::verify_row_statement(bytes, keys) {
+@@ -253,6 +280,35 @@ pub fn admit_row(
+         ));
+     }
+     refuse_edition_one(&payload)?;
++    // v62.0.0 (wave P1d) — the family's closed payload map
++    // (`edition2::payloads`), for a family that has one: an unknown member, a
++    // missing required one, a wrong type, a closed value or leaf broken is
++    // `edition2_payload_invalid`. A family with no list passes as before.
++    match protected.get_int(-70002).and_then(Value::as_text) {
++        Some(family) => super::payloads::check_by_id(family, &payload),
++        // No family in the header: Verify's verdict names that fault.
++        None => Ok(()),
++    }
++}
++
++/// Judge one edition-2 row statement at a door (steps 1 to 5).
++///
++/// `offered_id` is an id the carrier names the row by, if any. It is
++/// compared with the computed one, and never used.
++///
++/// # Errors
++/// The door's named refusals (module docs). A statement that waits on a key
++/// is `Error::AttesterKeyUnknown` (retryable).
++pub fn admit_row(
++    bytes: &[u8],
++    keys: &dyn KeyOwnership,
++    offered_id: Option<&Digest32>,
++    ctx: SelectContext,
++) -> Result<AdmittedRow, Error> {
++    // Steps 1 and 2: the pure gates. A door that reads the directory runs
++    // them first itself; repeated here, they cost a decode, and keep this
++    // function whole for every caller.
++    pure_statement_gates(bytes, keys)?;
+ 
+     let ctx = door_context(bytes, ctx);
+     let (row, role) = match verify_row_in_family_with(bytes, keys, &VendoredFamilyModel, &ctx) {
+diff --git a/src/federation/edition2/ingest.rs b/src/federation/edition2/ingest.rs
+index 6704e435..6e2b1044 100644
+--- a/src/federation/edition2/ingest.rs
++++ b/src/federation/edition2/ingest.rs
+@@ -266,6 +266,15 @@ pub fn json_of(v: &Value) -> serde_json::Value {
+     }
+ }
+ 
++/// A fixed6 payload member (CC 2.6.1.5: the value times 10^6, an integer)
++/// as the real the earlier form's gates and the typed columns read.
++fn fixed6_real(payload: &Value, member: &str) -> Option<f64> {
++    let n = payload.get_text(member).and_then(Value::as_i64)?;
++    #[allow(clippy::cast_precision_loss)]
++    let real = n as f64 / 1_000_000.0;
++    Some(real)
++}
++
+ fn ms_instant(ms: u64) -> Result<chrono::DateTime<chrono::Utc>, Error> {
+     i64::try_from(ms)
+         .ok()
+@@ -287,7 +296,8 @@ fn ms_instant(ms: u64) -> Result<chrono::DateTime<chrono::Utc>, Error> {
+ /// - `attesting_key_id` / `scrub_key_id` are `iss`; `attested_key_id` is
+ ///   `sub`; `attestation_type` is the row type.
+ /// - `asserted_at` / `scrub_timestamp` come from `asserted_at` (ms), and
+-///   `expires_at` from `expires_at`.
++///   `expires_at` from `expires_at`; `weight` from the fixed6 `weight`
++///   (`None` when absent).
+ /// - the envelope is the payload's projection ([`json_of`]) plus the
+ ///   statement under [`STATEMENT_MEMBER`]. `original_content_hash` is the
+ ///   SHA-256 of the envelope's JCS image, as every row's is.
+@@ -316,9 +326,7 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
+         // Scores, confidences and weights are integers at the fixed scale of
+         // 10^6 (CC 2.6.1.5); the earlier form's gates read the real value.
+         for member in SCALED_MEMBERS {
+-            if let Some(n) = row.payload.get_text(member).and_then(Value::as_i64) {
+-                #[allow(clippy::cast_precision_loss)]
+-                let real = n as f64 / 1_000_000.0;
++            if let Some(real) = fixed6_real(&row.payload, member) {
+                 o.insert((*member).to_owned(), serde_json::json!(real));
+             }
+         }
+@@ -386,6 +394,12 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
+     }
+     let mut a: Attestation = serde_json::from_value(v)
+         .map_err(|e| Error::InvalidArgument(format!("edition-2 mapping: {e}")))?;
++    // v62.0.0 (wave P1c, E1's finding) — the typed `weight` column is the
++    // payload's fixed6 `weight` (CC 2.6.1.5), as the envelope's real; `None`
++    // when the payload carries none. Before this every edition-2 row stored
++    // NULL, and the weighted folds (`topology`, `trust_scoring`:
++    // `weight.unwrap_or(1.0)`) read every edge at 1.0.
++    a.weight = fixed6_real(&row.payload, "weight");
+     // The earlier form's `row` mirror (CIRISPersist#643) is what its gates
+     // read to bind the columns. An edition-2 statement binds them itself: its
+     // protected header and payload ARE the row (CC 2.6.1.1, "no mirror of the
+@@ -401,6 +415,11 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
+     if !a.subject_key_ids.is_empty() {
+         mirror["subject_key_ids"] = serde_json::json!(a.subject_key_ids);
+     }
++    // The mirror binds `weight` both ways (absent ⇔ column `None`,
++    // `admission`'s mirror gate, compared numerically).
++    if let Some(w) = a.weight {
++        mirror["weight"] = serde_json::json!(w);
++    }
+     if let Some(o) = a.attestation_envelope.as_object_mut() {
+         o.insert("row".to_owned(), mirror);
+     }
+@@ -455,40 +474,139 @@ where
+         return Ok(None);
+     };
+     let bytes = bytes?;
++    // v62.0.0 (wave P1c, AV-76) — the pure gates before the key-plane read.
++    super::door::pure_statement_gates(&bytes, &HeldKeys::new())?;
+     let keys = held_keys_for(dir, &bytes).await?;
+-    let offered: Option<Digest32> = hex::decode(&row.attestation_id)
+-        .ok()
+-        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+-    let Some(offered) = offered else {
+-        return Err(Error::malformed_row(
+-            PLANE,
+-            malformed_row::EDITION2_ROW_ID_MISMATCH,
+-            format!(
+-                "a row carrying an edition-2 statement is stored under its row id, not `{}`",
+-                row.attestation_id
+-            ),
+-        ));
+-    };
++    let offered = offered_row_id(row)?;
+     let admitted = admit_row(&bytes, &keys, Some(&offered), SelectContext::default())?;
+     let expected = attestation_of(&admitted, &row.tier)?;
++    require_projection(&expected, row)?;
++    Ok(Some(admitted))
++}
++
++/// The row id a carrying row is stored under: 32 bytes of lowercase hex.
++fn offered_row_id(row: &Attestation) -> Result<Digest32, Error> {
++    hex::decode(&row.attestation_id)
++        .ok()
++        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
++        .ok_or_else(|| {
++            Error::malformed_row(
++                PLANE,
++                malformed_row::EDITION2_ROW_ID_MISMATCH,
++                format!(
++                    "a row carrying an edition-2 statement is stored under its row id, not `{}`",
++                    row.attestation_id
++                ),
++            )
++        })
++}
++
++/// `row` is exactly `expected`, the projection of the statement it carries:
++/// every typed column the mapping writes, and the envelope.
++fn require_projection(expected: &Attestation, row: &Attestation) -> Result<(), Error> {
+     let same = expected.attestation_id == row.attestation_id
+         && expected.attesting_key_id == row.attesting_key_id
+         && expected.attested_key_id == row.attested_key_id
+         && expected.attestation_type == row.attestation_type
+         && expected.asserted_at == row.asserted_at
+-        && expected.attestation_envelope == row.attestation_envelope
+-        && expected.subject_key_ids == row.subject_key_ids;
+-    if !same {
++        && expected.subject_key_ids == row.subject_key_ids
++        // v62.0.0 (wave P1c) — the weight column is the statement's too.
++        && expected.weight == row.weight
++        // Last: the one comparison whose cost scales with the envelope.
++        && expected.attestation_envelope == row.attestation_envelope;
++    if same {
++        return Ok(());
++    }
++    Err(Error::malformed_row(
++        PLANE,
++        malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++        format!(
++            "row {} is not the projection of the edition-2 statement it carries",
++            row.attestation_id
++        ),
++    ))
++}
++
++/// v62.0.0 (wave P1c) — **the carried-projection pre-check**, a pure
++/// function of the row: no directory read, no signature check, and no
++/// canonicalization of the offered envelope. For a row carrying an edition-2
++/// statement (`ceg_statement`), the row must be exactly what that statement
++/// derives ([`attestation_of`]); otherwise it is refused as
++/// [`verify_carried`] refuses it (`typed_diverges_from_envelope`,
++/// `edition2_row_id_mismatch`, or the door's pure statement gates). `Ok`
++/// for a row that carries none (an earlier-form row).
++///
++/// The attestation door runs it FIRST (`attestation_admit::plan_put_attestation`):
++/// a carrying row's envelope is not size-capped as an earlier-form envelope
++/// is (it is the statement's projection, bounded by the statement's cap), so
++/// a forged envelope beside a small valid statement must be refused before
++/// any gate pays for it. The derivation reads only the statement's bytes,
++/// already capped by the pure gates. [`verify_carried`] still runs at tier 3
++/// and checks the statement's signature and key; this is not a verdict.
++///
++/// # Errors
++/// As above.
++pub fn check_carried_projection(row: &Attestation) -> Result<(), Error> {
++    let Some(bytes) = carried_bytes(row) else {
++        return Ok(());
++    };
++    let bytes = bytes?;
++    super::door::pure_statement_gates(&bytes, &HeldKeys::new())?;
++    let derived = unverified_row(&bytes).ok_or_else(|| {
++        Error::malformed_row(
++            PLANE,
++            malformed_row::EDITION2_STATEMENT_INVALID,
++            "the carried statement has no row header (type, family, iss, sub) or payload",
++        )
++    })?;
++    let offered = offered_row_id(row)?;
++    if offered != derived.row_id.0 {
+         return Err(Error::malformed_row(
+             PLANE,
+-            malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++            malformed_row::EDITION2_ROW_ID_MISMATCH,
+             format!(
+-                "row {} is not the projection of the edition-2 statement it carries",
+-                row.attestation_id
++                "row {} carries a statement whose row id is {}",
++                row.attestation_id,
++                derived.row_id.hex()
+             ),
+         ));
+     }
+-    Ok(Some(admitted))
++    let expected = attestation_of(&derived, &row.tier)?;
++    require_projection(&expected, row)
++}
++
++/// The statement's row as its header and payload state it, UNVERIFIED: the
++/// inputs [`attestation_of`] reads, for [`check_carried_projection`]'s
++/// equality check only (never stored, never a verdict). `statement_id` and
++/// `role` are not read by the mapping and are left empty.
++fn unverified_row(bytes: &[u8]) -> Option<AdmittedRow> {
++    let (protected, payload) = statement_parts(bytes)?;
++    let text = |v: Option<&Value>| v.and_then(Value::as_text).map(str::to_owned);
++    let row_type = text(protected.get_int(-70001))?;
++    let family = text(protected.get_int(-70002))?;
++    let claims = protected.get_int(15)?;
++    let iss = text(claims.get_int(1))?;
++    let sub = text(claims.get_int(2))?;
++    let kid = <[u8; 32]>::try_from(protected.get_int(4)?.as_bytes()?).ok()?;
++    let author = text(payload.get_text("author"));
++    let asserted_at_ms = payload.get_text("asserted_at").and_then(Value::as_u64)?;
++    let names = super::names::names_of(&payload).ok()?;
++    let row_id = super::names::RowId::of_statement(bytes)?;
++    Some(AdmittedRow {
++        row_id,
++        statement_id: [0; 32],
++        kid,
++        iss,
++        sub,
++        row_type,
++        family,
++        author,
++        asserted_at_ms,
++        payload,
++        names,
++        role: None,
++        bytes: bytes.to_vec(),
++    })
+ }
+ 
+ /// The signer's `identity_type` for a row carrying a statement: from its
+@@ -558,7 +676,12 @@ pub async fn put_statement<F>(
+ where
+     F: FederationDirectory + ?Sized,
+ {
+-    super::door::require_statement_form(bytes)?;
++    // v62.0.0 (wave P1c, AV-76) — the pure gates (form, size, decode, not an
++    // object, no edition-1 name) run BEFORE the first directory read below
++    // (the accord's roster, the signer's key plane): a statement that can
++    // never be admitted buys no read. They need no key; an empty key set
++    // only names a decode fault, which no key changes.
++    super::door::pure_statement_gates(bytes, &HeldKeys::new())?;
+     // v62.0.0 (JSON-cut slice A) — an accord invocation is judged against
+     // the holders of the bundle in force for its accord, never the key
+     // plane (`edition2::halt`).
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 96060d48..939efe85 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -65,6 +65,13 @@ mod liveness_invariants;
+ mod payloads_invariants;
+ #[cfg(test)]
+ mod produce_invariants;
++// v62.0.0 (wave P1c) — I2914: the door's pure gates precede its first
++// directory read (AV-76), on sqlite and postgres.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod pure_gates_invariants;
++// v62.0.0 (wave P1c) — I2915: the mapping fills the typed `weight` column.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod weight_column_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod projection_invariants;
+ #[cfg(test)]
+diff --git a/src/federation/edition2/payloads.rs b/src/federation/edition2/payloads.rs
+index 50182260..0c88e895 100644
+--- a/src/federation/edition2/payloads.rs
++++ b/src/federation/edition2/payloads.rs
+@@ -11,12 +11,25 @@
+ //! CDDL is written from; `docs/EDITION2_PAYLOADS.md` is rendered from it
+ //! ([`render_markdown`]) and a witness keeps the two equal.
+ //!
+-//! The members every row carries are CC 2.6.1.3's, not repeated per family:
+-//! `asserted_at` (uint, POSIX ms, required), `author` (identity-ref, on an
+-//! authored family only), `dimension` (tstr: the family instance, required
+-//! where the family id has a parameter, e.g. `membership:widening:v1` under
+-//! `membership:{stage}`) and `refs` (map of row-refs). Per-family `refs`
+-//! roles are listed with the members.
++//! v62.0.0 (wave P1) — CC checked the nine families against its text
++//! (`manifests/family_payloads_v2.cddl`, read with `signed_object_v2.cddl`)
++//! and, where the two differed, the text won: `refs.head` (not `prev`) names
++//! a roster version's predecessor; the charter is cited under
++//! `refs.also.cites` (the `also` roles are closed: `ack`, `cites`); a
++//! `reason` is a uint code, free text riding `body.note`; the cosign states
++//! are `pending` | `signature` and carry no member (the lineage-head
++//! cosignature is no row, CC 3.4.10 / CC 5.3.1); a custody report carries
++//! no `expires_at` and no `cohort` (its scope is the CC 2.1 members
++//! `community_id` / `family_id`); `evidence_refs` is the envelope's
++//! sequence `[+ hash-digest]`; a delivery receipt's inner signed preimage is
++//! the earlier form's (CC 8.11.30).
++//!
++//! The members every row may carry are the envelope's (CC 2.6.1.3, the
++//! `attestation-envelope` of `signed_object_v2.cddl`) and the CC 2.1
++//! visibility / revocability / delivery members the logical-names table
++//! (CC 2.6.1.4) maps to "payload members of the same names" ([`COMMON`]),
++//! not repeated per family. Per-family `refs` roles are listed with the
++//! members.
+ //!
+ //! The conversions, everywhere:
+ //! - an instant (RFC 3339 text, `DateTime`) is a uint of POSIX ms (CC 2.6.2);
+@@ -24,7 +37,7 @@
+ //! - a reference to a held row (`persist_row_hash`, `attestation_id`) is an
+ //!   edition-2 `row-ref` under `refs`, computed by the node (CC 2.6.1.3);
+ //! - a SHA-256 digest carried as hex is a hash digest, `[-16, bstr .size
+-//!   32]`;
++//!   32]` ([`HASH_DIGEST_MEMBERS`] names the ones every family may carry);
+ //! - `persist_row_hash`, `original_content_hash`, the scrub members and
+ //!   `pqc_completed_at` are gone: the row id and the statements replace them.
+ 
+@@ -58,11 +71,16 @@ pub enum Ty {
+     Map,
+     /// array of identity-refs, sorted by encoding, unique.
+     IdentityRefs,
+-    /// array of hash digests (`[-16, bstr .size 32]`), sorted by encoding,
+-    /// unique.
++    /// v62.0.0 (wave P1) — the envelope's `evidence_refs` shape: a SEQUENCE
++    /// of hash digests (`[+ hash-digest]`), non-empty, in the order signed
++    /// (CC 2.6.1.4: "payload `evidence_refs`, a sequence"). Not a set.
+     Digests,
+-    /// array of roster members ([`ROSTER_MEMBER`]), sorted by `key`.
++    /// array of roster members ([`ROSTER_MEMBER`]): a set, sorted by each
++    /// element's deterministic encoding, one entry per `key`.
+     RosterMembers,
++    /// v62.0.0 (wave P1) — any `ceg-value`: a member whose type the text
++    /// leaves OPEN (`takedown_notice`'s `perceptual_hash`).
++    Any,
+ }
+ 
+ impl Ty {
+@@ -79,8 +97,9 @@ impl Ty {
+             Ty::Bool => "bool",
+             Ty::Map => "map",
+             Ty::IdentityRefs => "[* identity-ref]",
+-            Ty::Digests => "[* hash-digest]",
++            Ty::Digests => "[+ hash-digest]",
+             Ty::RosterMembers => "[* roster-member]",
++            Ty::Any => "ceg-value",
+         }
+     }
+ 
+@@ -89,20 +108,10 @@ impl Ty {
+             v.as_text()
+                 .is_some_and(ciris_verify_core::edition2::is_identity_ref)
+         };
+-        let digest = |v: &Value| match v.as_array() {
+-            Some([alg, b]) => {
+-                alg.as_i64() == Some(-16) && b.as_bytes().is_some_and(|b| b.len() == 32)
+-            }
+-            _ => false,
+-        };
+-        let sorted_unique = |a: &[Value]| {
+-            let enc: Vec<Vec<u8>> = a.iter().map(ciris_verify_core::cde::encode).collect();
+-            enc.windows(2).all(|w| w[0] < w[1])
+-        };
+         match self {
+             Ty::Ms | Ty::Uint => v.as_u64().is_some(),
+             Ty::Bstr => v.as_bytes().is_some(),
+-            Ty::Digest => digest(v),
++            Ty::Digest => is_digest(v),
+             Ty::Tstr => v.as_text().is_some(),
+             Ty::IdentityRef => identity(v),
+             Ty::Bool => matches!(v, Value::Bool(_)),
+@@ -112,21 +121,40 @@ impl Ty {
+                 .is_some_and(|a| a.iter().all(identity) && sorted_unique(a)),
+             Ty::Digests => v
+                 .as_array()
+-                .is_some_and(|a| a.iter().all(digest) && sorted_unique(a)),
++                .is_some_and(|a| !a.is_empty() && a.iter().all(is_digest)),
+             Ty::RosterMembers => v.as_array().is_some_and(|a| {
+-                let keys: Vec<Vec<u8>> = a
++                let mut keys: Vec<Vec<u8>> = a
+                     .iter()
+                     .filter_map(|m| m.get_text("key"))
+                     .map(ciris_verify_core::cde::encode)
+                     .collect();
+-                keys.len() == a.len()
+-                    && keys.windows(2).all(|w| w[0] < w[1])
+-                    && a.iter().all(|m| check_members(ROSTER_MEMBER, m).is_ok())
++                let n = keys.len();
++                keys.sort();
++                keys.dedup();
++                n == a.len()
++                    && keys.len() == n
++                    && sorted_unique(a)
++                    && a.iter().all(|m| check_map(ROSTER_MEMBER, &[], m).is_ok())
+             }),
++            Ty::Any => true,
+         }
+     }
+ }
+ 
++/// `[-16, bstr .size 32]`.
++fn is_digest(v: &Value) -> bool {
++    match v.as_array() {
++        Some([alg, b]) => alg.as_i64() == Some(-16) && b.as_bytes().is_some_and(|b| b.len() == 32),
++        _ => false,
++    }
++}
++
++/// A set: sorted by each element's deterministic encoding, no duplicate.
++fn sorted_unique(a: &[Value]) -> bool {
++    let enc: Vec<Vec<u8>> = a.iter().map(ciris_verify_core::cde::encode).collect();
++    enc.windows(2).all(|w| w[0] < w[1])
++}
++
+ /// Whether a member must be present.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Presence {
+@@ -134,8 +162,9 @@ pub enum Presence {
+     Required,
+     /// May be absent.
+     Optional,
+-    /// Present exactly when the named member holds the given text.
+-    RequiredWhen(&'static str, &'static str),
++    /// Required when the named member holds one of the given texts
++    /// (`dimension`: when one of them is a segment of `dimension`).
++    RequiredWhen(&'static str, &'static [&'static str]),
+ }
+ 
+ impl Presence {
+@@ -164,7 +193,8 @@ pub struct Member {
+ /// One `refs` role a family's row carries.
+ #[derive(Clone, Copy, Debug)]
+ pub struct RefRole {
+-    /// The `refs` member path (`prev`, `target`, `head`, `also:charter`).
++    /// The `refs` member path as [`names_of`] spells it (`head`, `target`,
++    /// `also:cites`).
+     pub role: &'static str,
+     /// Required or optional.
+     pub presence: Presence,
+@@ -231,6 +261,27 @@ pub const ROSTER_MEMBER: &[Member] = &[
+     m("role", Ty::Tstr, O, "FamilyMember/CommunityMember.role"),
+ ];
+ 
++/// v62.0.0 (wave P1) — the takedown bases, CC 3.3.2's closed set of eleven
++/// wire strings, compared byte for byte (the `{basis}` vocabulary of the
++/// `takedown_notice:{basis}` registry row; a witness keeps the two equal).
++pub const LEGAL_BASES: &[&str] = &[
++    "dmca512",
++    "dsa_article16",
++    "tvec_terrorist",
++    "ncmec_csam",
++    "gifct_cip",
++    "community_standards",
++    "perceptual_hash_csam",
++    "osa_illegal_content",
++    "avmsd_age_inappropriate",
++    "court_order",
++    "steward_purge",
++];
++
++/// The wrap algorithm a key grant carries: the v2 wire string, MANDATORY
++/// for every wrapped DEK (CC 3.3.2); v1 wraps none.
++const WRAP_ALGORITHMS: &[&str] = &[crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2];
++
+ /// Every family this module maps, in document order.
+ pub const FAMILIES: &[FamilyPayload] = &[
+     FamilyPayload {
+@@ -242,23 +293,26 @@ pub const FAMILIES: &[FamilyPayload] = &[
+             m("group_kind", Ty::Tstr, R, "the record's kind: \"family\" | \"community\""),
+             m("group", Ty::IdentityRef, R, "Family.family_key_id / Community.community_key_id (equals sub)"),
+             m("name", Ty::Tstr, R, "Family.family_name / Community.community_name"),
+-            m("version", Ty::Uint, R, "federation_group_versions.version"),
+-            m("members", Ty::RosterMembers, R, "Family.members / Community.members"),
++            m("version", Ty::Uint, R, "federation_group_versions.version (a consistency check only)"),
++            m("members", Ty::RosterMembers, R, "Family.members / Community.members (a set)"),
+             m("founded_at", Ty::Ms, R, "founded_at"),
+             m("consensus_protocol", Ty::Tstr, R, "consensus_protocol"),
+-            m("consensus_protocol_entrenched", Ty::Bool, O, "Family.consensus_protocol_entrenched (absent: false)"),
++            m("consensus_protocol_entrenched", Ty::Bool, O, "Family.consensus_protocol_entrenched (absent reads false)"),
+             m("dissolved_at", Ty::Ms, O, "Family.dissolved_at"),
+-            m("policy", Ty::Map, O, "Community.policy_blob (cohort_scope among its members)"),
++            m("policy", Ty::Map, O, "Community.policy_blob (an open map)"),
++            m("cohort_subkind", Ty::Tstr, O, "a community's discriminator (CC 3.2; earlier: policy_blob.cohort_subkind)"),
++            m("cohort_subkind_payload", Ty::Map, O, "a community's Option<SubkindPayload> (CC 3.2)"),
++            m("membership", Ty::Tstr, O, "a community's founding row: \"private\" | \"public\" (CC 3.1.3.2; absent reads public)"),
+         ],
+         refs: &[
+-            RefRole { role: "prev", presence: O, from: "prev_head_digest (the predecessor version's persist_row_hash); absent on version 1" },
+-            RefRole { role: "also:charter", presence: O, from: "charter_digest (the trust:charter:v1 row in force)" },
++            RefRole { role: "head", presence: O, from: "prev_head_digest: the version this one extends (CC 3.2 T6); absent on version 1, present on every later one" },
++            RefRole { role: "also:cites", presence: O, from: "charter_digest: the trust:charter row in force, placed by its family" },
+         ],
+         voices: &[
+             Voice { from: "scrub_signature_classical / scrub_signature_pqc under authority_key_id", becomes: "the group key's own statement" },
+             Voice { from: "cosignatures (RosterCosignature)", becomes: "one statement per listed member over the same payload" },
+             Voice { from: "supersede_proof.quorum_signatures (ThresholdSignature)", becomes: "the predecessor roster's holders' statements, counted at its consensus_protocol" },
+-            Voice { from: "SignedCommunity.lineage", becomes: "nothing carried: each prior version is its own held row, named by refs.prev" },
++            Voice { from: "SignedCommunity.lineage", becomes: "nothing carried: each prior version is its own held row, named by refs.head" },
+         ],
+         table: "federation_families / federation_communities (+ federation_group_versions)",
+     },
+@@ -271,15 +325,17 @@ pub const FAMILIES: &[FamilyPayload] = &[
+             m("group_kind", Ty::Tstr, R, "\"family\" | \"community\" (which struct)"),
+             m("group", Ty::IdentityRef, R, "family_key_id / community_key_id"),
+             m("member", Ty::IdentityRef, R, "removal: removed_identity_key_id; widening: member_key_id (equals sub)"),
+-            m("removed_at", Ty::Ms, Presence::RequiredWhen("dimension", "removal"), "MembershipRevocation.removed_at"),
+-            m("joined_at", Ty::Ms, Presence::RequiredWhen("dimension", "widening"), "MembershipWidening.joined_at"),
++            m("removed_at", Ty::Ms, Presence::RequiredWhen("dimension", &["removal"]), "MembershipRevocation.removed_at"),
++            m("joined_at", Ty::Ms, Presence::RequiredWhen("dimension", &["widening"]), "MembershipWidening.joined_at"),
+             m("effective_at", Ty::Ms, R, "effective_at"),
+-            m("reason", Ty::Tstr, O, "MembershipRevocation.reason"),
++            m("valid_until", Ty::Ms, O, "a time-boxed guest's widening (CC 3.3.4)"),
++            m("reason", Ty::Uint, O, "MembershipRevocation.reason, as a code of the closed registry (free text: body.note)"),
+             m("role", Ty::Tstr, O, "MembershipWidening.role"),
+             m("witness_set", Ty::IdentityRefs, O, "MembershipRevocation.witness_set (vouching key ids, not signatures)"),
+         ],
+         refs: &[
+-            RefRole { role: "head", presence: O, from: "the roster version the change is counted over (earlier: the signed instant)" },
++            RefRole { role: "head", presence: R, from: "the roster version the change is counted over (CC 2.6.1.9; earlier: the signed instant)" },
++            RefRole { role: "also:cites", presence: O, from: "a widening: the acceptance it spends (CC 3.1.3.2); a node's widening has none" },
+         ],
+         voices: &[
+             Voice { from: "scrub_signature_* under authority_key_id", becomes: "the proposer's statement" },
+@@ -287,47 +343,67 @@ pub const FAMILIES: &[FamilyPayload] = &[
+         ],
+         table: "federation_{family,community}_membership_{revocations,widenings}",
+     },
++    FamilyPayload {
++        family: "identity:occurrence",
++        replaces: "SignedIdentityOccurrence / IdentityOccurrence (an identity:occurrence:v1 row)",
++        authorship: "authored (by a live roster key of the identity); the occurrence key's own statement is a second voice, role occurrence_key (party sub)",
++        sub: "the occurrence key's identity-ref (occurrence_key_id)",
++        members: &[
++            m("identity_key_id", Ty::IdentityRef, R, "identity_key_id (equals author)"),
++            m("occurrence_key_id", Ty::IdentityRef, R, "occurrence_key_id (equals sub)"),
++            m("device_class", Ty::Tstr, R, "device_class: phone | laptop | server | embedded | agent | service"),
++            m("hardware_attestation", Ty::Bstr, O, "hardware_attestation (base64 in the earlier form)"),
++            m("transport_destination", Ty::Map, O, "transport_destination: exactly reticulum_x25519_pubkey (bstr 32), reticulum_ed25519_pubkey (bstr 32), app_name (tstr), aspects ([* tstr]), destination_hash (bstr 16, derived per CC 3.3.6.3)"),
++            m("transit_xwing_pubkey", Ty::Bstr, O, "transport_destination's transit_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2)"),
++            m("onion_hop_xwing_pubkey", Ty::Bstr, O, "transport_destination's onion_hop_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2)"),
++            m("onion_relay", Ty::Map, O, "exactly {\"opt_out\": true}, on a node that opts out of relaying (CC 3.3.6.2)"),
++            m("encryption_pubkeys", Ty::Map, O, "encryption_pubkeys: exactly x25519 (bstr 32) and ml_kem_768 (bstr 1184)"),
++            m("build_manifest_hash", Ty::Digest, O, "build_manifest_hash"),
++            m("valid_until", Ty::Ms, O, "valid_until (absent: indefinite; present: later than asserted_at)"),
++        ],
++        refs: &[
++            RefRole { role: "also:cites", presence: O, from: "build_manifest_ref: the provenance:build_manifest:{target} row" },
++        ],
++        voices: &[
++            Voice { from: "SignedIdentityOccurrence.signature (TransportBindingSignature) under attesting_key_id", becomes: "the author's statement: a live roster key of the identity (iss = identity_key_id)" },
++            Voice { from: "none (the earlier form carried no proof of possession)", becomes: "the occurrence key's own statement over the same payload (iss = sub), required before the author's" },
++            Voice { from: "the self-roster door's assent rows (objection:assent:v1)", becomes: "further roster keys' statements as the identity over the same payload, a strict majority of the live roster counted" },
++        ],
++        table: "federation_identity_occurrences (+ federation_identity_occurrence_history, transport_destinations)",
++    },
+     FamilyPayload {
+         family: "identity:occurrence_revocation",
+-        replaces: "FramedOccurrenceRevocation / IdentityOccurrenceRevocation (an identity:occurrence_revocation:v1 row)",
++        replaces: "IdentityOccurrenceRevocation (an identity:occurrence_revocation:v1 row; no framed object is embedded)",
+         authorship: "counted for a user self (identity=user), else authored",
+         sub: "the occurrence's identity-ref",
+         members: &[
+-            m("identity", Ty::IdentityRef, R, "identity_key_id"),
+-            m("occurrence", Ty::IdentityRef, R, "occurrence_key_id (equals sub)"),
++            m("identity_key_id", Ty::IdentityRef, R, "identity_key_id (the occurrence record's own name, CC ruling v62)"),
++            m("occurrence_key_id", Ty::IdentityRef, R, "occurrence_key_id (equals sub)"),
+             m("revoked_at", Ty::Ms, R, "revoked_at"),
+             m("effective_at", Ty::Ms, R, "effective_at (may be later than asserted_at)"),
+-            m("reason", Ty::Tstr, O, "reason"),
++            m("reason", Ty::Uint, O, "reason, as a code of the closed registry (free text: body.note)"),
+             m("witness_set", Ty::IdentityRefs, O, "witness_set"),
+         ],
+         refs: &[],
+         voices: &[
+-            Voice { from: "FramedOccurrenceRevocation.signature (TransportBindingSignature) under attesting_key_id", becomes: "the revoker's statement" },
++            Voice { from: "FramedOccurrenceRevocation.signature (TransportBindingSignature) under attesting_key_id", becomes: "the revoker's statement (the statement's signer)" },
+             Voice { from: "the row's additional_scrubs (roster cosigs, user self)", becomes: "the roster members' statements, a strict majority counted" },
+         ],
+         table: "federation_identity_occurrence_revocations",
+     },
+     FamilyPayload {
+         family: "cosign:{state}",
+-        replaces: "LineageHeadCosign (state `lineage_head`); cosign:pending:v1 / cosign:signature:v1 rows",
++        replaces: "cosign:pending:v1 / cosign:signature:v1 rows (the states are closed: pending | signature)",
+         authorship: "authored",
+-        sub: "the lineage's identity-ref (lineage_head); the group's (pending, signature)",
+-        members: &[
+-            m("lineage", Ty::IdentityRef, Presence::RequiredWhen("dimension", "lineage_head"), "LineageHeadCosign.lineage_key_id"),
+-            m("head_asserted_at", Ty::Ms, Presence::RequiredWhen("dimension", "lineage_head"), "LineageHeadCosign.head_asserted_at"),
+-            m("event_family", Ty::Tstr, Presence::RequiredWhen("dimension", "pending"), "cosign event_family"),
+-            m("group_kind", Ty::Tstr, Presence::RequiredWhen("dimension", "pending"), "cosign group_kind"),
+-        ],
+-        refs: &[
+-            RefRole { role: "head", presence: Presence::RequiredWhen("dimension", "lineage_head"), from: "head_digest_sha256_hex (the head's persist_row_hash)" },
+-            RefRole { role: "prev", presence: O, from: "prior_head_digest_sha256_hex" },
+-            RefRole { role: "target", presence: Presence::RequiredWhen("dimension", "pending"), from: "pending: the event (embedded `event`, now named); signature: quorum_key (the pending row)" },
+-        ],
++        sub: "the event's sub (the group's identity-ref)",
++        members: &[],
++        refs: &[],
+         voices: &[
+-            Voice { from: "signature_classical / signature_pqc under witness_key_id", becomes: "the witness's statement (iss); signed_at is asserted_at" },
+-            Voice { from: "cosign:signature row's scrub + additional_scrubs", becomes: "a further statement over the event's own row (CC 2.6.1.9); the signature state carries no member of its own" },
++            Voice { from: "cosign:pending row's embedded event and the primary's signature over its signing bytes", becomes: "the primary's statement over the event's own payload and header, named by the event's row id; no member of its own" },
++            Voice { from: "cosign:signature row's scrub + additional_scrubs", becomes: "a further statement over the event's own payload (CC 2.6.1.9); no member of its own" },
++            Voice { from: "LineageHeadCosign (signature_classical / signature_pqc under witness_key_id)", becomes: "no row and no state of this family: the ciris.lineage_head_cosign.v1 object (CC 3.4.10, CC 5.3.1), its edition-2 form OPEN" },
+         ],
+-        table: "federation_lineage_head_cosigns (lineage_head); ceg_statements only (pending, signature)",
++        table: "ceg_statements only",
+     },
+     FamilyPayload {
+         family: "revocation:{entity_type}:{reason}",
+@@ -338,7 +414,6 @@ pub const FAMILIES: &[FamilyPayload] = &[
+             m("revoked_at", Ty::Ms, R, "revoked_at"),
+             m("effective_at", Ty::Ms, R, "effective_at"),
+             m("revoked_after", Ty::Ms, O, "revoked_after"),
+-            m("reason", Ty::Tstr, O, "reason (free text; the {reason} leaf is the coded one)"),
+         ],
+         refs: &[
+             RefRole { role: "target", presence: O, from: "the revoked row, when the entity is a row (no earlier field: revoked_key_id named keys only)" },
+@@ -351,17 +426,19 @@ pub const FAMILIES: &[FamilyPayload] = &[
+     FamilyPayload {
+         family: "takedown_notice:{basis}",
+         replaces: "StewardPurgeNotice (envelope members, notice_terms)",
+-        authorship: "counted for leaf steward_purge, else authored",
++        authorship: "authored, but counted for leaf steward_purge and for group=affiliations & seats=one (CC 4.4.3.12)",
+         sub: "the claimant's identity-ref",
+         members: &[
+-            m("legal_basis", Ty::Tstr, R, "legal_basis (also the {basis} leaf)"),
++            m("legal_basis", Ty::Tstr, R, "legal_basis (CC 3.3.2's closed set; equals the {basis} leaf)"),
+             m("claimant", Ty::IdentityRef, R, "claimant_key_id"),
+             m("content_sha256", Ty::Digest, R, "content_sha256 (the selection digest)"),
+             m("content_holders", Ty::IdentityRefs, R, "content_holder_key_ids"),
+             m("claim_text", Ty::Tstr, R, "claim_text"),
+             m("good_faith_statement", Ty::Tstr, R, "good_faith_statement"),
+             m("jurisdiction", Ty::Tstr, R, "jurisdiction"),
+-            m("evidence_refs", Ty::Digests, O, "evidence_refs (the dry-run ledger digests)"),
++            m("evidence_refs", Ty::Digests, O, "evidence_refs (the dry-run ledger digests; a URI reference is OPEN)"),
++            m("perceptual_hash", Ty::Any, O, "perceptual_hash (CC 3.3.2; its type is OPEN)"),
++            m("counter_notice_channel", Ty::Tstr, O, "counter_notice_channel (CC 3.3.2)"),
+             m("selection_counts", Ty::Map, O, "selection_counts"),
+             m("expires_at", Ty::Ms, O, "expires_at"),
+         ],
+@@ -378,10 +455,8 @@ pub const FAMILIES: &[FamilyPayload] = &[
+         sub: "the device's identity-ref (equals iss)",
+         members: &[
+             m("custody_state", Ty::Tstr, R, "custody_state: \"here\" | \"none\""),
+-            m("evidence_refs", Ty::Digests, R, "evidence_refs (blob sha256)"),
+-            m("size", Ty::Uint, Presence::RequiredWhen("custody_state", "here"), "size"),
+-            m("cohort", Ty::IdentityRef, R, "community_id / family_key_id"),
+-            m("expires_at", Ty::Ms, R, "the row's expires_at (asserted_at + 72 h)"),
++            m("evidence_refs", Ty::Digests, R, "evidence_refs: exactly one, the blob's address digest"),
++            m("size", Ty::Uint, Presence::RequiredWhen("custody_state", &["here"]), "size"),
+         ],
+         refs: &[],
+         voices: &[],
+@@ -394,16 +469,14 @@ pub const FAMILIES: &[FamilyPayload] = &[
+         sub: "the recipient's identity-ref (attested_key_id / GrantWrap.recipient_key_id)",
+         members: &[
+             m("axis", Ty::Tstr, R, "axis: \"epoch\" | \"content\" | \"stream\" (also the {axis} leaf)"),
+-            m("wrap_algorithm", Ty::Tstr, R, "GrantWrap.wrap_algorithm"),
++            m("wrap_algorithm", Ty::Tstr, R, "GrantWrap.wrap_algorithm (the v2 wire string only)"),
+             m("wrapped_dek", Ty::Bstr, R, "GrantWrap.wrapped_dek"),
+-            m("community", Ty::IdentityRef, Presence::RequiredWhen("axis", "epoch"), "community_key_id"),
+-            m("community_id", Ty::Tstr, O, "community_id"),
+-            m("minter", Ty::IdentityRef, Presence::RequiredWhen("axis", "epoch"), "minter_key_id"),
+-            m("epoch", Ty::Uint, O, "epoch (epoch and stream axes)"),
+-            m("at_rest_sha256", Ty::Digest, Presence::RequiredWhen("axis", "content"), "at_rest_sha256"),
+-            m("owner", Ty::IdentityRef, O, "owner_key_id (content and stream axes)"),
+-            m("stream_id", Ty::Tstr, Presence::RequiredWhen("axis", "stream"), "stream_id"),
+-            m("cohort", Ty::IdentityRef, O, "the cohort target (community_id / family_key_id)"),
++            m("community", Ty::IdentityRef, Presence::RequiredWhen("axis", &["epoch"]), "community_key_id"),
++            m("minter", Ty::IdentityRef, Presence::RequiredWhen("axis", &["epoch"]), "minter_key_id"),
++            m("epoch", Ty::Uint, Presence::RequiredWhen("axis", &["epoch", "stream"]), "epoch"),
++            m("at_rest_sha256", Ty::Digest, Presence::RequiredWhen("axis", &["content"]), "at_rest_sha256"),
++            m("owner", Ty::IdentityRef, Presence::RequiredWhen("axis", &["content", "stream"]), "owner_key_id (the axis identity, CC 3.3.2)"),
++            m("stream_id", Ty::Tstr, Presence::RequiredWhen("axis", &["stream"]), "stream_id"),
+         ],
+         refs: &[],
+         voices: &[],
+@@ -417,19 +490,160 @@ pub const FAMILIES: &[FamilyPayload] = &[
+         members: &[
+             m("stream_id", Ty::Tstr, R, "stream_id (also the {stream_id} leaf)"),
+             m("epoch", Ty::Uint, R, "epoch"),
+-            m("k", Ty::Uint, R, "k (the chunk index acknowledged)"),
++            m("k", Ty::Uint, R, "K (the chunk index acknowledged; CBOR member names are lowercase)"),
+             m("chunk_root", Ty::Digest, R, "chunk_root"),
+         ],
+         refs: &[],
+         voices: &[
+-            Voice { from: "signature (HybridSignature over the binary receipt bytes)", becomes: "the subscriber's composite statement; the receipt store's HybridSignature is filled from its two halves" },
++            Voice { from: "signature (HybridSignature over the length-prefixed ciris-delivery-receipt/v1 bytes)", becomes: "the subscriber's composite statement over the payload; no inner signed object (the earlier layout is CC 8.11.30); the receipt store's HybridSignature is filled from its two halves" },
+         ],
+         table: "federation_stream_delivery_receipts",
+     },
+ ];
+ 
+-/// The members every row carries (CC 2.6.1.3), allowed in any payload.
+-pub const COMMON: &[&str] = &["asserted_at", "author", "dimension", "refs"];
++/// The members any row may carry, beyond its family's: the envelope's
++/// named members (`attestation-envelope`, CC 2.6.1.3) and the CC 2.1
++/// visibility / revocability / delivery members CC 2.6.1.4 maps to
++/// "payload members of the same names" (`cohort_scope`, `community_id`,
++/// `family_id`, `subject_key_ids`, `delivery_mode`). v62.0.0 (wave P1): a
++/// custody report's or key grant's cohort target is `community_id` /
++/// `family_id` here, not a family member. A family's map stays closed: a
++/// custody report refuses the envelope's `expires_at` ([`PROSE_RULES`]).
++pub const COMMON: &[&str] = &[
++    "asserted_at",
++    "author",
++    "body",
++    "cohort_scope",
++    "community_id",
++    "confidence",
++    "delivery_mode",
++    "dimension",
++    "evidence_refs",
++    "expires_at",
++    "family_id",
++    "passed",
++    "reason",
++    "refs",
++    "salt",
++    "score",
++    "seat_commitment",
++    "subject_key_ids",
++    "total",
++    "valid_from",
++    "valid_until",
++    "weight",
++];
++
++/// The common members persist types (the rest are typed by Verify's door
++/// or are the CC 2.1 members the earlier gates read as they are).
++const COMMON_TYPED: &[Member] = &[
++    m("asserted_at", Ty::Ms, R, "asserted_at"),
++    m("author", Ty::IdentityRef, O, "the author's iss"),
++    m("dimension", Ty::Tstr, O, "dimension"),
++    m("refs", Ty::Map, O, "refs"),
++    m("reason", Ty::Uint, O, "a code of the closed registry"),
++    m("body", Ty::Map, O, "body"),
++    m("evidence_refs", Ty::Digests, O, "evidence_refs"),
++    m("seat_commitment", Ty::Digest, O, "seat_commitment"),
++    m("valid_from", Ty::Ms, O, "valid_from"),
++    m("valid_until", Ty::Ms, O, "valid_until"),
++    m("expires_at", Ty::Ms, O, "expires_at"),
++    m("salt", Ty::Bstr, O, "salt"),
++];
++
++/// The longest `body.note`, in bytes (CC 2.6.1.10; `tstr .size (0..2048)`).
++pub const BODY_NOTE_MAX: usize = 2048;
++
++/// v62.0.0 (wave P1) — the hash-digest members (`[-16, bstr .size 32]`,
++/// SHA-256) any family may carry, that the earlier-form gates read as 64
++/// lowercase hex: the mapping projects each back to hex (`ingest`) and a
++/// producer states each as a digest (`emit`). `evidence_refs` is a sequence
++/// of them, the others one. `amendment_digest` rides
++/// `deferral:response:approved` and `identity_amendment` (CC 3.1.5): the
++/// hex the identity-amendment gate compares.
++pub const HASH_DIGEST_MEMBERS: &[&str] = &[
++    "evidence_refs",
++    "carried",
++    "seat_commitment",
++    "amendment_digest",
++];
++
++/// The `also` roles of `refs`, a closed registry (CC 2.6.1.3, the CDDL's
++/// `also-role`), as [`names_of`] spells them.
++pub const ALSO_ROLES: &[&str] = &["also:ack", "also:cites"];
++
++/// How a family's first parameter (its leaf, `dimension`'s second segment)
++/// bounds this module's table.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Leaves {
++    /// A closed set: a payload at any other leaf is refused.
++    Closed(&'static [&'static str]),
++    /// The table maps these leaves; a payload at another registered leaf
++    /// is not this table's (its forward payload is OPEN) and passes.
++    Mapped(&'static [&'static str]),
++}
++
++/// v62.0.0 (wave P1) — the leaves each parameterised family's table
++/// covers. The membership stages the table maps are the counted leaves,
++/// `widening` and `removal` (CC 3.1.3.2); the cosign states are closed
++/// (CC 3.1.3); the takedown bases are CC 3.3.2's.
++pub const LEAVES: &[(&str, Leaves)] = &[
++    (
++        "membership:{stage}",
++        Leaves::Mapped(&["widening", "removal"]),
++    ),
++    ("cosign:{state}", Leaves::Closed(&["pending", "signature"])),
++    ("takedown_notice:{basis}", Leaves::Closed(LEGAL_BASES)),
++];
++
++/// v62.0.0 (wave P1) — members whose text is one of a closed set, compared
++/// byte for byte: `(family, member, values)`.
++pub const CLOSED_VALUES: &[(&str, &str, &[&str])] = &[
++    ("group:roster", "membership", &["private", "public"]),
++    ("takedown_notice:{basis}", "legal_basis", LEGAL_BASES),
++    ("custody:{kind}", "custody_state", &["here", "none"]),
++    ("key_grant:{axis}", "wrap_algorithm", WRAP_ALGORITHMS),
++];
++
++/// v62.0.0 (wave P1) — the families whose statement is over ANOTHER row's
++/// payload (a cosign state: the event's own), so the payload's members are
++/// the event family's and are checked under it; this table checks only the
++/// state.
++pub const OVER_THE_EVENT: &[&str] = &["cosign:{state}"];
++
++/// v62.0.0 (wave P1) — the rules the member lists cannot state, each
++/// checked by [`check`] (refusal `edition2_payload_invalid`): `(family,
++/// rule)`; `*` is every mapped family.
++pub const PROSE_RULES: &[(&str, &str)] = &[
++    (
++        "*",
++        "every `refs.also` role is `ack` or `cites` (a closed registry, CC 2.6.1.3)",
++    ),
++    (
++        "*",
++        "`body.note`, when present, is text of at most 2048 bytes",
++    ),
++    (
++        "group:roster",
++        "`refs.head` is absent on version 1 and present on every later version",
++    ),
++    (
++        "takedown_notice:{basis}",
++        "`legal_basis` equals the `{basis}` leaf of `dimension`",
++    ),
++    (
++        "takedown_notice:{basis}",
++        "a `steward_purge` notice is counted: it carries no `author`",
++    ),
++    (
++        "custody:{kind}",
++        "`evidence_refs` holds exactly one digest, the blob's address",
++    ),
++    (
++        "custody:{kind}",
++        "`expires_at` is not a member: a report is live 72 hours from its `asserted_at` (CC 3.1.3.3)",
++    ),
++];
+ 
+ /// The payload of `family`, if this module maps it.
+ #[must_use]
+@@ -437,31 +651,71 @@ pub fn family(family: &str) -> Option<&'static FamilyPayload> {
+     FAMILIES.iter().find(|f| f.family == family)
+ }
+ 
++/// v62.0.0 (wave P1d) — the payload of the family a statement's header names
++/// (label -70002, the family id: each `{name}` written `.name`, CC 2.6), if
++/// this module maps it.
++#[must_use]
++pub fn family_by_id(family_id: &str) -> Option<&'static FamilyPayload> {
++    FAMILIES
++        .iter()
++        .find(|f| ciris_verify_core::namespace_match::family_id(f.family) == family_id)
++}
++
++/// v62.0.0 (wave P1d) — **the door's payload check**: [`check`] for the
++/// family a statement's header names (its family id). `Ok` for a family this
++/// module does not map (its payload passes as before). Pure; the edition-2
++/// door runs it with its other pure gates, before any directory read
++/// (`door::pure_statement_gates`).
++///
++/// # Errors
++/// `edition2_payload_invalid`, as [`check`].
++pub fn check_by_id(family_id: &str, payload: &Value) -> Result<(), Error> {
++    match family_by_id(family_id) {
++        Some(f) => check(f.family, payload),
++        None => Ok(()),
++    }
++}
++
+ fn refuse(message: String) -> Error {
+     Error::malformed_row(PLANE, malformed_row::EDITION2_PAYLOAD_INVALID, message)
+ }
+ 
+-/// The leaf a `RequiredWhen("dimension", leaf)` reads: the payload's
+-/// `dimension` contains `:{leaf}` as a segment.
++fn text_of<'a>(payload: &'a Value, member: &str) -> Option<&'a str> {
++    payload.get_text(member).and_then(Value::as_text)
++}
++
++/// Whether the payload's `dimension` contains `leaf` as a segment.
+ fn dimension_has(payload: &Value, leaf: &str) -> bool {
+-    payload
+-        .get_text("dimension")
+-        .and_then(Value::as_text)
+-        .is_some_and(|d| d.split(':').any(|s| s == leaf))
++    text_of(payload, "dimension").is_some_and(|d| d.split(':').any(|s| s == leaf))
++}
++
++/// The leaf of `family_id` a payload's `dimension` names: its second
++/// segment, when its first is the family's stem. `None` without a
++/// `dimension`, or with one of another family (a cosign state's payload
++/// is the event's).
++fn leaf_of<'a>(family_id: &str, payload: &'a Value) -> Option<&'a str> {
++    let stem = family_id.split(':').next()?;
++    let d = text_of(payload, "dimension")?;
++    let mut segs = d.split(':');
++    (segs.next() == Some(stem)).then(|| segs.next()).flatten()
+ }
+ 
+ fn required(p: Presence, payload: &Value) -> bool {
+     match p {
+         Presence::Required => true,
+         Presence::Optional => false,
+-        Presence::RequiredWhen("dimension", leaf) => dimension_has(payload, leaf),
+-        Presence::RequiredWhen(member, value) => {
+-            payload.get_text(member).and_then(Value::as_text) == Some(value)
++        Presence::RequiredWhen("dimension", leaves) => {
++            leaves.iter().any(|l| dimension_has(payload, l))
++        }
++        Presence::RequiredWhen(member, values) => {
++            text_of(payload, member).is_some_and(|v| values.contains(&v))
+         }
+     }
+ }
+ 
+-fn check_members(members: &[Member], payload: &Value) -> Result<(), String> {
++/// Each listed member present when required and of its type; no member
++/// outside `members` and `extra`.
++fn check_map(members: &[Member], extra: &[&str], payload: &Value) -> Result<(), String> {
+     let Some(map) = payload.as_map() else {
+         return Err("the payload is not a map".into());
+     };
+@@ -481,17 +735,98 @@ fn check_members(members: &[Member], payload: &Value) -> Result<(), String> {
+         let Some(k) = k.as_text() else {
+             return Err("a member key is not text".into());
+         };
+-        if !COMMON.contains(&k) && !members.iter().any(|x| x.name == k) {
++        if !extra.contains(&k) && !members.iter().any(|x| x.name == k) {
+             return Err(format!("`{k}` is not a member of this family's payload"));
+         }
+     }
+     Ok(())
+ }
+ 
++/// The common members' types, and `body.note`'s bound.
++fn check_common(payload: &Value) -> Result<(), String> {
++    for mem in COMMON_TYPED {
++        match payload.get_text(mem.name) {
++            None if required(mem.presence, payload) => {
++                return Err(format!("`{}` is required", mem.name));
++            }
++            Some(v) if !mem.ty.holds(v) => {
++                return Err(format!("`{}` is not {}", mem.name, mem.ty.spelling()));
++            }
++            _ => {}
++        }
++    }
++    if let Some(note) = payload.get_text("body").and_then(|b| b.get_text("note")) {
++        match note.as_text() {
++            Some(t) if t.len() <= BODY_NOTE_MAX => {}
++            _ => {
++                return Err(format!(
++                    "`body.note` is not text of at most {BODY_NOTE_MAX} bytes"
++                ))
++            }
++        }
++    }
++    Ok(())
++}
++
++/// The rules of [`PROSE_RULES`] beyond the common ones.
++fn check_prose(family_id: &str, payload: &Value, names: &[Name]) -> Result<(), String> {
++    match family_id {
++        "group:roster" => {
++            let version = payload.get_text("version").and_then(Value::as_u64);
++            let head = names.iter().any(|n| n.role == "head");
++            match (version, head) {
++                (Some(1), true) => {
++                    return Err("version 1 extends no version: `refs.head` is absent".into())
++                }
++                (Some(v), false) if v > 1 => {
++                    return Err(format!(
++                        "version {v} extends its predecessor: `refs.head` names it"
++                    ))
++                }
++                _ => {}
++            }
++        }
++        "takedown_notice:{basis}" => {
++            let leaf = leaf_of(family_id, payload);
++            if leaf.is_none() || leaf != text_of(payload, "legal_basis") {
++                return Err("`legal_basis` is not the `{basis}` leaf of `dimension`".into());
++            }
++            if leaf == Some("steward_purge") && payload.get_text("author").is_some() {
++                return Err("a steward_purge notice is counted: it carries no `author`".into());
++            }
++        }
++        "custody:{kind}" => {
++            // CC 3.1.3.3: the 72-hour window is read from the instant; the
++            // envelope's common `expires_at` is not a member of this map.
++            if payload.get_text("expires_at").is_some() {
++                return Err(
++                    "`expires_at` is not a member of this family's payload (a report \
++                     is live 72 hours from its asserted_at)"
++                        .into(),
++                );
++            }
++            let n = payload
++                .get_text("evidence_refs")
++                .and_then(Value::as_array)
++                .map_or(0, <[Value]>::len);
++            if n != 1 {
++                return Err(format!(
++                    "`evidence_refs` holds exactly one digest, the blob's address, not {n}"
++                ));
++            }
++        }
++        _ => {}
++    }
++    Ok(())
++}
++
+ /// **Check a payload of a mapped family** against its member list: each
+ /// required member present, each present member of its type, no member
+-/// outside the list and the common ones, each required `refs` role named.
+-/// `Ok` for a family this module does not map (its rules are elsewhere).
++/// outside the list and the common ones ([`COMMON`]), each required `refs`
++/// role named, the `also` roles closed, the leaf within [`LEAVES`], each
++/// closed text within [`CLOSED_VALUES`], and the family's
++/// [`PROSE_RULES`]. `Ok` for a family this module does not map (its rules
++/// are elsewhere) and for a `membership` stage the table does not map.
+ ///
+ /// # Errors
+ /// `edition2_payload_invalid` (`federation_malformed_row`), naming the
+@@ -500,15 +835,54 @@ pub fn check(family_id: &str, payload: &Value) -> Result<(), Error> {
+     let Some(f) = family(family_id) else {
+         return Ok(());
+     };
+-    check_members(f.members, payload).map_err(|e| refuse(format!("{family_id}: {e}")))?;
+-    let names: Vec<Name> =
+-        names_of(payload).map_err(|e| refuse(format!("{family_id}: refs: {e:?}")))?;
++    let fail = |e: String| refuse(format!("{family_id}: {e}"));
++    if let Some((_, leaves)) = LEAVES.iter().find(|(fam, _)| *fam == family_id) {
++        match (leaves, leaf_of(family_id, payload)) {
++            (Leaves::Closed(set), Some(l)) if !set.contains(&l) => {
++                return Err(fail(format!("`{l}` is not a leaf of this family")));
++            }
++            (Leaves::Mapped(set), Some(l)) if !set.contains(&l) => return Ok(()),
++            _ => {}
++        }
++    }
++    let names: Vec<Name> = names_of(payload).map_err(|e| fail(format!("refs: {e:?}")))?;
++    if let Some(n) = names
++        .iter()
++        .find(|n| n.role.starts_with("also:") && !ALSO_ROLES.contains(&n.role.as_str()))
++    {
++        return Err(fail(format!(
++            "refs `{}` is not an also role (ack | cites)",
++            n.role
++        )));
++    }
++    if OVER_THE_EVENT.contains(&family_id) {
++        // The payload is the event's own: its members are checked under the
++        // event's family.
++        return Ok(());
++    }
++    check_common(payload).map_err(fail)?;
++    check_map(f.members, COMMON, payload).map_err(fail)?;
++    for (fam, member, values) in CLOSED_VALUES {
++        if *fam != family_id {
++            continue;
++        }
++        if let Some(v) = text_of(payload, member) {
++            if !values.contains(&v) {
++                return Err(fail(format!("`{member}` {v:?} is not one of {values:?}")));
++            }
++        }
++    }
+     for r in f.refs {
+         if required(r.presence, payload) && !names.iter().any(|n| n.role == r.role) {
+-            return Err(refuse(format!("{family_id}: refs.{} is required", r.role)));
++            return Err(fail(format!("{} is required", ref_spelling(r.role))));
+         }
+     }
+-    Ok(())
++    check_prose(family_id, payload, &names).map_err(fail)
++}
++
++/// A `refs` role as the document spells it (`refs.also.cites`).
++fn ref_spelling(role: &str) -> String {
++    format!("refs.{}", role.replace(':', "."))
+ }
+ 
+ fn cell(s: &str) -> String {
+@@ -517,12 +891,23 @@ fn cell(s: &str) -> String {
+ 
+ fn presence_cell(p: Presence) -> String {
+     match p {
+-        Presence::RequiredWhen(k, v) => format!("required when `{k}` is `{v}`"),
++        Presence::RequiredWhen(k, vs) => {
++            let vs: Vec<String> = vs.iter().map(|v| format!("`{v}`")).collect();
++            format!("required when `{k}` is {}", vs.join(" or "))
++        }
+         other => other.spelling().to_owned(),
+     }
+ }
+ 
+-/// The payload document's per-family tables, rendered from [`FAMILIES`].
++fn codes(vs: &[&str]) -> String {
++    vs.iter()
++        .map(|v| format!("`{v}`"))
++        .collect::<Vec<_>>()
++        .join(", ")
++}
++
++/// The payload document's per-family tables, rendered from [`FAMILIES`],
++/// [`LEAVES`], [`CLOSED_VALUES`] and [`PROSE_RULES`].
+ #[must_use]
+ pub fn render_markdown() -> String {
+     let mut out = String::new();
+@@ -531,26 +916,64 @@ pub fn render_markdown() -> String {
+         out.push_str(&format!("- **Replaces:** {}\n", cell(f.replaces)));
+         out.push_str(&format!("- **Authorship:** {}\n", f.authorship));
+         out.push_str(&format!("- **`sub`:** {}\n", cell(f.sub)));
+-        out.push_str(&format!("- **Lands in:** {}\n\n", cell(f.table)));
+-        out.push_str("| member | CBOR type | presence | maps from |\n|---|---|---|---|\n");
+-        for mem in f.members {
+-            out.push_str(&format!(
+-                "| `{}` | `{}` | {} | {} |\n",
+-                mem.name,
+-                mem.ty.spelling(),
+-                presence_cell(mem.presence),
+-                cell(mem.from)
+-            ));
++        out.push_str(&format!("- **Lands in:** {}\n", cell(f.table)));
++        for (_, leaves) in LEAVES.iter().filter(|(fam, _)| *fam == f.family) {
++            match leaves {
++                Leaves::Closed(set) => {
++                    out.push_str(&format!("- **Leaves (closed):** {}\n", codes(set)));
++                }
++                Leaves::Mapped(set) => out.push_str(&format!(
++                    "- **Leaves mapped:** {} (another leaf's payload is OPEN, not this table's)\n",
++                    codes(set)
++                )),
++            }
+         }
+-        for r in f.refs {
+-            out.push_str(&format!(
+-                "| `refs.{}` | `row-ref` | {} | {} |\n",
+-                r.role,
+-                presence_cell(r.presence),
+-                cell(r.from)
+-            ));
++        if OVER_THE_EVENT.contains(&f.family) {
++            out.push_str(
++                "- **Payload:** the event's own; its members are checked under the event's family\n",
++            );
+         }
+         out.push('\n');
++        if f.members.is_empty() && f.refs.is_empty() {
++            out.push_str("Members of its own: none.\n\n");
++        } else {
++            out.push_str("| member | CBOR type | presence | maps from |\n|---|---|---|---|\n");
++            for mem in f.members {
++                out.push_str(&format!(
++                    "| `{}` | `{}` | {} | {} |\n",
++                    mem.name,
++                    mem.ty.spelling(),
++                    presence_cell(mem.presence),
++                    cell(mem.from)
++                ));
++            }
++            for r in f.refs {
++                out.push_str(&format!(
++                    "| `{}` | `row-ref` | {} | {} |\n",
++                    ref_spelling(r.role),
++                    presence_cell(r.presence),
++                    cell(r.from)
++                ));
++            }
++            out.push('\n');
++        }
++        let closed: Vec<String> = CLOSED_VALUES
++            .iter()
++            .filter(|(fam, _, _)| *fam == f.family)
++            .map(|(_, member, vs)| format!("- `{member}` is one of {}\n", codes(vs)))
++            .collect();
++        let prose: Vec<String> = PROSE_RULES
++            .iter()
++            .filter(|(fam, _)| *fam == f.family)
++            .map(|(_, rule)| format!("- {rule}\n"))
++            .collect();
++        if !closed.is_empty() || !prose.is_empty() {
++            out.push_str("Rules beyond the list (refused `edition2_payload_invalid`):\n\n");
++            for line in closed.iter().chain(prose.iter()) {
++                out.push_str(line);
++            }
++            out.push('\n');
++        }
+         if f.voices.is_empty() {
+             out.push_str(
+                 "Co-signatures now counted voices: none (the author's statement alone).\n\n",
+@@ -574,5 +997,17 @@ pub fn render_markdown() -> String {
+             cell(mem.from)
+         ));
+     }
++    out.push_str("\n### Every mapped family\n\n");
++    out.push_str(&format!(
++        "- **Common members** (any family): {}\n",
++        codes(COMMON)
++    ));
++    out.push_str(&format!(
++        "- **Hash-digest members** (any family; the earlier gates read each as 64 hex): {}\n",
++        codes(HASH_DIGEST_MEMBERS)
++    ));
++    for (_, rule) in PROSE_RULES.iter().filter(|(fam, _)| *fam == "*") {
++        out.push_str(&format!("- {rule}\n"));
++    }
+     out
+ }
+diff --git a/src/federation/edition2/payloads_invariants.rs b/src/federation/edition2/payloads_invariants.rs
+index 9f798a30..dc5265c6 100644
+--- a/src/federation/edition2/payloads_invariants.rs
++++ b/src/federation/edition2/payloads_invariants.rs
+@@ -9,11 +9,67 @@
+ //!   the wrong type, an unlisted member, an unsorted set, and a missing
+ //!   required `refs` role; a conditional member is required only when its
+ //!   condition holds; a family it does not map passes.
++//!
++//! v62.0.0 (wave P1) — CC's corrections to the nine families (the CC text
++//! wins where it differs from persist's earlier table). Each witness admits
++//! the corrected shape and refuses the earlier one `edition2_payload_invalid`:
++//!
++//! - **I2900** — a roster version names its predecessor by `refs.head`
++//!   (absent on version 1, present on every later one); `refs.prev` alone
++//!   does not.
++//! - **I2901** — the charter rides `refs.also.cites`; the `also` roles are
++//!   closed (`ack`, `cites`), on every mapped family.
++//! - **I2902** — `consensus_protocol_entrenched` is a bool; absent reads
++//!   false.
++//! - **I2903** — `group:roster` carries `cohort_subkind`,
++//!   `cohort_subkind_payload` and `membership` (`private` | `public`).
++//! - **I2904** — a roster's `members` is a set by element encoding, one
++//!   entry per key.
++//! - **I2905** — the membership table maps the stages `widening` and
++//!   `removal`, each counted over `refs.head` (required); another
++//!   registered stage is not this table's and passes.
++//! - **I2906** — `reason` is a uint code, never text, on every family;
++//!   free text rides `body.note` (at most 2048 bytes).
++//! - **I2907** — a time-boxed widening carries `valid_until`.
++//! - **I2908** — the cosign states are `pending` | `signature`, with no
++//!   member of their own (the payload is the event's); no `lineage_head`
++//!   state.
++//! - **I2909** — a takedown notice: `legal_basis` is CC 3.3.2's closed set
++//!   and equals the leaf; a steward purge carries no `author`;
++//!   `perceptual_hash` and `counter_notice_channel` ride; `evidence_refs`
++//!   is a non-empty sequence.
++//! - **I2910** — a custody report carries no `expires_at` (refused: the
++//!   map is closed; live 72 h from its instant) and no `cohort`: its scope
++//!   is `community_id` / `family_id`; exactly one evidence digest.
++//! - **I2911** — a key grant: `owner` on content and stream, `epoch` on
++//!   epoch and stream, `wrap_algorithm` the v2 wire string only, no
++//!   `cohort`.
++//! - **I2912** — a delivery receipt's chunk index is `k` (lowercase); no
++//!   inner signature member.
++//! - **I2918** — `identity:occurrence` (CC 3.3.6, carried for O1): the
++//!   ruling's members admit; a missing `device_class` is refused (its
++//!   vocabulary is `types::device_class`'s, one source); an unlisted member
++//!   is refused.
++//! - **I2920** (wave P1d, CC's naming ruling) — `identity:occurrence_revocation`
++//!   names its two keys as the occurrence record does, `identity_key_id` and
++//!   `occurrence_key_id`; the short spellings `identity` / `occurrence` are
++//!   refused as unlisted members.
++//! - **I2919** (wave P1d) — the list is enforced AT THE DOOR: for each mapped
++//!   family, a statement whose payload breaks its list (an unknown member, a
++//!   missing required one, a wrong type, a closed leaf) is refused
++//!   `edition2_payload_invalid` by `put_statement` with ZERO directory reads
++//!   (every directory method of the wrapping double errors), and a valid one
++//!   passes the pure gates and reaches the directory; on sqlite and
++//!   postgres. A family with no list passes as before.
++//! - **I2913** — `amendment_digest` is a hash-digest member
++//!   ([`HASH_DIGEST_MEMBERS`]); [`LEGAL_BASES`] is the registry's
++//!   `{basis}` vocabulary.
+ 
+ use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::identity_ref;
+ 
+ use super::door_invariants::fixture::*;
+-use super::payloads::{check, render_markdown, FAMILIES};
++use super::payloads::{check, render_markdown, FAMILIES, HASH_DIGEST_MEMBERS, LEGAL_BASES};
+ use crate::federation::{malformed_row, Error};
+ 
+ const BEGIN: &str = "<!-- BEGIN rendered from federation::edition2::payloads -->\n";
+@@ -55,30 +111,108 @@ fn ms(n: u64) -> Value {
+     Value::Uint(n)
+ }
+ 
++fn txt(s: &str) -> Value {
++    Value::Text(s.into())
++}
++
++/// An identity-ref, without minting a key.
++fn id(n: u8) -> String {
++    identity_ref(&[n; 32])
++}
++
++/// `[-16, h'nn..']`.
++fn digest(n: u8) -> Value {
++    Value::Array(vec![Value::Nint(15), Value::Bytes(vec![n; 32])])
++}
++
++/// `{role: row-ref}`.
++fn refs(entries: Vec<(&str, Value)>) -> Value {
++    map(entries)
++}
++
++/// `{also: {role: [row-ref]}}`'s inner value: a one-element set.
++fn ref_set(n: u8) -> Value {
++    Value::Array(vec![ref2(&[n; 32])])
++}
++
++/// The payload with `extra` added (replacing a member of the same name)
++/// and `drop` removed.
++fn with(base: &Value, extra: Vec<(&str, Value)>, drop: &[&str]) -> Value {
++    let Value::Map(entries) = base else {
++        unreachable!()
++    };
++    let mut v: Vec<(&str, Value)> = entries
++        .iter()
++        .filter_map(|(k, v)| {
++            let k = k.as_text()?;
++            (!drop.contains(&k) && !extra.iter().any(|(e, _)| *e == k))
++                .then(|| (leak(k), v.clone()))
++        })
++        .collect();
++    v.extend(extra);
++    map(v)
++}
++
++/// The fixtures' member names are `'static` text in this file; a payload
++/// rebuilt from one is keyed by the same names.
++fn leak(k: &str) -> &'static str {
++    Box::leak(k.to_owned().into_boxed_str())
++}
++
++#[track_caller]
++fn ok(family: &str, p: &Value, why: &str) {
++    if let Err(e) = check(family, p) {
++        panic!("{why}: {family} refused: {e}");
++    }
++}
++
++#[track_caller]
++fn bad(family: &str, p: &Value, why: &str) {
++    match check(family, p) {
++        Ok(()) => panic!("{why}: {family} admitted {p:?}"),
++        Err(e) => assert_eq!(
++            reason(&e),
++            malformed_row::EDITION2_PAYLOAD_INVALID,
++            "{why}: {e}"
++        ),
++    }
++}
++
++const MEMBERSHIP: &str = "membership:{stage}";
++
+ fn widening(extra: Vec<(&str, Value)>) -> Value {
+-    let (g, mbr) = (key(110), key(111));
+     let mut v = vec![
+         ("asserted_at", ms(1_000)),
+-        ("dimension", Value::Text("membership:widening:v1".into())),
+-        ("group_kind", Value::Text("community".into())),
+-        ("group", Value::Text(iref(&g))),
+-        ("member", Value::Text(iref(&mbr))),
++        ("dimension", txt("membership:widening:v1")),
++        ("group_kind", txt("community")),
++        ("group", txt(&id(110))),
++        ("member", txt(&id(111))),
+         ("joined_at", ms(900)),
+         ("effective_at", ms(1_000)),
++        ("refs", refs(vec![("head", ref2(&[0x40; 32]))])),
+     ];
+     v.extend(extra);
+     map(v)
+ }
+ 
++fn removal() -> Value {
++    map(vec![
++        ("asserted_at", ms(1_000)),
++        ("dimension", txt("membership:removal:v1")),
++        ("group_kind", txt("family")),
++        ("group", txt(&id(110))),
++        ("member", txt(&id(111))),
++        ("removed_at", ms(990)),
++        ("effective_at", ms(1_000)),
++        ("refs", refs(vec![("head", ref2(&[0x41; 32]))])),
++    ])
++}
++
+ #[test]
+ fn i2102_check_reads_the_member_lists() {
+-    let fam = "membership:{stage}";
++    let fam = MEMBERSHIP;
+     check(fam, &widening(vec![])).expect("I2102 required members");
+-    check(
+-        fam,
+-        &widening(vec![("role", Value::Text("moderator".into()))]),
+-    )
+-    .expect("I2102 optional member");
++    check(fam, &widening(vec![("role", txt("moderator"))])).expect("I2102 optional member");
+     let bad = |p: Value, why: &str| {
+         let e = check(fam, &p).unwrap_err();
+         assert_eq!(
+@@ -88,45 +222,42 @@ fn i2102_check_reads_the_member_lists() {
+         );
+     };
+     // Missing a required member.
+-    let Value::Map(mut entries) = widening(vec![]) else {
+-        unreachable!()
+-    };
+-    entries.retain(|(k, _)| k.as_text() != Some("effective_at"));
+-    bad(Value::Map(entries), "missing");
++    bad(
++        with(&widening(vec![]), vec![], &["effective_at"]),
++        "missing",
++    );
+     // `joined_at` is required for a widening, `removed_at` is not.
+-    let Value::Map(mut entries) = widening(vec![]) else {
+-        unreachable!()
+-    };
+-    entries.retain(|(k, _)| k.as_text() != Some("joined_at"));
+-    bad(Value::Map(entries), "conditional");
++    bad(
++        with(&widening(vec![]), vec![], &["joined_at"]),
++        "conditional",
++    );
+     // Wrong types.
+-    bad(widening(vec![("reason", ms(3))]), "tstr");
+-    let Value::Map(mut entries) = widening(vec![]) else {
+-        unreachable!()
+-    };
+-    for (k, v) in &mut entries {
+-        if k.as_text() == Some("member") {
+-            *v = Value::Text("alias-not-an-identity-ref".into());
+-        }
+-    }
+-    bad(Value::Map(entries), "identity-ref");
++    bad(widening(vec![("role", ms(3))]), "tstr");
++    bad(
++        with(
++            &widening(vec![]),
++            vec![("member", txt("alias-not-an-identity-ref"))],
++            &[],
++        ),
++        "identity-ref",
++    );
+     // An unlisted member.
+     bad(widening(vec![("persist_row_hash", ms(1))]), "unlisted");
+     // An unsorted set.
+-    let (a, b) = (iref(&key(112)), iref(&key(113)));
++    let (a, b) = (id(112), id(113));
+     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+     check(
+         fam,
+         &widening(vec![(
+             "witness_set",
+-            Value::Array(vec![Value::Text(lo.clone()), Value::Text(hi.clone())]),
++            Value::Array(vec![txt(&lo), txt(&hi)]),
+         )]),
+     )
+     .expect("I2102 sorted set");
+     bad(
+         widening(vec![(
+             "witness_set",
+-            Value::Array(vec![Value::Text(hi), Value::Text(lo)]),
++            Value::Array(vec![txt(&hi), txt(&lo)]),
+         )]),
+         "unsorted",
+     );
+@@ -138,31 +269,1086 @@ fn i2102_check_reads_the_member_lists() {
+     .unwrap();
+ }
+ 
++// ---- group:roster ------------------------------------------------------
++
++const ROSTER: &str = "group:roster";
++
++fn roster_member(n: u8, joined: u64) -> Value {
++    map(vec![("key", txt(&id(n))), ("joined_at", ms(joined))])
++}
++
++/// A sorted set of roster entries.
++fn roster_members(entries: Vec<Value>) -> Value {
++    let mut e = entries;
++    e.sort_by_key(ciris_verify_core::cde::encode);
++    Value::Array(e)
++}
++
++fn roster(version: u64, extra: Vec<(&str, Value)>) -> Value {
++    let mut v = vec![
++        ("asserted_at", ms(1_000)),
++        ("group_kind", txt("community")),
++        ("group", txt(&id(120))),
++        ("name", txt("Acme Co-op")),
++        ("version", ms(version)),
++        (
++            "members",
++            roster_members(vec![roster_member(121, 10), roster_member(122, 20)]),
++        ),
++        ("founded_at", ms(10)),
++        ("consensus_protocol", txt("majority")),
++    ];
++    v.extend(extra);
++    map(v)
++}
++
++/// I2900: a roster version names its predecessor by `refs.head`.
+ #[test]
+-fn i2102_a_required_refs_role_is_checked() {
+-    let g = key(114);
+-    let lineage = |refs: Option<Value>| {
+-        let mut v = vec![
+-            ("asserted_at", ms(1_000)),
+-            ("author", Value::Text(iref(&g))),
+-            ("dimension", Value::Text("cosign:lineage_head:v1".into())),
+-            ("lineage", Value::Text(iref(&g))),
+-            ("head_asserted_at", ms(900)),
+-        ];
+-        if let Some(r) = refs {
+-            v.push(("refs", r));
+-        }
+-        map(v)
++fn i2900_a_roster_version_names_its_predecessor_by_head() {
++    ok(
++        ROSTER,
++        &roster(1, vec![]),
++        "I2900 version 1 extends nothing",
++    );
++    ok(
++        ROSTER,
++        &roster(2, vec![("refs", refs(vec![("head", ref2(&[0x50; 32]))]))]),
++        "I2900 version 2 names its predecessor by refs.head",
++    );
++    bad(
++        ROSTER,
++        &roster(2, vec![("refs", refs(vec![("prev", ref2(&[0x50; 32]))]))]),
++        "I2900 refs.prev is a signer's own series, not the version a roster extends",
++    );
++    bad(
++        ROSTER,
++        &roster(2, vec![]),
++        "I2900 a later version names its predecessor",
++    );
++    bad(
++        ROSTER,
++        &roster(1, vec![("refs", refs(vec![("head", ref2(&[0x50; 32]))]))]),
++        "I2900 version 1 extends no version",
++    );
++}
++
++/// I2901: the charter rides `refs.also.cites`; the `also` roles are closed.
++#[test]
++fn i2901_the_charter_is_cited_and_the_also_roles_are_closed() {
++    let also = |role: &str| refs(vec![("also", map(vec![(leak(role), ref_set(0x51))]))]);
++    ok(
++        ROSTER,
++        &roster(1, vec![("refs", also("cites"))]),
++        "I2901 the charter under also.cites",
++    );
++    bad(
++        ROSTER,
++        &roster(1, vec![("refs", also("charter"))]),
++        "I2901 `charter` is no also role",
++    );
++    // The closure holds on every mapped family.
++    let with_also = |role: &str| {
++        widening(vec![(
++            "refs",
++            refs(vec![
++                ("head", ref2(&[0x40; 32])),
++                ("also", map(vec![(leak(role), ref_set(0x52))])),
++            ]),
++        )])
+     };
+-    check(
+-        "cosign:{state}",
+-        &lineage(Some(map(vec![("head", ref2(&[0x44; 32]))]))),
+-    )
+-    .expect("I2102 head named");
+-    let e = check("cosign:{state}", &lineage(None)).unwrap_err();
++    ok(
++        MEMBERSHIP,
++        &with_also("cites"),
++        "I2901 a widening cites its acceptance",
++    );
++    ok(MEMBERSHIP, &with_also("ack"), "I2901 ack is an also role");
++    bad(
++        MEMBERSHIP,
++        &with_also("acceptance"),
++        "I2901 an unregistered also role",
++    );
++}
++
++/// I2902: `consensus_protocol_entrenched` is a bool; absent reads false.
++#[test]
++fn i2902_entrenched_is_a_bool() {
++    ok(ROSTER, &roster(1, vec![]), "I2902 absent (reads false)");
++    for b in [true, false] {
++        ok(
++            ROSTER,
++            &roster(1, vec![("consensus_protocol_entrenched", Value::Bool(b))]),
++            "I2902 a bool",
++        );
++    }
++    bad(
++        ROSTER,
++        &roster(1, vec![("consensus_protocol_entrenched", ms(1))]),
++        "I2902 not a uint",
++    );
++    bad(
++        ROSTER,
++        &roster(1, vec![("consensus_protocol_entrenched", txt("true"))]),
++        "I2902 not text",
++    );
++}
++
++/// I2903: `cohort_subkind`, `cohort_subkind_payload`, `membership`.
++#[test]
++fn i2903_a_roster_carries_its_subkind_and_membership() {
++    let full = roster(
++        1,
++        vec![
++            ("cohort_subkind", txt("geographic")),
++            (
++                "cohort_subkind_payload",
++                map(vec![("region", txt("north"))]),
++            ),
++            ("membership", txt("private")),
++        ],
++    );
++    ok(ROSTER, &full, "I2903 the community record's members");
++    ok(
++        ROSTER,
++        &with(&full, vec![("membership", txt("public"))], &[]),
++        "I2903 public",
++    );
++    ok(
++        ROSTER,
++        &with(&full, vec![], &["membership"]),
++        "I2903 membership absent reads public",
++    );
++    bad(
++        ROSTER,
++        &with(&full, vec![("membership", txt("secret"))], &[]),
++        "I2903 membership is private | public",
++    );
++    bad(
++        ROSTER,
++        &with(&full, vec![("cohort_subkind", ms(1))], &[]),
++        "I2903 cohort_subkind is text",
++    );
++    bad(
++        ROSTER,
++        &with(&full, vec![("cohort_subkind_payload", txt("x"))], &[]),
++        "I2903 cohort_subkind_payload is a map",
++    );
++}
++
++/// I2904: `members` is a set by element encoding, one entry per key.
++#[test]
++fn i2904_roster_members_is_a_set() {
++    let (a, b) = (roster_member(121, 10), roster_member(122, 20));
++    let sorted = roster_members(vec![a.clone(), b.clone()]);
++    let Value::Array(s) = &sorted else {
++        unreachable!()
++    };
++    let reversed = Value::Array(vec![s[1].clone(), s[0].clone()]);
++    ok(
++        ROSTER,
++        &roster(1, vec![("members", sorted.clone())]),
++        "I2904 sorted",
++    );
++    bad(
++        ROSTER,
++        &roster(1, vec![("members", reversed)]),
++        "I2904 unsorted",
++    );
++    let twice = roster_members(vec![roster_member(121, 10), roster_member(121, 11)]);
++    bad(
++        ROSTER,
++        &roster(1, vec![("members", twice)]),
++        "I2904 one entry per key",
++    );
++    let stray = roster_members(vec![
++        a,
++        map(vec![
++            ("key", txt(&id(122))),
++            ("joined_at", ms(20)),
++            ("asserted_at", ms(1)),
++        ]),
++    ]);
++    bad(
++        ROSTER,
++        &roster(1, vec![("members", stray)]),
++        "I2904 an entry carries only key, joined_at, role",
++    );
++    let _ = b;
++}
++
++// ---- membership:{stage} --------------------------------------------------
++
++/// I2905: the stages mapped are `widening` and `removal`, each counted over
++/// `refs.head`; another stage is not this table's.
++#[test]
++fn i2905_the_mapped_stages_are_widening_and_removal() {
++    ok(MEMBERSHIP, &widening(vec![]), "I2905 widening");
++    ok(MEMBERSHIP, &removal(), "I2905 removal");
++    bad(
++        MEMBERSHIP,
++        &with(&widening(vec![]), vec![], &["refs"]),
++        "I2905 a widening is counted over refs.head",
++    );
++    bad(
++        MEMBERSHIP,
++        &with(&removal(), vec![], &["refs"]),
++        "I2905 a removal is counted over refs.head",
++    );
++    bad(
++        MEMBERSHIP,
++        &with(&removal(), vec![], &["removed_at"]),
++        "I2905 a removal states removed_at",
++    );
++    // A single-signer stage's forward payload is OPEN: not this table's.
++    let proposal = map(vec![
++        ("asserted_at", ms(1_000)),
++        ("dimension", txt("membership:proposal:v1")),
++        ("group_kind", txt("community")),
++        ("role", txt("member")),
++        ("expires_at", ms(2_000)),
++    ]);
++    ok(
++        MEMBERSHIP,
++        &proposal,
++        "I2905 a proposal is not this table's",
++    );
++}
++
++/// I2906: `reason` is a uint code, never text; free text rides `body.note`.
++#[test]
++fn i2906_reason_is_a_code() {
++    ok(
++        MEMBERSHIP,
++        &with(&removal(), vec![("reason", ms(3))], &[]),
++        "I2906 membership reason code",
++    );
++    bad(
++        MEMBERSHIP,
++        &with(&removal(), vec![("reason", txt("spam"))], &[]),
++        "I2906 membership reason text",
++    );
++    let occ = map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(130))),
++        ("identity_key_id", txt(&id(130))),
++        ("occurrence_key_id", txt(&id(131))),
++        ("revoked_at", ms(1_000)),
++        ("effective_at", ms(1_000)),
++    ]);
++    let fam = "identity:occurrence_revocation";
++    ok(fam, &occ, "I2906 occurrence revocation");
++    ok(
++        fam,
++        &with(&occ, vec![("reason", ms(1))], &[]),
++        "I2906 occurrence reason code",
++    );
++    bad(
++        fam,
++        &with(&occ, vec![("reason", txt("lost device"))], &[]),
++        "I2906 occurrence reason text",
++    );
++    let rev = map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(132))),
++        ("dimension", txt("revocation:key:compromise:v1")),
++        ("revoked_at", ms(1_000)),
++        ("effective_at", ms(1_000)),
++    ]);
++    let fam = "revocation:{entity_type}:{reason}";
++    ok(fam, &rev, "I2906 revocation");
++    ok(
++        fam,
++        &with(&rev, vec![("reason", ms(2))], &[]),
++        "I2906 the envelope's reason code",
++    );
++    bad(
++        fam,
++        &with(&rev, vec![("reason", txt("key leaked"))], &[]),
++        "I2906 no free-text reason beside the coded leaf",
++    );
++    ok(
++        fam,
++        &with(
++            &rev,
++            vec![("body", map(vec![("note", txt("key leaked"))]))],
++            &[],
++        ),
++        "I2906 free text rides body.note",
++    );
++    bad(
++        fam,
++        &with(
++            &rev,
++            vec![("body", map(vec![("note", txt(&"x".repeat(2049)))]))],
++            &[],
++        ),
++        "I2906 body.note is bounded",
++    );
++    bad(
++        fam,
++        &with(&rev, vec![("body", map(vec![("note", ms(1))]))], &[]),
++        "I2906 body.note is text",
++    );
++}
++
++/// I2907: a time-boxed guest is a widening with `valid_until`.
++#[test]
++fn i2907_a_widening_carries_valid_until() {
++    ok(
++        MEMBERSHIP,
++        &widening(vec![("valid_until", ms(5_000))]),
++        "I2907 valid_until",
++    );
++    bad(
++        MEMBERSHIP,
++        &widening(vec![("valid_until", txt("2026-01-01T00:00:00Z"))]),
++        "I2907 valid_until is POSIX ms",
++    );
++}
++
++// ---- cosign:{state} -------------------------------------------------------
++
++/// I2908: the cosign states are `pending` | `signature`, with no member of
++/// their own; no `lineage_head` state.
++#[test]
++fn i2908_cosign_states_are_pending_and_signature() {
++    let fam = "cosign:{state}";
++    // The statement is over the event's own payload: its members are the
++    // event family's, not this table's.
++    ok(fam, &widening(vec![]), "I2908 the event's payload");
++    for state in ["pending", "signature"] {
++        ok(
++            fam,
++            &map(vec![
++                ("asserted_at", ms(1_000)),
++                ("dimension", txt(leak(&format!("cosign:{state}:v1")))),
++            ]),
++            "I2908 a closed state",
++        );
++    }
++    let lineage = map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(140))),
++        ("dimension", txt("cosign:lineage_head:v1")),
++        ("lineage", txt(&id(140))),
++        ("head_asserted_at", ms(900)),
++        ("refs", refs(vec![("head", ref2(&[0x44; 32]))])),
++    ]);
++    bad(fam, &lineage, "I2908 no lineage_head state");
++    bad(
++        fam,
++        &with(
++            &widening(vec![]),
++            vec![(
++                "refs",
++                refs(vec![
++                    ("head", ref2(&[0x40; 32])),
++                    ("also", map(vec![("event", ref_set(0x53))])),
++                ]),
++            )],
++            &[],
++        ),
++        "I2908 the also roles stay closed",
++    );
++}
++
++// ---- takedown_notice:{basis} ---------------------------------------------
++
++const TAKEDOWN: &str = "takedown_notice:{basis}";
++
++fn notice(basis: &str) -> Value {
++    let (h1, h2) = (id(151), id(152));
++    map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(150))),
++        (
++            "dimension",
++            txt(leak(&format!("takedown_notice:{basis}:v1"))),
++        ),
++        ("legal_basis", txt(basis)),
++        ("claimant", txt(&id(150))),
++        ("content_sha256", digest(0x60)),
++        ("content_holders", text_set(&[h1.as_str(), h2.as_str()])),
++        ("claim_text", txt("the work is mine")),
++        ("good_faith_statement", txt("in good faith")),
++        ("jurisdiction", txt("US")),
++    ])
++}
++
++/// I2909: a takedown notice's closed basis, its counted leaf, its new
++/// optional members, and the evidence sequence.
++#[test]
++fn i2909_a_takedown_notice() {
++    for basis in LEGAL_BASES.iter().filter(|b| **b != "steward_purge") {
++        ok(TAKEDOWN, &notice(basis), "I2909 a closed basis");
++    }
++    let unknown = notice("dmca_512");
++    bad(
++        TAKEDOWN,
++        &unknown,
++        "I2909 a basis outside CC 3.3.2's eleven",
++    );
++    bad(
++        TAKEDOWN,
++        &with(
++            &notice("dmca512"),
++            vec![("legal_basis", txt("court_order"))],
++            &[],
++        ),
++        "I2909 legal_basis equals the leaf",
++    );
++    let purge = with(&notice("steward_purge"), vec![], &["author"]);
++    ok(TAKEDOWN, &purge, "I2909 a steward purge is counted");
++    bad(
++        TAKEDOWN,
++        &notice("steward_purge"),
++        "I2909 a steward purge carries no author",
++    );
++    ok(
++        TAKEDOWN,
++        &with(
++            &notice("perceptual_hash_csam"),
++            vec![
++                ("perceptual_hash", Value::Bytes(vec![7; 8])),
++                ("counter_notice_channel", txt("mailto:counter@example.org")),
++            ],
++            &[],
++        ),
++        "I2909 perceptual_hash and counter_notice_channel",
++    );
++    bad(
++        TAKEDOWN,
++        &with(
++            &notice("dmca512"),
++            vec![("counter_notice_channel", ms(1))],
++            &[],
++        ),
++        "I2909 counter_notice_channel is text",
++    );
++    // A sequence, in the order signed: not sorted, not a set.
++    let seq = Value::Array(vec![digest(0x62), digest(0x61)]);
++    ok(
++        TAKEDOWN,
++        &with(&notice("dmca512"), vec![("evidence_refs", seq)], &[]),
++        "I2909 evidence_refs is a sequence",
++    );
++    bad(
++        TAKEDOWN,
++        &with(
++            &notice("dmca512"),
++            vec![("evidence_refs", Value::Array(vec![]))],
++            &[],
++        ),
++        "I2909 evidence_refs is non-empty",
++    );
++    bad(
++        TAKEDOWN,
++        &with(
++            &notice("dmca512"),
++            vec![("evidence_refs", Value::Array(vec![txt(&"ab".repeat(32))]))],
++            &[],
++        ),
++        "I2909 evidence_refs holds digests, never hex",
++    );
++}
++
++// ---- custody:{kind} -------------------------------------------------------
++
++const CUSTODY: &str = "custody:{kind}";
++
++fn custody(extra: Vec<(&str, Value)>) -> Value {
++    let mut v = vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(160))),
++        ("dimension", txt("custody:ack:v1")),
++        ("custody_state", txt("here")),
++        ("evidence_refs", Value::Array(vec![digest(0x70)])),
++        ("size", ms(4096)),
++        ("cohort_scope", txt("community")),
++        ("community_id", txt(&id(161))),
++    ];
++    v.extend(extra);
++    map(v)
++}
++
++/// I2910: a custody report carries no `expires_at` and no `cohort`;
++/// exactly one evidence digest.
++#[test]
++fn i2910_a_custody_report() {
++    ok(
++        CUSTODY,
++        &custody(vec![]),
++        "I2910 no expires_at: live 72 h from its instant",
++    );
++    bad(
++        CUSTODY,
++        &custody(vec![("expires_at", ms(1_000 + 72 * 3_600_000))]),
++        "I2910 custody has no expires_at member: the map is closed",
++    );
++    ok(
++        CUSTODY,
++        &with(
++            &custody(vec![]),
++            vec![
++                ("cohort_scope", txt("family")),
++                ("family_id", txt(&id(162))),
++            ],
++            &["community_id"],
++        ),
++        "I2910 a family-scoped report names family_id",
++    );
++    bad(
++        CUSTODY,
++        &with(
++            &custody(vec![]),
++            vec![("cohort", txt(&id(161)))],
++            &["community_id"],
++        ),
++        "I2910 no `cohort` member",
++    );
++    bad(
++        CUSTODY,
++        &with(
++            &custody(vec![]),
++            vec![(
++                "evidence_refs",
++                Value::Array(vec![digest(0x70), digest(0x71)]),
++            )],
++            &[],
++        ),
++        "I2910 exactly one evidence digest",
++    );
++    bad(
++        CUSTODY,
++        &with(&custody(vec![]), vec![], &["size"]),
++        "I2910 a here report states its size",
++    );
++    ok(
++        CUSTODY,
++        &with(
++            &custody(vec![]),
++            vec![("custody_state", txt("none"))],
++            &["size"],
++        ),
++        "I2910 a none report",
++    );
++    bad(
++        CUSTODY,
++        &with(&custody(vec![]), vec![("custody_state", txt("gone"))], &[]),
++        "I2910 custody_state is here | none",
++    );
++}
++
++// ---- key_grant:{axis} -----------------------------------------------------
++
++const GRANT: &str = "key_grant:{axis}";
++
++fn grant(axis: &str, extra: Vec<(&str, Value)>) -> Value {
++    let mut v = vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(170))),
++        ("dimension", txt(leak(&format!("key_grant:{axis}:v1")))),
++        ("axis", txt(axis)),
++        (
++            "wrap_algorithm",
++            txt(crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2),
++        ),
++        ("wrapped_dek", Value::Bytes(vec![9; 48])),
++    ];
++    v.extend(extra);
++    map(v)
++}
++
++/// I2911: `owner` on content and stream, `epoch` on epoch and stream, the
++/// v2 wrap only, no `cohort`.
++#[test]
++fn i2911_a_key_grant() {
++    let epoch = grant(
++        "epoch",
++        vec![
++            ("community", txt(&id(171))),
++            ("minter", txt(&id(172))),
++            ("epoch", ms(3)),
++        ],
++    );
++    let content = grant(
++        "content",
++        vec![("at_rest_sha256", digest(0x72)), ("owner", txt(&id(173)))],
++    );
++    let stream = grant(
++        "stream",
++        vec![
++            ("stream_id", txt("s-1")),
++            ("epoch", ms(4)),
++            ("owner", txt(&id(173))),
++        ],
++    );
++    ok(GRANT, &epoch, "I2911 epoch");
++    ok(GRANT, &content, "I2911 content");
++    ok(GRANT, &stream, "I2911 stream");
++    bad(
++        GRANT,
++        &with(&epoch, vec![], &["epoch"]),
++        "I2911 epoch on epoch",
++    );
++    bad(
++        GRANT,
++        &with(&stream, vec![], &["epoch"]),
++        "I2911 epoch on stream",
++    );
++    bad(
++        GRANT,
++        &with(&content, vec![], &["owner"]),
++        "I2911 owner on content",
++    );
++    bad(
++        GRANT,
++        &with(&stream, vec![], &["owner"]),
++        "I2911 owner on stream",
++    );
++    bad(
++        GRANT,
++        &with(
++            &content,
++            vec![(
++                "wrap_algorithm",
++                txt(crate::federation::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED),
++            )],
++            &[],
++        ),
++        "I2911 the v2 wire string only",
++    );
++    bad(
++        GRANT,
++        &with(&epoch, vec![("cohort", txt(&id(171)))], &[]),
++        "I2911 no `cohort` member",
++    );
++    ok(
++        GRANT,
++        &with(
++            &epoch,
++            vec![
++                ("cohort_scope", txt("community")),
++                ("community_id", txt(&id(171))),
++            ],
++            &[],
++        ),
++        "I2911 the target alias is the CC 2.1 member",
++    );
++}
++
++// ---- delivery_receipt:{stream_id} -----------------------------------------
++
++/// I2912: the chunk index is `k`; no inner signature member.
++#[test]
++fn i2912_a_delivery_receipt() {
++    let fam = "delivery_receipt:{stream_id}";
++    let r = map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(180))),
++        ("dimension", txt("delivery_receipt:s-1:v1")),
++        ("stream_id", txt("s-1")),
++        ("epoch", ms(2)),
++        ("k", ms(17)),
++        ("chunk_root", digest(0x80)),
++    ]);
++    ok(fam, &r, "I2912 the receipt payload");
++    bad(
++        fam,
++        &with(&r, vec![("K", ms(17))], &["k"]),
++        "I2912 CBOR member names are lowercase",
++    );
++    bad(
++        fam,
++        &with(&r, vec![("signature", Value::Bytes(vec![1; 64]))], &[]),
++        "I2912 no inner signed object",
++    );
++}
++
++// ---- the tables -----------------------------------------------------------
++
++/// I2913: `amendment_digest` is a hash-digest member; the bases are the
++/// registry's.
++#[test]
++fn i2913_the_member_tables() {
++    for member in [
++        "evidence_refs",
++        "seat_commitment",
++        "carried",
++        "amendment_digest",
++    ] {
++        assert!(
++            HASH_DIGEST_MEMBERS.contains(&member),
++            "I2913 {member} is a hash-digest member"
++        );
++    }
++    let path = concat!(
++        env!("CARGO_MANIFEST_DIR"),
++        "/src/federation/namespace/namespace_registry.json"
++    );
++    let reg: serde_json::Value =
++        serde_json::from_str(&std::fs::read_to_string(path).expect("I2913 the registry"))
++            .expect("I2913 registry json");
++    let mut found = None;
++    let mut stack = vec![&reg];
++    while let Some(v) = stack.pop() {
++        match v {
++            serde_json::Value::Object(o) => {
++                if o.get("prefix").and_then(serde_json::Value::as_str)
++                    == Some("takedown_notice:{basis}")
++                {
++                    found = o.get("segments").cloned();
++                }
++                stack.extend(o.values());
++            }
++            serde_json::Value::Array(a) => stack.extend(a.iter()),
++            _ => {}
++        }
++    }
++    let segments = found.expect("I2913 the takedown_notice row");
++    let values: Vec<String> = segments
++        .as_array()
++        .into_iter()
++        .flatten()
++        .filter(|s| s["segment"] == "{basis}")
++        .flat_map(|s| s["values"].as_array().cloned().unwrap_or_default())
++        .filter_map(|v| v.as_str().map(str::to_owned))
++        .collect();
++    let mut want: Vec<String> = LEGAL_BASES.iter().map(|s| (*s).to_owned()).collect();
++    let mut got = values;
++    want.sort();
++    got.sort();
+     assert_eq!(
+-        reason(&e),
+-        malformed_row::EDITION2_PAYLOAD_INVALID,
+-        "I2102 refs.head"
++        got, want,
++        "I2913 LEGAL_BASES is the registry's {{basis}} vocabulary"
++    );
++}
++
++// ---- identity:occurrence (O1) -------------------------------------------
++
++/// I2918: the `identity:occurrence` payload.
++#[test]
++fn i2918_an_identity_occurrence() {
++    let fam = "identity:occurrence";
++    let occ = map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(190))),
++        ("identity_key_id", txt(&id(190))),
++        ("occurrence_key_id", txt(&id(191))),
++        ("device_class", txt("phone")),
++    ]);
++    ok(fam, &occ, "I2918 the required members");
++    ok(
++        fam,
++        &with(
++            &occ,
++            vec![
++                ("build_manifest_hash", digest(0x90)),
++                ("valid_until", ms(9_000)),
++                ("hardware_attestation", Value::Bytes(vec![1; 16])),
++                ("onion_relay", map(vec![("opt_out", Value::Bool(true))])),
++                (
++                    "refs",
++                    refs(vec![("also", map(vec![("cites", ref_set(0x91))]))]),
++                ),
++            ],
++            &[],
++        ),
++        "I2918 the optional members",
++    );
++    bad(
++        fam,
++        &with(&occ, vec![], &["device_class"]),
++        "I2918 device_class is required",
++    );
++    // The device-class vocabulary is `types::device_class` (its own token,
++    // `federation_device_class_rejected`, at O1's door): one source, so the
++    // list types the member and does not close it.
++    ok(
++        fam,
++        &with(&occ, vec![("device_class", txt("toaster"))], &[]),
++        "I2918 the vocabulary is device_class's own gate, not the list's",
++    );
++    bad(
++        fam,
++        &with(&occ, vec![("occurrence", txt(&id(191)))], &[]),
++        "I2918 an unlisted member (the short spelling no family uses)",
++    );
++    bad(
++        fam,
++        &with(
++            &occ,
++            vec![("build_manifest_hash", txt(&"ab".repeat(32)))],
++            &[],
++        ),
++        "I2918 build_manifest_hash is a digest, never hex",
++    );
++}
++
++// ---- the fixtures the door witness signs (I2919) -------------------------
++
++fn occurrence() -> Value {
++    map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(190))),
++        ("identity_key_id", txt(&id(190))),
++        ("occurrence_key_id", txt(&id(191))),
++        ("device_class", txt("phone")),
++    ])
++}
++
++fn occurrence_revocation() -> Value {
++    map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(130))),
++        ("identity_key_id", txt(&id(130))),
++        ("occurrence_key_id", txt(&id(131))),
++        ("revoked_at", ms(1_000)),
++        ("effective_at", ms(1_000)),
++    ])
++}
++
++fn revocation() -> Value {
++    map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(132))),
++        ("dimension", txt("revocation:key:compromise:v1")),
++        ("revoked_at", ms(1_000)),
++        ("effective_at", ms(1_000)),
++    ])
++}
++
++fn receipt() -> Value {
++    map(vec![
++        ("asserted_at", ms(1_000)),
++        ("author", txt(&id(180))),
++        ("dimension", txt("delivery_receipt:s-1:v1")),
++        ("stream_id", txt("s-1")),
++        ("epoch", ms(2)),
++        ("k", ms(17)),
++        ("chunk_root", digest(0x80)),
++    ])
++}
++
++fn cosign_pending() -> Value {
++    map(vec![
++        ("asserted_at", ms(1_000)),
++        ("dimension", txt("cosign:pending:v1")),
++    ])
++}
++
++/// Per mapped family: a valid payload, and one that breaks its list.
++fn door_cases() -> Vec<(&'static str, Value, Value, &'static str)> {
++    let content = grant(
++        "content",
++        vec![("at_rest_sha256", digest(0x72)), ("owner", txt(&id(173)))],
++    );
++    vec![
++        (
++            ROSTER,
++            roster(1, vec![]),
++            roster(1, vec![("charter_digest", txt(&"ab".repeat(32)))]),
++            "an unknown member",
++        ),
++        (
++            MEMBERSHIP,
++            widening(vec![]),
++            with(&widening(vec![]), vec![], &["effective_at"]),
++            "a missing required member",
++        ),
++        (
++            "identity:occurrence",
++            occurrence(),
++            with(&occurrence(), vec![("device_class", ms(1))], &[]),
++            "a wrong type",
++        ),
++        (
++            "identity:occurrence_revocation",
++            occurrence_revocation(),
++            with(&occurrence_revocation(), vec![("reason", txt("lost"))], &[]),
++            "a wrong type (reason is a code)",
++        ),
++        (
++            "cosign:{state}",
++            cosign_pending(),
++            with(
++                &cosign_pending(),
++                vec![("dimension", txt("cosign:lineage_head:v1"))],
++                &[],
++            ),
++            "a leaf outside the closed states",
++        ),
++        (
++            "revocation:{entity_type}:{reason}",
++            revocation(),
++            with(&revocation(), vec![], &["revoked_at"]),
++            "a missing required member",
++        ),
++        (
++            TAKEDOWN,
++            notice("dmca512"),
++            with(&notice("dmca512"), vec![("notice_terms", txt("x"))], &[]),
++            "an unknown member",
++        ),
++        (
++            CUSTODY,
++            custody(vec![]),
++            custody(vec![("expires_at", ms(1_000 + 72 * 3_600_000))]),
++            "a member the closed custody map refuses",
++        ),
++        (
++            GRANT,
++            content.clone(),
++            with(&content, vec![("wrapped_dek", txt("not bytes"))], &[]),
++            "a wrong type",
++        ),
++        (
++            "delivery_receipt:{stream_id}",
++            receipt(),
++            with(&receipt(), vec![("K", ms(17))], &["k"]),
++            "an unknown member (and k missing)",
++        ),
++    ]
++}
++
++/// Every mapped family has a door case.
++#[test]
++fn i2919_every_mapped_family_has_a_door_case() {
++    let cased: Vec<&str> = door_cases().iter().map(|c| c.0).collect();
++    for f in FAMILIES {
++        assert!(
++            cased.contains(&f.family),
++            "I2919 {} has no door case",
++            f.family
++        );
++    }
++}
++
++#[cfg(any(feature = "sqlite", feature = "postgres"))]
++mod door {
++    use std::sync::Arc;
++
++    use ciris_verify_core::edition2::sign_row_statement;
++    use ciris_verify_core::namespace_match::family_id;
++
++    use super::super::door_invariants::fixture::{iref, key};
++    use super::super::ingest::{put_statement, INGEST_TIER};
++    use super::*;
++    use crate::federation::directory_double::FaultInjectingDirectory;
++    use crate::federation::FederationDirectory;
++
++    /// The generated double, read for the names of the methods it delegates.
++    const DOUBLE: &str = include_str!("../directory_double.rs");
++
++    /// `inner` with every delegated method erroring: any directory read
++    /// answers `federation_backend`.
++    fn no_reads(inner: Arc<dyn FederationDirectory>) -> FaultInjectingDirectory {
++        DOUBLE
++            .lines()
++            .filter_map(|l| l.trim_start().strip_prefix("async fn "))
++            .filter_map(|rest| rest.split('(').next())
++            .map(str::trim)
++            .filter(|n| !n.is_empty())
++            .fold(FaultInjectingDirectory::new(inner), |d, m| d.erroring(m))
++    }
++
++    fn signed(family: &str, payload: &Value) -> Vec<u8> {
++        let k = key(200);
++        sign_row_statement(
++            &k,
++            &iref(&k),
++            &iref(&k),
++            "scores",
++            &family_id(family),
++            payload,
++            vec![],
++        )
++        .unwrap()
++    }
++
++    async fn body(inner: Arc<dyn FederationDirectory>) {
++        let dir = no_reads(inner);
++        for (family, good, broken, what) in door_cases() {
++            let e = put_statement(&dir, &signed(family, &broken), None, INGEST_TIER)
++                .await
++                .unwrap_err();
++            assert_eq!(
++                reason(&e),
++                malformed_row::EDITION2_PAYLOAD_INVALID,
++                "I2919 {family}: {what} is refused at the door with no read: {e:?}"
++            );
++            let e = put_statement(&dir, &signed(family, &good), None, INGEST_TIER)
++                .await
++                .unwrap_err();
++            assert_eq!(
++                e.kind(),
++                "federation_backend",
++                "I2919 {family}: a valid payload passes the pure gates and reaches the \
++                 directory (the double's injected failure): {e:?}"
++            );
++        }
++        // A family with no list passes the payload check as before.
++        let e = put_statement(
++            &dir,
++            &signed(
++                "evidence:.suite:.kind:.cell:.prefix",
++                &map(vec![("asserted_at", ms(1_000)), ("anything", ms(1))]),
++            ),
++            None,
++            INGEST_TIER,
++        )
++        .await
++        .unwrap_err();
++        assert_eq!(
++            e.kind(),
++            "federation_backend",
++            "I2919 an unmapped family is not checked against a list: {e:?}"
++        );
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test]
++    async fn i2919_the_lists_are_enforced_at_the_door_sqlite() {
++        use crate::store::Backend as _;
++        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        Box::pin(body(Arc::new(b))).await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test]
++    async fn i2919_the_lists_are_enforced_at_the_door_postgres() {
++        use crate::store::Backend as _;
++        let Some(dsn) = crate::test_pg::empty_dsn() else {
++            return;
++        };
++        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        Box::pin(body(Arc::new(b))).await;
++    }
++}
++
++/// I2920: the occurrence revocation uses the occurrence record's own names.
++#[test]
++fn i2920_the_occurrence_revocation_uses_the_records_names() {
++    let fam = "identity:occurrence_revocation";
++    ok(
++        fam,
++        &occurrence_revocation(),
++        "I2920 identity_key_id / occurrence_key_id",
++    );
++    let short = with(
++        &occurrence_revocation(),
++        vec![("identity", txt(&id(130))), ("occurrence", txt(&id(131)))],
++        &["identity_key_id", "occurrence_key_id"],
++    );
++    bad(fam, &short, "I2920 the short spellings are not members");
++    bad(
++        fam,
++        &with(&occurrence_revocation(), vec![], &["occurrence_key_id"]),
++        "I2920 occurrence_key_id is required",
+     );
+ }
+diff --git a/src/federation/edition2/pure_gates_invariants.rs b/src/federation/edition2/pure_gates_invariants.rs
+new file mode 100644
+index 00000000..7170e807
+--- /dev/null
++++ b/src/federation/edition2/pure_gates_invariants.rs
+@@ -0,0 +1,423 @@
++//! **I2914** (v62.0.0, wave P1c; AV-76 at the edition-2 door): the door's
++//! pure gates precede its first directory read, on sqlite and postgres.
++//!
++//! The directory is wrapped in the fault-injecting double with EVERY method
++//! it delegates declared erroring, so any directory read answers
++//! `federation_backend`:
++//!
++//! - the instrument can fail: an under-cap statement from a signer with no
++//!   held record reaches the key-plane read and draws the injected failure
++//!   (the double now delegates the edition-2 store, so the read is seen);
++//! - an oversized statement (over `MAX_STATEMENT_BYTES`) is refused
++//!   `federation_envelope_too_large` with NO directory read;
++//! - an edition-1 row-ref is refused `row_ref_edition_1` with NO directory
++//!   read;
++//! - a JSON object is refused `earlier_form_object` with NO directory read.
++//!
++//! **I2916** (wave P1c): a statement under the cap is not refused for its
++//! size downstream. The mapped row carries the statement again, as hex,
++//! under `ceg_statement`; the envelope size gate bounds that member on its
++//! own (at most the statement cap) and does not measure the derived rest
++//! against the earlier-form cap. So a 900 KiB statement, its bulk text or a
++//! byte string (hex in the projection), passes every size gate and is
++//! stored, on sqlite and postgres; an earlier-form envelope with no carried
++//! statement is measured exactly as before.
++//!
++//! **I2917** (wave P1c): a row carrying a statement is exactly its
++//! projection, checked FIRST at the attestation door. A small valid
++//! statement paired with a large forged envelope (3 MiB of `pad`) is refused
++//! `typed_diverges_from_envelope` by `check_carried_projection`, a pure
++//! function of the row (it takes no directory, so it reads none, and it
++//! never canonicalizes the offered envelope). On sqlite and postgres the
++//! same row, also carrying a malformed subject that the door's previous
++//! first gate (`validate_subject_key_ids`) refuses with its own error,
++//! comes back `typed_diverges_from_envelope`: the projection check runs
++//! ahead of every other gate. The honest mapped row passes the pre-check;
++//! an earlier-form row (no carried statement) is untouched by it.
++//!
++//! Before P1c, `put_statement` read the signer's key plane
++//! (`held_keys_for`) first, so the oversized statement drew the read (here
++//! `federation_backend`; against a bare backend the retryable
++//! `federation_attester_key_unknown`).
++
++use std::sync::Arc;
++
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::door::admit_row;
++use super::door::{pure_statement_gates, MAX_STATEMENT_BYTES};
++use super::door_invariants::fixture::*;
++use super::ingest::{
++    attestation_of, check_carried_projection, put_statement, StatementOutcome, INGEST_TIER,
++    STATEMENT_MEMBER,
++};
++use super::liveness::HeldKeys;
++use crate::federation::directory_double::FaultInjectingDirectory;
++use crate::federation::types::{Attestation, SignedAttestation};
++use crate::federation::{malformed_row, Error, FederationDirectory};
++use ciris_verify_core::edition2::family::SelectContext;
++
++/// The generated double, read for the names of the methods it delegates.
++const DOUBLE: &str = include_str!("../directory_double.rs");
++
++/// Every `async fn` the double delegates (each checks its fault table
++/// first).
++fn every_method() -> Vec<&'static str> {
++    DOUBLE
++        .lines()
++        .filter_map(|l| l.trim_start().strip_prefix("async fn "))
++        .filter_map(|rest| rest.split('(').next())
++        .map(str::trim)
++        .filter(|n| !n.is_empty())
++        .collect()
++}
++
++/// `inner`, with every delegated method answering an injected backend
++/// failure: a door that reads the directory at all draws
++/// `federation_backend`.
++fn no_reads(inner: Arc<dyn FederationDirectory>) -> FaultInjectingDirectory {
++    every_method()
++        .into_iter()
++        .fold(FaultInjectingDirectory::new(inner), |d, m| d.erroring(m))
++}
++
++fn reason(e: &Error) -> String {
++    match e {
++        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
++        other => other.kind().to_owned(),
++    }
++}
++
++/// An authored score row (Verify's vector family) by `k`, with `extra`
++/// members.
++fn statement(
++    k: &ciris_crypto::composite::CompositeSigningKey,
++    extra: Vec<(&str, Value)>,
++) -> Vec<u8> {
++    let mut m = vec![
++        ("asserted_at", Value::Uint(5_000)),
++        ("author", Value::Text(iref(k))),
++        ("score", Value::Uint(750_000)),
++        ("confidence", Value::Uint(900_000)),
++        (
++            "dimension",
++            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
++        ),
++    ];
++    m.extend(extra);
++    sign_row_statement(
++        k,
++        &iref(k),
++        &iref(k),
++        "scores",
++        "evidence:.suite:.kind:.cell:.prefix",
++        &map(m),
++        vec![],
++    )
++    .unwrap()
++}
++
++fn oversized(k: &ciris_crypto::composite::CompositeSigningKey) -> Vec<u8> {
++    let st = statement(
++        k,
++        vec![("pad", Value::Bytes(vec![0x78; MAX_STATEMENT_BYTES + 1]))],
++    );
++    assert!(
++        st.len() > MAX_STATEMENT_BYTES,
++        "I2914 the fixture is oversized"
++    );
++    st
++}
++
++/// I2914: the pure gates alone, no directory.
++#[test]
++fn i2914_the_pure_gates_need_no_directory() {
++    let k = key(150);
++    let e = pure_statement_gates(&oversized(&k), &HeldKeys::new()).unwrap_err();
++    assert_eq!(e.kind(), "federation_envelope_too_large", "I2914 {e}");
++    pure_statement_gates(&statement(&k, vec![]), &HeldKeys::new())
++        .expect("I2914 an under-cap statement passes the pure gates, keys or none");
++    let old = statement(&k, vec![("refs", map(vec![("target", ref1(&[0x21; 32]))]))]);
++    let e = pure_statement_gates(&old, &HeldKeys::new()).unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_ROW_REF_EDITION_1,
++        "I2914 {e}"
++    );
++}
++
++async fn body(inner: Arc<dyn FederationDirectory>) {
++    let methods = every_method();
++    assert!(
++        methods.contains(&"edition2_statements_about"),
++        "I2914 the double delegates the key-plane read, or a fault on it is never seen"
++    );
++    assert!(methods.len() > 100, "I2914 the double's methods were read");
++    let dir = no_reads(inner);
++    let k = key(151);
++
++    // The instrument can fail: an admissible-size statement is read for.
++    let e = put_statement(&dir, &statement(&k, vec![]), None, INGEST_TIER)
++        .await
++        .unwrap_err();
++    assert_eq!(
++        e.kind(),
++        "federation_backend",
++        "I2914 an under-cap statement reaches the directory (the injected failure): {e}"
++    );
++
++    // An oversized statement buys no read.
++    let e = put_statement(&dir, &oversized(&k), None, INGEST_TIER)
++        .await
++        .unwrap_err();
++    assert_eq!(
++        e.kind(),
++        "federation_envelope_too_large",
++        "I2914 the size gate precedes the signer's key-plane read: {e}"
++    );
++
++    // Nor does an edition-1 name, or an earlier-form object.
++    let old = statement(&k, vec![("refs", map(vec![("target", ref1(&[0x22; 32]))]))]);
++    let e = put_statement(&dir, &old, None, INGEST_TIER)
++        .await
++        .unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_ROW_REF_EDITION_1,
++        "I2914 {e}"
++    );
++    let e = put_statement(&dir, br#"{"attestation_id":"x"}"#, None, INGEST_TIER)
++        .await
++        .unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_EARLIER_FORM_OBJECT,
++        "I2914 {e}"
++    );
++}
++
++/// I2916: the envelope gate, unit.
++#[test]
++fn i2916_the_envelope_gate_does_not_count_the_carried_statement_twice() {
++    use crate::federation::admission::{
++        check_envelope_size_admission, MAX_ATTESTATION_ENVELOPE_BYTES,
++    };
++    let kib900 = 900 * 1024;
++    // A mapped row of a 900 KiB statement: the payload's projection plus the
++    // statement as hex. Over the cap counted whole; admitted.
++    let mapped = serde_json::json!({
++        "pad": "x".repeat(kib900),
++        STATEMENT_MEMBER: "ab".repeat(kib900),
++    });
++    check_envelope_size_admission(&mapped)
++        .expect("I2916 the carried statement is sized at the door, not again here");
++    // The carried member is still bounded: over the statement cap is refused.
++    let huge_carried = serde_json::json!({
++        STATEMENT_MEMBER: "ab".repeat(MAX_STATEMENT_BYTES + 1),
++    });
++    let e = check_envelope_size_admission(&huge_carried).unwrap_err();
++    assert_eq!(e.kind(), "federation_envelope_too_large", "I2916 {e}");
++    // A carrying envelope is sized by its statement alone: its projection is
++    // derived from the statement (a byte-string member is hex there), so it
++    // may exceed the earlier-form cap and is not measured against it.
++    let derived = serde_json::json!({
++        "blob": "ab".repeat(kib900),
++        STATEMENT_MEMBER: "ab".repeat(kib900),
++    });
++    check_envelope_size_admission(&derived)
++        .expect("I2916 the derived envelope is the statement's size, not its own");
++    // An earlier-form envelope (no carried statement): unchanged.
++    let earlier = serde_json::json!({ "pad": "x".repeat(MAX_ATTESTATION_ENVELOPE_BYTES + 1) });
++    let e = check_envelope_size_admission(&earlier).unwrap_err();
++    assert_eq!(e.kind(), "federation_envelope_too_large", "I2916 {e}");
++    let earlier_ok = serde_json::json!({ "pad": "x".repeat(kib900) });
++    check_envelope_size_admission(&earlier_ok).expect("I2916 earlier form under the cap");
++}
++
++/// I2916: a 900 KiB statement from a live key is admitted and stored, its
++/// bulk text (`pad`) or a byte string (`blob`, hex in the projection: a
++/// ~1.8 MiB derived envelope before the carried copy).
++async fn big_body(d: &dyn FederationDirectory) {
++    let k = key(152);
++    put_statement(d, &key_record(&k, &["user"], 0, None), None, INGEST_TIER)
++        .await
++        .unwrap_or_else(|e| panic!("I2916 key record: {e:?}"));
++    for (what, bulk) in [
++        ("pad", Value::Text("x".repeat(900 * 1024))),
++        ("blob", Value::Bytes(vec![0x5c; 900 * 1024])),
++    ] {
++        big_one(d, &k, what, bulk).await;
++    }
++}
++
++async fn big_one(
++    d: &dyn FederationDirectory,
++    k: &ciris_crypto::composite::CompositeSigningKey,
++    what: &str,
++    bulk: Value,
++) {
++    let st = statement(k, vec![(what, bulk)]);
++    assert!(
++        st.len() > 900 * 1024 && st.len() <= MAX_STATEMENT_BYTES,
++        "I2916 the {what} fixture is 900 KiB, under the statement cap"
++    );
++    let out = put_statement(d, &st, None, INGEST_TIER)
++        .await
++        .unwrap_or_else(|e| {
++            panic!("I2916 a 900 KiB {what} statement passes the size gates: {e:?}")
++        });
++    let StatementOutcome::Row { row_id, new: true } = out else {
++        panic!("I2916 {what}: {out:?}");
++    };
++    assert!(
++        d.get_attestation(&row_id.hex()).await.unwrap().is_some(),
++        "I2916 {what} stored"
++    );
++}
++
++/// The honest mapped row of `k`'s small statement, and a forgery of it: the
++/// same carried statement beside a 3 MiB forged `pad`.
++fn honest_and_forged(
++    k: &ciris_crypto::composite::CompositeSigningKey,
++) -> (Attestation, Attestation) {
++    let mut keys = HeldKeys::new();
++    keys.insert_record(key_record(k, &["user"], 0, None));
++    let st = statement(k, vec![]);
++    let admitted = admit_row(&st, &keys, None, SelectContext::default()).unwrap();
++    let honest = attestation_of(&admitted, INGEST_TIER).unwrap();
++    let mut forged = honest.clone();
++    forged.attestation_envelope["pad"] = serde_json::json!("x".repeat(3 * 1024 * 1024));
++    (honest, forged)
++}
++
++/// I2917: the pre-check, pure.
++#[test]
++fn i2917_a_forged_envelope_beside_a_valid_statement_is_refused_for_pennies() {
++    let k = key(153);
++    let (honest, forged) = honest_and_forged(&k);
++    check_carried_projection(&honest).expect("I2917 the honest projection passes");
++    let e = check_carried_projection(&forged).unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++        "I2917 {e}"
++    );
++    // A different row id than the statement's is refused by name.
++    let mut renamed = honest.clone();
++    renamed.attestation_id = hex::encode([7u8; 32]);
++    let e = check_carried_projection(&renamed).unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_ROW_ID_MISMATCH,
++        "I2917 {e}"
++    );
++    // An earlier-form row carries no statement: untouched.
++    let mut earlier = honest;
++    if let Some(o) = earlier.attestation_envelope.as_object_mut() {
++        o.remove(STATEMENT_MEMBER);
++    }
++    check_carried_projection(&earlier).expect("I2917 no carried statement, no pre-check");
++}
++
++/// I2917: wired FIRST at the attestation door.
++async fn forged_body(d: &dyn FederationDirectory) {
++    let k = key(154);
++    let (_, mut forged) = honest_and_forged(&k);
++    // The door's previous first gate refuses a malformed subject with its own
++    // error; the projection check must answer before it.
++    forged.subject_key_ids = vec![String::new()];
++    let e = d
++        .put_attestation(SignedAttestation {
++            attestation: forged.clone(),
++        })
++        .await
++        .unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++        "I2917 the projection check leads the door: {e:?}"
++    );
++    assert!(
++        d.get_attestation(&forged.attestation_id)
++            .await
++            .unwrap()
++            .is_none(),
++        "I2917 nothing stored"
++    );
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2917_a_forged_carrier_is_refused_first_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(forged_body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2917_a_forged_carrier_is_refused_first_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(forged_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2916_a_900_kib_statement_is_stored_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(big_body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2916_a_900_kib_statement_is_stored_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(big_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2914_pure_gates_precede_the_directory_read_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(Arc::new(b))).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2914_pure_gates_precede_the_directory_read_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(Arc::new(b))).await;
++}
+diff --git a/src/federation/edition2/weight_column_invariants.rs b/src/federation/edition2/weight_column_invariants.rs
+new file mode 100644
+index 00000000..06f25afb
+--- /dev/null
++++ b/src/federation/edition2/weight_column_invariants.rs
+@@ -0,0 +1,229 @@
++//! **I2915** (v62.0.0, wave P1c; E1's finding): the edition-2 mapping fills
++//! the typed `weight` column from the payload's fixed6 `weight`.
++//!
++//! - pure ([`attestation_of`] over an admitted `self:delegates_to` row, as
++//!   the door hands it on): payload `weight` 2_500_000 is the column
++//!   `Some(2.5)` and the mirror's `weight` 2.5; a negative fixed6 is its
++//!   negative real; no `weight` is `None` and the mirror names none;
++//! - store-backed, sqlite and postgres: a weighted row offered through
++//!   `put_statement` is stored with `weight` 2.5, and the weighted fold that
++//!   reads the column (`build_trust_topology`, `weight.unwrap_or(1.0)`)
++//!   reads 2.5, not the 1.0 a NULL column gave;
++//! - a mapped row whose `weight` column was altered after mapping, put
++//!   through the JSON door, is refused `typed_diverges_from_envelope` (the
++//!   row-mirror gate or `verify_carried`) and nothing is stored.
++//!
++//! No kernel module reads `Attestation.weight` (read-checked: `kernel::trust`
++//! / `kernel::owner` build `KRow`s from ids, names and signers; the kernel's
++//! `weights` are a `weighted:` rubric's, from the group record). The column's
++//! readers are `topology` and `replication::trust_scoring`.
++
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::family::SelectContext;
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::door::{admit_row, AdmittedRow};
++use super::door_invariants::fixture::*;
++use super::ingest::{attestation_of, put_statement, StatementOutcome, INGEST_TIER};
++use super::liveness::HeldKeys;
++use super::names::RowId;
++use crate::federation::types::SignedAttestation;
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++fn reason(e: &Error) -> String {
++    match e {
++        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
++        other => other.kind().to_owned(),
++    }
++}
++
++/// An admitted `self:delegates_to` row as the door hands it to the mapping,
++/// carrying `weight` (fixed6) when given.
++fn delegation(weight: Option<Value>) -> AdmittedRow {
++    let (a, b) = (key(160), key(161));
++    let mut m = vec![
++        ("asserted_at", Value::Uint(5_000)),
++        ("author", Value::Text(iref(&a))),
++    ];
++    if let Some(w) = weight {
++        m.push(("weight", w));
++    }
++    let payload = map(m);
++    let bytes = sign_row_statement(
++        &a,
++        &iref(&a),
++        &iref(&b),
++        "delegates_to",
++        "self:delegates_to",
++        &payload,
++        vec![],
++    )
++    .unwrap();
++    AdmittedRow {
++        row_id: RowId([0x5a; 32]),
++        statement_id: [0x5b; 32],
++        kid: kid(&a),
++        iss: iref(&a),
++        sub: iref(&b),
++        row_type: "delegates_to".into(),
++        family: "self:delegates_to".into(),
++        author: Some(iref(&a)),
++        asserted_at_ms: 5_000,
++        payload,
++        names: Vec::new(),
++        role: None,
++        bytes,
++    }
++}
++
++/// I2915: the mapping fills the column, and the mirror binds it.
++#[test]
++fn i2915_the_mapping_fills_the_weight_column() {
++    let a = attestation_of(&delegation(Some(Value::Uint(2_500_000))), INGEST_TIER).unwrap();
++    assert_eq!(a.weight, Some(2.5), "I2915 fixed6 2_500_000 is 2.5");
++    assert_eq!(
++        a.attestation_envelope["row"]["weight"].as_f64(),
++        Some(2.5),
++        "I2915 the mirror binds the weight"
++    );
++    assert_eq!(
++        a.attestation_envelope["weight"].as_f64(),
++        Some(2.5),
++        "I2915 the envelope's real agrees"
++    );
++    // -1 - 499_999 = -500_000: a negative fixed6.
++    let n = attestation_of(&delegation(Some(Value::Nint(499_999))), INGEST_TIER).unwrap();
++    assert_eq!(n.weight, Some(-0.5), "I2915 a negative weight");
++    let none = attestation_of(&delegation(None), INGEST_TIER).unwrap();
++    assert_eq!(none.weight, None, "I2915 no weight is None, not 1.0");
++    assert!(
++        none.attestation_envelope["row"].get("weight").is_none(),
++        "I2915 the mirror names no weight when the payload carries none"
++    );
++}
++
++/// An authored, weighted score row (Verify's vector family) by `k`, about
++/// `on`.
++fn weighted_score(k: &ciris_crypto::composite::CompositeSigningKey, on: &str) -> Vec<u8> {
++    weighted(k, on, 5_000)
++}
++
++/// The same row by `k` about itself, at `at`.
++fn weighted_score_at(k: &ciris_crypto::composite::CompositeSigningKey, at: u64) -> Vec<u8> {
++    weighted(k, &iref(k), at)
++}
++
++fn weighted(k: &ciris_crypto::composite::CompositeSigningKey, on: &str, at: u64) -> Vec<u8> {
++    let payload = map(vec![
++        ("asserted_at", Value::Uint(at)),
++        ("author", Value::Text(iref(k))),
++        ("score", Value::Uint(750_000)),
++        ("confidence", Value::Uint(900_000)),
++        ("weight", Value::Uint(2_500_000)),
++        (
++            "dimension",
++            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
++        ),
++    ]);
++    sign_row_statement(
++        k,
++        &iref(k),
++        on,
++        "scores",
++        "evidence:.suite:.kind:.cell:.prefix",
++        &payload,
++        vec![],
++    )
++    .unwrap()
++}
++
++async fn body(d: &dyn FederationDirectory) {
++    let k = key(162);
++    put_statement(d, &key_record(&k, &["user"], 0, None), None, INGEST_TIER)
++        .await
++        .unwrap_or_else(|e| panic!("I2915 key record: {e:?}"));
++    let st = weighted_score(&k, &iref(&k));
++    let out = put_statement(d, &st, None, INGEST_TIER)
++        .await
++        .unwrap_or_else(|e| panic!("I2915 a weighted row admits: {e:?}"));
++    let StatementOutcome::Row { row_id, .. } = out else {
++        panic!("I2915: {out:?}");
++    };
++    let stored = d
++        .get_attestation(&row_id.hex())
++        .await
++        .unwrap()
++        .expect("I2915 stored under its row id");
++    assert_eq!(stored.weight, Some(2.5), "I2915 the stored weight column");
++
++    let topo = crate::federation::build_trust_topology(
++        d,
++        &crate::federation::FederationDirectoryFilter {
++            granter_key: Some(iref(&k)),
++            ..Default::default()
++        },
++    )
++    .await
++    .unwrap();
++    assert_eq!(topo.edges.len(), 1, "I2915 one edge");
++    assert!(
++        (topo.edges[0].weight - 2.5).abs() < 1e-9,
++        "I2915 the weighted fold reads 2.5, got {}",
++        topo.edges[0].weight
++    );
++
++    // The column is the statement's: a fresh mapped row (not held) whose
++    // weight column was altered after mapping is refused at the JSON door,
++    // by the mirror gate or by `verify_carried` (both
++    // `typed_diverges_from_envelope`), and nothing is stored.
++    let mut keys = HeldKeys::new();
++    keys.insert_record(key_record(&k, &["user"], 0, None));
++    let st2 = weighted_score_at(&k, 6_000);
++    let admitted = admit_row(&st2, &keys, None, SelectContext::default()).unwrap();
++    let mut forged = attestation_of(&admitted, INGEST_TIER).unwrap();
++    assert_eq!(forged.weight, Some(2.5), "I2915 the mapping");
++    forged.weight = Some(9.0);
++    let e = d
++        .put_attestation(SignedAttestation {
++            attestation: forged,
++        })
++        .await
++        .unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++        "I2915 a weight column that is not the statement's: {e:?}"
++    );
++    assert!(
++        d.get_attestation(&admitted.row_id.hex())
++            .await
++            .unwrap()
++            .is_none(),
++        "I2915 nothing stored"
++    );
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2915_the_weight_column_is_stored_and_read_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2915_the_weight_column_is_stored_and_read_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index 4db4606b..741921a3 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -841,6 +841,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     // original THIS node holds must name the original's `cohort_scope`.
+     // One name at the six write doors on every backend.
+     ("check_rendition_placement", Class::Gate),
++    // v62.0.0 (wave P1c) — a row carrying an edition-2 statement is exactly
++    // its projection, checked first in the shared plan (pure).
++    ("check_carried_projection", Class::Gate),
+     ("check_delivery_mode_vocabulary", Class::Gate),
+     ("check_device_class", Class::Gate),
+     ("check_encryption_pubkeys", Class::Gate),

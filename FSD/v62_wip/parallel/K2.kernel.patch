@@ -1,0 +1,58 @@
+--- a/src/kernel/differential.rs	2026-11-18 11:34:54.492629080 -0600
++++ b/src/kernel/differential.rs	2026-11-18 11:34:54.559176874 -0600
+@@ -13,7 +13,10 @@
+ //! | [`Class::WeightedWhole`] | CC 3.3.4 "Each weight and the threshold is a whole number" | `consensus::evaluate` |
+ //! | [`Class::NodeCosign`] | CC 3.2 *The first binding (MUST)*: counts "only when the node's own key cosigned it" | `owner_of` |
+ //! | [`Class::ForkAsTip`] | CC 2.7.8 "Two versions of one head wait as tips" | `held_head_verdict` |
+-//! | [`Class::CycleVisitedOnce`] | CC 4.4.3.34 / KERNEL.md 5: the walk visits a cycle once; nothing is refused for closing one | the delegation cycle gate |
++//!
++//! v62.0.0 (kernel pass 2): `CycleVisitedOnce` (the delegation cycle gate,
++//! CC 4.4.3.34) is no longer a class: the gate is deleted, so there is no
++//! persist answer left to disagree with the kernel's walk.
+ //!
+ //! **Counting.** With `CIRIS_KERNEL_DIFF_LOG=<file>` set, each call appends
+ //! one tab-separated line `function  class  key  persist  kernel  test` (the key
+@@ -38,8 +41,6 @@
+     NodeCosign,
+     /// A version that does not name the held head is held as a tip.
+     ForkAsTip,
+-    /// A cycle-closing delegation is not refused.
+-    CycleVisitedOnce,
+     /// None of the above: a disagreement no CC sentence explains.
+     Unexplained,
+ }
+@@ -53,7 +54,6 @@
+             Class::WeightedWhole => "weighted_whole",
+             Class::NodeCosign => "node_cosign",
+             Class::ForkAsTip => "fork_as_tip",
+-            Class::CycleVisitedOnce => "cycle_visited_once",
+             Class::Unexplained => "UNEXPLAINED",
+         }
+     }
+@@ -213,26 +213,6 @@
+     );
+ }
+ 
+-/// The delegation cycle gate: persist refused (`Some(hops)`) or admitted.
+-pub fn cycle_gate(row: &crate::federation::types::Attestation, persist_refused: Option<usize>) {
+-    let class = if persist_refused.is_some() {
+-        Class::CycleVisitedOnce
+-    } else {
+-        Class::Agree
+-    };
+-    record(
+-        "check_delegation_cycle_admission",
+-        class,
+-        &key_of(&[
+-            &row.attesting_key_id,
+-            &row.attested_key_id,
+-            &row.attestation_id,
+-        ]),
+-        &format!("{persist_refused:?}"),
+-        "admit",
+-    );
+-}
+-
+ /// `held_head_verdict`: persist's verdict against the kernel's head reading.
+ pub fn held_head(
+     group: &str,

@@ -1,0 +1,1245 @@
+diff --git a/scripts/gen_directory_double.py b/scripts/gen_directory_double.py
+index 6971f699..250e510f 100644
+--- a/scripts/gen_directory_double.py
++++ b/scripts/gen_directory_double.py
+@@ -89,6 +89,22 @@ DELEGATED_DEFAULTS = (
+     # the trust-root reads ask it for every unlabelled `delegates_to`, so
+     # through the double it must reach the backend's held set.
+     "trust_direction_held_among",
++    # v62.0.0 (wave P1c) — the edition-2 statement store's leaves: each
++    # defaulted "none held" / a `Backend` refusal, overridden by sqlite and
++    # postgres, composing no trait method. Before this, the double answered
++    # every edition-2 read with the default, so a fault injected on the key
++    # plane (`edition2_statements_about`) was never observed and a witness
++    # counting the door's reads through the double could not fail.
++    # `key_edition` stays out: its default is a composition over
++    # `lookup_public_key`.
++    "edition2_statements_about",
++    "edition2_voices",
++    "edition2_rows_naming",
++    "edition2_objects",
++    "put_edition2_object",
++    "put_edition2_statement",
++    "upsert_edition2_key_projection",
++    "edition2_statements_since",
+ )
+ 
+ # NOT_DELEGATED — an `Unsupported`-bodied default the double must NOT delegate,
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index 35475526..e425a7f2 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -19566,6 +19566,43 @@ pub fn check_delivery_mode_vocabulary(envelope: &serde_json::Value) -> Result<()
+ /// model this door's stamp to do that, and a second spelling of a projection
+ /// that drifts is precisely how #643 and #598 each acquired their defect.
+ pub fn check_envelope_size_admission(envelope: &serde_json::Value) -> Result<(), Error> {
++    // v62.0.0 (wave P1c) — a row mapped from an edition-2 statement carries
++    // the statement under `ceg_statement`
++    // ([`STATEMENT_MEMBER`](super::edition2::ingest::STATEMENT_MEMBER)), as
++    // hex. Its envelope is DERIVED: a pure function of that statement
++    // (`edition2::ingest::attestation_of`, checked equal by
++    // `verify_carried`), so its size is the statement's, bounded by
++    // construction. The cap is therefore the statement's own bytes, the
++    // edition-2 door's
++    // ([`MAX_STATEMENT_BYTES`](super::edition2::door::MAX_STATEMENT_BYTES)),
++    // and the earlier-form envelope cap is not applied again: counting the
++    // derived envelope refused statements under the door cap (the hex copy
++    // doubled it, and a byte-string member is hex in the projection too). An
++    // envelope with no carried statement (every earlier-form JSON row) is
++    // measured exactly as before.
++    let carried = envelope
++        .as_object()
++        .and_then(|o| o.get(super::edition2::ingest::STATEMENT_MEMBER));
++    // A carried member that is not text is not a carried statement: the
++    // whole envelope is measured, and `verify_carried` names the fault.
++    if let Some(hex) = carried.and_then(serde_json::Value::as_str) {
++        let cap = super::edition2::door::MAX_STATEMENT_BYTES;
++        // Two hex digits per statement byte; an odd length rounds up.
++        let statement_bytes = hex.len().div_ceil(2);
++        if statement_bytes > cap {
++            return Err(Error::EnvelopeTooLarge {
++                bytes: statement_bytes,
++                cap,
++            });
++        }
++        return Ok(());
++    }
++    check_envelope_canonical_size(envelope)
++}
++
++/// The canonical (JCS) size of `envelope` against
++/// [`MAX_ATTESTATION_ENVELOPE_BYTES`].
++fn check_envelope_canonical_size(envelope: &serde_json::Value) -> Result<(), Error> {
+     let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope).map_err(|e| {
+         Error::malformed_row(
+             "attestation",
+diff --git a/src/federation/attestation_admit.rs b/src/federation/attestation_admit.rs
+index 9a72c73e..e3bb6bac 100644
+--- a/src/federation/attestation_admit.rs
++++ b/src/federation/attestation_admit.rs
+@@ -590,6 +590,16 @@ where
+     let cx = dir.admission_cx();
+     let mut row = attestation.attestation;
+ 
++    // v62.0.0 (wave P1c) — a row carrying an edition-2 statement must be
++    // exactly what that statement derives, checked FIRST: pure (no read, no
++    // signature, no canonicalization of the offered envelope). A carrying
++    // row's envelope is sized by its statement, not by the earlier-form cap
++    // (`admission::check_envelope_size_admission`), so a forged envelope
++    // beside a small valid statement is refused here, before any gate pays
++    // for it. `verify_carried` still judges the statement at tier 3. A no-op
++    // for a row that carries none.
++    crate::federation::edition2::ingest::check_carried_projection(&row)?;
++
+     // ── AV-76 TIER 0 — the free prologue ────────────────────────
+     // Neither check below reads the row's content or touches the
+     // substrate. Before v22.0.0 (CIRISPersist#543 finding 4) the memory
+diff --git a/src/federation/directory_double.rs b/src/federation/directory_double.rs
+index f3b0c6f3..df7ecf30 100644
+--- a/src/federation/directory_double.rs
++++ b/src/federation/directory_double.rs
+@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
+     }
+ }
+ 
+-// 141 delegations, generated. Every one: fault first, then delegate.
++// 149 delegations, generated. Every one: fault first, then delegate.
+ #[async_trait::async_trait]
+ impl FederationDirectory for FaultInjectingDirectory {
+     async fn adopt_genesis_reanchor(
+@@ -271,6 +271,51 @@ impl FederationDirectory for FaultInjectingDirectory {
+         }
+         self.inner.drop_cosign_rows(quorum_key).await
+     }
++    async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, Error> {
++        if let Some(e) = self.faulted("edition2_objects") {
++            return Err(e);
++        }
++        self.inner.edition2_objects(typ).await
++    }
++    async fn edition2_rows_naming(
++        &self,
++        named: &edition2::names::RowId,
++        role: &str,
++    ) -> Result<Vec<edition2::names::RowId>, Error> {
++        if let Some(e) = self.faulted("edition2_rows_naming") {
++            return Err(e);
++        }
++        self.inner.edition2_rows_naming(named, role).await
++    }
++    async fn edition2_statements_about(
++        &self,
++        family: &str,
++        sub: &str,
++    ) -> Result<Vec<Vec<u8>>, Error> {
++        if let Some(e) = self.faulted("edition2_statements_about") {
++            return Err(e);
++        }
++        self.inner.edition2_statements_about(family, sub).await
++    }
++    async fn edition2_statements_since(
++        &self,
++        cursor: Option<&edition2::store::StatementCursor>,
++        limit: u32,
++    ) -> Result<Vec<edition2::store::ServedStatement>, Error> {
++        if let Some(e) = self.faulted("edition2_statements_since") {
++            return Err(e);
++        }
++        self.inner.edition2_statements_since(cursor, limit).await
++    }
++    async fn edition2_voices(
++        &self,
++        row_id: &edition2::names::RowId,
++    ) -> Result<Vec<Vec<u8>>, Error> {
++        if let Some(e) = self.faulted("edition2_voices") {
++            return Err(e);
++        }
++        self.inner.edition2_voices(row_id).await
++    }
+     async fn enter_mesh(
+         &self,
+         attestation_id: &str,
+@@ -1293,6 +1338,24 @@ impl FederationDirectory for FaultInjectingDirectory {
+         }
+         self.inner.put_community_membership_widening(widening).await
+     }
++    async fn put_edition2_object(
++        &self,
++        object: &edition2::store::HeldObject,
++    ) -> Result<bool, Error> {
++        if let Some(e) = self.faulted("put_edition2_object") {
++            return Err(e);
++        }
++        self.inner.put_edition2_object(object).await
++    }
++    async fn put_edition2_statement(
++        &self,
++        row: &edition2::door::AdmittedRow,
++    ) -> Result<bool, Error> {
++        if let Some(e) = self.faulted("put_edition2_statement") {
++            return Err(e);
++        }
++        self.inner.put_edition2_statement(row).await
++    }
+     async fn put_family(&self, family: SignedFamily) -> Result<(), Error> {
+         if let Some(e) = self.faulted("put_family") {
+             return Err(e);
+@@ -1513,6 +1576,15 @@ impl FederationDirectory for FaultInjectingDirectory {
+     fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
+         self.inner.trust_root_standing_cache()
+     }
++    async fn upsert_edition2_key_projection(
++        &self,
++        set: &edition2::projection::ProjectionSet,
++    ) -> Result<(), Error> {
++        if let Some(e) = self.faulted("upsert_edition2_key_projection") {
++            return Err(e);
++        }
++        self.inner.upsert_edition2_key_projection(set).await
++    }
+     async fn vote_window_first_held(
+         &self,
+         action_id: &str,
+diff --git a/src/federation/edition2/door.rs b/src/federation/edition2/door.rs
+index ee8e32bf..f91806a3 100644
+--- a/src/federation/edition2/door.rs
++++ b/src/federation/edition2/door.rs
+@@ -7,6 +7,12 @@
+ //! 1. **Form** ([`input_form`]). Bytes that are not a tag-18 `COSE_Sign1` are
+ //!    refused [`token::EARLIER_FORM_OBJECT`]. That covers a JSON object of the
+ //!    earlier form, and bytes in no form. Nothing is parsed for standing.
++//!    v62.0.0 (wave P1c) — then **the size**: a statement over
++//!    [`MAX_STATEMENT_BYTES`] is refused `federation_envelope_too_large`.
++//!    Steps 1 and 2 are [`pure_statement_gates`]: a pure function of the
++//!    bytes, which every door runs BEFORE its first directory read (the
++//!    signer's key plane, a roster), as the JSON doors run their pure tier
++//!    (AV-76). A statement that can never be admitted buys no read.
+ //! 2. **Edition-1 row-refs.** A `row-ref` of edition 1 anywhere in `refs` is
+ //!    refused [`token::ROW_REF_EDITION_1`]. This is structural, so the
+ //!    answer does not depend on which keys are held. Verify's reader admits
+@@ -218,21 +224,42 @@ fn door_context(bytes: &[u8], mut ctx: SelectContext) -> SelectContext {
+     ctx
+ }
+ 
+-/// Judge one edition-2 row statement at a door (steps 1 to 5).
++/// v62.0.0 (wave P1c) — the largest edition-2 statement a door reads, in
++/// bytes: [`MAX_ATTESTATION_ENVELOPE_BYTES`](crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES),
++/// the attestation plane's one size cap. The signed thing is the sized
++/// thing (CC#38's rule): the bytes as received, which the store keeps and
++/// forwards as they are.
++pub const MAX_STATEMENT_BYTES: usize = crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES;
++
++/// v62.0.0 (wave P1c) — **the door's pure gates** (steps 1 and 2), a function
++/// of the bytes alone: no directory read and no signature check. In order:
+ ///
+-/// `offered_id` is an id the carrier names the row by, if any. It is
+-/// compared with the computed one, and never used.
++/// 1. the form ([`require_statement_form`]);
++/// 2. the size: over [`MAX_STATEMENT_BYTES`] is `federation_envelope_too_large`;
++/// 3. the decode: bytes that are no `COSE_Sign1` are
++///    [`token::STATEMENT_INVALID`], named by Verify's reader over `keys` (the
++///    decode fault does not depend on which keys are held);
++/// 4. a signed object that is not a row is [`token::NOT_A_ROW`];
++/// 5. an edition-1 row-ref is [`token::ROW_REF_EDITION_1`];
++/// 6. v62.0.0 (wave P1d) — the payload of a family with a member list
++///    ([`super::payloads`], by the header's family id) keeps that list:
++///    `edition2_payload_invalid` otherwise.
++///
++/// [`super::ingest::put_statement`] runs these before it reads the signer's
++/// key plane or a roster (AV-76: a statement that can never be admitted
++/// buys no directory read); [`admit_row`] runs them again at its head.
++/// Verify's verdict (step 3) and everything after it are unchanged.
+ ///
+ /// # Errors
+-/// The door's named refusals (module docs). A statement that waits on a key
+-/// is `Error::AttesterKeyUnknown` (retryable).
+-pub fn admit_row(
+-    bytes: &[u8],
+-    keys: &dyn KeyOwnership,
+-    offered_id: Option<&Digest32>,
+-    ctx: SelectContext,
+-) -> Result<AdmittedRow, Error> {
++/// The refusals above.
++pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyOwnership) -> Result<(), Error> {
+     require_statement_form(bytes)?;
++    if bytes.len() > MAX_STATEMENT_BYTES {
++        return Err(Error::EnvelopeTooLarge {
++            bytes: bytes.len(),
++            cap: MAX_STATEMENT_BYTES,
++        });
++    }
+     let Some((protected, payload)) = statement_parts(bytes) else {
+         // Not even a decodable COSE_Sign1: Verify's reader names the fault.
+         let why = match ciris_verify_core::edition2::verify_row_statement(bytes, keys) {
+@@ -253,6 +280,35 @@ pub fn admit_row(
+         ));
+     }
+     refuse_edition_one(&payload)?;
++    // v62.0.0 (wave P1d) — the family's closed payload map
++    // (`edition2::payloads`), for a family that has one: an unknown member, a
++    // missing required one, a wrong type, a closed value or leaf broken is
++    // `edition2_payload_invalid`. A family with no list passes as before.
++    match protected.get_int(-70002).and_then(Value::as_text) {
++        Some(family) => super::payloads::check_by_id(family, &payload),
++        // No family in the header: Verify's verdict names that fault.
++        None => Ok(()),
++    }
++}
++
++/// Judge one edition-2 row statement at a door (steps 1 to 5).
++///
++/// `offered_id` is an id the carrier names the row by, if any. It is
++/// compared with the computed one, and never used.
++///
++/// # Errors
++/// The door's named refusals (module docs). A statement that waits on a key
++/// is `Error::AttesterKeyUnknown` (retryable).
++pub fn admit_row(
++    bytes: &[u8],
++    keys: &dyn KeyOwnership,
++    offered_id: Option<&Digest32>,
++    ctx: SelectContext,
++) -> Result<AdmittedRow, Error> {
++    // Steps 1 and 2: the pure gates. A door that reads the directory runs
++    // them first itself; repeated here, they cost a decode, and keep this
++    // function whole for every caller.
++    pure_statement_gates(bytes, keys)?;
+ 
+     let ctx = door_context(bytes, ctx);
+     let (row, role) = match verify_row_in_family_with(bytes, keys, &VendoredFamilyModel, &ctx) {
+diff --git a/src/federation/edition2/ingest.rs b/src/federation/edition2/ingest.rs
+index 6704e435..6e2b1044 100644
+--- a/src/federation/edition2/ingest.rs
++++ b/src/federation/edition2/ingest.rs
+@@ -266,6 +266,15 @@ pub fn json_of(v: &Value) -> serde_json::Value {
+     }
+ }
+ 
++/// A fixed6 payload member (CC 2.6.1.5: the value times 10^6, an integer)
++/// as the real the earlier form's gates and the typed columns read.
++fn fixed6_real(payload: &Value, member: &str) -> Option<f64> {
++    let n = payload.get_text(member).and_then(Value::as_i64)?;
++    #[allow(clippy::cast_precision_loss)]
++    let real = n as f64 / 1_000_000.0;
++    Some(real)
++}
++
+ fn ms_instant(ms: u64) -> Result<chrono::DateTime<chrono::Utc>, Error> {
+     i64::try_from(ms)
+         .ok()
+@@ -287,7 +296,8 @@ fn ms_instant(ms: u64) -> Result<chrono::DateTime<chrono::Utc>, Error> {
+ /// - `attesting_key_id` / `scrub_key_id` are `iss`; `attested_key_id` is
+ ///   `sub`; `attestation_type` is the row type.
+ /// - `asserted_at` / `scrub_timestamp` come from `asserted_at` (ms), and
+-///   `expires_at` from `expires_at`.
++///   `expires_at` from `expires_at`; `weight` from the fixed6 `weight`
++///   (`None` when absent).
+ /// - the envelope is the payload's projection ([`json_of`]) plus the
+ ///   statement under [`STATEMENT_MEMBER`]. `original_content_hash` is the
+ ///   SHA-256 of the envelope's JCS image, as every row's is.
+@@ -316,9 +326,7 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
+         // Scores, confidences and weights are integers at the fixed scale of
+         // 10^6 (CC 2.6.1.5); the earlier form's gates read the real value.
+         for member in SCALED_MEMBERS {
+-            if let Some(n) = row.payload.get_text(member).and_then(Value::as_i64) {
+-                #[allow(clippy::cast_precision_loss)]
+-                let real = n as f64 / 1_000_000.0;
++            if let Some(real) = fixed6_real(&row.payload, member) {
+                 o.insert((*member).to_owned(), serde_json::json!(real));
+             }
+         }
+@@ -386,6 +394,12 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
+     }
+     let mut a: Attestation = serde_json::from_value(v)
+         .map_err(|e| Error::InvalidArgument(format!("edition-2 mapping: {e}")))?;
++    // v62.0.0 (wave P1c, E1's finding) — the typed `weight` column is the
++    // payload's fixed6 `weight` (CC 2.6.1.5), as the envelope's real; `None`
++    // when the payload carries none. Before this every edition-2 row stored
++    // NULL, and the weighted folds (`topology`, `trust_scoring`:
++    // `weight.unwrap_or(1.0)`) read every edge at 1.0.
++    a.weight = fixed6_real(&row.payload, "weight");
+     // The earlier form's `row` mirror (CIRISPersist#643) is what its gates
+     // read to bind the columns. An edition-2 statement binds them itself: its
+     // protected header and payload ARE the row (CC 2.6.1.1, "no mirror of the
+@@ -401,6 +415,11 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
+     if !a.subject_key_ids.is_empty() {
+         mirror["subject_key_ids"] = serde_json::json!(a.subject_key_ids);
+     }
++    // The mirror binds `weight` both ways (absent ⇔ column `None`,
++    // `admission`'s mirror gate, compared numerically).
++    if let Some(w) = a.weight {
++        mirror["weight"] = serde_json::json!(w);
++    }
+     if let Some(o) = a.attestation_envelope.as_object_mut() {
+         o.insert("row".to_owned(), mirror);
+     }
+@@ -455,40 +474,139 @@ where
+         return Ok(None);
+     };
+     let bytes = bytes?;
++    // v62.0.0 (wave P1c, AV-76) — the pure gates before the key-plane read.
++    super::door::pure_statement_gates(&bytes, &HeldKeys::new())?;
+     let keys = held_keys_for(dir, &bytes).await?;
+-    let offered: Option<Digest32> = hex::decode(&row.attestation_id)
+-        .ok()
+-        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+-    let Some(offered) = offered else {
+-        return Err(Error::malformed_row(
+-            PLANE,
+-            malformed_row::EDITION2_ROW_ID_MISMATCH,
+-            format!(
+-                "a row carrying an edition-2 statement is stored under its row id, not `{}`",
+-                row.attestation_id
+-            ),
+-        ));
+-    };
++    let offered = offered_row_id(row)?;
+     let admitted = admit_row(&bytes, &keys, Some(&offered), SelectContext::default())?;
+     let expected = attestation_of(&admitted, &row.tier)?;
++    require_projection(&expected, row)?;
++    Ok(Some(admitted))
++}
++
++/// The row id a carrying row is stored under: 32 bytes of lowercase hex.
++fn offered_row_id(row: &Attestation) -> Result<Digest32, Error> {
++    hex::decode(&row.attestation_id)
++        .ok()
++        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
++        .ok_or_else(|| {
++            Error::malformed_row(
++                PLANE,
++                malformed_row::EDITION2_ROW_ID_MISMATCH,
++                format!(
++                    "a row carrying an edition-2 statement is stored under its row id, not `{}`",
++                    row.attestation_id
++                ),
++            )
++        })
++}
++
++/// `row` is exactly `expected`, the projection of the statement it carries:
++/// every typed column the mapping writes, and the envelope.
++fn require_projection(expected: &Attestation, row: &Attestation) -> Result<(), Error> {
+     let same = expected.attestation_id == row.attestation_id
+         && expected.attesting_key_id == row.attesting_key_id
+         && expected.attested_key_id == row.attested_key_id
+         && expected.attestation_type == row.attestation_type
+         && expected.asserted_at == row.asserted_at
+-        && expected.attestation_envelope == row.attestation_envelope
+-        && expected.subject_key_ids == row.subject_key_ids;
+-    if !same {
++        && expected.subject_key_ids == row.subject_key_ids
++        // v62.0.0 (wave P1c) — the weight column is the statement's too.
++        && expected.weight == row.weight
++        // Last: the one comparison whose cost scales with the envelope.
++        && expected.attestation_envelope == row.attestation_envelope;
++    if same {
++        return Ok(());
++    }
++    Err(Error::malformed_row(
++        PLANE,
++        malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++        format!(
++            "row {} is not the projection of the edition-2 statement it carries",
++            row.attestation_id
++        ),
++    ))
++}
++
++/// v62.0.0 (wave P1c) — **the carried-projection pre-check**, a pure
++/// function of the row: no directory read, no signature check, and no
++/// canonicalization of the offered envelope. For a row carrying an edition-2
++/// statement (`ceg_statement`), the row must be exactly what that statement
++/// derives ([`attestation_of`]); otherwise it is refused as
++/// [`verify_carried`] refuses it (`typed_diverges_from_envelope`,
++/// `edition2_row_id_mismatch`, or the door's pure statement gates). `Ok`
++/// for a row that carries none (an earlier-form row).
++///
++/// The attestation door runs it FIRST (`attestation_admit::plan_put_attestation`):
++/// a carrying row's envelope is not size-capped as an earlier-form envelope
++/// is (it is the statement's projection, bounded by the statement's cap), so
++/// a forged envelope beside a small valid statement must be refused before
++/// any gate pays for it. The derivation reads only the statement's bytes,
++/// already capped by the pure gates. [`verify_carried`] still runs at tier 3
++/// and checks the statement's signature and key; this is not a verdict.
++///
++/// # Errors
++/// As above.
++pub fn check_carried_projection(row: &Attestation) -> Result<(), Error> {
++    let Some(bytes) = carried_bytes(row) else {
++        return Ok(());
++    };
++    let bytes = bytes?;
++    super::door::pure_statement_gates(&bytes, &HeldKeys::new())?;
++    let derived = unverified_row(&bytes).ok_or_else(|| {
++        Error::malformed_row(
++            PLANE,
++            malformed_row::EDITION2_STATEMENT_INVALID,
++            "the carried statement has no row header (type, family, iss, sub) or payload",
++        )
++    })?;
++    let offered = offered_row_id(row)?;
++    if offered != derived.row_id.0 {
+         return Err(Error::malformed_row(
+             PLANE,
+-            malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++            malformed_row::EDITION2_ROW_ID_MISMATCH,
+             format!(
+-                "row {} is not the projection of the edition-2 statement it carries",
+-                row.attestation_id
++                "row {} carries a statement whose row id is {}",
++                row.attestation_id,
++                derived.row_id.hex()
+             ),
+         ));
+     }
+-    Ok(Some(admitted))
++    let expected = attestation_of(&derived, &row.tier)?;
++    require_projection(&expected, row)
++}
++
++/// The statement's row as its header and payload state it, UNVERIFIED: the
++/// inputs [`attestation_of`] reads, for [`check_carried_projection`]'s
++/// equality check only (never stored, never a verdict). `statement_id` and
++/// `role` are not read by the mapping and are left empty.
++fn unverified_row(bytes: &[u8]) -> Option<AdmittedRow> {
++    let (protected, payload) = statement_parts(bytes)?;
++    let text = |v: Option<&Value>| v.and_then(Value::as_text).map(str::to_owned);
++    let row_type = text(protected.get_int(-70001))?;
++    let family = text(protected.get_int(-70002))?;
++    let claims = protected.get_int(15)?;
++    let iss = text(claims.get_int(1))?;
++    let sub = text(claims.get_int(2))?;
++    let kid = <[u8; 32]>::try_from(protected.get_int(4)?.as_bytes()?).ok()?;
++    let author = text(payload.get_text("author"));
++    let asserted_at_ms = payload.get_text("asserted_at").and_then(Value::as_u64)?;
++    let names = super::names::names_of(&payload).ok()?;
++    let row_id = super::names::RowId::of_statement(bytes)?;
++    Some(AdmittedRow {
++        row_id,
++        statement_id: [0; 32],
++        kid,
++        iss,
++        sub,
++        row_type,
++        family,
++        author,
++        asserted_at_ms,
++        payload,
++        names,
++        role: None,
++        bytes: bytes.to_vec(),
++    })
+ }
+ 
+ /// The signer's `identity_type` for a row carrying a statement: from its
+@@ -558,7 +676,12 @@ pub async fn put_statement<F>(
+ where
+     F: FederationDirectory + ?Sized,
+ {
+-    super::door::require_statement_form(bytes)?;
++    // v62.0.0 (wave P1c, AV-76) — the pure gates (form, size, decode, not an
++    // object, no edition-1 name) run BEFORE the first directory read below
++    // (the accord's roster, the signer's key plane): a statement that can
++    // never be admitted buys no read. They need no key; an empty key set
++    // only names a decode fault, which no key changes.
++    super::door::pure_statement_gates(bytes, &HeldKeys::new())?;
+     // v62.0.0 (JSON-cut slice A) — an accord invocation is judged against
+     // the holders of the bundle in force for its accord, never the key
+     // plane (`edition2::halt`).
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 96060d48..939efe85 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -65,6 +65,13 @@ mod liveness_invariants;
+ mod payloads_invariants;
+ #[cfg(test)]
+ mod produce_invariants;
++// v62.0.0 (wave P1c) — I2914: the door's pure gates precede its first
++// directory read (AV-76), on sqlite and postgres.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod pure_gates_invariants;
++// v62.0.0 (wave P1c) — I2915: the mapping fills the typed `weight` column.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod weight_column_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod projection_invariants;
+ #[cfg(test)]
+diff --git a/src/federation/edition2/pure_gates_invariants.rs b/src/federation/edition2/pure_gates_invariants.rs
+new file mode 100644
+index 00000000..7170e807
+--- /dev/null
++++ b/src/federation/edition2/pure_gates_invariants.rs
+@@ -0,0 +1,423 @@
++//! **I2914** (v62.0.0, wave P1c; AV-76 at the edition-2 door): the door's
++//! pure gates precede its first directory read, on sqlite and postgres.
++//!
++//! The directory is wrapped in the fault-injecting double with EVERY method
++//! it delegates declared erroring, so any directory read answers
++//! `federation_backend`:
++//!
++//! - the instrument can fail: an under-cap statement from a signer with no
++//!   held record reaches the key-plane read and draws the injected failure
++//!   (the double now delegates the edition-2 store, so the read is seen);
++//! - an oversized statement (over `MAX_STATEMENT_BYTES`) is refused
++//!   `federation_envelope_too_large` with NO directory read;
++//! - an edition-1 row-ref is refused `row_ref_edition_1` with NO directory
++//!   read;
++//! - a JSON object is refused `earlier_form_object` with NO directory read.
++//!
++//! **I2916** (wave P1c): a statement under the cap is not refused for its
++//! size downstream. The mapped row carries the statement again, as hex,
++//! under `ceg_statement`; the envelope size gate bounds that member on its
++//! own (at most the statement cap) and does not measure the derived rest
++//! against the earlier-form cap. So a 900 KiB statement, its bulk text or a
++//! byte string (hex in the projection), passes every size gate and is
++//! stored, on sqlite and postgres; an earlier-form envelope with no carried
++//! statement is measured exactly as before.
++//!
++//! **I2917** (wave P1c): a row carrying a statement is exactly its
++//! projection, checked FIRST at the attestation door. A small valid
++//! statement paired with a large forged envelope (3 MiB of `pad`) is refused
++//! `typed_diverges_from_envelope` by `check_carried_projection`, a pure
++//! function of the row (it takes no directory, so it reads none, and it
++//! never canonicalizes the offered envelope). On sqlite and postgres the
++//! same row, also carrying a malformed subject that the door's previous
++//! first gate (`validate_subject_key_ids`) refuses with its own error,
++//! comes back `typed_diverges_from_envelope`: the projection check runs
++//! ahead of every other gate. The honest mapped row passes the pre-check;
++//! an earlier-form row (no carried statement) is untouched by it.
++//!
++//! Before P1c, `put_statement` read the signer's key plane
++//! (`held_keys_for`) first, so the oversized statement drew the read (here
++//! `federation_backend`; against a bare backend the retryable
++//! `federation_attester_key_unknown`).
++
++use std::sync::Arc;
++
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::door::admit_row;
++use super::door::{pure_statement_gates, MAX_STATEMENT_BYTES};
++use super::door_invariants::fixture::*;
++use super::ingest::{
++    attestation_of, check_carried_projection, put_statement, StatementOutcome, INGEST_TIER,
++    STATEMENT_MEMBER,
++};
++use super::liveness::HeldKeys;
++use crate::federation::directory_double::FaultInjectingDirectory;
++use crate::federation::types::{Attestation, SignedAttestation};
++use crate::federation::{malformed_row, Error, FederationDirectory};
++use ciris_verify_core::edition2::family::SelectContext;
++
++/// The generated double, read for the names of the methods it delegates.
++const DOUBLE: &str = include_str!("../directory_double.rs");
++
++/// Every `async fn` the double delegates (each checks its fault table
++/// first).
++fn every_method() -> Vec<&'static str> {
++    DOUBLE
++        .lines()
++        .filter_map(|l| l.trim_start().strip_prefix("async fn "))
++        .filter_map(|rest| rest.split('(').next())
++        .map(str::trim)
++        .filter(|n| !n.is_empty())
++        .collect()
++}
++
++/// `inner`, with every delegated method answering an injected backend
++/// failure: a door that reads the directory at all draws
++/// `federation_backend`.
++fn no_reads(inner: Arc<dyn FederationDirectory>) -> FaultInjectingDirectory {
++    every_method()
++        .into_iter()
++        .fold(FaultInjectingDirectory::new(inner), |d, m| d.erroring(m))
++}
++
++fn reason(e: &Error) -> String {
++    match e {
++        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
++        other => other.kind().to_owned(),
++    }
++}
++
++/// An authored score row (Verify's vector family) by `k`, with `extra`
++/// members.
++fn statement(
++    k: &ciris_crypto::composite::CompositeSigningKey,
++    extra: Vec<(&str, Value)>,
++) -> Vec<u8> {
++    let mut m = vec![
++        ("asserted_at", Value::Uint(5_000)),
++        ("author", Value::Text(iref(k))),
++        ("score", Value::Uint(750_000)),
++        ("confidence", Value::Uint(900_000)),
++        (
++            "dimension",
++            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
++        ),
++    ];
++    m.extend(extra);
++    sign_row_statement(
++        k,
++        &iref(k),
++        &iref(k),
++        "scores",
++        "evidence:.suite:.kind:.cell:.prefix",
++        &map(m),
++        vec![],
++    )
++    .unwrap()
++}
++
++fn oversized(k: &ciris_crypto::composite::CompositeSigningKey) -> Vec<u8> {
++    let st = statement(
++        k,
++        vec![("pad", Value::Bytes(vec![0x78; MAX_STATEMENT_BYTES + 1]))],
++    );
++    assert!(
++        st.len() > MAX_STATEMENT_BYTES,
++        "I2914 the fixture is oversized"
++    );
++    st
++}
++
++/// I2914: the pure gates alone, no directory.
++#[test]
++fn i2914_the_pure_gates_need_no_directory() {
++    let k = key(150);
++    let e = pure_statement_gates(&oversized(&k), &HeldKeys::new()).unwrap_err();
++    assert_eq!(e.kind(), "federation_envelope_too_large", "I2914 {e}");
++    pure_statement_gates(&statement(&k, vec![]), &HeldKeys::new())
++        .expect("I2914 an under-cap statement passes the pure gates, keys or none");
++    let old = statement(&k, vec![("refs", map(vec![("target", ref1(&[0x21; 32]))]))]);
++    let e = pure_statement_gates(&old, &HeldKeys::new()).unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_ROW_REF_EDITION_1,
++        "I2914 {e}"
++    );
++}
++
++async fn body(inner: Arc<dyn FederationDirectory>) {
++    let methods = every_method();
++    assert!(
++        methods.contains(&"edition2_statements_about"),
++        "I2914 the double delegates the key-plane read, or a fault on it is never seen"
++    );
++    assert!(methods.len() > 100, "I2914 the double's methods were read");
++    let dir = no_reads(inner);
++    let k = key(151);
++
++    // The instrument can fail: an admissible-size statement is read for.
++    let e = put_statement(&dir, &statement(&k, vec![]), None, INGEST_TIER)
++        .await
++        .unwrap_err();
++    assert_eq!(
++        e.kind(),
++        "federation_backend",
++        "I2914 an under-cap statement reaches the directory (the injected failure): {e}"
++    );
++
++    // An oversized statement buys no read.
++    let e = put_statement(&dir, &oversized(&k), None, INGEST_TIER)
++        .await
++        .unwrap_err();
++    assert_eq!(
++        e.kind(),
++        "federation_envelope_too_large",
++        "I2914 the size gate precedes the signer's key-plane read: {e}"
++    );
++
++    // Nor does an edition-1 name, or an earlier-form object.
++    let old = statement(&k, vec![("refs", map(vec![("target", ref1(&[0x22; 32]))]))]);
++    let e = put_statement(&dir, &old, None, INGEST_TIER)
++        .await
++        .unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_ROW_REF_EDITION_1,
++        "I2914 {e}"
++    );
++    let e = put_statement(&dir, br#"{"attestation_id":"x"}"#, None, INGEST_TIER)
++        .await
++        .unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_EARLIER_FORM_OBJECT,
++        "I2914 {e}"
++    );
++}
++
++/// I2916: the envelope gate, unit.
++#[test]
++fn i2916_the_envelope_gate_does_not_count_the_carried_statement_twice() {
++    use crate::federation::admission::{
++        check_envelope_size_admission, MAX_ATTESTATION_ENVELOPE_BYTES,
++    };
++    let kib900 = 900 * 1024;
++    // A mapped row of a 900 KiB statement: the payload's projection plus the
++    // statement as hex. Over the cap counted whole; admitted.
++    let mapped = serde_json::json!({
++        "pad": "x".repeat(kib900),
++        STATEMENT_MEMBER: "ab".repeat(kib900),
++    });
++    check_envelope_size_admission(&mapped)
++        .expect("I2916 the carried statement is sized at the door, not again here");
++    // The carried member is still bounded: over the statement cap is refused.
++    let huge_carried = serde_json::json!({
++        STATEMENT_MEMBER: "ab".repeat(MAX_STATEMENT_BYTES + 1),
++    });
++    let e = check_envelope_size_admission(&huge_carried).unwrap_err();
++    assert_eq!(e.kind(), "federation_envelope_too_large", "I2916 {e}");
++    // A carrying envelope is sized by its statement alone: its projection is
++    // derived from the statement (a byte-string member is hex there), so it
++    // may exceed the earlier-form cap and is not measured against it.
++    let derived = serde_json::json!({
++        "blob": "ab".repeat(kib900),
++        STATEMENT_MEMBER: "ab".repeat(kib900),
++    });
++    check_envelope_size_admission(&derived)
++        .expect("I2916 the derived envelope is the statement's size, not its own");
++    // An earlier-form envelope (no carried statement): unchanged.
++    let earlier = serde_json::json!({ "pad": "x".repeat(MAX_ATTESTATION_ENVELOPE_BYTES + 1) });
++    let e = check_envelope_size_admission(&earlier).unwrap_err();
++    assert_eq!(e.kind(), "federation_envelope_too_large", "I2916 {e}");
++    let earlier_ok = serde_json::json!({ "pad": "x".repeat(kib900) });
++    check_envelope_size_admission(&earlier_ok).expect("I2916 earlier form under the cap");
++}
++
++/// I2916: a 900 KiB statement from a live key is admitted and stored, its
++/// bulk text (`pad`) or a byte string (`blob`, hex in the projection: a
++/// ~1.8 MiB derived envelope before the carried copy).
++async fn big_body(d: &dyn FederationDirectory) {
++    let k = key(152);
++    put_statement(d, &key_record(&k, &["user"], 0, None), None, INGEST_TIER)
++        .await
++        .unwrap_or_else(|e| panic!("I2916 key record: {e:?}"));
++    for (what, bulk) in [
++        ("pad", Value::Text("x".repeat(900 * 1024))),
++        ("blob", Value::Bytes(vec![0x5c; 900 * 1024])),
++    ] {
++        big_one(d, &k, what, bulk).await;
++    }
++}
++
++async fn big_one(
++    d: &dyn FederationDirectory,
++    k: &ciris_crypto::composite::CompositeSigningKey,
++    what: &str,
++    bulk: Value,
++) {
++    let st = statement(k, vec![(what, bulk)]);
++    assert!(
++        st.len() > 900 * 1024 && st.len() <= MAX_STATEMENT_BYTES,
++        "I2916 the {what} fixture is 900 KiB, under the statement cap"
++    );
++    let out = put_statement(d, &st, None, INGEST_TIER)
++        .await
++        .unwrap_or_else(|e| {
++            panic!("I2916 a 900 KiB {what} statement passes the size gates: {e:?}")
++        });
++    let StatementOutcome::Row { row_id, new: true } = out else {
++        panic!("I2916 {what}: {out:?}");
++    };
++    assert!(
++        d.get_attestation(&row_id.hex()).await.unwrap().is_some(),
++        "I2916 {what} stored"
++    );
++}
++
++/// The honest mapped row of `k`'s small statement, and a forgery of it: the
++/// same carried statement beside a 3 MiB forged `pad`.
++fn honest_and_forged(
++    k: &ciris_crypto::composite::CompositeSigningKey,
++) -> (Attestation, Attestation) {
++    let mut keys = HeldKeys::new();
++    keys.insert_record(key_record(k, &["user"], 0, None));
++    let st = statement(k, vec![]);
++    let admitted = admit_row(&st, &keys, None, SelectContext::default()).unwrap();
++    let honest = attestation_of(&admitted, INGEST_TIER).unwrap();
++    let mut forged = honest.clone();
++    forged.attestation_envelope["pad"] = serde_json::json!("x".repeat(3 * 1024 * 1024));
++    (honest, forged)
++}
++
++/// I2917: the pre-check, pure.
++#[test]
++fn i2917_a_forged_envelope_beside_a_valid_statement_is_refused_for_pennies() {
++    let k = key(153);
++    let (honest, forged) = honest_and_forged(&k);
++    check_carried_projection(&honest).expect("I2917 the honest projection passes");
++    let e = check_carried_projection(&forged).unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++        "I2917 {e}"
++    );
++    // A different row id than the statement's is refused by name.
++    let mut renamed = honest.clone();
++    renamed.attestation_id = hex::encode([7u8; 32]);
++    let e = check_carried_projection(&renamed).unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_ROW_ID_MISMATCH,
++        "I2917 {e}"
++    );
++    // An earlier-form row carries no statement: untouched.
++    let mut earlier = honest;
++    if let Some(o) = earlier.attestation_envelope.as_object_mut() {
++        o.remove(STATEMENT_MEMBER);
++    }
++    check_carried_projection(&earlier).expect("I2917 no carried statement, no pre-check");
++}
++
++/// I2917: wired FIRST at the attestation door.
++async fn forged_body(d: &dyn FederationDirectory) {
++    let k = key(154);
++    let (_, mut forged) = honest_and_forged(&k);
++    // The door's previous first gate refuses a malformed subject with its own
++    // error; the projection check must answer before it.
++    forged.subject_key_ids = vec![String::new()];
++    let e = d
++        .put_attestation(SignedAttestation {
++            attestation: forged.clone(),
++        })
++        .await
++        .unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++        "I2917 the projection check leads the door: {e:?}"
++    );
++    assert!(
++        d.get_attestation(&forged.attestation_id)
++            .await
++            .unwrap()
++            .is_none(),
++        "I2917 nothing stored"
++    );
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2917_a_forged_carrier_is_refused_first_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(forged_body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2917_a_forged_carrier_is_refused_first_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(forged_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2916_a_900_kib_statement_is_stored_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(big_body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2916_a_900_kib_statement_is_stored_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(big_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2914_pure_gates_precede_the_directory_read_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(Arc::new(b))).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2914_pure_gates_precede_the_directory_read_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(Arc::new(b))).await;
++}
+diff --git a/src/federation/edition2/weight_column_invariants.rs b/src/federation/edition2/weight_column_invariants.rs
+new file mode 100644
+index 00000000..06f25afb
+--- /dev/null
++++ b/src/federation/edition2/weight_column_invariants.rs
+@@ -0,0 +1,229 @@
++//! **I2915** (v62.0.0, wave P1c; E1's finding): the edition-2 mapping fills
++//! the typed `weight` column from the payload's fixed6 `weight`.
++//!
++//! - pure ([`attestation_of`] over an admitted `self:delegates_to` row, as
++//!   the door hands it on): payload `weight` 2_500_000 is the column
++//!   `Some(2.5)` and the mirror's `weight` 2.5; a negative fixed6 is its
++//!   negative real; no `weight` is `None` and the mirror names none;
++//! - store-backed, sqlite and postgres: a weighted row offered through
++//!   `put_statement` is stored with `weight` 2.5, and the weighted fold that
++//!   reads the column (`build_trust_topology`, `weight.unwrap_or(1.0)`)
++//!   reads 2.5, not the 1.0 a NULL column gave;
++//! - a mapped row whose `weight` column was altered after mapping, put
++//!   through the JSON door, is refused `typed_diverges_from_envelope` (the
++//!   row-mirror gate or `verify_carried`) and nothing is stored.
++//!
++//! No kernel module reads `Attestation.weight` (read-checked: `kernel::trust`
++//! / `kernel::owner` build `KRow`s from ids, names and signers; the kernel's
++//! `weights` are a `weighted:` rubric's, from the group record). The column's
++//! readers are `topology` and `replication::trust_scoring`.
++
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::family::SelectContext;
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::door::{admit_row, AdmittedRow};
++use super::door_invariants::fixture::*;
++use super::ingest::{attestation_of, put_statement, StatementOutcome, INGEST_TIER};
++use super::liveness::HeldKeys;
++use super::names::RowId;
++use crate::federation::types::SignedAttestation;
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++fn reason(e: &Error) -> String {
++    match e {
++        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
++        other => other.kind().to_owned(),
++    }
++}
++
++/// An admitted `self:delegates_to` row as the door hands it to the mapping,
++/// carrying `weight` (fixed6) when given.
++fn delegation(weight: Option<Value>) -> AdmittedRow {
++    let (a, b) = (key(160), key(161));
++    let mut m = vec![
++        ("asserted_at", Value::Uint(5_000)),
++        ("author", Value::Text(iref(&a))),
++    ];
++    if let Some(w) = weight {
++        m.push(("weight", w));
++    }
++    let payload = map(m);
++    let bytes = sign_row_statement(
++        &a,
++        &iref(&a),
++        &iref(&b),
++        "delegates_to",
++        "self:delegates_to",
++        &payload,
++        vec![],
++    )
++    .unwrap();
++    AdmittedRow {
++        row_id: RowId([0x5a; 32]),
++        statement_id: [0x5b; 32],
++        kid: kid(&a),
++        iss: iref(&a),
++        sub: iref(&b),
++        row_type: "delegates_to".into(),
++        family: "self:delegates_to".into(),
++        author: Some(iref(&a)),
++        asserted_at_ms: 5_000,
++        payload,
++        names: Vec::new(),
++        role: None,
++        bytes,
++    }
++}
++
++/// I2915: the mapping fills the column, and the mirror binds it.
++#[test]
++fn i2915_the_mapping_fills_the_weight_column() {
++    let a = attestation_of(&delegation(Some(Value::Uint(2_500_000))), INGEST_TIER).unwrap();
++    assert_eq!(a.weight, Some(2.5), "I2915 fixed6 2_500_000 is 2.5");
++    assert_eq!(
++        a.attestation_envelope["row"]["weight"].as_f64(),
++        Some(2.5),
++        "I2915 the mirror binds the weight"
++    );
++    assert_eq!(
++        a.attestation_envelope["weight"].as_f64(),
++        Some(2.5),
++        "I2915 the envelope's real agrees"
++    );
++    // -1 - 499_999 = -500_000: a negative fixed6.
++    let n = attestation_of(&delegation(Some(Value::Nint(499_999))), INGEST_TIER).unwrap();
++    assert_eq!(n.weight, Some(-0.5), "I2915 a negative weight");
++    let none = attestation_of(&delegation(None), INGEST_TIER).unwrap();
++    assert_eq!(none.weight, None, "I2915 no weight is None, not 1.0");
++    assert!(
++        none.attestation_envelope["row"].get("weight").is_none(),
++        "I2915 the mirror names no weight when the payload carries none"
++    );
++}
++
++/// An authored, weighted score row (Verify's vector family) by `k`, about
++/// `on`.
++fn weighted_score(k: &ciris_crypto::composite::CompositeSigningKey, on: &str) -> Vec<u8> {
++    weighted(k, on, 5_000)
++}
++
++/// The same row by `k` about itself, at `at`.
++fn weighted_score_at(k: &ciris_crypto::composite::CompositeSigningKey, at: u64) -> Vec<u8> {
++    weighted(k, &iref(k), at)
++}
++
++fn weighted(k: &ciris_crypto::composite::CompositeSigningKey, on: &str, at: u64) -> Vec<u8> {
++    let payload = map(vec![
++        ("asserted_at", Value::Uint(at)),
++        ("author", Value::Text(iref(k))),
++        ("score", Value::Uint(750_000)),
++        ("confidence", Value::Uint(900_000)),
++        ("weight", Value::Uint(2_500_000)),
++        (
++            "dimension",
++            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
++        ),
++    ]);
++    sign_row_statement(
++        k,
++        &iref(k),
++        on,
++        "scores",
++        "evidence:.suite:.kind:.cell:.prefix",
++        &payload,
++        vec![],
++    )
++    .unwrap()
++}
++
++async fn body(d: &dyn FederationDirectory) {
++    let k = key(162);
++    put_statement(d, &key_record(&k, &["user"], 0, None), None, INGEST_TIER)
++        .await
++        .unwrap_or_else(|e| panic!("I2915 key record: {e:?}"));
++    let st = weighted_score(&k, &iref(&k));
++    let out = put_statement(d, &st, None, INGEST_TIER)
++        .await
++        .unwrap_or_else(|e| panic!("I2915 a weighted row admits: {e:?}"));
++    let StatementOutcome::Row { row_id, .. } = out else {
++        panic!("I2915: {out:?}");
++    };
++    let stored = d
++        .get_attestation(&row_id.hex())
++        .await
++        .unwrap()
++        .expect("I2915 stored under its row id");
++    assert_eq!(stored.weight, Some(2.5), "I2915 the stored weight column");
++
++    let topo = crate::federation::build_trust_topology(
++        d,
++        &crate::federation::FederationDirectoryFilter {
++            granter_key: Some(iref(&k)),
++            ..Default::default()
++        },
++    )
++    .await
++    .unwrap();
++    assert_eq!(topo.edges.len(), 1, "I2915 one edge");
++    assert!(
++        (topo.edges[0].weight - 2.5).abs() < 1e-9,
++        "I2915 the weighted fold reads 2.5, got {}",
++        topo.edges[0].weight
++    );
++
++    // The column is the statement's: a fresh mapped row (not held) whose
++    // weight column was altered after mapping is refused at the JSON door,
++    // by the mirror gate or by `verify_carried` (both
++    // `typed_diverges_from_envelope`), and nothing is stored.
++    let mut keys = HeldKeys::new();
++    keys.insert_record(key_record(&k, &["user"], 0, None));
++    let st2 = weighted_score_at(&k, 6_000);
++    let admitted = admit_row(&st2, &keys, None, SelectContext::default()).unwrap();
++    let mut forged = attestation_of(&admitted, INGEST_TIER).unwrap();
++    assert_eq!(forged.weight, Some(2.5), "I2915 the mapping");
++    forged.weight = Some(9.0);
++    let e = d
++        .put_attestation(SignedAttestation {
++            attestation: forged,
++        })
++        .await
++        .unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
++        "I2915 a weight column that is not the statement's: {e:?}"
++    );
++    assert!(
++        d.get_attestation(&admitted.row_id.hex())
++            .await
++            .unwrap()
++            .is_none(),
++        "I2915 nothing stored"
++    );
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2915_the_weight_column_is_stored_and_read_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2915_the_weight_column_is_stored_and_read_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index 4db4606b..741921a3 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -841,6 +841,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     // original THIS node holds must name the original's `cohort_scope`.
+     // One name at the six write doors on every backend.
+     ("check_rendition_placement", Class::Gate),
++    // v62.0.0 (wave P1c) — a row carrying an edition-2 statement is exactly
++    // its projection, checked first in the shared plan (pure).
++    ("check_carried_projection", Class::Gate),
+     ("check_delivery_mode_vocabulary", Class::Gate),
+     ("check_device_class", Class::Gate),
+     ("check_encryption_pubkeys", Class::Gate),

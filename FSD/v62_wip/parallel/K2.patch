@@ -1,0 +1,2237 @@
+diff --git a/benches/kernel_paths.rs b/benches/kernel_paths.rs
+index 01a7d978..f3f3df5f 100644
+--- a/benches/kernel_paths.rs
++++ b/benches/kernel_paths.rs
+@@ -7,7 +7,7 @@
+ //! |---|---|---|
+ //! | `owner_of` | `admission::owner_of` | `seat::Seats::one("owner", key)` |
+ //! | `trust_root_valid` | `trust_root::trust_root_valid` | `trust::honours`, `trust::reaches` |
+-//! | `delegation_walk` | `admission::reachable_under_scope`, `check_delegation_cycle_admission` | `trust::reaches` (a cycle visited once), the seat walk's depth |
++//! | `delegation_walk` | `admission::reachable_under_scope` (v62.0.0: the cycle gate arms are deleted with the gate) | `trust::reaches` (a cycle visited once), the seat walk's depth |
+ //! | `held_head` | `group_supersede_admit::held_head_verdict` (via the supersede door) | `seat::Seats::tips`, `line::settle` |
+ //! | `accord_recovery` | `accord_recovery::{recovery_commitment_in_force, verify_accord_recovery}` | `seat::seat_rule` over the lineage |
+ //! | `admission_door` | `put_attestation_authored` (the `put_attestation` gauntlet, no AV-76 quota) | `layers::kept`, `layers::conclude` |
+@@ -50,9 +50,8 @@ use ciris_persist::federation::accord_recovery::{
+ };
+ use ciris_persist::federation::accord_test_support as ops;
+ use ciris_persist::federation::admission::{
+-    check_delegation_cycle_admission, owner_of, owner_of_pre_kernel, reachable_under_scope,
+-    steward_bindings_of, truncate_to_substrate_resolution, DelegationTermBounds,
+-    DELEGATION_SCOPE_MODERATE,
++    owner_of, owner_of_pre_kernel, reachable_under_scope, steward_bindings_of,
++    truncate_to_substrate_resolution, DelegationTermBounds, DELEGATION_SCOPE_MODERATE,
+ };
+ use ciris_persist::federation::canonical_community::{accord_family_key_id, NEXT_PERSIST_ROW_HASH};
+ use ciris_persist::federation::cohort::Cohort;
+@@ -661,42 +660,10 @@ fn bench_delegation_walk(c: &mut Criterion) {
+                 )
+             });
+         });
+-        // The cycle gate on a candidate edge tip → root: it closes a cycle
+-        // of `depth + 1` hops. Pre-kernel it was refused while the chain was
+-        // within the ceiling; v62.0.0 (slice C) refuses no edge for closing
+-        // a cycle (the kernel's walk visits it once), so every depth admits.
+-        // Not written: the gate is asked, the row is not stored.
+-        let closing = moderate_edge(&format!("walk-close-{depth}"), &tip, &root);
+-        group.bench_function(BenchmarkId::new("cycle_gate_closing", depth), |b| {
+-            let s = fx();
+-            let now = chrono::Utc::now();
+-            let r = rt.block_on(check_delegation_cycle_admission(&s.backend, &closing, now));
+-            assert!(
+-                r.is_ok(),
+-                "depth {depth}: v62 refuses no cycle-closing edge"
+-            );
+-            b.iter(|| {
+-                black_box(
+-                    rt.block_on(check_delegation_cycle_admission(&s.backend, &closing, now))
+-                        .is_err(),
+-                )
+-            });
+-        });
+-        // The cycle gate on an edge outsider → root: no cycle, the search
+-        // walks the whole chain from the root.
+-        let open = moderate_edge(&format!("walk-open-{depth}"), "walk-outsider", &root);
+-        group.bench_function(BenchmarkId::new("cycle_gate_open", depth), |b| {
+-            let s = fx();
+-            let now = chrono::Utc::now();
+-            rt.block_on(check_delegation_cycle_admission(&s.backend, &open, now))
+-                .expect("no cycle");
+-            b.iter(|| {
+-                black_box(
+-                    rt.block_on(check_delegation_cycle_admission(&s.backend, &open, now))
+-                        .is_ok(),
+-                )
+-            });
+-        });
++        // v62.0.0 (kernel pass 2): the `cycle_gate_closing` / `cycle_gate_open`
++        // arms measured the v54 cycle gate, which is deleted (the kernel's walk
++        // visits a cycle once; no edge is refused for closing one). Their
++        // baselines in `pre-kernel` have no v62 counterpart.
+     }
+     group.finish();
+ }
+@@ -1407,13 +1374,6 @@ fn smoke() {
+                     ))
+                     .expect("walk");
+                 assert!(hit, "depth 4 reach");
+-                let closing = moderate_edge("smoke-close", &walk_key(4, 4), &walk_key(4, 0));
+-                let r = rt.block_on(check_delegation_cycle_admission(
+-                    &s.backend,
+-                    &closing,
+-                    chrono::Utc::now(),
+-                ));
+-                assert!(r.is_err(), "cycle refused: {r:?}");
+             }),
+         ),
+         (
+diff --git a/evidence/cc_impl.tsv b/evidence/cc_impl.tsv
+index 647b1596..19cf99da 100644
+--- a/evidence/cc_impl.tsv
++++ b/evidence/cc_impl.tsv
+@@ -27,7 +27,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
+ 3.1.9.7	CLM-nsproc-meta-goal-alignment-goal-scale	CIRISPersist	src/federation/goal.rs#check_goal_row_admission	ciris-persist@61.4.1
+ 3.1.9.7	CLM-nsproc-goal-scope-goal-scale	CIRISPersist	src/federation/goal.rs#GoalScope	ciris-persist@61.4.1
+ 3.2	CLM-nsproc-delegated-scope-ownership	CIRISPersist	src/federation/admission.rs#check_node_agency_admission	ciris-persist@61.4.1
+-3.2	CLM-nsproc-attested-key-id-ownership	CIRISPersist	src/federation/admission.rs#check_single_node_owner_admission	ciris-persist@61.4.1
++3.2	CLM-nsproc-attested-key-id-ownership	CIRISPersist	src/federation/admission.rs#owner_of	ciris-persist@61.4.1
+ 3.2	CLM-nsproc-delegation-valid-until-ownership	CIRISPersist	src/federation/admission.rs#delegation_valid_until_lapsed	ciris-persist@61.4.1
+ 3.2	CLM-nsproc-delegation-purpose-ownership	CIRISPersist	src/federation/admission.rs#is_owner_binding_envelope	ciris-persist@61.4.1
+ 3.2	CLM-nsproc-pre-rotation-commitment-trust	CIRISPersist	src/federation/trust_root.rs#check_trust_charter_admission	ciris-persist@61.4.1
+@@ -209,7 +209,6 @@ decimal_id	claim_id	repo	path#symbol	crate@version
+ 3.2	CLM-canonical-founders-accord	CIRISPersist	src/federation/membership_acceptance.rs#node_seated_without_acceptance	ciris-persist@61.4.1
+ 3.2	CLM-attach-unlabelled	CIRISPersist	src/federation/trust_root.rs#direction_denied_ids	ciris-persist@61.4.1
+ 3.2	CLM-attach-unlabelled	CIRISPersist	src/federation/trust_root.rs#names_no_trust_job	ciris-persist@61.4.1
+-4.1.1	CLM-self-edge-not-cycle	CIRISPersist	src/federation/admission.rs#check_delegation_cycle_admission	ciris-persist@61.4.1
+ 4.1.1	CLM-self-edge-not-cycle	CIRISPersist	src/federation/admission.rs#is_trust_plane_edge	ciris-persist@61.4.1
+ 4.4.3.2.8	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#check_community_record	ciris-persist@61.4.1
+ 4.4.3.2.8	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#declared_cohort	ciris-persist@61.4.1
+@@ -370,7 +369,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
+ 3.1.7	CLM-polarity-admission	CIRISPersist	src/federation/admission.rs#check_dimension_case_rule	ciris-persist@61.4.1
+ 3.3.6.3	CLM-self-roster-authority	CIRISPersist	src/federation/self_roster.rs#acts_as_steward_at	ciris-persist@61.4.1
+ 3.3.6.3	CLM-self-roster-authority	CIRISPersist	src/federation/consent_by_humans.rs#grant_is_authored_for	ciris-persist@61.4.1
+-3.3.6.3	CLM-self-roster-authority	CIRISPersist	src/federation/admission.rs#check_single_node_owner_admission	ciris-persist@61.4.1
++3.3.6.3	CLM-self-roster-authority	CIRISPersist	src/federation/admission.rs#check_owner_binding_roster_fresh	ciris-persist@61.4.1
+ 3.3.6.3	CLM-self-roster-two-paths	CIRISPersist	src/federation/two_path.rs#decide	ciris-persist@61.4.1
+ 3.3.6.3	CLM-self-roster-two-paths	CIRISPersist	src/federation/self_roster.rs#gate	ciris-persist@61.4.1
+ 6.1.1	CLM-member-commitment-unique	CIRISPersist	src/fountain/aggregation.rs#check_distinct_sources	ciris-persist@61.4.1
+diff --git a/src/engine.rs b/src/engine.rs
+index 0a5c4c59..c3867ce8 100644
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -4412,11 +4412,12 @@ impl Engine {
+     /// (`"responsible_for"`) builds an **owner-binding** via
+     /// [`owner_binding_delegates_to_envelope`](crate::federation::owner_binding_delegates_to_envelope)
+     /// — the single-valued `delegates_to(user → node)` that names the node's one
+-    /// responsible steward and is admitted through the single-owner gate
+-    /// ([`check_single_node_owner_admission`](crate::federation::admission::check_single_node_owner_admission)):
+-    /// a second DISTINCT owner is rejected. `None` (the default) builds the
+-    /// general multi-parent `delegates_to` and is untouched by the gate. Any
+-    /// other purpose value is treated as a general delegation.
++    /// responsible steward. v62.0.0 (kernel pass 2, C557): no gate refuses a
++    /// second DISTINCT owner; the kernel's owner seat
++    /// ([`owner_of`](crate::federation::admission::owner_of)) counts only the
++    /// bindings the node cosigned and reads two counted owners as unowned.
++    /// `None` (the default) builds the general multi-parent `delegates_to`.
++    /// Any other purpose value is treated as a general delegation.
+     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+     ///
+     /// v60.0.0 (CIRISPersist#1048, CC 2.4, CIRISConstitution#163) — `term` is
+@@ -4438,8 +4439,8 @@ impl Engine {
+             .is_some_and(|p| p == crate::federation::types::owner_binding::PURPOSE);
+         let mut envelope = match delegation_purpose {
+             // The owner-binding sub-relation (CC 3.2): single-valued ownership,
+-            // gated by check_single_node_owner_admission. `sub_delegation` is
+-            // ignored (an owner-binding is a leaf, never a deputization).
++            // read by the kernel's owner seat. `sub_delegation` is ignored (an
++            // owner-binding is a leaf, never a deputization).
+             Some(p) if p == crate::federation::types::owner_binding::PURPOSE => {
+                 crate::federation::owner_binding_delegates_to_envelope(delegate_key_id, &scopes)
+             }
+@@ -4533,10 +4534,10 @@ impl Engine {
+     /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — pass
+     /// `delegation_purpose = Some(`[`owner_binding::PURPOSE`](crate::federation::types::owner_binding::PURPOSE)`)`
+     /// to make this steward-binding the node's single-valued **owner-binding**
+-    /// (`infra:*`-only scope IS the owner-binding shape). It is then subject to
+-    /// the single-owner admission gate (a second distinct owner rejects) and
+-    /// resolvable via [`owner_of`](Self::owner_of). `None` (default) is a plain
+-    /// steward-binding.
++    /// (`infra:*`-only scope IS the owner-binding shape), resolvable via
++    /// [`owner_of`](Self::owner_of). v62.0.0 (kernel pass 2): a second distinct
++    /// owner's binding is held, not refused; two counted owners read as
++    /// unowned. `None` (default) is a plain steward-binding.
+     ///
+     /// [`is_steward_bound`]: crate::federation::admission::is_steward_bound
+     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+@@ -9587,8 +9588,9 @@ impl Engine {
+     /// [`steward_bindings_of`](Self::steward_bindings_of) /
+     /// [`delegations_to`](Self::delegations_to) readers, which return every
+     /// `delegates_to` granter (cardinality > 1, the anti-pattern CC 3.2
+-    /// forbids). A pre-gate ambiguous state (two live owners from before the
+-    /// single-owner gate) resolves **fail-closed** with
++    /// forbids). Two counted owners (v62.0.0: both bindings held, each
++    /// cosigned by the node; the kernel's owner seat reads them as unowned)
++    /// resolve **fail-closed** with
+     /// [`Error::AmbiguousNodeOwner`](crate::federation::Error::AmbiguousNodeOwner).
+     /// See [`admission::owner_of`](crate::federation::admission::owner_of).
+     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+@@ -19760,15 +19762,18 @@ mod tests {
+     // ── v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) ──────────────
+     // The owner-binding sub-relation over the REAL emit path
+     // (`steward_bind(.., Some(owner_binding::PURPOSE))`) + `owner_of`: the
+-    // purpose arg round-trips onto the wire, a second DISTINCT owner is
+-    // rejected at bind time (idempotent same-owner), and `owner_of` is
+-    // purpose-filtered → ≤1 (an unrelated general delegation does not count).
++    // purpose arg round-trips onto the wire, a same-owner refresh is
++    // idempotent, and `owner_of` is purpose-filtered → ≤1 (an unrelated
++    // general delegation does not count). v62.0.0 (kernel pass 2, I2840): a
++    // second DISTINCT owner is no longer refused at bind time; its binding is
++    // held and two counted owners read as unowned (KERNEL_SEAMS B1, C557).
+ 
+     /// #378 (sqlite) — `steward_bind(node, infra, Some("responsible_for"))`
+     /// stamps the owner-binding wire shape, `owner_of` resolves the single
+-    /// owner, a second distinct owner rejects (`NodeAlreadyOwned`), a
+-    /// same-owner refresh is idempotent, a general (non-ownership) delegation
+-    /// does NOT count toward `owner_of`, and an unbound node is `None`.
++    /// owner, a same-owner refresh is idempotent, a general (non-ownership)
++    /// delegation does NOT count toward `owner_of`, an unbound node is `None`,
++    /// and (**I2840**) a second distinct owner's cosigned binding is HELD and
++    /// the node then reads as unowned (`AmbiguousNodeOwner`, fail-closed).
+     #[cfg(feature = "sqlite")]
+     #[tokio::test]
+     async fn owner_binding_single_owner_end_to_end_sqlite() {
+@@ -19832,35 +19837,6 @@ mod tests {
+             "owner_of resolves the single owner",
+         );
+ 
+-        // A second, DISTINCT owner is rejected at bind time (no trace).
+-        let err = engine
+-            .steward_bind(
+-                &o2_signer,
+-                &node_id,
+-                infra.clone(),
+-                Some(owner_binding::PURPOSE),
+-            )
+-            .await
+-            .expect_err("a second distinct owner is rejected");
+-        assert_eq!(err.kind(), "federation_node_already_owned");
+-        match err {
+-            crate::federation::Error::NodeAlreadyOwned {
+-                ref node_key_id,
+-                ref incumbent_owner,
+-                ref attempted_owner,
+-            } => {
+-                assert_eq!(node_key_id, &node_id);
+-                assert_eq!(incumbent_owner, &o1);
+-                assert_eq!(attempted_owner, &o2);
+-            }
+-            other => panic!("expected NodeAlreadyOwned, got {other:?}"),
+-        }
+-        assert_eq!(
+-            engine.owner_of(&node_id).await.unwrap(),
+-            Some(o1.clone()),
+-            "the rejected second owner left the owner unchanged",
+-        );
+-
+         // A refresh by the SAME owner is idempotently admitted.
+         engine
+             .steward_bind(
+@@ -19886,6 +19862,37 @@ mod tests {
+             "owner_of ignores the general delegation (purpose-filtered ≤1)",
+         );
+ 
++        // I2840 (kernel pass 2, KERNEL_SEAMS B1 / C557) — a second, DISTINCT
++        // owner's binding is HELD, not refused. The engine is the node, so it
++        // cosigned it: two counted owners read as unowned, fail-closed, never
++        // as the first to arrive.
++        let second = engine
++            .steward_bind(
++                &o2_signer,
++                &node_id,
++                infra.clone(),
++                Some(owner_binding::PURPOSE),
++            )
++            .await
++            .expect("I2840: a second distinct owner's binding is held, not refused");
++        assert!(
++            sq.get_attestation(&second).await.unwrap().is_some(),
++            "I2840: the second binding is stored"
++        );
++        match engine.owner_of(&node_id).await {
++            Err(crate::federation::Error::AmbiguousNodeOwner {
++                ref node_key_id,
++                ref owners,
++            }) => {
++                assert_eq!(node_key_id, &node_id);
++                assert!(
++                    owners.contains(&o1) && owners.contains(&o2),
++                    "I2840: both counted owners are named: {owners:?}"
++                );
++            }
++            other => panic!("I2840: two counted owners read as unowned, got {other:?}"),
++        }
++
+         // An unbound node reads as unowned.
+         let mut node2 = sweeper_test_key("ob-node2");
+         node2.record.identity_type = crate::federation::types::identity_type::NODE.into();
+@@ -19911,8 +19918,8 @@ mod tests {
+     }
+ 
+     /// #378 PG twin of [`owner_binding_single_owner_end_to_end_sqlite`] — the
+-    /// same owner-binding / single-owner-gate / purpose-filtered `owner_of`
+-    /// arc over the live Postgres gates. Skips when `CIRIS_PERSIST_TEST_PG_URL`
++    /// same owner-binding / purpose-filtered `owner_of` arc, and I2840's held
++    /// second owner, over the live Postgres gates. Skips when `CIRIS_PERSIST_TEST_PG_URL`
+     /// is unset.
+     #[cfg(feature = "postgres")]
+     #[tokio::test]
+@@ -19977,19 +19984,6 @@ mod tests {
+         );
+         assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
+ 
+-        // Second distinct owner rejected; owner unchanged.
+-        let err = engine
+-            .steward_bind(
+-                &o2_signer,
+-                &node_id,
+-                infra.clone(),
+-                Some(owner_binding::PURPOSE),
+-            )
+-            .await
+-            .expect_err("a second distinct owner is rejected");
+-        assert_eq!(err.kind(), "federation_node_already_owned");
+-        assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
+-
+         // Same-owner refresh idempotent.
+         engine
+             .steward_bind(
+@@ -20009,6 +20003,30 @@ mod tests {
+             .expect("a plain steward-binding is not an owner-binding");
+         assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
+ 
++        // I2840 (kernel pass 2) — a second distinct owner's binding is held,
++        // not refused; cosigned by the node, two counted owners read as
++        // unowned (fail-closed).
++        let second = engine
++            .steward_bind(
++                &o2_signer,
++                &node_id,
++                infra.clone(),
++                Some(owner_binding::PURPOSE),
++            )
++            .await
++            .expect("I2840: a second distinct owner's binding is held, not refused");
++        assert!(
++            pg.get_attestation(&second).await.unwrap().is_some(),
++            "I2840: the second binding is stored"
++        );
++        match engine.owner_of(&node_id).await {
++            Err(crate::federation::Error::AmbiguousNodeOwner { ref owners, .. }) => assert!(
++                owners.contains(&o1) && owners.contains(&o2),
++                "I2840: both counted owners are named: {owners:?}"
++            ),
++            other => panic!("I2840: two counted owners read as unowned, got {other:?}"),
++        }
++
+         // Unbound node → None.
+         let mut node2 = sweeper_test_key(&node2_label);
+         node2.record.identity_type = crate::federation::types::identity_type::NODE.into();
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index 35475526..04c05c93 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -3234,10 +3234,10 @@ pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), E
+ ///   a hash-covered field, and the promoted `persist_row_hash` already covers
+ ///   the value the local write resolved. Re-running it would let a
+ ///   later-changing delegation silently rewrite a stored row's audit metadata.
+-/// - **[`check_single_node_owner_admission`].** Its own doc pins the
+-///   precondition: *"The incoming row is NOT yet stored (this runs
+-///   pre-insert)"*. At promotion the row IS stored, so the incumbent set it
+-///   walks is no longer the set it was written to reason about.
++/// - **[`check_owner_binding_roster_fresh`].** A receipt bound (W) on the
++///   row's first arrival; at promotion the row IS stored, and the owner seat
++///   it reads already counts it. (v62.0.0: it replaced the single-owner gate,
++///   which the kernel's owner seat decides.)
+ /// - **The trust-charter gates.** Same class: they classify a row entering the
+ ///   corpus, and a promoted row is already in it.
+ ///
+@@ -3422,15 +3422,13 @@ pub async fn check_promotion_admission(
+     // have changed since the local write.
+     check_owner_binding_affiliation_admission(directory, row).await?;
+ 
+-    // CC 4.1.1 — the cycle-closing `delegates_to` is refused (v54.0.0,
+-    // CIRISPersist#1031). Re-run at promotion: the walks read the federation
+-    // tier only, so a local edge closes a cycle at the moment it is promoted.
+     // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — a term-bearing
+     // `delegates_to` carries a bounded term. Re-run here: whether the
+     // community an edge names is an affiliation, and its `role_term`, are
+     // directory state that can have changed since the local write.
++    // (v62.0.0, kernel pass 2: the v54 cycle gate that ran here is deleted;
++    // the kernel's walk visits a cycle once.)
+     check_delegation_term_admission(directory, row).await?;
+-    check_delegation_cycle_admission(directory, row, crate::host::clock::now()).await?;
+ 
+     // CC 5.4.6 / CC 3.4.13 Q5 — a minor's owner-binding is never announced
+     // (v50.0.0, CIRISPersist#924). Re-run here because "admission MUST refuse
+@@ -5821,11 +5819,12 @@ pub fn check_config_sensitive_leaf_floor(row: &super::Attestation) -> Result<(),
+ ///
+ /// [`owner_of`] is the CC 3.2 purpose-filtered resolution: the single live
+ /// `delegates_to(U → node)` carrying the owner-binding dimension, and at most
+-/// one such `U` ([`check_single_node_owner_admission`] is what keeps it
+-/// single). [`steward_bindings_of`] is multi-parent **by design** and would
+-/// admit any co-steward. The clause says `owner_of`; the two sets are not the
+-/// same set, and reading the wider one here would let a co-steward of a node
+-/// speak for its configuration — a widening nobody ratified.
++/// one such `U` (v62.0.0: the kernel's owner seat reads two counted owners as
++/// none, [`Error::AmbiguousNodeOwner`]). [`steward_bindings_of`] is
++/// multi-parent **by design** and would admit any co-steward. The clause says
++/// `owner_of`; the two sets are not the same set, and reading the wider one
++/// here would let a co-steward of a node speak for its configuration — a
++/// widening nobody ratified.
+ ///
+ /// Occurrence→identity resolution ([`admission_identity_for_writer`]) is
+ /// deliberately NOT applied either. It would lift a node writer to its OWNER,
+@@ -12305,8 +12304,8 @@ pub(crate) async fn live_delegation_granter_instants<F: super::FederationDirecto
+         // dimension OR the CC 2.4.1.2 `delegation_purpose: owner_binding`
+         // marker (v13.3.0 #378). This is what keeps ownership single-valued
+         // WITHOUT constraining act-on-behalf / hierarchy delegations (multi-
+-        // parent per CC 4.5.13). Must match `check_single_node_owner_admission`
+-        // exactly so the gate and the `owner_of` resolver agree on what an
++        // parent per CC 4.5.13). Must match `is_owner_binding_envelope`
++        // exactly so this fold and the `owner_of` resolver agree on what an
+         // owner-binding IS.
+         if matches!(
+             filter,
+@@ -12751,7 +12750,7 @@ pub async fn nodes_stewarded_by(
+ /// The distinct set of **live owner-binding granters** of `node` — the users
+ /// `U` with a live `delegates_to(U → node)` carrying the CC 1.13.3.3 / CC 3.2
+ /// owner-binding dimension ([`super::types::owner_binding::DIMENSION`]). The raw
+-/// set behind [`owner_of`] + [`check_single_node_owner_admission`].
++/// set behind persist's pre-kernel owner fold (the differential's reference).
+ ///
+ /// Exactly [`live_delegation_granters`] restricted to the ownership dimension —
+ /// not a parallel implementation of it. v25.x (CIRISPersist#578) wrote the
+@@ -12931,10 +12930,10 @@ pub(crate) async fn owner_of_reference_for_profile<F: super::FederationDirectory
+ }
+ 
+ /// The owner fold as persist wrote it before the kernel. v62.0.0: the
+-/// differential's reference for [`owner_of`], and still the single-owner
+-/// admission gate's incumbent read ([`check_single_node_owner_admission`]),
+-/// which refuses a second owner at the door — a breaker the kernel slice
+-/// that deletes the door gates moves (KERNEL_SEAMS §2.2).
++/// differential's reference for [`owner_of`] and the bench's pre-kernel arm
++/// only. Kernel pass 2 deleted the single-owner admission gate that also read
++/// it (KERNEL_SEAMS B1); no production path calls it.
++#[cfg(any(test, feature = "test-anchor"))]
+ async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
+     directory: &F,
+     node: &str,
+@@ -13023,8 +13022,10 @@ pub async fn admission_identity_for_writer<F: super::FederationDirectory + ?Size
+ /// or an `additional_scrubs` entry by the node is the cosignature.
+ ///
+ /// Returns [`Error::AmbiguousNodeOwner`] when the node carries **more than one**
+-/// distinct live owner — a pre-gate anomaly the single-owner admission gate
+-/// [`check_single_node_owner_admission`] prevents going forward. Consumers
++/// distinct counted owner. v62.0.0 (kernel pass 2, C557): no gate refuses a
++/// second owner's binding any more; two bindings the node cosigned for two
++/// selves are both held, and the seat reads them as **unowned** — this error
++/// is that verdict, fail-closed. Consumers
+ /// (CIRISEdge's `SelfOnly` widening, CIRISServer's node switcher) MUST treat the
+ /// error as **fail-closed**: an ambiguous owner is not a resolvable `self`
+ /// boundary. NEVER silently pick one (unlike the historical
+@@ -13064,8 +13065,8 @@ pub async fn owner_of<F: super::FederationDirectory + ?Sized>(
+ ///
+ /// # The asymmetry is load-bearing
+ ///
+-/// Node ownership is **single-valued** ([`owner_of`], policed by
+-/// [`check_single_node_owner_admission`]); stewardship is **multi-parent by
++/// Node ownership is **single-valued** ([`owner_of`]: the kernel's owner
++/// seat, two counted owners reading as none); stewardship is **multi-parent by
+ /// design** ([`steward_bindings_of`]). So the rule is *the node's one owner
+ /// must appear SOMEWHERE in the agent's steward set* — deliberately not
+ /// "the same human", which would wrongly imply the agent has exactly one
+@@ -13192,21 +13193,6 @@ pub async fn nodes_owned_by<F: super::FederationDirectory + ?Sized>(
+     Ok(out)
+ }
+ 
+-/// **CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the single-owner admission
+-/// gate.** The node-target companion to [`check_node_agency_admission`]: a node
+-/// has **at most one** responsible steward (the `self` cohort boundary is
+-/// undefined otherwise). Rejects a `delegates_to(U → node)` owner-binding when
+-/// the node already carries a LIVE owner-binding from a DIFFERENT granter `U'`
+-/// ([`Error::NodeAlreadyOwned`]) — the incumbent must first `withdraws` /
+-/// `recants` it (or it must lapse). A refresh by the SAME owner is idempotently
+-/// admitted; a first owner is admitted.
+-///
+-/// Keyed on the versioned owner-binding dimension
+-/// ([`super::types::owner_binding::DIMENSION`]) so it constrains ONLY the
+-/// ownership relation; act-on-behalf / hierarchy `delegates_to` (multi-parent
+-/// per CC 4.5.13) are untouched. A no-op for any non-`delegates_to` row or any
+-/// `delegates_to` lacking the ownership dimension.
+-///
+ /// v24.0.0 (CIRISPersist#557) — **the attested subject must be something this
+ /// node already knows**: either a registered `federation_keys` row, or a
+ /// CONSTITUTIONAL FAMILY it has stored.
+@@ -13448,60 +13434,50 @@ pub async fn affiliation_of_binding(
+     Ok(named.into_iter().min())
+ }
+ 
+-/// Verify-before-mutation (AV-9): wired into every backend's `put_attestation`
+-/// immediately AFTER [`check_user_target_steward_binding_admission`], so a
+-/// rejected second-owner emission leaves no trace. Backend-agnostic.
+-pub async fn check_single_node_owner_admission(
++/// v62.0.0 (kernel pass 2, KERNEL_SEAMS B1/C557) — **the roster W bound on an
++/// owner-binding.** What is left of the single-owner admission gate once the
++/// kernel's owner seat decides ownership.
++///
++/// The single-owner gate refused a second distinct owner's binding at the
++/// door (`federation_node_already_owned`), so which owner a node had depended
++/// on whether the incumbent's withdrawal arrived first. The kernel's owner
++/// seat ([`owner_of`], [`crate::kernel::owner`]) holds every binding and
++/// counts one only when the node's own key cosigned it (CC 3.2, *The first
++/// binding (MUST)*): exactly one counted owner is the owner; two or more is
++/// unowned ([`Error::AmbiguousNodeOwner`], fail-closed). So the refusal is
++/// gone and nothing is refused and forgotten.
++///
++/// The W bound stays (KERNEL_SEAMS B5, not yet a kernel conclusion): a roster
++/// key restating a binding for the self it stood for at the row's signed
++/// instant, but evicted since, may not sign more than W in the past
++/// ([`check_roster_act_fresh`](super::self_roster::check_roster_act_fresh),
++/// `asserted_at_stale`, CIRISPersist#1049). The stewards it is judged
++/// against are the kernel's owner seat over the node.
++///
++/// Verify-before-mutation (AV-9); backend-agnostic. A no-op for any row that
++/// is not an owner-binding `delegates_to`.
++pub async fn check_owner_binding_roster_fresh(
+     directory: &dyn super::FederationDirectory,
+     row: &super::Attestation,
+ ) -> Result<(), Error> {
+-    if row.attestation_type != attestation_type::DELEGATES_TO {
+-        return Ok(());
+-    }
+-    // v13.3.0 (#378): recognize the owner-binding by EITHER the internal
+-    // dimension OR the CC 2.4.1.2 `delegation_purpose: owner_binding` marker —
+-    // the raw `emit_attestation_self` path carries only the latter, and gating
+-    // on the dimension alone let it bypass the single-owner gate.
+-    if !is_owner_binding_envelope(&row.attestation_envelope) {
++    if row.attestation_type != attestation_type::DELEGATES_TO
++        || !is_owner_binding_envelope(&row.attestation_envelope)
++    {
+         return Ok(());
+     }
+-    // The incoming row is NOT yet stored (this runs pre-insert), so every
+-    // granter here is a pre-existing incumbent. Any incumbent that is NOT the
+-    // attesting owner blocks admission — a node cannot accrue a second steward.
+-    let incumbents = live_owner_binding_granters(directory, &row.attested_key_id).await?;
+-    // v59.0.0 (CIRISPersist#1049 bound on CIRISPersist#1099's predicate) — a
+-    // roster key restating the binding does so inside W.
++    let owners = kernel_owner_selves(
++        directory,
++        &row.attested_key_id,
++        crate::kernel::owner::Cosign::Required,
++    )
++    .await?;
+     super::self_roster::check_roster_act_fresh(
+         directory,
+-        &incumbents.iter().cloned().collect::<Vec<_>>(),
++        &owners.into_iter().collect::<Vec<_>>(),
+         &row.attesting_key_id,
+         row.asserted_at,
+     )
+-    .await?;
+-    for incumbent in incumbents {
+-        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the incumbent self, or a
+-        // live roster key of it at the row's `asserted_at`, is the same one
+-        // steward (THE steward predicate); a key of another self is not.
+-        if !super::self_roster::acts_as_steward_at(
+-            directory,
+-            &incumbent,
+-            &row.attesting_key_id,
+-            row.asserted_at,
+-        )
+-        .await?
+-        {
+-            return Err(Error::NodeAlreadyOwned {
+-                node_key_id: row.attested_key_id.clone(),
+-                incumbent_owner: incumbent,
+-                attempted_owner: row.attesting_key_id.clone(),
+-            });
+-        }
+-    }
+-    // v25.x (CIRISPersist#578, CC 3.2 ceremony step 4) — a node that has been
+-    // through a reclaim owes its OWN co-signature on the fresh owner-binding.
+-    // Hooked here so all three backends inherit it from one chokepoint.
+-    super::ownership_reclaim::check_post_reclaim_rebinding_admission(directory, row).await?;
+-    Ok(())
++    .await
+ }
+ 
+ /// **CIRISPersist#372 (CC 3.4.7.1 set-membership) — the `canonical`-role
+@@ -18758,196 +18734,13 @@ pub fn grant_chain_instant(row: &super::Attestation) -> chrono::DateTime<chrono:
+     row.asserted_at
+ }
+ 
+-/// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
+-/// is refused at admission.**
+-///
+-/// **v62.0.0 (slice C) — no longer refused.** The decision answers through the
+-/// kernel, whose trust walk visits a cycle once (`ciris_kernel::trust::reaches`,
+-/// KERNEL.md 5; CIRISKernel `ADOPTING.md`: "no edge is refused for closing a
+-/// cycle"). Every row this gate examines is now admitted and held; the walks'
+-/// visited guard reads a cycle once. What follows is the v54 reading, kept as
+-/// the differential's reference (test builds). CC 4.1.1's anti-pattern row
+-/// ("reject the cycle-closing emission") still reads the v54 way; the kernel's
+-/// reading is the one persist adopts (the CC session is told).
+-///
+-/// CC 4.1.1's anti-pattern table, row "Cycles (A → B → A)": *"Substrate MUST
+-/// detect cycles on the `delegates_to` graph and reject the cycle-closing
+-/// emission."* Until this gate every walk was visited-guarded
+-/// ([`scoped_delegation_reach_at`], `topology::build_delegation_graph`), so a
+-/// cycle was TOLERATED at read time, but nothing refused the closing edge and
+-/// it was stored.
+-///
+-/// A no-op for any row that is not a [`attestation_type::DELEGATES_TO`]. For
+-/// `delegates_to(A → B)` it asks whether `B` already reaches `A` through live
+-/// `delegates_to` edges ([`delegation_path_hops`]), and if so refuses with
+-/// [`Error::DelegationCycle`] (`federation_delegation_cycle`).
+-///
+-/// # Trust-plane edges are not in the cycle graph
+-///
+-/// The cycle graph is the CAPABILITY graph (CC 4.1.1, as CC confirmed on the
+-/// v54.0.0 integration). Two `delegates_to` labels are the trust plane, not a
+-/// delegation of capability ([`is_trust_plane_edge`]):
+-///
+-/// - `trust:accepts:v1`, the node's SUBSCRIPTION to a root (CC 4.2.1: "the
+-///   trust edge is the subscription"). It is the user's own leg, and CC 3.2
+-///   T3 says no conferral may substitute for it, so it is never a link a
+-///   capability flows along: `capability_roots_to_trusted_root` reads it as
+-///   the separate user leg, then walks root → … → subject;
+-/// - `trust:charter:v1`, the root's charter, self-referential by definition
+-///   (CC 3.4.7; a family's is holder → family).
+-///
+-/// Both are excluded on both sides, which covers both arrival orders: the
+-/// gate admits one without a search, and [`delegation_path_hops`] never
+-/// traverses one.
+-/// The production shape this keeps working is a KEY root's grantee
+-/// subscribing to the root that granted it: the root signs
+-/// `delegates_to(root → node, [infra:serve])` itself, and the node's own boot
+-/// writes `delegates_to(node → root, trust:accepts:v1)` (CIRISServer
+-/// `mesh_genesis.rs` `accept_trust_root`; the portable root's canonical).
+-/// Under CC 4.1.1 read over every `delegates_to`, that pair is "A → B → A"
+-/// and one of the two would be refused at boot. A CAPABILITY edge closing
+-/// the same pair is still a cycle and is still refused (CC 4.1.1, 4.2.1;
+-/// ruled on the v54.0.0 integration, test 603).
+-///
+-/// A self-edge (`A == B`) is admitted without a read: it is the root charter,
+-/// the constitutional `delegates_to(root → root)` self-declaration
+-/// (`trust_root`), not the "A → B → A" anti-pattern, and the walks' visited
+-/// guard reads it as a root. CC confirms the reading: a cycle needs at least
+-/// two distinct keys (CC 4.1.1; CC 3.2 T1/T3, the root's self-declaration).
+-///
+-/// # What "live" means here — the walks' own reading
+-///
+-/// An edge counts unless the walks would skip it: retracted by its granter
+-/// (gate (a) of [`scoped_delegation_reach_at`]: a `withdraws`/`recants` by the
+-/// granter naming the recipient), retracted by name (gate (b), the #593
+-/// clause, via [`retracted_edge_ids`]) by a retraction asserted by `now`,
+-/// expired by the first instant its term can open, or carrying a signed
+-/// term (`delegation_valid_from` / `delegation_valid_until` / `valid_until`,
+-/// #1032) that the walks' lens will refuse at every instant from `now` on
+-/// ([`delegation_edge_live_at_or_after`], the lens's own term reading). Scope does NOT
+-/// matter: CC names the `delegates_to` graph, not one scope's subgraph, and a
+-/// cycle on any scope is still a cycle. A future-dated edge counts — it
+-/// exists, and skipping it would let the closing edge in now and the cycle go
+-/// live the moment the clock reaches it (fail toward refusal). The same holds
+-/// for a term that opens later: its `delegation_valid_from` does not hide it.
+-///
+-/// # The ceiling
+-///
+-/// The search follows at most [`MAX_WITHDRAWS_DELEGATION_DEPTH`] hops from
+-/// `B`, the absolute ceiling every delegation walk clamps to (the issue's ask
+-/// verbatim). A longer path is invisible to every walk this substrate runs,
+-/// so a cycle through it cannot change any verdict a walk returns.
+-///
+-/// # Where it runs
+-///
+-/// Every backend's `put_attestation` (all tiers), beside the other
+-/// `delegates_to` gates, AND [`check_promotion_admission`]: the walks read
+-/// the federation tier only, so a local-tier edge closes nothing until it is
+-/// promoted, and the graph may have grown since its local write.
+-///
+-/// v56.0.0 (CIRISPersist#934 step 1) — `received_at` is the receiving node's
+-/// clock at the door, an INPUT of the shared attestation plan
+-/// (`attestation_admit::PlanInstants`) rather than a clock read inside the
+-/// gate. This gate read the clock before the plan existed, so it judges at
+-/// the receipt instant still: unchanged behaviour (#934). Where its judgement
+-/// belongs at the row's signed instant instead, moving it is #1049's ruling.
+-pub async fn check_delegation_cycle_admission<G>(
+-    directory: &G,
+-    row: &super::Attestation,
+-    received_at: chrono::DateTime<chrono::Utc>,
+-) -> Result<(), Error>
+-where
+-    G: super::attestation_query::AttestationQueryExec + ?Sized,
+-{
+-    if row.attestation_type != attestation_type::DELEGATES_TO {
+-        return Ok(());
+-    }
+-    // A TRUST-PLANE edge (an acceptance or a charter) is not a delegation of
+-    // capability: it is not in the cycle graph (see the doc above).
+-    if is_trust_plane_edge(row) {
+-        return Ok(());
+-    }
+-    // A self-edge is not the anti-pattern: it is the root charter, the
+-    // constitutional `delegates_to(root → root)` self-declaration (CC 3.2 —
+-    // `trust_root`), and every walk's visited guard already treats it as a
+-    // root. CC 4.1.1's row is "A → B → A", a cycle between distinct keys.
+-    if row.attesting_key_id == row.attested_key_id {
+-        return Ok(());
+-    }
+-    // v62.0.0 (slice C) — the kernel's walk visits a cycle once
+-    // (`ciris_kernel::trust::reaches`: "a cycle is visited once, since
+-    // arriving again at a key with no more budget than before reaches
+-    // nothing new"; KERNEL.md 5; CC 4.4.3.34: "Cycles are visited
+-    // once"), so no edge is refused for
+-    // closing one: the closing edge is held, and every walk reads it once.
+-    // The differential witness still computes persist's former reading.
+-    #[cfg(test)]
+-    {
+-        let hops = delegation_path_hops(
+-            directory,
+-            &row.attested_key_id,
+-            &row.attesting_key_id,
+-            received_at,
+-        )
+-        .await?;
+-        crate::kernel::differential::cycle_gate(row, hops);
+-    }
+-    #[cfg(not(test))]
+-    let _ = (directory, received_at);
+-    Ok(())
+-}
+-
+-/// v54.0.0 (Codex on PR #1050) — does [`check_delegation_cycle_admission`]
+-/// examine `row`: a capability `delegates_to` between two distinct keys (not a
+-/// trust-plane edge, not a self-edge)? Exactly these rows can close a cycle
+-/// AND exactly these rows are the edges a cycle search walks, so they are the
+-/// writes every backend serializes with the check.
+-///
+-/// # Why the check must be serialized with the write
+-///
+-/// The gate reads the graph, then the door inserts. Two writers submitting
+-/// `A → B` and `B → A` can both finish the read before either inserts, and
+-/// both are admitted: the cycle the gate exists to refuse. Every backend
+-/// therefore holds a write lock from a check that sees the committed graph
+-/// through its own insert's commit: an in-process mutex on every backend
+-/// (memory, sqlite: one process owns the store), and on postgres also a
+-/// transaction-scoped advisory lock, `DELEGATION_CYCLE_LOCK_KEY`, taken in
+-/// the insert's own transaction with the check re-run under it, because two
+-/// processes share one database.
+-///
+-/// The lock is ONE key for every gated write, not one per pair: a cycle
+-/// `A → B → C → A` is closed by a write whose pair `{C, A}` shares no key with
+-/// the concurrent `B → C`, so a pair key would not serialize them. Delegation
+-/// writes are rare, so one key costs nothing.
+-pub(crate) fn delegation_cycle_gated(row: &super::Attestation) -> bool {
+-    row.attestation_type == attestation_type::DELEGATES_TO
+-        && !is_trust_plane_edge(row)
+-        && row.attesting_key_id != row.attested_key_id
+-}
+-
+-// v54.0.0 (Codex round 2 on PR #1050) — the cycle gate's walk reads.
+-// v56.0.0 (CIRISPersist#1001): the walk reads through
+-// `AttestationQueryExec`, the typed read's storage half. Every directory
+-// answers it; the postgres backend re-runs the gate inside the transaction
+-// that holds the delegation advisory lock and answers the SAME statement on
+-// that transaction's own client, so no walk read checks out a second pooled
+-// client while the lock's transaction holds one (I602).
+-/// v54.0.0 (Codex on PR #1050) — the postgres advisory-lock key every
+-/// [`delegation_cycle_gated`] write takes in its insert transaction
+-/// (`pg_advisory_xact_lock(DELEGATION_CYCLE_LOCK_KEY)`), so a cycle check and
+-/// the insert it admits are one step across every process sharing the
+-/// database. A fixed 64-bit constant (the ASCII bytes of `"dlgcycle"`),
+-/// distinct from every other key this crate takes.
+-#[cfg(feature = "postgres")]
+-pub(crate) const DELEGATION_CYCLE_LOCK_KEY: i64 = 0x646c_6763_7963_6c65;
+-
+ /// v54.0.0 (CIRISPersist#1031) — is `row` a TRUST-PLANE edge, a
+ /// `delegates_to` whose envelope `dimension` is
+ /// [`TRUST_ACCEPTS_DIMENSION`](crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION)
+ /// (the subscription) or
+ /// [`TRUST_CHARTER_DIMENSION`](crate::federation::trust_root::TRUST_CHARTER_DIMENSION)
+-/// (the charter)? Never part of the cycle graph, which is the capability
+-/// graph ([`check_delegation_cycle_admission`]).
++/// (the charter)? Never part of the capability graph a delegation walk
++/// follows (CC 4.2.1: the trust edge is the subscription).
+ fn is_trust_plane_edge(row: &super::Attestation) -> bool {
+     use crate::federation::trust_root::{TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION};
+     row.attestation_type == attestation_type::DELEGATES_TO
+@@ -18960,10 +18753,17 @@ fn is_trust_plane_edge(row: &super::Attestation) -> bool {
+ /// v54.0.0 (CIRISPersist#1031) — the shortest live `delegates_to` path from
+ /// `from` to `to`, in hops, within [`MAX_WITHDRAWS_DELEGATION_DEPTH`]; `None`
+ /// when there is none. Unscoped, unattenuated: it asks whether the graph
+-/// CONNECTS the two keys, not whether a duty flows. Edge liveness is the
+-/// reading [`check_delegation_cycle_admission`] documents.
+-// v62.0.0 (slice C): the differential's reference and the cycle witnesses'
+-// reading of the graph (test builds only).
++/// CONNECTS the two keys, not whether a duty flows. An edge counts unless
++/// the walks would skip it: retracted by its granter (gate (a) of
++/// [`scoped_delegation_reach_at`]), retracted by name (gate (b), the #593
++/// clause) by a retraction asserted by `now`, or carrying a term the walks'
++/// lens refuses at every instant from `now` on
++/// ([`delegation_edge_live_at_or_after`]). Trust-plane edges
++/// ([`is_trust_plane_edge`]) are not walked.
++// v62.0.0 (kernel pass 2): the v54 cycle gate this was the reading of is
++// deleted (the kernel's walk visits a cycle once, CC 4.4.3.34); the cycle
++// witnesses still read the graph a held cycle-closing edge closes through it
++// (test builds only).
+ #[cfg(test)]
+ pub(crate) async fn delegation_path_hops<G>(
+     directory: &G,
+@@ -18984,7 +18784,7 @@ where
+     // and licence walks at `now` still traverse the edge it names. Counted
+     // here, it hid a live `B → A` and admitted the `A → B` closing a cycle
+     // those walks follow. Edges themselves are NOT lensed: a future-dated
+-    // edge still counts (see `check_delegation_cycle_admission`).
++    // edge still counts: it exists, and the walk reads it once its clock comes.
+     let lens = DelegationWalkLens {
+         as_of: Some(now),
+         ..DelegationWalkLens::default()
+@@ -22752,7 +22552,8 @@ mod tests {
+     ///   carry CC's opaque `"reserved (see table)"`, whose enforcement lives in
+     ///   purpose-built gates elsewhere in this file, not in a prefix→role table.
+     ///   `config:`'s is [`check_config_self_or_owner_admission`] (v38.7.0,
+-    ///   #778); `ownership:`'s is [`check_single_node_owner_admission`];
++    ///   #778); `ownership:`'s is the kernel's owner seat ([`owner_of`]) with
++    ///   [`check_owner_binding_roster_fresh`];
+     ///   `trace:`'s is [`check_trace_dimension_admission`], and so is
+     ///   `trace_summary:`'s (v61.1.0, #1174: until then this line named no
+     ///   gate for it, and none existed). Naming them is not
+diff --git a/src/federation/attestation_admit.rs b/src/federation/attestation_admit.rs
+index 9a72c73e..6fcbfe40 100644
+--- a/src/federation/attestation_admit.rs
++++ b/src/federation/attestation_admit.rs
+@@ -32,16 +32,13 @@
+ //!   two after-steps that were also written three times (the #771 re-put
+ //!   verdict on an occupied id, the #963 re-wrap after a consent-list change).
+ //!
+-//! # The one re-ask an executor makes
++//! # No re-ask
+ //!
+-//! A cycle-gated `delegates_to` (CIRISPersist#1031) is checked by the plan
+-//! with the graph unlocked, then checked AGAIN by the executor under its
+-//! delegation write lock in the same step as the INSERT (Codex on PR #1050):
+-//! a writer of the reverse edge may have committed between the two. The
+-//! executor does not decide that either — it calls
+-//! [`PlannedAttestation::recheck_cycle_under_lock`] with the graph view its
+-//! lock covers (the backend itself on memory and sqlite, the open transaction
+-//! on postgres).
++//! v62.0.0 (kernel pass 2) — the executor re-asked one gate under a lock: the
++//! v54 delegation cycle gate (CIRISPersist#1031), re-run under the delegation
++//! write lock in the INSERT's step. The kernel's walk visits a cycle once and
++//! refuses no edge for closing one (CC 4.4.3.34), so the gate, its lock and
++//! the re-ask are deleted; the executor decides nothing.
+ 
+ use std::sync::Arc;
+ 
+@@ -76,11 +73,11 @@ pub(crate) struct AdmissionCx<'a> {
+ ///   attach-freshness window W (`check_attach_freshness`, CC 2.6.7).
+ ///
+ /// #934 changes no behaviour, so each gate reads the instant it read before
+-/// the plan existed. Four folds read the receipt clock today and still read
++/// the plan existed. Three folds read the receipt clock today and still read
+ /// `received_at` (`check_capacity_consent_admission`,
+-/// `check_delegation_cycle_admission`, `check_peer_deadmission`,
+-/// `check_trust_charter_admission`): candidates for #1049. Which gate reads
+-/// which is pinned by `store::parity`'s `PLAN_INSTANTS`.
++/// `check_peer_deadmission`, `check_trust_charter_admission`): candidates for
++/// #1049. (v62.0.0: the fourth, the delegation cycle gate, is deleted.)
++/// Which gate reads which is pinned by `store::parity`'s `PLAN_INSTANTS`.
+ #[derive(Clone, Copy, Debug)]
+ pub(crate) struct PlanInstants {
+     /// The row's signed instant: where folds over other rows are judged.
+@@ -169,30 +166,6 @@ pub(crate) struct PlannedAttestation {
+     /// The signed-wire-index locator (#507b), federation tier only; the hash
+     /// comes from the stored row (#646).
+     pub(crate) wire_index_key: Option<String>,
+-    cycle_gated: bool,
+-    /// The receipt instant the plan judged the cycle at; the under-lock re-ask
+-    /// judges at it too.
+-    received_at: chrono::DateTime<chrono::Utc>,
+-}
+-
+-impl PlannedAttestation {
+-    /// Does the store step hold the delegation write lock (CIRISPersist#1031)?
+-    pub(crate) fn cycle_gated(&self) -> bool {
+-        self.cycle_gated
+-    }
+-
+-    /// The cycle gate, asked again under the executor's delegation write lock,
+-    /// in the same step as the INSERT (see the module doc). A no-op for a row
+-    /// that is not [`Self::cycle_gated`].
+-    pub(crate) async fn recheck_cycle_under_lock<G>(&self, graph: &G) -> Result<(), Error>
+-    where
+-        G: super::attestation_query::AttestationQueryExec + ?Sized,
+-    {
+-        if !self.cycle_gated {
+-            return Ok(());
+-        }
+-        super::admission::check_delegation_cycle_admission(graph, &self.row, self.received_at).await
+-    }
+ }
+ 
+ /// What the executor's store step found.
+@@ -238,9 +211,8 @@ pub(crate) trait AttestationStore:
+         -> Result<(), Error>;
+ 
+     /// Store an admitted row: the row, its projections and its depth in one
+-    /// transaction (under the delegation write lock when
+-    /// [`PlannedAttestation::cycle_gated`]), then its trace rows and its wire
+-    /// index. An occupied id writes nothing and reports the stored hash.
++    /// transaction, then its trace rows and its wire index. An occupied id
++    /// writes nothing and reports the stored hash.
+     async fn store_planned_attestation(
+         &self,
+         planned: PlannedAttestation,
+@@ -1161,22 +1133,24 @@ where
+     // federation`. Backend-symmetric; verify-before-mutation.
+     crate::federation::admission::check_minor_owner_binding_not_announced(dir, &row).await?;
+ 
+-    // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
+-    // is refused: the recipient must not already reach the granter through live
+-    // `delegates_to` edges. Backend-symmetric with SQLite + Postgres; verify-before-mutation.
+     // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — a term-bearing
+     // `delegates_to` (issuance, moderation, `sub_delegation`, or in an
+     // affiliation's hierarchy) carries a bounded term:
+     // `delegation_term_required`. Every backend, verify-before-mutation.
++    // v62.0.0 (kernel pass 2) — the v54 cycle gate (CIRISPersist#1031) is
++    // deleted: the kernel's walk visits a cycle once (CC 4.4.3.34), so no
++    // edge is refused for closing one.
+     crate::federation::admission::check_delegation_term_admission(dir, &row).await?;
+-    crate::federation::admission::check_delegation_cycle_admission(dir, &row, received_at).await?;
+-
+-    // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
+-    // gate: a node has AT MOST ONE responsible steward, so a second,
+-    // distinct-owner owner-binding `delegates_to(U → node)` is rejected. This
+-    // is what makes the `self` cohort boundary well-defined. Backend-symmetric
+-    // with SQLite + Postgres; verify-before-mutation.
+-    crate::federation::admission::check_single_node_owner_admission(dir, &row).await?;
++
++    // v62.0.0 (kernel pass 2, KERNEL_SEAMS B1 / C557) — the single-owner gate
++    // is gone: no owner-binding is refused for naming a second owner. The
++    // kernel's owner seat (`owner_of`) holds every binding and counts one only
++    // when the node's own key cosigned it; two counted owners read as unowned.
++    // What stays: the roster W bound on the binding's signer (B5, not yet a
++    // kernel conclusion), and the CC 3.2 ceremony step 4 refusal of an
++    // uncosigned post-reclaim rebinding (#578).
++    crate::federation::admission::check_owner_binding_roster_fresh(dir, &row).await?;
++    crate::federation::ownership_reclaim::check_post_reclaim_rebinding_admission(dir, &row).await?;
+     // v60.0.0 (CIRISPersist#1062) — an owner-binding that names an
+     // organisation is cosigned under that affiliation's protocol.
+     crate::federation::admission::check_owner_binding_affiliation_admission(dir, &row).await?;
+@@ -1386,7 +1360,6 @@ where
+     let withdraws_depth = (row.attestation_type
+         == crate::federation::types::attestation_type::WITHDRAWS)
+         .then(|| dir.withdraws_delegation_depth());
+-    let cycle_gated = crate::federation::admission::delegation_cycle_gated(&row);
+     // v61.1.0 (CIRISPersist#1198, CIRISPersist#1220) — ONE first-held
+     // instant for both receipts this row can open: the door's one clock read
+     // (`received_at`, so the plan reads no clock of its own, #934), at
+@@ -1412,8 +1385,6 @@ where
+         cosign_receipt,
+         cosign_signature,
+         wire_index_key,
+-        cycle_gated,
+-        received_at,
+     })))
+ }
+ 
+diff --git a/src/federation/attestation_admit_invariants.rs b/src/federation/attestation_admit_invariants.rs
+index b222393c..32f3034d 100644
+--- a/src/federation/attestation_admit_invariants.rs
++++ b/src/federation/attestation_admit_invariants.rs
+@@ -17,9 +17,9 @@
+ //!   signed an hour ahead of `t0` is refused at `received_at = t0` and
+ //!   admitted at `received_at = t0 + 1h`, with `fold_at` its own instant both
+ //!   times;
+-//! - (2) a fold still at receipt (`check_delegation_cycle_admission`, a
+-//!   #1049 candidate): with `c → e` live until `t0 + 1h`, `e → c` closes a
+-//!   cycle at `received_at = t0` and nothing at `t0 + 2h`;
++//! - (2) the cycle that was a fold at receipt (the v54 cycle gate, deleted
++//!   in v62.0.0's kernel pass 2): with `c → e` live until `t0 + 1h`, `e → c`
++//!   plans an insert at `received_at = t0` and at `t0 + 2h` alike;
+ //! - (3) a fold on `fold_at` (`check_community_trust_grant_admission`, the
+ //!   owner bindings in force): with the owner's binding signed at
+ //!   2026-05-01, a capture grant is refused at `fold_at` a month earlier and
+diff --git a/src/federation/delegation_cycle_invariants.rs b/src/federation/delegation_cycle_invariants.rs
+index ec9fbf72..e7dde18f 100644
+--- a/src/federation/delegation_cycle_invariants.rs
++++ b/src/federation/delegation_cycle_invariants.rs
+@@ -8,7 +8,7 @@
+ //! an admission: the closing edge is HELD, and the walk's reading of the
+ //! graph it closes (retractions, expiry, terms, the trust plane, the ceiling)
+ //! is still asserted through `delegation_path_hops`, the same lens the v54
+-//! gate read. I597's two writers are both admitted.
++//! gate read. (I597 is deleted; see below.)
+ //!
+ //! CC 4.1.1's anti-pattern table, row "Cycles (A → B → A)": *"Substrate MUST
+ //! detect cycles on the `delegates_to` graph and reject the cycle-closing
+@@ -57,17 +57,10 @@
+ //! opens the row has expired), so it connects nothing; an edge whose expiry
+ //! falls after its term opens still connects.
+ //!
+-//! I597 — the check and the insert are ONE step (Codex on PR #1050). Two
+-//! writers of `A → B` and `B → A` that both finish the graph read before
+-//! either inserts would both be admitted. The witness forces exactly that
+-//! interleaving: the first writer is paused (a `store::test_hooks` pause) at
+-//! the last point before its write, the second writer then runs to completion
+-//! or blocks, and the first is resumed. Exactly one edge may be admitted, and
+-//! the refused one is `federation_delegation_cycle`. Run as (i) put vs put and
+-//! (ii) a local `B → A` crossing (`enter_mesh`) vs a put of `A → B`. On memory
+-//! and sqlite both writers share the one backend (its in-process lock is the
+-//! serialization); on postgres they are TWO backends with two pools on one
+-//! database, so only the advisory lock can serialize them.
++//! I597 (the cycle check and the insert as ONE step under the delegation
++//! write lock, Codex on PR #1050) is deleted in v62.0.0's kernel pass 2 with
++//! the gate, its lock and its re-ask: nothing is refused for closing a cycle,
++//! so there is nothing to serialize.
+ 
+ /// The backend-agnostic witness body; `run` instantiates it per backend.
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+@@ -210,97 +203,6 @@ pub mod bodies {
+         })
+     }
+ 
+-    /// Run `rival` while the first writer is held at its armed pause, then
+-    /// resume the first. Returns the rival's result and whether it FINISHED
+-    /// while the first writer was held (true = the two were not serialized).
+-    async fn rival_while_paused<T>(
+-        pause: &crate::store::test_hooks::Pause,
+-        rival: impl std::future::Future<Output = T>,
+-    ) -> (T, bool) {
+-        pause.reached().await;
+-        tokio::pin!(rival);
+-        match tokio::time::timeout(std::time::Duration::from_secs(3), &mut rival).await {
+-            Ok(out) => {
+-                pause.resume();
+-                (out, true)
+-            }
+-            Err(_) => {
+-                pause.resume();
+-                (rival.await, false)
+-            }
+-        }
+-    }
+-
+-    /// I597 (i) — put vs put. `first` carries the armed
+-    /// `delegation_cycle_before_insert` pause; `second` may be the same
+-    /// backend or another one on the same database.
+-    pub(crate) async fn i597_put_vs_put_admits_one(
+-        first: &dyn FederationDirectory,
+-        second: &dyn FederationDirectory,
+-        pause: std::sync::Arc<crate::store::test_hooks::Pause>,
+-        tag: &str,
+-    ) {
+-        let (a, b) = (format!("{tag}-a"), format!("{tag}-b"));
+-        agent(first, &a).await;
+-        agent(first, &b).await;
+-        let (ra, (rb, b_ran_free)) = tokio::join!(
+-            ts::put_delegates_to(first, &a, &b, None),
+-            rival_while_paused(&pause, ts::put_delegates_to(second, &b, &a, None)),
+-        );
+-        // v62.0.0 (slice C) — the kernel refuses no edge for closing a cycle:
+-        // both writers are admitted, in whichever order they land.
+-        let _ = b_ran_free;
+-        assert!(ra.is_ok(), "I597 (i): the first writer admits: {ra:?}");
+-        expect_cycle(
+-            first,
+-            rb,
+-            &b,
+-            &a,
+-            1,
+-            "I597 (i): the second writer, serialized behind the first",
+-        )
+-        .await;
+-        assert!(
+-            has_fed_edge(first, &a, &b).await && has_fed_edge(first, &b, &a).await,
+-            "I597 (i): both edges are held"
+-        );
+-    }
+-
+-    /// I597 (ii) — a crossing vs a put. `first` carries the armed
+-    /// `delegation_cycle_before_crossing` pause.
+-    pub(crate) async fn i597_crossing_vs_put_admits_one(
+-        first: &dyn FederationDirectory,
+-        second: &dyn FederationDirectory,
+-        pause: std::sync::Arc<crate::store::test_hooks::Pause>,
+-        tag: &str,
+-    ) {
+-        let (x, y) = (format!("{tag}-x"), format!("{tag}-y"));
+-        agent(first, &x).await;
+-        agent(first, &y).await;
+-        let (staged_id, ci, custody) = stage_local_edge(first, &y, &x).await;
+-        let (rc, (rp, p_ran_free)) = tokio::join!(
+-            first.enter_mesh(&staged_id, &ci, &custody),
+-            rival_while_paused(&pause, ts::put_delegates_to(second, &x, &y, None)),
+-        );
+-        // v62.0.0 (slice C) — the kernel refuses no edge for closing a cycle:
+-        // the crossing and the put both land.
+-        let _ = p_ran_free;
+-        assert!(rc.is_ok(), "I597 (ii): the held crossing admits: {rc:?}");
+-        expect_cycle(
+-            first,
+-            rp,
+-            &x,
+-            &y,
+-            1,
+-            "I597 (ii): the put, serialized behind the crossing",
+-        )
+-        .await;
+-        assert!(
+-            has_fed_edge(first, &y, &x).await && has_fed_edge(first, &x, &y).await,
+-            "I597 (ii): both edges are held"
+-        );
+-    }
+-
+     /// A retraction by `granter` against `grantee` (naming `target` when
+     /// given), signed `ahead` in the future: inside the admitted skew, so the
+     /// door stores it, and not yet in force at `now`.
+@@ -801,77 +703,6 @@ mod run {
+         };
+     }
+ 
+-    /// I597 on one backend `$b`: both writers share it.
+-    #[cfg(feature = "sqlite")]
+-    macro_rules! i597_single {
+-        ($b:expr) => {{
+-            let b = $b;
+-            let d = &b as &dyn crate::federation::FederationDirectory;
+-            let pause = b.test_hooks().arm_pause("delegation_cycle_before_insert");
+-            super::bodies::i597_put_vs_put_admits_one(d, d, pause, &format!("i597p-{}", suffix()))
+-                .await;
+-            let pause = b.test_hooks().arm_pause("delegation_cycle_before_crossing");
+-            super::bodies::i597_crossing_vs_put_admits_one(
+-                d,
+-                d,
+-                pause,
+-                &format!("i597c-{}", suffix()),
+-            )
+-            .await;
+-        }};
+-    }
+-
+-    #[cfg(feature = "sqlite")]
+-    #[tokio::test(flavor = "multi_thread")]
+-    async fn i597_sqlite() {
+-        use crate::store::Backend as _;
+-        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+-            .await
+-            .unwrap();
+-        b.run_migrations().await.unwrap();
+-        i597_single!(b);
+-    }
+-
+-    /// I597 on postgres: TWO backends, two pools, one database — two
+-    /// processes' worth of writers. Neither backend's in-process lock sees the
+-    /// other's writer, so only the advisory lock can serialize them.
+-    #[cfg(feature = "postgres")]
+-    #[tokio::test(flavor = "multi_thread")]
+-    async fn i597_postgres() {
+-        use crate::federation::FederationDirectory;
+-        use crate::store::Backend as _;
+-        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+-            eprintln!("i597_postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+-            return;
+-        };
+-        let b1 = crate::store::postgres::PostgresBackend::connect(&dsn)
+-            .await
+-            .unwrap();
+-        b1.run_migrations().await.unwrap();
+-        let b2 = crate::store::postgres::PostgresBackend::connect(&dsn)
+-            .await
+-            .unwrap();
+-        let pause = b1.test_hooks().arm_pause("delegation_cycle_before_insert");
+-        super::bodies::i597_put_vs_put_admits_one(
+-            &b1 as &dyn FederationDirectory,
+-            &b2 as &dyn FederationDirectory,
+-            pause,
+-            &format!("i597p-{}", suffix()),
+-        )
+-        .await;
+-        let pause = b1
+-            .test_hooks()
+-            .arm_pause("delegation_cycle_before_crossing");
+-        super::bodies::i597_crossing_vs_put_admits_one(
+-            &b1 as &dyn FederationDirectory,
+-            &b2 as &dyn FederationDirectory,
+-            pause,
+-            &format!("i597c-{}", suffix()),
+-        )
+-        .await;
+-        eprintln!("i597_postgres: RAN on {dsn}");
+-    }
+-
+     #[cfg(feature = "sqlite")]
+     dyn_runners!(sqlite_dyn, async {
+         use crate::store::Backend as _;
+diff --git a/src/federation/directory_admit.rs b/src/federation/directory_admit.rs
+index bf5a76a8..39983c21 100644
+--- a/src/federation/directory_admit.rs
++++ b/src/federation/directory_admit.rs
+@@ -7,8 +7,8 @@
+ //! [`DirectoryStore`]: the SQL, the serve position, the transaction. It
+ //! decides nothing. The peer add's held-row verdict runs INSIDE the
+ //! executor's transaction (a conflict rolls the key row back with it), so it
+-//! is a shared plan the executor re-asks ([`peer_record_held_verdict`]), the
+-//! `recheck_cycle_under_lock` shape.
++//! is a shared plan the executor re-asks ([`peer_record_held_verdict`]) (the
++//! shape of the v54 cycle re-ask, deleted in v62.0.0).
+ //!
+ //! # Which instant each plan reads
+ //!
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index 7d19bfe2..6eab28fd 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -12550,31 +12550,6 @@ pub enum Error {
+         detail: String,
+     },
+ 
+-    /// v54.0.0 (CIRISPersist#1031, CC 4.1.1 — the anti-pattern table's
+-    /// "Cycles (A → B → A)" row: "Substrate MUST detect cycles on the
+-    /// `delegates_to` graph and reject the cycle-closing emission"). A
+-    /// `delegates_to(attesting → attested)` was REFUSED because `attested`
+-    /// already reaches `attesting` through live `delegates_to` edges within the
+-    /// absolute depth ceiling, so storing it would close a cycle between
+-    /// distinct keys. A self-edge is the root charter's self-declaration and is
+-    /// not refused. The row is not stored (verify-before-mutation, AV-9). Stable
+-    /// `kind()` token `federation_delegation_cycle`. See
+-    /// [`admission::check_delegation_cycle_admission`].
+-    #[error(
+-        "delegates_to {attesting_key_id:?} -> {attested_key_id:?} closes a delegation cycle: \
+-         {attested_key_id:?} already reaches {attesting_key_id:?} through {hops} live \
+-         delegates_to hop(s) (CC 4.1.1 — the cycle-closing emission is refused)"
+-    )]
+-    DelegationCycle {
+-        /// The refused edge's granter (`attesting_key_id`).
+-        attesting_key_id: String,
+-        /// The refused edge's recipient (`attested_key_id`).
+-        attested_key_id: String,
+-        /// Length of the existing path `attested → … → attesting` that this
+-        /// edge would close (at least 1).
+-        hops: usize,
+-    },
+-
+     /// v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C, CIRISConstitution#163)
+     /// — a term-bearing `delegates_to` was REFUSED because its signed term is
+     /// missing, unreadable, or longer than the bound that governs it. A
+@@ -12603,34 +12578,12 @@ pub enum Error {
+         detail: String,
+     },
+ 
+-    /// v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a **second,
+-    /// distinct-owner** node owner-binding was REJECTED: the node already
+-    /// carries a LIVE owner-binding from `incumbent_owner`, and a node has at
+-    /// most ONE responsible steward (the `self` cohort boundary is undefined
+-    /// otherwise). The incumbent must first `withdraws`/`recants` (or the
+-    /// binding must lapse) before a different owner can bind. A refresh by the
+-    /// SAME owner is idempotently admitted. The row is NOT stored (verify-
+-    /// before-mutation, AV-9). Stable `kind()` token
+-    /// `federation_node_already_owned`. See
+-    /// [`admission::check_single_node_owner_admission`] / [`admission::owner_of`].
+-    #[error(
+-        "node {node_key_id:?} is already owner-bound by {incumbent_owner:?}; a node has \
+-         at most one responsible steward (CC 1.13.3.3 / CC 3.2) — {attempted_owner:?} may \
+-         not bind until the incumbent withdraws/recants or the binding lapses"
+-    )]
+-    NodeAlreadyOwned {
+-        /// The node whose ownership is already claimed.
+-        node_key_id: String,
+-        /// The live incumbent owner (a different `user`-role granter).
+-        incumbent_owner: String,
+-        /// The rejected would-be owner (the incoming `attesting_key_id`).
+-        attempted_owner: String,
+-    },
+-
+     /// v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — [`admission::owner_of`]
+-    /// found **more than one** distinct live owner for a node (a pre-gate
+-    /// anomaly; [`admission::check_single_node_owner_admission`] prevents new
+-    /// occurrences). This is a READ-path fail-closed signal: an ambiguous owner
++    /// found **more than one** distinct counted owner for a node. v62.0.0
++    /// (kernel pass 2, C557): no gate refuses a second owner's binding; two
++    /// bindings the node cosigned for two selves are both held and the
++    /// kernel's owner seat reads the node as unowned. This is a READ-path
++    /// fail-closed signal: an ambiguous owner
+     /// is NOT a resolvable `self` boundary, so consumers MUST refuse rather than
+     /// silently pick one. Stable `kind()` token `federation_ambiguous_node_owner`.
+     #[error(
+@@ -13845,8 +13798,6 @@ impl Error {
+             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
+             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
+             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
+-            Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
+-            Error::DelegationCycle { .. } => "federation_delegation_cycle",
+             Error::DelegationTermRequired { .. } => "federation_delegation_term_required",
+             Error::AffiliationCohortMismatch { .. } => "federation_affiliation_cohort_mismatch",
+             Error::AffiliationConfigInvalid { .. } => "federation_affiliation_config_invalid",
+diff --git a/src/federation/namespace/namespace_supersets.json b/src/federation/namespace/namespace_supersets.json
+index 2f26bede..2cec084e 100644
+--- a/src/federation/namespace/namespace_supersets.json
++++ b/src/federation/namespace/namespace_supersets.json
+@@ -4008,7 +4008,7 @@
+     "CIRISPersist types.rs#Attestation.attested_key_id/.subject_key_ids (ALREADY typed; precedent in safety/moderation.rs#emit_moderation_event)",
+     "proposed: admission-time self-report equality check colocated with the transport:* rule (no existing symbol; must sit as a contrasting sibling to the capacity check so implementers do not invert them)",
+     "proposed:CIRISPersist engine.rs#resolve_contribution_group_key (today defaults per engine.rs:2351 unwrap_or_else, collapsing cross-voter grouping into singletons)",
+-    "src/federation/admission.rs#check_single_node_owner_admission (CIRISPersist v21.4.0)"
++    "src/federation/admission.rs#owner_of (CIRISPersist v62.0.0: the kernel owner seat; the single-owner gate is deleted)"
+    ],
+    "enforcement_point": "admission",
+    "enforcement_points_all": [
+@@ -14300,7 +14300,7 @@
+     "claim_id": "CLM-nsproc-attested-key-id-ownership",
+     "repo": "CIRISPersist",
+     "crate": "ciris-persist@21.4.0",
+-    "path#symbol": "src/federation/admission.rs#check_single_node_owner_admission",
++    "path#symbol": "src/federation/admission.rs#owner_of",
+     "tsv_target": "evidence/cc_impl.tsv",
+     "field": "attested_key_id",
+     "prefix": "ownership:*",
+@@ -15702,7 +15702,8 @@
+     "claim_id": "CLM-self-edge-not-cycle",
+     "repo": "CIRISPersist",
+     "path#symbol": "src/federation/admission.rs#check_delegation_cycle_admission",
+-    "tsv_target": "evidence/cc_impl.tsv",
++    "tsv_target": "n/a",
++    "tsv_excluded": "v62.0.0 (kernel pass 2): the cycle gate is deleted with its lock; the kernel's trust walk visits a cycle once (CC 4.4.3.34), so no self-edge or other edge is judged for closing one. The claim's trust-plane half stays on is_trust_plane_edge.",
+     "manifest_round": "cc-repin-15-1052"
+    },
+    {
+@@ -16963,7 +16964,7 @@
+     "decimal_id": "3.3.6.3",
+     "claim_id": "CLM-self-roster-authority",
+     "repo": "CIRISPersist",
+-    "path#symbol": "src/federation/admission.rs#check_single_node_owner_admission",
++    "path#symbol": "src/federation/admission.rs#check_owner_binding_roster_fresh",
+     "tsv_target": "evidence/cc_impl.tsv",
+     "manifest_round": "cc-rc9-1099"
+    },
+@@ -42801,7 +42802,7 @@
+      {
+       "field": "attested_key_id (node_key_id at the CIRISServer wire layer)",
+       "owner_component": "persist",
+-      "processor": "src/federation/admission.rs#check_single_node_owner_admission (CIRISPersist v21.4.0)",
++      "processor": "src/federation/admission.rs#owner_of (CIRISPersist v62.0.0: the kernel owner seat; the single-owner gate is deleted)",
+       "enforcement_point": "admission"
+      },
+      {
+diff --git a/src/federation/owner_binding_audience_invariants.rs b/src/federation/owner_binding_audience_invariants.rs
+index a71864df..df2468cc 100644
+--- a/src/federation/owner_binding_audience_invariants.rs
++++ b/src/federation/owner_binding_audience_invariants.rs
+@@ -20,9 +20,10 @@
+ //! - a binding naming the room from a NON-targeted placement (federation) is
+ //!   an organisation's bond, not an audience: #1062's gate refuses it
+ //!   (`owner_binding_affiliation_refused`; the room is no affiliation);
+-//! - a second, different owner's binding of the node is still refused (the
+-//!   single-owner gate), and a `delegates_to` at community scope that names
+-//!   a foreign subject is still refused by `named_subject`.
++//! - a second, different owner's binding of the node is held (v62.0.0,
++//!   I2844: the single-owner gate is deleted; two counted owners read as
++//!   unowned), and a `delegates_to` at community scope that names a foreign
++//!   subject is still refused by `named_subject`.
+ 
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ pub(crate) mod bodies {
+@@ -186,14 +187,26 @@ pub(crate) mod bodies {
+                 .is_none(),
+             "I1511: the refused bond stores nothing"
+         );
+-        // A different owner is still refused, whatever the scope.
++        // v62.0.0 (kernel pass 2, I2844; KERNEL_SEAMS B1 / C557) — a different
++        // owner is no longer refused at any scope: the binding is held, and
++        // cosigned by the node (the fixture sealer's co-scrub) the seat counts
++        // two owners and reads the node as unowned, fail-closed.
+         let rival = binding_at(
+             &peer,
+             &node,
+             cohort_scope::COMMUNITY,
+             Some(("community_key_id", &room)),
+         );
+-        put(d, &rival).await.expect_err("I1511: a second owner");
++        put(d, &rival)
++            .await
++            .expect("I2844: a second owner's binding is held, not refused");
++        assert!(
++            matches!(
++                crate::federation::admission::owner_of(d, &node).await,
++                Err(Error::AmbiguousNodeOwner { .. })
++            ),
++            "I2844: two counted owners read as unowned"
++        );
+         // v61 S2 (#1161) — a delegates_to naming a subject outside the room's
+         // audience is refused on the audience rule.
+         let mut named = binding_at(
+diff --git a/src/federation/ownership_reclaim.rs b/src/federation/ownership_reclaim.rs
+index 4fd04e2e..2940532c 100644
+--- a/src/federation/ownership_reclaim.rs
++++ b/src/federation/ownership_reclaim.rs
+@@ -6,11 +6,12 @@
+ //! # The gap this closes
+ //!
+ //! Ownership is a `delegates_to(U → node)` on the owner-binding dimension
+-//! ([`super::types::owner_binding::DIMENSION`]).
+-//! [`super::admission::check_single_node_owner_admission`] enforces
+-//! at-most-one live owner (CC 3.2): a node already owned rejects a
+-//! DIFFERENT granter's binding — the incumbent must `withdraws`/`recants`
+-//! it, or it must lapse. So if the owner dies, loses custody, or *front-ran
++//! ([`super::types::owner_binding::DIMENSION`]). Ownership is single-valued
++//! (CC 3.2): a binding counts only when the node cosigned it, and v62.0.0's
++//! kernel owner seat ([`super::admission::owner_of`]) reads two counted owners
++//! as none. Until v62.0.0 a single-owner gate refused a DIFFERENT granter's
++//! binding outright; either way the incumbent's live binding stands until it
++//! is withdrawn or lapses. So if the owner dies, loses custody, or *front-ran
+ //! the legitimate owner*, the live binding never withdraws and the node is
+ //! locked **forever**. That is CC 3.2's "no permanent ownerless lock"
+ //! violated by omission.
+@@ -66,12 +67,13 @@
+ //!   [`ReclaimRefusal::SingleActTransferAttempted`] *before any authority is
+ //!   even considered* — a producer that tries to express the collapse is
+ //!   told exactly which rule it broke.
+-//! - **Refused by the ownership gate.** Step 4 still runs through
+-//!   [`super::admission::check_single_node_owner_admission`], which rejects a
+-//!   different granter's binding while ANY live binding remains. The reclaim
+-//!   `withdraws` must therefore have already landed and taken the incumbent
+-//!   non-live — i.e. K really does pass through the unowned state — before a
+-//!   claimant can bind.
++//! - **Not counted by the owner seat.** v62.0.0 (kernel pass 2): a
++//!   claimant's binding is held, but counts only with K's cosignature, and
++//!   while the incumbent's binding is live a second counted owner leaves the
++//!   node unowned, not transferred. Step 4's own refusal
++//!   ([`check_post_reclaim_rebinding_admission`]) still demands K's
++//!   co-signature on a rebinding after a reclaim, so K really does pass
++//!   through the unowned state.
+ //!
+ //! # Authority is re-derived from this node's own verified state (#377)
+ //!
+@@ -1210,8 +1212,10 @@ pub async fn check_ownership_reclaim_admission(
+ /// **Ceremony step 4** — a fresh owner-binding on a node that has been
+ /// through a reclaim MUST be co-signed by that node.
+ ///
+-/// Wired into [`super::admission::check_single_node_owner_admission`], so
+-/// all three backends inherit it from one chokepoint.
++/// Asked by the shared attestation plan (`plan_put_attestation`) beside
++/// [`super::admission::check_owner_binding_roster_fresh`] (v62.0.0: the
++/// single-owner gate that called it is deleted), so every backend inherits it
++/// from one chokepoint.
+ ///
+ /// "Has been through a reclaim" is derived from this node's own stored
+ /// rows and nothing else: a `withdraws` against K stamped with
+@@ -1980,16 +1984,24 @@ pub(crate) mod test_support {
+             "({suffix}) a quorum finding is not a warrant for an arbitrary third party"
+         );
+ 
+-        // ══ RED 7 — a fresh binding while the incumbent is still live is the
+-        //    ordinary single-owner refusal (the claimant cannot skip step 3).
+-        let premature =
++        // ══ I2842 (was RED 7) — a fresh binding while the incumbent is still
++        //    live. v62.0.0 (kernel pass 2, KERNEL_SEAMS B1 / C557): the
++        //    single-owner refusal is gone; the claimant's binding is HELD. One
++        //    K never cosigned names no owner (CC 3.2, the first binding), so
++        //    the claimant still cannot skip step 3: the incumbent stays the
++        //    owner, and after the reclaim the node is still unowned.
++        let mut premature =
+             ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &claimant, &node);
+-        assert!(
+-            matches!(
+-                store(dir, &premature).await,
+-                Err(Error::NodeAlreadyOwned { .. })
+-            ),
+-            "({suffix}) the claimant cannot bind while the incumbent is live"
++        premature.additional_scrubs.clear();
++        store(dir, &premature)
++            .await
++            .expect("I2842: the claimant's uncosigned binding is held, not refused");
++        assert_eq!(
++            crate::federation::admission::owner_of(dir, &node)
++                .await
++                .expect("owner_of"),
++            Some(owner.clone()),
++            "({suffix}) I2842: a binding K never cosigned names no owner; the incumbent stays"
+         );
+ 
+         // ══ GREEN — step 3: the full ceremony admits, THROUGH THE REAL GATE.
+diff --git a/src/federation/self_at_login.rs b/src/federation/self_at_login.rs
+index 426de3b1..5b9422a8 100644
+--- a/src/federation/self_at_login.rs
++++ b/src/federation/self_at_login.rs
+@@ -1374,8 +1374,8 @@ mod tests {
+     #[test]
+     fn owner_binding_envelope_carries_ownership_dimension_and_purpose() {
+         // #378 (CC 3.2 rc2) — the owner-binding specialization stamps the
+-        // ownership dimension + producer-side purpose marker (what the
+-        // single-owner gate + owner_of key on), sub_delegation always false.
++        // ownership dimension + producer-side purpose marker (what owner_of
++        // keys on), sub_delegation always false.
+         use super::super::types::owner_binding;
+         let env = owner_binding_delegates_to_envelope(
+             "node-key",
+diff --git a/src/federation/self_roster.rs b/src/federation/self_roster.rs
+index 114cd2f4..35e6115f 100644
+--- a/src/federation/self_roster.rs
++++ b/src/federation/self_roster.rs
+@@ -385,9 +385,10 @@ pub(crate) fn roster_assertion_live(
+ /// ([`grant_is_authored_for`](super::consent_by_humans::grant_is_authored_for),
+ /// and through it
+ /// [`consent_peers_by_principals`](super::consent_by_humans::consent_peers_by_principals))
+-/// and the one-responsible-steward gate
+-/// ([`check_single_node_owner_admission`](super::admission::check_single_node_owner_admission),
+-/// through [`self_of_at`]) ask this, and nothing else.
++/// and the owner seat ([`owner_of`](super::admission::owner_of), through
++/// [`self_of_at`]) ask this, and nothing else. (v62.0.0: the
++/// one-responsible-steward gate that asked it at the door is deleted; the
++/// kernel's owner seat reads two selves as unowned.)
+ pub async fn acts_as_steward_at<D>(
+     dir: &D,
+     steward: &str,
+diff --git a/src/federation/self_roster_invariants.rs b/src/federation/self_roster_invariants.rs
+index d7b3bac2..17a36208 100644
+--- a/src/federation/self_roster_invariants.rs
++++ b/src/federation/self_roster_invariants.rs
+@@ -548,14 +548,22 @@ pub(crate) mod bodies {
+             Some(f.clone()),
+             "I1137: the node has one owner, the self"
+         );
+-        match d
+-            .put_attestation(SignedAttestation {
+-                attestation: binding(&e1, &node),
+-            })
+-            .await
+-        {
+-            Err(Error::NodeAlreadyOwned { .. }) => {}
+-            other => panic!("I1137: another self's key binding the node: {other:?}"),
++        // I2843 (v62.0.0, kernel pass 2, KERNEL_SEAMS B1 / C557) — another
++        // self's key binding the node is no longer refused: it is HELD, and
++        // with the node's cosignature (the fixture sealer's) the seat counts
++        // two selves, so the node reads as unowned (fail-closed), never as
++        // whichever self bound first.
++        d.put_attestation(SignedAttestation {
++            attestation: binding(&e1, &node),
++        })
++        .await
++        .expect("I2843: another self's key binding the node is held");
++        match crate::federation::admission::owner_of(d, &node).await {
++            Err(Error::AmbiguousNodeOwner { owners, .. }) => assert!(
++                owners.contains(&f) && owners.len() == 2,
++                "I2843: the two selves are the counted owners: {owners:?}"
++            ),
++            other => panic!("I2843: two selves bound the node, got {other:?}"),
+         }
+     }
+ 
+diff --git a/src/federation/tier_ingest.rs b/src/federation/tier_ingest.rs
+index f2f9d6b8..fc03704e 100644
+--- a/src/federation/tier_ingest.rs
++++ b/src/federation/tier_ingest.rs
+@@ -2726,10 +2726,9 @@ pub mod test_support {
+         //     custody claim counts; an unmarked delegation is a capability
+         //     conferral, giving them a job rather than custody of them.
+         //
+-        // Two marker-bearing claims on ONE key is not a way to build it:
+-        // `check_single_node_owner_admission` fires on any marker-bearing
+-        // `delegates_to` regardless of the recipient's identity_type, so the
+-        // second is refused `NodeAlreadyOwned`. Hence occurrence + one
++        // Two marker-bearing claims on ONE key is not a way to build it: the
++        // owner seat reads two counted owners as unowned (v62.0.0; until then
++        // the single-owner gate refused the second). Hence occurrence + one
+         // custody claim.
+         dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+             identity_key_id: other.clone(),
+@@ -4877,8 +4876,8 @@ pub mod test_support {
+     }
+ 
+     /// #371 — build a LIVE **owner-binding** `delegates_to(owner → node)`
+-    /// (the CC 1.13.3.3 / CC 3.2 ownership dimension the v12.6.0
+-    /// single-owner gate + `owner_of` key on), federation-tier
++    /// (the CC 1.13.3.3 / CC 3.2 ownership dimension `owner_of` keys on),
++    /// federation-tier
+     /// hybrid-signed by `owner`'s deterministic keys so
+     /// `verify_federation_tier_ingest` admits it. Register `owner` as a
+     /// `user`-role key ([`register_identity_key`]) first.
+diff --git a/src/federation/types.rs b/src/federation/types.rs
+index 87a7f417..48358079 100644
+--- a/src/federation/types.rs
++++ b/src/federation/types.rs
+@@ -788,7 +788,7 @@ pub mod owner_binding {
+     /// `steward_bind` path sets the dimension; a raw `emit_attestation_self`
+     /// `delegates_to` — the only expressible owner-binding path per CC 2.4.1.2,
+     /// and what CIRISConformance probes — carries only this). Keying on the
+-    /// dimension ALONE let the raw-emit path bypass the single-owner gate.
++    /// dimension ALONE let the raw-emit path bypass the owner fold.
+     pub const CC_DELEGATION_PURPOSE: &str = "owner_binding";
+ }
+ 
+diff --git a/src/ffi/pyo3.rs b/src/ffi/pyo3.rs
+index 1237d484..22c587c4 100644
+--- a/src/ffi/pyo3.rs
++++ b/src/ffi/pyo3.rs
+@@ -7890,9 +7890,10 @@ impl PyEngine {
+     /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — `delegation_purpose` (optional,
+     /// default `None`) marks the ownership sub-relation: pass
+     /// `"responsible_for"` (`owner_binding::PURPOSE`) to build the node's
+-    /// single-valued **owner-binding**, gated so a second DISTINCT owner is
+-    /// rejected (`federation_node_already_owned`) and resolvable via
+-    /// `owner_of_json`. `None` is the general (multi-parent) delegation.
++    /// single-valued **owner-binding**, resolvable via `owner_of_json`
++    /// (v62.0.0: a second distinct owner's binding is held, and two counted
++    /// owners read as unowned, `federation_ambiguous_node_owner`). `None` is
++    /// the general (multi-parent) delegation.
+     ///
+     /// v60.0.0 (CIRISPersist#1048, CC 2.4) — `delegation_valid_from` /
+     /// `delegation_valid_until` (RFC 3339, optional) are signed onto the edge.
+@@ -7957,8 +7958,10 @@ impl PyEngine {
+     /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — pass
+     /// `delegation_purpose="responsible_for"` (`owner_binding::PURPOSE`) to make
+     /// this the node's single-valued **owner-binding** (`infra:*`-only scope IS
+-    /// the owner-binding shape); the single-owner gate then rejects a second
+-    /// distinct owner. `None` (default) is a plain steward-binding.
++    /// the owner-binding shape). v62.0.0: a second distinct owner's binding is
++    /// held, not refused; two counted owners read as unowned
++    /// (`federation_ambiguous_node_owner`). `None` (default) is a plain
++    /// steward-binding.
+     #[pyo3(signature = (node_or_agent_key_id, infra_scopes, delegation_purpose = None))]
+     fn steward_bind(
+         &self,
+@@ -24479,9 +24482,9 @@ impl PyEngine {
+     /// resolver consumers MUST use for "who owns this node" — NEVER
+     /// `steward_bindings_of_json` / `delegations_to_json`, which conflate every
+     /// `delegates_to` purpose and can return cardinality > 1 (the CC 3.2
+-    /// anti-pattern). A pre-gate ambiguous state (two live owners from before
+-    /// the single-owner gate) raises `federation_ambiguous_node_owner`
+-    /// (fail-closed).
++    /// anti-pattern). Two counted owners (v62.0.0: both bindings held, each
++    /// cosigned by the node) are unowned, raised as
++    /// `federation_ambiguous_node_owner` (fail-closed).
+     fn owner_of_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+         self.ensure_usable()?;
+         catch_panic(|| {
+@@ -33253,10 +33256,6 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
+         // node-role key is caller-side authorization failure; ValueError
+         // (4xx). "Infrastructure must not have agency."
+         crate::federation::Error::NodeAgencyForbidden { .. } => PyValueError::new_err(kind),
+-        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — a cycle-closing
+-        // `delegates_to` joins the node-agency arm it sits beside on the
+-        // put door: a caller-side delegation refusal, ValueError (4xx).
+-        crate::federation::Error::DelegationCycle { .. } => PyValueError::new_err(kind),
+         // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — an affiliation addressed
+         // as a community (or the reverse), and a malformed or invalid
+         // affiliation record: caller-side refusals of a group write, the
+@@ -33265,12 +33264,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
+         crate::federation::Error::AffiliationConfigInvalid { rule, .. } => {
+             PyValueError::new_err(format!("{kind}: {rule}"))
+         }
+-        // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a rejected
+-        // second-owner binding (single-owner gate) is a caller-side conflict,
+-        // and an ambiguous-owner read is a fail-closed state rejection; both are
+-        // ValueError (4xx / 409-shaped, like `Conflict`).
+-        crate::federation::Error::NodeAlreadyOwned { .. }
+-        | crate::federation::Error::AmbiguousNodeOwner { .. } => PyValueError::new_err(kind),
++        // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — an
++        // ambiguous-owner read is a fail-closed state rejection: ValueError
++        // (4xx / 409-shaped, like `Conflict`). (v62.0.0: the single-owner
++        // gate's `NodeAlreadyOwned` is deleted; the kernel's owner seat reads
++        // two counted owners as unowned.)
++        crate::federation::Error::AmbiguousNodeOwner { .. } => PyValueError::new_err(kind),
+         // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — a refused
+         // step of the ownerless-reclaim ceremony is caller-side authorization
+         // failure; ValueError (4xx). The stable `kind()` token is the same for
+diff --git a/src/store/backend_suite.rs b/src/store/backend_suite.rs
+index e460d3ec..b5be7cdf 100644
+--- a/src/store/backend_suite.rs
++++ b/src/store/backend_suite.rs
+@@ -4091,11 +4091,11 @@ mod tests {
+         assert_eq!(err.kind(), "witness_admit_malformed_root");
+     }
+ 
+-    // ── CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — single-owner gate ──
++    // ── CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the owner seat ──
+ 
+     /// Build an OWNER-BINDING `delegates_to(owner → node)` carrying the CC
+-    /// 1.13.3.3 / CC 3.2 ownership dimension (what the single-owner gate +
+-    /// `owner_of` key on) with infra-only scope, re-signed for the
++    /// 1.13.3.3 / CC 3.2 ownership dimension (what `owner_of` keys on) with
++    /// infra-only scope, re-signed for the
+     /// federation-tier ingest gate. Distinct from [`fix_node_delegates_to`],
+     /// which builds a plain (non-ownership) infra delegation.
+     fn fix_owner_binding(id: &str, owner: &str, node: &str) -> Attestation {
+@@ -4128,16 +4128,16 @@ mod tests {
+     /// 2.4.1.2 canonical marker only** (`delegation_purpose: "owner_binding"`,
+     /// **no `dimension`**) — the shape a raw `emit_attestation_self` `delegates_to`
+     /// carries, and exactly what CIRISConformance `test_551` probes. Before the
+-    /// fix, the gate keyed on the internal dimension alone and this path was
+-    /// UNGATED (a second distinct owner was admitted — CC 3.2 violated).
++    /// fix, the owner fold keyed on the internal dimension alone and this path
++    /// was invisible to it.
+     fn fix_owner_binding_cc(id: &str, owner: &str, node: &str) -> Attestation {
+         use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
+         let mut att = fix_attestation(id, owner, node, owner);
+         att.attestation_type = attestation_type::DELEGATES_TO.into();
+         crate::federation::tier_ingest::test_support::reseal(&mut att);
+         // CC 2.4.1.2 marker ONLY (no `dimension`). Carries the infra scopes so
+-        // it clears the node-agency gate and actually reaches the single-owner
+-        // gate under test (the marker recognition is the thing being proven).
++        // it clears the node-agency gate and is stored, so the owner seat reads
++        // it (the marker recognition is the thing being proven).
+         att.attestation_envelope = serde_json::json!({
+             "id": id,
+             "kind": "delegates_to",
+@@ -4148,13 +4148,20 @@ mod tests {
+         att
+     }
+ 
+-    /// v13.3.0 (CIRISPersist#378) — the single-owner gate + `owner_of` now fire
+-    /// on the **CC-marker raw-emit path** (`delegation_purpose: "owner_binding"`,
+-    /// no dimension), not only persist's internal-dimension `steward_bind` path.
+-    /// A second distinct owner via the raw path is rejected; `owner_of` resolves
+-    /// the first. This is the exact bypass CIRISConformance `test_551` caught.
++    /// v13.3.0 (CIRISPersist#378) — `owner_of` fires on the **CC-marker
++    /// raw-emit path** (`delegation_purpose: "owner_binding"`, no dimension),
++    /// not only persist's internal-dimension `steward_bind` path (the bypass
++    /// CIRISConformance `test_551` caught).
++    ///
++    /// **I2841** (v62.0.0, kernel pass 2, KERNEL_SEAMS B1 / C557) — a second,
++    /// DIFFERENT owner via the same path is no longer refused
++    /// (`federation_node_already_owned` is gone): its binding is HELD. Both
++    /// bindings are cosigned by the node (the fixture sealer co-scrubs an
++    /// owner binding by its node), so the kernel's owner seat counts two
++    /// owners and reads the node as unowned — `AmbiguousNodeOwner`,
++    /// fail-closed — never as whichever binding arrived first.
+     #[tokio::test]
+-    async fn single_owner_gate_rejects_second_distinct_owner_via_cc_marker() {
++    async fn i2841_a_second_distinct_owner_via_cc_marker_is_held_and_reads_unowned() {
+         use crate::federation::admission::owner_of;
+         let backend = test_backend();
+         seed_ob_keys(&backend).await;
+@@ -4173,30 +4180,50 @@ mod tests {
+             "owner_of must resolve the CC-marker owner-binding"
+         );
+ 
+-        // A second, DIFFERENT owner via the same CC-marker path is REJECTED.
+-        let err = backend
++        // A second, DIFFERENT owner via the same CC-marker path is HELD.
++        backend
+             .put_attestation(SignedAttestation {
+                 attestation: fix_owner_binding_cc("ob-cc2", "ob-owner2", "ob-node"),
+             })
+             .await
+-            .unwrap_err();
+-        assert_eq!(
+-            err.kind(),
+-            "federation_node_already_owned",
+-            "second distinct owner via the CC-marker raw-emit path must be rejected, got {err:?}"
+-        );
+-        assert_eq!(
+-            owner_of(&backend, "ob-node").await.unwrap(),
+-            Some("ob-owner".to_string()),
+-            "the rejected second binding left no trace"
++            .expect("I2841: a second distinct owner's binding is held, not refused");
++        assert!(
++            backend.get_attestation("ob-cc2").await.unwrap().is_some(),
++            "I2841: the second binding is stored"
++        );
++        match owner_of(&backend, "ob-node").await {
++            Err(crate::federation::Error::AmbiguousNodeOwner { owners, .. }) => assert_eq!(
++                owners,
++                vec!["ob-owner".to_string(), "ob-owner2".to_string()],
++                "I2841: both counted owners are named, sorted"
++            ),
++            other => panic!("I2841: two counted owners read as unowned, got {other:?}"),
++        }
++
++        // A binding the node never cosigned names no owner: it changes nothing.
++        let mut stranger = fix_owner_binding_cc("ob-cc3", "ob-owner2", "ob-node");
++        stranger.additional_scrubs.clear();
++        backend
++            .put_attestation(SignedAttestation {
++                attestation: stranger,
++            })
++            .await
++            .expect("I2841: an uncosigned owner binding is held");
++        assert!(
++            matches!(
++                owner_of(&backend, "ob-node").await,
++                Err(crate::federation::Error::AmbiguousNodeOwner { .. })
++            ),
++            "I2841: the uncosigned binding neither adds nor resolves an owner"
+         );
+     }
+ 
+     /// Ownership is transferable, not permanent: after the incumbent binding
+-    /// lapses (expiry → non-live), a DIFFERENT owner may bind. The gate honors
+-    /// the same liveness predicate as `steward_bindings_of`.
++    /// lapses (expiry → non-live), a DIFFERENT owner's binding is the one the
++    /// owner seat counts. (v62.0.0: no gate stands between the two; the
++    /// kernel's owner seat presents only a live binding.)
+     #[tokio::test]
+-    async fn single_owner_gate_admits_new_owner_after_incumbent_expires() {
++    async fn the_owner_after_the_incumbent_expires_is_the_new_owner() {
+         use crate::federation::admission::owner_of;
+         let backend = test_backend();
+         seed_ob_keys(&backend).await;
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index 4db4606b..b4c08a8c 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -236,7 +236,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     ("insert_known_wire_hash_planned", Class::Plan),
+     ("purge_put_execution_planned", Class::Plan),
+     ("revoke_trust_planned", Class::Plan),
+-    // The peer add's held-row verdict, re-asked by the executor inside its transaction (the `recheck_cycle_under_lock` shape).
++    // The peer add's held-row verdict, re-asked by the executor inside its
++    // transaction (the shape of the v54 cycle re-ask, deleted in v62.0.0).
+     ("peer_record_held_verdict", Class::Plan),
+     ("refuse_held_peer_conflict", Class::Gate),
+     // The stored granter read the revocation's ownership check compares against (a read; the refusal is the plan's).
+@@ -561,7 +562,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's shared door
+     // and the executor's one re-ask under its lock: each is a SHARED plan.
+     ("put_attestation_planned", Class::Plan),
+-    ("recheck_cycle_under_lock", Class::Plan),
+     // Inside the shared plan: its two same-file halves.
+     ("plan_put_attestation", Class::Delegates),
+     ("execute_planned", Class::Delegates),
+@@ -906,13 +906,15 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     // CIRISPersist#1098 F4/F5 (CC 2.6.1.1.1, rc12) — a fact about the caller's
+     // envelope (an explicit-null member, `witnesses[]` out of set order).
+     ("check_envelope_member_shapes", Class::Gate),
+-    ("check_single_node_owner_admission", Class::Gate),
++    // v62.0.0 (kernel pass 2, KERNEL_SEAMS B1) — what is left of the deleted
++    // single-owner gate: the roster W bound on an owner-binding's signer, and
++    // the CC 3.2 ceremony step 4 refusal of an uncosigned post-reclaim
++    // rebinding (#578), now asked by the plan directly.
++    ("check_owner_binding_roster_fresh", Class::Gate),
++    ("check_post_reclaim_rebinding_admission", Class::Gate),
+     // v50.0.0 (CIRISPersist#924, CC 5.4.6) — a minor's owner-binding is
+     // refused at `cohort_scope: federation`.
+     ("check_minor_owner_binding_not_announced", Class::Gate),
+-    // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — refuses the cycle-closing
+-    // `delegates_to` (`federation_delegation_cycle`).
+-    ("check_delegation_cycle_admission", Class::Gate),
+     // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — refuses a
+     // term-bearing `delegates_to` without a bounded term
+     // (`federation_delegation_term_required`).
+@@ -1503,6 +1505,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+ /// exemption someone had to write down is reviewable.
+ #[cfg(test)]
+ #[derive(Debug)]
++// v62.0.0 (kernel pass 2): the manifest is empty (its one row, the v54 cycle
++// gate's `enter_mesh` re-ask, went with the gate); the type stays so a new
++// divergence has a reviewed place to be written down.
++#[allow(dead_code)]
+ pub(crate) struct DeclaredDivergence {
+     /// The trait the method belongs to.
+     pub trait_name: &'static str,
+@@ -1531,19 +1537,9 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
+     // shape and seal gates, and every executor re-asks the shape gate on the
+     // row it holds inside its write step (`PlannedReseal::sealed_over`;
+     // SHARED_DOORS below).
+-    DeclaredDivergence {
+-        trait_name: "FederationDirectory",
+-        method: "enter_mesh",
+-        backend: "postgres",
+-        expected: &["check_delegation_cycle_admission"],
+-        reason: "v54.0.0 (Codex on PR #1050) — the crossing's cycle check runs inside \
+-                 `plan_enter_mesh` on every backend. Sqlite takes its in-process delegation \
+-                 write lock BEFORE the plan, so the plan's check and the write are one step: one \
+-                 process owns the store. Postgres shares its database with other \
+-                 processes, so it also takes the delegation advisory lock in the UPDATE's \
+-                 transaction and asks the cycle gate AGAIN under it: a writer in another process \
+-                 may have committed the reverse edge between the plan and the lock (I597).",
+-    },
++    // v62.0.0 (kernel pass 2) — the `enter_mesh` postgres divergence (the
++    // v54 cycle gate re-asked under the advisory lock, I597) is gone with the
++    // gate: the kernel's walk visits a cycle once, so nothing is re-asked.
+ ];
+ 
+ #[cfg(test)]
+@@ -1606,7 +1602,7 @@ mod tests {
+     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
+     /// partition as a backend door, and its sequence is what a door's
+     /// `plan:NAME` token stands for.
+-    const SHARED_PLANS: [(&str, &str); 74] = [
++    const SHARED_PLANS: [(&str, &str); 73] = [
+         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
+         (
+             "src/federation/transport_admit.rs",
+@@ -1796,10 +1792,6 @@ mod tests {
+             "src/federation/attestation_admit.rs",
+             "put_attestation_planned",
+         ),
+-        (
+-            "src/federation/attestation_admit.rs",
+-            "recheck_cycle_under_lock",
+-        ),
+         (
+             "src/federation/attestation_admit.rs",
+             "write_local_attestation_planned",
+@@ -1877,7 +1869,7 @@ mod tests {
+     /// this list on the commit that moves its decision into a plan, and
+     /// cannot drift back: a gate added to one backend's copy fails
+     /// [`shared_doors_decide_nothing_in_a_backend`].
+-    const SHARED_DOORS: [(&str, &str, &str); 81] = [
++    const SHARED_DOORS: [(&str, &str, &str); 80] = [
+         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
+         // decoded by the row mapper both doors read through.
+         (
+@@ -2218,12 +2210,6 @@ mod tests {
+             "put_attestation_with_origin",
+             "put_attestation_planned",
+         ),
+-        // The executor's one re-ask: the plan's cycle gate under the write lock.
+-        (
+-            "AttestationStore",
+-            "store_planned_attestation",
+-            "recheck_cycle_under_lock",
+-        ),
+         (
+             "FederationDirectory",
+             "attestation_upsert_local",
+@@ -3455,11 +3441,6 @@ mod tests {
+             "check_capacity_consent_admission",
+             Reads::ReceivedAt,
+         ),
+-        (
+-            "plan_put_attestation",
+-            "check_delegation_cycle_admission",
+-            Reads::ReceivedAt,
+-        ),
+         (
+             "plan_put_attestation",
+             "check_trust_charter_admission",
+@@ -3490,12 +3471,6 @@ mod tests {
+             "first_held_instant",
+             Reads::ReceivedAt,
+         ),
+-        // The executor's re-ask under its lock: the same instant as the plan's.
+-        (
+-            "recheck_cycle_under_lock",
+-            "check_delegation_cycle_admission",
+-            Reads::ReceivedAt,
+-        ),
+         // The local door mints the row's instant from the receipt clock (or the
+         // signed envelope), and every gate it ran read the receipt clock.
+         (
+@@ -3615,7 +3590,7 @@ mod tests {
+     ];
+ 
+     /// The plan fns [`PLAN_INSTANTS`] covers: `(file, fn)`.
+-    const INSTANT_PLANS: [(&str, &str); 16] = [
++    const INSTANT_PLANS: [(&str, &str); 15] = [
+         // v60.0.0 (CIRISPersist#934 step 4) — the consent planners and the
+         // reaper's selection: none reads the clock (the trust grant's
+         // `trusted_at` is the door's one `received_at`).
+@@ -3634,10 +3609,6 @@ mod tests {
+             "src/federation/attestation_admit.rs",
+             "plan_put_attestation",
+         ),
+-        (
+-            "src/federation/attestation_admit.rs",
+-            "recheck_cycle_under_lock",
+-        ),
+         (
+             "src/federation/attestation_admit.rs",
+             "plan_write_local_attestation",
+diff --git a/src/store/postgres.rs b/src/store/postgres.rs
+index ecf6cf56..ca3034ae 100644
+--- a/src/store/postgres.rs
++++ b/src/store/postgres.rs
+@@ -5560,11 +5560,6 @@ pub struct PostgresBackend {
+     scoring_factors_cache: std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache>,
+     /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
+     trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
+-    /// v54.0.0 (Codex on PR #1050) — the in-process half of the
+-    /// `delegates_to` cycle-gate serialization
+-    /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
+-    /// the cycle check through the insert of every gated write.
+-    delegation_write_lock: tokio::sync::Mutex<()>,
+     /// v59.1.2 — how long [`Self::checkout`] waits for a connection.
+     checkout_wait: std::time::Duration,
+     /// v59.1.2: persist's runtime, captured where the backend was built.
+@@ -6291,7 +6286,6 @@ impl PostgresBackend {
+             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+             trust_root_standing_cache: Default::default(),
+-            delegation_write_lock: tokio::sync::Mutex::new(()),
+             wire_index_locks: Default::default(),
+             #[cfg(test)]
+             test_hooks: Default::default(),
+@@ -6354,7 +6348,6 @@ impl PostgresBackend {
+             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+             trust_root_standing_cache: Default::default(),
+-            delegation_write_lock: tokio::sync::Mutex::new(()),
+             wire_index_locks: Default::default(),
+             #[cfg(test)]
+             test_hooks: Default::default(),
+@@ -14415,17 +14408,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+                 "federation_attestations row {attestation_id} does not exist"
+             ))
+         })?;
+-        // v54.0.0 (Codex on PR #1050) — a crossing `delegates_to` adds an edge to
+-        // the federation-tier graph the cycle gate reads, exactly as a put does:
+-        // the plan's cycle check and the UPDATE are serialized the same way (the
+-        // in-process lock here, the advisory lock + re-check in the UPDATE's
+-        // transaction below).
+-        let cycle_gated = crate::federation::admission::delegation_cycle_gated(&current);
+-        let cycle_guard = if cycle_gated {
+-            Some(self.delegation_write_lock.lock().await)
+-        } else {
+-            None
+-        };
+         let Some(crossing::EnterPlan { row, crossing }) =
+             crossing::plan_enter_mesh(self, &current, ci, custody, self.self_key_id().as_deref())
+                 .await?
+@@ -14452,26 +14434,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+             .transaction()
+             .await
+             .map_err(|e| Error::Backend(format!("enter_mesh transaction: {e}")))?;
+-        if cycle_gated {
+-            tx.execute(
+-                "SELECT pg_advisory_xact_lock($1)",
+-                &[&crate::federation::admission::DELEGATION_CYCLE_LOCK_KEY],
+-            )
+-            .await
+-            .map_err(|e| Error::Backend(format!("delegation cycle lock: {e}")))?;
+-            // v54.0.0 (Codex round 2 on PR #1050) — on THIS transaction's
+-            // client (see `put_attestation`).
+-            crate::federation::admission::check_delegation_cycle_admission(
+-                &PgTxDelegationGraph(&*tx),
+-                &row,
+-                crate::host::clock::now(),
+-            )
+-            .await?;
+-            #[cfg(test)]
+-            self.test_hooks()
+-                .pause_if_armed("delegation_cycle_before_crossing")
+-                .await;
+-        }
+         let n = tx
+             .execute(
+                 "UPDATE cirislens.federation_attestations \
+@@ -14513,7 +14475,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+         tx.commit()
+             .await
+             .map_err(|e| Error::Backend(format!("enter_mesh commit: {e}")))?;
+-        drop(cycle_guard);
+         let wire_index_key =
+             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+         drop(client);
+@@ -20887,27 +20848,6 @@ where
+     })
+ }
+ 
+-/// v54.0.0 (Codex round 2 on PR #1050) — the cycle gate's walk reads
+-/// ([`AttestationQueryExec`](crate::federation::attestation_query::AttestationQueryExec))
+-/// answered on the transaction that holds the delegation advisory lock. The
+-/// re-check under the lock reads through this, never through the backend, so
+-/// it takes no second pooled client while the lock's transaction holds one
+-/// (I602), and it reads exactly what that transaction sees.
+-struct PgTxDelegationGraph<'a, C>(&'a C);
+-
+-#[async_trait::async_trait]
+-impl<C> crate::federation::attestation_query::AttestationQueryExec for PgTxDelegationGraph<'_, C>
+-where
+-    C: tokio_postgres::GenericClient + Sync,
+-{
+-    async fn run_attestation_query(
+-        &self,
+-        q: &crate::federation::attestation_query::AttestationQuery,
+-    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+-        pg_execute_attestation_query(self.0, q).await
+-    }
+-}
+-
+ /// v54.0.0 (Codex on PR #1050) — the seed that namespaces the
+ /// `signed_wire_index` per-record advisory lock
+ /// (`hashtextextended(kind || chr(31) || record_key, seed)`) away from every
+@@ -21809,15 +21749,6 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend
+     ) -> Result<crate::federation::attestation_admit::StoredAttestation, crate::federation::Error>
+     {
+         use crate::federation::attestation_admit::StoredAttestation;
+-        // v54.0.0 (Codex on PR #1050) — a cycle-gated `delegates_to` holds the
+-        // in-process delegation write lock from here through its commit, taken
+-        // BEFORE the pooled client so a queue of such writers holds no clients
+-        // (the holder's re-check below needs one of its own).
+-        let cycle_guard = if planned.cycle_gated() {
+-            Some(self.delegation_write_lock.lock().await)
+-        } else {
+-            None
+-        };
+         let mut client = self
+             .get_client()
+             .await
+@@ -21857,26 +21788,13 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend
+         let tx = client.transaction().await.map_err(|e| {
+             crate::federation::Error::Backend(format!("attestation transaction: {e}"))
+         })?;
+-        // v54.0.0 (Codex on PR #1050) — THE CYCLE CHECK AND THE INSERT ARE ONE
+-        // STEP. Take the delegation advisory lock in THIS transaction (released
+-        // at its commit or rollback) and re-ask the plan's cycle gate under it:
+-        // every gated writer that committed before we got the lock is visible
+-        // (READ COMMITTED, fresh statements), and none can commit until we do.
+-        // (Codex round 2) — on THIS transaction's client: a directory read here
+-        // would check out a second one.
+-        if planned.cycle_gated() {
+-            tx.execute(
+-                "SELECT pg_advisory_xact_lock($1)",
+-                &[&crate::federation::admission::DELEGATION_CYCLE_LOCK_KEY],
+-            )
+-            .await
+-            .map_err(|e| {
+-                crate::federation::Error::Backend(format!("delegation cycle lock: {e}"))
+-            })?;
+-            planned
+-                .recheck_cycle_under_lock(&PgTxDelegationGraph(&*tx))
+-                .await?;
+-            #[cfg(test)]
++        // v62.0.0 (kernel pass 2) — the v54 cycle gate's advisory lock and
++        // under-lock re-ask that stood here are deleted (the kernel's walk
++        // visits a cycle once; no edge is refused for closing one). The test
++        // pause stays at the same point for I1671: a `delegates_to` holding
++        // its serve position inside an open transaction.
++        #[cfg(test)]
++        if row.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO {
+             self.test_hooks()
+                 .pause_if_armed("delegation_cycle_before_insert")
+                 .await;
+@@ -22066,7 +21984,6 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend
+         tx.commit()
+             .await
+             .map_err(|e| crate::federation::Error::Backend(format!("attestation commit: {e}")))?;
+-        drop(cycle_guard);
+ 
+         if inserted_rows == 0 {
+             // The id was occupied: report the STORED hash; the caller decides.
+@@ -49059,9 +48976,9 @@ mod tests {
+             })
+             .await
+             .unwrap();
+-        // …owner2's binding is the PRE-GATE anomaly, inserted via raw SQL
+-        // (bypassing check_single_node_owner_admission, exactly the state a
+-        // pre-v12.6.0 corpus can hold).
++        // …owner2's binding is inserted via raw SQL (the two-owner state a
++        // pre-v12.6.0 corpus can hold; since v62.0.0 the door holds it too,
++        // the single-owner gate being deleted).
+         {
+             let anomaly =
+                 ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner2, &node);
+diff --git a/src/store/sqlite.rs b/src/store/sqlite.rs
+index ae68f51a..65720b6f 100644
+--- a/src/store/sqlite.rs
++++ b/src/store/sqlite.rs
+@@ -182,11 +182,6 @@ pub struct SqliteBackend {
+     scoring_factors_cache: std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache>,
+     /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
+     trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
+-    /// v54.0.0 (Codex on PR #1050) — the in-process half of the
+-    /// `delegates_to` cycle-gate serialization
+-    /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
+-    /// the cycle check through the insert of every gated write.
+-    delegation_write_lock: tokio::sync::Mutex<()>,
+     /// v54.0.0 (Codex on PR #1050) — the per-record stripe a
+     /// `signed_wire_index` re-index holds from its read of the stored bytes
+     /// through the replacement ([`crate::store::record_locks`]).
+@@ -635,7 +630,6 @@ impl SqliteBackend {
+             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+             trust_root_standing_cache: Default::default(),
+-            delegation_write_lock: tokio::sync::Mutex::new(()),
+             wire_index_locks: Default::default(),
+             #[cfg(test)]
+             test_hooks: Default::default(),
+@@ -4528,8 +4522,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+             let composer = crate::federation::types::attestation_type::SUPERSEDES;
+             // v41.1.0 (#807) — the equivalence arm is restricted to
+             // `delegates_to`, where `(attester, attested, dimension)` IDENTIFIES
+-            // the edge and persist already keeps ownership single-valued
+-            // (`check_single_node_owner_admission`). It must NOT be generalized:
++            // the edge (one attester's binding of one key on one dimension; the
++            // owner seat counts each attester once). It must NOT be generalized:
+             // two `scores` or `chat:` rows share all four and are different
+             // claims, so a wider one settles nothing about the others.
+             let edge = crate::federation::types::attestation_type::DELEGATES_TO;
+@@ -7725,14 +7719,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+                 "federation_attestations row {attestation_id} does not exist"
+             ))
+         })?;
+-        // v54.0.0 (Codex on PR #1050) — a crossing `delegates_to` adds an edge to
+-        // the federation-tier graph the cycle gate reads: the plan's cycle check
+-        // and the write below are one step under the delegation write lock.
+-        let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&current) {
+-            Some(self.delegation_write_lock.lock().await)
+-        } else {
+-            None
+-        };
+         let Some(crossing::EnterPlan { row, crossing }) =
+             crossing::plan_enter_mesh(self, &current, ci, custody, self.self_key_id().as_deref())
+                 .await?
+@@ -7741,12 +7727,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+                 attestation_id: attestation_id.to_owned(),
+             });
+         };
+-        #[cfg(test)]
+-        if _cycle_guard.is_some() {
+-            self.test_hooks()
+-                .pause_if_armed("delegation_cycle_before_crossing")
+-                .await;
+-        }
+         let envelope_text = serde_json::to_string(&row.attestation_envelope)
+             .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
+         let och = hex::decode(&row.original_content_hash)
+@@ -16050,23 +16030,6 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
+             })?;
+         let withdraws_admission_rule: Option<i64> = row.withdraws_admission_rule.map(|v| v as i64);
+         let withdraws_depth: Option<i64> = planned.withdraws_depth.map(|d| d as i64);
+-        // v54.0.0 (Codex on PR #1050) — THE CYCLE CHECK AND THE INSERT ARE ONE
+-        // STEP. The plan read the graph unlocked; a concurrent writer of the
+-        // reverse edge could have passed the same read since. Hold the
+-        // delegation write lock from the re-ask through the write, so every
+-        // gated writer is serialized against it. One process owns this store,
+-        // so the in-process lock is the whole serialization.
+-        let _cycle_guard = if planned.cycle_gated() {
+-            let guard = self.delegation_write_lock.lock().await;
+-            planned.recheck_cycle_under_lock(self).await?;
+-            #[cfg(test)]
+-            self.test_hooks()
+-                .pause_if_armed("delegation_cycle_before_insert")
+-                .await;
+-            Some(guard)
+-        } else {
+-            None
+-        };
+         let crate::federation::attestation_admit::PlannedAttestation {
+             row,
+             projected_trace,
+@@ -28803,9 +28766,9 @@ mod tests {
+             })
+             .await
+             .unwrap();
+-        // …owner2's binding is the PRE-GATE anomaly, inserted via raw SQL
+-        // (bypassing check_single_node_owner_admission, exactly the state a
+-        // pre-v12.6.0 corpus can hold).
++        // …owner2's binding is inserted via raw SQL (the two-owner state a
++        // pre-v12.6.0 corpus can hold; since v62.0.0 the door holds it too,
++        // the single-owner gate being deleted).
+         {
+             let anomaly = ts::owner_binding_attestation(
+                 &uuid::Uuid::new_v4().to_string(),
+@@ -28892,9 +28855,8 @@ mod tests {
+     /// for it"* — which is an operator's problem, not the writer's.
+     ///
+     /// Sqlite-only for the same reason its sibling above is: the two-owner
+-    /// state is a PRE-GATE anomaly that
+-    /// `check_single_node_owner_admission` makes unreachable through any door,
+-    /// so it has to be raw-inserted. The gate under test is backend-agnostic
++    /// state was a pre-gate anomaly no door could reach until v62.0.0 deleted
++    /// the single-owner gate, so it is raw-inserted. The gate under test is backend-agnostic
+     /// (one predicate, called at the same point on all three), so the arm the
+     /// three backends share is covered by
+     /// `federation::admission::tests::config_self_or_owner_gate_*_778`.

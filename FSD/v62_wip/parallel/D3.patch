@@ -1,0 +1,1764 @@
+diff --git a/docs/PYTHON_EDITION2_ADOPTION.md b/docs/PYTHON_EDITION2_ADOPTION.md
+new file mode 100644
+index 00000000..9d448293
+--- /dev/null
++++ b/docs/PYTHON_EDITION2_ADOPTION.md
+@@ -0,0 +1,100 @@
++# Edition-2 from Python: adoption notes for the Agent and the Bridge (v62.0.0)
++
++A v62 node reads and produces only **edition-2 statements**: a CBOR payload signed once by a composite key (ML-DSA-65 + Ed25519) as one `COSE_Sign1` (CC 2.6.1). The earlier form (a JSON object signed over its JCS image, with separate classical and PQC scrubs) is refused by name. This page lists what changes for a Python host of the wheel: the CIRISAgent's embedded edge, and any replication bridge written against the Engine.
++
++The witnesses are `tests/python/test_edition2_surface.py` (I2510–I2515).
++
++## What a host stops doing
++
++- **No more JSON rows at the doors.** After the cut, each of these raises `ValueError("federation_malformed_row: <plane>: earlier_form_object …")` before it decodes its argument:
++  - `put_public_key`, `register_federation_key`, `rebind_key_record`, `apply_replicated_key_record`;
++  - `put_revocation`, `deregister_federation_key`;
++  - `put_attestation`, `apply_replicated_attestation`, `apply_replicated_key_grant`, `apply_replicated_accord_evidence`;
++  - `put_delivery_receipt`, `put_identity_occurrence_json`, `put_wholeness_witness_json`, `put_family_json`, `put_community_json`, `put_lineage_head_cosign_json`;
++  - `put_accord_proposal_json`, `put_accord_participation_json`, `put_accord_decision_json`;
++  - `bake_assembled_genesis`, `install_genesis_bundle_roster_json`, `pin_trust_from_bundle_response_json`;
++  - `apply_replicated_purge_json`, `purge_rows_json`, `federation_grant_trust`, `federation_revoke_trust`.
++
++  Match on the start of the message (`federation_malformed_row`) and the token `earlier_form_object`, not on the plane. The refusal is terminal: do not re-offer the object.
++- **`ciris_persist.earlier_form_doors_shut()`** says whether this wheel refuses them. It is `False` on a wheel built before the doors were shut, and `True` from the release that ships the cut.
++- **No PQC attach, no key-id fingerprint.** `attach_*_pqc_signature` and the `<label>-<fp>` key id are gone. A row is signed once, by the composite; there is no second half to attach later.
++
++## The key: `register_self_federation_key`
++
++```python
++kid = engine.register_self_federation_key("agent")            # (identity_type, valid_until=None, attestation_evidence_json=None)
++assert kid == engine.local_derived_key_id()
++# kid == "urn:ietf:params:oauth:ckt:sha-256:<43 base64url chars>"
++```
++
++- The call writes this node's `key:record` statement and returns the key's **identity-ref**: the base64url SHA-256 thumbprint of the composite public key, behind the prefix `urn:ietf:params:oauth:ckt:sha-256:`. Treat it as opaque. The CIRISAgent already overwrites `_actor_key_id` from the returned value, which keeps working.
++- The `identity_ref`, `registration_envelope_json` and `roles` arguments are gone. The pre-v62 five-argument call raises `TypeError`; it is not read as something else.
++- A `node` or `agent` record ends at most 365 days out; a `user` record carries no end. Re-register before the end to keep the key live.
++- `lookup_public_key(kid)` still returns a JSON record with `key_id`, `pubkey_ed25519_base64` (32 bytes), `pubkey_ml_dsa_65_base64` (1952 bytes) and `identity_type`. It is a read model of the held `key:record` statements. `identity_type` is now a set, written comma-separated (`"agent"`, `"node,…"`): split on `,` rather than comparing the whole string.
++
++## The statement door: `put_edition2_statement`
++
++```python
++out = json.loads(engine.put_edition2_statement(statement_bytes, offered_row_id=None))
++# {"plane": "key_plane" | "voice" | "row", "row_id": "<64 lowercase hex>", "new": bool}
++```
++
++- `statement_bytes` is one `COSE_Sign1` statement exactly as received. The node computes the row id. If you pass `offered_row_id` (64 hex, any case), it must be that id, or the call raises `ValueError("federation_malformed_row: edition2: row_id_mismatch …")`. A string that is not 64 hex raises `ValueError("offered_row_id: …")` without reaching the door.
++- `plane` says where the statement went: `key_plane` (a `key:record` or `key:revocation`), `row` (a new row, through the same gates the JSON door ran), or `voice` (a further signature over a row this node already holds, counted by that row's fold).
++- Putting a statement the node already holds changes nothing and returns `new: false` with the row id. A producing node can use this to learn the id of a statement it serves.
++- A JSON object, or bytes that are no statement at all, raises `ValueError("federation_malformed_row: edition2: earlier_form_object …")` on every wheel, whatever `earlier_form_doors_shut()` says.
++
++## Replication: serving and applying statements
++
++**Serving** (the sender's side):
++
++```python
++cursor = load_cursor()                       # None the first time
++page = engine.edition2_statements_since(cursor, 1000)
++for cursor, statement in page:               # (str, bytes), in this node's admission order
++    row_id = json.loads(engine.put_edition2_statement(statement))["row_id"]   # new is False: it is held
++    send(statement, row_id)
++save_cursor(cursor)                          # the LAST item's cursor
++```
++
++- The cursor is an opaque string; store it and pass it back as given. A page holds at most 1000 statements. A malformed cursor raises `ValueError("cursor: …")`.
++- Each statement is served as received, byte for byte (CC 2.6.1.2). Key it by its row id, not by an envelope hash.
++
++**Applying** (the receiver's side):
++
++```python
++try:
++    out = json.loads(engine.apply_replicated_statement(statement, row_id))
++except ValueError as e:
++    if str(e).startswith("federation_attester_key_unknown"):
++        hold_and_retry_later(statement, row_id)   # do NOT advance past it
++    else:
++        drop(statement, reason=str(e))            # terminal: a gate refused it
++else:
++    # out["outcome"]: "admitted" | "unchanged" | "refused"
++    advance_cursor()                              # out["advances_cursor"] is always True
++```
++
++- `admitted` and `unchanged` carry `plane`, `row_id` and `new`. `refused` carries `reason` (today `store_conflict`: a race the store lost; the held rows are untouched and the statement is safe to offer again later).
++- `federation_attester_key_unknown` means the signer's `key:record` has not arrived. Deliver the sender's key-plane statements first, or hold the row and retry. The sender's own serving order already puts a key before the rows it signs.
++- Every other `ValueError` is a refusal by name and is terminal for those bytes, with the same text the JSON door used to raise for the same row (for example the attestation gates' tokens).
++
++## Genesis: `bundles_in_force_json`
++
++```python
++bundles = json.loads(engine.bundles_in_force_json())
++# [{"object_id": "<64 hex>", "version": int, "prev": "<64 hex>" | null, "asserted_at": <POSIX ms>,
++#   "family_key_id": str, "holders": [identity-ref, …], "serve_nodes": [identity-ref, …], "counted": […]}]
++```
++
++- The bundles in force are the tips of the held `ceg-genesis-bundle/2` lineage (CC 2.6.1.11), followed by `prev` links from a fresh genesis (version 1, no `prev`). An empty list means the node holds no bundle yet (it booted pre-genesis). Two entries are a fork: both are in force, and a reader takes only what both name.
++- `holders` is in roster order and `serve_nodes` in seat order; neither has duplicates. The call takes no arguments.
++- **Canonical standing** is an identity-ref in `serve_nodes` of the bundle in force. This replaces reading `serve_nodes[].record.key_id` out of a bundle/1 JSON response, and the `ciris-canonical-1-<fp>` key id.
++- The accord's roster is `holders`. A halt is one statement from one holder of the bundle in force; there is no proposal, participation or decision object any more.
++
++## Unchanged, or not yet ruled
++
++- **Removed:** `local_sign_hybrid`, `verify_hybrid`, `verify_hybrid_via_directory` and `verify_signed_{key_record,attestation,revocation}`. A v62 signature is one composite, produced through persist's producers; there is no separate classical-plus-PQC pair to sign or verify. The Agent's `substrate_signing.py` must move off them.
++- **Kept:** `local_sign` and `local_pqc_sign`, the single-component signers. CC rc20 allows a component signature in two places: on substrate objects (CC 6.1.3, for example the wholeness witness and the fountain aggregation meta) and on the per-chunk media trailer. The local and split planes, such as the audit chain, use them. They cannot produce a mesh row: every door admits only a composite edition-2 statement.
++- The local tier (`attestation_upsert_local`), the blob, secrets and trace surfaces keep their calls.
++- Errors keep their Python types: an edition-2 refusal is the same `ValueError` the JSON door raised.
+diff --git a/tests/python/conftest.py b/tests/python/conftest.py
+new file mode 100644
+index 00000000..c27d97e0
+--- /dev/null
++++ b/tests/python/conftest.py
+@@ -0,0 +1,109 @@
++"""Shared fixtures for the wheel's pytest suite.
++
++v62.0.0 (JSON-cut slice D) — the edition-2 witnesses need two engines that
++sign with fixed composite keys, one after the other (the engine is a process
++singleton). ``engine_factory`` builds one: a sqlite engine with both halves of
++the LocalSigner from fixed seeds, so a failure reproduces, or a skip on a
++wheel built without the sqlite feature (the same narrow skip every engine-level
++test in this directory uses: a ``ValueError`` naming both ``sqlite`` and
++``feature``; any other error re-raises).
++
++Older files keep their own ``_engine`` helpers; nothing here changes them.
++"""
++from __future__ import annotations
++
++import json
++from typing import Callable, Iterator
++
++import pytest
++
++import ciris_persist
++
++#: An identity-ref (CIRISVerify ``edition2::IDENTITY_REF_PREFIX`` followed by
++#: the base64url, unpadded, SHA-256 thumbprint of the composite public key:
++#: 43 characters).
++IDENTITY_REF_PREFIX = "urn:ietf:params:oauth:ckt:sha-256:"
++IDENTITY_REF_TAIL_LEN = 43
++
++
++def is_identity_ref(s: object) -> bool:
++    """The shape CIRISVerify's ``is_identity_ref`` accepts."""
++    if not isinstance(s, str) or not s.startswith(IDENTITY_REF_PREFIX):
++        return False
++    tail = s[len(IDENTITY_REF_PREFIX) :]
++    return len(tail) == IDENTITY_REF_TAIL_LEN and all(
++        c.isascii() and (c.isalnum() or c in "-_") for c in tail
++    )
++
++
++@pytest.fixture
++def engine_factory(tmp_path) -> Iterator[Callable[..., "ciris_persist.Engine"]]:
++    """``engine_factory(name, fill)`` — a fresh sqlite engine signing with the
++    composite key whose Ed25519 seed is ``fill`` × 32 and whose ML-DSA-65
++    seed is ``fill ^ 0xFF`` × 32. Resets the singleton first; the caller
++    closes it (``eng.close(force=True)``) before building the next one.
++    """
++
++    def make(name: str, fill: int, *, dsn: str = "sqlite::memory:") -> "ciris_persist.Engine":
++        seed = tmp_path / f"{name}.seed"
++        pqc_seed = tmp_path / f"{name}.pqc"
++        seed.write_bytes(bytes([fill] * 32))
++        pqc_seed.write_bytes(bytes([fill ^ 0xFF] * 32))
++        alias = f"e2-{name}"
++        ciris_persist.reset_engine()
++        try:
++            return ciris_persist.Engine(
++                dsn,
++                alias,
++                local_key_id=alias,
++                local_key_path=str(seed),
++                local_pqc_key_id=alias + "-pqc",
++                local_pqc_key_path=str(pqc_seed),
++            )
++        except ValueError as exc:
++            if "sqlite" in str(exc) and "feature" in str(exc):
++                pytest.skip("wheel built without the sqlite feature")
++            raise
++
++    yield make
++    ciris_persist.reset_engine()
++
++
++def served_statements(eng: "ciris_persist.Engine", page: int = 1000) -> list[tuple[str, bytes]]:
++    """Every edition-2 statement ``eng`` holds, in its admission order, as
++    ``(cursor, bytes)``: the serving cursor walked to its end, ``page`` at a
++    time (``Engine.edition2_statements_since``)."""
++    out: list[tuple[str, bytes]] = []
++    cursor = None
++    while True:
++        got = eng.edition2_statements_since(cursor, page)
++        out.extend(got)
++        if len(got) < page:
++            return out
++        cursor = got[-1][0]
++
++
++def carry_statements(eng: "ciris_persist.Engine") -> list[tuple[bytes, str, str]]:
++    """What a replication bridge carries off ``eng``: each held statement with
++    the row id it is offered under and its plane, as
++    ``(bytes, row_id, plane)``. The row id is the producing node's own answer:
++    a re-put of a held statement through ``put_edition2_statement`` changes
++    nothing (``new`` is False) and names the row."""
++    carried = []
++    for _, st in served_statements(eng):
++        again = json.loads(eng.put_edition2_statement(st))
++        assert again["new"] is False, again
++        carried.append((bytes(st), again["row_id"], again["plane"]))
++    return carried
++
++
++def deliver(eng: "ciris_persist.Engine", carried: list[tuple[bytes, str, str]]) -> list[dict]:
++    """Deliver ``carried`` to ``eng`` through ``apply_replicated_statement``,
++    in order; every outcome must be admitted or unchanged (a statement this
++    node already holds, for example a genesis it was born with)."""
++    outs = []
++    for st, row_id, _plane in carried:
++        out = json.loads(eng.apply_replicated_statement(st, row_id))
++        assert out["outcome"] in ("admitted", "unchanged"), out
++        outs.append(out)
++    return outs
+diff --git a/tests/python/test_affiliation_surface.py b/tests/python/test_affiliation_surface.py
+index 094285a6..2f8c9b7b 100644
+--- a/tests/python/test_affiliation_surface.py
++++ b/tests/python/test_affiliation_surface.py
+@@ -9,12 +9,12 @@ given, refusing a term-bearing edge minted without one
+ """
+ from __future__ import annotations
+ 
+-import json
+ from datetime import datetime, timedelta, timezone
+ 
+ import pytest
+ 
+ import ciris_persist
++from conftest import carry_statements, deliver
+ 
+ RETIRED = (
+     "put_organization",
+@@ -66,17 +66,19 @@ def test_producer_doors_sign_the_term(tmp_path) -> None:
+     # Node A: a key the granter can name as its delegate.
+     a = _engine(tmp_path, "a", 0xA6)
+     try:
+-        ka = a.register_self_federation_key("agent", "ref-aff-a", None, None, None)
+-        record_a = a.lookup_public_key(ka)
+-        assert record_a is not None
++        ka = a.register_self_federation_key("agent")
++        assert a.lookup_public_key(ka) is not None
++        # v62.0.0 — A's key travels as its edition-2 `key:record` statement
++        # (the earlier `put_public_key` JSON door is shut).
++        carried = carry_statements(a)
+     finally:
+         ciris_persist.reset_engine()
+ 
+     b = _engine(tmp_path, "b", 0xB6)
+     try:
+-        b.register_self_federation_key("user", "ref-aff-b", None, None, None)
+-        # lookup_public_key returns the record; the put door takes it signed.
+-        b.put_public_key(json.dumps({"record": json.loads(record_a)}))
++        b.register_self_federation_key("user")
++        deliver(b, carried)
++        assert b.lookup_public_key(ka) is not None
+ 
+         # A term-bearing edge with no term is refused: CC supplies no default.
+         with pytest.raises(ValueError, match="delegation_term_required"):
+diff --git a/tests/python/test_cirisnode_rows_surface.py b/tests/python/test_cirisnode_rows_surface.py
+index bafc93b1..190524f3 100644
+--- a/tests/python/test_cirisnode_rows_surface.py
++++ b/tests/python/test_cirisnode_rows_surface.py
+@@ -73,14 +73,13 @@ def _contribution(kind: str, payload: dict) -> str:
+ def test_the_classes_are_rows_from_python(tmp_path) -> None:
+     eng = _engine(tmp_path)
+     try:
+-        me = eng.register_self_federation_key("user", "ref-node", None, None, None)
++        me = eng.register_self_federation_key("user")
+ 
+         cid = eng.cirisnode_put_contribution(_contribution("arc_question", {"q": 1}))
+         page = json.loads(eng.cirisnode_list_contributions(me))
+         assert [r["attestation_id"] for r in page["items"]] == [cid], page
+         row = page["items"][0]
+         assert row["attestation_envelope"]["dimension"] == "contribution:arc_question:v1"
+-        assert row["scrub_signature_pqc"], "the row is hybrid-signed"
+ 
+         vid = eng.cirisnode_cast_vote(json.dumps({"contribution_id": cid, "score": 0.5}))
+         votes = json.loads(eng.cirisnode_list_votes(cid))
+@@ -112,7 +111,7 @@ def test_the_classes_are_rows_from_python(tmp_path) -> None:
+ def test_a_takedown_notice_is_a_row_from_python(tmp_path) -> None:
+     eng = _engine(tmp_path)
+     try:
+-        me = eng.register_self_federation_key("user", "ref-node", None, None, None)
++        me = eng.register_self_federation_key("user")
+         sha = hashlib.sha256(b"cirisnode-rows-takedown").hexdigest()
+         # The content's establishing row names this node as its signed subject
+         # (CC 4.5.5 `subject_of`): this node holds the takedown duty over it.
+diff --git a/tests/python/test_edition2_surface.py b/tests/python/test_edition2_surface.py
+new file mode 100644
+index 00000000..21b9a6af
+--- /dev/null
++++ b/tests/python/test_edition2_surface.py
+@@ -0,0 +1,356 @@
++"""v62.0.0 (JSON-cut slice D; CC 2.6.1, 2.6.1.2, 2.6.1.11, 2.6.1.12) — the
++edition-2 surface, end to end from the wheel.
++
++A v62 node reads and produces only edition-2 statements (CBOR payload, one
++composite ``COSE_Sign1``). The Rust witnesses prove the door, the mapping and
++the store on sqlite and postgres; this file asks what a host sees through
++``import ciris_persist``:
++
++- I2510: ``register_self_federation_key`` returns the key's identity-ref, the
++  same as ``local_derived_key_id()``, and the key reads back as its edition-2
++  projection; the pre-v62 five-argument call is a ``TypeError``.
++- I2511: ``put_edition2_statement`` on the producing node: a re-put of a held
++  statement changes nothing and names its row; an offered id the bytes do not
++  name is ``row_id_mismatch``; a JSON object, or bytes in no form, is
++  ``earlier_form_object`` (the door's own check, switch or no switch).
++- I2512: two nodes. A's statements are carried to B and applied with
++  ``apply_replicated_statement``: a row before its signer's key waits
++  (``federation_attester_key_unknown``, retryable), the key lands, the row
++  lands under the id A computed, re-delivery is ``unchanged``.
++- I2513: ``edition2_statements_since`` pages in admission order and resumes
++  from the opaque cursor it hands out.
++- I2514: ``bundles_in_force_json()`` is a JSON list, one entry per tip:
++  ``{object_id, version, prev, asserted_at, family_key_id, holders,
++  serve_nodes, counted}``; it takes no pin.
++- I2515: once ``earlier_form_doors_shut()`` (slice F), every earlier-form
++  JSON door still on the Engine refuses by name, as a ``ValueError``.
++
++The engine is a process singleton, so the two nodes of I2512 run one after the
++other: A's statements are carried to B as the bytes a replication bridge would
++carry, each with the row id A offers it under.
++"""
++from __future__ import annotations
++
++import base64
++import json
++import re
++
++import pytest
++
++import ciris_persist
++from conftest import carry_statements, deliver, is_identity_ref, served_statements
++
++#: ``ValueError`` text of a refusal at the edition-2 door (plane ``edition2``).
++EDITION2_REFUSAL = "federation_malformed_row: edition2: "
++
++#: A cursor handed out by ``edition2_statements_since``:
++#: ``<admitted_us>:<statement_id, 64 hex>``.
++CURSOR = re.compile(r"^-?[0-9]+:[0-9a-f]{64}$")
++
++HEX64 = re.compile(r"^[0-9a-f]{64}$")
++
++
++def _goal(text: str) -> str:
++    """A self-scale goal body (CC 3.1.9.7) that meets the M-1 gate."""
++    return json.dumps(
++        {
++            "goal_text": text,
++            "scale": "self",
++            "meta_goal_alignment": {"dimension": "justice", "rationale": "fair to outsiders"},
++        }
++    )
++
++
++# ── I2510 ────────────────────────────────────────────────────────────────
++
++
++def test_register_self_returns_the_identity_ref_i2510(engine_factory) -> None:
++    """I2510 — the registered key is named by its identity-ref, everywhere a
++    host reads it, and the earlier argument list is gone (a clean break)."""
++    eng = engine_factory("reg", 0x21)
++    try:
++        kid = eng.register_self_federation_key("agent")
++        assert is_identity_ref(kid), kid
++        assert eng.local_derived_key_id() == kid
++        assert eng.local_derived_key_id() != eng.local_key_id()
++        # Idempotent: the same key, the same id.
++        assert eng.register_self_federation_key("agent") == kid
++
++        # The read model: the key's edition-2 projection, both halves of the
++        # composite key filled (Ed25519 32 bytes, ML-DSA-65 1952 bytes).
++        record = json.loads(eng.lookup_public_key(kid))
++        assert record["key_id"] == kid, record
++        assert len(base64.b64decode(record["pubkey_ed25519_base64"])) == 32, record
++        assert len(base64.b64decode(record["pubkey_ml_dsa_65_base64"])) == 1952, record
++        assert "agent" in record["identity_type"].split(","), record
++
++        # The key travels as one key-plane statement the node serves.
++        planes = [plane for _, _, plane in carry_statements(eng)]
++        assert "key_plane" in planes, planes
++
++        # The pre-v62 call (identity_ref, registration envelope, roles) is not
++        # read as something else: it is a TypeError.
++        with pytest.raises(TypeError):
++            eng.register_self_federation_key("agent", "ref", None, None, None)
++    finally:
++        eng.close(force=True)
++
++
++# ── I2511 ────────────────────────────────────────────────────────────────
++
++
++def test_put_edition2_statement_on_the_producing_node_i2511(engine_factory) -> None:
++    """I2511 — the local statement door: idempotent on a held statement,
++    names its row, refuses an id the bytes do not name, and refuses the
++    earlier form by name."""
++    eng = engine_factory("put", 0x32)
++    try:
++        kid = eng.register_self_federation_key("user")
++        gid = eng.cirisnode_put_goal_json(_goal("publish the report"))
++
++        served = served_statements(eng)
++        assert served, "the node serves the statements it produced"
++        by_plane: dict[str, list[tuple[bytes, str]]] = {}
++        for _, st in served:
++            out = json.loads(eng.put_edition2_statement(st))
++            assert set(out) == {"plane", "row_id", "new"}, out
++            assert out["new"] is False, ("a held statement re-put is not new", out)
++            assert HEX64.match(out["row_id"]), out
++            by_plane.setdefault(out["plane"], []).append((st, out["row_id"]))
++            # Offered under the id it names: the same answer.
++            again = json.loads(eng.put_edition2_statement(st, out["row_id"].upper()))
++            assert again == out, (again, out)
++        assert "key_plane" in by_plane, list(by_plane)
++        # The goal row is a row, stored under the id the node computed: the
++        # goal id the producer returned is that row id.
++        assert gid in [rid for _, rid in by_plane.get("row", [])], (gid, by_plane.get("row"))
++
++        # An offered id the bytes do not name: terminal, by name.
++        st, rid = by_plane["row"][0]
++        wrong = ("0" if rid[0] != "0" else "1") + rid[1:]
++        with pytest.raises(ValueError) as e:
++            eng.put_edition2_statement(st, wrong)
++        assert str(e.value).startswith(EDITION2_REFUSAL + "row_id_mismatch"), str(e.value)
++        # A malformed offered id never reaches the door.
++        with pytest.raises(ValueError) as e:
++            eng.put_edition2_statement(st, "not-hex")
++        assert str(e.value).startswith("offered_row_id"), str(e.value)
++
++        # The earlier form at the edition-2 door: a JSON object (as str
++        # bytes) and bytes in no form, both `earlier_form_object`, both
++        # ValueError (the type of the malformed-row arm).
++        record = eng.lookup_public_key(kid)
++        for earlier in (record.encode(), json.dumps({"record": json.loads(record)}).encode(), b"\x00no form"):
++            with pytest.raises(ValueError) as e:
++                eng.put_edition2_statement(earlier)
++            assert str(e.value).startswith(EDITION2_REFUSAL + "earlier_form_object"), str(e.value)
++    finally:
++        eng.close(force=True)
++
++
++# ── I2512 ────────────────────────────────────────────────────────────────
++
++
++def test_statements_round_trip_between_two_nodes_i2512(engine_factory) -> None:
++    """I2512 — produce on A, carry the bytes, apply on B."""
++    # ── Node A: a key and one row ────────────────────────────────────────
++    a = engine_factory("a", 0x5A)
++    try:
++        ka = a.register_self_federation_key("user")
++        gid = a.cirisnode_put_goal_json(_goal("keep the commons open"))
++        carried = carry_statements(a)
++    finally:
++        a.close(force=True)
++    keys = [c for c in carried if c[2] == "key_plane"]
++    rows = [c for c in carried if c[2] == "row" and c[1] == gid]
++    assert keys, carried
++    assert len(rows) == 1, ("A serves its goal row once", gid, [c[1:] for c in carried])
++    goal_st, goal_rid, _ = rows[0]
++
++    # ── Node B: admit A's statements ─────────────────────────────────────
++    b = engine_factory("b", 0xB5)
++    try:
++        assert b.lookup_public_key(ka) is None
++
++        # The row before its signer's key: it waits. Retryable, by name, and
++        # the caller must not advance its cursor; nothing is stored.
++        with pytest.raises(ValueError) as e:
++            b.apply_replicated_statement(goal_st, goal_rid)
++        assert str(e.value).startswith("federation_attester_key_unknown"), str(e.value)
++
++        # Offered under an id the bytes do not name: terminal.
++        key_st, key_rid, _ = keys[0]
++        wrong = ("0" if key_rid[0] != "0" else "1") + key_rid[1:]
++        with pytest.raises(ValueError) as e:
++            b.apply_replicated_statement(key_st, wrong)
++        assert str(e.value).startswith(EDITION2_REFUSAL + "row_id_mismatch"), str(e.value)
++        assert b.lookup_public_key(ka) is None
++
++        # A's key lands; the read model answers for it.
++        outs = deliver(b, keys)
++        assert any(o["outcome"] == "admitted" for o in outs), outs
++        for o, (_, rid, _) in zip(outs, keys):
++            assert o["advances_cursor"] is True, o
++            if o["outcome"] == "admitted":
++                assert (o["plane"], o["row_id"], o["new"]) == ("key_plane", rid, True), o
++        assert json.loads(b.lookup_public_key(ka))["key_id"] == ka
++
++        # Now the row lands, under the id A computed.
++        got = json.loads(b.apply_replicated_statement(goal_st, goal_rid))
++        assert got == {
++            "outcome": "admitted",
++            "plane": "row",
++            "row_id": goal_rid,
++            "new": True,
++            "advances_cursor": True,
++        }, got
++        held = json.loads(b.list_attestations_by(ka, 500, None, "goal:"))["items"]
++        assert goal_rid in [r["attestation_id"] for r in held], held
++
++        # Re-delivery changes nothing.
++        again = json.loads(b.apply_replicated_statement(goal_st, goal_rid))
++        assert (again["outcome"], again["new"], again["row_id"]) == ("unchanged", False, goal_rid), again
++
++        # B now serves A's statements byte for byte, as received.
++        b_served = {bytes(st) for _, st in served_statements(b)}
++        assert goal_st in b_served and keys[0][0] in b_served
++    finally:
++        b.close(force=True)
++
++
++# ── I2513 ────────────────────────────────────────────────────────────────
++
++
++def test_edition2_statements_since_pages_and_resumes_i2513(engine_factory) -> None:
++    """I2513 — the serving cursor: one page or many, the same statements in
++    the same order; each cursor resumes after its own statement."""
++    eng = engine_factory("since", 0x43)
++    try:
++        eng.register_self_federation_key("user")
++        for i in range(3):
++            eng.cirisnode_put_goal_json(_goal(f"goal {i}"))
++
++        whole = served_statements(eng)
++        assert len(whole) >= 4, len(whole)
++        for cursor, st in whole:
++            assert CURSOR.match(cursor), cursor
++            assert isinstance(st, bytes) and st, st
++        # Admission order: the (admitted_us, statement_id) positions rise.
++        positions = [(int(c.split(":")[0]), c.split(":")[1]) for c, _ in whole]
++        assert positions == sorted(positions) and len(set(positions)) == len(positions), positions
++
++        # One at a time gives the same sequence.
++        assert served_statements(eng, page=1) == whole
++        # Resuming after the k-th statement serves exactly the rest.
++        for k in range(len(whole)):
++            rest = eng.edition2_statements_since(whole[k][0], 1000)
++            assert rest == whole[k + 1 :], k
++        # From the start, a page is bounded by its limit.
++        assert eng.edition2_statements_since(None, 2) == whole[:2]
++
++        with pytest.raises(ValueError) as e:
++            eng.edition2_statements_since("not-a-cursor", 10)
++        assert str(e.value).startswith("cursor"), str(e.value)
++    finally:
++        eng.close(force=True)
++
++
++# ── I2514 ────────────────────────────────────────────────────────────────
++
++
++def test_bundles_in_force_json_shape_i2514(engine_factory) -> None:
++    """I2514 — the bundles in force, as a host reads them: one entry per tip
++    of the held genesis lineage (CC 2.6.1.11), empty when none is held."""
++    eng = engine_factory("bundles", 0x54)
++    try:
++        bundles = json.loads(eng.bundles_in_force_json())
++        assert isinstance(bundles, list), bundles
++        for b in bundles:
++            assert set(b) == {
++                "object_id",
++                "version",
++                "prev",
++                "asserted_at",
++                "family_key_id",
++                "holders",
++                "serve_nodes",
++                "counted",
++            }, b
++            assert HEX64.match(b["object_id"]), b
++            assert isinstance(b["version"], int) and b["version"] >= 1, b
++            # A fresh genesis is version 1 with no prev; a later bundle names one.
++            assert (b["prev"] is None) == (b["version"] == 1), b
++            assert b["prev"] is None or HEX64.match(b["prev"]), b
++            assert isinstance(b["asserted_at"], int) and b["asserted_at"] > 0, b
++            assert isinstance(b["family_key_id"], str) and b["family_key_id"], b
++            for member in ("holders", "serve_nodes"):
++                refs = b[member]
++                assert isinstance(refs, list) and refs, (member, b)
++                assert all(is_identity_ref(r) for r in refs), (member, refs)
++                # A set (roster / seat order, not sorted): no duplicates.
++                assert len(set(refs)) == len(refs), (member, refs)
++            assert isinstance(b["counted"], list), b
++            assert b["counted"] == sorted(b["counted"]), b
++        # Two tips are a fork; each is its own object.
++        assert len({b["object_id"] for b in bundles}) == len(bundles), bundles
++
++        # The pin is gone (C1): the call takes no argument.
++        with pytest.raises(TypeError):
++            eng.bundles_in_force_json("ab" * 32)
++    finally:
++        eng.close(force=True)
++
++
++# ── I2515 ────────────────────────────────────────────────────────────────
++
++#: The earlier-form JSON doors that take one JSON string (D1.api.md's table).
++#: Slice F may delete a door outright; an absent door is closed too.
++EARLIER_FORM_DOORS = (
++    "put_public_key",
++    "register_federation_key",
++    "put_attestation",
++    "apply_replicated_attestation",
++    "put_revocation",
++    "apply_replicated_key_grant",
++    "put_identity_occurrence_json",
++    "put_family_json",
++    "put_community_json",
++    "put_lineage_head_cosign_json",
++    "apply_replicated_purge_json",
++)
++
++
++def _doors_shut() -> bool:
++    return bool(ciris_persist.earlier_form_doors_shut())
++
++
++def test_earlier_form_doors_shut_is_reachable_from_the_package_i2515() -> None:
++    """I2515 (reachability) — the switch a host reads is on the package."""
++    assert isinstance(ciris_persist.earlier_form_doors_shut(), bool)
++
++
++@pytest.mark.skipif(
++    not hasattr(ciris_persist, "earlier_form_doors_shut") or not _doors_shut(),
++    reason="the earlier-form doors open until slice F flips EARLIER_FORM_DOORS_SHUT",
++)
++def test_every_earlier_form_door_refuses_by_name_i2515(engine_factory) -> None:
++    """I2515 — with the switch on, an earlier-form JSON object at any door
++    still on the Engine is refused before it is decoded:
++    ``ValueError("federation_malformed_row: <plane>: earlier_form_object …")``,
++    the type of the malformed-row arm. The plane is not pinned."""
++    eng = engine_factory("shut", 0x65)
++    try:
++        eng.register_self_federation_key("agent")
++        present = [name for name in EARLIER_FORM_DOORS if hasattr(eng, name)]
++        for name in present:
++            with pytest.raises(ValueError) as e:
++                getattr(eng, name)("{}")
++            text = str(e.value)
++            assert text.startswith("federation_malformed_row: "), (name, text)
++            assert "earlier_form_object" in text, (name, text)
++        # The edition-2 door stays open beside them.
++        served = served_statements(eng)
++        assert served
++        assert json.loads(eng.put_edition2_statement(served[0][1]))["new"] is False
++    finally:
++        eng.close(force=True)
+diff --git a/tests/python/test_encrypted_chunk_dag_surface.py b/tests/python/test_encrypted_chunk_dag_surface.py
+index 851db17b..6ec9e96a 100644
+--- a/tests/python/test_encrypted_chunk_dag_surface.py
++++ b/tests/python/test_encrypted_chunk_dag_surface.py
+@@ -66,7 +66,7 @@ def test_encrypted_chunk_dag_round_trips_through_the_wheel_832(tmp_path) -> None
+     eng = _engine(tmp_path)
+     try:
+         # The identity and ONE occurrence of it, keyed for content delivery.
+-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
++        kid = eng.register_self_federation_key("agent")
+         enc = eng.self_enc_pubkeys()
+         eng.put_identity_occurrence_json(
+             json.dumps(
+@@ -181,7 +181,7 @@ def test_commons_seal_stream_refuses_a_sealed_chunk_row_832(tmp_path) -> None:
+     row cannot be sealed by the commons `seal_stream`."""
+     eng = _engine(tmp_path)
+     try:
+-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
++        kid = eng.register_self_federation_key("agent")
+         stream = "py-832-mixed-" + secrets.token_hex(4)
+         eng.put_blob_chunk_scoped("self", stream, 0, _b64(b"sealed"), 0, community_key_id=kid)
+         with pytest.raises(ValueError, match="blob_invalid_argument"):
+@@ -201,7 +201,7 @@ def test_a_stream_belongs_to_its_first_append_and_a_chunk_to_its_position_837_83
+     is `blob_not_granted`; an unknown position is `blob_invalid_argument`."""
+     eng = _engine(tmp_path)
+     try:
+-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
++        kid = eng.register_self_federation_key("agent")
+         enc = eng.self_enc_pubkeys()
+         eng.put_identity_occurrence_json(
+             json.dumps(
+diff --git a/tests/python/test_genesis_import_surface.py b/tests/python/test_genesis_import_surface.py
+deleted file mode 100644
+index 3dbc1c5a..00000000
+--- a/tests/python/test_genesis_import_surface.py
++++ /dev/null
+@@ -1,67 +0,0 @@
+-"""v60.0.0 (CIRISPersist#1002; steward ruling 2026-10-25, parity even for
+-genesis) — ``PyEngine.install_genesis_bundle_roster_json`` on the wheel.
+-
+-The import door replays the bundle on a scratch the engine's own backend
+-provisions (an in-memory SQLite clone here; a scratch database on postgres).
+-Re-importing the compiled bundle a booted node already holds writes nothing
+-new and reports every record held; a tampered bundle raises ``ValueError``
+-naming ``federation_genesis_bundle_invalid`` and installs nothing.
+-"""
+-
+-from __future__ import annotations
+-
+-import json
+-import os
+-import secrets
+-import tempfile
+-
+-import pytest
+-
+-import ciris_persist
+-
+-SEED_JSON = os.path.join(
+-    os.path.dirname(__file__), "..", "..", "src", "federation", "genesis", "canonical_seed.json"
+-)
+-
+-
+-def _engine():
+-    ciris_persist.reset_engine()
+-    d = tempfile.mkdtemp()
+-    seed = os.path.join(d, "seed")
+-    pqc_seed = os.path.join(d, "pqc.seed")
+-    with open(seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    with open(pqc_seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    alias = "node-" + secrets.token_hex(8)
+-    try:
+-        return ciris_persist.Engine(
+-            "sqlite::memory:",
+-            alias,
+-            local_key_id=alias,
+-            local_key_path=seed,
+-            local_pqc_key_id=alias + "-pqc",
+-            local_pqc_key_path=pqc_seed,
+-        )
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-
+-
+-def test_install_genesis_bundle_roster_json_reimport_and_tamper() -> None:
+-    with open(SEED_JSON, encoding="utf-8") as fh:
+-        bundle_json = fh.read()
+-    eng = _engine()
+-    try:
+-        report = json.loads(eng.install_genesis_bundle_roster_json(bundle_json))
+-        assert report["records"], report
+-        assert all(r["outcome"] != "installed" for r in report["records"]), report
+-
+-        tampered = json.loads(bundle_json)
+-        tampered["produced_at"] = "2099-01-01T00:00:00+00:00"
+-        with pytest.raises(ValueError, match="federation_genesis_bundle_invalid"):
+-            eng.install_genesis_bundle_roster_json(json.dumps(tampered))
+-    finally:
+-        eng.close(force=True)
+-    ciris_persist.reset_engine()
+diff --git a/tests/python/test_goal_rows_surface.py b/tests/python/test_goal_rows_surface.py
+index f679696e..e7da2c05 100644
+--- a/tests/python/test_goal_rows_surface.py
++++ b/tests/python/test_goal_rows_surface.py
+@@ -53,7 +53,7 @@ def _body(text: str, scale: str = "self", **extra) -> str:
+ def test_a_goal_is_a_row_from_python(tmp_path) -> None:
+     eng = _engine(tmp_path)
+     try:
+-        me = eng.register_self_federation_key("user", "ref-goal-node", None, None, None)
++        me = eng.register_self_federation_key("user")
+ 
+         gid = eng.cirisnode_put_goal_json(
+             _body("publish the report", "cohort", cohort_id="stewards", score=-0.5)
+@@ -97,7 +97,7 @@ def test_a_goal_is_a_row_from_python(tmp_path) -> None:
+ def test_m1_and_the_retired_typed_goal_are_refused(tmp_path) -> None:
+     eng = _engine(tmp_path)
+     try:
+-        eng.register_self_federation_key("user", "ref-goal-node", None, None, None)
++        eng.register_self_federation_key("user")
+         no_m1 = json.dumps({"goal_text": "t", "scale": "self"})
+         with pytest.raises(ValueError):
+             eng.cirisnode_put_goal_json(no_m1)
+diff --git a/tests/python/test_hybrid_policy_1233_surface.py b/tests/python/test_hybrid_policy_1233_surface.py
+deleted file mode 100644
+index 27d319cc..00000000
+--- a/tests/python/test_hybrid_policy_1233_surface.py
++++ /dev/null
+@@ -1,106 +0,0 @@
+-"""v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — I1563: at the wheel, the
+-verify doors accept only ``"strict"``.
+-
+-CC 5.3.2.4.3.1: "a verifier's hybrid-required check is always-on, never an
+-operator toggle". ``Engine.verify_hybrid``, ``Engine.verify_hybrid_via_directory``
+-and the three ``verify_signed_*`` methods keep their ``policy`` argument until
+-v62 removes it, and refuse every value except ``"strict"`` with
+-``ValueError("verify_policy_violation")`` before any decode, lookup or crypto.
+-
+-The Rust witnesses (I1560, I1561 on sqlite and postgres; I1562 through the
+-capsule) prove the same doors from inside the crate; this proves them through
+-the installed wheel.
+-"""
+-
+-import base64
+-import secrets
+-
+-import pytest
+-
+-import ciris_persist
+-
+-NOT_STRICT = ["ed25519_fallback", "soft_freshness", "STRICT", "strict ", "", "hybrid"]
+-
+-
+-def _engine(tmp_path):
+-    alias = "hp1233-" + secrets.token_hex(6)
+-    seed = tmp_path / "ed.seed"
+-    pqc_seed = tmp_path / "pqc.seed"
+-    seed.write_bytes(secrets.token_bytes(32))
+-    pqc_seed.write_bytes(secrets.token_bytes(32))
+-    ciris_persist.reset_engine()
+-    try:
+-        return ciris_persist.Engine(
+-            "sqlite::memory:",
+-            alias,
+-            local_key_id=alias,
+-            local_key_path=str(seed),
+-            local_pqc_key_id=alias + "-pqc",
+-            local_pqc_key_path=str(pqc_seed),
+-        )
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-
+-
+-def _b64(b: bytes) -> str:
+-    return base64.b64encode(b).decode()
+-
+-
+-def test_verify_hybrid_via_directory_accepts_only_strict_1233(tmp_path) -> None:
+-    eng = _engine(tmp_path)
+-    try:
+-        kid = eng.register_self_federation_key("agent", "ref-1233", None, None, None)
+-        msg = b"CIRISPersist#1233 I1563"
+-        out = eng.local_sign_hybrid(msg)
+-        ed_sig = _b64(out["classical_sig"])
+-        pqc_sig = _b64(out["pqc_sig"])
+-
+-        got = eng.verify_hybrid_via_directory(msg, kid, ed_sig, pqc_sig, "strict")
+-        assert got["outcome"] == "hybrid_verified", got
+-
+-        for policy in NOT_STRICT:
+-            # A VALID hybrid signature is refused by policy.
+-            with pytest.raises(ValueError) as e:
+-                eng.verify_hybrid_via_directory(msg, kid, ed_sig, pqc_sig, policy, 3600.0, 1.0)
+-            assert str(e.value) == "verify_policy_violation", (policy, str(e.value))
+-            # And the refusal precedes the directory lookup.
+-            with pytest.raises(ValueError) as e:
+-                eng.verify_hybrid_via_directory(msg, "no-such-key-1233", ed_sig, None, policy)
+-            assert str(e.value) == "verify_policy_violation", (policy, str(e.value))
+-
+-        with pytest.raises(ValueError) as e:
+-            eng.verify_hybrid_via_directory(msg, "no-such-key-1233", ed_sig, pqc_sig, "strict")
+-        assert str(e.value) == "verify_unknown_key"
+-
+-        for method in (
+-            eng.verify_signed_key_record,
+-            eng.verify_signed_attestation,
+-            eng.verify_signed_revocation,
+-        ):
+-            for policy in NOT_STRICT:
+-                with pytest.raises(ValueError) as e:
+-                    method("{", policy)
+-                assert str(e.value) == "verify_policy_violation", (method, policy)
+-            with pytest.raises(ValueError) as e:
+-                method("{", "strict")
+-            assert "JSON decode" in str(e.value), (method, str(e.value))
+-    finally:
+-        eng.close(force=True)
+-        ciris_persist.reset_engine()
+-
+-
+-def test_verify_hybrid_refuses_before_any_decode_1233(tmp_path) -> None:
+-    eng = _engine(tmp_path)
+-    try:
+-        for policy in NOT_STRICT:
+-            with pytest.raises(ValueError) as e:
+-                eng.verify_hybrid(b"m", "!!!", "!!!", "!!!", "!!!", policy)
+-            assert str(e.value) == "verify_policy_violation", (policy, str(e.value))
+-        with pytest.raises(ValueError) as e:
+-            eng.verify_hybrid(b"m", "!!!", "!!!", "!!!", "!!!", "strict")
+-        assert str(e.value) == "verify_hybrid_base64"
+-    finally:
+-        eng.close(force=True)
+-        ciris_persist.reset_engine()
+diff --git a/tests/python/test_key_grant_rows_surface.py b/tests/python/test_key_grant_rows_surface.py
+deleted file mode 100644
+index 072ca16f..00000000
+--- a/tests/python/test_key_grant_rows_surface.py
++++ /dev/null
+@@ -1,224 +0,0 @@
+-"""v55.0.0 (CIRISPersist#989, #981; CC 3.3.2 rc7, CC 5.3.3.2.5) — the
+-per-recipient key-grant row and the caller-supplied stream epoch DEK, end to
+-end from Python.
+-
+-Slice B moved every key wrap onto one `scores` row per recipient
+-(`key_grant:{axis}:v1`) and changed the JSON `emit_key_grant` takes and
+-`apply_replicated_key_grant` admits. The Rust witnesses (I742–I757) prove the
+-doors on every backend; this file asks whether a host can drive a real signed
+-round trip through the wheel: node A seals, A's rows go to node B as JSON, and
+-B's admission (signature, the one audience rule, the projection) answers.
+-
+-The engine is a process singleton, so the two nodes run one after the other in
+-this process: A's key records, its occurrence and its signed rows are carried
+-to B as the JSON a replication bridge would carry. B is told about A's
+-occurrence through the trusted-local occurrence door; the signed occurrence
+-door is the edge bridge's, not the wheel's.
+-"""
+-from __future__ import annotations
+-
+-import base64
+-import copy
+-import json
+-
+-import pytest
+-
+-import ciris_persist
+-
+-KEY_GRANT_PREFIX = "key_grant:"
+-
+-
+-def _engine(tmp_path, name: str, fill: int):
+-    """A sqlite engine with a hybrid LocalSigner from fixed seeds, or a skip."""
+-    seed = tmp_path / f"{name}.seed"
+-    pqc_seed = tmp_path / f"{name}.pqc"
+-    # Fixed bytes, not urandom: a failure here should reproduce.
+-    seed.write_bytes(bytes([fill] * 32))
+-    pqc_seed.write_bytes(bytes([fill ^ 0xFF] * 32))
+-    alias = f"kg-rows-{name}"
+-    ciris_persist.reset_engine()
+-    try:
+-        return ciris_persist.Engine(
+-            "sqlite::memory:",
+-            alias,
+-            local_key_id=alias,
+-            local_key_path=str(seed),
+-            local_pqc_key_id=alias + "-pqc",
+-            local_pqc_key_path=str(pqc_seed),
+-        )
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-
+-
+-def _occurrence(eng, identity: str, occurrence: str, enc: dict) -> None:
+-    eng.put_identity_occurrence_json(
+-        json.dumps(
+-            {
+-                "identity_key_id": identity,
+-                "occurrence_key_id": occurrence,
+-                "device_class": "server",
+-                "hardware_attestation": None,
+-                "asserted_at": "2026-09-09T00:00:00Z",
+-                "valid_until": None,
+-                "encryption_pubkeys": enc,
+-                "transport_binding": None,
+-                "persist_row_hash": "",
+-            }
+-        )
+-    )
+-
+-
+-def _key_grant_rows(eng, signer: str) -> list[dict]:
+-    # v56.0.0 (CIRISPersist#1001): list_attestations_by is one bounded page;
+-    # walk the cursor, narrowed to the key-grant family.
+-    rows: list[dict] = []
+-    cursor = None
+-    while True:
+-        page = json.loads(eng.list_attestations_by(signer, 500, cursor, KEY_GRANT_PREFIX))
+-        rows.extend(page["items"])
+-        if page["next_cursor"] is None:
+-            break
+-        cursor = json.dumps(page["next_cursor"])
+-    return [
+-        r
+-        for r in rows
+-        if str((r.get("attestation_envelope") or {}).get("dimension", "")).startswith(
+-            KEY_GRANT_PREFIX
+-        )
+-    ]
+-
+-
+-def test_key_grant_rows_round_trip_between_two_nodes_989(tmp_path) -> None:
+-    # ── Node A: a self stream under a caller-supplied epoch DEK ──────────
+-    a = _engine(tmp_path, "a", 0x5A)
+-    try:
+-        ka = a.register_self_federation_key("agent", "ref-a", None, None, None)
+-        enc_a = a.self_enc_pubkeys()
+-        _occurrence(a, ka, ka, enc_a)
+-
+-        stream = "py-989-stream"
+-        dek = bytes(range(32))
+-        reg = json.loads(
+-            a.register_stream_epoch_dek("self", ka, stream, 0, base64.b64encode(dek).decode())
+-        )
+-        assert reg["stream_id"] == stream and reg["epoch"] == 0, reg
+-        assert "keep" not in reg and reg["tier"] == "invisible_encrypted", reg
+-        assert reg["granted"] == [ka], reg
+-        # One DEK per (stream, epoch): a second supply is refused, terminally.
+-        with pytest.raises(ValueError, match="blob_stream_epoch_dek_exists") as exc:
+-            a.register_stream_epoch_dek(
+-                "self", ka, stream, 0, base64.b64encode(bytes(32)).decode()
+-            )
+-        body = json.loads(str(exc.value).split(": ", 1)[1])
+-        assert body["retryable"] is False, body
+-
+-        segs = [b"live call segment one " * 20, b"live call segment two " * 30]
+-        for seq, seg in enumerate(segs):
+-            a.put_blob_chunk_scoped(
+-                "self", stream, seq, base64.b64encode(seg).decode(), 0, community_key_id=ka
+-            )
+-        sealed = json.loads(a.seal_stream_scoped("self", stream, community_key_id=ka))
+-        manifest = sealed["manifest_sha256"]
+-        assert sealed["total_size"] == sum(len(s) for s in segs), sealed
+-        assert base64.b64decode(a.read_blob_as(manifest, ka)) == b"".join(segs)
+-
+-        # The rows the seal emitted: one per recipient per axis, each a
+-        # structural `scores` row, signed by A, naming its recipient.
+-        content_axis = {
+-            "axis": "content",
+-            "at_rest_sha256": manifest,
+-            "cohort_scope": "self",
+-            "owner_key_id": ka,
+-        }
+-        emitted = json.loads(a.emit_key_grant(json.dumps(content_axis)))
+-        assert emitted["axis"] == content_axis, emitted
+-        assert emitted["already_emitted"] == [ka], emitted
+-        assert emitted["withheld"] == [] and emitted["sealer_refused"] is None, emitted
+-        rows = _key_grant_rows(a, ka)
+-        by_dim = {r["attestation_envelope"]["dimension"]: r for r in rows}
+-        assert set(by_dim) == {"key_grant:content:v1", "key_grant:stream:v1"}, list(by_dim)
+-        for r in rows:
+-            assert r["attestation_type"] == "scores", r["attestation_type"]
+-            assert r["attesting_key_id"] == ka and r["attested_key_id"] == ka
+-            assert r["scrub_signature_pqc"], "a key-grant row is hybrid-signed"
+-        assert by_dim["key_grant:content:v1"]["attestation_envelope"]["at_rest_sha256"] == manifest
+-        assert by_dim["key_grant:stream:v1"]["attestation_envelope"]["stream_id"] == stream
+-
+-        # v58.0.0 (CIRISPersist#991) — key records ride the attestation stream
+-        # as key:record:v1 rows.
+-        key_rows = [
+-            r
+-            for r in json.loads(a.list_attestations_since(None, None, 1000))
+-            if (r.get("attestation", r).get("attestation_envelope") or {}).get("dimension")
+-            == "key:record:v1"
+-        ]
+-        assert key_rows, "A's own key record is a key:record:v1 row"
+-    finally:
+-        a.close(force=True)
+-    ciris_persist.reset_engine()
+-
+-    # ── Node B: admit A's rows ───────────────────────────────────────────
+-    b = _engine(tmp_path, "b", 0xB5)
+-    try:
+-        b.register_self_federation_key("agent", "ref-b", None, None, None)
+-        content_row = by_dim["key_grant:content:v1"]
+-        stream_row = by_dim["key_grant:stream:v1"]
+-
+-        # Before B knows A's occurrence, the recipient is outside the one
+-        # audience rule: refused, and re-offerable once it lands.
+-        with pytest.raises(ValueError, match="recipient_not_in_audience") as refused:
+-            b.apply_replicated_key_grant(json.dumps({"attestation": stream_row}))
+-        # v61.0.1 (CIRISPersist#1184) — a refusal the key-grant rule makes
+-        # itself carries no plane reason.
+-        assert refused.value.attestation_reason is None, refused.value
+-
+-        for row in key_rows:
+-            b.apply_replicated_attestation(json.dumps({"attestation": row.get("attestation", row)}))
+-        _occurrence(b, ka, ka, enc_a)
+-
+-        # A row whose wrap was altered in flight no longer verifies.
+-        forged = copy.deepcopy(stream_row)
+-        wrap = json.loads(forged["attestation_envelope"]["wrapped_dek"])
+-        wrap["ciphertext_b64"] = base64.b64encode(bytes(48)).decode()
+-        forged["attestation_envelope"]["wrapped_dek"] = json.dumps(wrap)
+-        with pytest.raises(ValueError, match="unverified"):
+-            b.apply_replicated_key_grant(json.dumps({"attestation": forged}))
+-
+-        # The stream wrap is held: admitted and projected.
+-        got = json.loads(b.apply_replicated_key_grant(json.dumps({"attestation": stream_row})))
+-        assert got["axis"] == {
+-            "axis": "stream",
+-            "stream_id": stream,
+-            "epoch": 0,
+-            "cohort_scope": "self",
+-            "owner_key_id": ka,
+-        }, got
+-        assert got["recipient_key_id"] == ka, got
+-        assert (got["attestation"], got["projected"], got["pending"]) == ("inserted", True, False), got
+-
+-        # v61.0.1 (CIRISPersist#1184) — a refusal by the attestation plane is
+-        # carried typed: the altered copy under the held row's id is a
+-        # conflicting attestation, and the exception says so in
+-        # `attestation_reason` (the snake_case token), not only in its text.
+-        with pytest.raises(ValueError, match="attestation_refused") as conflict:
+-            b.apply_replicated_key_grant(json.dumps({"attestation": forged}))
+-        assert conflict.value.attestation_reason == "conflicting_attestation", conflict.value
+-
+-        # The content wrap is admitted and kept pending: B holds none of the
+-        # bytes it opens (it is not party to A's self content).
+-        got = json.loads(b.apply_replicated_key_grant(json.dumps({"attestation": content_row})))
+-        assert got["axis"] == content_axis, got
+-        assert (got["attestation"], got["projected"], got["pending"]) == ("inserted", False, True), got
+-
+-        # Re-delivery is idempotent.
+-        for row in (stream_row, content_row):
+-            again = json.loads(b.apply_replicated_key_grant(json.dumps({"attestation": row})))
+-            assert again["attestation"] == "unchanged", again
+-
+-        held = {r["attestation_id"] for r in _key_grant_rows(b, ka)}
+-        assert held == {stream_row["attestation_id"], content_row["attestation_id"]}, held
+-    finally:
+-        b.close(force=True)
+-    ciris_persist.reset_engine()
+diff --git a/tests/python/test_key_id_fingerprint_surface.py b/tests/python/test_key_id_fingerprint_surface.py
+deleted file mode 100644
+index 8671b9b6..00000000
+--- a/tests/python/test_key_id_fingerprint_surface.py
++++ /dev/null
+@@ -1,56 +0,0 @@
+-"""v59.0.0 (CIRISPersist#1103, CC 2.6.8) — I1153 at Python ``put_public_key``.
+-
+-A host's raw registration through the wheel refuses a key id that does not end
+-in ``-<fp>`` of its own Ed25519 key (``federation_malformed_row:
+-key_registration: key_id_fingerprint_mismatch``) and admits one that does.
+-"""
+-
+-import json
+-
+-import pytest
+-
+-import ciris_persist
+-
+-
+-def _engine(tmp_path):
+-    seed = tmp_path / "fp.seed"
+-    pqc_seed = tmp_path / "fp.pqc"
+-    seed.write_bytes(bytes([0x5A] * 32))
+-    pqc_seed.write_bytes(bytes([0xA5] * 32))
+-    alias = "fp-surface"
+-    ciris_persist.reset_engine()
+-    try:
+-        return ciris_persist.Engine(
+-            "sqlite::memory:",
+-            alias,
+-            local_key_id=alias,
+-            local_key_path=str(seed),
+-            local_pqc_key_id=alias + "-pqc",
+-            local_pqc_key_path=str(pqc_seed),
+-        ), alias
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-
+-
+-def test_put_public_key_refuses_a_mismatched_id_and_admits_a_derived_one_1103(tmp_path) -> None:
+-    eng, alias = _engine(tmp_path)
+-    try:
+-        # The engine registers its own key under the DERIVED id
+-        # (`<alias>-<fp>`), through the unchecked in-process executor.
+-        derived = eng.register_self_federation_key("agent", alias)
+-        assert derived != alias and derived.startswith(alias + "-"), derived
+-        record = json.loads(eng.lookup_public_key(derived))
+-
+-        bad = dict(record, key_id="fp-surface-mismatched")
+-        with pytest.raises(ValueError) as refused:
+-            eng.put_public_key(json.dumps({"record": bad}))
+-        assert "key_id_fingerprint_mismatch" in str(refused.value), refused.value
+-        assert eng.lookup_public_key("fp-surface-mismatched") is None
+-
+-        # The derived id passes the gate (an identical re-put is a no-op).
+-        eng.put_public_key(json.dumps({"record": record}))
+-        assert eng.lookup_public_key(derived) is not None
+-    finally:
+-        ciris_persist.reset_engine()
+diff --git a/tests/python/test_sqlite_engine.py b/tests/python/test_sqlite_engine.py
+index c607b1f9..4fa0f538 100644
+--- a/tests/python/test_sqlite_engine.py
++++ b/tests/python/test_sqlite_engine.py
+@@ -16,6 +16,9 @@ from __future__ import annotations
+ 
+ import ciris_persist
+ 
++# v62.0.0 — an identity-ref (CIRISVerify `edition2::IDENTITY_REF_PREFIX`).
++IDENTITY_REF_PREFIX = "urn:ietf:params:oauth:ckt:sha-256:"
++
+ 
+ def test_typed_exception_hierarchy_exported() -> None:
+     """v1.0.0 (CIRISAgent#755 + #756 sign-off) — the four typed
+@@ -341,17 +344,22 @@ def test_register_self_then_put_blob_signing_275() -> None:
+             pytest.skip("wheel built without the sqlite feature")
+         raise
+     try:
+-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
++        kid = eng.register_self_federation_key("agent")
+         # The registered + returned key_id is the DERIVED wire id, NOT the
+         # bare alias — this is the heart of the #275 fix.
+         assert kid != alias, "register_self must register the derived id, not the alias"
+-        assert kid.startswith(alias + "-"), f"derived id shape <label>-<fp>: {kid!r}"
++        # v62.0.0 — the returned id is the key's identity-ref (CC 2.6.1), not
++        # the earlier `<label>-<fp>` shape; its form is witnessed in
++        # test_edition2_surface.py (I2510).
++        assert kid.startswith(IDENTITY_REF_PREFIX), kid
+ 
+         # #275 3rd surface — the stored pubkey_ed25519_base64 must be a valid
+         # 32-byte Ed25519 key (not the 65-byte P-256 point the keystore
+         # software/TPM fallback would yield), or any read-back verify
+-        # (verify_hybrid_via_directory) fails invalid_length.
+-        row = json.loads(eng.lookup_keys_for_identity("ref"))[0]
++        # fails invalid_length.
++        # v62.0.0 — read through the key's edition-2 projection (the
++        # `identity_ref` argument of register_self is gone).
++        row = json.loads(eng.lookup_public_key(kid))
+         pubkey = base64.b64decode(row["pubkey_ed25519_base64"])
+         assert len(pubkey) == 32, f"stored pubkey must be 32-byte Ed25519, got {len(pubkey)}"
+ 
+@@ -368,13 +376,10 @@ def test_register_self_then_put_blob_signing_275() -> None:
+             str(uuid.uuid4()),
+         )
+ 
+-        # CIRISPersist#851 §20.5 (operator ruling) — hybrid/PQC only, no
+-        # legacy fallback. The commons door's holding claim (v55.0.0:
+-        # custody:ack:v1 `here` at federation, CIRISPersist#989) ALWAYS carries
+-        # its PQC half, because an engine without one cannot announce at all:
+-        # its door refuses before storing anything announced (I80, I83). This
+-        # engine has a PQC LocalSigner, so the claim must be hybrid. Read back
+-        # through a host door.
++        # The commons door's holding claim (v55.0.0: custody:ack:v1 `here` at
++        # federation, CIRISPersist#989) is stored under the registered id. Read
++        # back through a host door. (v62.0.0: the earlier per-row PQC-half
++        # assertion is gone; a row is one composite statement.)
+         # v56.0.0 (CIRISPersist#1001): one bounded page, narrowed to the
+         # custody family.
+         rows = json.loads(eng.list_attestations_by(kid, 500, None, "custody:ack:"))["items"]
+@@ -385,10 +390,6 @@ def test_register_self_then_put_blob_signing_275() -> None:
+             and (r.get("attestation_envelope") or {}).get("dimension") == "custody:ack:v1"
+         ]
+         assert claims, "the holding claim is stored under the derived id"
+-        assert all(r.get("scrub_signature_pqc") for r in claims), (
+-            "hybrid-only (#851 §20.5): every announced holding claim carries its "
+-            "ML-DSA-65 half — a classical claim no peer admits can no longer be produced"
+-        )
+ 
+         # #295 — local_derived_key_id() returns the SAME registered/verified
+         # derived id (the footgun-free one), distinct from the bare alias.
+@@ -400,131 +401,6 @@ def test_register_self_then_put_blob_signing_275() -> None:
+     ciris_persist.reset_engine()
+ 
+ 
+-def test_local_derived_key_id_pyo3_295():
+-    """#295 — the pyo3 Engine exposes local_derived_key_id(): the DERIVED
+-    federation key_id (`<label>-<fp>`) the substrate registers + verifies,
+-    so consumers stop re-implementing derive_key_id. Distinct from the bare
+-    local_key_id() alias. Skips on a non-sqlite wheel."""
+-    import os
+-    import secrets
+-    import tempfile
+-
+-    import pytest
+-
+-    ciris_persist.reset_engine()
+-    d = tempfile.mkdtemp()
+-    seed = os.path.join(d, "seed")
+-    pqc_seed = os.path.join(d, "pqc.seed")
+-    with open(seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    with open(pqc_seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    alias = "node-" + secrets.token_hex(8)
+-    try:
+-        # v21.3.0 (#513) — the FIPS floor made the self-signed authority path
+-        # hybrid-mandatory, so the node needs a PQC key too. This test predates
+-        # that cut and CI never re-ran it (the `pyo3` wheel has no sqlite, so it
+-        # SKIPS there) — the classical-only Engine it used to build now fails
+-        # the hybrid-Strict verify at put_community.
+-        eng = ciris_persist.Engine(
+-            "sqlite::memory:",
+-            alias,
+-            local_key_id=alias,
+-            local_key_path=seed,
+-            local_pqc_key_id=alias + "-pqc",
+-            local_pqc_key_path=pqc_seed,
+-        )
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-    try:
+-        derived = eng.local_derived_key_id()
+-        # Shape: <alias>-<fingerprint>, NOT the bare alias.
+-        assert derived != alias
+-        assert derived.startswith(alias + "-"), f"derived shape <label>-<fp>: {derived!r}"
+-        assert eng.local_key_id() == alias
+-        # Stable across calls (pure derivation over the composed signer).
+-        assert eng.local_derived_key_id() == derived
+-        # It is exactly the id register_self registers + returns (the FK target).
+-        assert eng.register_self_federation_key("agent", "ref", None, None, None) == derived
+-    finally:
+-        eng.close(force=True)
+-    ciris_persist.reset_engine()
+-
+-
+-def test_put_community_json_round_trip_290() -> None:
+-    """v10.4.0 (CIRISPersist#290) — `put_community_json` brings a community
+-    into existence over the wheel (symmetric with `put_family_json`). Before
+-    this, the only community surfaces were add/lookup/active — none could
+-    CREATE one — so the §11.10 moderation-authority walk's authority set was
+-    always empty. Round-trips create → lookup. Skips on a non-sqlite wheel."""
+-    import json
+-    import os
+-    import secrets
+-    import tempfile
+-
+-    import pytest
+-
+-    ciris_persist.reset_engine()
+-    d = tempfile.mkdtemp()
+-    seed = os.path.join(d, "seed")
+-    pqc_seed = os.path.join(d, "pqc.seed")
+-    with open(seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    with open(pqc_seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    alias = "node-" + secrets.token_hex(8)
+-    try:
+-        # v21.3.0 (#513) — the FIPS floor made the self-signed authority path
+-        # hybrid-mandatory, so the node needs a PQC key too. This test predates
+-        # that cut and CI never re-ran it (the `pyo3` wheel has no sqlite, so it
+-        # SKIPS there) — the classical-only Engine it used to build now fails
+-        # the hybrid-Strict verify at put_community.
+-        eng = ciris_persist.Engine(
+-            "sqlite::memory:",
+-            alias,
+-            local_key_id=alias,
+-            local_key_path=seed,
+-            local_pqc_key_id=alias + "-pqc",
+-            local_pqc_key_path=pqc_seed,
+-        )
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-    try:
+-        # The community_key_id + each member must FK a registered
+-        # federation_keys row. Register as `primitive` — the put_community
+-        # steward-binding gate (CC 3.2 UnstewardedCommunityMember) is exempt for
+-        # primitive identities; agent/node members would need a steward-
+-        # binding chain (which the conformance harness supplies in the real
+-        # moderation flow, but isn't needed to prove the FFI admits a row).
+-        kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
+-        now = "2026-06-25T00:00:00.000Z"
+-        eng.put_community_json(
+-            json.dumps(
+-                {
+-                    "community_key_id": kid,
+-                    "community_name": "T",
+-                    "members": [{"key_id": kid, "joined_at": now, "role": "founder"}],
+-                    "founded_at": now,
+-                    "consensus_protocol": "majority",
+-                    "policy_blob": None,
+-                    "persist_row_hash": "",
+-                }
+-            )
+-        )
+-        # The community now exists + is readable (the authority root the
+-        # §11.10 moderation walk needs).
+-        got = json.loads(eng.lookup_community_json(kid))
+-        assert got["community_key_id"] == kid
+-        assert any(m["key_id"] == kid for m in got["members"]), got
+-    finally:
+-        eng.close(force=True)
+-    ciris_persist.reset_engine()
+-
+-
+ def test_emit_attestation_self_rejects_uppercase_subject_key_id_293():
+     """#293 (CC 2.6.3 / §0.6) — emit_attestation_self must REFUSE a
+     non-lowercase subject_key_ids[] element (uppercase-hex from the issue
+@@ -560,7 +436,7 @@ def test_emit_attestation_self_rejects_uppercase_subject_key_id_293():
+             pytest.skip("wheel built without the sqlite feature")
+         raise
+     try:
+-        eng.register_self_federation_key("agent", "ref", None, None, None)
++        eng.register_self_federation_key("agent")
+         upper = "FF7C5632DAE6EF3AE7F6283BD35268BC7910332414AA8A1C35A1645CA0295F61"
+ 
+         # Uppercase-hex subject id — must be refused (was admitted on 10.4.0).
+@@ -626,7 +502,7 @@ def test_nodes_stewarded_by_json_pyo3_299():
+             pytest.skip("wheel built without the sqlite feature")
+         raise
+     try:
+-        kid = eng.register_self_federation_key("user", "ref", None, None, None)
++        kid = eng.register_self_federation_key("user")
+         # A user-role key owns itself (exact inverse: kid ∈ nodes_stewarded_by(kid)
+         # ⟺ kid ∈ steward_bindings_of(kid), the clause-1 self-binding).
+         owned = json.loads(eng.nodes_stewarded_by_json(kid))
+@@ -641,213 +517,6 @@ def test_nodes_stewarded_by_json_pyo3_299():
+     ciris_persist.reset_engine()
+ 
+ 
+-def test_accord_live_quorum_ffi_302():
+-    """#302 — the accord live-quorum write-through FFI is bound and routes
+-    JSON through the backend: a proposer-minted nonce admits and its reuse by
+-    a different proposal is refused (v54.1.0, #1047), proposal round-trip via the anchor index, and active-halt H2
+-    set/clear semantics. The verify-before-mutation participation path needs
+-    real hybrid signatures and is covered exhaustively by the Rust tests."""
+-    import json
+-    import os
+-    import secrets
+-    import tempfile
+-
+-    import pytest
+-
+-    ciris_persist.reset_engine()
+-    seed = os.path.join(tempfile.mkdtemp(), "seed")
+-    with open(seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    alias = "n" + secrets.token_hex(6)
+-    try:
+-        eng = ciris_persist.Engine(
+-            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
+-        )
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-    try:
+-        proposal = {
+-            "family_key_id": "fam",
+-            "action": "fire",
+-            "nonce": "n1",
+-            "window_until": "2031-01-01T00:00:00Z",
+-            "prior_family_digest": "pfd-abc",
+-            "payload_sha256": "psh-def",
+-        }
+-        # v54.1.0 (#1047): the nonce is the proposer's; nothing is issued
+-        # first. Admitted; the anchor index returns it (verbatim round-trip).
+-        eng.put_accord_proposal_json(
+-            json.dumps({"proposal": proposal, "authority_signature": None})
+-        )
+-        # Single use: a different proposal reusing the nonce in this family
+-        # is refused (typed, ValueError).
+-        reuse = dict(proposal, window_until="2030-01-01T00:00:00Z")
+-        with pytest.raises(ValueError, match="federation_accord_proposal_nonce_reused"):
+-            eng.put_accord_proposal_json(
+-                json.dumps({"proposal": reuse, "authority_signature": None})
+-            )
+-        rows = json.loads(eng.list_accord_proposals_by_anchor_json("fire", "pfd-abc"))
+-        assert len(rows) == 1
+-        assert rows[0]["proposal"]["nonce"] == "n1"
+-
+-        # H2 active halt: set, wrong-id resume no-ops, right-id clears.
+-        eng.set_active_halt("fam", "halt-X")
+-        assert json.loads(eng.get_active_halt_json("fam"))["active_halt_id"] == "halt-X"
+-        eng.clear_active_halt("fam", "halt-WRONG")
+-        assert eng.get_active_halt_json("fam") is not None
+-        eng.clear_active_halt("fam", "halt-X")
+-        assert eng.get_active_halt_json("fam") is None
+-    finally:
+-        eng.close(force=True)
+-    ciris_persist.reset_engine()
+-
+-
+-def test_pyengine_seeds_family_and_canonical() -> None:
+-    """v13.4.1 (CIRISPersist#392) — the pyo3 `Engine()` ctor must run the SAME
+-    genesis seed as the Rust `with_signer`: a fresh Engine has the entrenched
+-    HUMANITY_ACCORD family (#386) AND the baked 2-of-3 `ciris-canonical-1`
+-    canonical server (#390). This is the guard for the drift where the pyo3
+-    ctor stopped at the holder seed, so wheel consumers (the server) got
+-    neither. Skips on a non-sqlite wheel."""
+-    import json
+-    import pytest
+-
+-    try:
+-        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="genesis-seed-key")
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-    try:
+-        # #390 — the baked 2-of-3 canonical server is trusted out of the box.
+-        assert eng.is_canonical("ciris-canonical-1-d7bdeu223k") is True
+-        servers = json.loads(eng.list_canonical_servers())
+-        assert len(servers) == 1
+-        assert servers[0]["key_id"] == "ciris-canonical-1-d7bdeu223k"
+-
+-        # #386 — the entrenched quorum:2/3 HUMANITY_ACCORD family resolves.
+-        fam_json = eng.lookup_family_json("humanity-accord")
+-        assert fam_json is not None, "the accord family must be seeded on the pyo3 path"
+-        fam = json.loads(fam_json)
+-        assert fam["consensus_protocol"] == "quorum:2/3"
+-        assert len(fam["members"]) == 3
+-    finally:
+-        eng.close(force=True)
+-    ciris_persist.reset_engine()
+-
+-
+-def test_pyengine_canonical_bootstrap_hints() -> None:
+-    """v13.6.0 (CIRISPersist#402, CIRISEdge#296) — a fresh Engine exposes the
+-    baked canonical's dial hints as a flat {key_id, kind, destination} list, so
+-    the agent-embedded edge auto-seeds the canonical TCP dial without parsing
+-    persist's signed registration_envelope. Skips on a non-sqlite wheel."""
+-    import json
+-    import pytest
+-
+-    try:
+-        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="genesis-seed-key")
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-    try:
+-        hints = json.loads(eng.canonical_bootstrap_hints())
+-        # The baked 2-of-3 canonical carries one `ip` dial hint (#390).
+-        assert isinstance(hints, list) and len(hints) >= 1
+-        ip_hints = [h for h in hints if h["kind"] == "ip"]
+-        assert len(ip_hints) == 1, f"expected exactly one ip dial hint, got {hints}"
+-        h = ip_hints[0]
+-        assert h["key_id"] == "ciris-canonical-1-d7bdeu223k"
+-        assert h["destination"] == "108.61.242.236:4242"
+-        # Flat object shape — edge reads these keys directly, not a tuple/array.
+-        assert set(h.keys()) == {"key_id", "kind", "destination"}
+-    finally:
+-        eng.close(force=True)
+-    ciris_persist.reset_engine()
+-
+-
+-def test_local_sign_hybrid_matches_hand_composition_470() -> None:
+-    """v17.7.0 (CIRISPersist#470) — cross-boundary DIFFERENTIAL test for the
+-    single hybrid-sign verb.
+-
+-    ``Engine.local_sign_hybrid(msg)`` must be *exactly* equivalent to the
+-    hand-composition every PyO3 consumer previously had to write —
+-    ``local_sign(msg)`` then ``local_pqc_sign(msg + classical_sig)`` (the
+-    canonical bound rule ``pqc = Sign_PQC(message ‖ ed25519_sig)``). This is
+-    the authority-equivalence guard from the crypto-DRY assessment: the rule
+-    now lives in ONE place (LocalSigner::sign_hybrid) and this test pins the
+-    PyO3 surface to it from the consumer's side, so lens-core can migrate off
+-    its hand-composed site knowing the bytes are identical.
+-
+-    Ed25519 is deterministic (RFC 8032) so the classical halves compare
+-    byte-for-byte. ML-DSA-65 signing is randomized ("hedged", FIPS 204), so
+-    the PQC halves cannot be compared byte-for-byte — instead we assert the
+-    verb's PQC signature has the ML-DSA-65 shape and, critically, that the
+-    hand-composed bound signature and the verb's signature are BOTH accepted
+-    /interchangeable over the same bound preimage (same key, same preimage).
+-    Skips on a non-sqlite wheel."""
+-    import os
+-    import secrets
+-    import tempfile
+-
+-    import pytest
+-
+-    ciris_persist.reset_engine()
+-    d = tempfile.mkdtemp()
+-    ed_seed = os.path.join(d, "ed.seed")
+-    pqc_seed = os.path.join(d, "pqc.seed")
+-    with open(ed_seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    with open(pqc_seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    alias = "dry470-" + secrets.token_hex(6)
+-    try:
+-        eng = ciris_persist.Engine(
+-            "sqlite::memory:",
+-            alias,
+-            local_key_id=alias,
+-            local_key_path=ed_seed,
+-            local_pqc_key_id=alias + "-pqc",
+-            local_pqc_key_path=pqc_seed,
+-        )
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-    try:
+-        msg = b"CIRISPersist#470 pyo3 differential"
+-
+-        # The single verb.
+-        out = eng.local_sign_hybrid(msg)
+-        assert set(out.keys()) == {"classical_sig", "pqc_sig"}
+-        classical = out["classical_sig"]
+-        pqc = out["pqc_sig"]
+-        assert isinstance(classical, bytes) and len(classical) == 64
+-        # ML-DSA-65 signatures are 3309 bytes (FIPS 204).
+-        assert isinstance(pqc, bytes) and len(pqc) == 3309
+-
+-        # The hand-composition it replaces (the pre-#470 consumer pattern).
+-        hand_classical = eng.local_sign(msg)
+-        hand_pqc = eng.local_pqc_sign(msg + hand_classical)
+-
+-        # Classical halves: Ed25519 is deterministic — byte-identical.
+-        assert classical == hand_classical, (
+-            "local_sign_hybrid's classical half must be byte-identical to "
+-            "local_sign — both delegate to the same LocalSigner"
+-        )
+-        # PQC halves: ML-DSA-65 is randomized, so assert shape parity (same
+-        # scheme, same preimage family) rather than byte equality. The
+-        # Rust-side round-trip test (sign_hybrid_round_trips_verify_hybrid_strict)
+-        # proves the verb's bound preimage verifies under HybridPolicy::Strict
+-        # and that a raw-preimage signature is rejected.
+-        assert len(hand_pqc) == len(pqc) == 3309
+-    finally:
+-        eng.close(force=True)
+-    ciris_persist.reset_engine()
+-
+-
+ def test_consent_expiry_sweep_and_scoped_stance_reachable_from_python_866():
+     """v44.8.0 (CIRISPersist#866) — the two new consent doors are host-reachable:
+     `run_consent_expiry_sweep_json` returns the sweep report shape, and
+@@ -886,7 +555,6 @@ def test_consent_expiry_sweep_and_scoped_stance_reachable_from_python_866():
+     ciris_persist.reset_engine()
+ 
+ 
+-
+ def test_deletion_window_watch_reachable_from_python_543() -> None:
+     """v22.0.0 (CIRISPersist#543 / ciris.ai/contextual-integrity) — the
+     deletion-window breach sweep is reachable THROUGH the FFI.
+@@ -982,7 +650,7 @@ def test_put_blob_scoped_aad_b64_binds_the_seal_831() -> None:
+             pytest.skip("wheel built without the sqlite feature")
+         raise
+     try:
+-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
++        kid = eng.register_self_federation_key("agent")
+         # One keyed occurrence of the self identity — the grantee. The
+         # occurrence key IS the identity key (the v3.12.0 binding shape; the
+         # occurrence column carries an FK to `federation_keys`, and the self
+@@ -1097,7 +765,7 @@ def test_put_blob_scoped_reports_the_roster_partition_843() -> None:
+     try:
+         # The node's own key is the community's key AND its one member (a
+         # primitive identity needs no steward binding at put_community).
+-        kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
++        kid = eng.register_self_federation_key("primitive")
+         now = "2026-09-09T00:00:00.000Z"
+         eng.put_community_json(
+             json.dumps(
+@@ -1212,7 +880,7 @@ def test_would_hold_adopt_and_hold_breadth_846() -> None:
+             pytest.skip("wheel built without the sqlite feature")
+         raise
+     try:
+-        eng.register_self_federation_key("agent", "ref", None, None, None)
++        eng.register_self_federation_key("agent")
+         peer = "peer-" + secrets.token_hex(4)
+ 
+         # Not party to a community we are not a member of: the answer, not an error.
+@@ -1277,99 +945,6 @@ def test_would_hold_adopt_and_hold_breadth_846() -> None:
+     ciris_persist.reset_engine()
+ 
+ 
+-def test_ciris_canonical_trust_root_surface_926() -> None:
+-    """v50.0.0 (CIRISPersist#926) — the trust-root surface is host-reachable.
+-
+-    A fresh engine (genesis seeded, no community row yet) resolves
+-    ``ciris-canonical`` to nothing, serves the compiled-in bundle with
+-    ``community: null``, and a consumer pin from that one response is refused
+-    (nothing beside the bundle) rather than pinning a name that resolves to
+-    nothing. A ``cosignatures`` list on ``put_community_json`` is decoded, and
+-    a malformed one is refused, never read as "none".
+-    """
+-    import json
+-    import os
+-    import secrets
+-    import tempfile
+-
+-    import pytest
+-
+-    ciris_persist.reset_engine()
+-    d = tempfile.mkdtemp()
+-    seed = os.path.join(d, "seed")
+-    pqc_seed = os.path.join(d, "pqc.seed")
+-    with open(seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    with open(pqc_seed, "wb") as fh:
+-        fh.write(secrets.token_bytes(32))
+-    alias = "node-" + secrets.token_hex(8)
+-    try:
+-        eng = ciris_persist.Engine(
+-            "sqlite::memory:",
+-            alias,
+-            local_key_id=alias,
+-            local_key_path=seed,
+-            local_pqc_key_id=alias + "-pqc",
+-            local_pqc_key_path=pqc_seed,
+-        )
+-    except ValueError as exc:
+-        if "sqlite" in str(exc) and "feature" in str(exc):
+-            pytest.skip("wheel built without the sqlite feature")
+-        raise
+-    try:
+-        # v53.1.1 — the final genesis is baked: a fresh node boots holding the
+-        # ciris-canonical birth (founders A1/B1/C1, the one serve node), live.
+-        canon = json.loads(eng.resolve_community_json("ciris-canonical"))
+-        assert canon["founders"] == ["A1", "B1", "C1"], canon
+-        assert canon["members"] == ["ciris-canonical-1-d7bdeu223k"], canon
+-        assert canon["cohort_subkind"] == "infrastructure" and canon["live"] is True, canon
+-        resp = json.loads(eng.trust_root_bundle_response_json())
+-        assert resp["charter_root_key_id"] == "humanity-accord"
+-        assert resp["community"]["community"]["community_key_id"] == "ciris-canonical", resp["community"]
+-        assert isinstance(resp["bundle"]["authorizations"], list)
+-        # v53.1.1 — pinning trust from the node's own served response now
+-        # succeeds: the response carries the final genesis's v3 bundle and
+-        # its live community, and the pin verifies every holder.
+-        pinned = json.loads(eng.pin_trust_from_bundle_response_json(json.dumps(resp)))
+-        assert pinned["family"] == "humanity-accord", pinned
+-        # v59.1.0 — the baked bundle is the 2-of-3 v4 amend (A1 + B1), which
+-        # meets the charter's 2/3; the carried charter keeps all three scrubs.
+-        assert pinned["bundle_holders_verified"] == 2, pinned
+-        assert pinned["community"]["community_key_id"] == "ciris-canonical", pinned
+-        assert pinned["community"]["live"] is True, pinned
+-        now = "2026-06-25T00:00:00.000Z"
+-        kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
+-        base = {
+-            "community_key_id": kid,
+-            "community_name": "T",
+-            "members": [{"key_id": kid, "joined_at": now, "role": "founder"}],
+-            "founded_at": now,
+-            "consensus_protocol": "majority",
+-            "policy_blob": None,
+-            "persist_row_hash": "",
+-            "authority_key_id": kid,
+-            "scrub_signature_classical": "AAAA",
+-        }
+-        with pytest.raises(ValueError, match="cosignatures decode"):
+-            eng.put_community_json(json.dumps({**base, "cosignatures": "not-a-list"}))
+-        # A well-formed list is decoded and reaches the door, which verifies it
+-        # (here the authority signature itself is bogus, so the door refuses).
+-        with pytest.raises(Exception):
+-            eng.put_community_json(
+-                json.dumps(
+-                    {
+-                        **base,
+-                        "cosignatures": [
+-                            {"authority_key_id": kid, "scrub_signature_classical": "AAAA"}
+-                        ],
+-                    }
+-                )
+-            )
+-    finally:
+-        eng.close(force=True)
+-    ciris_persist.reset_engine()
+-
+-
+ def test_reack_holding_claims_once_is_host_reachable_989() -> None:
+     """v55.0.0 (#989, CC 3.1.3.3 rule 5) — the re-ack pass is reachable from
+     Python and returns its report as JSON. A fresh commons claim is a day
+@@ -1408,7 +983,7 @@ def test_reack_holding_claims_once_is_host_reachable_989() -> None:
+             pytest.skip("wheel built without the sqlite feature")
+         raise
+     try:
+-        eng.register_self_federation_key("agent", "ref", None, None, None)
++        eng.register_self_federation_key("agent")
+         body = b"commons bytes " + secrets.token_bytes(8)
+         put = json.loads(
+             eng.put_blob_scoped("federation", base64.b64encode(body).decode(), None, None)

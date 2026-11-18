@@ -53,7 +53,7 @@ Do not commit in the `w62int` worktree. The coordinator commits the patch and no
   - `src/federation/directory_double.rs` is generated: edit `FederationDirectory` in `mod.rs`, then run `python3 scripts/gen_directory_double.py`.
   - Python surface: `python/ciris_persist/ciris_persist.pyi` must match (`scripts/pyi_surface.py check`).
 - **Tests that assert earlier-form behaviour are deleted, not rewritten.** These are hybrid-pending, `attach_*_pqc`, scrub upgrade, fingerprints, JCS hash checks and `*_v1_pinned`. List every deleted test in your notes, with one line of why.
-- **EMBARGO.**
+- **EMBARGO: LIFTED 2026-11-18 (Eric).** Neutral wording is no longer required.
   - In every code comment, test name, doc or note, name the key-of-issuer check neutrally: "the key-of-issuer check", "kid_not_of_iss".
   - This holds until the coordinator lifts it.
 - **Report back.** Your final message is at most 120 words: done or not done, the paths to your patch and notes, and your top 3 compile risks. Everything else goes in `<ID>.md`.

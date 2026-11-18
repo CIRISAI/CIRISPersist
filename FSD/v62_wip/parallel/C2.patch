@@ -1,0 +1,3353 @@
+diff --git a/scripts/gen_test_ceremony_v2_custody.py b/scripts/gen_test_ceremony_v2_custody.py
+new file mode 100644
+index 00000000..9057cc58
+--- /dev/null
++++ b/scripts/gen_test_ceremony_v2_custody.py
+@@ -0,0 +1,234 @@
++#!/usr/bin/env python3
++"""v62 (slice C2) -- the test ceremony's holder custody evidence.
++
++Writes `src/federation/edition2/fixture_genesis_custody.rs`: the mock YubiKey
++PIV attestation root and, for each test holder seed n in HOLDERS, the chain
++[9c leaf, f9] attesting the Ed25519 half of the composite test key n
++(ML-DSA-65 seed [n]*32, Ed25519 seed [n+100]*32).
++
++The PKI is CIRISVerify v23.3.0's vector PKI, reproduced exactly
++(`tests/vectors/edition2/genesis/gen_genesis_bundles_v2.py`, `CA`, `cert`,
++`yubikey_chain`). Ed25519 signing is deterministic, so the bytes are a pure
++function of the seeds. With `--check-verify <pool dir>` the chains of the
++holders Verify's vectors also carry (1, 2, 3, 4, and holder 1's recovered
++key 41 and recovery key 51) must appear byte for byte in
++Verify's pool, and the root must equal the case file's
++`attestation_root_der`.
++
++Test-only evidence: the root says "MOCK" in its name and is trusted only by a
++reader handed it as its attestation store.
++
++Needs pyca/cryptography. Calls no cargo.
++"""
++import argparse
++import datetime
++import hashlib
++import json
++import pathlib
++import sys
++
++from cryptography import x509
++from cryptography.hazmat.primitives import serialization as ser
++from cryptography.hazmat.primitives.asymmetric.ed25519 import (
++    Ed25519PrivateKey,
++    Ed25519PublicKey,
++)
++from cryptography.x509.oid import NameOID
++
++HOLDERS = [1, 2, 3, 4, 5, 6, 7]
++# After a recovery, holder n signs with key n + 40 (Verify's A_NEW = 41 for A = 1);
++# its chain carries the holder's own f9 (labelled n).
++RECOVERED_OFFSET = 40
++# Holder n's first recovery key is key n + 50 (Verify's REC). Its chain exists
++# only so a witness can offer a recovery that seats the recovery key itself
++# as the signing key (Verify's `recA_rk`), which the reader refuses.
++RECOVERY_KEY_OFFSET = 50
++# After a SECOND recovery, holder n signs with key n + 80 (not in Verify's
++# vectors, which use 42 for holder 1; 80 keeps every holder's keys disjoint).
++SECOND_RECOVERED_OFFSET = 80
++NB = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
++NA = datetime.datetime(2099, 12, 31, tzinfo=datetime.timezone.utc)
++OID_FW, OID_TOUCH, OID_FIPS = (
++    "1.3.6.1.4.1.41482.3.3",
++    "1.3.6.1.4.1.41482.3.8",
++    "1.3.6.1.4.1.41482.3.10",
++)
++
++
++def sha(b):
++    return hashlib.sha256(b).digest()
++
++
++def name(cn):
++    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
++
++
++def cert(subject, issuer, pub, signer, serial, exts=()):
++    b = (
++        x509.CertificateBuilder()
++        .subject_name(name(subject))
++        .issuer_name(name(issuer))
++        .public_key(pub)
++        .serial_number(serial)
++        .not_valid_before(NB)
++        .not_valid_after(NA)
++    )
++    for oid, val in exts:
++        b = b.add_extension(
++            x509.UnrecognizedExtension(x509.ObjectIdentifier(oid), val), critical=False
++        )
++    return b.sign(signer, None).public_bytes(ser.Encoding.DER)
++
++
++class CA:
++    def __init__(self, label):
++        self.key = Ed25519PrivateKey.from_private_bytes(sha(label.encode()))
++        self.cn = label
++        self.der = cert(label, label, self.key.public_key(), self.key, 1)
++
++
++ROOT = CA("Yubico PIV Attestation (MOCK root, test only)")
++
++
++def ed_pub(n):
++    k = Ed25519PrivateKey.from_private_bytes(bytes([(n + 100) % 256]) * 32)
++    return k.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw)
++
++
++def yubikey_chain(ed_pub_bytes, n, ca=ROOT, fips=True, touch=2):
++    f9k = Ed25519PrivateKey.from_private_bytes(sha(b"f9" + bytes([n]) + ca.cn.encode()))
++    f9cn = "YubiKey PIV Attestation f9 (MOCK %d)" % n
++    f9 = cert(f9cn, ca.cn, f9k.public_key(), ca.key, 100 + n, [(OID_FIPS, b"")] if fips else [])
++    leaf = cert(
++        "YubiKey PIV Attestation 9c (MOCK %d)" % n,
++        f9cn,
++        Ed25519PublicKey.from_public_bytes(ed_pub_bytes),
++        f9k,
++        200 + n,
++        [(OID_FW, b"\x04\x03\x05\x07\x04"), (OID_TOUCH, b"\x04\x02\x01" + bytes([touch]))],
++    )
++    return [leaf, f9]
++
++
++def rust_bytes(b, indent="    "):
++    """concat! arguments: one comma-terminated literal per 96 hex digits."""
++    h = b.hex()
++    return "\n".join('%s"%s",' % (indent, h[i : i + 96]) for i in range(0, len(h), 96))
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out", default="src/federation/edition2/fixture_genesis_custody.rs")
++    ap.add_argument("--check-verify", help="Verify's tests/vectors/edition2/genesis directory")
++    a = ap.parse_args()
++    chains = {n: yubikey_chain(ed_pub(n), n) for n in HOLDERS}
++    recovered = {n: yubikey_chain(ed_pub(n + RECOVERED_OFFSET), n) for n in HOLDERS}
++    recovery = {n: yubikey_chain(ed_pub(n + RECOVERY_KEY_OFFSET), n) for n in HOLDERS}
++    second = {n: yubikey_chain(ed_pub(n + SECOND_RECOVERED_OFFSET), n) for n in HOLDERS}
++    if a.check_verify:
++        d = pathlib.Path(a.check_verify)
++        case = json.loads((d / "genesis_bundles_v2.json").read_text())
++        assert case["attestation_root_der"] == ROOT.der.hex(), "root differs from Verify's"
++        pool = "".join(p.read_text() for p in sorted(d.glob("pool_v2_*.json")))
++        for n in (1, 2, 3, 4):
++            for c in chains[n]:
++                assert c.hex() in pool, "chain %d differs from Verify's pool" % n
++        for c in recovered[1]:
++            assert c.hex() in pool, "the recovered chain of holder 1 (key 41) differs from Verify's pool"
++        for c in recovery[1]:
++            assert c.hex() in pool, "the recovery-key chain of holder 1 (key 51) differs from Verify's pool"
++        print("checked: root, chains 1..4 and holder 1's recovered and recovery-key chains are byte-identical to Verify's vectors", file=sys.stderr)
++    out = [
++        "//! GENERATED by `scripts/gen_test_ceremony_v2_custody.py`: do not edit.",
++        "//!",
++        "//! The test ceremony's holder custody evidence (CC 4.2.2.1): the MOCK",
++        "//! YubiKey PIV attestation root of CIRISVerify v23.3.0's genesis vectors,",
++        "//! and for each test holder seed `n` the chain `[9c leaf, f9]` (hex, DER)",
++        "//! attesting the Ed25519 half of the composite test key `n`. Trusted only",
++        "//! by a reader handed [`MOCK_ATTESTATION_ROOT_HEX`] as its store.",
++        "",
++        "/// The MOCK attestation root (DER, hex).",
++        "pub const MOCK_ATTESTATION_ROOT_HEX: &str = concat!(",
++        rust_bytes(ROOT.der),
++        ");",
++        "",
++        "/// The holder seeds a chain is carried for.",
++        "pub const CHAIN_SEEDS: [u8; %d] = %s;" % (len(HOLDERS), str(HOLDERS)),
++        "",
++        "/// `(seed, [leaf hex, f9 hex])` per holder seed.",
++        "pub const HOLDER_CHAINS_HEX: [(u8, [&str; 2]); %d] = [" % len(HOLDERS),
++    ]
++    for n in HOLDERS:
++        leaf, f9 = chains[n]
++        out += [
++            "    (",
++            "        %d," % n,
++            "        [",
++            "            concat!(",
++            rust_bytes(leaf, " " * 16),
++            "            ),",
++            "            concat!(",
++            rust_bytes(f9, " " * 16),
++            "            ),",
++            "        ],",
++            "    ),",
++        ]
++    out += [
++        "];",
++        "",
++        "/// The signing-key seed offset after a recovery: holder `n` re-seats key `n + %d`." % RECOVERED_OFFSET,
++        "pub const RECOVERED_KEY_OFFSET: u8 = %d;" % RECOVERED_OFFSET,
++        "",
++        "/// `(holder seed, [leaf hex, f9 hex])`: the chain attesting the key holder `n`",
++        "/// re-seats after a recovery (key `n + RECOVERED_KEY_OFFSET`).",
++        "pub const RECOVERED_CHAINS_HEX: [(u8, [&str; 2]); %d] = [" % len(HOLDERS),
++    ]
++    for n in HOLDERS:
++        leaf, f9 = recovered[n]
++        out += chain_entry(n, leaf, f9)
++    out += [
++        "];",
++        "",
++        "/// `(holder seed, [leaf hex, f9 hex])`: a chain attesting holder `n`'s first",
++        "/// recovery key (key `n + %d`), for the witness that a recovery seating the" % RECOVERY_KEY_OFFSET,
++        "/// recovery key itself as the signing key is refused.",
++        "pub const RECOVERY_KEY_CHAINS_HEX: [(u8, [&str; 2]); %d] = [" % len(HOLDERS),
++    ]
++    for n in HOLDERS:
++        leaf, f9 = recovery[n]
++        out += chain_entry(n, leaf, f9)
++    out += [
++        "];",
++        "",
++        "/// The signing-key seed offset after a SECOND recovery: key `n + %d`." % SECOND_RECOVERED_OFFSET,
++        "pub const SECOND_RECOVERED_KEY_OFFSET: u8 = %d;" % SECOND_RECOVERED_OFFSET,
++        "",
++        "/// `(holder seed, [leaf hex, f9 hex])`: the chain attesting the key holder `n`",
++        "/// re-seats after a second recovery (key `n + SECOND_RECOVERED_KEY_OFFSET`).",
++        "pub const SECOND_RECOVERED_CHAINS_HEX: [(u8, [&str; 2]); %d] = [" % len(HOLDERS),
++    ]
++    for n in HOLDERS:
++        leaf, f9 = second[n]
++        out += chain_entry(n, leaf, f9)
++    out += ["];", ""]
++    pathlib.Path(a.out).write_text("\n".join(out))
++
++
++def chain_entry(n, leaf, f9):
++    return [
++        "    (",
++        "        %d," % n,
++        "        [",
++        "            concat!(",
++        rust_bytes(leaf, " " * 16),
++        "            ),",
++        "            concat!(",
++        rust_bytes(f9, " " * 16),
++        "            ),",
++        "        ],",
++        "    ),",
++    ]
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/engine.rs b/src/engine.rs
+index 0a5c4c59..3a2d2859 100644
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -489,7 +489,7 @@ impl Engine {
+     /// that declares what it is. `HostStoreProfile::SingleProcess` (a browser
+     /// worker over OPFS, a UEFI image) opens a SQLite store with
+     /// `locking_mode = EXCLUSIVE` first, WAL, and **no reader pool**, end to
+-    /// end through the migrations, the genesis seed and the open legs; no
++    /// end through the migrations and the open legs; no
+     /// environment knob or cgroup limit is read. `Native` is `with_signer`.
+     /// Postgres ignores the profile. The host's capability answer decides,
+     /// never a compile target.
+@@ -498,7 +498,7 @@ impl Engine {
+         dsn: &str,
+         host: crate::store::HostStoreProfile,
+     ) -> Result<Self, EngineError> {
+-        let backend = build_backend(dsn, true, host).await?;
++        let backend = build_backend(dsn, host).await?;
+         // v2.12.0 (#112): preserve the original `LocalSigner` Arc so
+         // `Engine::sign_hybrid` can reach `LocalSigner::sign_hybrid`.
+         let local_signer = Some(signer.clone());
+@@ -531,59 +531,42 @@ impl Engine {
+         // v61 — the open legs every open runs, the Python `Engine(...)`
+         // included ([`Self::settle_at_open`]). Never boot-fatal.
+         engine.settle_at_open().await;
++        // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
++        // bundles held (never seeded). Never boot-fatal.
++        engine.report_genesis_at_boot().await;
++        // v62.0.0 (JSON-cut slice C) — lib unit tests only: root the test
++        // ceremony's bundle/2 (`Self::install_test_genesis_at_boot`).
++        #[cfg(test)]
++        engine.install_test_genesis_at_boot().await;
+         Ok(engine)
+     }
+ 
+-    /// v31.0.0 (CIRISPersist#648) — **the pre-genesis constructor**: identical
+-    /// to [`with_signer`](Self::with_signer) (connect + run migrations) but it
+-    /// **SKIPS the HUMANITY_ACCORD genesis seed** — no baked A1/B1/C1 holder
+-    /// rows, no entrenched family row, no canonical.
++    /// v31.0.0 (CIRISPersist#648) — **the pre-genesis constructor**.
+     ///
+-    /// This is a **supported, default-features** entry point as of 31.0.0. It
+-    /// was `with_signer_no_genesis_seed`, fenced behind the `test-genesis-seam`
+-    /// cargo feature and absent from every release build, on the reasoning that
+-    /// *"a node without the baked trust root is broken"*. 31.0.0 is the release
+-    /// that disproves that: it is the binary that RUNS the genesis ceremony
+-    /// which produces the root a later cut bakes, so it has to be able to start
+-    /// without one. The seam is not test-only any more; it is the boot mode of
+-    /// a node that has not had its ceremony yet, and the feature that fenced it
+-    /// is removed.
++    /// v62.0.0 (JSON-cut slice C): every production constructor now boots
++    /// pre-genesis. There is no baked genesis to seed: a node roots nothing
++    /// until a `ceg-genesis-bundle/2` arrives at the import door (CC
++    /// 2.6.1.11, CC 5.3.4), and then roots it only under its anchor. In a
++    /// production build this constructor is exactly
++    /// [`with_signer`](Self::with_signer).
++    ///
++    /// It stays, under its name, as the one constructor that NEVER installs a
++    /// genesis, in any build: in lib unit tests the other constructors root
++    /// the test ceremony's bundle/2 at boot
++    /// (`install_test_genesis_at_boot`, `cfg(test)`),
++    /// and this one is "a fresh node".
+     ///
+     /// # This is not a relaxation
+     ///
+-    /// An Engine built here reports
+-    /// [`GenesisPosture::PreGenesis`](crate::federation::genesis::GenesisPosture::PreGenesis)
+-    /// from [`genesis_posture`](Self::genesis_posture), and every gate in
+-    /// [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
+-    /// refuses with
+-    /// [`Error::NoConstitutionalRootYet`](crate::federation::Error::NoConstitutionalRootYet).
+-    /// A node with no trust root is a node that trusts nothing — it is NOT a
+-    /// node that therefore checks nothing. Absence of a root is not absence of
+-    /// a rule.
+-    ///
+-    /// # What it is still for, unchanged
+-    ///
+-    /// Downstream integration tests that assemble a *controllable*
+-    /// custom-holder `humanity-accord` family (holders they can sign as) still
+-    /// use it, and for the same reason: the baked A1/B1/C1 + family would
+-    /// otherwise cause a UNIQUE conflict or an unsignable roster. That use is
+-    /// now a special case of the general one rather than a fenced exception.
+-    ///
+-    /// # What has NOT changed
+-    ///
+-    /// The assemble ceremony remains **idempotent**: an already-entrenched
+-    /// family is a no-op, never a replacement, so a node owner cannot overwrite
+-    /// the constitutional family with their own holders. Trust roots CO-EXIST —
+-    /// a second ceremony ADDS a root, addressed by its own `root_ref` and
+-    /// resolved per user — and none of that is a licence to mutate a root that
+-    /// already stands. See
+-    /// [`seed_accord_family`](crate::federation::genesis::seed_accord_family)
+-    /// and [`Error::ConstitutionalFamilyReserved`](crate::federation::Error::ConstitutionalFamilyReserved).
++    /// A node with no bundle in force holds no accord roster and no canonical
++    /// seat: every read that resolves authority to the accord root finds none
++    /// and refuses. A node with no trust root is a node that trusts nothing —
++    /// it is NOT a node that therefore checks nothing.
+     pub async fn with_signer_pre_genesis(
+         signer: Arc<LocalSigner>,
+         dsn: &str,
+     ) -> Result<Self, EngineError> {
+-        let backend = build_backend(dsn, false, crate::store::HostStoreProfile::Native).await?;
++        let backend = build_backend(dsn, crate::store::HostStoreProfile::Native).await?;
+         let local_signer = Some(signer.clone());
+         let signer: Arc<dyn HardwareSigner> = Arc::new(LocalSignerHardwareAdapter::new(signer));
+         let engine = Engine {
+@@ -612,9 +595,121 @@ impl Engine {
+         // v61 — the open legs every open runs, the Python `Engine(...)`
+         // included ([`Self::settle_at_open`]). Never boot-fatal.
+         engine.settle_at_open().await;
++        // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
++        // bundles held (never seeded). Never boot-fatal.
++        engine.report_genesis_at_boot().await;
+         Ok(engine)
+     }
+ 
++    /// v62.0.0 (JSON-cut slice C) — **a test Engine that holds a root**:
++    /// [`with_signer`](Self::with_signer), then the test ceremony's bundle/2
++    /// installed through the real doors
++    /// ([`fixture_genesis::install_v2`](crate::federation::edition2::fixture_genesis::install_v2)).
++    /// For integration tests and `test-anchor` hosts, where the lib-test boot
++    /// hook does not run. Idempotent where it does.
++    ///
++    /// # Errors
++    /// [`with_signer`](Self::with_signer)'s; [`EngineError::GenesisSeed`]
++    /// with the import door's refusal.
++    #[cfg(all(
++        any(test, feature = "test-anchor"),
++        any(feature = "postgres", feature = "sqlite")
++    ))]
++    pub async fn with_signer_test_genesis(
++        signer: Arc<LocalSigner>,
++        dsn: &str,
++    ) -> Result<Self, EngineError> {
++        let engine = Self::with_signer(signer, dsn).await?;
++        crate::federation::edition2::fixture_genesis::install_v2_engine(&engine)
++            .await
++            .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
++        Ok(engine)
++    }
++
++    /// v62.0.0 (JSON-cut slice C) — **the lib-test boot hook**: every
++    /// constructor but [`with_signer_pre_genesis`](Self::with_signer_pre_genesis)
++    /// ends here under `cfg(test)`, so a unit test's Engine holds
++    /// [`fixture_genesis::bundle_v2`](crate::federation::edition2::fixture_genesis::bundle_v2)
++    /// in force, as the earlier boot held the baked JSON genesis, with no edit
++    /// at the call site. A failed install panics, naming the refusal: a test
++    /// Engine that silently booted without its root would fail later, far
++    /// from the cause.
++    #[cfg(test)]
++    pub(crate) async fn install_test_genesis_at_boot(&self) {
++        #[cfg(any(feature = "postgres", feature = "sqlite"))]
++        crate::federation::edition2::fixture_genesis::install_v2_engine(self)
++            .await
++            .unwrap_or_else(|e| panic!("test_ceremony_v2 install: {e}"));
++    }
++
++    /// v62.0.0 (JSON-cut slice C) — **the boot's genesis read**: the bundles
++    /// this node holds, read through Verify's bundle reader
++    /// ([`genesis_in_force`](crate::federation::edition2::genesis::genesis_in_force)).
++    /// Nothing is seeded. A node holding no Valid bundle boots pre-genesis
++    /// and says so with a structured `posture = "pre_genesis"` warning, the
++    /// line a node-mode host renders as its banner; a read that fails is
++    /// warned the same way, since an unanswered question is not a root.
++    /// Never boot-fatal: a node must come up to receive its bundle.
++    async fn report_genesis_at_boot(&self) {
++        #[cfg(any(feature = "postgres", feature = "sqlite"))]
++        {
++            let dir = self.federation_directory();
++            let held = crate::federation::edition2::genesis::genesis_in_force(dir.as_ref()).await;
++            match held {
++                Ok(state) if state.is_held() => {}
++                Ok(_) => tracing::warn!(
++                    posture = "pre_genesis",
++                    "PRE-GENESIS BOOT: this node holds no ceg-genesis-bundle/2. It roots \
++                     nothing until a bundle arrives at the import door under its anchor; \
++                     every operation that resolves authority to the accord root is refused \
++                     until then."
++                ),
++                Err(e) => tracing::warn!(
++                    posture = "pre_genesis",
++                    error = %e,
++                    "PRE-GENESIS BOOT: the held genesis bundles could not be read; this \
++                     node treats itself as holding no root."
++                ),
++            }
++        }
++    }
++
++    /// v62.0.0 (JSON-cut slice C) — **the bundle/2 import door** on this
++    /// node: one statement list (bundle voices and the rows they name),
++    /// read by Verify's reader under `anchor` for a first bundle (CC 2.6.1.11,
++    /// CC 5.3.4). Replaces the bundle/1 `install_genesis_bundle_roster` and
++    /// `bake_assembled_genesis`. See
++    /// [`put_genesis_bundle`](crate::federation::edition2::genesis::put_genesis_bundle).
++    ///
++    /// # Errors
++    /// The door's refusals.
++    #[cfg(any(feature = "postgres", feature = "sqlite"))]
++    pub async fn put_genesis_bundle(
++        &self,
++        statements: &[Vec<u8>],
++        anchor: Option<&crate::federation::edition2::genesis::Anchor>,
++    ) -> Result<crate::federation::edition2::genesis::GenesisAdmission, crate::federation::Error>
++    {
++        let dir = self.federation_directory();
++        crate::federation::edition2::genesis::put_genesis_bundle(dir.as_ref(), statements, anchor)
++            .await
++    }
++
++    /// v62.0.0 (JSON-cut slice C) — the genesis state this node holds,
++    /// re-derived from its held bundles on every call
++    /// ([`genesis_in_force`](crate::federation::edition2::genesis::genesis_in_force)).
++    ///
++    /// # Errors
++    /// Directory read failures.
++    #[cfg(any(feature = "postgres", feature = "sqlite"))]
++    pub async fn genesis_in_force(
++        &self,
++    ) -> Result<crate::federation::edition2::genesis::GenesisInForce, crate::federation::Error>
++    {
++        let dir = self.federation_directory();
++        crate::federation::edition2::genesis::genesis_in_force(dir.as_ref()).await
++    }
++
+     /// Variant accepting raw signer Arcs — matches the issue's
+     /// `Engine::with_signer_arcs(classical, pqc, dsn)` shape from
+     /// CIRISPersist#43.
+@@ -657,7 +752,7 @@ impl Engine {
+         signer: Arc<dyn HardwareSigner>,
+         dsn: &str,
+     ) -> Result<Self, EngineError> {
+-        let backend = build_backend(dsn, true, crate::store::HostStoreProfile::Native).await?;
++        let backend = build_backend(dsn, crate::store::HostStoreProfile::Native).await?;
+         let engine = Engine {
+             backend,
+             signer,
+@@ -676,6 +771,13 @@ impl Engine {
+         // v61 — the open legs every open runs, the Python `Engine(...)`
+         // included ([`Self::settle_at_open`]). Never boot-fatal.
+         engine.settle_at_open().await;
++        // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
++        // bundles held (never seeded). Never boot-fatal.
++        engine.report_genesis_at_boot().await;
++        // v62.0.0 (JSON-cut slice C) — lib unit tests only: root the test
++        // ceremony's bundle/2 (`Self::install_test_genesis_at_boot`).
++        #[cfg(test)]
++        engine.install_test_genesis_at_boot().await;
+         Ok(engine)
+     }
+ 
+@@ -727,7 +829,7 @@ impl Engine {
+             )
+             .await?,
+         );
+-        let backend = build_backend(dsn, true, crate::store::HostStoreProfile::Native).await?;
++        let backend = build_backend(dsn, crate::store::HostStoreProfile::Native).await?;
+         let engine = Engine {
+             backend,
+             // `signer` is the hardware classical itself — same shape as
+@@ -750,6 +852,13 @@ impl Engine {
+         // v61 — the open legs every open runs, the Python `Engine(...)`
+         // included ([`Self::settle_at_open`]). Never boot-fatal.
+         engine.settle_at_open().await;
++        // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
++        // bundles held (never seeded). Never boot-fatal.
++        engine.report_genesis_at_boot().await;
++        // v62.0.0 (JSON-cut slice C) — lib unit tests only: root the test
++        // ceremony's bundle/2 (`Self::install_test_genesis_at_boot`).
++        #[cfg(test)]
++        engine.install_test_genesis_at_boot().await;
+         Ok(engine)
+     }
+ 
+@@ -3466,28 +3575,6 @@ impl Engine {
+         Ok(report)
+     }
+ 
+-    /// v19.1.0 (CIRISPersist#490) — bake an assembled genesis trust-root
+-    /// bundle (the ceremony artifact JSON): quorum-verify against THIS
+-    /// node's roster, then land serve nodes (insert / idempotent /
+-    /// authenticated re-anchor) + the delegation plane. See
+-    /// [`crate::federation::genesis::bake_assembled_genesis`].
+-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+-    pub async fn bake_assembled_genesis(
+-        &self,
+-        bundle_json: &str,
+-    ) -> Result<crate::federation::genesis::GenesisBakeReport, crate::federation::Error> {
+-        match &self.backend {
+-            #[cfg(feature = "postgres")]
+-            BackendDispatch::Postgres(b) => {
+-                crate::federation::genesis::bake_assembled_genesis(&**b, bundle_json).await
+-            }
+-            #[cfg(feature = "sqlite")]
+-            BackendDispatch::Sqlite(b) => {
+-                crate::federation::genesis::bake_assembled_genesis(&**b, bundle_json).await
+-            }
+-        }
+-    }
+-
+     /// v57.0.0 (CIRISPersist#988; CC 2.4.2, CLM-silo-projection-rebuildable)
+     /// — **the projection gate, live**: rebuild `projection` from the rows on
+     /// this node through the same writer, into a scratch table, and compare it
+@@ -3512,30 +3599,6 @@ impl Engine {
+         }
+     }
+ 
+-    /// v53.1.0 — **install a verified genesis bundle on this node** (the import
+-    /// door): verify the ceremony outputs against THIS build's accord roster
+-    /// (a refusal writes nothing), bake its serve nodes and delegation plane,
+-    /// then install its roster records — the accord family's genesis head and
+-    /// the `ciris-canonical` birth — through the same function the boot seed
+-    /// uses. This node's own genesis posture is not changed. See
+-    /// [`crate::federation::genesis::install_genesis_bundle_roster`].
+-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+-    pub async fn install_genesis_bundle_roster(
+-        &self,
+-        bundle: &crate::federation::genesis::GenesisBundle,
+-    ) -> Result<crate::federation::genesis::RosterInstall, crate::federation::Error> {
+-        match &self.backend {
+-            #[cfg(feature = "postgres")]
+-            BackendDispatch::Postgres(b) => {
+-                crate::federation::genesis::install_genesis_bundle_roster(&**b, &**b, bundle).await
+-            }
+-            #[cfg(feature = "sqlite")]
+-            BackendDispatch::Sqlite(b) => {
+-                crate::federation::genesis::install_genesis_bundle_roster(&**b, &**b, bundle).await
+-            }
+-        }
+-    }
+-
+     /// "The payload follows the consent edge" (v21.2.0, CIRISPersist#509) —
+     /// v39.0.0 — **enter the mesh**: flip a local-tier row to the federation
+     /// tier over the SAME bytes (CC 5.3.2.4.2). Replaces `attestation_promote`,
+@@ -9932,42 +9995,6 @@ impl Engine {
+         directory.put_public_key(record).await
+     }
+ 
+-    /// v12.2.0 (CIRISPersist#351) — adopt-scrub-**upgrade**: replace this
+-    /// node's **self-signed** own-key row with the accord-anchor-**scrubbed**
+-    /// record (same `key_id`, same pubkey) so it can root against the seeded
+-    /// A1/B1/C1 anchor. The in-place seed's missing primitive:
+-    /// `register_federation_key` is `ON CONFLICT DO NOTHING`, so the boot-time
+-    /// self-signed row is otherwise sticky and no peer can root it.
+-    ///
+-    /// Verifies the incoming scrub-signature first (same
+-    /// [`verify_key_registration`](crate::federation::verify_key_registration)
+-    /// gate as `register_federation_key` — granting-authority resolves the
+-    /// scrubber's pubkeys from the directory), THEN applies the backend's
+-    /// monotonic gated UPDATE (self-signed → anchored only; pubkey change and
+-    /// anchored→self downgrade refused; re-applying the same record is
+-    /// idempotent — see [`AdoptScrubOutcome`](crate::federation::register::AdoptScrubOutcome)).
+-    /// Fail-secure: a reject never mutates the row.
+-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+-    pub async fn adopt_scrub_upgrade(
+-        &self,
+-        record: crate::federation::SignedKeyRecord,
+-    ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
+-        let directory = self.federation_directory();
+-        crate::federation::verify_key_registration(directory.as_ref(), &record.record).await?;
+-        match &self.backend {
+-            #[cfg(feature = "postgres")]
+-            BackendDispatch::Postgres(b) => {
+-                crate::federation::FederationDirectory::adopt_scrub_upgrade(b.as_ref(), record)
+-                    .await
+-            }
+-            #[cfg(feature = "sqlite")]
+-            BackendDispatch::Sqlite(b) => {
+-                crate::federation::FederationDirectory::adopt_scrub_upgrade(b.as_ref(), record)
+-                    .await
+-            }
+-        }
+-    }
+-
+     /// v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+     /// apply**: the anti-entropy apply the edge replication bridge routes
+     /// `apply_key` to instead of raw
+@@ -9978,9 +10005,8 @@ impl Engine {
+     /// holds a **self-signed** row for auto-upgrades that row in place, so
+     /// the genesis-mesh seed becomes pure owned-node replication and stale
+     /// self-signed copies on sibling nodes heal — no per-node
+-    /// `adopt-scrubbed` endpoint call ([`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade)
+-    /// itself is unchanged and remains available; consumers retire the
+-    /// endpoint separately).
++    /// `adopt-scrubbed` endpoint call (the Engine's `adopt_scrub_upgrade`
++    /// wrapper is removed in v62.0.0).
+     ///
+     /// Decision table + gate composition live in the shared
+     /// [`plan_replicated_key_apply`](crate::federation::register::plan_replicated_key_apply):
+@@ -9995,7 +10021,7 @@ impl Engine {
+     /// byte-identical ⇒ `Unchanged`; anything else (downgrade, re-scrub,
+     /// pubkey swap, conflicting version) ⇒ `Refused`, row untouched.
+     ///
+-    /// Unlike [`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade)'s
++    /// Unlike the removed `adopt_scrub_upgrade` wrapper's
+     /// Engine-layer verify split, the verification is INSIDE the backend
+     /// method (it only binds on the upgrade transition — a fresh insert
+     /// keeps `put_public_key`'s as-today semantics), so no caller can reach
+@@ -11178,76 +11204,22 @@ pub enum EngineMaintenance {
+     Sqlite(crate::maintenance::sqlite::SqliteMaintenanceBackend),
+ }
+ 
+-/// Build the backend dispatch for an `Engine` from a DSN string.
++/// Build the backend dispatch for an `Engine` from a DSN string: connect,
++/// then run the migrations.
+ ///
+ /// Factored out so `Engine::with_signer` and any future Engine
+ /// constructors share the same URL-sniff + migration shape.
+-// `seed_genesis` is consumed inside the postgres / sqlite `if` blocks; in a
+-// no-backend build both arms are cfg'd out, so silence the unused-var lint there.
+-#[cfg_attr(
+-    not(any(feature = "postgres", feature = "sqlite")),
+-    allow(unused_variables)
+-)]
+-/// v31.0.0 (CIRISPersist#648) — **the boot decision: which genesis faults may a
+-/// node survive?**
+-///
+-/// Exactly one may not. Before this cut every seed failure was fatal, and it had
+-/// to be, because the seeder returned an `Err(String)` in which "the accord
+-/// holders were never seeded" and "somebody else's pubkey is sitting on A1's
+-/// key_id" were the same value. With
+-/// [`GenesisFault`](crate::federation::genesis::GenesisFault) splitting them:
+-///
+-/// - [`Absent`](crate::federation::genesis::GenesisFault::Absent) — a node
+-///   before its ceremony. **Boots.** 31.0.0 is the binary that RUNS the
+-///   ceremony, so refusing to start without the thing the ceremony produces is
+-///   a deadlock. The node comes up in the pre-genesis posture, reports it
+-///   (`Engine::genesis_posture`, `NodeState::genesis`), and every gate in
+-///   `ROOT_REQUIRING_GATES` refuses.
+-/// - [`Unreadable`](crate::federation::genesis::GenesisFault::Unreadable) — the
+-///   backend could not answer. **Boots**, and is likewise not entrenched: an
+-///   unanswered question is not a yes, so the same gates refuse. A node whose
+-///   directory is broken should be able to come up far enough to say so.
+-/// - [`Divergent`](crate::federation::genesis::GenesisFault::Divergent) —
+-///   **REFUSES.** A constitutional row is present and wrong: a squatted holder
+-///   key_id, a family whose entrenched protocol or founder seats were mutated,
+-///   a canonical stripped of its role. That is an established root altered
+-///   underneath the node, and #648 is about making a MISSING root survivable,
+-///   never a TAMPERED one. Roots co-exist and a new ceremony adds one; nothing
+-///   here may become a path to overwriting one that already stands.
+ ///
+-/// The warning is `tracing::warn!` with a structured `posture` field rather than
+-/// a bare message, because the host renders a banner from it — see
+-/// [`GenesisPosture::banner`](crate::federation::genesis::GenesisPosture::banner).
+-#[cfg(any(feature = "postgres", feature = "sqlite"))]
+-fn classify_genesis_seed(
+-    outcome: Result<(), crate::federation::genesis::GenesisFault>,
+-) -> Result<(), EngineError> {
+-    let Err(fault) = outcome else { return Ok(()) };
+-    if fault.refuses_boot() {
+-        return Err(EngineError::GenesisSeed(fault.to_string()));
+-    }
+-    tracing::warn!(
+-        posture = "pre_genesis",
+-        leg = fault.leg().as_str(),
+-        fault = fault.as_str(),
+-        detail = fault.detail(),
+-        "PRE-GENESIS BOOT: this node holds no constitutional trust root. It can host a \
+-         genesis ceremony; until one completes, every operation that resolves authority to \
+-         the accord root is REFUSED (federation_no_constitutional_root_yet). Node mode only \
+-         — do not run an agent against this node."
+-    );
+-    Ok(())
+-}
+-
++/// v62.0.0 (JSON-cut slice C) — **no genesis is seeded here.** A node boots
++/// pre-genesis and roots nothing until a `ceg-genesis-bundle/2` arrives at
++/// the import door (CC 2.6.1.11, CC 5.3.4). The earlier boot seeded the
++/// baked bundle/1 JSON (the accord holders, the family, the canonical
++/// servers) and classified its faults; there is no baked bundle to seed any
++/// more, so there is nothing to classify, and no genesis fault can refuse a
++/// boot. Lib unit tests root `fixture_genesis::bundle_v2` after the
++/// constructor returns (`Engine::install_test_genesis_at_boot`, `cfg(test)`).
+ async fn build_backend(
+     dsn: &str,
+-    // Read only inside the backend `cfg` arms; a build with neither backend
+-    // compiled in reaches the `UnrecognizedDsn` tail without consulting it.
+-    #[cfg_attr(
+-        not(any(feature = "postgres", feature = "sqlite")),
+-        allow(unused_variables)
+-    )]
+-    seed_genesis: bool,
+     // Read only by the sqlite arm; postgres has no host profile.
+     #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
+     host: crate::store::HostStoreProfile,
+@@ -11259,40 +11231,6 @@ async fn build_backend(
+                 .await
+                 .map_err(EngineError::Store)?;
+             pg.run_migrations().await.map_err(EngineError::Store)?;
+-            // v31.0.0 (CIRISPersist#648) — the genesis seed is ATTEMPTED in
+-            // production and no longer fatal when it is merely ABSENT. See
+-            // `attempt_genesis_seed` for the classification and why divergence
+-            // is still fatal. `seed_genesis == false` is the supported
+-            // pre-genesis constructor `Engine::with_signer_pre_genesis`.
+-            if seed_genesis {
+-                // v12.0.2 (#347) — first-boot-seed the HUMANITY_ACCORD holder
+-                // rooting-anchor rows (idempotent). A write failure here is NOT
+-                // decided on: `seed_family_and_canonical` opens with
+-                // `verify_anchor_seeded`, which is the one place that can tell
+-                // "never seeded" from "seeded by somebody else".
+-                if let Err(e) = pg
+-                    .seed_genesis_accord_holders(
+-                        &crate::federation::genesis::effective_accord_holder_records(),
+-                    )
+-                    .await
+-                {
+-                    tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+-                }
+-                // v13.4.1 (#392) — the SHARED seed routine (verify anchor →
+-                // family #386 → canonical #390), identical to the pyo3
+-                // `PyEngine::new` path so they can't drift.
+-                classify_genesis_seed(
+-                    crate::federation::genesis::seed_family_and_canonical(&pg).await,
+-                )?;
+-            }
+-            // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
+-            // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
+-            // REMOVED: a single-anchor founding record is a first-strike
+-            // weakness (one captured accord key mints a rogue canonical). Now
+-            // that canonical ADD requires ≥2 distinct anchor scrubs (2-of-3),
+-            // a fresh node ships with an EMPTY canonical set until the operator
+-            // bakes the 2-of-3 replacement. The accord-holder rooting anchor
+-            // (A1/B1/C1) above is untouched.
+             Ok(BackendDispatch::Postgres(Arc::new(pg)))
+         }
+         #[cfg(not(feature = "postgres"))]
+@@ -11322,33 +11260,6 @@ async fn build_backend(
+                     .map_err(EngineError::Store)?
+             };
+             sq.run_migrations().await.map_err(EngineError::Store)?;
+-            // v31.0.0 (CIRISPersist#648) — see the postgres leg: the seed is
+-            // attempted, an ABSENT seed leaves a pre-genesis node that boots and
+-            // refuses, a DIVERGENT one still refuses to boot.
+-            if seed_genesis {
+-                // v12.0.2 (#347) — HUMANITY_ACCORD holder anchor rows, then verify.
+-                if let Err(e) = sq
+-                    .seed_genesis_accord_holders(
+-                        &crate::federation::genesis::effective_accord_holder_records(),
+-                    )
+-                    .await
+-                {
+-                    tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+-                }
+-                // v13.4.1 (#392) — shared seed routine (verify anchor → family
+-                // #386 → canonical #390); identical to the pyo3 path.
+-                classify_genesis_seed(
+-                    crate::federation::genesis::seed_family_and_canonical(&sq).await,
+-                )?;
+-            }
+-            // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
+-            // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
+-            // REMOVED: a single-anchor founding record is a first-strike
+-            // weakness (one captured accord key mints a rogue canonical). Now
+-            // that canonical ADD requires ≥2 distinct anchor scrubs (2-of-3),
+-            // a fresh node ships with an EMPTY canonical set until the operator
+-            // bakes the 2-of-3 replacement. The accord-holder rooting anchor
+-            // (A1/B1/C1) above is untouched.
+             Ok(BackendDispatch::Sqlite(Arc::new(sq)))
+         }
+         #[cfg(not(feature = "sqlite"))]
+@@ -11396,12 +11307,13 @@ pub enum EngineError {
+     #[error("local signer: {0}")]
+     LocalSigner(#[from] crate::signing::LocalSignerError),
+ 
+-    /// v12.0.2 (CIRISPersist#347) — the HUMANITY_ACCORD holder genesis
+-    /// rooting-anchor rows could not be seeded or verified at boot.
+-    /// **Fail-secure**: a node that cannot establish its constitutional
+-    /// rooting anchor (the pinned accord holders) must not come up — else
+-    /// it would silently root nothing (or, worse, honor a divergent anchor).
+-    #[error("genesis accord-holder seed: {0}")]
++    /// v62.0.0 (JSON-cut slice C) — a genesis install a constructor was
++    /// asked to make failed. No production constructor installs a genesis
++    /// (a node boots pre-genesis); only
++    /// `Engine::with_signer_test_genesis` (`test-anchor`) raises this, with
++    /// the import door's refusal. (Was the v12.0.2 baked accord-holder
++    /// seed's failure, CIRISPersist#347; that seed is gone.)
++    #[error("genesis install: {0}")]
+     GenesisSeed(String),
+ }
+ 
+diff --git a/src/federation/edition2/fixture_genesis.rs b/src/federation/edition2/fixture_genesis.rs
+new file mode 100644
+index 00000000..22350be6
+--- /dev/null
++++ b/src/federation/edition2/fixture_genesis.rs
+@@ -0,0 +1,1054 @@
++//! v62.0.0 (JSON-cut slice C) — **`test_ceremony_v2`**: a signed
++//! `ceg-genesis-bundle/2` for tests, and the helpers that install it through
++//! the real doors (CC 2.6.1.11, CC 4.2.2.1, CC 5.3.4).
++//!
++//! A v62 node boots pre-genesis: nothing is baked, and nothing is rooted
++//! until a bundle/2 arrives at the import door. A test that needs a root
++//! mints one here, in four steps:
++//!
++//! 1. the holders' and serve seats' composite keys come from fixed seeds
++//!    ([`test_key`]: ML-DSA-65 seed `[n; 32]`, Ed25519 seed `[n + 100; 32]`,
++//!    Verify's vector rule and the door fixtures' `key(n)`);
++//! 2. each holder's `key:record` carries the custody evidence the reader's
++//!    gate verifies (`YubiKey_5_FIPS`, `removable_offline`, a chain to
++//!    Verify's MOCK attestation root, [`attestation_roots`]); each seat has a
++//!    `node` record ending one year out and an `identity:occurrence` binding
++//!    carrying its transport destination and its two X-Wing keys;
++//! 3. one bundle payload names those rows by row id in `refs.also.cites`,
++//!    with `holders`, `serve_nodes` and the charter (one recovery
++//!    commitment per holder, scope `infra:attest` + `infra:serve`);
++//! 4. every holder signs it.
++//!
++//! [`install_ceremony_v2`] offers the named rows and the voices to the
++//! bundle/2 import door, the door a production node uses. Nothing here
++//! places a row by its own rules: Verify's reader does.
++//!
++//! The custody chains are generated by
++//! `scripts/gen_test_ceremony_v2_custody.py`, which reproduces Verify
++//! v23.3.0's vector PKI and checks its bytes against Verify's pool
++//! (`fixture_genesis_custody`). The root says MOCK in its name and is
++//! trusted only by a reader handed it.
++//!
++//! Gated `cfg(any(test, feature = "test-anchor"))`: no production build
++//! contains it.
++
++use std::collections::{BTreeMap, BTreeSet};
++use std::sync::OnceLock;
++
++use ciris_crypto::composite::CompositeSigningKey;
++use ciris_verify_core::cde::{self, Value};
++use ciris_verify_core::edition2::genesis::{Anchor, BINDING_FAMILY, XWING_PUBKEY_LEN};
++use ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY;
++use ciris_verify_core::edition2::recovery::recovery_commitment;
++use ciris_verify_core::edition2::{
++    cose_key, hash_digest_value, identity_ref, row_ref, sig_structure, sign_row_statement,
++    thumbprint, Digest32,
++};
++use ciris_verify_core::trust_anchor_store::{environments, single, Purpose, TrustAnchorStore};
++use sha2::Digest as _;
++
++use super::fixture_genesis_custody::{
++    HOLDER_CHAINS_HEX, MOCK_ATTESTATION_ROOT_HEX, RECOVERED_CHAINS_HEX, RECOVERED_KEY_OFFSET,
++    RECOVERY_KEY_CHAINS_HEX, SECOND_RECOVERED_CHAINS_HEX, SECOND_RECOVERED_KEY_OFFSET,
++};
++use super::genesis::GENESIS_BUNDLE_TYP;
++use super::names::RowId;
++use super::produce::{assemble, object_protected};
++use crate::federation::{Error, FederationDirectory};
++
++/// Holder seeds of the standard ceremony (Verify's vector keys A, B, C).
++pub const HOLDER_SEEDS: [u8; 3] = [1, 2, 3];
++
++/// Serve-node (seat) seeds of the standard ceremony (Verify's S1, S2).
++pub const SERVE_NODE_SEEDS: [u8; 2] = [11, 12];
++
++/// The holder seeds a custody chain exists for. A spec's holders must be
++/// among these.
++pub const HOLDER_SEED_RANGE: core::ops::RangeInclusive<u8> = 1..=7;
++
++/// The recovery-key seed offset (Verify's `REC` rule: holder `n`'s recovery
++/// key is key `n + 50`).
++pub const RECOVERY_SEED_OFFSET: u8 = 50;
++
++/// The seed offset of a holder's NEXT recovery key, committed by
++/// [`recover_v2`] (Verify's `A_REC2 = 61` for holder 1).
++pub const NEXT_RECOVERY_SEED_OFFSET: u8 = 60;
++
++/// The signing-key seed offset after a recovery: [`recover_v2`] re-seats
++/// holder `n` on key `n + 40` (Verify's `A_NEW = 41` for holder 1).
++pub const RECOVERED_SEED_OFFSET: u8 = RECOVERED_KEY_OFFSET;
++
++/// After a SECOND recovery holder `n` signs with key `n + 80`, and commits
++/// recovery key `n + 70` next.
++pub const SECOND_RECOVERED_SEED_OFFSET: u8 = SECOND_RECOVERED_KEY_OFFSET;
++
++/// The recovery key a second recovery commits next: `n + 70`.
++pub const SECOND_NEXT_RECOVERY_SEED_OFFSET: u8 = 70;
++
++/// `family_key_id` of the standard ceremony.
++pub const FAMILY_KEY_ID: &str = "humanity-accord";
++
++/// One day in milliseconds.
++pub const DAY_MS: u64 = 86_400_000;
++
++/// 365 days in milliseconds: the longest a `node` record may run (CC
++/// 2.4.1.1).
++pub const YEAR_MS: u64 = 31_536_000_000;
++
++/// The gap between a later bundle and its predecessor.
++pub const LATER_STEP_MS: u64 = 60_000;
++
++const ROW_TYPE: &str = "scores";
++const HARDWARE_CLASS: &str = "YubiKey_5_FIPS";
++const PQ_CUSTODY: &str = "removable_offline";
++const APP_NAME: &str = "ciris.federation";
++const ASPECT: &str = "serve";
++
++/// Composite test key `seed`: ML-DSA-65 seed `[seed; 32]`, Ed25519 seed
++/// `[seed + 100; 32]`.
++#[must_use]
++pub fn test_key(seed: u8) -> CompositeSigningKey {
++    CompositeSigningKey::from_seeds(&[seed; 32], &[seed.wrapping_add(100); 32])
++}
++
++/// A holder's recovery key: [`test_key`]`(seed + 50)`.
++#[must_use]
++pub fn recovery_key(holder_seed: u8) -> CompositeSigningKey {
++    test_key(holder_seed.wrapping_add(RECOVERY_SEED_OFFSET))
++}
++
++/// The kid of [`test_key`]`(seed)`.
++#[must_use]
++pub fn kid_of(seed: u8) -> Digest32 {
++    thumbprint(test_key(seed).public_key())
++}
++
++/// The identity reference of [`test_key`]`(seed)`.
++#[must_use]
++pub fn identity_ref_of(seed: u8) -> String {
++    identity_ref(&kid_of(seed))
++}
++
++/// What a ceremony seats, and when.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct CeremonySpec {
++    /// Holder seeds, each in [`HOLDER_SEED_RANGE`].
++    pub holders: Vec<u8>,
++    /// Seat seeds, disjoint from the holders and their recovery keys.
++    pub serve_nodes: Vec<u8>,
++    /// The records' instant (POSIX ms). A fresh bundle is asserted at
++    /// `t0_ms + DAY_MS / 2`; seat records end at `t0_ms + YEAR_MS`.
++    pub t0_ms: u64,
++    /// The bundle's `family_key_id`.
++    pub family_key_id: String,
++}
++
++impl CeremonySpec {
++    /// [`HOLDER_SEEDS`], [`SERVE_NODE_SEEDS`], [`FAMILY_KEY_ID`], with `t0`
++    /// at yesterday's UTC midnight, so the bundle (yesterday noon) is in the
++    /// past and every seat record is live for the next 364 days. The bytes
++    /// move with the date; a test that pins bytes uses [`Self::at`].
++    #[must_use]
++    pub fn standard() -> Self {
++        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
++        Self::at((now / DAY_MS) * DAY_MS - DAY_MS)
++    }
++
++    /// The standard sets with a fixed `t0` (deterministic bytes).
++    #[must_use]
++    pub fn at(t0_ms: u64) -> Self {
++        CeremonySpec {
++            holders: HOLDER_SEEDS.to_vec(),
++            serve_nodes: SERVE_NODE_SEEDS.to_vec(),
++            t0_ms,
++            family_key_id: FAMILY_KEY_ID.to_owned(),
++        }
++    }
++}
++
++/// A named row: its statement and the row id the bundle cites.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct NamedRow {
++    /// The node-computed row id.
++    pub row_id: Digest32,
++    /// The `COSE_Sign1` row statement.
++    pub statement: Vec<u8>,
++}
++
++impl NamedRow {
++    fn of(statement: Vec<u8>) -> Self {
++        let row_id = RowId::of_statement(&statement)
++            .expect("a fixture row statement carries a row id")
++            .0;
++        NamedRow { row_id, statement }
++    }
++}
++
++/// A seated holder.
++#[derive(Clone, Debug)]
++pub struct HolderV2 {
++    /// The seed of the key it signs with now ([`HolderV2::holder_seed`]
++    /// until a recovery, then `holder_seed + RECOVERED_SEED_OFFSET`).
++    pub seed: u8,
++    /// The seed whose key names the holder: its identity reference is
++    /// [`identity_ref_of`]`(holder_seed)` for good (CC 2.6.1.7).
++    pub holder_seed: u8,
++    /// The seed of the recovery key its commitment commits to.
++    pub recovery_seed: u8,
++    /// The kid of the key it signs with now.
++    pub kid: Digest32,
++    /// Its identity reference.
++    pub identity_ref: String,
++    /// Its current `key:record` (`accord_holder`, with custody evidence).
++    pub record: NamedRow,
++    /// The commitment over `test_key(recovery_seed)`.
++    pub recovery_commitment: Digest32,
++}
++
++/// A seated serve node.
++#[derive(Clone, Debug)]
++pub struct SeatV2 {
++    /// Its key seed.
++    pub seed: u8,
++    /// Its kid.
++    pub kid: Digest32,
++    /// Its identity reference.
++    pub identity_ref: String,
++    /// Its `key:record` (`node`, ending `t0 + YEAR_MS`).
++    pub record: NamedRow,
++    /// Its `identity:occurrence` binding, citing the record.
++    pub binding: NamedRow,
++    /// The binding's transit X-Wing key.
++    pub transit_xwing_pubkey: [u8; XWING_PUBKEY_LEN],
++    /// The binding's onion-hop X-Wing key.
++    pub onion_hop_xwing_pubkey: [u8; XWING_PUBKEY_LEN],
++}
++
++/// A minted bundle and every row it names.
++#[derive(Clone, Debug)]
++pub struct TestCeremonyV2 {
++    /// What was minted.
++    pub spec: CeremonySpec,
++    /// `version`: 1 for [`ceremony_v2`], prev's + 1 for [`later_v2`].
++    pub version: u64,
++    /// `refs.prev`, for a later bundle.
++    pub prev: Option<Digest32>,
++    /// The bundle's `asserted_at` (POSIX ms).
++    pub asserted_at_ms: u64,
++    /// The holders, in spec order.
++    pub holders: Vec<HolderV2>,
++    /// The seats, in spec order.
++    pub seats: Vec<SeatV2>,
++    /// Further rows the bundle names: a recovery's recovery-key record.
++    pub extra_rows: Vec<NamedRow>,
++    /// The holder a recovery bundle recovers (its identity reference).
++    pub recovered: Option<String>,
++    /// The bundle payload.
++    pub payload: Value,
++    /// One `ceg-genesis-bundle/2` statement per signer.
++    pub voices: Vec<Vec<u8>>,
++    /// The bundle's object id (`["CEG-object/2", typ, null, payload]`).
++    pub object_id: Digest32,
++}
++
++impl TestCeremonyV2 {
++    /// Every named row, by row id (the shape of Verify's
++    /// `GenesisInput.rows`).
++    #[must_use]
++    pub fn rows(&self) -> BTreeMap<Digest32, Vec<u8>> {
++        self.rows_in_put_order()
++            .into_iter()
++            .map(|r| (r.row_id, r.statement.clone()))
++            .collect()
++    }
++
++    /// The named rows in the order a node can admit them: holder records,
++    /// seat records, then the bindings (each signed by a key whose record
++    /// precedes it).
++    #[must_use]
++    pub fn rows_in_put_order(&self) -> Vec<&NamedRow> {
++        self.holders
++            .iter()
++            .map(|h| &h.record)
++            .chain(self.extra_rows.iter())
++            .chain(self.seats.iter().map(|s| &s.record))
++            .chain(self.seats.iter().map(|s| &s.binding))
++            .collect()
++    }
++
++    /// The reader's anchor for this bundle: its holders' thumbprints (CC
++    /// 5.3.4).
++    #[must_use]
++    pub fn anchor(&self) -> Anchor {
++        Anchor::Thumbprints(self.holder_kids())
++    }
++
++    /// The holders' kids.
++    #[must_use]
++    pub fn holder_kids(&self) -> BTreeSet<Digest32> {
++        self.holders.iter().map(|h| h.kid).collect()
++    }
++
++    /// The holders' identity references, in spec order.
++    #[must_use]
++    pub fn holder_identity_refs(&self) -> Vec<String> {
++        self.holders
++            .iter()
++            .map(|h| h.identity_ref.clone())
++            .collect()
++    }
++
++    /// The seats' identity references, in spec order.
++    #[must_use]
++    pub fn serve_node_identity_refs(&self) -> Vec<String> {
++        self.seats.iter().map(|s| s.identity_ref.clone()).collect()
++    }
++
++    /// Seat `i`'s identity reference. Replaces
++    /// `canonical_genesis_bundle().serve_nodes[i].record.key_id`.
++    #[must_use]
++    pub fn serve_node_identity_ref(&self, i: usize) -> &str {
++        &self.seats[i].identity_ref
++    }
++
++    /// Holder `i`'s identity reference. Replaces
++    /// `canonical_genesis_bundle().holders[i].record.key_id`.
++    #[must_use]
++    pub fn holder_identity_ref(&self, i: usize) -> &str {
++        &self.holders[i].identity_ref
++    }
++
++    /// Holder `i`'s signing key.
++    #[must_use]
++    pub fn holder_key(&self, i: usize) -> CompositeSigningKey {
++        test_key(self.holders[i].seed)
++    }
++
++    /// Holder `i`'s committed recovery key.
++    #[must_use]
++    pub fn holder_recovery_key(&self, i: usize) -> CompositeSigningKey {
++        test_key(self.holders[i].recovery_seed)
++    }
++
++    /// Seat `i`'s signing key.
++    #[must_use]
++    pub fn serve_node_key(&self, i: usize) -> CompositeSigningKey {
++        test_key(self.seats[i].seed)
++    }
++}
++
++/// Verify's MOCK YubiKey PIV attestation root (DER).
++#[must_use]
++pub fn mock_attestation_root_der() -> Vec<u8> {
++    hex::decode(MOCK_ATTESTATION_ROOT_HEX).expect("the MOCK root is hex")
++}
++
++/// A store holding only [`mock_attestation_root_der`], for
++/// `KeyAttestation`: the custody gate's roots when a test calls Verify's
++/// reader directly.
++#[must_use]
++pub fn attestation_roots() -> TrustAnchorStore {
++    TrustAnchorStore::new().with_store(single(
++        environments::YUBIKEY_PIV,
++        Purpose::KeyAttestation,
++        vec![mock_attestation_root_der()],
++    ))
++}
++
++fn text(s: &str) -> Value {
++    Value::Text(s.to_owned())
++}
++
++/// A deterministic map: entries sorted by their keys' encodings.
++fn map(mut m: Vec<(&str, Value)>) -> Value {
++    m.sort_by_key(|(k, _)| cde::encode(&text(k)));
++    Value::Map(m.into_iter().map(|(k, v)| (text(k), v)).collect())
++}
++
++/// A deterministic map keyed by owned text.
++fn map_owned(mut m: Vec<(String, Value)>) -> Value {
++    m.sort_by_key(|(k, _)| cde::encode(&text(k)));
++    Value::Map(m.into_iter().map(|(k, v)| (Value::Text(k), v)).collect())
++}
++
++/// A CBOR set: members sorted by their encodings.
++fn set(mut xs: Vec<Value>) -> Value {
++    xs.sort_by_key(cde::encode);
++    Value::Array(xs)
++}
++
++fn text_set(xs: &[&str]) -> Value {
++    set(xs.iter().map(|x| text(x)).collect())
++}
++
++/// `n` bytes derived from a label and a seed (SHA-256 in counter mode).
++fn derived(label: &[u8], seed: u8, n: usize) -> Vec<u8> {
++    let mut out = Vec::with_capacity(n);
++    let mut ctr = 0u32;
++    while out.len() < n {
++        let mut h = sha2::Sha256::new();
++        h.update(b"ciris-test-ceremony-v2\0");
++        h.update(label);
++        h.update([seed]);
++        h.update(ctr.to_be_bytes());
++        out.extend_from_slice(&h.finalize());
++        ctr += 1;
++    }
++    out.truncate(n);
++    out
++}
++
++fn sha256(b: &[u8]) -> [u8; 32] {
++    sha2::Sha256::digest(b).into()
++}
++
++/// The Reticulum destination hash (CC 3.3.6.3).
++fn rns_destination_hash(x: &[u8], e: &[u8], app: &str, aspects: &[&str]) -> Vec<u8> {
++    let mut name = app.to_owned();
++    for a in aspects {
++        name.push('.');
++        name.push_str(a);
++    }
++    let nh = &sha256(name.as_bytes())[..10];
++    let mut xe = x.to_vec();
++    xe.extend_from_slice(e);
++    let ih = &sha256(&xe)[..16];
++    let mut both = nh.to_vec();
++    both.extend_from_slice(ih);
++    sha256(&both)[..16].to_vec()
++}
++
++fn sign_row(k: &CompositeSigningKey, sub: &str, family: &str, payload: &Value) -> NamedRow {
++    let iss = identity_ref(&thumbprint(k.public_key()));
++    sign_row_as(k, &iss, sub, family, payload)
++}
++
++/// A row signed by `k` under the identity `iss` (a holder's later key or
++/// its recovery key speaks for the holder's identity).
++fn sign_row_as(
++    k: &CompositeSigningKey,
++    iss: &str,
++    sub: &str,
++    family: &str,
++    payload: &Value,
++) -> NamedRow {
++    NamedRow::of(
++        sign_row_statement(k, iss, sub, ROW_TYPE, family, payload, vec![])
++            .expect("a fixture key signs"),
++    )
++}
++
++fn holder_chain(seed: u8) -> Vec<Vec<u8>> {
++    chain_of(HOLDER_CHAINS_HEX, seed)
++}
++
++fn chain_of(table: [(u8, [&str; 2]); 7], seed: u8) -> Vec<Vec<u8>> {
++    for (n, chain) in table {
++        if n == seed {
++            return chain
++                .iter()
++                .map(|h| hex::decode(h).expect("a chain is hex"))
++                .collect();
++        }
++    }
++    panic!("no custody chain for holder seed {seed} (1..=7)");
++}
++
++fn mint_holder(seed: u8, t0_ms: u64) -> HolderV2 {
++    let iref = identity_ref_of(seed);
++    let record = holder_record(&iref, &test_key(seed), holder_chain(seed), t0_ms);
++    let recovery_seed = seed + RECOVERY_SEED_OFFSET;
++    HolderV2 {
++        seed,
++        holder_seed: seed,
++        recovery_seed,
++        kid: kid_of(seed),
++        identity_ref: iref,
++        record,
++        recovery_commitment: recovery_commitment(&[test_key(recovery_seed).public_key().clone()]),
++    }
++}
++
++/// A holder's `key:record` for `key`, authored and issued under the
++/// holder's identity `iref`, signed by `key`, carrying `chain`.
++fn holder_record(iref: &str, key: &CompositeSigningKey, chain: Vec<Vec<u8>>, at: u64) -> NamedRow {
++    let evidence = map(vec![
++        ("hardware_class", text(HARDWARE_CLASS)),
++        ("pq_custody", text(PQ_CUSTODY)),
++        (
++            "chain",
++            Value::Array(chain.into_iter().map(Value::Bytes).collect()),
++        ),
++    ]);
++    let payload = map(vec![
++        ("key", cose_key(key.public_key())),
++        ("author", text(iref)),
++        ("asserted_at", Value::Uint(at)),
++        ("identity_type", text_set(&["accord_holder"])),
++        ("attestation_evidence", evidence),
++    ]);
++    sign_row_as(key, iref, iref, KEY_RECORD_FAMILY, &payload)
++}
++
++/// A recovery key's own record: authored under the holder's identity,
++/// signed by the recovery key (CC 4.2.6; Verify's `recovery_key_record`).
++fn recovery_key_record(iref: &str, rk: &CompositeSigningKey, at: u64) -> NamedRow {
++    let payload = map(vec![
++        ("key", cose_key(rk.public_key())),
++        ("author", text(iref)),
++        ("asserted_at", Value::Uint(at)),
++        ("identity_type", text_set(&["accord_holder"])),
++    ]);
++    sign_row_as(rk, iref, iref, KEY_RECORD_FAMILY, &payload)
++}
++
++fn xwing_key(label: &[u8], seed: u8) -> [u8; XWING_PUBKEY_LEN] {
++    <[u8; XWING_PUBKEY_LEN]>::try_from(derived(label, seed, XWING_PUBKEY_LEN).as_slice())
++        .expect("derived to length")
++}
++
++fn mint_seat(seed: u8, t0_ms: u64) -> SeatV2 {
++    let k = test_key(seed);
++    let kid = thumbprint(k.public_key());
++    let iref = identity_ref(&kid);
++    let record_payload = map(vec![
++        ("key", cose_key(k.public_key())),
++        ("author", text(&iref)),
++        ("asserted_at", Value::Uint(t0_ms)),
++        ("identity_type", text_set(&["node"])),
++        ("valid_until", Value::Uint(t0_ms + YEAR_MS)),
++    ]);
++    let record = sign_row(&k, &iref, KEY_RECORD_FAMILY, &record_payload);
++    let transit = xwing_key(b"transit", seed);
++    let onion = xwing_key(b"onion", seed);
++    let rx = derived(b"rns-x25519", seed, 32);
++    let re = derived(b"rns-ed25519", seed, 32);
++    let td = map(vec![
++        ("reticulum_x25519_pubkey", Value::Bytes(rx.clone())),
++        ("reticulum_ed25519_pubkey", Value::Bytes(re.clone())),
++        ("app_name", text(APP_NAME)),
++        ("aspects", Value::Array(vec![text(ASPECT)])),
++        (
++            "destination_hash",
++            Value::Bytes(rns_destination_hash(&rx, &re, APP_NAME, &[ASPECT])),
++        ),
++    ]);
++    // CC 3.3.6 (O1's ruling): every identity:occurrence names its identity,
++    // its occurrence and its device class. A seat binding is the self pair.
++    let binding_payload = map(vec![
++        ("identity_key_id", text(&iref)),
++        ("occurrence_key_id", text(&iref)),
++        ("device_class", text("server")),
++        ("author", text(&iref)),
++        ("asserted_at", Value::Uint(t0_ms)),
++        ("transport_destination", td),
++        ("transit_xwing_pubkey", Value::Bytes(transit.to_vec())),
++        ("onion_hop_xwing_pubkey", Value::Bytes(onion.to_vec())),
++        (
++            "refs",
++            map(vec![(
++                "also",
++                map(vec![("cites", Value::Array(vec![row_ref(&record.row_id)]))]),
++            )]),
++        ),
++    ]);
++    let binding = sign_row(&k, &iref, BINDING_FAMILY, &binding_payload);
++    SeatV2 {
++        seed,
++        kid,
++        identity_ref: iref,
++        record,
++        binding,
++        transit_xwing_pubkey: transit,
++        onion_hop_xwing_pubkey: onion,
++    }
++}
++
++fn check_spec(spec: &CeremonySpec) {
++    assert!(!spec.holders.is_empty(), "test_ceremony_v2: no holder");
++    assert!(!spec.serve_nodes.is_empty(), "test_ceremony_v2: no seat");
++    for h in &spec.holders {
++        assert!(
++            HOLDER_SEED_RANGE.contains(h),
++            "test_ceremony_v2: holder seed {h} has no custody chain (1..=7)"
++        );
++    }
++    let recovery: BTreeSet<u8> = HOLDER_SEED_RANGE
++        .flat_map(|h| {
++            [
++                h + RECOVERY_SEED_OFFSET,
++                h + RECOVERED_SEED_OFFSET,
++                h + NEXT_RECOVERY_SEED_OFFSET,
++                h + SECOND_RECOVERED_SEED_OFFSET,
++                h + SECOND_NEXT_RECOVERY_SEED_OFFSET,
++            ]
++        })
++        .collect();
++    for s in &spec.serve_nodes {
++        assert!(
++            !spec.holders.contains(s) && !recovery.contains(s),
++            "test_ceremony_v2: seat seed {s} is a holder's, a recovered key's or a recovery key's"
++        );
++    }
++}
++
++/// The bundle payload over minted holders and seats (CC 2.6.1.11).
++fn bundle_payload(
++    spec: &CeremonySpec,
++    version: u64,
++    prev: Option<&Digest32>,
++    asserted_at_ms: u64,
++    holders: &[HolderV2],
++    seats: &[SeatV2],
++    extra_rows: &[NamedRow],
++) -> Value {
++    let cited: Vec<Value> = holders
++        .iter()
++        .map(|h| row_ref(&h.record.row_id))
++        .chain(extra_rows.iter().map(|r| row_ref(&r.row_id)))
++        .chain(seats.iter().map(|s| row_ref(&s.record.row_id)))
++        .chain(seats.iter().map(|s| row_ref(&s.binding.row_id)))
++        .collect();
++    let mut refs = vec![("also", map(vec![("cites", set(cited))]))];
++    if let Some(p) = prev {
++        refs.push(("prev", row_ref(p)));
++    }
++    let commitments = map_owned(
++        holders
++            .iter()
++            .map(|h| {
++                (
++                    h.identity_ref.clone(),
++                    hash_digest_value(&h.recovery_commitment),
++                )
++            })
++            .collect(),
++    );
++    let charter = map(vec![
++        ("recovery_commitments", commitments),
++        ("scope", text_set(&["infra:attest", "infra:serve"])),
++        ("halt_fuse_secs", Value::Uint(86_400)),
++    ]);
++    map(vec![
++        ("refs", map(refs)),
++        ("version", Value::Uint(version)),
++        ("asserted_at", Value::Uint(asserted_at_ms)),
++        ("family_key_id", text(&spec.family_key_id)),
++        (
++            "holders",
++            set(holders.iter().map(|h| text(&h.identity_ref)).collect()),
++        ),
++        (
++            "serve_nodes",
++            set(seats.iter().map(|s| text(&s.identity_ref)).collect()),
++        ),
++        ("charter", charter),
++    ])
++}
++
++/// One signer's `ceg-genesis-bundle/2` statement over `payload`.
++fn voice(k: &CompositeSigningKey, iss: &str, payload_bytes: &[u8], asserted_at_ms: u64) -> Vec<u8> {
++    let kid = thumbprint(k.public_key());
++    let protected = object_protected(&kid, iss, GENESIS_BUNDLE_TYP, Some(asserted_at_ms / 1000));
++    let sig = k
++        .sign(&sig_structure(&protected, payload_bytes))
++        .expect("a fixture key signs");
++    assemble(protected, payload_bytes.to_vec(), sig)
++}
++
++/// One bundle over placed parties, signed by `signers` (key, `iss`).
++#[allow(clippy::too_many_arguments)]
++fn assemble_bundle(
++    spec: &CeremonySpec,
++    version: u64,
++    prev: Option<Digest32>,
++    asserted_at_ms: u64,
++    holders: Vec<HolderV2>,
++    seats: Vec<SeatV2>,
++    extra_rows: Vec<NamedRow>,
++    signers: &[(CompositeSigningKey, String)],
++    recovered: Option<String>,
++) -> TestCeremonyV2 {
++    let payload = bundle_payload(
++        spec,
++        version,
++        prev.as_ref(),
++        asserted_at_ms,
++        &holders,
++        &seats,
++        &extra_rows,
++    );
++    let payload_bytes = cde::encode(&payload);
++    let object_id = RowId::of_object(GENESIS_BUNDLE_TYP, None, &payload_bytes).0;
++    let voices = signers
++        .iter()
++        .map(|(k, iss)| voice(k, iss, &payload_bytes, asserted_at_ms))
++        .collect();
++    TestCeremonyV2 {
++        spec: spec.clone(),
++        version,
++        prev,
++        asserted_at_ms,
++        holders,
++        seats,
++        extra_rows,
++        recovered,
++        payload,
++        voices,
++        object_id,
++    }
++}
++
++/// Mint a fresh genesis (version 1, no prev), signed by every holder.
++///
++/// # Panics
++/// A bad spec: a holder seed outside [`HOLDER_SEED_RANGE`], no holder or
++/// seat, or a seat seed that is a holder's or a recovery key's.
++#[must_use]
++pub fn ceremony_v2(spec: &CeremonySpec) -> TestCeremonyV2 {
++    check_spec(spec);
++    let holders: Vec<HolderV2> = spec
++        .holders
++        .iter()
++        .map(|s| mint_holder(*s, spec.t0_ms))
++        .collect();
++    let seats: Vec<SeatV2> = spec
++        .serve_nodes
++        .iter()
++        .map(|s| mint_seat(*s, spec.t0_ms))
++        .collect();
++    let signers: Vec<(CompositeSigningKey, String)> = holders
++        .iter()
++        .map(|h| (test_key(h.seed), h.identity_ref.clone()))
++        .collect();
++    assemble_bundle(
++        spec,
++        1,
++        None,
++        spec.t0_ms + DAY_MS / 2,
++        holders,
++        seats,
++        Vec::new(),
++        &signers,
++        None,
++    )
++}
++
++/// Mint a later bundle over `prev` (CC 5.3.4): `holders` and `serve_nodes`
++/// are the new sets, by holder / seat seed, and `signers` the holder seeds
++/// whose voices it carries. A party `prev` seats is carried as `prev` seats
++/// it (a recovered holder keeps its re-seated key and commitment); a new one
++/// is minted at prev's `t0`. Each signer signs with the key it holds now,
++/// under its identity. The reader judges the count against prev's holders
++/// (a strict majority, plus each holder added or re-committed); this
++/// fixture does not. The bundle is asserted [`LATER_STEP_MS`] after prev.
++///
++/// # Panics
++/// As [`ceremony_v2`].
++#[must_use]
++pub fn later_v2(
++    prev: &TestCeremonyV2,
++    holders: &[u8],
++    serve_nodes: &[u8],
++    signers: &[u8],
++) -> TestCeremonyV2 {
++    let spec = CeremonySpec {
++        holders: holders.to_vec(),
++        serve_nodes: serve_nodes.to_vec(),
++        t0_ms: prev.spec.t0_ms,
++        family_key_id: prev.spec.family_key_id.clone(),
++    };
++    check_spec(&spec);
++    let held_holder = |h: u8| prev.holders.iter().find(|x| x.holder_seed == h).cloned();
++    let placed: Vec<HolderV2> = holders
++        .iter()
++        .map(|h| held_holder(*h).unwrap_or_else(|| mint_holder(*h, spec.t0_ms)))
++        .collect();
++    let seats: Vec<SeatV2> = serve_nodes
++        .iter()
++        .map(|s| {
++            prev.seats
++                .iter()
++                .find(|x| x.seed == *s)
++                .cloned()
++                .unwrap_or_else(|| mint_seat(*s, spec.t0_ms))
++        })
++        .collect();
++    let voices: Vec<(CompositeSigningKey, String)> = signers
++        .iter()
++        .map(|s| {
++            placed
++                .iter()
++                .find(|x| x.holder_seed == *s)
++                .cloned()
++                .or_else(|| held_holder(*s))
++                .map_or_else(
++                    || (test_key(*s), identity_ref_of(*s)),
++                    |h| (test_key(h.seed), h.identity_ref),
++                )
++        })
++        .collect();
++    assemble_bundle(
++        &spec,
++        prev.version + 1,
++        Some(prev.object_id),
++        prev.asserted_at_ms + LATER_STEP_MS,
++        placed,
++        seats,
++        Vec::new(),
++        &voices,
++        None,
++    )
++}
++
++/// Mint a **recovery** over `prev` (CC 2.6.1.11, CC 4.2.6): a later bundle
++/// with ONE statement, `iss` the holder `holder_seed`, signed by the
++/// recovery key its commitment in force commits to, naming that key's
++/// record. It changes that holder's seat alone: the holder is re-seated on a
++/// new key with its own custody chain and commits a next recovery key, so
++/// the spent commitment never returns. Every other holder, every seat and
++/// the charter are as `prev` has them. The new records are asserted one
++/// second before the bundle, which is asserted [`LATER_STEP_MS`] after prev.
++///
++/// A first recovery re-seats key `n + RECOVERED_SEED_OFFSET` and commits
++/// `n + NEXT_RECOVERY_SEED_OFFSET`; a second re-seats
++/// `n + SECOND_RECOVERED_SEED_OFFSET` and commits
++/// `n + SECOND_NEXT_RECOVERY_SEED_OFFSET`.
++///
++/// # Panics
++/// `holder_seed` is not a holder of `prev`, or was recovered twice already.
++#[must_use]
++pub fn recover_v2(prev: &TestCeremonyV2, holder_seed: u8) -> TestCeremonyV2 {
++    let old = holder_of(prev, holder_seed);
++    let (new_key, next) = if old.seed == holder_seed {
++        (
++            holder_seed + RECOVERED_SEED_OFFSET,
++            holder_seed + NEXT_RECOVERY_SEED_OFFSET,
++        )
++    } else if old.seed == holder_seed + RECOVERED_SEED_OFFSET {
++        (
++            holder_seed + SECOND_RECOVERED_SEED_OFFSET,
++            holder_seed + SECOND_NEXT_RECOVERY_SEED_OFFSET,
++        )
++    } else {
++        panic!("recover_v2: holder {holder_seed} was recovered twice already")
++    };
++    recover_v2_with(prev, holder_seed, old.recovery_seed, new_key, next)
++}
++
++/// A recovery with every key chosen by the caller, for the witnesses of what
++/// the reader must refuse: `recovery_signer_seed` signs the one statement
++/// (its record is named), the holder is re-seated on `new_key_seed`, and
++/// `next_recovery_seed` is committed. A `new_key_seed` must be one a custody
++/// chain is carried for: `n + RECOVERED_SEED_OFFSET`,
++/// `n + SECOND_RECOVERED_SEED_OFFSET`, or `n + RECOVERY_SEED_OFFSET` (the
++/// first recovery key ITSELF: `recovery_key_is_signing_key`).
++///
++/// # Panics
++/// `holder_seed` is not a holder of `prev`; a `new_key_seed` with no chain.
++#[must_use]
++pub fn recover_v2_with(
++    prev: &TestCeremonyV2,
++    holder_seed: u8,
++    recovery_signer_seed: u8,
++    new_key_seed: u8,
++    next_recovery_seed: u8,
++) -> TestCeremonyV2 {
++    let i = prev
++        .holders
++        .iter()
++        .position(|h| h.holder_seed == holder_seed)
++        .unwrap_or_else(|| panic!("recover_v2: {holder_seed} is not a holder of prev"));
++    let iref = prev.holders[i].identity_ref.clone();
++    let at = prev.asserted_at_ms + LATER_STEP_MS;
++    let rows_at = at - 1000;
++    let rk = test_key(recovery_signer_seed);
++    let chain = chain_for_key(holder_seed, new_key_seed);
++    let record = holder_record(&iref, &test_key(new_key_seed), chain, rows_at);
++    let rk_record = recovery_key_record(&iref, &rk, rows_at);
++    let mut holders = prev.holders.clone();
++    holders[i] = HolderV2 {
++        seed: new_key_seed,
++        holder_seed,
++        recovery_seed: next_recovery_seed,
++        kid: kid_of(new_key_seed),
++        identity_ref: iref.clone(),
++        record,
++        recovery_commitment: recovery_commitment(&[test_key(next_recovery_seed)
++            .public_key()
++            .clone()]),
++    };
++    let signers = [(rk, iref.clone())];
++    assemble_bundle(
++        &prev.spec,
++        prev.version + 1,
++        Some(prev.object_id),
++        at,
++        holders,
++        prev.seats.clone(),
++        vec![rk_record],
++        &signers,
++        Some(iref),
++    )
++}
++
++fn holder_of(prev: &TestCeremonyV2, holder_seed: u8) -> &HolderV2 {
++    prev.holders
++        .iter()
++        .find(|h| h.holder_seed == holder_seed)
++        .unwrap_or_else(|| panic!("{holder_seed} is not a holder of prev"))
++}
++
++/// The custody chain carried for holder `holder_seed`'s key `key_seed`.
++fn chain_for_key(holder_seed: u8, key_seed: u8) -> Vec<Vec<u8>> {
++    if key_seed == holder_seed {
++        chain_of(HOLDER_CHAINS_HEX, holder_seed)
++    } else if key_seed == holder_seed + RECOVERED_SEED_OFFSET {
++        chain_of(RECOVERED_CHAINS_HEX, holder_seed)
++    } else if key_seed == holder_seed + SECOND_RECOVERED_SEED_OFFSET {
++        chain_of(SECOND_RECOVERED_CHAINS_HEX, holder_seed)
++    } else if key_seed == holder_seed + RECOVERY_SEED_OFFSET {
++        chain_of(RECOVERY_KEY_CHAINS_HEX, holder_seed)
++    } else {
++        panic!("no custody chain for key {key_seed} of holder {holder_seed}")
++    }
++}
++
++/// Mint a later bundle over `prev` that changes ONE thing: holder
++/// `holder_seed`'s recovery commitment, re-committed to
++/// `test_key(recovery_seed)`. Every other party and the charter are as
++/// `prev` has them; `signers` (holder seeds) sign with their current keys.
++/// The reader counts it as any later bundle (a strict majority of prev's
++/// holders, plus the re-committed holder), and concludes nothing for a
++/// bundle naming a commitment the lineage has spent
++/// (`recovery_commitment_spent`, CC 4.2.6: a spent commitment never
++/// returns).
++///
++/// # Panics
++/// `holder_seed` is not a holder of `prev`.
++#[must_use]
++pub fn recommit_v2(
++    prev: &TestCeremonyV2,
++    holder_seed: u8,
++    recovery_seed: u8,
++    signers: &[u8],
++) -> TestCeremonyV2 {
++    let i = prev
++        .holders
++        .iter()
++        .position(|h| h.holder_seed == holder_seed)
++        .unwrap_or_else(|| panic!("recommit_v2: {holder_seed} is not a holder of prev"));
++    let mut holders = prev.holders.clone();
++    holders[i].recovery_seed = recovery_seed;
++    holders[i].recovery_commitment =
++        recovery_commitment(&[test_key(recovery_seed).public_key().clone()]);
++    let voices: Vec<(CompositeSigningKey, String)> = signers
++        .iter()
++        .map(|s| {
++            holders.iter().find(|h| h.holder_seed == *s).map_or_else(
++                || (test_key(*s), identity_ref_of(*s)),
++                |h| (test_key(h.seed), h.identity_ref.clone()),
++            )
++        })
++        .collect();
++    assemble_bundle(
++        &prev.spec,
++        prev.version + 1,
++        Some(prev.object_id),
++        prev.asserted_at_ms + LATER_STEP_MS,
++        holders,
++        prev.seats.clone(),
++        Vec::new(),
++        &voices,
++        None,
++    )
++}
++
++/// The standard ceremony ([`CeremonySpec::standard`]), minted once per
++/// process.
++#[must_use]
++pub fn bundle_v2() -> &'static TestCeremonyV2 {
++    static STANDARD: OnceLock<TestCeremonyV2> = OnceLock::new();
++    STANDARD.get_or_init(|| ceremony_v2(&CeremonySpec::standard()))
++}
++
++/// What an install placed.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct InstalledV2 {
++    /// The bundle's object id.
++    pub object_id: Digest32,
++    /// Its version.
++    pub version: u64,
++}
++
++/// Install `c` on `dir` through the real import door
++/// (`edition2::genesis::put_genesis_bundle`): one statement list, the named
++/// rows in put order then the voices, under [`TestCeremonyV2::anchor`],
++/// after registering the MOCK attestation root with the door's custody
++/// gate (`edition2::genesis::add_test_attestation_root`).
++///
++/// Idempotent: the outcome is read back from the held state, so a bundle
++/// already held is Ok whatever the door says of a second offer.
++///
++/// Under `test-anchor` outside `cfg(test)` the door trusts the MOCK root
++/// only while `ciris_verify_core::test_anchor::test_anchor_active()`.
++///
++/// # Errors
++/// The door's refusal, unchanged, when the bundle is not held after it.
++pub async fn install_ceremony_v2<F>(dir: &F, c: &TestCeremonyV2) -> Result<InstalledV2, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    super::genesis::add_test_attestation_root(mock_attestation_root_der());
++    let mut statements: Vec<Vec<u8>> = c
++        .rows_in_put_order()
++        .into_iter()
++        .map(|r| r.statement.clone())
++        .collect();
++    statements.extend(c.voices.iter().cloned());
++    let anchor = c.anchor();
++    let offered = super::genesis::put_genesis_bundle(dir, &statements, Some(&anchor)).await;
++    let held = super::genesis::genesis_in_force(dir).await?;
++    if held.valid.iter().any(|p| p.object_id == c.object_id) {
++        return Ok(InstalledV2 {
++            object_id: c.object_id,
++            version: c.version,
++        });
++    }
++    match offered {
++        Err(e) => Err(e),
++        Ok(admission) => Err(Error::malformed_row(
++            super::door::PLANE,
++            crate::federation::malformed_row::GENESIS_BUNDLE_MALFORMED,
++            format!(
++                "test_ceremony_v2: bundle {} is not held after the door: {:?}",
++                hex::encode(c.object_id),
++                admission.not_placed
++            ),
++        )),
++    }
++}
++
++/// [`install_ceremony_v2`] of [`bundle_v2`]. Replaces the earlier seeds:
++/// `seed_genesis_accord_holders` + `seed_family_and_canonical`,
++/// `seed_accord_family`, `seed_canonical_servers`, `seed_delegation_plane`,
++/// `seed_canonical_community_from` and `install_test_ceremony_outputs*`.
++///
++/// # Errors
++/// As [`install_ceremony_v2`].
++pub async fn install_v2<F>(dir: &F) -> Result<InstalledV2, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    install_ceremony_v2(dir, bundle_v2()).await
++}
++
++/// [`install_v2`] on an Engine's directory.
++///
++/// # Errors
++/// As [`install_ceremony_v2`].
++#[cfg(any(feature = "sqlite", feature = "postgres"))]
++pub async fn install_v2_engine(engine: &crate::Engine) -> Result<InstalledV2, Error> {
++    let dir = engine.federation_directory();
++    install_v2(dir.as_ref()).await
++}
+diff --git a/src/federation/edition2/fixture_genesis_custody.rs b/src/federation/edition2/fixture_genesis_custody.rs
+new file mode 100644
+index 00000000..473e37d9
+--- /dev/null
++++ b/src/federation/edition2/fixture_genesis_custody.rs
+@@ -0,0 +1,691 @@
++//! GENERATED by `scripts/gen_test_ceremony_v2_custody.py`: do not edit.
++//!
++//! The test ceremony's holder custody evidence (CC 4.2.2.1): the MOCK
++//! YubiKey PIV attestation root of CIRISVerify v23.3.0's genesis vectors,
++//! and for each test holder seed `n` the chain `[9c leaf, f9]` (hex, DER)
++//! attesting the Ed25519 half of the composite test key `n`. Trusted only
++//! by a reader handed [`MOCK_ATTESTATION_ROOT_HEX`] as its store.
++
++/// The MOCK attestation root (DER, hex).
++pub const MOCK_ATTESTATION_ROOT_HEX: &str = concat!(
++    "3082011e3081d1a003020102020101300506032b657030383136303406035504030c2d59756269636f20504956204174",
++    "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++    "5a180f32303939313233313030303030305a30383136303406035504030c2d59756269636f2050495620417474657374",
++    "6174696f6e20284d4f434b20726f6f742c2074657374206f6e6c7929302a300506032b657003210075d30efc3a67206c",
++    "22963620729f9cd6d759e545a8d81a9333c9341fa865fc99300506032b657003410059d6889352c484847563bc225243",
++    "c7df44be8036aaef963bf2bf3299ef8d7514e45bc35ff661c358c5db5a3294b76b37d9f498b1ccc521db5b7932c7b089",
++    "4503",
++);
++
++/// The holder seeds a chain is carried for.
++pub const CHAIN_SEEDS: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
++
++/// `(seed, [leaf hex, f9 hex])` per holder seed.
++pub const HOLDER_CHAINS_HEX: [(u8, [&str; 2]); 7] = [
++    (
++        1,
++        [
++            concat!(
++                "308201383081eba003020102020200c9300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2031293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203129302a300506032b6570032100d62f016a1efd1e4fdf793eb42cd84471e1ba9f0cf04d1287b5cc71",
++                "f616287cb8a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100d6d2d2c4653dfdb788c9927bd5e674384bbba941ba9c98d4235ef2a58958aaf41b842596",
++                "2bfca42a250c52ed62df44df16cba558739996082e75054314694409",
++            ),
++            concat!(
++                "308201283081dba003020102020165300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203129302a300506032b65700321000db01ef074d426b02f72ac98041b6c05b3af",
++                "98c70951675a2c6c0ea2b8d8749ca3123010300e060a2b0601040182c40a030a0400300506032b657003410000bb9a34",
++                "ac9cd3c25bc6407fdc306189b87b7f9f0c0ce88772a18f7df49f001b4f6dc0b6cd4201cc83083c06827a0c57d41e661d",
++                "f72a42233ff718a20d60a10c",
++            ),
++        ],
++    ),
++    (
++        2,
++        [
++            concat!(
++                "308201383081eba003020102020200ca300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2032293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203229302a300506032b657003210034b4d9043156cb6dcf0beb0a2949b7559c940d2bcb6dbe8c53a9b3",
++                "0278e3a746a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100aa856fa0e24c0ab9fcceed117e4b9c240530f14986c2155f14c8291e3e67bc384b33a33f",
++                "2008becf5264df6a84bd551268a269392fcbd8151a15a2ec8ea13502",
++            ),
++            concat!(
++                "308201283081dba003020102020166300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203229302a300506032b6570032100bb82f86000b66e83ddbc08c9e50a9cd0011e",
++                "ff42c076ca6eb5c4ee7d562f26fca3123010300e060a2b0601040182c40a030a0400300506032b65700341000883446c",
++                "bcf4d7baa42a24779873073e1c85352f4376930e2c31caad7408254ac472cfc513bc76bafe951cc9b5243462d0a42496",
++                "c0b522110119a88164cbcb01",
++            ),
++        ],
++    ),
++    (
++        3,
++        [
++            concat!(
++                "308201383081eba003020102020200cb300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2033293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203329302a300506032b657003210012a41592c8b7c17d4059e7b29b61e8ff96c7415f2f803348f2f017",
++                "e05b9ea1daa32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b65700341008ed9661af6014fb758b555ff59261e4b561a4c6f042707a00a7b695095e5bdece435c333",
++                "3444dc69a5d350accf3db7fb7478fa926dd135e01ac4dcf874730606",
++            ),
++            concat!(
++                "308201283081dba003020102020167300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203329302a300506032b6570032100e024a066dcb9fb563a3f5a6b5cc3db2979bc",
++                "ceba2d1da8e6bc347ec08f309f91a3123010300e060a2b0601040182c40a030a0400300506032b6570034100df744dc6",
++                "1a85d739a067143966c38bfe8350830550200ab7b2f67858bd585da79981556c2ef54ee91d2d9f677bd6a889ffb5a53e",
++                "4ede33bafbe20b1f2778dc05",
++            ),
++        ],
++    ),
++    (
++        4,
++        [
++            concat!(
++                "308201383081eba003020102020200cc300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2034293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203429302a300506032b657003210054b0d81d0fa7d00e4a7d600dfaba6f2b22035b22fe335e17edf5f9",
++                "aa5bb05074a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b65700341004053fcf912a09a2cd3dacec542b11bb6488caaeb94638a804b4ce661af1866bf7d828322",
++                "0c402a31dd371c8d7be5f831368a33b6cd37b4e93d9e8b57c1d29804",
++            ),
++            concat!(
++                "308201283081dba003020102020168300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203429302a300506032b65700321008c43f03a9ef85df5ac4bb472bfb4d71277f0",
++                "a2c4cbad3ea14a5586d00cbb9366a3123010300e060a2b0601040182c40a030a0400300506032b6570034100a15c1dc5",
++                "3c86dae7c14a1a9240e30a85636433c08ffc060a2ef31507613b5edf22c7df9997f9c2b23a90d60640a4ab5956669993",
++                "7c1406ced23467906db4ef0b",
++            ),
++        ],
++    ),
++    (
++        5,
++        [
++            concat!(
++                "308201383081eba003020102020200cd300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2035293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203529302a300506032b6570032100e34d3a01b6112e1429ead61668405f4ef4be4f8853abee5079d28a",
++                "c6c13ffdd0a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100a10b7277f8aa885f69554683cb9462ee24689eb6cd26befe9273759343b1103ba63044ec",
++                "f1ddfd47696388d23c64ccfafb78aa64293b4fbb64cccdbcc3d04b03",
++            ),
++            concat!(
++                "308201283081dba003020102020169300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203529302a300506032b65700321007a3c4d5c9c4aaa6b4da59bce0c5d1efe38b3",
++                "2f5eff689f28a36b6f15c8594776a3123010300e060a2b0601040182c40a030a0400300506032b6570034100f9a10dfd",
++                "6629d62057450ca0fbcd5704986117e833217f5c9e03df5c17adf9fcaf486eda357a8f17d87a478ca078180c59265029",
++                "c05fd6b5353f8162c4dc0f0f",
++            ),
++        ],
++    ),
++    (
++        6,
++        [
++            concat!(
++                "308201383081eba003020102020200ce300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2036293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203629302a300506032b6570032100750826c281a4f691a41ffb03ef1b4287568ebfc52ec5cca89d953e",
++                "5a0093abd5a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b657003410067224b04fd72732808a02d3c05a345097b5d9b559442c66488bbae01179f7f8873ead266",
++                "97ca3267c92d7474942ed40f0619f5ac716e348d559bfb2feca69504",
++            ),
++            concat!(
++                "308201283081dba00302010202016a300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203629302a300506032b6570032100ef9c5e748470f9b547fd283e02a5dda396e9",
++                "05b4a51dc70380f4a3c8bce20791a3123010300e060a2b0601040182c40a030a0400300506032b6570034100c7c3133e",
++                "2d0f63d668aa22b219a484c7d19d7246b442a80b97d274aea92ff5f2c56712f594b199a92900a1eb3fed6f94af20b05b",
++                "c7beff2342d36ef9c0671b0b",
++            ),
++        ],
++    ),
++    (
++        7,
++        [
++            concat!(
++                "308201383081eba003020102020200cf300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2037293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203729302a300506032b65700321008320a51977d8c38ca8a4927c670df5821e449761945e15e9efb26a",
++                "1509d230eaa32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100a79b65f91e08cbdf8fcf4b1c1acdd8412a80a6531eb8f55c450e28669db5b3639a97c566",
++                "19a4d4474a3e2c28deb9a9c3100c59b8ed6ef67bb72c63d06bb19305",
++            ),
++            concat!(
++                "308201283081dba00302010202016b300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203729302a300506032b6570032100496047a3abb2dbe7bac83bf2bae23fc4a8b7",
++                "9a58608f269145abc0b9ba024cdfa3123010300e060a2b0601040182c40a030a0400300506032b657003410064687117",
++                "6442670a2ae054bf4888c337d8b85939c64ec529d80b32a32bc05e1a3a0e840d7faeb2200e408f3901343701254685b1",
++                "4965a7863f4c773ee89c5108",
++            ),
++        ],
++    ),
++];
++
++/// The signing-key seed offset after a recovery: holder `n` re-seats key `n + 40`.
++pub const RECOVERED_KEY_OFFSET: u8 = 40;
++
++/// `(holder seed, [leaf hex, f9 hex])`: the chain attesting the key holder `n`
++/// re-seats after a recovery (key `n + RECOVERED_KEY_OFFSET`).
++pub const RECOVERED_CHAINS_HEX: [(u8, [&str; 2]); 7] = [
++    (
++        1,
++        [
++            concat!(
++                "308201383081eba003020102020200c9300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2031293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203129302a300506032b65700321008c3da879bd09c821b6356d9524de7386e422416aec74139a46f030",
++                "1197d1b2dba32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b65700341004e03b3771308e0ddab32c1c7d9fe0bd54c0f522ca3174dde1be0f1252eda637cd054504d",
++                "1709aad30ccbb825a21a581ddc63e6f57cc01bc2c834c20604882808",
++            ),
++            concat!(
++                "308201283081dba003020102020165300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203129302a300506032b65700321000db01ef074d426b02f72ac98041b6c05b3af",
++                "98c70951675a2c6c0ea2b8d8749ca3123010300e060a2b0601040182c40a030a0400300506032b657003410000bb9a34",
++                "ac9cd3c25bc6407fdc306189b87b7f9f0c0ce88772a18f7df49f001b4f6dc0b6cd4201cc83083c06827a0c57d41e661d",
++                "f72a42233ff718a20d60a10c",
++            ),
++        ],
++    ),
++    (
++        2,
++        [
++            concat!(
++                "308201383081eba003020102020200ca300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2032293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203229302a300506032b6570032100ab3fa2fdab77f98706c76697b42bc99d7b5f967cadcd59c19633ea",
++                "502fd1dcf3a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b657003410016c1918db55b884f4796afbb309ef552778b2a0818732fd114f5c2459f5c9eaeb0cea310",
++                "d22ab28cad9e6937b3adf2d0559bd866d30865ef10508f9dd0eeef0d",
++            ),
++            concat!(
++                "308201283081dba003020102020166300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203229302a300506032b6570032100bb82f86000b66e83ddbc08c9e50a9cd0011e",
++                "ff42c076ca6eb5c4ee7d562f26fca3123010300e060a2b0601040182c40a030a0400300506032b65700341000883446c",
++                "bcf4d7baa42a24779873073e1c85352f4376930e2c31caad7408254ac472cfc513bc76bafe951cc9b5243462d0a42496",
++                "c0b522110119a88164cbcb01",
++            ),
++        ],
++    ),
++    (
++        3,
++        [
++            concat!(
++                "308201383081eba003020102020200cb300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2033293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203329302a300506032b6570032100a8eebe0df1d72f384ba6d6172b1ade07d02a13b8e55a39a1c7e706",
++                "76a86d5a07a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b657003410091da7b2a8519571189cef961076ae39d6cb4501cba2d35b734070989fd0854a2fa10f88d",
++                "92f56eee436024bbadef9197d6dc6f9b6519b956187d7ed1e18b9108",
++            ),
++            concat!(
++                "308201283081dba003020102020167300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203329302a300506032b6570032100e024a066dcb9fb563a3f5a6b5cc3db2979bc",
++                "ceba2d1da8e6bc347ec08f309f91a3123010300e060a2b0601040182c40a030a0400300506032b6570034100df744dc6",
++                "1a85d739a067143966c38bfe8350830550200ab7b2f67858bd585da79981556c2ef54ee91d2d9f677bd6a889ffb5a53e",
++                "4ede33bafbe20b1f2778dc05",
++            ),
++        ],
++    ),
++    (
++        4,
++        [
++            concat!(
++                "308201383081eba003020102020200cc300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2034293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203429302a300506032b65700321001a381879f8a8dc97361d012e3b472207cc7313ed1a81c918eebfa8",
++                "72b93414d9a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100bb45c4165deabb2ba2463a9879621487bbff3f8af7c752290b048bab3fea2594cf09e007",
++                "8e588245a4b62bd6dcf52e3fdb58cf87e494568197b2c3de0162180b",
++            ),
++            concat!(
++                "308201283081dba003020102020168300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203429302a300506032b65700321008c43f03a9ef85df5ac4bb472bfb4d71277f0",
++                "a2c4cbad3ea14a5586d00cbb9366a3123010300e060a2b0601040182c40a030a0400300506032b6570034100a15c1dc5",
++                "3c86dae7c14a1a9240e30a85636433c08ffc060a2ef31507613b5edf22c7df9997f9c2b23a90d60640a4ab5956669993",
++                "7c1406ced23467906db4ef0b",
++            ),
++        ],
++    ),
++    (
++        5,
++        [
++            concat!(
++                "308201383081eba003020102020200cd300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2035293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203529302a300506032b65700321008ca63145907a2e6c5fb3dc0791c0189b8252da3e4143704b3b2ca4",
++                "e526f25dd1a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b657003410022f296c711d27f2540b32342e8d9d8902462573c04269b0b0ad9b26593db0dcfd99824c9",
++                "a36b0aad2dcf896d1c26b6bdf2bd64d2f7d2b3e946a66eff421b980f",
++            ),
++            concat!(
++                "308201283081dba003020102020169300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203529302a300506032b65700321007a3c4d5c9c4aaa6b4da59bce0c5d1efe38b3",
++                "2f5eff689f28a36b6f15c8594776a3123010300e060a2b0601040182c40a030a0400300506032b6570034100f9a10dfd",
++                "6629d62057450ca0fbcd5704986117e833217f5c9e03df5c17adf9fcaf486eda357a8f17d87a478ca078180c59265029",
++                "c05fd6b5353f8162c4dc0f0f",
++            ),
++        ],
++    ),
++    (
++        6,
++        [
++            concat!(
++                "308201383081eba003020102020200ce300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2036293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203629302a300506032b6570032100c6d0c796bb4c3c923615f8dc85e6fc35149eb6b1317de523d3a508",
++                "5584f5c109a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b657003410019ec9656c12c8938db114504d7eca4cb2e5712a74b9d0ca99ca8c44e2214950340309b01",
++                "1f3f7af4f0fd57a772da6a3b9cb19c167c9f81cff009d2a0154ffc0d",
++            ),
++            concat!(
++                "308201283081dba00302010202016a300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203629302a300506032b6570032100ef9c5e748470f9b547fd283e02a5dda396e9",
++                "05b4a51dc70380f4a3c8bce20791a3123010300e060a2b0601040182c40a030a0400300506032b6570034100c7c3133e",
++                "2d0f63d668aa22b219a484c7d19d7246b442a80b97d274aea92ff5f2c56712f594b199a92900a1eb3fed6f94af20b05b",
++                "c7beff2342d36ef9c0671b0b",
++            ),
++        ],
++    ),
++    (
++        7,
++        [
++            concat!(
++                "308201383081eba003020102020200cf300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2037293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203729302a300506032b657003210011fd45714f88a20def29308b6fc2bb3f997717c74c059dbaf3bf5d",
++                "adc6cf960aa32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100fd3a53b688f2f4c92b82be8102cc04d028b95250bfb03b49c1f14fa3691e41796c8a8555",
++                "7ac8f7706dcb89e74db578c16812c4c404449f32e3446c82e4007a0e",
++            ),
++            concat!(
++                "308201283081dba00302010202016b300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203729302a300506032b6570032100496047a3abb2dbe7bac83bf2bae23fc4a8b7",
++                "9a58608f269145abc0b9ba024cdfa3123010300e060a2b0601040182c40a030a0400300506032b657003410064687117",
++                "6442670a2ae054bf4888c337d8b85939c64ec529d80b32a32bc05e1a3a0e840d7faeb2200e408f3901343701254685b1",
++                "4965a7863f4c773ee89c5108",
++            ),
++        ],
++    ),
++];
++
++/// `(holder seed, [leaf hex, f9 hex])`: a chain attesting holder `n`'s first
++/// recovery key (key `n + 50`), for the witness that a recovery seating the
++/// recovery key itself as the signing key is refused.
++pub const RECOVERY_KEY_CHAINS_HEX: [(u8, [&str; 2]); 7] = [
++    (
++        1,
++        [
++            concat!(
++                "308201383081eba003020102020200c9300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2031293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203129302a300506032b6570032100e1b71abfd3232804261e423f36556f6b4185bed41fdfd00d769ce1",
++                "5a394f43cea32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b65700341002e86a533c401c63139460c46098db726afa683a0f191e3e911f9abd0755b1079a536b900",
++                "c0cf5246844ed28e9bd4f2b27825c9b36a440c27a29921139f5bda09",
++            ),
++            concat!(
++                "308201283081dba003020102020165300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203129302a300506032b65700321000db01ef074d426b02f72ac98041b6c05b3af",
++                "98c70951675a2c6c0ea2b8d8749ca3123010300e060a2b0601040182c40a030a0400300506032b657003410000bb9a34",
++                "ac9cd3c25bc6407fdc306189b87b7f9f0c0ce88772a18f7df49f001b4f6dc0b6cd4201cc83083c06827a0c57d41e661d",
++                "f72a42233ff718a20d60a10c",
++            ),
++        ],
++    ),
++    (
++        2,
++        [
++            concat!(
++                "308201383081eba003020102020200ca300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2032293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203229302a300506032b65700321007be29b98ba0937eadfa1fc1b47931f05dfce49faeee896c0f40c24",
++                "a78d649fe6a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b657003410015057dcfaa54093244796ac5f45d86844208a3f8653d4a4d4b52597c5a9b274f574f1434",
++                "b444eaa713d6e6d15a2ad95b32bb369bb8bc4e0b9bea90bcac93c50a",
++            ),
++            concat!(
++                "308201283081dba003020102020166300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203229302a300506032b6570032100bb82f86000b66e83ddbc08c9e50a9cd0011e",
++                "ff42c076ca6eb5c4ee7d562f26fca3123010300e060a2b0601040182c40a030a0400300506032b65700341000883446c",
++                "bcf4d7baa42a24779873073e1c85352f4376930e2c31caad7408254ac472cfc513bc76bafe951cc9b5243462d0a42496",
++                "c0b522110119a88164cbcb01",
++            ),
++        ],
++    ),
++    (
++        3,
++        [
++            concat!(
++                "308201383081eba003020102020200cb300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2033293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203329302a300506032b6570032100332ebe8d27cb7323b3a401c1c13b5dd64bccc0e10ecda1c2b5d11a",
++                "03779a85e5a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b657003410092191179adab79ef4e52b429975539d27e3ad035b15dfcbbfdca43d9c9b0710dc7446257",
++                "c133a30376333b530f6942d663c84966a674ee86432ede985ce51c09",
++            ),
++            concat!(
++                "308201283081dba003020102020167300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203329302a300506032b6570032100e024a066dcb9fb563a3f5a6b5cc3db2979bc",
++                "ceba2d1da8e6bc347ec08f309f91a3123010300e060a2b0601040182c40a030a0400300506032b6570034100df744dc6",
++                "1a85d739a067143966c38bfe8350830550200ab7b2f67858bd585da79981556c2ef54ee91d2d9f677bd6a889ffb5a53e",
++                "4ede33bafbe20b1f2778dc05",
++            ),
++        ],
++    ),
++    (
++        4,
++        [
++            concat!(
++                "308201383081eba003020102020200cc300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2034293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203429302a300506032b65700321001bee74bb8f513f1b5357bc477c886ad96949d04740ccd13a22f912",
++                "edf00dfe27a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100aefd10b90190a3bbf7d7f664776d131e560599cee102b29a9da2602402ccb85db48222f2",
++                "ce4cb1cd9cb828567d3545515e0e6a5f29ed25be575594dfe7445008",
++            ),
++            concat!(
++                "308201283081dba003020102020168300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203429302a300506032b65700321008c43f03a9ef85df5ac4bb472bfb4d71277f0",
++                "a2c4cbad3ea14a5586d00cbb9366a3123010300e060a2b0601040182c40a030a0400300506032b6570034100a15c1dc5",
++                "3c86dae7c14a1a9240e30a85636433c08ffc060a2ef31507613b5edf22c7df9997f9c2b23a90d60640a4ab5956669993",
++                "7c1406ced23467906db4ef0b",
++            ),
++        ],
++    ),
++    (
++        5,
++        [
++            concat!(
++                "308201383081eba003020102020200cd300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2035293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203529302a300506032b6570032100e5145a37d984d244ce11e69388cb36dedc828c1a277ca347d50f50",
++                "76a60959e8a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b657003410026fe85b736db5af6ce026282b4433d023f860af5533a08926baef5c3af235ea440f9f18b",
++                "b24d8109444a509702178fdf48df410b77b6916f1484f7b0b1b31309",
++            ),
++            concat!(
++                "308201283081dba003020102020169300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203529302a300506032b65700321007a3c4d5c9c4aaa6b4da59bce0c5d1efe38b3",
++                "2f5eff689f28a36b6f15c8594776a3123010300e060a2b0601040182c40a030a0400300506032b6570034100f9a10dfd",
++                "6629d62057450ca0fbcd5704986117e833217f5c9e03df5c17adf9fcaf486eda357a8f17d87a478ca078180c59265029",
++                "c05fd6b5353f8162c4dc0f0f",
++            ),
++        ],
++    ),
++    (
++        6,
++        [
++            concat!(
++                "308201383081eba003020102020200ce300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2036293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203629302a300506032b657003210023b631709df22832a04b29a1677ab761058ecb42329e14fd484269",
++                "e63fe55c60a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100381c8ab020405646f972bb9e6efeb05d9297daea76c6c54cbd70f99cbc3d8601370f6186",
++                "e5760ee0a5fc1c75c838e466028b0f4884b4c05157b450493dde200f",
++            ),
++            concat!(
++                "308201283081dba00302010202016a300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203629302a300506032b6570032100ef9c5e748470f9b547fd283e02a5dda396e9",
++                "05b4a51dc70380f4a3c8bce20791a3123010300e060a2b0601040182c40a030a0400300506032b6570034100c7c3133e",
++                "2d0f63d668aa22b219a484c7d19d7246b442a80b97d274aea92ff5f2c56712f594b199a92900a1eb3fed6f94af20b05b",
++                "c7beff2342d36ef9c0671b0b",
++            ),
++        ],
++    ),
++    (
++        7,
++        [
++            concat!(
++                "308201383081eba003020102020200cf300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2037293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203729302a300506032b657003210040b0f498a16f2b943d74dc4f9d4acc05d0de9c935dd569ae831cf8",
++                "fcdd4e3feba32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b65700341004fb6c585fd8a495c8b9b6616ac08fbe33d8695e0c4955d1a7f8dc371e21a870d276fc6df",
++                "0c2748431d4127d4eff6c7c565cdc492a6c03818e4458a7285f1c001",
++            ),
++            concat!(
++                "308201283081dba00302010202016b300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203729302a300506032b6570032100496047a3abb2dbe7bac83bf2bae23fc4a8b7",
++                "9a58608f269145abc0b9ba024cdfa3123010300e060a2b0601040182c40a030a0400300506032b657003410064687117",
++                "6442670a2ae054bf4888c337d8b85939c64ec529d80b32a32bc05e1a3a0e840d7faeb2200e408f3901343701254685b1",
++                "4965a7863f4c773ee89c5108",
++            ),
++        ],
++    ),
++];
++
++/// The signing-key seed offset after a SECOND recovery: key `n + 80`.
++pub const SECOND_RECOVERED_KEY_OFFSET: u8 = 80;
++
++/// `(holder seed, [leaf hex, f9 hex])`: the chain attesting the key holder `n`
++/// re-seats after a second recovery (key `n + SECOND_RECOVERED_KEY_OFFSET`).
++pub const SECOND_RECOVERED_CHAINS_HEX: [(u8, [&str; 2]); 7] = [
++    (
++        1,
++        [
++            concat!(
++                "308201383081eba003020102020200c9300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2031293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203129302a300506032b657003210091ea2db8260039049bd3b16db0f42755861e7d238f4c78d064d9a2",
++                "201a2e1350a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100fa9e5b6f4d12844f962cbb63abb867037b3885285cff965f0ea06dd03c5992548f18a415",
++                "d939df38923dd8f5efbef693db021191dc80890776734ef480555004",
++            ),
++            concat!(
++                "308201283081dba003020102020165300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203129302a300506032b65700321000db01ef074d426b02f72ac98041b6c05b3af",
++                "98c70951675a2c6c0ea2b8d8749ca3123010300e060a2b0601040182c40a030a0400300506032b657003410000bb9a34",
++                "ac9cd3c25bc6407fdc306189b87b7f9f0c0ce88772a18f7df49f001b4f6dc0b6cd4201cc83083c06827a0c57d41e661d",
++                "f72a42233ff718a20d60a10c",
++            ),
++        ],
++    ),
++    (
++        2,
++        [
++            concat!(
++                "308201383081eba003020102020200ca300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2032293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203229302a300506032b6570032100805440ee48051fc82ea64d905acabff0d21780f7fcaba6900e0e41",
++                "387b1d4a57a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100df027b9d1cd14feb27a2774a0bb26f01ebe78bd4274cf06eeccdc6833500983906904ebc",
++                "5b647ac23ccab5a45078ba54f7a996d8d19ed6bf91db4b08ba66c80a",
++            ),
++            concat!(
++                "308201283081dba003020102020166300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203229302a300506032b6570032100bb82f86000b66e83ddbc08c9e50a9cd0011e",
++                "ff42c076ca6eb5c4ee7d562f26fca3123010300e060a2b0601040182c40a030a0400300506032b65700341000883446c",
++                "bcf4d7baa42a24779873073e1c85352f4376930e2c31caad7408254ac472cfc513bc76bafe951cc9b5243462d0a42496",
++                "c0b522110119a88164cbcb01",
++            ),
++        ],
++    ),
++    (
++        3,
++        [
++            concat!(
++                "308201383081eba003020102020200cb300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2033293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203329302a300506032b65700321007b242f9778bbf9d1baa38a8026268be5566dff341e59bb3798db47",
++                "1c4cb282faa32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100c96d3704c38a01927c2aa825e9dcd4ac53091e5061131cb26514ad3fb5344fbb6f0996a0",
++                "ddab0293c953bb0523f8de52a71a8a9e315b027765aa994954de7607",
++            ),
++            concat!(
++                "308201283081dba003020102020167300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203329302a300506032b6570032100e024a066dcb9fb563a3f5a6b5cc3db2979bc",
++                "ceba2d1da8e6bc347ec08f309f91a3123010300e060a2b0601040182c40a030a0400300506032b6570034100df744dc6",
++                "1a85d739a067143966c38bfe8350830550200ab7b2f67858bd585da79981556c2ef54ee91d2d9f677bd6a889ffb5a53e",
++                "4ede33bafbe20b1f2778dc05",
++            ),
++        ],
++    ),
++    (
++        4,
++        [
++            concat!(
++                "308201383081eba003020102020200cc300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2034293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203429302a300506032b657003210046fd485b646d606a611023531e2810dce190778294bffcf21b446e",
++                "c7bb042b01a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100285c86c80c17c9d29d141bb75ced0bd9355e5017ddebe8b100c09a9d9591af8c06468e75",
++                "3089b4bab38e67faa634582d6a8cb9fc11d9ad765eb34a6f0e17320e",
++            ),
++            concat!(
++                "308201283081dba003020102020168300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203429302a300506032b65700321008c43f03a9ef85df5ac4bb472bfb4d71277f0",
++                "a2c4cbad3ea14a5586d00cbb9366a3123010300e060a2b0601040182c40a030a0400300506032b6570034100a15c1dc5",
++                "3c86dae7c14a1a9240e30a85636433c08ffc060a2ef31507613b5edf22c7df9997f9c2b23a90d60640a4ab5956669993",
++                "7c1406ced23467906db4ef0b",
++            ),
++        ],
++    ),
++    (
++        5,
++        [
++            concat!(
++                "308201383081eba003020102020200cd300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2035293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203529302a300506032b6570032100259145ad2655219b76837676ba31b9779035ffaa88c457a595d22e",
++                "4a374527c2a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100b83592e55545639b825e1434bcfb4e07833b13c02f6910e565f131b58dca0ecfd3290dfa",
++                "c8b207b92e3aafd75ac8e18e46cfe6e5ed5873f93e995caa83584907",
++            ),
++            concat!(
++                "308201283081dba003020102020169300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203529302a300506032b65700321007a3c4d5c9c4aaa6b4da59bce0c5d1efe38b3",
++                "2f5eff689f28a36b6f15c8594776a3123010300e060a2b0601040182c40a030a0400300506032b6570034100f9a10dfd",
++                "6629d62057450ca0fbcd5704986117e833217f5c9e03df5c17adf9fcaf486eda357a8f17d87a478ca078180c59265029",
++                "c05fd6b5353f8162c4dc0f0f",
++            ),
++        ],
++    ),
++    (
++        6,
++        [
++            concat!(
++                "308201383081eba003020102020200ce300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2036293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203629302a300506032b6570032100ca7d75b4ea1d5a861aa5838406782dfc62cdee7b059a334f0da153",
++                "d59386a09aa32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100be4ed15cbf1ea06ac4485646e2211d8fd9edf842e9f004c27f1293e22c50ba8bdc55f2c7",
++                "d948e9e75493993139ec6578f3ac744f7e330d9521ba4dc1a3979405",
++            ),
++            concat!(
++                "308201283081dba00302010202016a300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203629302a300506032b6570032100ef9c5e748470f9b547fd283e02a5dda396e9",
++                "05b4a51dc70380f4a3c8bce20791a3123010300e060a2b0601040182c40a030a0400300506032b6570034100c7c3133e",
++                "2d0f63d668aa22b219a484c7d19d7246b442a80b97d274aea92ff5f2c56712f594b199a92900a1eb3fed6f94af20b05b",
++                "c7beff2342d36ef9c0671b0b",
++            ),
++        ],
++    ),
++    (
++        7,
++        [
++            concat!(
++                "308201383081eba003020102020200cf300506032b6570302e312c302a06035504030c23597562694b65792050495620",
++                "4174746573746174696f6e20663920284d4f434b2037293020170d3236303130313030303030305a180f323039393132",
++                "33313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573746174696f6e203963",
++                "20284d4f434b203729302a300506032b65700321007d59c5623dd40a74aa4d5a32ac645d3b3f95daeae4c22be25476dd",
++                "6a486f7382a32b30293013060a2b0601040182c40a0303040504030507043012060a2b0601040182c40a030804040402",
++                "0102300506032b6570034100d102473f7fd9adebeace518a680e8f3d9bb5d37446638b9482afdadc40c3f9267922304c",
++                "fc60ea8f26b2b23ba57f8af8f6700c497cd075b48fd67f2ea43b7e05",
++            ),
++            concat!(
++                "308201283081dba00302010202016b300506032b657030383136303406035504030c2d59756269636f20504956204174",
++                "746573746174696f6e20284d4f434b20726f6f742c2074657374206f6e6c79293020170d323630313031303030303030",
++                "5a180f32303939313233313030303030305a302e312c302a06035504030c23597562694b657920504956204174746573",
++                "746174696f6e20663920284d4f434b203729302a300506032b6570032100496047a3abb2dbe7bac83bf2bae23fc4a8b7",
++                "9a58608f269145abc0b9ba024cdfa3123010300e060a2b0601040182c40a030a0400300506032b657003410064687117",
++                "6442670a2ae054bf4888c337d8b85939c64ec529d80b32a32bc05e1a3a0e840d7faeb2200e408f3901343701254685b1",
++                "4965a7863f4c773ee89c5108",
++            ),
++        ],
++    ),
++];
+diff --git a/src/federation/edition2/fixture_genesis_invariants.rs b/src/federation/edition2/fixture_genesis_invariants.rs
+new file mode 100644
+index 00000000..0594d766
+--- /dev/null
++++ b/src/federation/edition2/fixture_genesis_invariants.rs
+@@ -0,0 +1,745 @@
++//! The test ceremony and the pre-genesis boot (JSON-cut slice C,
++//! CC 2.6.1.11, CC 4.2.2.1, CC 5.3.4).
++//!
++//! - **I2330**: the fixture's bundle/2 replays Valid through Verify's own
++//!   reader under its anchor and the MOCK attestation root. The placement
++//!   seats exactly the spec's holders and seats, each seat with the X-Wing
++//!   keys of its binding; a seat is canonical and a holder is not.
++//! - **I2331**: with no anchor, or an anchor of other keys, the same bundle
++//!   roots nothing (`genesis_bundle_not_anchored`). With a root the reader
++//!   does not trust, no holder is seated (`genesis_holder_custody`).
++//! - **I2332**: a fixed `t0` gives the same bytes every time. The standard
++//!   ceremony is asserted in the past, and its seat records stay live for
++//!   most of a year from today: the fixture does not decay on a date.
++//! - **I2333**: a later bundle counts a strict majority of its
++//!   predecessor's holders (2 of 3 counts; 1 of 3 concludes nothing,
++//!   `genesis_bundle_count_unmet`). A seat it drops is not canonical under
++//!   it.
++//! - **I2339**: `recover_v2` is a recovery Verify's reader counts on its one
++//!   statement (the holder's committed recovery key, the key's record
++//!   named): the holder keeps its identity, is re-seated on its new key and
++//!   commits the next recovery key; the first commitment is spent; the other
++//!   holders and the seats are unchanged. A later bundle over it counts the
++//!   recovered holder under its new key. On the store, the recovery
++//!   installs over the installed genesis and is the head.
++//! - **I2340** (CC 4.2.6: a spent recovery commitment never returns): over
++//!   a recovered lineage, a second recovery under the spent recovery key,
++//!   a second recovery that commits the spent key again, and a roster
++//!   bundle re-committing it each conclude nothing
++//!   (`genesis_bundle_count_unmet`, `recovery_commitment_spent`). The
++//!   controls, a second recovery under the committed key and a roster
++//!   re-commit to a fresh key, are Valid. On the store, the import door
++//!   refuses each and the recovery stays the head.
++//! - **I2341** (CC 4.2.6: a recovery key is refused as a signing key, by
++//!   its public key material): a recovery seating the recovery key itself
++//!   as the holder's signing key is `genesis_bundle_malformed`
++//!   (`recovery_key_is_signing_key`). On the store, the door refuses it,
++//!   and a row signed by a recovery key's material under the holder's
++//!   identity is refused finally (never the retryable unknown-signer wait),
++//!   with no voice and no row held.
++//! - **I2334**: a custody chain exists for every holder seed the fixture
++//!   accepts, and a holder seed outside them is refused at minting.
++//! - **I2335**: a fresh node boots pre-genesis: it holds no bundle and no
++//!   seat is canonical (sqlite and postgres).
++//! - **I2336**: `install_v2` puts the rows and the voices through the real
++//!   doors; the bundle is then held and in force, its seats canonical and
++//!   its holders not. A second install changes nothing.
++//! - **I2337**: in lib unit tests every constructor but
++//!   `with_signer_pre_genesis` boots holding `bundle_v2`.
++//! - **I2338** (from disk): `engine.rs`'s production code seeds no earlier
++//!   genesis, and installs the test ceremony only under `cfg(test)` or
++//!   `test-anchor`.
++
++use std::collections::{BTreeMap, BTreeSet};
++
++use ciris_verify_core::edition2::genesis::{
++    read_genesis_bundles, Anchor, GenesisInput, GenesisPlacement, GenesisVerdict, Inconclusive,
++    Predecessor,
++};
++use ciris_verify_core::edition2::Digest32;
++use ciris_verify_core::trust_anchor_store::TrustAnchorStore;
++
++use super::fixture_genesis::*;
++use super::fixture_genesis_custody::CHAIN_SEEDS;
++
++/// A fixed records' instant: 2026-06-01T00:00:00Z.
++const T: u64 = 1_780_272_000_000;
++
++/// Read `c` alone with Verify's reader.
++fn read(
++    c: &TestCeremonyV2,
++    anchor: Option<&Anchor>,
++    predecessors: &[Predecessor<'_>],
++    roots: &TrustAnchorStore,
++) -> GenesisVerdict {
++    let rows = c.rows();
++    let reading = read_genesis_bundles(&GenesisInput {
++        statements: &c.voices,
++        rows: &rows,
++        anchor,
++        predecessors,
++        attestation_roots: roots,
++    });
++    assert!(reading.refused.is_empty(), "{:?}", reading.refused);
++    assert_eq!(reading.bundles.len(), 1, "one object");
++    let b = &reading.bundles[0];
++    assert_eq!(b.object_id, c.object_id, "the object id is the fixture's");
++    assert!(b.refused.is_empty(), "{:?}", b.refused);
++    b.verdict.clone()
++}
++
++fn valid(v: GenesisVerdict) -> GenesisPlacement {
++    match v {
++        GenesisVerdict::Valid(p) => *p,
++        other => panic!("not Valid: {other:?}"),
++    }
++}
++
++fn nothing(v: &GenesisVerdict) -> &Inconclusive {
++    match v {
++        GenesisVerdict::Nothing(i) => i,
++        other => panic!("not Nothing: {other:?}"),
++    }
++}
++
++#[test]
++fn i2330_the_ceremony_replays_valid_through_verifys_reader() {
++    let c = ceremony_v2(&CeremonySpec::at(T));
++    let p = valid(read(&c, Some(&c.anchor()), &[], &attestation_roots()));
++    assert_eq!(
++        (p.version, p.prev, p.family_key_id.as_str()),
++        (1, None, FAMILY_KEY_ID),
++        "I2330"
++    );
++    let holders: BTreeSet<String> = p.holders.iter().map(|h| h.identity_ref.clone()).collect();
++    assert_eq!(
++        holders,
++        c.holder_identity_refs()
++            .into_iter()
++            .collect::<BTreeSet<_>>(),
++        "I2330: the holders seated"
++    );
++    let seats: BTreeMap<String, _> = p
++        .seats
++        .iter()
++        .map(|s| (s.identity_ref.clone(), s))
++        .collect();
++    assert_eq!(seats.len(), c.seats.len(), "I2330: the seats seated");
++    for s in &c.seats {
++        let placed = seats.get(&s.identity_ref).expect("I2330: seat placed");
++        assert_eq!(placed.kid, s.kid, "I2330");
++        assert_eq!(placed.record, s.record.row_id, "I2330: record");
++        assert_eq!(placed.binding, s.binding.row_id, "I2330: binding");
++        assert_eq!(
++            (placed.transit_xwing_pubkey, placed.onion_hop_xwing_pubkey),
++            (s.transit_xwing_pubkey, s.onion_hop_xwing_pubkey),
++            "I2330: the binding's X-Wing keys"
++        );
++        assert!(
++            p.is_canonical(&s.identity_ref),
++            "I2330: a seat is canonical"
++        );
++    }
++    for h in &c.holders {
++        assert!(
++            !p.is_canonical(&h.identity_ref),
++            "I2330: a holder is not canonical"
++        );
++        assert_eq!(
++            p.charter.recovery_commitments.get(&h.identity_ref),
++            Some(&h.recovery_commitment),
++            "I2330: the commitment"
++        );
++    }
++}
++
++#[test]
++fn i2331_without_its_anchor_or_root_nothing_roots() {
++    let c = ceremony_v2(&CeremonySpec::at(T));
++    let roots = attestation_roots();
++    for (what, anchor) in [
++        ("no anchor", None),
++        (
++            "other keys",
++            Some(Anchor::Thumbprints(
++                [kid_of(4), kid_of(5), kid_of(6)].into(),
++            )),
++        ),
++        ("another object", Some(Anchor::ObjectId([7u8; 32]))),
++    ] {
++        let v = read(&c, anchor.as_ref(), &[], &roots);
++        assert_eq!(
++            nothing(&v).token(),
++            "genesis_bundle_not_anchored",
++            "I2331 {what}"
++        );
++    }
++    let v = read(&c, Some(&c.anchor()), &[], &TrustAnchorStore::new());
++    assert_eq!(
++        nothing(&v).token(),
++        "genesis_holder_custody",
++        "I2331: an untrusted root seats no holder"
++    );
++    // The pinned object id roots it too.
++    let pinned = Anchor::ObjectId(c.object_id);
++    valid(read(&c, Some(&pinned), &[], &roots));
++}
++
++#[test]
++fn i2332_fixed_bytes_and_no_calendar_decay() {
++    let (a, b) = (
++        ceremony_v2(&CeremonySpec::at(T)),
++        ceremony_v2(&CeremonySpec::at(T)),
++    );
++    assert_eq!((a.object_id, &a.voices), (b.object_id, &b.voices), "I2332");
++    assert_eq!(a.rows(), b.rows(), "I2332");
++    assert_ne!(
++        ceremony_v2(&CeremonySpec::at(T + DAY_MS)).object_id,
++        a.object_id,
++        "I2332: t0 is in the bytes"
++    );
++    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
++    let s = bundle_v2();
++    assert!(s.asserted_at_ms <= now, "I2332: asserted in the past");
++    assert!(
++        s.spec.t0_ms + YEAR_MS > now + 300 * DAY_MS,
++        "I2332: seat records live for most of a year from today"
++    );
++    assert_eq!(s.spec.holders, HOLDER_SEEDS.to_vec());
++    assert_eq!(s.spec.serve_nodes, SERVE_NODE_SEEDS.to_vec());
++    valid(read(s, Some(&s.anchor()), &[], &attestation_roots()));
++}
++
++#[test]
++fn i2333_a_later_bundle_counts_a_strict_majority() {
++    let first = ceremony_v2(&CeremonySpec::at(T));
++    let roots = attestation_roots();
++    let p1 = valid(read(&first, Some(&first.anchor()), &[], &roots));
++    let pre = [Predecessor::Valid(&p1)];
++    let dropped = SERVE_NODE_SEEDS[1];
++    let two = later_v2(
++        &first,
++        &HOLDER_SEEDS,
++        &SERVE_NODE_SEEDS[..1],
++        &HOLDER_SEEDS[..2],
++    );
++    assert_eq!((two.version, two.prev), (2, Some(first.object_id)), "I2333");
++    let p2 = valid(read(&two, None, &pre, &roots));
++    assert!(
++        p2.is_canonical(two.serve_node_identity_ref(0)),
++        "I2333: a kept seat"
++    );
++    assert!(
++        !p2.is_canonical(&identity_ref_of(dropped)),
++        "I2333: a dropped seat is not canonical under the later bundle"
++    );
++    let one = later_v2(
++        &first,
++        &HOLDER_SEEDS,
++        &SERVE_NODE_SEEDS[..1],
++        &HOLDER_SEEDS[..1],
++    );
++    let v = read(&one, None, &pre, &roots);
++    assert_eq!(
++        nothing(&v).token(),
++        "genesis_bundle_count_unmet",
++        "I2333: one of three concludes nothing"
++    );
++}
++
++#[test]
++fn i2334_every_accepted_holder_seed_has_a_chain() {
++    let accepted: Vec<u8> = HOLDER_SEED_RANGE.collect();
++    assert_eq!(accepted, CHAIN_SEEDS.to_vec(), "I2334");
++    let spec = CeremonySpec {
++        holders: vec![1, 5, 7],
++        serve_nodes: vec![20, 21, 22],
++        ..CeremonySpec::at(T)
++    };
++    let c = ceremony_v2(&spec);
++    valid(read(&c, Some(&c.anchor()), &[], &attestation_roots()));
++    let refused = std::panic::catch_unwind(|| {
++        ceremony_v2(&CeremonySpec {
++            holders: vec![1, 2, 8],
++            ..CeremonySpec::at(T)
++        })
++    });
++    assert!(refused.is_err(), "I2334: seed 8 carries no chain");
++}
++
++#[test]
++fn i2339_a_recovery_counts_on_its_one_statement() {
++    let first = ceremony_v2(&CeremonySpec::at(T));
++    let roots = attestation_roots();
++    let p1 = valid(read(&first, Some(&first.anchor()), &[], &roots));
++    let pre = [Predecessor::Valid(&p1)];
++    let r = recover_v2(&first, HOLDER_SEEDS[0]);
++    assert_eq!(r.voices.len(), 1, "I2339: one statement");
++    assert_eq!(r.recovered.as_deref(), Some(first.holder_identity_ref(0)));
++    let pr = valid(read(&r, None, &pre, &roots));
++    assert_eq!(
++        pr.recovered.as_deref(),
++        Some(first.holder_identity_ref(0)),
++        "I2339"
++    );
++    let placed = pr
++        .holders
++        .iter()
++        .find(|h| h.identity_ref == first.holder_identity_ref(0))
++        .expect("I2339: the holder keeps its identity");
++    assert_eq!(
++        placed.kid,
++        kid_of(HOLDER_SEEDS[0] + RECOVERED_SEED_OFFSET),
++        "I2339: re-seated on its new key"
++    );
++    assert_ne!(placed.kid, first.holders[0].kid, "I2339");
++    assert_eq!(
++        pr.charter
++            .recovery_commitments
++            .get(first.holder_identity_ref(0)),
++        Some(&r.holders[0].recovery_commitment),
++        "I2339: the next commitment"
++    );
++    assert_ne!(
++        r.holders[0].recovery_commitment, first.holders[0].recovery_commitment,
++        "I2339"
++    );
++    assert!(
++        pr.spent_commitments
++            .contains(&first.holders[0].recovery_commitment),
++        "I2339: the first commitment is spent"
++    );
++    for (h0, h1) in first.holders.iter().zip(&r.holders).skip(1) {
++        assert_eq!(
++            (h0.kid, h0.recovery_commitment),
++            (h1.kid, h1.recovery_commitment),
++            "I2339"
++        );
++    }
++    for sref in first.serve_node_identity_refs() {
++        assert!(pr.is_canonical(&sref), "I2339: the seats are unchanged");
++    }
++    // The recovered holder speaks under its new key in the next bundle.
++    let pre2 = [Predecessor::Valid(&pr)];
++    let next = later_v2(&r, &HOLDER_SEEDS, &SERVE_NODE_SEEDS, &HOLDER_SEEDS[..2]);
++    valid(read(&next, None, &pre2, &roots));
++}
++
++/// A verdict's token and detail.
++fn outcome(v: &GenesisVerdict) -> (&'static str, Option<&'static str>) {
++    match v {
++        GenesisVerdict::Valid(_) => ("valid", None),
++        GenesisVerdict::Invalid(m) => ("genesis_bundle_malformed", Some(m.reason())),
++        GenesisVerdict::Waiting(_) => ("waiting", None),
++        GenesisVerdict::Nothing(i) => (i.token(), i.detail()),
++    }
++}
++
++const SPENT: (&str, Option<&str>) = (
++    "genesis_bundle_count_unmet",
++    Some("recovery_commitment_spent"),
++);
++
++#[test]
++fn i2340_a_spent_recovery_commitment_never_returns() {
++    let n = HOLDER_SEEDS[0];
++    let first = ceremony_v2(&CeremonySpec::at(T));
++    let roots = attestation_roots();
++    let p1 = valid(read(&first, Some(&first.anchor()), &[], &roots));
++    let r = recover_v2(&first, n);
++    let pr = valid(read(&r, None, &[Predecessor::Valid(&p1)], &roots));
++    let pre = [Predecessor::Valid(&pr)];
++    let spent_key = n + RECOVERY_SEED_OFFSET;
++    let cases = [
++        (
++            "a second recovery under the spent key",
++            recover_v2_with(
++                &r,
++                n,
++                spent_key,
++                n + SECOND_RECOVERED_SEED_OFFSET,
++                n + SECOND_NEXT_RECOVERY_SEED_OFFSET,
++            ),
++        ),
++        (
++            "a second recovery committing the spent key again",
++            recover_v2_with(
++                &r,
++                n,
++                n + NEXT_RECOVERY_SEED_OFFSET,
++                n + SECOND_RECOVERED_SEED_OFFSET,
++                spent_key,
++            ),
++        ),
++        (
++            "a roster bundle re-committing the spent key",
++            recommit_v2(&r, n, spent_key, &HOLDER_SEEDS[..2]),
++        ),
++    ];
++    for (what, b) in &cases {
++        assert_eq!(
++            outcome(&read(b, None, &pre, &roots)),
++            SPENT,
++            "I2340: {what}"
++        );
++    }
++    // The controls: the same shapes under a key no commitment has spent.
++    let second = recover_v2(&r, n);
++    valid(read(&second, None, &pre, &roots));
++    valid(read(
++        &recommit_v2(&r, n, 91, &HOLDER_SEEDS[..2]),
++        None,
++        &pre,
++        &roots,
++    ));
++}
++
++#[test]
++fn i2341_a_recovery_key_is_refused_as_a_signing_key() {
++    let n = HOLDER_SEEDS[0];
++    let first = ceremony_v2(&CeremonySpec::at(T));
++    let roots = attestation_roots();
++    let p1 = valid(read(&first, Some(&first.anchor()), &[], &roots));
++    let pre = [Predecessor::Valid(&p1)];
++    let rk = n + RECOVERY_SEED_OFFSET;
++    let onto_rk = recover_v2_with(&first, n, rk, rk, n + NEXT_RECOVERY_SEED_OFFSET);
++    assert_eq!(
++        outcome(&read(&onto_rk, None, &pre, &roots)),
++        (
++            "genesis_bundle_malformed",
++            Some("recovery_key_is_signing_key")
++        ),
++        "I2341"
++    );
++    // The control: the same recovery onto a key no commitment names.
++    valid(read(&recover_v2(&first, n), None, &pre, &roots));
++}
++
++#[cfg(any(feature = "sqlite", feature = "postgres"))]
++mod store {
++    use std::sync::Arc;
++
++    use ciris_verify_core::cde::Value;
++    use ciris_verify_core::edition2::sign_row_statement;
++
++    use super::super::genesis::{genesis_in_force, is_canonical_by_bundle, GENESIS_BUNDLE_TYP};
++    use super::super::ingest::{put_statement, INGEST_TIER};
++    use super::super::names::RowId;
++    use super::*;
++    use crate::federation::{malformed_row, Error, FederationDirectory};
++    use crate::signing::LocalSigner;
++    use crate::Engine;
++
++    fn signer() -> Arc<LocalSigner> {
++        Arc::new(LocalSigner::from_parts(
++            ed25519_dalek::SigningKey::from_bytes(&[0x2c; 32]),
++            "c2-boot-node".to_owned(),
++            None,
++            None,
++        ))
++    }
++
++    /// The Valid bundles held (object id, version) and the count of held
++    /// bundle voices.
++    async fn held(d: &dyn FederationDirectory) -> (Vec<(Digest32, u32)>, usize) {
++        let state = genesis_in_force(d).await.unwrap();
++        let valid = state
++            .valid
++            .iter()
++            .map(|p| (p.object_id, p.version))
++            .collect();
++        let voices = d.edition2_objects(GENESIS_BUNDLE_TYP).await.unwrap().len();
++        (valid, voices)
++    }
++
++    fn reason(e: &Error) -> &'static str {
++        match e {
++            Error::MalformedRow { reason, .. } => reason,
++            other => other.kind(),
++        }
++    }
++
++    async fn head(d: &dyn FederationDirectory) -> Option<Digest32> {
++        genesis_in_force(d).await.unwrap().head.map(|h| h.object_id)
++    }
++
++    /// I2340 and I2341 through the import door, on one backend.
++    async fn recovery_body(dsn: &str) {
++        let n = HOLDER_SEEDS[0];
++        let s = bundle_v2();
++        let node = Engine::with_signer_pre_genesis(signer(), dsn)
++            .await
++            .unwrap();
++        let d = node.federation_directory();
++        install_v2(d.as_ref()).await.unwrap();
++        let r = recover_v2(s, n);
++        install_ceremony_v2(d.as_ref(), &r).await.unwrap();
++        assert_eq!(head(d.as_ref()).await, Some(r.object_id), "I2340");
++        let spent_key = n + RECOVERY_SEED_OFFSET;
++        for (what, b, want) in [
++            (
++                "I2340: a second recovery under the spent key",
++                recover_v2_with(
++                    &r,
++                    n,
++                    spent_key,
++                    n + SECOND_RECOVERED_SEED_OFFSET,
++                    n + SECOND_NEXT_RECOVERY_SEED_OFFSET,
++                ),
++                malformed_row::GENESIS_BUNDLE_COUNT_UNMET,
++            ),
++            (
++                "I2340: a roster bundle re-committing the spent key",
++                recommit_v2(&r, n, spent_key, &HOLDER_SEEDS[..2]),
++                malformed_row::GENESIS_BUNDLE_COUNT_UNMET,
++            ),
++            (
++                "I2341: a recovery seating the recovery key itself",
++                recover_v2_with(
++                    &r,
++                    HOLDER_SEEDS[1],
++                    HOLDER_SEEDS[1] + RECOVERY_SEED_OFFSET,
++                    HOLDER_SEEDS[1] + RECOVERY_SEED_OFFSET,
++                    HOLDER_SEEDS[1] + NEXT_RECOVERY_SEED_OFFSET,
++                ),
++                malformed_row::GENESIS_BUNDLE_MALFORMED,
++            ),
++        ] {
++            let e = install_ceremony_v2(d.as_ref(), &b).await.expect_err(what);
++            assert_eq!(reason(&e), want, "{what}: {e:?}");
++            assert_eq!(
++                head(d.as_ref()).await,
++                Some(r.object_id),
++                "{what}: the recovery stays the head"
++            );
++        }
++        // I2341: the spent recovery key's record is held (the recovery named
++        // it). A row signed by that key's material under the holder's
++        // identity is not admitted, whichever refusal the door names.
++        let iref = s.holder_identity_ref(0).to_owned();
++        let at = r.asserted_at_ms + 1000;
++        let payload = Value::Map(vec![
++            (Value::Text("author".into()), Value::Text(iref.clone())),
++            (Value::Text("asserted_at".into()), Value::Uint(at)),
++        ]);
++        let row = sign_row_statement(
++            &test_key(spent_key),
++            &iref,
++            &iref,
++            "scores",
++            "key:revocation",
++            &payload,
++            vec![],
++        )
++        .unwrap();
++        // A FINAL refusal (CC 4.2.6: refused by its public key material),
++        // never the retryable wait for an unknown signer, nor a storage
++        // fault: the key's record is held, so a wait would admit the row the
++        // moment the door looked again. The token is not pinned.
++        let e = put_statement(d.as_ref(), &row, None, INGEST_TIER)
++            .await
++            .expect_err("I2341: a row signed by a recovery key's material was admitted");
++        assert!(
++            !matches!(e, Error::AttesterKeyUnknown { .. } | Error::Backend(_)),
++            "I2341: a recovery key's material must be refused finally, not waited on: {e:?}"
++        );
++        let id = RowId::of_statement(&row).expect("a row id");
++        assert!(
++            d.edition2_voices(&id).await.unwrap().is_empty(),
++            "I2341: no voice of it is held"
++        );
++        assert!(
++            d.get_attestation(&id.hex()).await.unwrap().is_none(),
++            "I2341: no row of it is held"
++        );
++        // The control: a second recovery under the committed key installs.
++        let second = recover_v2(&r, n);
++        install_ceremony_v2(d.as_ref(), &second).await.unwrap();
++        assert_eq!(head(d.as_ref()).await, Some(second.object_id), "I2340");
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test]
++    async fn i2340_i2341_sqlite() {
++        Box::pin(recovery_body("sqlite::memory:")).await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test]
++    async fn i2340_i2341_postgres() {
++        let Some(dsn) = crate::test_pg::isolated_dsn() else {
++            return;
++        };
++        Box::pin(recovery_body(&dsn)).await;
++    }
++
++    /// I2335 and I2336 on one backend.
++    async fn body(dsn: &str) {
++        let s = bundle_v2();
++        let fresh = Engine::with_signer_pre_genesis(signer(), dsn)
++            .await
++            .unwrap();
++        let d = fresh.federation_directory();
++        assert_eq!(
++            held(d.as_ref()).await,
++            (vec![], 0),
++            "I2335: a fresh node holds no bundle"
++        );
++        for iref in s
++            .serve_node_identity_refs()
++            .iter()
++            .chain(s.holder_identity_refs().iter())
++        {
++            assert!(
++                !is_canonical_by_bundle(d.as_ref(), iref).await.unwrap(),
++                "I2335: nothing is canonical before a bundle"
++            );
++        }
++        let installed = install_v2_engine(&fresh).await.unwrap();
++        assert_eq!(
++            (installed.object_id, installed.version),
++            (s.object_id, 1),
++            "I2336"
++        );
++        let one = (vec![(s.object_id, 1u32)], s.voices.len());
++        assert_eq!(
++            held(d.as_ref()).await,
++            one,
++            "I2336: one bundle, every voice"
++        );
++        for iref in s.serve_node_identity_refs() {
++            assert!(
++                is_canonical_by_bundle(d.as_ref(), &iref).await.unwrap(),
++                "I2336: a seat is canonical"
++            );
++        }
++        for iref in s.holder_identity_refs() {
++            assert!(
++                !is_canonical_by_bundle(d.as_ref(), &iref).await.unwrap(),
++                "I2336: a holder is not"
++            );
++        }
++        install_v2_engine(&fresh)
++            .await
++            .expect("I2336: a second install is a no-op");
++        assert_eq!(held(d.as_ref()).await, one, "I2336: unchanged");
++        let r = recover_v2(s, HOLDER_SEEDS[0]);
++        install_ceremony_v2(d.as_ref(), &r)
++            .await
++            .expect("I2339: the recovery installs over the genesis");
++        let state = genesis_in_force(d.as_ref()).await.unwrap();
++        assert_eq!(
++            state.head.as_ref().map(|h| h.object_id),
++            Some(r.object_id),
++            "I2339: the recovery is the head"
++        );
++    }
++
++    /// I2337 on one backend.
++    async fn boots_holding(dsn: &str) {
++        let s = bundle_v2();
++        let booted = Engine::with_signer(signer(), dsn).await.unwrap();
++        let d = booted.federation_directory();
++        assert_eq!(
++            held(d.as_ref()).await,
++            (vec![(s.object_id, 1u32)], s.voices.len()),
++            "I2337: a lib-test Engine boots holding bundle_v2"
++        );
++        assert!(
++            is_canonical_by_bundle(d.as_ref(), s.serve_node_identity_ref(0))
++                .await
++                .unwrap(),
++            "I2337"
++        );
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test]
++    async fn i2335_i2336_sqlite() {
++        Box::pin(body("sqlite::memory:")).await;
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test]
++    async fn i2337_sqlite() {
++        Box::pin(boots_holding("sqlite::memory:")).await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test]
++    async fn i2335_i2336_postgres() {
++        let Some(dsn) = crate::test_pg::isolated_dsn() else {
++            return;
++        };
++        Box::pin(body(&dsn)).await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test]
++    async fn i2337_postgres() {
++        let Some(dsn) = crate::test_pg::isolated_dsn() else {
++            return;
++        };
++        Box::pin(boots_holding(&dsn)).await;
++    }
++}
++
++/// `engine.rs` up to its test module, with `//` comment lines removed.
++fn engine_production_code() -> String {
++    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine.rs");
++    let s = std::fs::read_to_string(path).unwrap();
++    let end = s
++        .find("\n#[cfg(test)]\nmod tests {")
++        .expect("engine.rs has its test module");
++    s[..end]
++        .lines()
++        .filter(|l| !l.trim_start().starts_with("//"))
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
++#[test]
++fn i2338_engine_boot_seeds_no_earlier_genesis() {
++    let code = engine_production_code();
++    for name in [
++        "seed_genesis_accord_holders",
++        "seed_family_and_canonical",
++        "effective_accord_holder_records",
++        "canonical_genesis_bundle",
++        "classify_genesis_seed",
++        "seed_genesis",
++    ] {
++        assert!(
++            !code.contains(name),
++            "I2338: engine.rs production code names `{name}`"
++        );
++    }
++    // The test ceremony is reached only from the two test-gated fns.
++    assert_eq!(
++        code.matches("fixture_genesis::install_v2_engine(").count(),
++        2,
++        "I2338"
++    );
++    let lines: Vec<&str> = code.lines().map(str::trim).collect();
++    let hooks: Vec<usize> = lines
++        .iter()
++        .enumerate()
++        .filter(|(_, l)| l.contains(".install_test_genesis_at_boot().await;"))
++        .map(|(i, _)| i)
++        .collect();
++    assert_eq!(hooks.len(), 3, "I2338: the three seeding constructors");
++    for i in hooks {
++        assert_eq!(lines[i - 1], "#[cfg(test)]", "I2338: the hook is cfg(test)");
++    }
++    let pre = code
++        .find("pub async fn with_signer_pre_genesis(")
++        .expect("the pre-genesis constructor");
++    let body_end = code[pre..]
++        .find("\n    }\n")
++        .map(|e| pre + e)
++        .expect("its body");
++    assert!(
++        !code[pre..body_end].contains("install_test_genesis_at_boot"),
++        "I2338: the pre-genesis constructor never installs"
++    );
++}
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 96060d48..ec68e170 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -30,6 +30,10 @@
+ 
+ pub mod door;
+ #[cfg(any(test, feature = "test-anchor"))]
++pub mod fixture_genesis;
++#[cfg(any(test, feature = "test-anchor"))]
++pub mod fixture_genesis_custody;
++#[cfg(any(test, feature = "test-anchor"))]
+ pub mod fixture_switch;
+ pub mod genesis;
+ pub mod halt;
+@@ -50,6 +54,8 @@ mod door_invariants;
+ #[cfg(test)]
+ mod earlier_form_refusal_invariants;
+ #[cfg(test)]
++mod fixture_genesis_invariants;
++#[cfg(test)]
+ mod genesis_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod genesis_store_invariants;

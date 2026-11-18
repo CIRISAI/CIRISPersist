@@ -1,0 +1,302 @@
+//! v53.0.0 — **the rc7 accord cut** (CIRISConstitution rc7 `fe459cf` /
+//! `5e89627`, CIRISConstitution#139): commitments bind key material, the
+//! accord's charter commits a recovery key per holder, and acceptance edges
+//! rotate the way grants do.
+//!
+//! - **I430** — the commitment bytes are CC's spelling: JCS of
+//!   `{key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64}` elements sorted
+//!   by `key_id`, lowercase-hex SHA-256; one key twice, or an empty set, is
+//!   refused; a record with no ML-DSA-65 key forms no element.
+//! - **I431** — the T3 recovery door recomputes each successor's element from
+//!   the key record this node stores: a record under a committed id with other
+//!   keys does not satisfy the commitment (the squat).
+//! - **I432** — the accord's charter must carry `recovery_commitments`, one per
+//!   standing holder.
+//! - **I433** — a commitment for a key that is not a standing holder is
+//!   refused (stray).
+//! - **I434** — a recovery key that is a holder's signing key, or one recovery
+//!   key shared by two holders, is refused (not apart).
+//! - **I435** — a non-accord family's charter carries no such requirement.
+//! - **I436** — an accord decision carries no steward signatures, and stores
+//!   and reads back on every backend without them.
+//! - **I437** — `trust_root_valid`'s edge leg reads a superseded acceptance
+//!   edge the way the capability walk reads a superseded grant: the successor
+//!   is the live edge and the edge it replaced is not.
+//! - **I438** — `trusted_roots_of` agrees with I437.
+//! - **I439** — a keyless family confers only as it charters (CC 3.4.7): a
+//!   grant one holder signs confers nothing as the family; the same grant
+//!   scrubbed to the family's quorum does.
+//!
+//! v62.0.0 (JSON cut, wave 3, E5) — **I430–I436 are deleted** (lead's ruling 1:
+//! the accord's charter, recovery commitments and decisions are genesis
+//! bundle/2). Covered by C2's I2339 (a recovery counts on its one statement),
+//! I2340 (a spent commitment never returns), I2341 (a recovery key is refused
+//! as a signing key) and I2333 (a later bundle at the holders' majority).
+//! I437–I439 (trust-root edges, a keyless family's conferral) survive and stay
+//! HELD: they build on `operational::test_support::establish_trust_root_side` /
+//! `seed_chartered_family_root` (E7's file; earlier-form self-referencing
+//! charters and co-scrubs).
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod bodies {
+    use crate::federation::accord_test_support as ops;
+    use crate::federation::trust_root::{
+        capability_roots_to_trusted_root, trust_root_valid, trusted_roots_of, ConferralPlane,
+        INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE, TRUST_ACCEPTS_DIMENSION, TRUST_CONFERS_DIMENSION,
+    };
+    use crate::federation::types::{attestation_type, identity_type};
+    use crate::federation::{FederationDirectory, SignedAttestation};
+
+    // ── I432–I435 ───────────────────────────────────────────────────────
+
+    // ── I436 ────────────────────────────────────────────────────────────
+
+    // ── I437 / I438 ─────────────────────────────────────────────────────
+
+    struct Edges {
+        user: String,
+        r1: String,
+        r2: String,
+    }
+
+    /// Two trusted key roots; the user's edge to `r1` is then superseded by the
+    /// user's own successor naming `r2`.
+    async fn rotate_the_edge(d: &dyn FederationDirectory, tag: &str) -> Edges {
+        let user = format!("i437-user-{tag}");
+        let r1 = format!("i437-r1-{tag}");
+        let r2 = format!("i437-r2-{tag}");
+        let s1 = format!("i437-s1-{tag}");
+        let s2 = format!("i437-s2-{tag}");
+        ops::register_typed_key(d, &user, identity_type::NODE)
+            .await
+            .unwrap();
+        for s in [&s1, &s2] {
+            ops::register_typed_key(d, s, identity_type::NODE)
+                .await
+                .unwrap();
+        }
+        ops::establish_trust_root_side(d, &r1, &s1, INFRA_SERVE_SCOPE)
+            .await
+            .unwrap();
+        ops::establish_trust_root_side(d, &r2, &s2, INFRA_SERVE_SCOPE)
+            .await
+            .unwrap();
+        let e1 = format!("i437-e1-{tag}");
+        let edge = ops::signed_trust_attestation(
+            &e1,
+            &user,
+            &r1,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({
+                "references_attestation_id": e1,
+                "dimension": TRUST_ACCEPTS_DIMENSION,
+                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+            }),
+        );
+        d.put_attestation(SignedAttestation { attestation: edge })
+            .await
+            .expect("the user's edge to r1");
+        assert!(
+            trust_root_valid(d, &user, &r1).await.unwrap().edge_exists,
+            "CONTROL: the edge to r1 stands before the rotation"
+        );
+        let e2 = format!("i437-e2-{tag}");
+        let succ = ops::signed_trust_attestation(
+            &e2,
+            &user,
+            &r2,
+            attestation_type::SUPERSEDES,
+            serde_json::json!({
+                "references_attestation_id": e1,
+                "dimension": TRUST_ACCEPTS_DIMENSION,
+                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+            }),
+        );
+        d.put_attestation(SignedAttestation { attestation: succ })
+            .await
+            .expect("the user's successor edge naming r2");
+        Edges { user, r1, r2 }
+    }
+
+    /// **I437** — the edge leg reads the rotation.
+    pub(crate) async fn i437_trust_root_valid_reads_a_superseded_edge(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let e = rotate_the_edge(d, tag).await;
+        assert!(
+            !trust_root_valid(d, &e.user, &e.r1)
+                .await
+                .unwrap()
+                .edge_exists,
+            "I437: the superseded edge to r1 is not live"
+        );
+        let v2 = trust_root_valid(d, &e.user, &e.r2).await.unwrap();
+        assert!(
+            v2.edge_exists && v2.valid,
+            "I437: the successor edge to r2 is the live edge: {v2:?}"
+        );
+    }
+
+    /// **I438** — the subscription read agrees.
+    pub(crate) async fn i438_trusted_roots_of_reads_a_superseded_edge(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let e = rotate_the_edge(d, tag).await;
+        let roots = trusted_roots_of(d, &e.user, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            roots,
+            vec![e.r2.clone()],
+            "I438: the subscription set is the successor's root, not the superseded edge's"
+        );
+        // The transit candidate set reaches the successor's root (each
+        // candidate is then judged by `trust_root_valid`, I437).
+        let by_user = d.all_attestations_by(&e.user).await.unwrap();
+        let candidates: Vec<String> = crate::federation::trust_root::transit_candidate_roots(
+            &by_user,
+            &e.user,
+            chrono::Utc::now(),
+        )
+        .into_iter()
+        .map(|c| c.root_ref)
+        .collect();
+        assert!(
+            candidates.contains(&e.r2),
+            "I438: transit follows the rotated edge to its root: {candidates:?}"
+        );
+    }
+
+    // ── I439 ────────────────────────────────────────────────────────────
+
+    /// **I439** — CC 3.4.7: a keyless family confers as it charters.
+    pub(crate) async fn i439_a_keyless_family_confers_at_its_quorum(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let user = format!("i439-user-{tag}");
+        let fam = format!("i439-fam-{tag}");
+        let subject = format!("i439-subject-{tag}");
+        let holders: Vec<String> = (0..3).map(|i| format!("i439-h{i}-{tag}")).collect();
+        for k in holders.iter().chain([&user, &subject]) {
+            ops::register_typed_key(d, k, identity_type::NODE)
+                .await
+                .unwrap();
+        }
+        ops::seed_chartered_family_root(d, &fam, &holders, &user)
+            .await
+            .unwrap();
+        assert!(
+            trust_root_valid(d, &user, &fam).await.unwrap().valid,
+            "I439 CONTROL: the family is a valid root for the user"
+        );
+        let grant = |id: &str, cosigners: &[&str]| {
+            ops::co_signed_trust_attestation(
+                id,
+                &holders[0],
+                &subject,
+                attestation_type::DELEGATES_TO,
+                serde_json::json!({
+                    "references_attestation_id": id,
+                    "dimension": TRUST_CONFERS_DIMENSION,
+                    "scope": [INFRA_SERVE_SCOPE],
+                }),
+                cosigners,
+            )
+        };
+        let lone = format!("i439-lone-{tag}");
+        let _ = d
+            .put_attestation(SignedAttestation {
+                attestation: grant(&lone, &[]),
+            })
+            .await;
+        assert_eq!(
+            capability_roots_to_trusted_root(d, &user, &subject, INFRA_SERVE_SCOPE)
+                .await
+                .unwrap()
+                .map(|g| g.root_key_id),
+            None,
+            "I439: one holder's scrub is no grant by the family"
+        );
+        let quorate = format!("i439-quorate-{tag}");
+        d.put_attestation(SignedAttestation {
+            attestation: grant(&quorate, &[holders[1].as_str()]),
+        })
+        .await
+        .expect("I439: the quorate grant admits");
+        let g = capability_roots_to_trusted_root(d, &user, &subject, INFRA_SERVE_SCOPE)
+            .await
+            .unwrap()
+            .expect("I439: the grant at the family's quorum confers");
+        assert_eq!(g.root_key_id, fam, "I439: the family is the root");
+        assert_eq!(g.grant_attestation_id, quorate, "I439: the quorate grant");
+        assert_eq!(
+            g.conferral_plane,
+            ConferralPlane::FamilyQuorum,
+            "I439: the plane"
+        );
+    }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod runners {
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
+    }
+
+    macro_rules! dyn_runners {
+        ($modname:ident, $fresh:expr) => {
+            mod $modname {
+                use super::suffix;
+                use crate::federation::FederationDirectory;
+                macro_rules! tagged {
+                    ($name:ident) => {
+                        #[tokio::test]
+                        async fn $name() {
+                            // v62.0.0 (JSON cut, E5) — HELD under the earlier form: typed plane
+                            // (no edition-2 projection yet); a follow-up wave flips it.
+                            crate::federation::edition2::fixture_switch::with_earlier_form_async(
+                                async move {
+                                    let Some(d) = $fresh.await else { return };
+                                    super::super::bodies::$name(
+                                        &d as &dyn FederationDirectory,
+                                        &format!("{}-{}", stringify!($name), suffix()),
+                                    )
+                                    .await
+                                },
+                            )
+                            .await
+                        }
+                    };
+                }
+                tagged!(i437_trust_root_valid_reads_a_superseded_edge);
+                tagged!(i438_trusted_roots_of_reads_a_superseded_edge);
+                tagged!(i439_a_keyless_family_confers_at_its_quorum);
+            }
+        };
+    }
+
+    #[cfg(feature = "sqlite")]
+    dyn_runners!(sqlite, async {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
+
+    #[cfg(feature = "postgres")]
+    dyn_runners!(postgres, async {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::empty_dsn()?;
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
+}

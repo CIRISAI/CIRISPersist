@@ -1,0 +1,2547 @@
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index 4af64f8c..6e43ad02 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -3423,6 +3423,12 @@ pub async fn check_promotion_admission(
+     // is cosigned under its protocol; the roster is directory state that can
+     // have changed since the local write.
+     check_owner_binding_affiliation_admission(directory, row).await?;
++    // v62.0.0 (wave V1b) — an edition-2 owner binding is counted: the
++    // owner's, the bound key's and (naming one) the affiliation's voices.
++    check_owner_binding_counted(directory, row).await?;
++    // v62.0.0 (wave V1b, CC 4.4.3.12) — a counted officer appointment waits
++    // for the affiliation's quorum at the head it names.
++    check_officer_appointment_counted(directory, row).await?;
+ 
+     // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — a term-bearing
+     // `delegates_to` carries a bounded term. Re-run here: whether the
+@@ -4659,7 +4665,7 @@ async fn licence_roots_at(
+ /// the one shared count), evaluated under `c`'s own `consensus_protocol`
+ /// ([`super::consensus::evaluate`], `Direction::Add`: an issuance confers).
+ /// The question is asked about the SIGNERS, never about the row's subject.
+-async fn community_quorum_cosigned_at(
++pub(crate) async fn community_quorum_cosigned_at(
+     directory: &dyn super::FederationDirectory,
+     c: &super::Community,
+     row: &super::Attestation,
+@@ -4670,13 +4676,10 @@ async fn community_quorum_cosigned_at(
+     ))
+     .await?;
+     let keys: Vec<String> = roster.iter().map(|m| m.key_id.clone()).collect();
+-    let signers = super::reverse_quorum::count_distinct_roster_scrubs(
+-        directory,
+-        &row.attestation_envelope,
+-        &row.scrubs(),
+-        &keys,
+-    )
+-    .await;
++    // v62.0.0 (wave V1, I3281) — an edition-2 row's cosigners are its
++    // voices (`edition2::voices`); an earlier-form row's scrub set stays
++    // behind the earlier-form switch.
++    let signers = super::edition2::voices::counted_roster_signers(directory, row, &keys).await?;
+     if signers.is_empty() {
+         return Ok(false);
+     }
+@@ -4751,8 +4754,16 @@ async fn community_quorum_at_head(
+     ) else {
+         return Ok(false);
+     };
+-    let voices =
+-        super::cosign::edition2_voices(directory, &super::edition2::names::RowId(row_id)).await?;
++    // v62.0.0 (wave V1b) — every voice of the row: the held ones, the one it
++    // carries and the one the door is offering now (`edition2::voices`), so a
++    // row is counted as its voices arrive, before any of them is kept.
++    let voices: std::collections::BTreeSet<String> = if super::edition2::voices::carried_row_id(row)
++        .is_some()
++    {
++        super::edition2::voices::row_voice_issuers(directory, row).await?
++    } else {
++        super::cosign::edition2_voices(directory, &super::edition2::names::RowId(row_id)).await?
++    };
+     let signers: std::collections::BTreeSet<String> = version
+         .members
+         .iter()
+@@ -4784,6 +4795,301 @@ async fn community_quorum_at_head(
+     .admits())
+ }
+ 
++/// v62.0.0 (wave V1b; CC 4.4.3.12 "two consents", the second ruling) —
++/// **does an officer appointment stand at `t`?** The root-edge test of
++/// [`quorum_licence_reach`], the one place an affiliation officer's standing
++/// is read:
++///
++/// - an edition-2 COUNTED appointment (a `self:delegates_to` with no
++///   `author`, [`is_counted_officer_appointment_row`]): the affiliation's
++///   quorum counted over its roster at the head the edge names
++///   ([`community_quorum_at_head`]; no head, no quorum) AND the officer's own
++///   `membership:acceptance` of it, held by `t`
++///   ([`membership_acceptance::officer_accepted_at`](super::membership_acceptance::officer_accepted_at)).
++///   The two consents are separate rows; the seat stands only when both hold.
++/// - any other edge (an authored one, or the earlier form): cosigned under
++///   the protocol at `t`, as before ([`community_quorum_cosigned_at`]).
++async fn appointment_stands_at(
++    directory: &dyn super::FederationDirectory,
++    c: &super::Community,
++    edge: &super::Attestation,
++    t: chrono::DateTime<chrono::Utc>,
++) -> Result<bool, Error> {
++    if !is_counted_officer_appointment_row(edge) {
++        return community_quorum_cosigned_at(directory, c, edge, t).await;
++    }
++    Ok(group_act_at(directory, c, edge, t).await?
++        && super::membership_acceptance::officer_accepted_at(directory, edge, t).await?)
++}
++
++/// v62.0.0 (wave V1b; CC 4.4.3.12, CC 2.4.1.1) — **is `row` an act of
++/// `c`'s quorum at `t`?** A COUNTED edition-2 row (statement-carrying, no
++/// `author`: an appointment, or the group's withdrawal of one) is counted over
++/// the roster at the head it names ([`community_quorum_at_head`]; no head, no
++/// act); any other row is cosigned under the protocol at `t`
++/// ([`community_quorum_cosigned_at`]).
++async fn group_act_at(
++    directory: &dyn super::FederationDirectory,
++    c: &super::Community,
++    row: &super::Attestation,
++    t: chrono::DateTime<chrono::Utc>,
++) -> Result<bool, Error> {
++    if super::edition2::voices::carried_row_id(row).is_none()
++        || row.attestation_envelope.get("author").is_some()
++    {
++        return community_quorum_cosigned_at(directory, c, row, t).await;
++    }
++    let Some(head) = edition2_named_head(row) else {
++        return Ok(false);
++    };
++    community_quorum_at_head(directory, c, row, &head, t).await
++}
++
++/// v62.0.0 (wave V1b) — the plane a counted licence withdrawal's refusals
++/// carry (`malformed_row::LICENCE_WITHDRAWAL_SHORT`,
++/// `malformed_row::LICENCE_WITHDRAWAL_NO_HEAD`).
++pub const LICENCE_WITHDRAWAL_PLANE: &str = "licence_withdrawal";
++
++/// v62.0.0 (wave V1b; CC 2.4.1.1) — **the group a COUNTED act is the act
++/// of**: a statement-carrying row with no `author` (act=group), not itself a
++/// `withdraws`, whose group is named either by a cohort target
++/// ([`envelope_cohort_target`]: an affiliation's officer appointment,
++/// [`is_counted_officer_appointment_row`]) or, for a counted
++/// `licensure:{authority}` row, by the authority its dimension names (a key
++/// authority's bare thumbprint segment read back as its identity-ref,
++/// [`key_segment::identity_ref_of`](super::namespace::key_segment::identity_ref_of)
++/// via [`licensure::authority_of`](crate::federation::licensure::authority_of)).
++/// The bool is `true` for the dimension-named group, which is a group only
++/// when it resolves to a held community (a key authority has no quorum).
++#[must_use]
++pub fn counted_group_of(row: &super::Attestation) -> Option<(String, bool)> {
++    if super::edition2::voices::carried_row_id(row).is_none()
++        || row.attestation_type == attestation_type::WITHDRAWS
++        || row.attestation_envelope.get("author").is_some()
++    {
++        return None;
++    }
++    if let Some(named) = envelope_cohort_target(&row.attestation_envelope)
++        .ok()
++        .flatten()
++    {
++        return Some((named.to_owned(), false));
++    }
++    envelope_dimension(&row.attestation_envelope)
++        .and_then(crate::federation::licensure::authority_of)
++        .map(|a| (a.into_owned(), true))
++}
++
++/// v62.0.0 (wave V1b; CC 2.4.1.1) — is `row` a COUNTED act of a named
++/// group ([`counted_group_of`])?
++#[must_use]
++pub fn is_counted_group_row(row: &super::Attestation) -> bool {
++    counted_group_of(row).is_some()
++}
++
++/// v62.0.0 (wave V1b; CC 4.4.3.12, CC 2.4.1.1) — **the withdrawal of a
++/// counted act is itself counted** at the same group's protocol (`named`:
++/// [`counted_group_of`] — the affiliation an appointment names, or the
++/// authority community a counted licence's dimension names), over the roster
++/// head the withdrawal names (`refs.head`), with the act as its
++/// `refs.target`. The act's own subject's withdrawal is refused first
++/// (CLM-licence-contest). Only the group's counted
++/// withdrawal (a statement-carrying `withdraws` with no `author`) is
++/// admitted: short of the quorum it notes a shortfall, so the door keeps the
++/// voice and answers `Pending`; met, it lands (rule 1 when its first voice
++/// signed the appointment, else 4). Any other `withdraws` of a counted
++/// appointment, a lone member's own included, is refused
++/// (`WithdrawsNotAdmitted`): a group's act is never undone by one key. The
++/// officer's own exit is their `membership:decline`, which ends the seat
++/// ([`membership_acceptance::officer_accepted_at`](super::membership_acceptance::officer_accepted_at)).
++///
++/// # Errors
++///
++/// [`Error::WithdrawsNotAdmitted`]; [`Error::InvalidArgument`] prefixed
++/// [`OFFICER_APPOINTMENT_REFUSED`] (no `refs.head`) or
++/// [`OFFICER_APPOINTMENT_SHORT`] (outside the door's attempt); directory
++/// reads.
++async fn check_counted_withdrawal(
++    directory: &dyn super::FederationDirectory,
++    row: &super::Attestation,
++    target: &super::Attestation,
++    named: &str,
++) -> Result<Option<u8>, Error> {
++    // v62.0.0 (wave V1b) — a counted licence's withdrawal carries its own
++    // tokens (`malformed_row::LICENCE_WITHDRAWAL_*`).
++    let licence = envelope_dimension(&target.attestation_envelope)
++        .is_some_and(|d| d.starts_with(crate::federation::licensure::LICENSURE_DIMENSION_PREFIX));
++    let not_admitted = || Error::WithdrawsNotAdmitted {
++        issuer: row.attesting_key_id.clone(),
++        target_attestation_id: target.attestation_id.clone(),
++        beyond_delegation_depth_cap: false,
++    };
++    // CLM-licence-contest (CC 2.4.1.1 rule 0 carve-out) — the act's own
++    // subject never withdraws it, counted or not: a licensee contests by
++    // `reconsideration:{grounds}`, an officer exits by declining.
++    if row.attesting_key_id == target.attested_key_id
++        || target.subject_key_ids.contains(&row.attesting_key_id)
++    {
++        return Err(not_admitted());
++    }
++    if super::edition2::voices::carried_row_id(row).is_none()
++        || row.attestation_envelope.get("author").is_some()
++    {
++        return Err(not_admitted());
++    }
++    let short = match directory.lookup_community(named).await? {
++        None => format!("the group {named:?} (not held yet)"),
++        Some(c) => {
++            let Some(head) = edition2_named_head(row) else {
++                if licence {
++                    return Err(Error::malformed_row(
++                        LICENCE_WITHDRAWAL_PLANE,
++                        super::malformed_row::LICENCE_WITHDRAWAL_NO_HEAD,
++                        format!(
++                            "withdrawal {} of the counted licence {} names no `refs.head`: the \
++                             authority's counted withdrawal is counted over the roster version \
++                             it names (CC 2.4.1.1)",
++                            row.attestation_id, target.attestation_id
++                        ),
++                    ));
++                }
++                return Err(Error::InvalidArgument(format!(
++                    "{OFFICER_APPOINTMENT_REFUSED}: withdrawal {} of appointment {} names no \
++                     `refs.head`: a counted withdrawal is counted over the roster version it \
++                     names (CC 4.4.3.12, CC 2.4.1.1)",
++                    row.attestation_id, target.attestation_id
++                )));
++            };
++            if community_quorum_at_head(directory, &c, row, &head, row.asserted_at).await? {
++                return Ok(Some(if row.attesting_key_id == target.attesting_key_id {
++                    1
++                } else {
++                    4
++                }));
++            }
++            format!(
++                "the group {named:?}'s quorum ({:?}) at the roster head it names",
++                c.consensus_protocol
++            )
++        }
++    };
++    super::edition2::voices::note_short();
++    if licence {
++        return Err(Error::malformed_row(
++            LICENCE_WITHDRAWAL_PLANE,
++            super::malformed_row::LICENCE_WITHDRAWAL_SHORT,
++            format!(
++                "withdrawal {} of the counted licence {} waits for {short} (CC 2.4.1.1)",
++                row.attestation_id, target.attestation_id
++            ),
++        ));
++    }
++    Err(Error::InvalidArgument(format!(
++        "{OFFICER_APPOINTMENT_SHORT}: withdrawal {} of appointment {} waits for {short} (CC \
++         4.4.3.12, CC 2.4.1.1)",
++        row.attestation_id, target.attestation_id
++    )))
++}
++
++/// v62.0.0 (wave V1b; CC 4.4.3.12) — is `row` an affiliation officer
++/// appointment as a COUNTED edition-2 row: a statement-carrying
++/// `delegates_to` that is not an owner binding, carries no `author`, and
++/// names a community ([`envelope_cohort_target`])?
++#[must_use]
++pub fn is_counted_officer_appointment_row(row: &super::Attestation) -> bool {
++    row.attestation_type == attestation_type::DELEGATES_TO
++        && super::edition2::voices::carried_row_id(row).is_some()
++        && !is_owner_binding_envelope(&row.attestation_envelope)
++        && row.attestation_envelope.get("author").is_none()
++        && envelope_cohort_target(&row.attestation_envelope)
++            .ok()
++            .flatten()
++            .is_some()
++}
++
++/// v62.0.0 (wave V1b) — the prefix of [`check_officer_appointment_counted`]'s
++/// shortfall: `officer_appointment_short: …`, an [`Error::InvalidArgument`]
++/// (Python `ValueError`). At the edition-2 door it is never seen: the
++/// appointment waits (`Pending`).
++pub const OFFICER_APPOINTMENT_SHORT: &str = "officer_appointment_short";
++
++/// v62.0.0 (wave V1b) — the prefix of [`check_officer_appointment_counted`]'s
++/// terminal refusal: `officer_appointment_refused: …`, an
++/// [`Error::InvalidArgument`] (Python `ValueError`).
++pub const OFFICER_APPOINTMENT_REFUSED: &str = "officer_appointment_refused";
++
++/// v62.0.0 (wave V1b; CC 4.4.3.12 "two consents", the second ruling) —
++/// **an affiliation's officer appointment is a counted row.** A COUNTED
++/// `self:delegates_to` ([`is_counted_officer_appointment_row`]) lands only
++/// when the affiliation members' voices meet its `consensus_protocol` over
++/// its roster at the head the appointment names (`refs.head`,
++/// [`community_quorum_at_head`]). Short, the gate notes a shortfall, so the
++/// door keeps the voice and answers `Pending` (no typed row); an affiliation
++/// not held yet also waits. Never refused for a shortfall.
++///
++/// Refused (terminal): a counted appointment naming a community that is not
++/// an affiliation, or naming no `refs.head` (counted over no roster version,
++/// it can never land). The officer's consent is NOT a voice here: it is the
++/// officer's own `membership:acceptance` row, read where the seat is read
++/// ([`appointment_stands_at`]). An authored `self:delegates_to` (one key's
++/// own delegation) is untouched.
++///
++/// # Errors
++///
++/// [`Error::InvalidArgument`] prefixed [`OFFICER_APPOINTMENT_SHORT`] (outside
++/// the door's attempt) or [`OFFICER_APPOINTMENT_REFUSED`]; directory reads.
++pub async fn check_officer_appointment_counted(
++    directory: &dyn super::FederationDirectory,
++    row: &super::Attestation,
++) -> Result<(), Error> {
++    if !is_counted_officer_appointment_row(row) {
++        return Ok(());
++    }
++    let Some(named) = envelope_cohort_target(&row.attestation_envelope)? else {
++        return Ok(());
++    };
++    let refuse = |detail: String| {
++        Err(Error::InvalidArgument(format!(
++            "{OFFICER_APPOINTMENT_REFUSED}: appointment {} of {} names {named:?}: {detail} \
++             (CC 4.4.3.12)",
++            row.attestation_id, row.attested_key_id
++        )))
++    };
++    let short = match directory.lookup_community(named).await? {
++        None => Some(format!("the affiliation {named:?} (not held yet)")),
++        Some(c) => {
++            if crate::federation::affiliation_config::declared_cohort(&c)?
++                != super::cohort::Cohort::Affiliations
++            {
++                return refuse("it does not declare cohort_scope: affiliations".to_owned());
++            }
++            let Some(head) = edition2_named_head(row) else {
++                return refuse(
++                    "it names no `refs.head`: a counted appointment is counted over the roster \
++                     version it names"
++                        .to_owned(),
++                );
++            };
++            if community_quorum_at_head(directory, &c, row, &head, row.asserted_at).await? {
++                None
++            } else {
++                Some(format!(
++                    "the affiliation {named:?}'s quorum ({:?}) at the roster head it names",
++                    c.consensus_protocol
++                ))
++            }
++        }
++    };
++    let Some(short) = short else {
++        return Ok(());
++    };
++    super::edition2::voices::note_short();
++    Err(Error::InvalidArgument(format!(
++        "{OFFICER_APPOINTMENT_SHORT}: appointment {} of {} waits for {short} (CC 4.4.3.12)",
++        row.attestation_id, row.attested_key_id
++    )))
++}
++
+ /// v60.0.0 (CIRISPersist#1036 item 1) — **the `license` walk rooted at a
+ /// community's quorum**, read through `lens` (its `as_of` is the instant).
+ ///
+@@ -4851,13 +5157,13 @@ async fn quorum_licence_reach(
+             if crate::federation::precedence::references_attestation_id_from_envelope(
+                 &w.attestation_envelope,
+             ) == Some(edge.attestation_id.as_str())
+-                && community_quorum_cosigned_at(directory, c, w, w.asserted_at).await?
++                && group_act_at(directory, c, w, w.asserted_at).await?
+             {
+                 retracted = true;
+                 break;
+             }
+         }
+-        if !retracted && community_quorum_cosigned_at(directory, c, &edge, t).await? {
++        if !retracted && appointment_stands_at(directory, c, &edge, t).await? {
+             roots.push(edge);
+         }
+     }
+@@ -5421,13 +5727,17 @@ pub async fn check_licensure_delegator_is_authority(
+             .await?;
+             if roster.iter().any(|m| m.key_id == row.attesting_key_id) {
+                 let keys: Vec<String> = roster.iter().map(|m| m.key_id.clone()).collect();
+-                let signers = super::reverse_quorum::count_distinct_roster_scrubs(
+-                    directory,
+-                    &row.attestation_envelope,
+-                    &row.scrubs(),
+-                    &keys,
+-                )
+-                .await;
++                // v62.0.0 (wave V1) — the signers reported are the row's
++                // voices for an edition-2 row (`edition2::voices`).
++                let signers =
++                    super::edition2::voices::counted_roster_signers(directory, row, &keys).await?;
++                // v62.0.0 (wave V1b) — the voices are short: the door keeps
++                // this voice and the row waits for the rest (`Pending`). Only
++                // a row that names its roster head can ever be counted (CC
++                // 2.7.4); one that names none is refused, as before.
++                if edition2_named_head(row).is_some() {
++                    super::edition2::voices::note_short();
++                }
+                 return Err(Error::LicensureShortOfAuthorityQuorum {
+                     attesting_key_id: row.attesting_key_id.clone(),
+                     authority_id: authority_id.to_owned(),
+@@ -11418,6 +11728,18 @@ pub(crate) async fn check_withdraws_admission_against(
+     // v61 (CIRISPersist#991, CC 2.4.1.1) — a group-plane row (a cosigned
+     // roster event) is retracted by a cosigned `withdraws` under the same
+     // protocol; rules 1-4 do not decide it.
++    // v62.0.0 (wave V1b; CC 4.4.3.12, CC 2.4.1.1) — a counted affiliation
++    // appointment is withdrawn only by the group's counted withdrawal, held
++    // `Pending` until the quorum at the head it names.
++    // v62.0.0 (wave V1b; CC 2.4.1.1, CLM-licence-contest) — and so is a
++    // counted licence, at its authority community's protocol; a licence of
++    // a KEY authority (no community held under the id) is not a group's act
++    // and keeps the rules below.
++    if let Some((group, by_dimension)) = counted_group_of(target) {
++        if !by_dimension || directory.lookup_community(&group).await?.is_some() {
++            return check_counted_withdrawal(directory, row, target, &group).await;
++        }
++    }
+     if let Some(rule) =
+         crate::federation::group_plane::check_cosigned_withdraws(directory, row, target).await?
+     {
+@@ -12952,7 +13274,30 @@ pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
+     // binding seats its own granter, independently of every other, so
+     // filtering the holders by the `user` fact equals presenting only the
+     // `user` granters' bindings
+-    let view = crate::kernel::owner::owner_rows(node, &rows, &retractions, now, &|_| true, cosign);
++    // v62.0.0 (wave V1, I3283) — an edition-2 owner binding's signatures
++    // are its voices: the node's cosignature is the node's own statement over
++    // the binding (`edition2::voices`).
++    let mut held_voices: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
++        std::collections::BTreeMap::new();
++    for r in &rows {
++        if r.attestation_type == attestation_type::DELEGATES_TO
++            && is_owner_binding_envelope(&r.attestation_envelope)
++            && super::edition2::voices::carried_row_id(r).is_some()
++        {
++            let issuers = super::edition2::voices::row_voice_issuers(directory, r).await?;
++            held_voices.insert(r.attestation_id.clone(), issuers);
++        }
++    }
++    let view = crate::kernel::owner::owner_rows_with_voices(
++        node,
++        &rows,
++        &retractions,
++        now,
++        &|_| true,
++        cosign,
++        &std::collections::BTreeSet::new(),
++        &held_voices,
++    );
+     let mut held = crate::kernel::owner::owner_holders(&view, node).value;
+     let mut users = std::collections::BTreeSet::new();
+     for g in &held {
+@@ -13488,6 +13833,127 @@ where
+ /// [`owner_binding_affiliation_reason`]'s tokens.
+ pub const OWNER_BINDING_AFFILIATION_REFUSED: &str = "owner_binding_affiliation_refused";
+ 
++/// v62.0.0 (wave V1b) — the prefix of [`check_owner_binding_counted`]'s
++/// shortfall: `owner_binding_counted_short: …`, an [`Error::InvalidArgument`]
++/// (Python `ValueError`). At the edition-2 door it is never seen: the binding
++/// waits (`Pending`) for the voices it lacks.
++pub const OWNER_BINDING_COUNTED_SHORT: &str = "owner_binding_counted_short";
++
++/// v62.0.0 (wave V1b; CC 3.2 *The first binding*, C557; CC 3.2 "An
++/// organisation's agent" ruling (a), CLM-org-on-the-bond, CC 2.4.1.3) —
++/// **an edition-2 owner binding is a counted row.** It lands only when ALL
++/// of these voices are held (`edition2::voices`: the held ones, the one it
++/// carries and the one the door is offering now):
++///
++/// 1. the owner's own statement (the payload's `author`, one person: the
++///    steward);
++/// 2. the bound key's own statement (the `ownership:*` family's
++///    `bound_node` role: RULINGS "with the node's own statement as the
++///    second voice");
++/// 3. where the binding names an affiliation (`community_id` or an alias,
++///    [`envelope_cohort_target`]; not a node's group-audience re-signing,
++///    `binding_is_group_audience`): the affiliation members' voices counted
++///    over its roster at the head the binding names (`refs.head`), at its
++///    `consensus_protocol` ([`community_quorum_at_head`], the licence's count,
++///    CC 2.4.1.3).
++///
++/// Short of any of them the gate notes a shortfall, so the door keeps the
++/// voice and answers `Pending`: NO typed row is written, and no reader sees a
++/// binding that is not yet the owner's, the node's and the affiliation's. An
++/// affiliation not held yet also waits. Refused (terminal, as before): a
++/// named community that is not an affiliation (`not_an_affiliation`), and a
++/// binding naming an affiliation but no `refs.head` (`not_cosigned_under_protocol`:
++/// counted over no roster version, it can never land). An earlier-form
++/// binding is untouched (its doors are shut;
++/// [`check_owner_binding_affiliation_admission`] keeps its earlier rule).
++///
++/// Verify 23.3.0 refuses an affiliation member's voice `iss_not_in_role`
++/// until rc21's ownership arm is vendored; the edition-2 door admits it
++/// meanwhile (`edition2::door::names_an_affiliation_on_the_bond`).
++///
++/// # Errors
++///
++/// [`Error::InvalidArgument`] prefixed [`OWNER_BINDING_COUNTED_SHORT`]
++/// (outside the door's attempt) or [`OWNER_BINDING_AFFILIATION_REFUSED`];
++/// directory reads.
++pub async fn check_owner_binding_counted(
++    directory: &dyn super::FederationDirectory,
++    row: &super::Attestation,
++) -> Result<(), Error> {
++    if row.attestation_type != attestation_type::DELEGATES_TO
++        || !is_owner_binding_envelope(&row.attestation_envelope)
++        || super::edition2::voices::carried_row_id(row).is_none()
++    {
++        return Ok(());
++    }
++    let voices = super::edition2::voices::row_voice_issuers(directory, row).await?;
++    let owner = row
++        .attestation_envelope
++        .get("author")
++        .and_then(serde_json::Value::as_str)
++        .unwrap_or(row.attesting_key_id.as_str());
++    let mut short: Vec<String> = Vec::new();
++    if !voices.contains(owner) {
++        short.push(format!("the owner {owner}'s own statement"));
++    }
++    if !voices.contains(&row.attested_key_id) {
++        short.push(format!(
++            "the bound key {}'s own statement",
++            row.attested_key_id
++        ));
++    }
++    if !binding_is_group_audience(row) {
++        if let Some(named) = envelope_cohort_target(&row.attestation_envelope)? {
++            let refuse = |reason: &'static str, detail: String| {
++                Err(Error::InvalidArgument(format!(
++                    "{OWNER_BINDING_AFFILIATION_REFUSED}: {reason}: owner-binding {} by {} over \
++                     {} names {named:?}: {detail} (CC 3.2 ruling (a), CC 2.4.1.3)",
++                    row.attestation_id, owner, row.attested_key_id
++                )))
++            };
++            match directory.lookup_community(named).await? {
++                None => short.push(format!("the affiliation {named:?} (not held yet)")),
++                Some(c) => {
++                    if crate::federation::affiliation_config::declared_cohort(&c)?
++                        != super::cohort::Cohort::Affiliations
++                    {
++                        return refuse(
++                            owner_binding_affiliation_reason::NOT_AN_AFFILIATION,
++                            "it does not declare cohort_scope: affiliations".to_owned(),
++                        );
++                    }
++                    let Some(head) = edition2_named_head(row) else {
++                        return refuse(
++                            owner_binding_affiliation_reason::NOT_COSIGNED_UNDER_PROTOCOL,
++                            "it names no `refs.head`: a binding counted over the affiliation \
++                             is counted over the roster version it names"
++                                .to_owned(),
++                        );
++                    };
++                    if !community_quorum_at_head(directory, &c, row, &head, row.asserted_at).await?
++                    {
++                        short.push(format!(
++                            "the affiliation {named:?}'s quorum ({:?}) at the roster head it \
++                             names",
++                            c.consensus_protocol
++                        ));
++                    }
++                }
++            }
++        }
++    }
++    if short.is_empty() {
++        return Ok(());
++    }
++    super::edition2::voices::note_short();
++    Err(Error::InvalidArgument(format!(
++        "{OWNER_BINDING_COUNTED_SHORT}: owner-binding {} over {} waits for {} (CC 3.2, C557)",
++        row.attestation_id,
++        row.attested_key_id,
++        short.join("; ")
++    )))
++}
++
+ /// v60.0.0 (CIRISPersist#1062) — the stable reasons of
+ /// [`OWNER_BINDING_AFFILIATION_REFUSED`]. Append-only.
+ pub mod owner_binding_affiliation_reason {
+@@ -13530,6 +13996,12 @@ pub async fn check_owner_binding_affiliation_admission(
+     {
+         return Ok(());
+     }
++    // v62.0.0 (wave V1b) — an edition-2 binding is counted by
++    // [`check_owner_binding_counted`] (the affiliation's quorum at the head it
++    // names, CC 3.2 ruling (a)); this is the earlier form's rule.
++    if super::edition2::voices::carried_row_id(row).is_some() {
++        return Ok(());
++    }
+     let Some(named) = envelope_cohort_target(&row.attestation_envelope)? else {
+         return Ok(());
+     };
+diff --git a/src/federation/attestation_admit.rs b/src/federation/attestation_admit.rs
+index 4f4ead25..10ed1688 100644
+--- a/src/federation/attestation_admit.rs
++++ b/src/federation/attestation_admit.rs
+@@ -1170,6 +1170,13 @@ where
+     // v60.0.0 (CIRISPersist#1062) — an owner-binding that names an
+     // organisation is cosigned under that affiliation's protocol.
+     crate::federation::admission::check_owner_binding_affiliation_admission(dir, &row).await?;
++    // v62.0.0 (wave V1b, CC 3.2 / C557, ruling (a)) — an edition-2 owner
++    // binding is counted: the owner's, the bound key's and (naming one) the
++    // affiliation's voices; short, the door keeps the voice (`Pending`).
++    crate::federation::admission::check_owner_binding_counted(dir, &row).await?;
++    // v62.0.0 (wave V1b, CC 4.4.3.12) — an affiliation's counted officer
++    // appointment waits (`Pending`) for the quorum at the head it names.
++    crate::federation::admission::check_officer_appointment_counted(dir, &row).await?;
+ 
+     // v18.2.0 — trust-charter admission (the charter walk). AV-76: a
+     // directory walk, so it stays in tier 4.
+diff --git a/src/federation/edition2/door.rs b/src/federation/edition2/door.rs
+index c4f16cb6..5c94c4cd 100644
+--- a/src/federation/edition2/door.rs
++++ b/src/federation/edition2/door.rs
+@@ -56,7 +56,7 @@ use ciris_verify_core::edition2::family::{
+ };
+ use ciris_verify_core::edition2::keys::{check_key_record, KeyRecordError, KEY_RECORD_FAMILY};
+ use ciris_verify_core::edition2::{
+-    identity_ref, Digest32, Invalid, KeyDirectory, KeyOf, MissingKey,
++    identity_ref, verify_row_statement, Digest32, Invalid, KeyDirectory, KeyOf, MissingKey, Verdict,
+ };
+ 
+ use super::liveness::statement_parts;
+@@ -366,6 +366,48 @@ pub fn admit_row(
+         FamilyVerdict::Invalid(i) => {
+             return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
+         }
++        // v62.0.0 (wave V1b; CC 3.2 "An organisation's agent", ruling (a),
++        // CLM-org-on-the-bond) — an owner binding that names an affiliation
++        // is COUNTED over the affiliation's roster (CC 2.4.1.3): a member's
++        // voice over it is a counted voice, which rc21's family model admits
++        // and Verify 23.3.0 still refuses `iss_not_in_role`. Persist must not
++        // refuse what the ruled model admits: the statement itself must be
++        // Valid, and persist's counted rule
++        // (`admission::check_owner_binding_counted`) counts only the roster at
++        // the head the binding names. TODO(verify-rc21): drop this arm when
++        // Verify vendors the ownership arm.
++        FamilyVerdict::FamilyInvalid(FamilyFault::IssNotInRole)
++            if names_an_affiliation_on_the_bond(bytes) =>
++        {
++            match verify_row_statement(bytes, keys) {
++                Verdict::Valid(row) => (row, Some(AFFILIATION_MEMBER_ROLE.to_owned())),
++                Verdict::Invalid(i) => {
++                    return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
++                }
++                Verdict::Waiting { missing } => return Err(waiting(&missing)),
++            }
++        }
++        // v62.0.0 (wave V1b; CC 4.4.3.12 "two consents", the second ruling)
++        // — an affiliation's officer appointment is a `self:delegates_to`
++        // COUNTED over the affiliation's roster (act=group, no `author`,
++        // `refs.head`). rc21's family model gains the act=group arm, as
++        // `licensure` has; Verify 23.3.0 still reads `self:delegates_to` as
++        // authored and refuses an author-less one `author_column`. Persist
++        // must not refuse what the ruled model admits: the statement itself
++        // must be Valid, and the counted rule
++        // (`admission::check_officer_appointment_counted`) counts it.
++        // TODO(verify-rc21): drop this arm when Verify vendors it.
++        FamilyVerdict::FamilyInvalid(FamilyFault::AuthorColumn)
++            if is_counted_officer_appointment(bytes) =>
++        {
++            match verify_row_statement(bytes, keys) {
++                Verdict::Valid(row) => (row, None),
++                Verdict::Invalid(i) => {
++                    return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
++                }
++                Verdict::Waiting { missing } => return Err(waiting(&missing)),
++            }
++        }
+         FamilyVerdict::FamilyInvalid(f) => {
+             return Err(refuse(token::FAMILY_INVALID, fault_label(&f)));
+         }
+@@ -431,6 +473,67 @@ pub fn admit_row(
+     })
+ }
+ 
++/// v62.0.0 (wave V1b) — the role a member of the affiliation an owner
++/// binding names fills when it voices the binding (CC 3.2 ruling (a)).
++/// TODO(verify-rc21): Verify's own role name when it vendors the arm.
++pub const AFFILIATION_MEMBER_ROLE: &str = "affiliation_member";
++
++/// v62.0.0 (wave V1b) — is `bytes` an owner binding (`ownership:*`) whose
++/// payload names a community (`community_id` or one of its aliases): the
++/// binding counted over the affiliation's roster (CC 3.2 ruling (a))? Read
++/// from the bytes only; whether the community is an affiliation, and who is
++/// on its roster, is the counted rule's (`admission::check_owner_binding_counted`).
++#[must_use]
++pub fn names_an_affiliation_on_the_bond(bytes: &[u8]) -> bool {
++    let Some((protected, payload)) = statement_parts(bytes) else {
++        return false;
++    };
++    let ownership = protected
++        .get_int(-70002)
++        .and_then(Value::as_text)
++        .and_then(ciris_verify_core::namespace_match::prefix_of_family_id)
++        .is_some_and(|p| p.starts_with("ownership:"));
++    ownership
++        && crate::federation::admission::COHORT_TARGET_ENVELOPE_FIELDS
++            .iter()
++            .any(|f| payload.get_text(f).and_then(Value::as_text).is_some())
++}
++
++/// The family of a `delegates_to` that is not an owner binding or another
++/// purpose-specific family (RULINGS, *delegates_to families*).
++pub const SELF_DELEGATES_TO_FAMILY_PREFIX: &str = "self:delegates_to";
++
++/// v62.0.0 (wave V1b; CC 4.4.3.12) — is `bytes` an affiliation's officer
++/// appointment as a COUNTED row: a `self:delegates_to` statement (exactly
++/// that family, not `self:delegates_to:agent_occurrence`) whose payload has
++/// no `author` and names a community (`community_id` or an alias), or the
++/// group's counted `withdraws` of one (no `author`)? Read from
++/// the bytes only; whether the community is an affiliation, its roster and
++/// the quorum are the counted rule's
++/// (`admission::check_officer_appointment_counted`).
++#[must_use]
++pub fn is_counted_officer_appointment(bytes: &[u8]) -> bool {
++    let Some((protected, payload)) = statement_parts(bytes) else {
++        return false;
++    };
++    let family = protected
++        .get_int(-70002)
++        .and_then(Value::as_text)
++        .and_then(ciris_verify_core::namespace_match::prefix_of_family_id);
++    // v62.0.0 (wave V1b; CC 2.4.1.1) — the group's counted withdrawal of
++    // one carries the appointment's family and names it by `refs.target`,
++    // not the community: the counted rule finds the community on the
++    // target (`admission::check_counted_withdrawal`).
++    let counted_withdrawal = protected.get_int(-70001).and_then(Value::as_text)
++        == Some(crate::federation::types::attestation_type::WITHDRAWS);
++    family == Some(SELF_DELEGATES_TO_FAMILY_PREFIX)
++        && payload.get_text("author").is_none()
++        && (counted_withdrawal
++            || crate::federation::admission::COHORT_TARGET_ENVELOPE_FIELDS
++                .iter()
++                .any(|f| payload.get_text(f).and_then(Value::as_text).is_some()))
++}
++
+ /// Step 3b of the door: `kid` must be a key of `iss` (module docs). Every
+ /// place the door resolves a signer calls this after Verify's verdict: rows,
+ /// each counted voice, objects, the halt. It asks the directory's
+diff --git a/src/federation/edition2/fixture_switch.rs b/src/federation/edition2/fixture_switch.rs
+index 848cae8d..a4a1ce2c 100644
+--- a/src/federation/edition2/fixture_switch.rs
++++ b/src/federation/edition2/fixture_switch.rs
+@@ -763,6 +763,69 @@ pub fn statement_of(a: &Attestation, seed: &str) -> Vec<u8> {
+     statement_of_family(a, seed, &family_of(a))
+ }
+ 
++/// v62.0.0 (wave V1b, CC 2.6.1.9) — **a COUNTED row's first voice**: as
++/// [`statement_of`], but the payload carries no `author`, so the door reads
++/// the act as `group` and a family whose card is counted under `act=group`
++/// (`licensure:{authority_id}`, `trust:{job}:{version}`, `key:record`,
++/// `collection:{kind}`, ...) admits any signer's voice over it. Further
++/// voices: [`voices_of`] / [`voice_of`] over its statement (same row id).
++/// [`statement_of`] signs such a row as one signer's OWN (authored) row, over
++/// which a second signer is refused `iss_not_in_role`.
++///
++/// # Panics
++/// As [`statement_of_family`].
++#[must_use]
++pub fn counted_statement_of(a: &Attestation, seed: &str) -> Vec<u8> {
++    counted_statement_of_family(a, seed, &family_of(a))
++}
++
++/// [`counted_statement_of`] under an explicit `family` id (a composer of a
++/// counted row carries its target's family: a counted `withdraws`).
++///
++/// # Panics
++/// As [`statement_of_family`].
++#[must_use]
++pub fn counted_statement_of_family(a: &Attestation, seed: &str, family: &str) -> Vec<u8> {
++    let family = family.to_owned();
++    let key = signing_key(seed);
++    let iref = identity_ref(&thumbprint(key.public_key()));
++    let payload = match payload_of(a, &family, &iref) {
++        Value::Map(m) => det_map(
++            m.into_iter()
++                .filter(|(k, _)| k.as_text() != Some("author"))
++                .collect(),
++        ),
++        other => other,
++    };
++    let st = sign_row_statement(
++        &key,
++        &iref,
++        &subject_of(&a.attested_key_id),
++        &a.attestation_type,
++        &family,
++        &payload,
++        vec![],
++    )
++    .expect("fixture_switch: sign a counted row");
++    if let Some(id) = RowId::of_statement(&st) {
++        row_families()
++            .lock()
++            .expect("family map")
++            .insert(id.hex(), family.clone());
++    }
++    st
++}
++
++/// [`counted_statement_of`] as the typed row the gates read (its first
++/// voice's projection), for [`put_signed`] and [`voices_of`].
++///
++/// # Panics
++/// The door refuses it.
++#[must_use]
++pub fn counted_row_of(a: &Attestation, seed: &str) -> Attestation {
++    row_of_statement(&counted_statement_of(a, seed), tier_of(a))
++}
++
+ /// [`statement_of`], or why the row names no family.
+ ///
+ /// # Errors
+diff --git a/src/federation/edition2/genesis.rs b/src/federation/edition2/genesis.rs
+index 48b87306..f79164fe 100644
+--- a/src/federation/edition2/genesis.rs
++++ b/src/federation/edition2/genesis.rs
+@@ -1069,7 +1069,16 @@ where
+     for (o, p, admitted) in plans {
+         for a in &admitted {
+             // Named by an earlier bundle of this offer, and stored with it.
+-            if !dir.edition2_voices(&a.row_id).await?.is_empty() {
++            // v62.0.0 (wave V1b) — skipped only when THIS statement is held:
++            // a further voice of a counted row is stored too, so a row its
++            // first voice left `Pending` lands when the bundle's other voices
++            // meet its quorum (`edition2::voices::put_counted_row`).
++            if dir
++                .edition2_voices(&a.row_id)
++                .await?
++                .iter()
++                .any(|held| *held == a.bytes)
++            {
+                 continue;
+             }
+             super::ingest::put_admitted_row(dir, a, super::ingest::INGEST_TIER).await?;
+diff --git a/src/federation/edition2/ingest.rs b/src/federation/edition2/ingest.rs
+index 6af98a3d..efb6bae4 100644
+--- a/src/federation/edition2/ingest.rs
++++ b/src/federation/edition2/ingest.rs
+@@ -44,7 +44,7 @@ use sha2::Digest as _;
+ 
+ use super::door::{admit_row, AdmittedRow, PLANE};
+ use super::liveness::{statement_parts, HeldKeys, Liveness, KEY_REVOCATION_FAMILY};
+-use crate::federation::types::{attestation_tier, Attestation, SignedAttestation};
++use crate::federation::types::{attestation_tier, Attestation};
+ use crate::federation::{malformed_row, Error, FederationDirectory};
+ 
+ /// The envelope member a mapped row carries its statement under: the
+@@ -853,22 +853,11 @@ where
+     }
+     // A further voice of a row already held (a counted row, CC 2.6.1.9): the
+     // row is admitted, and this voice joins its fold under `event_row_id`
+-    // (`cosign::edition2_voices`), never a second row.
+-    if dir.get_attestation(&admitted.row_id.hex()).await?.is_some() {
+-        let new = dir.put_edition2_statement(&admitted).await?;
+-        return Ok(StatementOutcome::Voice {
+-            row_id: admitted.row_id,
+-            new,
+-        });
+-    }
+-    let row = attestation_of(&admitted, tier)?;
+-    dir.put_attestation(SignedAttestation { attestation: row })
+-        .await?;
+-    let new = dir.put_edition2_statement(&admitted).await?;
+-    Ok(StatementOutcome::Row {
+-        row_id: admitted.row_id,
+-        new,
+-    })
++    // (`cosign::edition2_voices`), never a second row. v62.0.0 (wave V1b) —
++    // a row not held yet runs the attestation gates counted by ALL its
++    // voices, this one included; a gate that finds them short keeps the
++    // voice and answers `Pending` (`edition2::voices::put_counted_row`).
++    Box::pin(super::voices::put_counted_row(dir, admitted, tier)).await
+ }
+ 
+ /// The tier replication and tier ingest deliver at.
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 1123d305..954213f2 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -54,6 +54,9 @@ pub mod produce;
+ pub mod projection;
+ pub mod recovery_signer;
+ pub mod store;
++pub mod voices;
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++pub(crate) mod voices_invariants;
+ 
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod composer_invariants;
+diff --git a/src/federation/edition2/voices.rs b/src/federation/edition2/voices.rs
+new file mode 100644
+index 00000000..f346ea42
+--- /dev/null
++++ b/src/federation/edition2/voices.rs
+@@ -0,0 +1,347 @@
++//! v62.0.0 (wave V1, CC 2.6.1.9) — **counting edition-2 voices**.
++//!
++//! In edition 2 a co-signature is not a member of the row's envelope: it is
++//! a separate VOICE, an edition-2 statement over the same payload, so the
++//! same row id, held in `ceg_statements`. A gate that counted the earlier
++//! form's `additional_scrubs` (re-verified over the JSON envelope) counts 0
++//! for an edition-2 row, and every quorum fails. The gates count here
++//! instead.
++//!
++//! Every held voice was verified at its door before it was kept
++//! ([`ingest::put_statement`](super::ingest::put_statement),
++//! [`ingest::apply_replicated_statement`](super::ingest::apply_replicated_statement),
++//! T1's group door), so nothing here re-verifies a signature: it reads the
++//! signer's `iss`, `kid` and the payload's `asserted_at` from the held bytes.
++
++use std::collections::BTreeSet;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++
++use super::door::AdmittedRow;
++use super::liveness::statement_parts;
++use super::names::RowId;
++use super::Digest32;
++use crate::federation::types::Attestation;
++use crate::federation::{Error, FederationDirectory};
++
++/// One held voice of a row: one signer's edition-2 statement over the row's
++/// payload, as `ceg_statements` holds it.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Voice {
++    /// The CWT `iss`: the signer's identity-ref (a person; a second device
++    /// of the same person shares it).
++    pub iss: String,
++    /// The signing key's thumbprint (protected header label 4).
++    pub kid: Digest32,
++    /// The payload's `asserted_at`, POSIX ms (the same for every voice of
++    /// one row id, since the payload is).
++    pub asserted_at_ms: u64,
++}
++
++/// The voice a held statement states, if it is a row statement of exactly
++/// `row_id`. Anything else held under the id (an object voice, bytes that do
++/// not decode) is not a voice of the row and is skipped.
++fn voice_of(statement: &[u8], row_id: &RowId) -> Option<Voice> {
++    if RowId::of_statement(statement)? != *row_id {
++        return None;
++    }
++    let (protected, payload) = statement_parts(statement)?;
++    let iss = protected.get_int(15)?.get_int(1)?.as_text()?.to_owned();
++    let kid = <[u8; 32]>::try_from(protected.get_int(4)?.as_bytes()?).ok()?;
++    let asserted_at_ms = payload.get_text("asserted_at")?.as_u64()?;
++    Some(Voice {
++        iss,
++        kid,
++        asserted_at_ms,
++    })
++}
++
++/// **Every held voice of `row_id`**, one per held statement, in
++/// statement-id order (the backends' `ORDER BY statement_id`). A held
++/// statement that is not a row statement of exactly `row_id` is skipped,
++/// never counted.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn voices_of_row<F>(dir: &F, row_id: &RowId) -> Result<Vec<Voice>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let mut out: Vec<Voice> = dir
++        .edition2_voices(row_id)
++        .await?
++        .iter()
++        .filter_map(|st| voice_of(st, row_id))
++        .collect();
++    // v62.0.0 (wave V1b) — the voice the door is offering now, while it
++    // re-runs a counted row's gates ([`put_counted_row`]): verified at the
++    // door, counted with the held ones, kept only if the row lands or waits.
++    if let Ok(Some(v)) = ATTEMPT.try_with(|a| (a.row_id == *row_id).then(|| a.offered.clone())) {
++        out.push(v);
++    }
++    Ok(out)
++}
++
++/// The edition-2 row id of a row that carries its statement (it is stored
++/// under its row id, as lowercase hex). `None` for an earlier-form row.
++#[must_use]
++pub fn carried_row_id(row: &Attestation) -> Option<RowId> {
++    row.attestation_envelope
++        .get(super::ingest::STATEMENT_MEMBER)?;
++    let b = hex::decode(&row.attestation_id).ok()?;
++    <[u8; 32]>::try_from(b.as_slice()).ok().map(RowId)
++}
++
++/// The voice of the statement `row` carries (its first voice, the one the
++/// row was admitted on; the attestation door re-verified it through
++/// [`ingest::verify_carried`](super::ingest::verify_carried)). `None` for an
++/// earlier-form row.
++///
++/// The row's admission gates run BEFORE its first statement is kept in
++/// `ceg_statements` (`ingest::put_admitted_row`), so a gate that counts a row
++/// it is admitting reads this voice from the row, not from the store.
++#[must_use]
++pub fn carried_voice(row: &Attestation) -> Option<Voice> {
++    let row_id = carried_row_id(row)?;
++    let h = row
++        .attestation_envelope
++        .get(super::ingest::STATEMENT_MEMBER)?
++        .as_str()?;
++    voice_of(&hex::decode(h).ok()?, &row_id)
++}
++
++/// The DISTINCT signers (`iss`) among `row_id`'s voices that are members of
++/// `roster` (identity-refs, as the typed group rows hold them).
++///
++/// # Errors
++/// Directory read failures.
++pub async fn roster_voices<F>(
++    dir: &F,
++    row_id: &RowId,
++    roster: &[String],
++) -> Result<BTreeSet<String>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    Ok(voices_of_row(dir, row_id)
++        .await?
++        .into_iter()
++        .map(|v| v.iss)
++        .filter(|iss| roster.iter().any(|m| m == iss))
++        .collect())
++}
++
++/// **The one switch every co-signature-counting gate calls** for a row: how
++/// many DISTINCT members of `roster` stand behind `row`?
++///
++/// - a row carrying its edition-2 statement: its voices
++///   ([`roster_voices`]);
++/// - an earlier-form row while the earlier-form doors are open: its
++///   re-verified scrub set, unchanged
++///   ([`count_distinct_roster_scrubs`](crate::federation::reverse_quorum::count_distinct_roster_scrubs));
++///   F deletes this arm;
++/// - an earlier-form row once the doors are shut: nobody.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn counted_roster_signers<F>(
++    dir: &F,
++    row: &Attestation,
++    roster: &[String],
++) -> Result<BTreeSet<String>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    if let Some(row_id) = carried_row_id(row) {
++        let mut counted = roster_voices(dir, &row_id, roster).await?;
++        // The row's own first voice, which a gate admitting the row reads
++        // before the store keeps it.
++        if let Some(v) = carried_voice(row) {
++            if roster.iter().any(|m| *m == v.iss) {
++                counted.insert(v.iss);
++            }
++        }
++        return Ok(counted);
++    }
++    if super::door::earlier_form_doors_shut() {
++        return Ok(BTreeSet::new());
++    }
++    Ok(
++        crate::federation::reverse_quorum::count_distinct_roster_scrubs(
++            dir,
++            &row.attestation_envelope,
++            &row.scrubs(),
++            roster,
++        )
++        .await,
++    )
++}
++
++/// Every distinct signer (`iss`) of a statement-carrying `row`: its held
++/// voices and its own carried voice, with no roster filter (the kernel's
++/// owner seat reads the full voice set). Empty for an earlier-form row.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn row_voice_issuers<F>(dir: &F, row: &Attestation) -> Result<BTreeSet<String>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let Some(row_id) = carried_row_id(row) else {
++        return Ok(BTreeSet::new());
++    };
++    let mut out: BTreeSet<String> = voices_of_row(dir, &row_id)
++        .await?
++        .into_iter()
++        .map(|v| v.iss)
++        .collect();
++    if let Some(v) = carried_voice(row) {
++        out.insert(v.iss);
++    }
++    Ok(out)
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The counted-row hold (wave V1b)
++// ─────────────────────────────────────────────────────────────────────────
++
++/// The attempt the door is making to land a row by its voices: the row id,
++/// the voice it is offering now, and whether a gate found the voices short.
++struct Attempt {
++    row_id: RowId,
++    offered: Voice,
++    short: AtomicBool,
++}
++
++tokio::task_local! {
++    static ATTEMPT: Arc<Attempt>;
++}
++
++/// **A gate found the row's voices short of its quorum.** Called by a gate,
++/// structurally, right before it returns its shortfall refusal, so the door
++/// keeps the voice and answers `Pending` instead of refusing it
++/// ([`put_counted_row`]). A no-op outside the door's attempt (the earlier
++/// form, a read, a replayed check): there the refusal stands.
++pub(crate) fn note_short() {
++    let _ = ATTEMPT.try_with(|a| a.short.store(true, Ordering::SeqCst));
++}
++
++/// The voice that should project the typed row: the author's own voice for an
++/// authored row (a second signer's consent never becomes the row's
++/// attester), else the first held voice that is still admitted, else the
++/// voice offered now. A held voice is re-admitted under the key plane as it
++/// stands, so a signer revoked since never projects the row.
++async fn primary_voice<F>(dir: &F, admitted: &AdmittedRow) -> Result<AdmittedRow, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    if admitted.author.as_deref() == Some(admitted.iss.as_str()) {
++        return Ok(admitted.clone());
++    }
++    for st in dir.edition2_voices(&admitted.row_id).await? {
++        let Some(v) = voice_of(&st, &admitted.row_id) else {
++            continue;
++        };
++        let wanted = match &admitted.author {
++            Some(author) => v.iss == *author,
++            None => true,
++        };
++        if !wanted {
++            continue;
++        }
++        let keys = super::ingest::held_keys_for(dir, &st).await?;
++        if let Ok(p) = super::door::admit_row(
++            &st,
++            &keys,
++            Some(&admitted.row_id.0),
++            ciris_verify_core::edition2::family::SelectContext::default(),
++        ) {
++            return Ok(p);
++        }
++    }
++    Ok(admitted.clone())
++}
++
++/// v62.0.0 (wave V1b, CC 2.6.1.9) — **the store tail for a row through the
++/// attestation gates, counted by its voices.** Every family that reaches the
++/// attestation door (not T1's group planes, O1's occurrences, T2's typed
++/// planes or the key plane, which route first):
++///
++/// - a row already held: this voice joins it (`Voice`);
++/// - otherwise the row, projected from its primary voice ([`primary_voice`]),
++///   runs the attestation gates with THIS voice counted beside the held ones
++///   ([`voices_of_row`] reads it during the attempt):
++///   - admitted: the typed row lands, and the voice is kept (`Row`);
++///   - refused by a gate that found the voices SHORT of a quorum
++///     ([`note_short`], structurally, never by the error's text): the voice is
++///     kept in `ceg_statements`, no typed row is written (`Pending`), and a
++///     later voice re-runs the gates over all of them;
++///   - any other refusal: refused, nothing kept.
++///
++/// A voice from a signer that is no member of the counted roster is kept
++/// like any verified voice but is never counted, so it never completes the
++/// row; a duplicate signer's re-offer is the same statement (`new: false`)
++/// or another voice of the same `iss`, which counts once.
++///
++/// # Errors
++/// The attestation gates' refusals other than a shortfall; directory errors.
++pub async fn put_counted_row<F>(
++    dir: &F,
++    admitted: &AdmittedRow,
++    tier: &str,
++) -> Result<super::ingest::StatementOutcome, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    use super::ingest::StatementOutcome;
++    if dir.get_attestation(&admitted.row_id.hex()).await?.is_some() {
++        let new = dir.put_edition2_statement(admitted).await?;
++        return Ok(StatementOutcome::Voice {
++            row_id: admitted.row_id,
++            new,
++        });
++    }
++    let primary = primary_voice(dir, admitted).await?;
++    let row = super::ingest::attestation_of(&primary, tier)?;
++    let attempt = Arc::new(Attempt {
++        row_id: admitted.row_id,
++        offered: Voice {
++            iss: admitted.iss.clone(),
++            kid: admitted.kid,
++            asserted_at_ms: admitted.asserted_at_ms,
++        },
++        short: AtomicBool::new(false),
++    });
++    let out = ATTEMPT
++        .scope(
++            attempt.clone(),
++            dir.put_attestation(crate::federation::SignedAttestation { attestation: row }),
++        )
++        .await;
++    match out {
++        Ok(_) => {
++            if primary.statement_id != admitted.statement_id {
++                dir.put_edition2_statement(&primary).await?;
++            }
++            let new = dir.put_edition2_statement(admitted).await?;
++            Ok(StatementOutcome::Row {
++                row_id: admitted.row_id,
++                new,
++            })
++        }
++        Err(e) if attempt.short.load(Ordering::SeqCst) => {
++            let new = dir.put_edition2_statement(admitted).await?;
++            tracing::debug!(
++                row_id = %admitted.row_id.hex(),
++                family = %admitted.family,
++                reason = %e,
++                "edition-2 counted row kept short of its quorum"
++            );
++            Ok(StatementOutcome::Pending {
++                row_id: admitted.row_id,
++                new,
++            })
++        }
++        Err(e) => Err(e),
++    }
++}
+diff --git a/src/federation/edition2/voices_invariants.rs b/src/federation/edition2/voices_invariants.rs
+new file mode 100644
+index 00000000..42cc2394
+--- /dev/null
++++ b/src/federation/edition2/voices_invariants.rs
+@@ -0,0 +1,966 @@
++//! v62.0.0 (wave V1) — **a co-signature is a counted VOICE**, on sqlite and
++//! postgres. In edition 2 a cosigner states the row's payload in its own
++//! statement (same row id), kept in `ceg_statements`; the gates that counted
++//! `additional_scrubs` count these voices (`edition2::voices`).
++//!
++//! - **I3280** the family quorum (`trust_root::family_quorum_holders_over`,
++//!   the charter / config / rebind count): one member's voice is short of a
++//!   2-of-3 majority; a second member's voice meets it; a stranger's voice
++//!   is never counted.
++//! - **I3281** the community quorum (`admission::community_quorum_cosigned_at`,
++//!   the licence root and the affiliation owner-binding count): short with
++//!   one voice of a 2-member majority room, met with both.
++//! - **I3283** the owner seat (`admission::kernel_owner_selves`,
++//!   `Cosign::Required`): an owner binding the node has not voiced seats
++//!   nobody; once the node's own statement over it is held, the owner holds
++//!   the seat.
++//! - **I3289** (wave V1b) the counted-row hold
++//!   (`edition2::voices::put_counted_row`) on an owner binding: the owner's
++//!   voice alone is `Pending` (kept, no typed row; re-offered, `new: false`);
++//!   a stranger's voice never lands it; the node's voice lands it as the
++//!   owner's row (`Row`).
++//! - **I3286** `voices_of_row` reads each held voice's `iss`, `kid` and
++//!   `asserted_at` from the store, one per signer, the same instant for all.
++//! - **I3292 / I3293** (wave V1b, CC 3.2 ruling (a)) an owner binding naming
++//!   an affiliation is counted: `Pending` until the owner's, the bound key's
++//!   and the affiliation quorum's voices (at `refs.head`) are all held, in
++//!   either order; a non-member's voice never completes it; landed, the
++//!   affiliation answers for the agent (`affiliation_of_binding`).
++//! - **I3294 / I3295** (wave V1b, CC 4.4.3.12) an affiliation's officer
++//!   appointment, a counted `self:delegates_to`: `Pending` until the quorum
++//!   at its `refs.head`; landed, no seat without the officer's own
++//!   `membership:acceptance`; both, the officer resolves to the authority.
++//! - **I3296** (wave V1b, CC 2.4.1.1) the withdrawal of a counted
++//!   appointment is counted at the affiliation's protocol over the head it
++//!   names: a lone member's authored retraction is refused; the counted one
++//!   is `Pending` until met (a non-member's voice never completes it); met,
++//!   the officer's seat ends.
++//! - **I3297** (wave V1b, CC 2.4.1.1, CLM-licence-contest) the group's
++//!   withdrawal of a counted licence is counted at the authority community
++//!   its dimension names: the licensee's own and a lone member's are
++//!   refused; the counted one is `Pending` until the quorum, then lands, and
++//!   the licence stops counting (`licensure::status_set_for` drops `issued`).
++//! - **I3287** an earlier-form row (no statement) counts nobody once the
++//!   earlier-form doors are shut (`counted_roster_signers`).
++//!
++//! The ownership-reclaim WA quorum (I3284, I3285) is witnessed beside its
++//! gate in `ownership_reclaim.rs`, through [`found_family`] / [`counted_row`]
++//! / [`add_voice`] here.
++
++use std::collections::BTreeSet;
++
++use super::fixture_switch as e2;
++use super::group::GroupRecord;
++use super::group_fixtures::{put_voices, roster_voices};
++use super::ingest::StatementOutcome;
++use super::voices;
++use crate::federation::types::{
++    identity_type, Attestation, Community, CommunityMember, Family, FamilyMember,
++};
++use crate::federation::{Error, FederationDirectory};
++
++fn epoch(ms: i64) -> chrono::DateTime<chrono::Utc> {
++    use chrono::TimeZone as _;
++    chrono::Utc
++        .timestamp_millis_opt(ms)
++        .single()
++        .expect("instant")
++}
++
++/// Found a family of `members` (seeds; each must be a live key) under
++/// `protocol`, by every member's roster voice; the held record.
++///
++/// # Panics
++/// The founding does not land.
++pub(crate) async fn found_family(
++    d: &dyn FederationDirectory,
++    group_seed: &str,
++    members: &[&str],
++    protocol: &str,
++) -> Family {
++    let gid = e2::kid(group_seed);
++    let rec = GroupRecord::Family(Family {
++        family_key_id: gid.clone(),
++        family_name: format!("v1 {group_seed}"),
++        members: members
++            .iter()
++            .map(|s| FamilyMember {
++                key_id: e2::kid(s),
++                joined_at: epoch(1_000),
++                role: None,
++            })
++            .collect(),
++        founded_at: epoch(1_000),
++        consensus_protocol: protocol.to_owned(),
++        consensus_protocol_entrenched: false,
++        dissolved_at: None,
++        prev_head_digest: String::new(),
++        charter_digest: String::new(),
++        persist_row_hash: String::new(),
++    });
++    let keys: Vec<_> = members.iter().map(|s| e2::signing_key(s)).collect();
++    let signers: Vec<&_> = keys.iter().collect();
++    put_voices(d, &roster_voices(&rec, 1, None, 2_000, &signers))
++        .await
++        .expect("V1: the family's founding voices");
++    d.lookup_family(&gid)
++        .await
++        .unwrap()
++        .expect("V1: the family landed")
++}
++
++/// Found a community (first member `founder`) under `protocol`, with
++/// `policy_blob` (e.g. `cohort_scope: affiliations`).
++async fn found_community(
++    d: &dyn FederationDirectory,
++    group_seed: &str,
++    members: &[&str],
++    protocol: &str,
++    policy_blob: Option<serde_json::Value>,
++) -> Community {
++    let gid = e2::kid(group_seed);
++    let rec = GroupRecord::Community(Community {
++        community_key_id: gid.clone(),
++        community_name: format!("v1 {group_seed}"),
++        members: members
++            .iter()
++            .enumerate()
++            .map(|(i, s)| CommunityMember {
++                key_id: e2::kid(s),
++                joined_at: epoch(1_000),
++                role: (i == 0).then(|| "founder".to_owned()),
++            })
++            .collect(),
++        founded_at: epoch(1_000),
++        consensus_protocol: protocol.to_owned(),
++        policy_blob,
++        prev_head_digest: String::new(),
++        charter_digest: String::new(),
++        persist_row_hash: String::new(),
++    });
++    let keys: Vec<_> = members.iter().map(|s| e2::signing_key(s)).collect();
++    let signers: Vec<&_> = keys.iter().collect();
++    put_voices(d, &roster_voices(&rec, 1, None, 2_000, &signers))
++        .await
++        .expect("V1: the community's founding voices");
++    d.lookup_community(&gid)
++        .await
++        .unwrap()
++        .expect("V1: the community landed")
++}
++
++/// A counted row (a `scores` row) stated by `seed`, put through the
++/// statement door; the row as stored (it carries its statement).
++pub(crate) async fn counted_row(d: &dyn FederationDirectory, seed: &str) -> Attestation {
++    let a = crate::federation::genesis::ordinary_scores_row(
++        &uuid::Uuid::new_v4().to_string(),
++        &e2::kid(seed),
++    );
++    // v62.0.0 (wave V1b) — a COUNTED statement (no `author`): the family
++    // (`trust:{job}:{version}`) is counted under `act=group`, so a second
++    // member's voice over it is admitted (an authored row's would be refused
++    // `iss_not_in_role`).
++    let row = e2::counted_row_of(&a, seed);
++    e2::put_signed(d, &row)
++        .await
++        .expect("V1: the counted row's first voice");
++    row
++}
++
++/// `seed`'s voice over the statement `row` carries, through the door.
++///
++/// # Errors
++/// The door's refusals.
++pub(crate) async fn add_voice(
++    d: &dyn FederationDirectory,
++    row: &Attestation,
++    seed: &str,
++) -> Result<StatementOutcome, Error> {
++    let st = e2::carried_statement(row).expect("V1: the row carries its statement");
++    e2::put_statement(d, &e2::voice_of(&st, seed)).await
++}
++
++async fn keys(d: &dyn FederationDirectory, seeds: &[&str], types: &[&str]) {
++    for s in seeds {
++        let _ = e2::put_key(d, s, types).await;
++    }
++}
++
++fn kids(seeds: &[&str]) -> BTreeSet<String> {
++    seeds.iter().map(|s| e2::kid(s)).collect()
++}
++
++/// I3280 + I3286: the family quorum by voices.
++pub(crate) async fn family_quorum_body(d: &dyn FederationDirectory) {
++    let (a, b, c, x) = ("v1-fq-a", "v1-fq-b", "v1-fq-c", "v1-fq-x");
++    keys(d, &[a, b, c, x], &[identity_type::USER]).await;
++    let family = found_family(d, "v1-fq-g", &[a, b, c], "majority").await;
++
++    let row = counted_row(d, a).await;
++    let (q, who) = crate::federation::trust_root::family_quorum_holders_over(d, &row, &family)
++        .await
++        .unwrap();
++    assert_eq!(who, kids(&[a]), "I3280 the row's own voice counts");
++    assert!(
++        q.distinct_holders < q.required,
++        "I3280 one voice of three is short of majority: {q:?}"
++    );
++
++    // A stranger's voice (held or refused) never counts.
++    let _ = add_voice(d, &row, x).await;
++    let (_, who) = crate::federation::trust_root::family_quorum_holders_over(d, &row, &family)
++        .await
++        .unwrap();
++    assert_eq!(who, kids(&[a]), "I3280 a non-member's voice is not counted");
++
++    let o = add_voice(d, &row, b).await.expect("I3280 b's voice");
++    assert!(
++        matches!(o, StatementOutcome::Voice { new: true, .. }),
++        "I3280 b's voice joins the held row: {o:?}"
++    );
++    let (q, who) = crate::federation::trust_root::family_quorum_holders_over(d, &row, &family)
++        .await
++        .unwrap();
++    assert_eq!(who, kids(&[a, b]), "I3280 the two members' voices");
++    assert!(
++        q.distinct_holders >= q.required,
++        "I3280 two voices of three meet majority: {q:?}"
++    );
++
++    // I3286 — the held voices, read back as the store holds them.
++    let row_id = voices::carried_row_id(&row).expect("I3286 a statement-carrying row");
++    let held = voices::voices_of_row(d, &row_id).await.unwrap();
++    let iss: BTreeSet<String> = held.iter().map(|v| v.iss.clone()).collect();
++    assert!(
++        iss.contains(&e2::kid(a)) && iss.contains(&e2::kid(b)),
++        "I3286 both voices are held: {iss:?}"
++    );
++    for v in &held {
++        let seed = [a, b, x]
++            .into_iter()
++            .find(|s| e2::kid(s) == v.iss)
++            .expect("I3286 a known signer");
++        assert_eq!(v.kid, e2::kid_digest(seed), "I3286 the voice's kid");
++        assert_eq!(
++            v.asserted_at_ms, held[0].asserted_at_ms,
++            "I3286 one payload, one asserted_at"
++        );
++    }
++}
++
++/// I3281: the community quorum by voices.
++pub(crate) async fn community_quorum_body(d: &dyn FederationDirectory) {
++    let (a, b) = ("v1-cq-a", "v1-cq-b");
++    keys(d, &[a, b], &[identity_type::USER]).await;
++    let c = found_community(d, "v1-cq-g", &[a, b], "majority", None).await;
++    let row = counted_row(d, a).await;
++    let at = row.asserted_at;
++    assert!(
++        !crate::federation::admission::community_quorum_cosigned_at(d, &c, &row, at)
++            .await
++            .unwrap(),
++        "I3281 one voice of two is short of majority"
++    );
++    add_voice(d, &row, b).await.expect("I3281 b's voice");
++    assert!(
++        crate::federation::admission::community_quorum_cosigned_at(d, &c, &row, at)
++            .await
++            .unwrap(),
++        "I3281 both members' voices meet majority"
++    );
++}
++
++/// I3283 + I3289: an owner binding is held `Pending` until the node voices
++/// it, then lands and seats its owner.
++pub(crate) async fn owner_seat_body(d: &dyn FederationDirectory) {
++    let (owner, node, stranger) = ("v1-own-o", "v1-own-n", "v1-own-x");
++    let _ = e2::put_key(d, owner, &[identity_type::USER]).await;
++    let _ = e2::put_key(d, stranger, &[identity_type::USER]).await;
++    let node_kid = e2::put_key(d, node, &[identity_type::NODE]).await;
++    let row = crate::federation::tier_ingest::test_support::owner_binding_attestation(
++        &uuid::Uuid::new_v4().to_string(),
++        owner,
++        node,
++    );
++    let id = voices::carried_row_id(&row)
++        .expect("I3289 the binding carries its statement")
++        .hex();
++    let required = crate::kernel::owner::Cosign::Required;
++
++    // I3289 — the owner's voice alone: kept, no typed row.
++    let o = e2::put_signed(d, &row)
++        .await
++        .expect("I3289 the owner's voice is kept, not refused");
++    assert!(
++        matches!(o, StatementOutcome::Pending { new: true, .. }),
++        "I3289 the binding waits for the node's voice: {o:?}"
++    );
++    assert!(
++        d.get_attestation(&id).await.unwrap().is_none(),
++        "I3289 no typed row for a binding the node never voiced"
++    );
++    assert!(
++        crate::federation::admission::kernel_owner_selves(d, &node_kid, required)
++            .await
++            .unwrap()
++            .is_empty(),
++        "I3283 a binding the node has not voiced seats nobody"
++    );
++    // A re-offer of the same voice is the same hold.
++    let o = e2::put_signed(d, &row).await.expect("I3289 re-offer");
++    assert!(
++        matches!(o, StatementOutcome::Pending { new: false, .. }),
++        "I3289 a re-offered voice: {o:?}"
++    );
++
++    // A voice that is not the bound key's never completes it (refused by the
++    // family's roles, or held and not counted).
++    let st = e2::carried_statement(&row).expect("I3289 the binding's statement");
++    let _ = e2::put_statement(d, &e2::voice_of(&st, stranger)).await;
++    assert!(
++        d.get_attestation(&id).await.unwrap().is_none(),
++        "I3289 a stranger's voice does not land the binding"
++    );
++
++    // The node's voice lands it.
++    let o = e2::put_statement(d, &e2::voice_of(&st, node))
++        .await
++        .expect("I3289 the node's voice over its binding");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3289 the node's voice lands the binding: {o:?}"
++    );
++    let held = d
++        .get_attestation(&id)
++        .await
++        .unwrap()
++        .expect("I3289 the typed row landed");
++    assert_eq!(
++        held.attesting_key_id,
++        e2::kid(owner),
++        "I3289 the row is the owner's (projected from the author's voice)"
++    );
++    assert_eq!(
++        crate::federation::admission::kernel_owner_selves(d, &node_kid, required)
++            .await
++            .unwrap()
++            .len(),
++        1,
++        "I3283 with the node's voice held, the owner holds the seat"
++    );
++}
++
++/// An owner binding of `owner` over `agent` that names the affiliation `c`
++/// at its held roster head (`refs.head`), as `owner`'s statement.
++async fn affiliation_binding(
++    d: &dyn FederationDirectory,
++    owner: &str,
++    agent: &str,
++    c: &Community,
++) -> Attestation {
++    let (head, _) = super::group_fixtures::held_head(d, &c.community_key_id)
++        .await
++        .expect("I3292 the affiliation's roster head is held");
++    let mut a = crate::federation::tier_ingest::test_support::owner_binding_attestation(
++        &uuid::Uuid::new_v4().to_string(),
++        owner,
++        agent,
++    );
++    a.attestation_envelope["community_id"] = serde_json::json!(c.community_key_id);
++    a.attestation_envelope["refs"] = serde_json::json!({ "head": [2, [-16, head.hex()]] });
++    e2::row_of(&a, owner)
++}
++
++fn pending(o: &StatementOutcome) -> bool {
++    matches!(o, StatementOutcome::Pending { .. })
++}
++
++/// I3292 + I3293: an owner binding naming an affiliation is COUNTED (CC 3.2
++/// ruling (a), CC 2.4.1.3): held `Pending` until the owner's, the bound
++/// key's AND the affiliation quorum's voices are all held, in either order;
++/// then it lands and the affiliation answers for the agent
++/// (`affiliation_of_binding`, the slashing / quarantine reach).
++pub(crate) async fn affiliation_owner_binding_body(d: &dyn FederationDirectory) {
++    let (owner, m1, m2, m3, x) = ("v1-ab-o", "v1-ab-m1", "v1-ab-m2", "v1-ab-m3", "v1-ab-x");
++    keys(d, &[owner, m1, m2, m3, x], &[identity_type::USER]).await;
++    let blob = serde_json::json!({
++        "cohort_scope": "affiliations",
++        "affiliation_config": { "licence_audiences": { "professional_full": "federation" } },
++    });
++    let c = found_community(d, "v1-ab-g", &[m1, m2, m3], "majority", Some(blob)).await;
++    let reach = |agent_kid: String| async move {
++        crate::federation::admission::affiliation_of_binding(d, &agent_kid)
++            .await
++            .unwrap()
++    };
++
++    // I3292 — owner, then the bound key, then the members.
++    let agent = "v1-ab-a1";
++    let agent_kid = e2::put_key(d, agent, &[identity_type::AGENT]).await;
++    let row = affiliation_binding(d, owner, agent, &c).await;
++    let id = voices::carried_row_id(&row)
++        .expect("I3292 a statement")
++        .hex();
++    let st = e2::carried_statement(&row).expect("I3292 the binding's statement");
++    let o = e2::put_signed(d, &row)
++        .await
++        .expect("I3292 the owner's voice");
++    assert!(pending(&o), "I3292 the owner alone waits: {o:?}");
++    let o = e2::put_statement(d, &e2::voice_of(&st, agent))
++        .await
++        .expect("I3292 the bound key's voice");
++    assert!(
++        pending(&o),
++        "I3292 owner + bound key, no quorum, waits: {o:?}"
++    );
++    let o = e2::put_statement(d, &e2::voice_of(&st, m1))
++        .await
++        .expect("I3292 a member's voice is admitted (ruling (a))");
++    assert!(pending(&o), "I3292 one of three members waits: {o:?}");
++    // A non-member's voice never completes it.
++    let _ = e2::put_statement(d, &e2::voice_of(&st, x)).await;
++    assert!(
++        d.get_attestation(&id).await.unwrap().is_none(),
++        "I3292 no typed row short of the quorum (a non-member does not count)"
++    );
++    assert_eq!(
++        reach(agent_kid.clone()).await,
++        None,
++        "I3292 a held binding reaches no affiliation"
++    );
++    let o = e2::put_statement(d, &e2::voice_of(&st, m2))
++        .await
++        .expect("I3292 the second member's voice");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3292 owner + bound key + 2 of 3 members lands it: {o:?}"
++    );
++    let held = d
++        .get_attestation(&id)
++        .await
++        .unwrap()
++        .expect("I3292 the typed row landed");
++    assert_eq!(
++        held.attesting_key_id,
++        e2::kid(owner),
++        "I3292 the owner's row"
++    );
++    assert_eq!(
++        reach(agent_kid).await,
++        Some(c.community_key_id.clone()),
++        "I3292 slashing reaches the affiliation"
++    );
++
++    // I3293 — the quorum first: met without the bound key, it still waits.
++    let agent = "v1-ab-a2";
++    let agent_kid = e2::put_key(d, agent, &[identity_type::AGENT]).await;
++    let row = affiliation_binding(d, owner, agent, &c).await;
++    let id = voices::carried_row_id(&row)
++        .expect("I3293 a statement")
++        .hex();
++    let st = e2::carried_statement(&row).expect("I3293 the binding's statement");
++    let o = e2::put_signed(d, &row)
++        .await
++        .expect("I3293 the owner's voice");
++    assert!(pending(&o), "I3293 {o:?}");
++    for m in [m1, m2] {
++        let o = e2::put_statement(d, &e2::voice_of(&st, m))
++            .await
++            .expect("I3293 a member's voice");
++        assert!(
++            pending(&o),
++            "I3293 the quorum without the bound key waits: {o:?}"
++        );
++    }
++    assert!(
++        d.get_attestation(&id).await.unwrap().is_none(),
++        "I3293 no typed row without the bound key's voice"
++    );
++    let o = e2::put_statement(d, &e2::voice_of(&st, agent))
++        .await
++        .expect("I3293 the bound key's voice");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3293 the bound key's voice completes it: {o:?}"
++    );
++    assert_eq!(
++        reach(agent_kid).await,
++        Some(c.community_key_id.clone()),
++        "I3293 slashing reaches the affiliation"
++    );
++}
++
++/// I3294 + I3295: an affiliation's officer appointment is a COUNTED
++/// `self:delegates_to` (CC 4.4.3.12, the second ruling): held `Pending`
++/// until the affiliation's quorum at its `refs.head` is met (a non-member's
++/// voice never completes it); landed, the officer still holds no seat until
++/// their own `membership:acceptance` of it is held ("two consents"); with
++/// both, the officer resolves to the affiliation's authority.
++pub(crate) async fn officer_appointment_body(d: &dyn FederationDirectory) {
++    use crate::federation::admission::{
++        emitter_resolves_to_authority, DELEGATION_SCOPE_LICENSE, DELEGATION_VALID_UNTIL_FIELD,
++    };
++    use crate::federation::types::{attestation_type, cohort_scope};
++    let (m1, m2, m3, x, officer) = ("v1-oa-m1", "v1-oa-m2", "v1-oa-m3", "v1-oa-x", "v1-oa-o");
++    keys(d, &[m1, m2, m3, x, officer], &[identity_type::USER]).await;
++    let blob = serde_json::json!({
++        "cohort_scope": "affiliations",
++        "affiliation_config": { "licence_audiences": { "professional_full": "federation" } },
++    });
++    let c = found_community(d, "v1-oa-g", &[m1, m2, m3], "majority", Some(blob)).await;
++    let aff = c.community_key_id.clone();
++    let (head, _) = super::group_fixtures::held_head(d, &aff)
++        .await
++        .expect("I3294 the affiliation's roster head is held");
++    let now = chrono::Utc::now();
++    let officer_kid = e2::kid(officer);
++
++    // The appointment: the affiliation's counted `self:delegates_to` to the
++    // officer (no author), first voiced by m1.
++    let mut a = crate::federation::genesis::ordinary_scores_row(
++        &uuid::Uuid::new_v4().to_string(),
++        &e2::kid(m1),
++    );
++    a.attestation_type = attestation_type::DELEGATES_TO.to_owned();
++    a.attested_key_id = officer_kid.clone();
++    a.subject_key_ids = vec![officer_kid.clone()];
++    a.weight = None;
++    a.asserted_at = now - chrono::Duration::hours(1);
++    a.scrub_timestamp = a.asserted_at;
++    a.attestation_envelope = serde_json::json!({
++        "id": a.attestation_id,
++        "scope": [DELEGATION_SCOPE_LICENSE],
++        "community_id": aff,
++        DELEGATION_VALID_UNTIL_FIELD: crate::federation::admission::render_signed_instant(
++            now + chrono::Duration::days(1),
++        ),
++        "refs": { "head": [2, [-16, head.hex()]] },
++    });
++    let row = e2::counted_row_of(&a, m1);
++    let id = voices::carried_row_id(&row)
++        .expect("I3294 a statement")
++        .hex();
++    let st = e2::carried_statement(&row).expect("I3294 the appointment's statement");
++
++    // I3294 — Pending until the quorum.
++    let o = e2::put_signed(d, &row).await.expect("I3294 m1's voice");
++    assert!(pending(&o), "I3294 one of three members waits: {o:?}");
++    let _ = e2::put_statement(d, &e2::voice_of(&st, x)).await;
++    assert!(
++        d.get_attestation(&id).await.unwrap().is_none(),
++        "I3294 a non-member's voice does not land the appointment"
++    );
++    let o = e2::put_statement(d, &e2::voice_of(&st, m2))
++        .await
++        .expect("I3294 m2's voice");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3294 two of three members land the appointment: {o:?}"
++    );
++
++    // I3295 — the quorum alone seats nobody: the officer has not consented.
++    assert!(
++        !emitter_resolves_to_authority(d, &officer_kid, &aff)
++            .await
++            .unwrap(),
++        "I3295 a quorum appointment without the officer's acceptance is no seat"
++    );
++    let held = d
++        .get_attestation(&id)
++        .await
++        .unwrap()
++        .expect("I3295 the appointment is held");
++    let mut answered = held.clone();
++    answered.cohort_scope = cohort_scope::COMMUNITY.to_owned();
++    answered.attestation_envelope["community_key_id"] = serde_json::json!(aff);
++    let acceptance = crate::federation::membership_acceptance::test_support::acceptance_row(
++        officer, &answered, now,
++    );
++    e2::put_signed(d, &acceptance)
++        .await
++        .expect("I3295 the officer's own acceptance of the appointment");
++    assert!(
++        emitter_resolves_to_authority(d, &officer_kid, &aff)
++            .await
++            .unwrap(),
++        "I3295 both consents: the officer resolves to the affiliation's authority"
++    );
++
++    // I3296 — the affiliation's withdrawal of the appointment is itself
++    // counted: a lone member's own (authored) retraction is refused, the
++    // group's counted one waits until the quorum at the head it names, and a
++    // non-member's voice never completes it; met, the seat ends.
++    let lone = e2::composer_of(attestation_type::WITHDRAWS, &held, m3);
++    assert!(
++        e2::put_signed(d, &lone).await.is_err(),
++        "I3296 a lone member's retraction of a counted appointment never lands"
++    );
++    let mut w = held.clone();
++    w.attestation_type = attestation_type::WITHDRAWS.to_owned();
++    w.attesting_key_id = e2::kid(m1);
++    w.asserted_at = chrono::Utc::now();
++    w.scrub_timestamp = w.asserted_at;
++    w.expires_at = None;
++    w.subject_key_ids = Vec::new();
++    w.weight = None;
++    w.cohort_scope = cohort_scope::FEDERATION.to_owned();
++    w.attestation_envelope = serde_json::json!({
++        "refs": {
++            "target": [2, [-16, id]],
++            "head": [2, [-16, head.hex()]],
++        },
++    });
++    let family =
++        ciris_verify_core::namespace_match::family_id(super::door::SELF_DELEGATES_TO_FAMILY_PREFIX);
++    let wst = e2::counted_statement_of_family(&w, m1, &family);
++    let wid = super::names::RowId::of_statement(&wst)
++        .expect("I3296 a row statement")
++        .hex();
++    let o = e2::put_statement(d, &wst)
++        .await
++        .expect("I3296 m1's withdrawal voice");
++    assert!(
++        pending(&o),
++        "I3296 one member's counted withdrawal waits: {o:?}"
++    );
++    let _ = e2::put_statement(d, &e2::voice_of(&wst, x)).await;
++    assert!(
++        d.get_attestation(&wid).await.unwrap().is_none(),
++        "I3296 a non-member's voice does not land the withdrawal"
++    );
++    assert!(
++        emitter_resolves_to_authority(d, &officer_kid, &aff)
++            .await
++            .unwrap(),
++        "I3296 a held withdrawal does not end the seat"
++    );
++    let o = e2::put_statement(d, &e2::voice_of(&wst, m2))
++        .await
++        .expect("I3296 m2's withdrawal voice");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3296 two of three members land the withdrawal: {o:?}"
++    );
++    assert!(
++        !emitter_resolves_to_authority(d, &officer_kid, &aff)
++            .await
++            .unwrap(),
++        "I3296 the group's counted withdrawal ends the seat"
++    );
++}
++
++/// What a licence counts for: is `issued` among the authority's live
++/// statuses about the licensee (`licensure::status_set_for`, the licence
++/// fold)?
++async fn licence_issued(d: &dyn FederationDirectory, holder: &str, authority: &str) -> bool {
++    crate::federation::licensure::status_set_for(d, holder, authority, chrono::Utc::now())
++        .await
++        .unwrap()
++        .contains(&crate::federation::licensure::LicensureStatus::Issued)
++}
++
++/// I3297: the group's withdrawal of a COUNTED licence is itself counted, at
++/// the protocol of the authority community its dimension names
++/// (`licensure:{authority}`), over the head the withdrawal names. The
++/// licensee's own withdrawal stays refused (CLM-licence-contest), as does a
++/// lone member's authored one; the counted withdrawal is `Pending` until the
++/// quorum, then lands with an admitted rule.
++pub(crate) async fn licence_withdrawal_body(d: &dyn FederationDirectory) {
++    use crate::federation::types::attestation_type;
++    let (m1, m2, m3, x, holder) = ("v1-lw-m1", "v1-lw-m2", "v1-lw-m3", "v1-lw-x", "v1-lw-h");
++    keys(d, &[m1, m2, m3, x, holder], &[identity_type::USER]).await;
++    let blob = serde_json::json!({
++        "cohort_scope": "affiliations",
++        "affiliation_config": { "licence_audiences": { "professional_full": "federation" } },
++    });
++    let c = found_community(d, "v1-lw-g", &[m1, m2, m3], "majority", Some(blob)).await;
++    let aff = c.community_key_id.clone();
++    let (head, _) = super::group_fixtures::held_head(d, &aff)
++        .await
++        .expect("I3297 the authority's roster head is held");
++    let now = chrono::Utc::now();
++    let holder_kid = e2::kid(holder);
++
++    // The counted licence: the authority's act, voiced by m1 and m2.
++    let mut a = crate::federation::genesis::ordinary_scores_row(
++        &uuid::Uuid::new_v4().to_string(),
++        &e2::kid(m1),
++    );
++    a.attested_key_id = holder_kid.clone();
++    a.asserted_at = now - chrono::Duration::hours(1);
++    a.scrub_timestamp = a.asserted_at;
++    a.attestation_envelope = serde_json::json!({
++        "id": a.attestation_id,
++        "dimension": format!("{}:v1", crate::federation::licensure::licensure_stem_of(&aff)),
++        "status": "issued",
++        "score": 1.0,
++        "confidence": 0.9,
++        "partner_record": {
++            "license_id": a.attestation_id,
++            "license_type": "professional_full",
++            "capabilities_granted": [],
++            "capabilities_denied": [],
++            "max_autonomy_tier": "A2",
++            "requires_supervisor": false,
++            "geographic_restrictions": ["CA", "US"],
++            "allowed_identity_templates": [],
++            "deployment_limit": 10,
++            "offline_grace_hours": 24,
++            "revision": 1,
++            "issued_at": "2026-10-01T00:00:00.000Z",
++            "expires_at": "2027-10-01T00:00:00.000Z",
++        },
++        "refs": { "head": [2, [-16, head.hex()]] },
++    });
++    let lic = e2::counted_row_of(&a, m1);
++    let lid = voices::carried_row_id(&lic)
++        .expect("I3297 a statement")
++        .hex();
++    let lst = e2::carried_statement(&lic).expect("I3297 the licence's statement");
++    let o = e2::put_signed(d, &lic)
++        .await
++        .expect("I3297 m1's licence voice");
++    assert!(pending(&o), "I3297 one member's licence waits: {o:?}");
++    let o = e2::put_statement(d, &e2::voice_of(&lst, m2))
++        .await
++        .expect("I3297 m2's licence voice");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3297 the quorum lands the licence: {o:?}"
++    );
++    let held = d
++        .get_attestation(&lid)
++        .await
++        .unwrap()
++        .expect("I3297 the licence is held");
++    let family = e2::family_of(&held);
++    assert!(
++        licence_issued(d, &holder_kid, &aff).await,
++        "I3297 the landed licence counts: the licensee holds it"
++    );
++
++    // A counted withdrawal of the licence, first voiced by `seed`.
++    let withdrawal = |seed: &str| {
++        let mut w = held.clone();
++        w.attestation_type = attestation_type::WITHDRAWS.to_owned();
++        w.attesting_key_id = e2::kid(seed);
++        w.asserted_at = chrono::Utc::now();
++        w.scrub_timestamp = w.asserted_at;
++        w.expires_at = None;
++        w.subject_key_ids = Vec::new();
++        w.weight = None;
++        w.attestation_envelope = serde_json::json!({
++            "dimension": held.attestation_envelope["dimension"],
++            "refs": {
++                "target": [2, [-16, lid]],
++                "head": [2, [-16, head.hex()]],
++            },
++        });
++        e2::counted_statement_of_family(&w, seed, &family)
++    };
++
++    // The licensee's own withdrawal: refused, counted or authored.
++    assert!(
++        e2::put_statement(d, &withdrawal(holder)).await.is_err(),
++        "I3297 the licensee's own counted withdrawal is refused (CLM-licence-contest)"
++    );
++    assert!(
++        e2::put_signed(
++            d,
++            &e2::composer_of(attestation_type::WITHDRAWS, &held, holder)
++        )
++        .await
++        .is_err(),
++        "I3297 the licensee's own withdrawal is refused (CLM-licence-contest)"
++    );
++    // A lone member's authored withdrawal: refused.
++    assert!(
++        e2::put_signed(d, &e2::composer_of(attestation_type::WITHDRAWS, &held, m3))
++            .await
++            .is_err(),
++        "I3297 a lone member's retraction of a counted licence never lands"
++    );
++    // The group's counted withdrawal: Pending, a non-member never completes
++    // it, the quorum lands it.
++    let wst = withdrawal(m1);
++    let wid = super::names::RowId::of_statement(&wst)
++        .expect("I3297 a row statement")
++        .hex();
++    let o = e2::put_statement(d, &wst)
++        .await
++        .expect("I3297 m1's withdrawal voice");
++    assert!(
++        pending(&o),
++        "I3297 one member's counted withdrawal waits: {o:?}"
++    );
++    let _ = e2::put_statement(d, &e2::voice_of(&wst, x)).await;
++    assert!(
++        d.get_attestation(&wid).await.unwrap().is_none(),
++        "I3297 a non-member's voice does not land the withdrawal"
++    );
++    assert!(
++        licence_issued(d, &holder_kid, &aff).await,
++        "I3297 a held withdrawal does not retire the licence"
++    );
++    let o = e2::put_statement(d, &e2::voice_of(&wst, m2))
++        .await
++        .expect("I3297 m2's withdrawal voice");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3297 two of three members land the withdrawal: {o:?}"
++    );
++    let landed = d
++        .get_attestation(&wid)
++        .await
++        .unwrap()
++        .expect("I3297 the withdrawal is held");
++    assert!(
++        matches!(landed.withdraws_admission_rule, Some(1 | 4)),
++        "I3297 the counted withdrawal is admitted with a rule: {:?}",
++        landed.withdraws_admission_rule
++    );
++    assert!(
++        !licence_issued(d, &holder_kid, &aff).await,
++        "I3297 the landed counted withdrawal retires the licence: it no longer counts"
++    );
++}
++
++/// I3287: an earlier-form row counts nobody with the doors shut.
++async fn earlier_form_shut_body(d: &dyn FederationDirectory) {
++    let row = crate::federation::genesis::ordinary_scores_row("v1-earlier", "v1-earlier-key");
++    let roster = vec!["v1-earlier-key".to_owned()];
++    let counted =
++        super::door::with_earlier_form_doors_shut(voices::counted_roster_signers(d, &row, &roster))
++            .await
++            .unwrap();
++    assert!(
++        counted.is_empty(),
++        "I3287 an earlier-form row counts nobody once the doors are shut"
++    );
++}
++
++#[cfg(feature = "sqlite")]
++async fn sqlite() -> crate::store::sqlite::SqliteBackend {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    b
++}
++
++#[cfg(feature = "postgres")]
++async fn postgres() -> Option<crate::store::postgres::PostgresBackend> {
++    use crate::store::Backend as _;
++    let dsn = crate::test_pg::empty_dsn()?;
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Some(b)
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3280_i3286_family_quorum_by_voices_sqlite() {
++    Box::pin(family_quorum_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3280_i3286_family_quorum_by_voices_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(family_quorum_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3281_community_quorum_by_voices_sqlite() {
++    Box::pin(community_quorum_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3281_community_quorum_by_voices_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(community_quorum_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3283_owner_seat_reads_the_node_voice_sqlite() {
++    Box::pin(owner_seat_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3283_owner_seat_reads_the_node_voice_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(owner_seat_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3287_earlier_form_counts_nobody_when_shut_sqlite() {
++    Box::pin(earlier_form_shut_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3287_earlier_form_counts_nobody_when_shut_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(earlier_form_shut_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3292_i3293_affiliation_owner_binding_counted_sqlite() {
++    Box::pin(affiliation_owner_binding_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3292_i3293_affiliation_owner_binding_counted_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(affiliation_owner_binding_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3294_i3296_officer_appointment_two_consents_sqlite() {
++    Box::pin(officer_appointment_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3294_i3296_officer_appointment_two_consents_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(officer_appointment_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3297_counted_licence_withdrawal_sqlite() {
++    Box::pin(licence_withdrawal_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3297_counted_licence_withdrawal_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(licence_withdrawal_body(&b)).await;
++}
+diff --git a/src/federation/group_plane.rs b/src/federation/group_plane.rs
+index a97449d3..886a0c6c 100644
+--- a/src/federation/group_plane.rs
++++ b/src/federation/group_plane.rs
+@@ -1508,13 +1508,24 @@ pub(crate) async fn check_cosigned_withdraws(
+             )
+             .await?;
+             let persons = persons.at(row.asserted_at);
+-            let counted = super::reverse_quorum::count_distinct_roster_scrubs(
+-                directory,
+-                &row.attestation_envelope,
+-                &scrubs,
+-                &persons.roster_with_devices(&ids, scrubs.iter().map(|s| s.scrub_key_id.as_str())),
+-            )
+-            .await;
++            // v62.0.0 (wave V1, I3282) — an edition-2 `withdraws` is counted
++            // by its voices (`edition2::voices`): each voice's `iss` is
++            // already its person, so the roster is the seated ids. An
++            // earlier-form row keeps the scrub count behind the switch.
++            let counted = if super::edition2::voices::carried_row_id(row).is_some()
++                || super::edition2::door::earlier_form_doors_shut()
++            {
++                super::edition2::voices::counted_roster_signers(directory, row, &ids).await?
++            } else {
++                super::reverse_quorum::count_distinct_roster_scrubs(
++                    directory,
++                    &row.attestation_envelope,
++                    &scrubs,
++                    &persons
++                        .roster_with_devices(&ids, scrubs.iter().map(|s| s.scrub_key_id.as_str())),
++                )
++                .await
++            };
+             // Retracting a widening takes a member off; retracting a removal
+             // puts one back. v61 S2 (CIRISPersist#1143) — withdrawing a
+             // community's record dissolves it: a whole-group change, judged
+diff --git a/src/federation/membership_acceptance.rs b/src/federation/membership_acceptance.rs
+index a6760386..6906b4b7 100644
+--- a/src/federation/membership_acceptance.rs
++++ b/src/federation/membership_acceptance.rs
+@@ -453,12 +453,21 @@ where
+         MembershipRow::Acceptance | MembershipRow::Decline => {
+             let member = row.attested_key_id.as_str();
+             let proposal_id = env_str(row, "references_attestation_id").unwrap_or_default();
+-            let Some(p) = dir
++            let referenced = dir
+                 .get_attestation(proposal_id)
+                 .await?
+-                .filter(|p| p.tier == attestation_tier::FEDERATION)
+-                .and_then(as_proposal)
+-            else {
++                .filter(|p| p.tier == attestation_tier::FEDERATION);
++            // v62.0.0 (wave V1b; CC 4.4.3.12 "two consents") — an officer's
++            // consent to a held counted appointment is its own acceptance
++            // naming the appointment: the officer signs it, about the
++            // affiliation the appointment names.
++            if let Some(appointment) = referenced
++                .as_ref()
++                .filter(|a| super::admission::is_counted_officer_appointment_row(a))
++            {
++                return check_officer_reply(dir, row, kind, &group, appointment).await;
++            }
++            let Some(p) = referenced.and_then(as_proposal) else {
+                 return Err(refuse(&group, member, RULE_PROPOSAL_UNRESOLVED));
+             };
+             let signer =
+@@ -485,6 +494,95 @@ where
+     }
+ }
+ 
++/// v62.0.0 (wave V1b; CC 4.4.3.12) — **a reply to a counted officer
++/// appointment**: signed for the officer (the appointment's attested key, by
++/// person), attested to it, about the affiliation the appointment names,
++/// binding the appointment's content hash; never both an acceptance and a
++/// decline of one appointment.
++async fn check_officer_reply<F>(
++    dir: &F,
++    row: &Attestation,
++    kind: MembershipRow,
++    group: &str,
++    appointment: &Attestation,
++) -> Result<(), Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let member = row.attested_key_id.as_str();
++    let signer =
++        super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
++    let officer =
++        super::admission::admission_identity_for_writer(dir, &appointment.attested_key_id).await?;
++    let names = super::admission::envelope_cohort_target(&appointment.attestation_envelope)?;
++    if signer != officer
++        || member != appointment.attested_key_id
++        || names != Some(group)
++        || env_str(row, "proposal_hash") != Some(appointment.original_content_hash.as_str())
++    {
++        return Err(refuse(group, member, RULE_ACCEPTANCE_MISMATCH));
++    }
++    let held = replies_of(dir, member).await?;
++    let opposite = match kind {
++        MembershipRow::Acceptance => MembershipRow::Decline,
++        _ => MembershipRow::Acceptance,
++    };
++    if replies_to(&held, &appointment.attestation_id)
++        .iter()
++        .any(|r| r.attestation_id != row.attestation_id && membership_row(r) == Some(opposite))
++    {
++        return Err(refuse(group, member, RULE_REPLY_CONFLICT));
++    }
++    Ok(())
++}
++
++/// v62.0.0 (wave V1b; CC 4.4.3.12 "two consents") — **has the officer
++/// accepted `appointment` by `t`?** A held federation-tier
++/// `membership:acceptance:v1` attested to the appointment's officer, naming
++/// the appointment (`references_attestation_id`), signed for the officer
++/// (by person), asserted by `t`, and no decline of it by `t`. The
++/// appointment's quorum is the other consent ([`admission`]'s counted rule);
++/// the officer's seat stands only when both hold.
++///
++/// [`admission`]: super::admission
++///
++/// # Errors
++///
++/// Directory reads.
++pub async fn officer_accepted_at<F>(
++    dir: &F,
++    appointment: &Attestation,
++    t: chrono::DateTime<chrono::Utc>,
++) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let officer = appointment.attested_key_id.as_str();
++    let held = replies_of(dir, officer).await?;
++    let replies: Vec<&Attestation> = replies_to(&held, &appointment.attestation_id)
++        .into_iter()
++        .filter(|r| r.asserted_at <= t)
++        .collect();
++    if replies
++        .iter()
++        .any(|r| membership_row(r) == Some(MembershipRow::Decline))
++    {
++        return Ok(false);
++    }
++    let person = super::admission::admission_identity_for_writer(dir, officer).await?;
++    for r in replies
++        .iter()
++        .filter(|r| membership_row(r) == Some(MembershipRow::Acceptance))
++    {
++        if super::admission::admission_identity_for_writer(dir, &r.attesting_key_id).await?
++            == person
++        {
++            return Ok(true);
++        }
++    }
++    Ok(false)
++}
++
+ /// v55.0.0 (CIRISPersist#1053, CC 3.2) — a standing proposal is admitted only
+ /// for an open `public` room, from one of its founders ("the founder's
+ /// standing proposal").
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index f4a3c593..215c40ee 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -13732,6 +13732,16 @@ pub mod malformed_row {
+     /// identity): "the author is the owner's roster key, plus the agent key's
+     /// own statement".
+     pub const AGENT_OCCURRENCE_NOT_OWNER_AUTHORED: &str = "agent_occurrence_not_owner_authored";
++    /// v62.0.0 (wave V1b; CC 2.4.1.1, CLM-licence-contest) — the group's
++    /// counted withdrawal of a counted `licensure:{authority}` row whose
++    /// voices are short of the authority community's `consensus_protocol`
++    /// over the roster head it names. At the edition-2 door it is never seen:
++    /// the withdrawal waits (`Pending`).
++    pub const LICENCE_WITHDRAWAL_SHORT: &str = "licence_withdrawal_short";
++    /// v62.0.0 (wave V1b; CC 2.4.1.1) — a counted withdrawal of a counted
++    /// licence that names no `refs.head`: counted over no roster version, it
++    /// can never land. Terminal.
++    pub const LICENCE_WITHDRAWAL_NO_HEAD: &str = "licence_withdrawal_no_head";
+ 
+     /// Every token, for the from-disk witnesses and adopters' tables.
+     pub const ALL: &[&str] = &[
+@@ -13794,6 +13804,9 @@ pub mod malformed_row {
+         OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+         AGENT_OCCURRENCE_UNOWNED,
+         AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
++        // v62.0.0 (wave V1b) — appended.
++        LICENCE_WITHDRAWAL_SHORT,
++        LICENCE_WITHDRAWAL_NO_HEAD,
+     ];
+ }
+ 
+diff --git a/src/federation/transport_rebind.rs b/src/federation/transport_rebind.rs
+index f545d877..4f0d64f2 100644
+--- a/src/federation/transport_rebind.rs
++++ b/src/federation/transport_rebind.rs
+@@ -233,6 +233,9 @@ where
+     let quorum =
+         super::trust_root::family_quorum_over(dir.as_dyn_directory(), row, &family).await?;
+     if quorum.distinct_holders < quorum.required {
++        // v62.0.0 (wave V1b) — short of the accord holders: an edition-2
++        // re-bind waits for their voices (`Pending`).
++        super::edition2::voices::note_short();
+         return Err(refuse(format!(
+             "{} distinct verified accord holder(s) signed it; the charter requires {}",
+             quorum.distinct_holders, quorum.required
+diff --git a/src/federation/trust_root.rs b/src/federation/trust_root.rs
+index 56271cb7..d88ca44f 100644
+--- a/src/federation/trust_root.rs
++++ b/src/federation/trust_root.rs
+@@ -1265,6 +1265,30 @@ pub(crate) async fn family_quorum_holders_over<F>(
+ where
+     F: FederationDirectory + ?Sized,
+ {
++    // v62.0.0 (wave V1, I3280) — a row carrying its edition-2 statement is
++    // counted by its VOICES (the separate statements over its payload, held
++    // in `ceg_statements`), never by an `additional_scrubs` set it does not
++    // have. The roster, threshold and counted set are read as before; only
++    // the "who signed" step changes. An earlier-form row keeps the scrub
++    // count behind the earlier-form switch (`edition2::voices`).
++    if super::edition2::voices::carried_row_id(row).is_some()
++        || super::edition2::door::earlier_form_doors_shut()
++    {
++        let roster: Vec<String> = match directory.active_family_members(&family.family_key_id).await
++        {
++            Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
++            Err(Error::Unsupported { .. }) => Vec::new(),
++            Err(e) => return Err(e),
++        };
++        let counted =
++            super::edition2::voices::counted_roster_signers(directory, row, &roster).await?;
++        let quorum = CharterQuorum {
++            distinct_holders: counted.len(),
++            required: family_charter_threshold(family, roster.len()),
++            roster_size: roster.len(),
++        };
++        return Ok((quorum, counted));
++    }
+     family_quorum_holders_over_envelope(directory, &row.attestation_envelope, &row.scrubs(), family)
+         .await
+ }
+@@ -3466,6 +3490,9 @@ where
+ 
+     let quorum = family_quorum_over(directory, row, &family).await?;
+     if !quorum.met() {
++        // v62.0.0 (wave V1b) — short of the family's quorum: an edition-2
++        // charter waits for its holders' voices (`Pending`).
++        super::edition2::voices::note_short();
+         return refuse(format!(
+             "family charter for {} is signed by {} — the accord's own \
+              consensus_protocol {:?} makes this root a threshold, not a seat, and a \
+diff --git a/src/kernel/owner.rs b/src/kernel/owner.rs
+index 9f267755..7d5c90b0 100644
+--- a/src/kernel/owner.rs
++++ b/src/kernel/owner.rs
+@@ -124,6 +124,38 @@ pub fn owner_rows_with_genesis(
+     is_user: &dyn Fn(&str) -> bool,
+     cosign: Cosign,
+     genesis_carried: &BTreeSet<RowId>,
++) -> Vec<KRow> {
++    owner_rows_with_voices(
++        node,
++        rows,
++        retractions_about_node,
++        now,
++        is_user,
++        cosign,
++        genesis_carried,
++        &BTreeMap::new(),
++    )
++}
++
++/// v62.0.0 (wave V1, I3283) — [`owner_rows_with_genesis`], where
++/// `held_voices` maps a binding's `attestation_id` to the signers (`iss`) of
++/// its edition-2 VOICES (`edition2::voices::row_voice_issuers`). In edition 2
++/// the node's cosignature on an owner binding is its own statement over the
++/// binding's payload (RULINGS: "with the node's own statement as the second
++/// voice"), held in `ceg_statements`, not an `additional_scrubs` entry: each
++/// held voice joins the binding's verified signatures. Every held voice was
++/// verified at its door.
++#[allow(clippy::too_many_arguments)]
++#[must_use]
++pub fn owner_rows_with_voices(
++    node: &str,
++    rows: &[Attestation],
++    retractions_about_node: &[Attestation],
++    now: chrono::DateTime<chrono::Utc>,
++    is_user: &dyn Fn(&str) -> bool,
++    cosign: Cosign,
++    genesis_carried: &BTreeSet<RowId>,
++    held_voices: &BTreeMap<String, BTreeSet<String>>,
+ ) -> Vec<KRow> {
+     // CC 3.2, the ownerless-lock reclaim: a third-party `withdraws` the door
+     // admitted only on a verified m-of-n reclaim quorum (rule 5) ends the
+@@ -163,7 +195,10 @@ pub fn owner_rows_with_genesis(
+         .collect();
+     let mut out: Vec<KRow> = Vec::with_capacity(bindings.len());
+     for b in &bindings {
+-        let voices = verified_voices(b);
++        let mut voices = verified_voices(b);
++        if let Some(held) = held_voices.get(b.attestation_id.as_str()) {
++            voices.extend(held.iter().cloned());
++        }
+         let id = id_of[b.attestation_id.as_str()];
+         let node_cosigned =
+             cosign == Cosign::Assumed || voices.contains(node) || genesis_carried.contains(&id);
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index 5a47fabd..79dbd009 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -932,6 +932,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     ("check_partner_record_revision", Class::Gate),
+     ("check_licence_audience", Class::Gate),
+     ("check_owner_binding_affiliation_admission", Class::Gate),
++    // v62.0.0 (wave V1b, CC 3.2 / C557, ruling (a)) — an edition-2 owner
++    // binding is counted (owner, bound key, affiliation quorum); at the
++    // edition-2 door it waits (`Pending`).
++    ("check_owner_binding_counted", Class::Gate),
++    // v62.0.0 (wave V1b, CC 4.4.3.12) — an affiliation's counted officer
++    // appointment; at the edition-2 door it waits (`Pending`).
++    ("check_officer_appointment_counted", Class::Gate),
+     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — refuses a community record
+     // whose declared cohort or affiliation config is malformed or invalid.
+     ("check_community_record", Class::Gate),

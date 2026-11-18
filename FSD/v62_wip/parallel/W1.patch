@@ -1,0 +1,2000 @@
+diff --git a/docs/EDITION2_PAYLOADS.md b/docs/EDITION2_PAYLOADS.md
+index 1934adc6..5461605d 100644
+--- a/docs/EDITION2_PAYLOADS.md
++++ b/docs/EDITION2_PAYLOADS.md
+@@ -294,6 +294,24 @@ Co-signatures now counted voices: none (the author's statement alone).
+ |---|---|
+ | signature (HybridSignature over the length-prefixed ciris-delivery-receipt/v1 bytes) | the subscriber's composite statement over the payload; no inner signed object (the earlier layout is CC 8.11.30); the receipt store's HybridSignature is filled from its two halves |
+ 
++### `transport:canonical_rebind`
++
++- **Replaces:** the transport:canonical_rebind:v1 scores row (its additional_scrubs, and the carried SignedTransportDestination under transport_destination)
++- **Authorship:** counted (the accord's holders: a strict majority of the holders of the genesis bundle in force that refs.head names, each at its placed key; refused reserved_family_unseated otherwise, CC 3.4.7)
++- **`sub`:** the seat's identity-ref (a serve node of the genesis bundle in force)
++- **Lands in:** ceg_statements (no typed table; the seat's live transit key is read from the counted voices)
++
++| member | CBOR type | presence | maps from |
++|---|---|---|---|
++| `transit_xwing_pubkey` | `bstr` | required | the carried row's transit_xwing_pubkey: 1216 bytes, pk_M then pk_X (CC 3.3.6.2) |
++| `onion_hop_xwing_pubkey` | `bstr` | optional | the carried row's onion_hop_xwing_pubkey: 1216 bytes (CC 3.3.6.2) |
++| `transport_destination` | `map` | optional | the carried row's transport_destination, as identity:occurrence's |
++| `refs.head` | `row-ref` | required | none (new): the genesis bundle in force the re-bind is counted over, by its object id |
++
++| earlier-form co-signature (not a payload member) | now |
++|---|---|
++| authority scrub + additional_scrubs by accord holders over the canonical envelope | one statement per holder over the same payload, counted at a strict majority of the holders of the bundle in force |
++
+ ### `roster-member` (an entry of `group:roster`'s `members`)
+ 
+ | member | CBOR type | presence | maps from |
+diff --git a/src/federation/canonical_community.rs b/src/federation/canonical_community.rs
+index 4cefc2db..e996c9a9 100644
+--- a/src/federation/canonical_community.rs
++++ b/src/federation/canonical_community.rs
+@@ -235,6 +235,11 @@ async fn accord_holder_seated_at<F>(
+ where
+     F: FederationDirectory + ?Sized,
+ {
++    // v62.0.0 (wave W1) — the accord is the genesis bundle in force: a
++    // holder of it is a seat of the accord (`edition2::trust_root_group`).
++    if super::edition2::trust_root_group::is_bundle_holder(directory, key_id).await? {
++        return Ok(true);
++    }
+     let Some(family) =
+         super::trust_root::resolve_family_root(directory, accord_family_key_id()).await?
+     else {
+@@ -297,6 +302,12 @@ pub async fn check_founder_eligible<F>(
+ where
+     F: FederationDirectory + ?Sized,
+ {
++    // v62.0.0 (wave W1) — a holder of the genesis bundle in force is a seated
++    // holder (#972: nothing more is asked of one), read before its key
++    // record: the bundle placed its key.
++    if super::edition2::trust_root_group::is_bundle_holder(directory, founder).await? {
++        return Ok(());
++    }
+     let Some(record) = directory.lookup_public_key(founder).await? else {
+         return Err(violation(
+             community_key_id,
+@@ -415,6 +426,15 @@ async fn accord_quorum_at<F>(
+ where
+     F: FederationDirectory + ?Sized,
+ {
++    // v62.0.0 (wave W1; CC 3.2 citing CC 2.7.5, CC 2.6.1.11) — an edition-2 birth: its
++    // voices are the held `group:roster` statements of the version (and the
++    // vouched ones at its door), counted against a strict majority of the
++    // holders of the genesis bundle in force.
++    if let Some(signers) =
++        super::edition2::trust_root_group::version_signers(directory, &signed.community).await?
++    {
++        return super::edition2::trust_root_group::bundle_quorum_over(directory, &signers).await;
++    }
+     let Some(family) =
+         super::trust_root::resolve_family_root(directory, accord_family_key_id()).await?
+     else {
+@@ -464,6 +484,10 @@ where
+ }
+ 
+ fn insufficient(signed: &SignedCommunity) -> Error {
++    // v62.0.0 (wave W1) — at an edition-2 door the voices so far are short:
++    // the voice is kept and the version waits for the next one (a no-op
++    // outside a vouch).
++    super::edition2::group::note_short();
+     Error::RosterAuthorityUnauthorized {
+         group_key_id: signed.community.community_key_id.clone(),
+         offered_authority_key_id: signed.authority_key_id.clone(),
+@@ -790,11 +814,18 @@ impl Memo {
+     where
+         F: FederationDirectory + ?Sized,
+     {
+-        let Some(rec) = self.record(directory, key_id).await? else {
+-            return Ok(false);
+-        };
+         let when = at.unwrap_or(self.now);
+-        let (arm, next_edge) = founder_arm_at(directory, &rec, when).await?;
++        // v62.0.0 (wave W1) — a holder of the genesis bundle in force is the
++        // holder arm, whatever this node's key-record read model holds.
++        let (arm, next_edge) =
++            if super::edition2::trust_root_group::is_bundle_holder(directory, key_id).await? {
++                (FounderArm::Holder, None)
++            } else {
++                let Some(rec) = self.record(directory, key_id).await? else {
++                    return Ok(false);
++                };
++                founder_arm_at(directory, &rec, when).await?
++            };
+         if at.is_none() {
+             if let Some(t) = next_edge {
+                 self.bound(t);
+@@ -1030,6 +1061,26 @@ where
+             signers.insert(sig.member_id.clone());
+         }
+     }
++    // v62.0.0 (wave W1) — an edition-2 version carries no quorum signatures:
++    // its voices are the held `group:roster` statements of the version (and
++    // the vouched ones at its door), each verified at the edition-2 door.
++    // They count as a verified signature does above: a prior founder that
++    // counts at the link's instant.
++    let edition2_voices =
++        super::edition2::trust_root_group::version_signers(directory, &next.community).await?;
++    if let Some(voices) = &edition2_voices {
++        for v in voices {
++            if !prior_founders.contains(&v.as_str())
++                || signers.contains(v)
++                || !memo
++                    .founder_counts(directory, id, v, Some(amended_at), seated_since(chain, v))
++                    .await?
++            {
++                continue;
++            }
++            signers.insert(v.clone());
++        }
++    }
+     // The seats: prior's recorded members, minus every founder that does not
+     // count at the link's instant — resigned, node-bearing (#925), withdrawn or
+     // never conferred — so an ineligible seat never inflates the denominator.
+@@ -1068,6 +1119,8 @@ where
+         high_water: None,
+     });
+     if !verdict.admits() {
++        // v62.0.0 (wave W1) — short at an edition-2 door: the voice waits.
++        super::edition2::group::note_short();
+         return Err(Error::RosterAuthorityUnauthorized {
+             group_key_id: id.to_owned(),
+             offered_authority_key_id: next.authority_key_id.clone(),
+@@ -1075,7 +1128,11 @@ where
+             shortfall: verdict.shortfall().cloned(),
+         });
+     }
+-    if !signers.contains(&next.authority_key_id) {
++    // v62.0.0 (wave W1) — an edition-2 version has no single authority: its
++    // signature columns name its first voice in key order, which may be a
++    // voice that is not counted (a seat the version adds). The count above
++    // is its whole authorization.
++    if edition2_voices.is_none() && !signers.contains(&next.authority_key_id) {
+         return Err(violation(
+             id,
+             super::admission::TRUST_ROOT_RULE_CHAIN,
+@@ -1085,7 +1142,14 @@ where
+             ),
+         ));
+     }
+-    super::verify_community_admission(directory, next).await?;
++    // v62.0.0 (wave W1) — an edition-2 version's authority is one of its
++    // voices, verified at the edition-2 door (above: it is a counted
++    // signer); its signature columns hold the composite markers, which the
++    // earlier verifier reads only under the door's vouch. A re-judge outside
++    // the door reads the voices instead.
++    if edition2_voices.is_none() {
++        super::verify_community_admission(directory, next).await?;
++    }
+     Ok(amended_at)
+ }
+ 
+@@ -1382,6 +1446,20 @@ where
+             c.witness_quorum
+         ))),
+     );
++    // v62.0.0 (wave W1) — the edition-2 inputs: the holders of the genesis
++    // bundle in force (the holder arm and the birth's count) and the held
++    // `group:roster` voices of the community (a version's signers).
++    let bundle_holders = super::edition2::trust_root_group::bundle_holder_refs(directory).await?;
++    feed("bundle_holders", &serde_json::json!(bundle_holders));
++    let roster_voices: Vec<String> = super::edition2::trust_root_group::roster_statements(
++        directory,
++        &signed.community.community_key_id,
++    )
++    .await?
++    .iter()
++    .map(hex::encode)
++    .collect();
++    feed("edition2_roster_voices", &serde_json::json!(roster_voices));
+     let family_id = accord_family_key_id();
+     // PR #921 review (Codex, F1) — every read here PROPAGATES its failure. A
+     // key built over a failed read keyed exactly like a genuinely empty
+diff --git a/src/federation/edition2/fixture_genesis.rs b/src/federation/edition2/fixture_genesis.rs
+index 22350be6..0468f26c 100644
+--- a/src/federation/edition2/fixture_genesis.rs
++++ b/src/federation/edition2/fixture_genesis.rs
+@@ -892,6 +892,91 @@ pub fn recover_v2_with(
+     )
+ }
+ 
++/// v62.0.0 (wave W1; CC 3.3.6.2, CC 5.3.4) — **a later bundle that
++/// re-seats a seat on fresh X-Wing keys**: over `prev`, the seat
++/// `seat_seed` gets a NEW binding (its bundle binding's payload with a fresh
++/// `transit_xwing_pubkey` and `onion_hop_xwing_pubkey` of generation `gen`,
++/// asserted one second before the bundle, signed by the seat's key); its key
++/// record, every holder and every other seat are as `prev` has them.
++/// `signers` are holder seeds, signing as in [`later_v2`]. The bundle is
++/// asserted [`LATER_STEP_MS`] after prev.
++///
++/// # Panics
++/// `seat_seed` is not a seat of `prev`.
++#[must_use]
++pub fn reseat_xwing_v2(
++    prev: &TestCeremonyV2,
++    seat_seed: u8,
++    gen: u8,
++    signers: &[u8],
++) -> TestCeremonyV2 {
++    let asserted_at = prev.asserted_at_ms + LATER_STEP_MS;
++    let seats: Vec<SeatV2> = prev
++        .seats
++        .iter()
++        .map(|seat| {
++            if seat.seed != seat_seed {
++                return seat.clone();
++            }
++            let transit = xwing_key(format!("transit-reseat-{gen}").as_bytes(), seat_seed);
++            let onion = xwing_key(format!("onion-reseat-{gen}").as_bytes(), seat_seed);
++            let (_, payload) = super::liveness::statement_parts(&seat.binding.statement)
++                .expect("a fixture binding is a statement");
++            let members: Vec<(Value, Value)> = payload
++                .as_map()
++                .expect("a fixture binding's payload is a map")
++                .iter()
++                .map(|(k, v)| {
++                    let v = match k.as_text() {
++                        Some("transit_xwing_pubkey") => Value::Bytes(transit.to_vec()),
++                        Some("onion_hop_xwing_pubkey") => Value::Bytes(onion.to_vec()),
++                        Some("asserted_at") => Value::Uint(asserted_at - 1_000),
++                        _ => v.clone(),
++                    };
++                    (k.clone(), v)
++                })
++                .collect();
++            let binding = sign_row(
++                &test_key(seat.seed),
++                &seat.identity_ref,
++                BINDING_FAMILY,
++                &Value::Map(members),
++            );
++            SeatV2 {
++                binding,
++                transit_xwing_pubkey: transit,
++                onion_hop_xwing_pubkey: onion,
++                ..seat.clone()
++            }
++        })
++        .collect();
++    assert!(
++        seats
++            .iter()
++            .zip(&prev.seats)
++            .any(|(a, b)| a.binding.row_id != b.binding.row_id),
++        "reseat_xwing_v2: {seat_seed} is not a seat of prev"
++    );
++    let voices: Vec<(CompositeSigningKey, String)> = signers
++        .iter()
++        .map(|s| {
++            let h = holder_of(prev, *s);
++            (test_key(h.seed), h.identity_ref.clone())
++        })
++        .collect();
++    assemble_bundle(
++        &prev.spec,
++        prev.version + 1,
++        Some(prev.object_id),
++        asserted_at,
++        prev.holders.clone(),
++        seats,
++        Vec::new(),
++        &voices,
++        None,
++    )
++}
++
+ fn holder_of(prev: &TestCeremonyV2, holder_seed: u8) -> &HolderV2 {
+     prev.holders
+         .iter()
+diff --git a/src/federation/edition2/group.rs b/src/federation/edition2/group.rs
+index 90a64f4b..b91d7231 100644
+--- a/src/federation/edition2/group.rs
++++ b/src/federation/edition2/group.rs
+@@ -224,6 +224,20 @@ pub(crate) fn vouched_quorum_signers(
+         .flatten()
+ }
+ 
++/// v62.0.0 (wave W1) — **the record's vouched voices**: each voice's signer
++/// (identity-ref), when the vouch in scope names exactly `envelope` (the
++/// record's signing envelope). `None` outside a vouch or for another record.
++/// The trust-root door counts a version's voices through this while the
++/// version's last voice is still at its door (`edition2::trust_root_group`).
++#[must_use]
++pub(crate) fn vouched_signers_for(envelope: &serde_json::Value) -> Option<BTreeSet<String>> {
++    let hash = envelope_hash(envelope).ok()?;
++    VOUCH
++        .try_with(|v| (v.envelope_hash == hash).then(|| v.voices.keys().cloned().collect()))
++        .ok()
++        .flatten()
++}
++
+ /// The door that found the vouched voices short of the protocol notes it
+ /// here (structurally, before it returns the shortfall). A no-op outside a
+ /// vouch.
+@@ -885,7 +899,7 @@ where
+             run_vouched(vouch, dir.put_family(signed)).await
+         }
+         GroupRecord::Community(community) => {
+-            let proof = match view.head {
++            let mut proof = match view.head {
+                 None => None,
+                 Some(head) => Some(
+                     supersede_proof(
+@@ -903,6 +917,38 @@ where
+                     .await?,
+                 ),
+             };
++            // v62.0.0 (wave W1) — a trust-root community's version is a
++            // founders' link (`canonical_community::verify_founders_link`):
++            // its change envelope binds the founder roles, the version's
++            // content and its instant (`bind_next_version`, at the version's
++            // `asserted_at`), and it travels with the held chain it extends
++            // (the payload carries no lineage: each prior version is its own
++            // held row).
++            let trust_root =
++                crate::federation::canonical_community::is_trust_root_grade(&community);
++            let mut lineage = Vec::new();
++            if trust_root {
++                if let Some(p) = proof.as_mut() {
++                    let amended_at = i64::try_from(row.asserted_at_ms)
++                        .ok()
++                        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
++                        .ok_or_else(|| invalid("group:roster: asserted_at is not an instant"))?;
++                    crate::federation::canonical_community::bind_next_version(
++                        &mut p.change_envelope,
++                        &community,
++                        amended_at,
++                    )?;
++                    if let Some(held) =
++                        crate::federation::canonical_community::lookup_signed_community(
++                            dir,
++                            &community.community_key_id,
++                        )
++                        .await?
++                    {
++                        lineage = crate::federation::canonical_community::chain_of(&held);
++                    }
++                }
++            }
+             let vouch = Vouch {
+                 envelope_hash: envelope_hash(&community.signing_envelope())?,
+                 voices,
+@@ -916,7 +962,7 @@ where
+                 scrub_signature_pqc: Some(marker),
+                 supersede_proof: proof,
+                 cosignatures,
+-                lineage: Vec::new(),
++                lineage,
+             };
+             run_vouched(vouch, dir.put_community(signed)).await
+         }
+diff --git a/src/federation/edition2/ingest.rs b/src/federation/edition2/ingest.rs
+index 4fdd5ad4..09bd1dbc 100644
+--- a/src/federation/edition2/ingest.rs
++++ b/src/federation/edition2/ingest.rs
+@@ -794,6 +794,12 @@ where
+     if admitted.family == super::occurrence::OCCURRENCE_FAMILY {
+         return Box::pin(super::occurrence::put_occurrence_voice(dir, &admitted)).await;
+     }
++    // v62.0.0 (wave W1; CC 3.1.3, 3.4.7) — a seat's counted re-bind: held
++    // in the statement store, counted by the holders of the genesis bundle
++    // in force (`edition2::transport_rebind`), never an attestation row.
++    if admitted.family == super::transport_rebind::REBIND_FAMILY {
++        return Box::pin(super::transport_rebind::put_rebind_voice(dir, admitted)).await;
++    }
+     if admitted.family == KEY_RECORD_FAMILY || admitted.family == KEY_REVOCATION_FAMILY {
+         let new = dir.put_edition2_statement(&admitted).await?;
+         // v62.0.0 (slice J0) — the read models: the key this statement is
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 2a3ff10c..51c5f1a1 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -22,6 +22,8 @@
+ //! | the group planes: a `group:roster` version and a counted membership change judged by the typed group doors, counted over every voice (v62.0.0, wave T1) | [`group`] |
+ //! | a recovery key refused as a signer by its key material (CC 4.2.6) | [`recovery_signer`] |
+ //! | the `identity:occurrence` bind (two voices, the typed occurrence table) and the key-of-issuer check's occurrence arm | [`occurrence`] |
++//! | a seat's transit key moved only by a counted `transport:canonical_rebind` of the bundle's holders (v62.0.0, wave W1) | [`transport_rebind`] |
++//! | a trust-root community counted over the genesis bundle in force: holders as founders, the birth's count, a founders' link's voices (v62.0.0, wave W1) | [`trust_root_group`] |
+ //!
+ //! **The rule this module keeps (CC 2.6.1.12).** A node of this form reads and
+ //! writes this form only. An object of the earlier form (CC 8.11, a JSON object
+@@ -52,6 +54,8 @@ pub mod produce;
+ pub mod projection;
+ pub mod recovery_signer;
+ pub mod store;
++pub mod transport_rebind;
++pub mod trust_root_group;
+ 
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod composer_invariants;
+diff --git a/src/federation/edition2/payloads.rs b/src/federation/edition2/payloads.rs
+index 0c88e895..77ec1f4b 100644
+--- a/src/federation/edition2/payloads.rs
++++ b/src/federation/edition2/payloads.rs
+@@ -499,6 +499,24 @@ pub const FAMILIES: &[FamilyPayload] = &[
+         ],
+         table: "federation_stream_delivery_receipts",
+     },
++    FamilyPayload {
++        family: "transport:canonical_rebind",
++        replaces: "the transport:canonical_rebind:v1 scores row (its additional_scrubs, and the carried SignedTransportDestination under transport_destination)",
++        authorship: "counted (the accord's holders: a strict majority of the holders of the genesis bundle in force that refs.head names, each at its placed key; refused reserved_family_unseated otherwise, CC 3.4.7)",
++        sub: "the seat's identity-ref (a serve node of the genesis bundle in force)",
++        members: &[
++            m("transit_xwing_pubkey", Ty::Bstr, R, "the carried row's transit_xwing_pubkey: 1216 bytes, pk_M then pk_X (CC 3.3.6.2)"),
++            m("onion_hop_xwing_pubkey", Ty::Bstr, O, "the carried row's onion_hop_xwing_pubkey: 1216 bytes (CC 3.3.6.2)"),
++            m("transport_destination", Ty::Map, O, "the carried row's transport_destination, as identity:occurrence's"),
++        ],
++        refs: &[
++            RefRole { role: "head", presence: R, from: "none (new): the genesis bundle in force the re-bind is counted over, by its object id" },
++        ],
++        voices: &[
++            Voice { from: "authority scrub + additional_scrubs by accord holders over the canonical envelope", becomes: "one statement per holder over the same payload, counted at a strict majority of the holders of the bundle in force" },
++        ],
++        table: "ceg_statements (no typed table; the seat's live transit key is read from the counted voices)",
++    },
+ ];
+ 
+ /// The members any row may carry, beyond its family's: the envelope's
+diff --git a/src/federation/edition2/transport_rebind.rs b/src/federation/edition2/transport_rebind.rs
+new file mode 100644
+index 00000000..64cbb341
+--- /dev/null
++++ b/src/federation/edition2/transport_rebind.rs
+@@ -0,0 +1,279 @@
++//! v62.0.0 (wave W1; CC 3.1.3 `transport:canonical_rebind`, CC 3.3.6.2 "A
++//! seat's transit key", CC 3.4.7, CC 5.3.4) — **the counted re-bind of a
++//! seat's transit key, in edition 2.**
++//!
++//! A seat of the genesis bundle in force takes its X-Wing transit key first
++//! from its binding in the bundle. The key moves only by a
++//! `transport:canonical_rebind` row about the seat, counted by the accord's
++//! holders, or by a later bundle that re-seats the seat on new keys. A
++//! binding the seat publishes itself that carries another key is not
++//! honoured (CC 3.3.6.2: "a node of this form takes a seat's
++//! `transit_xwing_pubkey` from the bundle or from such a re-bind, and a
++//! seat's own binding that carries another key is not honoured").
++//!
++//! # The row
++//!
++//! Family `transport:canonical_rebind` (counted: no `author`; Verify's family
++//! model `"counted"`), row type `scores`, `sub` = the seat's identity-ref.
++//! Payload (`edition2::payloads`): `transit_xwing_pubkey` (bstr, 1216 bytes,
++//! required), `onion_hop_xwing_pubkey` and `transport_destination`
++//! (optional), and `refs.head` (required) naming the genesis bundle in force
++//! the re-bind is counted over (its object id). Every voice is one holder's
++//! statement over the same payload (CC 2.6.1.9).
++//!
++//! # The count (CC ruling, 2026-11-18)
++//!
++//! A STRICT MAJORITY (⌊n/2⌋ + 1) of the holders of the bundle in force, over
++//! the `refs.head` naming that bundle. A later bundle that re-seats the node
++//! with new X-Wing keys is the other path; both stand.
++//!
++//! # The door ([`put_rebind_voice`])
++//!
++//! - No genesis bundle held, or `refs.head` names a bundle this node does not
++//!   hold: the voice WAITS (the retryable unknown-signer error naming
++//!   `ceg-genesis-bundle/2:<hex>`), as the genesis door waits.
++//! - `refs.head` names a held bundle that is not in force (a predecessor of
++//!   the head, a superseded tip): refused `edition2_payload_invalid`.
++//! - `sub` is not a seat of the bundle in force, or the signer is not a holder
++//!   of it at its placed key: refused `reserved_family_unseated` (CC 3.4.7).
++//!   A seat signing its own re-bind is refused by this rule.
++//! - A transit key that is not 1216 bytes: `xwing_pubkey_wrong_length`.
++//! - Otherwise the voice is kept. The row is `Row` once its distinct holder
++//!   voices reach the count ([`required_count`]), `Pending` before.
++//!
++//! # The read ([`seat_transit_key`])
++//!
++//! The seat's binding was seeded by the earliest bundle of the unbroken run
++//! (back from the newest Valid bundle) that seats it with its current
++//! transit key. A re-bind applies when its `refs.head` names a bundle of that
++//! run and its voices reach a strict majority of THAT bundle's holders. The
++//! live key is the latest such re-bind's (by `asserted_at`, then row id), or
++//! else the binding's. A later bundle that re-seats the seat on new keys
++//! starts a new run, so the re-binds over older bundles no longer apply and
++//! the new binding's key is live.
++
++use std::collections::{BTreeMap, BTreeSet};
++
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::genesis::{
++    GenesisPlacement, PlacedHolder, PlacedSeat, XWING_PUBKEY_LEN,
++};
++use ciris_verify_core::edition2::Digest32;
++
++use super::door::{AdmittedRow, PLANE};
++use super::genesis::{genesis_in_force, GenesisInForce, GENESIS_BUNDLE_TYP};
++use super::ingest::StatementOutcome;
++use super::liveness::statement_parts;
++use super::names::{names_of, single, RowId};
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++/// The family id (header -70002) of a re-bind row.
++pub const REBIND_FAMILY: &str = "transport:canonical_rebind";
++
++/// The row type a re-bind is signed under (an attestation row about the
++/// seat, CC 3.1.3).
++pub const REBIND_ROW_TYPE: &str = "scores";
++
++/// The payload member carrying the new transit key.
++pub const TRANSIT_MEMBER: &str = "transit_xwing_pubkey";
++
++/// The `refs` role naming the bundle a re-bind is counted over.
++pub const HEAD_ROLE: &str = "head";
++
++/// The count a re-bind needs over `holders` holders: a strict majority (CC
++/// ruling).
++#[must_use]
++pub const fn required_count(holders: usize) -> usize {
++    holders / 2 + 1
++}
++
++fn unseated(detail: impl Into<String>) -> Error {
++    Error::malformed_row(PLANE, malformed_row::RESERVED_FAMILY_UNSEATED, detail)
++}
++
++fn invalid(detail: impl Into<String>) -> Error {
++    Error::malformed_row(PLANE, malformed_row::EDITION2_PAYLOAD_INVALID, detail)
++}
++
++/// The signer of a voice, if it is one of `holders` at its placed key: its
++/// identity-ref.
++fn holder_of(holders: &[PlacedHolder], iss: &str, kid: &Digest32) -> Option<String> {
++    holders
++        .iter()
++        .find(|h| h.identity_ref == iss && h.kid == *kid)
++        .map(|h| h.identity_ref.clone())
++}
++
++/// A voice's `iss` and `kid`, read from its protected header.
++fn signer_of(statement: &[u8]) -> Option<(String, Digest32)> {
++    let (protected, _) = statement_parts(statement)?;
++    let iss = protected
++        .get_int(15)?
++        .get_int(1)?
++        .as_text()
++        .map(str::to_owned)?;
++    let kid = <[u8; 32]>::try_from(protected.get_int(4)?.as_bytes()?).ok()?;
++    Some((iss, kid))
++}
++
++/// The distinct `holders` among `voices`.
++fn counted_holders(holders: &[PlacedHolder], voices: &[Vec<u8>]) -> BTreeSet<String> {
++    voices
++        .iter()
++        .filter_map(|v| signer_of(v.as_slice()))
++        .filter_map(|(iss, kid)| holder_of(holders, &iss, &kid))
++        .collect()
++}
++
++/// The transit key a re-bind payload carries, when it is exactly 1216 bytes.
++fn transit_of(payload: &Value) -> Option<[u8; XWING_PUBKEY_LEN]> {
++    payload
++        .get_text(TRANSIT_MEMBER)
++        .and_then(Value::as_bytes)
++        .and_then(|b| <[u8; XWING_PUBKEY_LEN]>::try_from(b).ok())
++}
++
++/// The bundle a re-bind payload's `refs.head` names.
++fn head_of(payload: &Value) -> Option<RowId> {
++    names_of(payload)
++        .ok()
++        .and_then(|names| single(&names, HEAD_ROLE))
++}
++
++fn waiting_on_bundle(head: &RowId) -> Error {
++    Error::unknown_signer(&format!("{GENESIS_BUNDLE_TYP}:{}", head.hex()), PLANE)
++}
++
++/// **The re-bind door**: one voice of a `transport:canonical_rebind` row
++/// (see the module doc).
++///
++/// # Errors
++/// `reserved_family_unseated`, `edition2_payload_invalid`,
++/// `xwing_pubkey_wrong_length`; the retryable unknown-signer wait for a
++/// bundle not held; storage failures.
++pub async fn put_rebind_voice<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let Some(head) = single(&row.names, HEAD_ROLE) else {
++        return Err(invalid(format!(
++            "{REBIND_FAMILY}: `refs.head` names the genesis bundle in force the re-bind is \
++             counted over"
++        )));
++    };
++    let in_force = genesis_in_force(dir).await?;
++    if !in_force.tips().iter().any(|t| t.object_id == head.0) {
++        if in_force.valid.iter().any(|p| p.object_id == head.0) {
++            return Err(invalid(format!(
++                "{REBIND_FAMILY}: `refs.head` names bundle {}, which is not in force: a re-bind \
++                 is counted over the bundle in force",
++                head.hex()
++            )));
++        }
++        return Err(waiting_on_bundle(&head));
++    }
++    if in_force.seat(&row.sub).is_none() {
++        return Err(unseated(format!(
++            "{REBIND_FAMILY}: {} is not a seat of the genesis bundle in force",
++            row.sub
++        )));
++    }
++    if holder_of(in_force.holders(), &row.iss, &row.kid).is_none() {
++        return Err(unseated(format!(
++            "{REBIND_FAMILY}: {} is not a holder of the genesis bundle in force at the key it \
++             signed with; only the accord's holders re-bind a seat (CC 3.4.7)",
++            row.iss
++        )));
++    }
++    if transit_of(&row.payload).is_none() {
++        return Err(Error::malformed_row(
++            PLANE,
++            malformed_row::XWING_PUBKEY_WRONG_LENGTH,
++            format!("{REBIND_FAMILY}: `{TRANSIT_MEMBER}` is not {XWING_PUBKEY_LEN} bytes"),
++        ));
++    }
++    let new = dir.put_edition2_statement(row).await?;
++    let voices = dir.edition2_voices(&row.row_id).await?;
++    let counted = counted_holders(in_force.holders(), &voices);
++    Ok(
++        if counted.len() >= required_count(in_force.holders().len()) {
++            StatementOutcome::Row {
++                row_id: row.row_id,
++                new,
++            }
++        } else {
++            StatementOutcome::Pending {
++                row_id: row.row_id,
++                new,
++            }
++        },
++    )
++}
++
++/// The bundles of the run that seeded the seat's current binding: back from
++/// the newest Valid bundle, every bundle that seats it with its current
++/// transit key, until the first that does not.
++fn seeding_run<'a>(in_force: &'a GenesisInForce, seat: &PlacedSeat) -> Vec<&'a GenesisPlacement> {
++    let mut run = Vec::new();
++    for p in in_force.valid.iter().rev() {
++        match p.seats.iter().find(|s| s.identity_ref == seat.identity_ref) {
++            Some(s) if s.transit_xwing_pubkey == seat.transit_xwing_pubkey => run.push(p),
++            _ => break,
++        }
++    }
++    run
++}
++
++/// **The live transit key of a seat of the bundle in force**: the latest
++/// re-bind counted over a bundle of the seeding run, else the binding's key
++/// (module doc).
++///
++/// # Errors
++/// Directory read failures.
++pub async fn seat_transit_key<F>(
++    dir: &F,
++    in_force: &GenesisInForce,
++    seat: &PlacedSeat,
++) -> Result<[u8; XWING_PUBKEY_LEN], Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let run = seeding_run(in_force, seat);
++    let mut rows: BTreeMap<RowId, Vec<Vec<u8>>> = BTreeMap::new();
++    for st in dir
++        .edition2_statements_about(REBIND_FAMILY, &seat.identity_ref)
++        .await?
++    {
++        if let Some(id) = RowId::of_statement(&st) {
++            rows.entry(id).or_default().push(st);
++        }
++    }
++    let mut best: Option<(u64, RowId, [u8; XWING_PUBKEY_LEN])> = None;
++    for (id, voices) in rows {
++        let Some((_, payload)) = voices.first().and_then(|v| statement_parts(v.as_slice())) else {
++            continue;
++        };
++        let Some(head) = head_of(&payload) else {
++            continue;
++        };
++        let Some(over) = run.iter().find(|p| p.object_id == head.0) else {
++            continue;
++        };
++        if counted_holders(&over.holders, &voices).len() < required_count(over.holders.len()) {
++            continue;
++        }
++        let Some(at) = payload.get_text("asserted_at").and_then(Value::as_u64) else {
++            continue;
++        };
++        let Some(key) = transit_of(&payload) else {
++            continue;
++        };
++        if best
++            .as_ref()
++            .is_none_or(|(b_at, b_id, _)| (at, id) > (*b_at, *b_id))
++        {
++            best = Some((at, id, key));
++        }
++    }
++    Ok(best.map_or(seat.transit_xwing_pubkey, |(_, _, k)| k))
++}
+diff --git a/src/federation/edition2/trust_root_group.rs b/src/federation/edition2/trust_root_group.rs
+new file mode 100644
+index 00000000..b014ed1f
+--- /dev/null
++++ b/src/federation/edition2/trust_root_group.rs
+@@ -0,0 +1,168 @@
++//! v62.0.0 (wave W1; CC 3.2 T2/T7, CC 2.6.1.11, CC 2.7.5) — **a trust-root
++//! community counted over the genesis bundle in force.**
++//!
++//! The trust-root door (`canonical_community`) counted a trust-root
++//! community's birth against the accord FAMILY record (`humanity-accord`)
++//! and seated founders by that family's roster. A v62 node never holds that
++//! record: the accord is the genesis bundle in force (bundle/2 names key
++//! records and seat bindings only, and a `group:roster` group is an
++//! identity-ref). So every trust-root birth was short and the T7 stalled /
++//! restored legs could not be reached. This module re-points the three reads
++//! the door makes:
++//!
++//! - **the holder arm of a founder** ([`is_bundle_holder`]): an identity-ref
++//!   that is a holder of the bundle in force (common to every tip);
++//! - **the birth's accord count** ([`bundle_quorum_over`]): the distinct
++//!   holders among the version's voices, against a strict majority of the
++//!   holders (CC 3.2, citing CC 2.7.5: "a co-signature by a strict majority of the standing
++//!   accord roster"; CC 2.6.1.11, the bundle's own count for the holders'
++//!   acts);
++//! - **a version's voices** ([`version_signers`]): the signers of the held
++//!   `group:roster` statements whose typed record is that version (each was
++//!   verified at the edition-2 door when it arrived), plus, while the
++//!   version's last voice is at its door, the vouched voices
++//!   (`group::vouched_signers_for`).
++//!
++//! A version no held statement maps to (an earlier-form record) answers
++//! `None`, and the door keeps its earlier reading.
++
++use std::collections::BTreeSet;
++
++use ciris_verify_core::namespace_match;
++
++use super::genesis::genesis_in_force;
++use super::group::{
++    prev_head_digest, record_of_roster, roster_view_of_statement, GROUP_ROSTER_PREFIX,
++};
++use super::liveness::statement_parts;
++use super::names::RowId;
++use crate::federation::trust_root::CharterQuorum;
++use crate::federation::types::Community;
++use crate::federation::{Error, FederationDirectory};
++
++/// Is `key_id` (an identity-ref) a holder of the genesis bundle in force,
++/// seated alike by every tip?
++///
++/// # Errors
++/// Directory read failures.
++pub async fn is_bundle_holder<F>(dir: &F, key_id: &str) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    Ok(genesis_in_force(dir)
++        .await?
++        .holders()
++        .iter()
++        .any(|h| h.identity_ref == key_id))
++}
++
++/// The identity-refs of the holders of the bundle in force (empty: none
++/// held). An input of the standing cache's key.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn bundle_holder_refs<F>(dir: &F) -> Result<Vec<String>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    Ok(genesis_in_force(dir)
++        .await?
++        .holders()
++        .iter()
++        .map(|h| h.identity_ref.clone())
++        .collect())
++}
++
++/// The count a holders' act needs over `holders` holders: a strict majority.
++#[must_use]
++pub const fn holders_required(holders: usize) -> usize {
++    holders / 2 + 1
++}
++
++/// **The birth's accord count**: the distinct holders of the bundle in force
++/// among `signers`, against [`holders_required`]. With no bundle held the
++/// roster is empty and the count is never met.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn bundle_quorum_over<F>(
++    dir: &F,
++    signers: &BTreeSet<String>,
++) -> Result<CharterQuorum, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let holders = bundle_holder_refs(dir).await?;
++    let distinct_holders = holders.iter().filter(|h| signers.contains(*h)).count();
++    Ok(CharterQuorum {
++        distinct_holders,
++        required: holders_required(holders.len()),
++        roster_size: holders.len(),
++    })
++}
++
++/// A held statement's `iss`.
++fn iss_of(statement: &[u8]) -> Option<String> {
++    let (protected, _) = statement_parts(statement)?;
++    protected
++        .get_int(15)?
++        .get_int(1)?
++        .as_text()
++        .map(str::to_owned)
++}
++
++/// The held `group:roster` statements of `group`, as received.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn roster_statements<F>(dir: &F, group: &str) -> Result<Vec<Vec<u8>>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    dir.edition2_statements_about(&namespace_match::family_id(GROUP_ROSTER_PREFIX), group)
++        .await
++}
++
++/// **The voices of one version of a community**: the signers of every held
++/// `group:roster` statement whose typed record hashes to `community`'s
++/// `persist_row_hash` (re-derived from the record), plus the vouched voices
++/// of the record at its door. `None` when neither exists (an earlier-form
++/// record: the door's earlier reading applies).
++///
++/// # Errors
++/// Directory read failures.
++pub async fn version_signers<F>(
++    dir: &F,
++    community: &Community,
++) -> Result<Option<BTreeSet<String>>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let target = crate::federation::types::compute_persist_row_hash(community)?;
++    let mut found: Option<BTreeSet<String>> = None;
++    for st in roster_statements(dir, &community.community_key_id).await? {
++        let Ok(view) = roster_view_of_statement(&st) else {
++            continue;
++        };
++        let Some(id) = RowId::of_statement(&st) else {
++            continue;
++        };
++        let Ok(prev) = prev_head_digest(dir, &view, &id).await else {
++            continue;
++        };
++        let Ok(hash) = record_of_roster(&view, prev).and_then(|r| r.persist_row_hash()) else {
++            continue;
++        };
++        if hash != target {
++            continue;
++        }
++        let set = found.get_or_insert_with(BTreeSet::new);
++        if let Some(iss) = iss_of(&st) {
++            set.insert(iss);
++        }
++    }
++    if let Some(vouched) = super::group::vouched_signers_for(&community.signing_envelope()) {
++        found.get_or_insert_with(BTreeSet::new).extend(vouched);
++    }
++    Ok(found)
++}
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index 060b5bbf..42139548 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -964,6 +964,11 @@ mod verify_v23_vectors;
+ // v62.0.0 (slice D) — I1853–I1855, I1857: the composite cut, by form.
+ #[cfg(test)]
+ mod sth_form_invariants;
++// v62.0.0 (wave W1) — I3230–I3234: edition-2 witnesses for the properties the
++// deleted rc6 / 1106 tests carried (attach freshness, the liveness margin, the
++// seat's transit key).
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod v62_coverage_invariants;
+ pub mod stream_receipt;
+ pub mod stream_sth;
+ // v62.0.0 (P13) — every item inside is test-gated; so is the module.
+@@ -13730,6 +13735,13 @@ pub mod malformed_row {
+     /// whose `device_class` is `agent`: an occurrence never binds a machine
+     /// to a person; an agent's occurrence binds the agent's own identity.
+     pub const OCCURRENCE_BINDS_MACHINE_TO_PERSON: &str = "occurrence_binds_machine_to_person";
++    /// v62.0.0 (wave W1; CC 3.4.7, the enforcement row of
++    /// `transport:canonical_rebind`) — a voice of a reserved family signed
++    /// by a party the family's rule does not seat: a re-bind voice whose
++    /// signer is not a holder of the genesis bundle in force at its placed
++    /// key, or a re-bind about an identity that is not a seat of it
++    /// (`federation::edition2::transport_rebind`).
++    pub const RESERVED_FAMILY_UNSEATED: &str = "reserved_family_unseated";
+ 
+     /// Every token, for the from-disk witnesses and adopters' tables.
+     pub const ALL: &[&str] = &[
+@@ -13785,6 +13797,8 @@ pub mod malformed_row {
+         OCCURRENCE_VOICE_NOT_OWN_KEY,
+         RECOVERY_KEY_IS_NOT_A_SIGNER,
+         OCCURRENCE_BINDS_MACHINE_TO_PERSON,
++        // v62.0.0 (wave W1) — appended.
++        RESERVED_FAMILY_UNSEATED,
+     ];
+ }
+ 
+diff --git a/src/federation/self_at_login.rs b/src/federation/self_at_login.rs
+index 5b9422a8..df270504 100644
+--- a/src/federation/self_at_login.rs
++++ b/src/federation/self_at_login.rs
+@@ -1172,6 +1172,17 @@ pub async fn transit_xwing_pubkey_for<D: crate::federation::FederationDirectory
+     dir: &D,
+     occurrence_key_id: &str,
+ ) -> Result<Option<XWingPublicKey>, crate::federation::Error> {
++    // v62.0.0 (wave W1; CC 3.3.6.2 "A seat's transit key") — a seat of the
++    // genesis bundle in force: its key is the bundle binding's, moved only
++    // by a counted `transport:canonical_rebind`; a binding the seat
++    // publishes itself is not read (`edition2::transport_rebind`).
++    let in_force = crate::federation::edition2::genesis::genesis_in_force(dir).await?;
++    if let Some(seat) = in_force.seat(occurrence_key_id) {
++        let key =
++            crate::federation::edition2::transport_rebind::seat_transit_key(dir, &in_force, seat)
++                .await?;
++        return Ok(XWingPublicKey::from_bytes(&key));
++    }
+     let bindings = dir
+         .list_signed_transport_destinations_for(occurrence_key_id)
+         .await?;
+diff --git a/src/federation/v62_coverage_invariants.rs b/src/federation/v62_coverage_invariants.rs
+new file mode 100644
+index 00000000..7c75379c
+--- /dev/null
++++ b/src/federation/v62_coverage_invariants.rs
+@@ -0,0 +1,1034 @@
++//! v62.0.0 (wave W1) — **edition-2 witnesses for properties whose earlier
++//! tests were deleted** with the earlier canonical and accord records (rc6,
++//! `test_ceremony_1106`, remint, `accord_lineage`; E7's property map,
++//! "Update 9"). Each runs on sqlite and postgres through the one edition-2
++//! entry (`edition2::ingest::put_statement`).
++//!
++//! - **I3230** (was I356, CC 3.2 T4a "a new edge that names no head is
++//!   refused with `trust_root_head_unnamed` in every mode, witnessed mode off
++//!   included") — a NEW `trust:accepts:v1` acceptance edge to a group root
++//!   this node holds, naming no head, is refused `trust_root_head_unnamed` and
++//!   not stored.
++//! - **I3231** (was I194 / I359) — the same consumer's edge naming the head
++//!   this node holds (`attached_head_digest` = the family's
++//!   `persist_row_hash`) is admitted and stored.
++//! - **I3232** (was I357 / I372 / I373; CC 3.2 T4 "an attached root stays
++//!   valid until revoked", T4a "a new edge that names a head other than the
++//!   one it must name concludes nothing; it is never refused for that") —
++//!   after the root's head moves (a counted version 2), the attached edge
++//!   re-put is not re-judged (kept, not new), and a NEW edge naming the
++//!   superseded head is not refused.
++//! - **I3233** (was I195b; CC 3.2 T7 "founding at N = M is non-conformant")
++//!   — an infrastructure community founded at N = M (`quorum:2/2`, two
++//!   founders) is refused `liveness_margin_at_founding` when its last founder
++//!   voices it, and nothing lands; the same shape at N = M + 1
++//!   (`quorum:2/3`, three founders) is never refused for the margin.
++//! - **I3234** (was I1874/I1875, `tests/xwing_rebind_1274.rs`; CC 3.3.6.2 "a
++//!   node takes a seat's `transit_xwing_pubkey` from the bundle or from such a
++//!   re-bind, and a seat's own binding that carries another key is not
++//!   honoured"; RULINGS "a seat publishing one alone is not live") — the seat
++//!   of the bundle in force has its bundle-bound X-Wing transit key, and its
++//!   own later binding carrying another key does not make that key live.
++//! - **I3235** (was I195's birth; CC 2.7.5, CC 3.2 T2) — a trust-root
++//!   community founded by holders of the genesis bundle in force is counted
++//!   against a strict majority of those holders: short of it each voice is
++//!   `Pending` and nothing lands; met, it lands Rooted and live.
++//! - **I3236** (was I195; CC 3.2 T7 "a resignation that leaves exactly `M`
++//!   founders stalls the root … declared") — one founder's resignation (a
++//!   removal voiced by that founder alone) stalls it: `Stalled`, not live,
++//!   `community_liveness_stalled` declared exactly once.
++//! - **I3237** (was I195; CC 3.2 T7 recovery) — a founders' amendment that
++//!   seats another holder in the resigned seat, counted by the remaining
++//!   founders (short: `Pending`), roots it again: `Rooted`, live,
++//!   `community_liveness_restored` declared once.
++//! - **I3238** (CC 3.1.3 / 3.3.6.2, a COUNTED `transport:canonical_rebind`) —
++//!   one holder's re-bind voice is `Pending` and the seat's key stays the
++//!   bundle's; the voice that meets a strict majority of the holders lands it
++//!   and the re-bound key is live.
++//! - **I3239** (CC 3.4.7) — a re-bind voice signed by the seat itself, or
++//!   about an identity that is not a seat, is refused
++//!   `reserved_family_unseated`.
++//! - **I3240** (CC ruling: counted "over the `refs.head` naming that
++//!   bundle") — a re-bind naming no bundle is refused
++//!   `edition2_payload_invalid`; naming a bundle not held, it waits
++//!   (`federation_attester_key_unknown`); naming a held bundle no longer in
++//!   force, it is refused; over the bundle in force it is kept.
++//! - **I3241** (CC ruling: the re-seat path stands) — a later bundle that
++//!   re-seats the seat on new X-Wing keys makes the new key live, and a
++//!   re-bind counted over the earlier bundle no longer applies.
++//!
++//! Not witnessed here, and why (W1.md): the witnessed-mode legs of T4a (I194's
++//! `trust_root_head_stale` / unwitnessed, I375) have no edition-2 form (wave 3
++//! rule 4: `lineage_head` cosign has no forward form).
++
++use ciris_verify_core::cde::Value;
++
++use crate::federation::edition2::fixture_genesis;
++use crate::federation::edition2::fixture_switch as e2;
++use crate::federation::edition2::group::GroupRecord;
++use crate::federation::edition2::group_fixtures::{put_voices, roster_voices, row_id_of};
++use crate::federation::edition2::ingest::StatementOutcome;
++use crate::federation::types::{
++    attestation_type, Community, CommunityMember, Family, FamilyMember,
++};
++use crate::federation::{Error, FederationDirectory};
++
++fn at(ms: i64) -> chrono::DateTime<chrono::Utc> {
++    use chrono::TimeZone as _;
++    chrono::Utc.timestamp_millis_opt(ms).single().unwrap()
++}
++
++/// Live `user` keys (records from 0, no end): they cover every fixed
++/// instant below.
++async fn users(d: &dyn FederationDirectory, seeds: &[&str]) {
++    for s in seeds {
++        e2::put_key(d, s, &["user"]).await;
++    }
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  (a) The acceptance edge on a group root (CC 3.2 T4a)
++// ─────────────────────────────────────────────────────────────────────────
++
++const ROOT: &str = "w1-root";
++const MEMBERS: [&str; 3] = ["w1-ra", "w1-rb", "w1-rc"];
++
++fn root_family(name: &str) -> GroupRecord {
++    GroupRecord::Family(Family {
++        family_key_id: e2::kid(ROOT),
++        family_name: name.into(),
++        members: MEMBERS
++            .iter()
++            .map(|s| FamilyMember {
++                key_id: e2::kid(s),
++                joined_at: at(1_000),
++                role: None,
++            })
++            .collect(),
++        founded_at: at(1_000),
++        consensus_protocol: "majority".into(),
++        consensus_protocol_entrenched: false,
++        dissolved_at: None,
++        prev_head_digest: String::new(),
++        charter_digest: String::new(),
++        persist_row_hash: String::new(),
++    })
++}
++
++/// The root family, founded by all three members' voices (a founding roster
++/// lands when its last listed member voices it). Returns the version's row
++/// id.
++async fn found_root(d: &dyn FederationDirectory) -> crate::federation::edition2::names::RowId {
++    users(d, &MEMBERS).await;
++    let keys: Vec<_> = MEMBERS.iter().map(|s| e2::signing_key(s)).collect();
++    let refs: Vec<_> = keys.iter().collect();
++    let voices = roster_voices(&root_family("w1 root"), 1, None, 2_000, &refs);
++    let o = put_voices(d, &voices)
++        .await
++        .expect("the root family founds");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "the root family lands on its last voice: {o:?}"
++    );
++    row_id_of(&voices[0])
++}
++
++/// The head this node holds for the root (what an edge names).
++async fn held_root_head(d: &dyn FederationDirectory) -> String {
++    d.lookup_family(&e2::kid(ROOT))
++        .await
++        .unwrap()
++        .expect("the root family is held")
++        .persist_row_hash
++}
++
++/// `consumer`'s `trust:accepts:v1` edge to the root, naming `head` when
++/// given, as the consumer's edition-2 statement.
++fn acceptance_edge(consumer: &str, head: Option<&str>) -> Vec<u8> {
++    let mut env = serde_json::json!({
++        "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
++        "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
++    });
++    if let Some(h) = head {
++        env["attached_head_digest"] = serde_json::Value::String(h.to_owned());
++    }
++    let mut a = crate::federation::tier_ingest::test_support::bare_attestation(
++        "ignored-as-an-id",
++        consumer,
++        &e2::kid(ROOT),
++        &env,
++    );
++    a.attestation_type = attestation_type::DELEGATES_TO.to_owned();
++    e2::statement_of(&a, consumer)
++}
++
++async fn stored(d: &dyn FederationDirectory, statement: &[u8]) -> bool {
++    d.get_attestation(&row_id_of(statement).hex())
++        .await
++        .unwrap()
++        .is_some()
++}
++
++/// **I3230 / I3231** — a new headless edge is refused by name; the edge
++/// naming the held head is admitted.
++pub(crate) async fn i3230_i3231_a_new_edge_names_its_head(d: &dyn FederationDirectory) {
++    found_root(d).await;
++    let consumer = "w1-consumer";
++    users(d, &[consumer]).await;
++
++    // I3230 — witnessed mode off (the root's charter is silent): still refused.
++    let headless = acceptance_edge(consumer, None);
++    match e2::put_statement(d, &headless).await {
++        Err(e) if e.kind() == "trust_root_head_unnamed" => {}
++        other => panic!("I3230: a new headless acceptance edge, got {other:?}"),
++    }
++    assert!(
++        !stored(d, &headless).await,
++        "I3230: the refused edge is not stored"
++    );
++
++    // I3231 — naming the head this node holds: admitted.
++    let head = held_root_head(d).await;
++    let named = acceptance_edge(consumer, Some(&head));
++    let o = e2::put_statement(d, &named)
++        .await
++        .expect("I3231: the edge naming the held head attaches");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3231: {o:?}"
++    );
++    assert!(stored(d, &named).await, "I3231: the edge is stored");
++}
++
++/// **I3232** — after the head moves: the attached edge is not re-judged,
++/// and a new edge naming the superseded head is not refused for it.
++pub(crate) async fn i3232_attached_stays_attached(d: &dyn FederationDirectory) {
++    let v1 = found_root(d).await;
++    let v1_head = held_root_head(d).await;
++    let (early, late) = ("w1-early", "w1-late");
++    users(d, &[early, late]).await;
++    let edge = acceptance_edge(early, Some(&v1_head));
++    e2::put_statement(d, &edge)
++        .await
++        .expect("I3232: attaches on version 1");
++
++    // The root's head moves: version 2, counted at majority (two of three).
++    let keys: Vec<_> = MEMBERS[..2].iter().map(|s| e2::signing_key(s)).collect();
++    let refs: Vec<_> = keys.iter().collect();
++    let o = put_voices(
++        d,
++        &roster_voices(&root_family("w1 root v2"), 2, Some(&v1), 3_000, &refs),
++    )
++    .await
++    .expect("I3232: version 2");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3232: version 2 is the head: {o:?}"
++    );
++    assert_ne!(held_root_head(d).await, v1_head, "I3232: the head moved");
++
++    // T4 — the attached edge re-offered is not re-judged against the new head.
++    let o = e2::put_statement(d, &edge)
++        .await
++        .expect("I3232: the attached edge re-put");
++    assert!(
++        matches!(
++            o,
++            StatementOutcome::Row { new: false, .. } | StatementOutcome::Voice { new: false, .. }
++        ),
++        "I3232: held, not new: {o:?}"
++    );
++    assert!(stored(d, &edge).await, "I3232: attached stays attached");
++
++    // T4a — a NEW edge naming the superseded head concludes nothing, and is
++    // never refused for that.
++    let stale = acceptance_edge(late, Some(&v1_head));
++    e2::put_statement(d, &stale)
++        .await
++        .expect("I3232: a new edge naming another head is not refused for it");
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  (b) The liveness margin at founding (CC 3.2 T7)
++// ─────────────────────────────────────────────────────────────────────────
++
++fn infrastructure_room(group: &str, founders: &[&str], protocol: &str) -> GroupRecord {
++    GroupRecord::Community(Community {
++        community_key_id: e2::kid(group),
++        community_name: format!("{group} room"),
++        members: founders
++            .iter()
++            .map(|s| CommunityMember {
++                key_id: e2::kid(s),
++                joined_at: at(1_000),
++                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
++            })
++            .collect(),
++        founded_at: at(1_000),
++        consensus_protocol: protocol.into(),
++        policy_blob: Some(serde_json::json!({
++            "cohort_subkind": crate::federation::canonical_community::COHORT_SUBKIND_INFRASTRUCTURE,
++            "cohort_subkind_payload": {
++                "infrastructure_constraint": {
++                    "admission_quorum_basis":
++                        crate::federation::canonical_community::ADMISSION_QUORUM_BASIS_FOUNDERS,
++                },
++            },
++            "consensus_protocol_entrenched": true,
++        })),
++        prev_head_digest: String::new(),
++        charter_digest: String::new(),
++        persist_row_hash: String::new(),
++    })
++}
++
++fn is_margin_refusal(e: &Error) -> bool {
++    matches!(
++        e,
++        Error::CommunityConsensusProtocolViolation { rule, .. }
++            if *rule == crate::federation::admission::INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING
++    )
++}
++
++/// Every founder voices the founding, in order; the first refusal, if any.
++async fn found_room(
++    d: &dyn FederationDirectory,
++    group: &str,
++    founders: &[&str],
++    protocol: &str,
++) -> Option<Error> {
++    users(d, founders).await;
++    let keys: Vec<_> = founders.iter().map(|s| e2::signing_key(s)).collect();
++    let refs: Vec<_> = keys.iter().collect();
++    let room = infrastructure_room(group, founders, protocol);
++    for v in roster_voices(&room, 1, None, 2_000, &refs) {
++        if let Err(e) = e2::put_statement(d, &v).await {
++            return Some(e);
++        }
++    }
++    None
++}
++
++/// **I3233** — founding at N = M is refused for the margin; N = M + 1 is not.
++pub(crate) async fn i3233_founding_needs_a_margin(d: &dyn FederationDirectory) {
++    let refused = found_room(d, "w1-room-nm", &["w1-f1", "w1-f2"], "quorum:2/2").await;
++    match &refused {
++        Some(e) if is_margin_refusal(e) => {}
++        other => panic!("I3233: founding at N = M, got {other:?}"),
++    }
++    assert!(
++        d.lookup_community(&e2::kid("w1-room-nm"))
++            .await
++            .unwrap()
++            .is_none(),
++        "I3233: nothing lands"
++    );
++    // The control: one founder more is never refused for the margin (it may
++    // be refused for a later leg, e.g. its founders' conferral).
++    let control = found_room(d, "w1-room-nm1", &["w1-g1", "w1-g2", "w1-g3"], "quorum:2/3").await;
++    assert!(
++        !control.as_ref().is_some_and(is_margin_refusal),
++        "I3233: N = M + 1 meets the margin: {control:?}"
++    );
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  (c) A seat's transit key (CC 3.3.6.2): only the bundle or a counted re-bind
++// ─────────────────────────────────────────────────────────────────────────
++
++/// The seat's own binding re-signed with `transit` as its X-Wing transit key,
++/// stated at `asserted_at_ms` (every other member as the bundle's binding).
++fn seat_rebinding_itself(
++    seat: &fixture_genesis::SeatV2,
++    key: &ciris_crypto::composite::CompositeSigningKey,
++    transit: &[u8],
++    asserted_at_ms: u64,
++) -> Vec<u8> {
++    let (protected, payload) =
++        crate::federation::edition2::liveness::statement_parts(&seat.binding.statement)
++            .expect("the bundle binding is a statement");
++    let text = |label: i64| {
++        protected
++            .get_int(label)
++            .and_then(Value::as_text)
++            .expect("the binding's header")
++            .to_owned()
++    };
++    let (row_type, family) = (text(-70001), text(-70002));
++    let members: Vec<(Value, Value)> = payload
++        .as_map()
++        .expect("the binding's payload is a map")
++        .iter()
++        .map(|(k, v)| {
++            let v = match k.as_text() {
++                Some("transit_xwing_pubkey") => Value::Bytes(transit.to_vec()),
++                Some("asserted_at") => Value::Uint(asserted_at_ms),
++                _ => v.clone(),
++            };
++            (k.clone(), v)
++        })
++        .collect();
++    ciris_verify_core::edition2::sign_row_statement(
++        key,
++        &seat.identity_ref,
++        &seat.identity_ref,
++        &row_type,
++        &family,
++        &Value::Map(members),
++        vec![],
++    )
++    .expect("the seat signs its binding")
++}
++
++async fn live_transit_key(d: &dyn FederationDirectory, seat: &str) -> Option<Vec<u8>> {
++    crate::federation::self_at_login::transit_xwing_pubkey_for(d, seat)
++        .await
++        .unwrap()
++        .map(|k| k.as_bytes().to_vec())
++}
++
++/// **I3234** — the seat's transit key is the bundle's until a counted
++/// re-bind; the seat's own binding alone does not move it.
++pub(crate) async fn i3234_a_seat_alone_does_not_move_its_transit_key(d: &dyn FederationDirectory) {
++    fixture_genesis::install_v2(d)
++        .await
++        .expect("I3234: the test ceremony installs");
++    let ceremony = fixture_genesis::bundle_v2();
++    let seat = &ceremony.seats[0];
++    let bundle_key = seat.transit_xwing_pubkey.to_vec();
++    assert_eq!(
++        live_transit_key(d, &seat.identity_ref).await,
++        Some(bundle_key.clone()),
++        "I3234: live from the genesis binding"
++    );
++    // A different X-Wing key: both halves (pk_M 0..1184, pk_X 1184..1216) changed.
++    let mut other = seat.transit_xwing_pubkey;
++    other[0] ^= 0xff;
++    other[1200] ^= 0xff;
++    let now_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap();
++    let own = seat_rebinding_itself(seat, &ceremony.serve_node_key(0), &other, now_ms);
++    e2::put_statement(d, &own)
++        .await
++        .expect("I3234: the seat's own binding is held");
++    let live = live_transit_key(d, &seat.identity_ref).await;
++    assert_ne!(
++        live,
++        Some(other.to_vec()),
++        "I3234: a seat publishing a transit key alone is not live"
++    );
++    assert_eq!(
++        live,
++        Some(bundle_key),
++        "I3234: the bundle's key stays live until a counted transport:canonical_rebind"
++    );
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  (c, continued) The counted re-bind (CC 3.1.3, 3.4.7)
++// ─────────────────────────────────────────────────────────────────────────
++
++/// One voice of a `transport:canonical_rebind` about `seat`, signed by `key`
++/// under `iss`, carrying `transit`.
++fn rebind_voice(
++    key: &ciris_crypto::composite::CompositeSigningKey,
++    iss: &str,
++    seat: &str,
++    transit: &[u8],
++    asserted_at_ms: u64,
++    head: Option<&ciris_verify_core::edition2::Digest32>,
++) -> Vec<u8> {
++    use crate::federation::edition2::transport_rebind::{
++        REBIND_FAMILY, REBIND_ROW_TYPE, TRANSIT_MEMBER,
++    };
++    let mut members = vec![
++        (
++            Value::Text("asserted_at".into()),
++            Value::Uint(asserted_at_ms),
++        ),
++        (
++            Value::Text(TRANSIT_MEMBER.into()),
++            Value::Bytes(transit.to_vec()),
++        ),
++    ];
++    if let Some(h) = head {
++        members.push((
++            Value::Text("refs".into()),
++            Value::Map(vec![(
++                Value::Text("head".into()),
++                ciris_verify_core::edition2::row_ref(h),
++            )]),
++        ));
++    }
++    members.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
++    ciris_verify_core::edition2::sign_row_statement(
++        key,
++        iss,
++        seat,
++        REBIND_ROW_TYPE,
++        REBIND_FAMILY,
++        &Value::Map(members),
++        vec![],
++    )
++    .expect("a holder signs a re-bind")
++}
++
++fn other_key(k: &[u8; ciris_verify_core::edition2::genesis::XWING_PUBKEY_LEN], n: u8) -> Vec<u8> {
++    let mut o = *k;
++    o[0] ^= n;
++    o[1200] ^= n;
++    o.to_vec()
++}
++
++fn now_ms() -> u64 {
++    u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap()
++}
++
++/// **I3238** — a re-bind is counted by the holders.
++pub(crate) async fn i3238_a_rebind_is_counted(d: &dyn FederationDirectory) {
++    fixture_genesis::install_v2(d)
++        .await
++        .expect("I3238: the test ceremony installs");
++    let c = fixture_genesis::bundle_v2();
++    let seat = &c.seats[0];
++    let bundle_key = seat.transit_xwing_pubkey.to_vec();
++    let rebound = other_key(&seat.transit_xwing_pubkey, 0x5a);
++    let at = now_ms();
++    let first = rebind_voice(
++        &c.holder_key(0),
++        c.holder_identity_ref(0),
++        &seat.identity_ref,
++        &rebound,
++        at,
++        Some(&c.object_id),
++    );
++    let o = e2::put_statement(d, &first)
++        .await
++        .expect("I3238: a holder's voice is kept");
++    assert!(
++        matches!(o, StatementOutcome::Pending { new: true, .. }),
++        "I3238: one of three holders is short: {o:?}"
++    );
++    assert_eq!(
++        live_transit_key(d, &seat.identity_ref).await,
++        Some(bundle_key),
++        "I3238: a short re-bind moves nothing"
++    );
++    let second = rebind_voice(
++        &c.holder_key(1),
++        c.holder_identity_ref(1),
++        &seat.identity_ref,
++        &rebound,
++        at,
++        Some(&c.object_id),
++    );
++    assert_eq!(
++        row_id_of(&first),
++        row_id_of(&second),
++        "I3238: two voices of one row"
++    );
++    let o = e2::put_statement(d, &second)
++        .await
++        .expect("I3238: the second holder's voice");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3238: two of three holders meet the count: {o:?}"
++    );
++    assert_eq!(
++        live_transit_key(d, &seat.identity_ref).await,
++        Some(rebound),
++        "I3238: the counted re-bind's key is live"
++    );
++}
++
++fn is_unseated(e: &Error) -> bool {
++    matches!(
++        e,
++        Error::MalformedRow { reason, .. }
++            if *reason == crate::federation::malformed_row::RESERVED_FAMILY_UNSEATED
++    )
++}
++
++/// **I3239** — only the holders re-bind, and only a seat.
++pub(crate) async fn i3239_only_holders_rebind_a_seat(d: &dyn FederationDirectory) {
++    fixture_genesis::install_v2(d)
++        .await
++        .expect("I3239: the test ceremony installs");
++    let c = fixture_genesis::bundle_v2();
++    let seat = &c.seats[0];
++    let rebound = other_key(&seat.transit_xwing_pubkey, 0x33);
++    let own = rebind_voice(
++        &c.serve_node_key(0),
++        &seat.identity_ref,
++        &seat.identity_ref,
++        &rebound,
++        now_ms(),
++        Some(&c.object_id),
++    );
++    match e2::put_statement(d, &own).await {
++        Err(e) if is_unseated(&e) => {}
++        other => panic!("I3239: the seat's own re-bind voice, got {other:?}"),
++    }
++    let not_a_seat = rebind_voice(
++        &c.holder_key(0),
++        c.holder_identity_ref(0),
++        c.holder_identity_ref(1),
++        &rebound,
++        now_ms(),
++        Some(&c.object_id),
++    );
++    match e2::put_statement(d, &not_a_seat).await {
++        Err(e) if is_unseated(&e) => {}
++        other => panic!("I3239: a re-bind about a holder (not a seat), got {other:?}"),
++    }
++    assert_eq!(
++        live_transit_key(d, &seat.identity_ref).await,
++        Some(seat.transit_xwing_pubkey.to_vec()),
++        "I3239: nothing moved"
++    );
++}
++
++fn is_payload_invalid(e: &Error) -> bool {
++    matches!(
++        e,
++        Error::MalformedRow { reason, .. }
++            if *reason == crate::federation::malformed_row::EDITION2_PAYLOAD_INVALID
++    )
++}
++
++/// **I3240** — a re-bind is counted over the bundle in force, named by
++/// `refs.head`: none is refused, an unheld bundle waits, a bundle no longer
++/// in force is refused.
++pub(crate) async fn i3240_a_rebind_names_the_bundle_in_force(d: &dyn FederationDirectory) {
++    fixture_genesis::install_v2(d)
++        .await
++        .expect("I3240: the test ceremony installs");
++    let c = fixture_genesis::bundle_v2();
++    let seat = &c.seats[0];
++    let rebound = other_key(&seat.transit_xwing_pubkey, 0x21);
++    let voice = |head: Option<&ciris_verify_core::edition2::Digest32>| {
++        rebind_voice(
++            &c.holder_key(0),
++            c.holder_identity_ref(0),
++            &seat.identity_ref,
++            &rebound,
++            now_ms(),
++            head,
++        )
++    };
++    match e2::put_statement(d, &voice(None)).await {
++        Err(e) if is_payload_invalid(&e) => {}
++        other => panic!("I3240: a re-bind naming no bundle, got {other:?}"),
++    }
++    match e2::put_statement(d, &voice(Some(&[0xab; 32]))).await {
++        Err(e) if e.kind() == "federation_attester_key_unknown" => {}
++        other => panic!("I3240: a re-bind over a bundle not held waits, got {other:?}"),
++    }
++    // A later bundle (the same parties) is now in force.
++    let later = fixture_genesis::later_v2(
++        c,
++        &fixture_genesis::HOLDER_SEEDS,
++        &fixture_genesis::SERVE_NODE_SEEDS,
++        &fixture_genesis::HOLDER_SEEDS[..2],
++    );
++    fixture_genesis::install_ceremony_v2(d, &later)
++        .await
++        .expect("I3240: the later bundle installs");
++    match e2::put_statement(d, &voice(Some(&c.object_id))).await {
++        Err(e) if is_payload_invalid(&e) => {}
++        other => panic!("I3240: a re-bind over a bundle no longer in force, got {other:?}"),
++    }
++    let o = e2::put_statement(d, &voice(Some(&later.object_id)))
++        .await
++        .expect("I3240: over the bundle in force, kept");
++    assert!(
++        matches!(o, StatementOutcome::Pending { new: true, .. }),
++        "I3240: {o:?}"
++    );
++}
++
++/// **I3241** — a later bundle that re-seats the seat on new X-Wing keys makes
++/// the new key live, and a re-bind counted over the earlier bundle no longer
++/// applies.
++pub(crate) async fn i3241_a_reseat_by_a_later_bundle_is_live(d: &dyn FederationDirectory) {
++    fixture_genesis::install_v2(d)
++        .await
++        .expect("I3241: the test ceremony installs");
++    let c = fixture_genesis::bundle_v2();
++    let seat = &c.seats[0];
++    let rebound = other_key(&seat.transit_xwing_pubkey, 0x44);
++    let at = now_ms();
++    for i in 0..2 {
++        e2::put_statement(
++            d,
++            &rebind_voice(
++                &c.holder_key(i),
++                c.holder_identity_ref(i),
++                &seat.identity_ref,
++                &rebound,
++                at,
++                Some(&c.object_id),
++            ),
++        )
++        .await
++        .expect("I3241: a holder's re-bind voice");
++    }
++    assert_eq!(
++        live_transit_key(d, &seat.identity_ref).await,
++        Some(rebound.clone()),
++        "I3241: the counted re-bind is live first"
++    );
++    let reseat =
++        fixture_genesis::reseat_xwing_v2(c, seat.seed, 1, &fixture_genesis::HOLDER_SEEDS[..2]);
++    fixture_genesis::install_ceremony_v2(d, &reseat)
++        .await
++        .expect("I3241: the re-seating bundle installs");
++    let new_key = reseat.seats[0].transit_xwing_pubkey.to_vec();
++    assert_ne!(
++        new_key,
++        seat.transit_xwing_pubkey.to_vec(),
++        "I3241: new keys"
++    );
++    assert_eq!(
++        live_transit_key(d, &seat.identity_ref).await,
++        Some(new_key),
++        "I3241: the re-seat's key is live; the re-bind over the earlier bundle no longer applies"
++    );
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  (b, continued) The stalled and restored legs (CC 3.2 T7)
++// ─────────────────────────────────────────────────────────────────────────
++
++const TR_ROOM: &str = "w1-trust-root-room";
++
++/// Four holders (seeds 1–4), so one can be seated in a resigned seat.
++fn four_holders() -> fixture_genesis::TestCeremonyV2 {
++    let mut spec = fixture_genesis::CeremonySpec::standard();
++    spec.holders = vec![1, 2, 3, 4];
++    fixture_genesis::ceremony_v2(&spec)
++}
++
++fn trust_root_room(
++    c: &fixture_genesis::TestCeremonyV2,
++    founders: &[usize],
++    founded_at_ms: i64,
++) -> GroupRecord {
++    let mut room = infrastructure_room(TR_ROOM, &[], "quorum:2/3");
++    if let GroupRecord::Community(r) = &mut room {
++        r.founded_at = at(founded_at_ms);
++        r.members = founders
++            .iter()
++            .map(|i| CommunityMember {
++                key_id: c.holder_identity_ref(*i).to_owned(),
++                joined_at: at(founded_at_ms),
++                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
++            })
++            .collect();
++    }
++    room
++}
++
++async fn hard_cases(d: &dyn FederationDirectory, kind: &str) -> usize {
++    d.list_hard_case_events(crate::federation::hard_case::HardCaseFilter {
++        kind: Some(kind.to_owned()),
++        since: None,
++        emitter_key_id: None,
++    })
++    .await
++    .unwrap()
++    .len()
++}
++
++async fn standing(
++    d: &dyn FederationDirectory,
++) -> crate::federation::canonical_community::StoredStanding {
++    crate::federation::canonical_community::stored_standing(d, &e2::kid(TR_ROOM))
++        .await
++        .unwrap()
++}
++
++/// **I3235 / I3236 / I3237** — born over the bundle, stalled by a
++/// resignation, restored by the founders' amendment.
++pub(crate) async fn i3235_i3237_the_trust_root_liveness_margin(d: &dyn FederationDirectory) {
++    use crate::federation::canonical_community::StoredStanding;
++    use crate::federation::edition2::group::MembershipRecord;
++    use crate::federation::edition2::group_fixtures::membership_voices;
++    use crate::federation::hard_case::kind;
++    use crate::federation::types::CommunityMembershipRevocation;
++
++    let c = four_holders();
++    fixture_genesis::install_ceremony_v2(d, &c)
++        .await
++        .expect("I3235: four holders install");
++    let gid = e2::kid(TR_ROOM);
++    let base = crate::host::clock::now().timestamp_millis() - 2 * 3_600_000;
++    let ms = |offset: i64| u64::try_from(base + offset).unwrap();
++
++    // I3235 — the birth: three holder founders, quorum:2/3 (M + 1 = 3).
++    let v1 = trust_root_room(&c, &[0, 1, 2], base);
++    let keys: Vec<_> = (0..4).map(|i| c.holder_key(i)).collect();
++    let voices: Vec<Vec<u8>> = (0..3)
++        .map(|i| roster_voices(&v1, 1, None, ms(60_000), &[&keys[i]]).remove(0))
++        .collect();
++    for v in &voices[..2] {
++        let o = e2::put_statement(d, v)
++            .await
++            .expect("I3235: a holder's voice");
++        assert!(
++            matches!(o, StatementOutcome::Pending { new: true, .. }),
++            "I3235: short of a strict majority of four holders: {o:?}"
++        );
++        assert!(d.lookup_community(&gid).await.unwrap().is_none(), "I3235");
++    }
++    let o = e2::put_statement(d, &voices[2])
++        .await
++        .expect("I3235: the third holder founder");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3235: three of four holders: {o:?}"
++    );
++    let v1_id = row_id_of(&voices[0]);
++    let StoredStanding::Rooted(signed) = standing(d).await else {
++        panic!("I3235: born over the bundle in force, Rooted");
++    };
++    assert!(
++        crate::federation::canonical_community::is_live(d, &signed, crate::host::clock::now())
++            .await
++            .unwrap(),
++        "I3235: three founders at quorum:2/3 are live"
++    );
++    assert_eq!(hard_cases(d, kind::COMMUNITY_LIVENESS_STALLED).await, 0);
++
++    // I3236 — the third founder resigns, alone.
++    let resignation = MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
++        community_key_id: gid.clone(),
++        removed_identity_key_id: c.holder_identity_ref(2).to_owned(),
++        removed_at: at(base + 600_000),
++        effective_at: at(base + 600_000),
++        reason: None,
++        witness_set: Vec::new(),
++        persist_row_hash: String::new(),
++    });
++    let o = put_voices(
++        d,
++        &membership_voices(&resignation, Some(&v1_id), &[&keys[2]]),
++    )
++    .await
++    .expect("I3236: a founder resigns alone");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3236: a resignation is one voice: {o:?}"
++    );
++    let StoredStanding::Stalled { held, .. } = standing(d).await else {
++        panic!("I3236: stalled at M founders");
++    };
++    assert!(
++        !crate::federation::canonical_community::is_live(d, &held, crate::host::clock::now())
++            .await
++            .unwrap(),
++        "I3236: not live"
++    );
++    let _ = standing(d).await;
++    assert_eq!(
++        hard_cases(d, kind::COMMUNITY_LIVENESS_STALLED).await,
++        1,
++        "I3236: declared exactly once"
++    );
++
++    // I3237 — the founders seat the fourth holder in the resigned seat.
++    let v2 = trust_root_room(&c, &[0, 1, 3], base);
++    let v2_voices: Vec<Vec<u8>> = [0usize, 3, 1]
++        .iter()
++        .map(|i| roster_voices(&v2, 2, Some(&v1_id), ms(1_200_000), &[&keys[*i]]).remove(0))
++        .collect();
++    for v in &v2_voices[..2] {
++        let o = e2::put_statement(d, v)
++            .await
++            .expect("I3237: a voice of the amendment");
++        assert!(
++            matches!(o, StatementOutcome::Pending { new: true, .. }),
++            "I3237: one counted founder of the two needed: {o:?}"
++        );
++    }
++    let o = e2::put_statement(d, &v2_voices[2])
++        .await
++        .expect("I3237: the second remaining founder");
++    assert!(
++        matches!(o, StatementOutcome::Row { new: true, .. }),
++        "I3237: the remaining founders meet quorum:2/3: {o:?}"
++    );
++    let StoredStanding::Rooted(signed) = standing(d).await else {
++        panic!("I3237: restored, Rooted");
++    };
++    assert!(
++        crate::federation::canonical_community::is_live(d, &signed, crate::host::clock::now())
++            .await
++            .unwrap(),
++        "I3237: live again"
++    );
++    assert_eq!(hard_cases(d, kind::COMMUNITY_LIVENESS_RESTORED).await, 1);
++    assert_eq!(hard_cases(d, kind::COMMUNITY_LIVENESS_STALLED).await, 1);
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  Runners: sqlite and postgres
++// ─────────────────────────────────────────────────────────────────────────
++
++#[cfg(feature = "sqlite")]
++async fn sqlite() -> crate::store::sqlite::SqliteBackend {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    b
++}
++
++#[cfg(feature = "postgres")]
++async fn postgres() -> Option<crate::store::postgres::PostgresBackend> {
++    use crate::store::Backend as _;
++    let dsn = crate::test_pg::empty_dsn()?;
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Some(b)
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3230_i3231_sqlite() {
++    Box::pin(i3230_i3231_a_new_edge_names_its_head(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3230_i3231_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(i3230_i3231_a_new_edge_names_its_head(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3232_sqlite() {
++    Box::pin(i3232_attached_stays_attached(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3232_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(i3232_attached_stays_attached(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3233_sqlite() {
++    Box::pin(i3233_founding_needs_a_margin(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3233_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(i3233_founding_needs_a_margin(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3234_sqlite() {
++    Box::pin(i3234_a_seat_alone_does_not_move_its_transit_key(
++        &sqlite().await,
++    ))
++    .await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3234_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(i3234_a_seat_alone_does_not_move_its_transit_key(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3235_i3237_sqlite() {
++    Box::pin(i3235_i3237_the_trust_root_liveness_margin(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3235_i3237_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(i3235_i3237_the_trust_root_liveness_margin(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3238_sqlite() {
++    Box::pin(i3238_a_rebind_is_counted(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3238_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(i3238_a_rebind_is_counted(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3239_sqlite() {
++    Box::pin(i3239_only_holders_rebind_a_seat(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3239_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(i3239_only_holders_rebind_a_seat(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3240_sqlite() {
++    Box::pin(i3240_a_rebind_names_the_bundle_in_force(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3240_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(i3240_a_rebind_names_the_bundle_in_force(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3241_sqlite() {
++    Box::pin(i3241_a_reseat_by_a_later_bundle_is_live(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3241_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(i3241_a_reseat_by_a_later_bundle_is_live(&b)).await;
++}

@@ -1,0 +1,4316 @@
+diff --git a/docs/EDITION2_PAYLOADS.md b/docs/EDITION2_PAYLOADS.md
+index 91fd2069..8818759d 100644
+--- a/docs/EDITION2_PAYLOADS.md
++++ b/docs/EDITION2_PAYLOADS.md
+@@ -77,6 +77,34 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
+ | scrub_signature_* under authority_key_id | the proposer's statement |
+ | cosignatures (RosterCosignature) | the roster members' statements, counted at the group's consensus_protocol |
+ 
++### `identity:occurrence`
++
++- **Replaces:** SignedIdentityOccurrence / IdentityOccurrence (an identity:occurrence:v1 row)
++- **Authorship:** authored (by a live roster key of the identity); the occurrence key's own statement is a second voice, role occurrence_key (party sub)
++- **`sub`:** the occurrence key's identity-ref (occurrence_key_id)
++- **Lands in:** federation_identity_occurrences (+ federation_identity_occurrence_history, transport_destinations)
++
++| member | CBOR type | presence | maps from |
++|---|---|---|---|
++| `identity_key_id` | `identity-ref` | required | identity_key_id (equals author) |
++| `occurrence_key_id` | `identity-ref` | required | occurrence_key_id (equals sub) |
++| `device_class` | `tstr` | required | device_class: phone \| laptop \| server \| embedded \| agent \| service |
++| `hardware_attestation` | `bstr` | optional | hardware_attestation (base64 in the earlier form) |
++| `transport_destination` | `map` | optional | transport_destination: exactly reticulum_x25519_pubkey (bstr 32), reticulum_ed25519_pubkey (bstr 32), app_name (tstr), aspects ([* tstr]), destination_hash (bstr 16, derived per CC 3.3.6.3) |
++| `transit_xwing_pubkey` | `bstr` | optional | transport_destination's transit_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2) |
++| `onion_hop_xwing_pubkey` | `bstr` | optional | transport_destination's onion_hop_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2) |
++| `onion_relay` | `map` | optional | exactly {"opt_out": true}, on a node that opts out of relaying (CC 3.3.6.2) |
++| `encryption_pubkeys` | `map` | optional | encryption_pubkeys: exactly x25519 (bstr 32) and ml_kem_768 (bstr 1184) |
++| `build_manifest_hash` | `hash-digest [-16, bstr .size 32]` | optional | build_manifest_hash |
++| `valid_until` | `uint (ms)` | optional | valid_until (absent: indefinite; present: later than asserted_at) |
++| `refs.also:cites` | `row-ref` | optional | build_manifest_ref: the provenance:build_manifest:{target} row |
++
++| earlier-form co-signature (not a payload member) | now |
++|---|---|
++| SignedIdentityOccurrence.signature (TransportBindingSignature) under attesting_key_id | the author's statement: a live roster key of the identity (iss = identity_key_id) |
++| none (the earlier form carried no proof of possession) | the occurrence key's own statement over the same payload (iss = sub), required before the author's |
++| the self-roster door's assent rows (objection:assent:v1) | further roster keys' statements as the identity over the same payload, a strict majority of the live roster counted |
++
+ ### `identity:occurrence_revocation`
+ 
+ - **Replaces:** FramedOccurrenceRevocation / IdentityOccurrenceRevocation (an identity:occurrence_revocation:v1 row)
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index 35475526..95248d39 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -13006,6 +13006,116 @@ pub async fn admission_identity_for_writer<F: super::FederationDirectory + ?Size
+     Ok(writer.to_owned())
+ }
+ 
++/// v62.0.0 (wave O1; CC 3.2 "Who owns a key", CC 3.3.6; RULINGS
++/// "delegates_to families") — **the owner of an agent identity at `at_ms`**,
++/// the agent-side analogue of [`owner_of`], read from the edition-2
++/// statement store: the held rows of the family
++/// `ownership:{relation}:{target_kind}:{version}` about `agent` (CWT `sub`)
++/// whose `dimension` names the `agent` target kind, each carrying BOTH the
++/// author's statement (`iss` = `author`, a `user` key) and the agent's own
++/// statement as its second voice (`iss` = `sub` = `agent`, signed by the
++/// agent's key, the family's `bound_node` role), asserted by `at_ms` and not
++/// ended by then (`valid_until` / `expires_at`, the half-open record window),
++/// and not retracted by its author (a held `withdraws` / `recants` naming it
++/// by `refs.target`, signed as the author).
++///
++/// `Ok(None)` with no such binding; `Ok(Some(owner))` with exactly one
++/// owner identity; more than one is [`Error::AmbiguousNodeOwner`]
++/// (fail-closed: ownership is single-valued, CC 3.2).
++///
++/// # Errors
++/// As above; directory failures.
++pub async fn agent_owner_of<F: super::FederationDirectory + ?Sized>(
++    directory: &F,
++    agent: &str,
++    at_ms: u64,
++) -> Result<Option<String>, Error> {
++    use super::edition2::ingest::{kid_of_identity_ref, statement_kid};
++    use super::edition2::liveness::statement_parts;
++    use super::edition2::names::RowId;
++    use super::edition2::occurrence::statement_iss;
++    use ciris_verify_core::cde::Value;
++    let family = ciris_verify_core::namespace_match::family_id(
++        "ownership:{relation}:{target_kind}:{version}",
++    );
++    let Some(agent_kid) = kid_of_identity_ref(agent) else {
++        return Ok(None);
++    };
++    let mut by_row: std::collections::BTreeMap<RowId, Vec<Vec<u8>>> =
++        std::collections::BTreeMap::new();
++    for st in directory.edition2_statements_about(&family, agent).await? {
++        if let Some(id) = RowId::of_statement(&st) {
++            by_row.entry(id).or_default().push(st);
++        }
++    }
++    let mut owners: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
++    for (id, voices) in &by_row {
++        let Some((_, payload)) = voices.first().and_then(|v| statement_parts(v)) else {
++            continue;
++        };
++        let names_agent_kind = payload
++            .get_text("dimension")
++            .and_then(Value::as_text)
++            .is_some_and(|d| {
++                let segs: Vec<&str> = d.split(':').collect();
++                segs.len() == 4 && segs[0] == "ownership" && segs[2] == "agent"
++            });
++        let Some(author) = payload
++            .get_text("author")
++            .and_then(Value::as_text)
++            .map(str::to_owned)
++        else {
++            continue;
++        };
++        let from = payload.get_text("asserted_at").and_then(Value::as_u64);
++        let until = payload
++            .get_text("valid_until")
++            .or_else(|| payload.get_text("expires_at"))
++            .and_then(Value::as_u64);
++        let live = from.is_some_and(|f| crate::kernel::key_end::within_record(at_ms, f, until));
++        if !names_agent_kind || !live {
++            continue;
++        }
++        let by_author = voices
++            .iter()
++            .any(|v| statement_iss(v).as_deref() == Some(author.as_str()));
++        let by_agent = voices.iter().any(|v| {
++            statement_iss(v).as_deref() == Some(agent) && statement_kid(v) == Some(agent_kid)
++        });
++        if !by_author || !by_agent || !super::self_roster::is_user_key(directory, &author).await? {
++            continue;
++        }
++        let mut retracted = false;
++        for c in directory.edition2_rows_naming(id, "target").await? {
++            for v in directory.edition2_voices(&c).await? {
++                let composer = statement_parts(&v).is_some_and(|(h, _)| {
++                    h.get_int(-70001).and_then(Value::as_text).is_some_and(|t| {
++                        t == attestation_type::WITHDRAWS || t == attestation_type::RECANTS
++                    })
++                });
++                let at_or_before = statement_parts(&v)
++                    .and_then(|(_, p)| p.get_text("asserted_at").and_then(Value::as_u64))
++                    .is_some_and(|t| t <= at_ms);
++                if composer && at_or_before && statement_iss(&v).as_deref() == Some(author.as_str())
++                {
++                    retracted = true;
++                }
++            }
++        }
++        if !retracted {
++            owners.insert(author);
++        }
++    }
++    match owners.len() {
++        0 => Ok(None),
++        1 => Ok(owners.into_iter().next()),
++        _ => Err(Error::AmbiguousNodeOwner {
++            node_key_id: agent.to_owned(),
++            owners: owners.into_iter().collect(),
++        }),
++    }
++}
++
+ /// **CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the single responsible owner
+ /// of `node`, or `None` when the node is unowned.** The dimension-precise
+ /// ownership projection (a subset of [`steward_bindings_of`] restricted to
+diff --git a/src/federation/directory_double.rs b/src/federation/directory_double.rs
+index f3b0c6f3..c0e030c2 100644
+--- a/src/federation/directory_double.rs
++++ b/src/federation/directory_double.rs
+@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
+     }
+ }
+ 
+-// 141 delegations, generated. Every one: fault first, then delegate.
++// 142 delegations, generated. Every one: fault first, then delegate.
+ #[async_trait::async_trait]
+ impl FederationDirectory for FaultInjectingDirectory {
+     async fn adopt_genesis_reanchor(
+@@ -1328,6 +1328,15 @@ impl FederationDirectory for FaultInjectingDirectory {
+         }
+         self.inner.put_identity_occurrence(occurrence).await
+     }
++    async fn put_identity_occurrence_edition2(
++        &self,
++        bind: edition2::occurrence::OccurrenceBind,
++    ) -> Result<bool, Error> {
++        if let Some(e) = self.faulted("put_identity_occurrence_edition2") {
++            return Err(e);
++        }
++        self.inner.put_identity_occurrence_edition2(bind).await
++    }
+     async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
+         if let Some(e) = self.faulted("put_location_proof") {
+             return Err(e);
+diff --git a/src/federation/edition2/door.rs b/src/federation/edition2/door.rs
+index ee8e32bf..17169f92 100644
+--- a/src/federation/edition2/door.rs
++++ b/src/federation/edition2/door.rs
+@@ -255,7 +255,10 @@ pub fn admit_row(
+     refuse_edition_one(&payload)?;
+ 
+     let ctx = door_context(bytes, ctx);
+-    let (row, role) = match verify_row_in_family_with(bytes, keys, &VendoredFamilyModel, &ctx) {
++    // v62.0.0 (wave O1; CC 3.3.6, the rc21 reading) — CC's vendored model,
++    // with the occurrence key's own voice on `identity:occurrence`.
++    let model = super::occurrence::WithOccurrenceRole(&VendoredFamilyModel);
++    let (row, role) = match verify_row_in_family_with(bytes, keys, &model, &ctx) {
+         FamilyVerdict::Valid { row, role } => (row, role),
+         FamilyVerdict::Invalid(i) => {
+             return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
+diff --git a/src/federation/edition2/fixture_occurrence.rs b/src/federation/edition2/fixture_occurrence.rs
+new file mode 100644
+index 00000000..8b58ac67
+--- /dev/null
++++ b/src/federation/edition2/fixture_occurrence.rs
+@@ -0,0 +1,173 @@
++//! v62.0.0 (wave O1) — **the shared fixture for `identity:occurrence`
++//! binds** (re-exported from [`super::fixture_switch`] as `e2::…`). One
++//! builder for every agent's witnesses, so they sign binds one way.
++//!
++//! Keys are E0's seeds ([`super::fixture_switch::signing_key`],
++//! [`super::fixture_switch::kid`]): a seed text, or an identity-ref the
++//! fixtures derived. A bind is two (or more) statements over one payload
++//! (`edition2::occurrence`):
++//! 1. the occurrence key's own statement (`iss` = `sub` = the occurrence);
++//! 2. the author's statement (`iss` = `author`): the identity itself, or,
++//!    for an agent identity, its OWNER (whose owner binding must be held:
++//!    [`put_agent_owner_binding`]).
++//!
++//! [`occurrence_bind_voices`] returns them in that order, the order the door
++//! takes them; [`put_bind`] offers them through `ingest::put_statement`.
++
++use ciris_verify_core::cde::{self, Value};
++use ciris_verify_core::edition2::family::SelectContext;
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::fixture_switch::{kid, signing_key};
++use super::ingest::{held_keys_for, put_statement, StatementOutcome, INGEST_TIER};
++use super::occurrence::OCCURRENCE_FAMILY;
++use crate::federation::{Error, FederationDirectory};
++
++fn det_map(mut m: Vec<(&str, Value)>) -> Value {
++    m.sort_by_key(|(k, _)| cde::encode(&Value::Text((*k).to_owned())));
++    Value::Map(
++        m.into_iter()
++            .map(|(k, v)| (Value::Text(k.to_owned()), v))
++            .collect(),
++    )
++}
++
++/// What a bind states, beyond its keys.
++#[derive(Clone, Debug)]
++pub struct BindOptions {
++    /// `asserted_at`, POSIX ms.
++    pub asserted_at_ms: u64,
++    /// `valid_until`, POSIX ms; `None` is indefinite.
++    pub valid_until_ms: Option<u64>,
++    /// Further payload members (`transport_destination`,
++    /// `encryption_pubkeys`, the X-Wing keys, ...), as CBOR.
++    pub extra: Vec<(&'static str, Value)>,
++}
++
++impl Default for BindOptions {
++    fn default() -> Self {
++        BindOptions {
++            asserted_at_ms: super::fixture_switch::ms(crate::host::clock::now()),
++            valid_until_ms: None,
++            extra: Vec::new(),
++        }
++    }
++}
++
++/// **The voices of one bind**: `occurrence`'s own statement, then
++/// `author`'s, over the payload binding `occurrence` (a seed or kid) to
++/// `identity` (a seed or kid) at `device_class`. `author` is the identity
++/// for a person's occurrence and the owner for an agent's.
++///
++/// # Panics
++/// A signing failure.
++#[must_use]
++pub fn occurrence_bind_voices(
++    author: &str,
++    identity: &str,
++    occurrence: &str,
++    device_class: &str,
++    opts: &BindOptions,
++) -> Vec<Vec<u8>> {
++    let (author_ref, identity_ref, occ_ref) = (kid(author), kid(identity), kid(occurrence));
++    let mut m = vec![
++        ("asserted_at", Value::Uint(opts.asserted_at_ms)),
++        ("author", Value::Text(author_ref.clone())),
++        ("identity_key_id", Value::Text(identity_ref)),
++        ("occurrence_key_id", Value::Text(occ_ref.clone())),
++        ("device_class", Value::Text(device_class.to_owned())),
++    ];
++    if let Some(u) = opts.valid_until_ms {
++        m.push(("valid_until", Value::Uint(u)));
++    }
++    for (k, v) in &opts.extra {
++        m.push((*k, v.clone()));
++    }
++    let payload = det_map(m);
++    let sign = |seed: &str, iss: &str| {
++        sign_row_statement(
++            &signing_key(seed),
++            iss,
++            &occ_ref,
++            "scores",
++            OCCURRENCE_FAMILY,
++            &payload,
++            vec![],
++        )
++        .expect("fixture_occurrence: sign a bind voice")
++    };
++    let own = sign(occurrence, &occ_ref);
++    if author_ref == occ_ref {
++        // The self pair: one statement is both voices.
++        return vec![own];
++    }
++    vec![own, sign(author, &author_ref)]
++}
++
++/// **Put a bind**: each of [`occurrence_bind_voices`] through the one entry,
++/// in order; the last outcome (`Row` when the bind landed).
++///
++/// # Errors
++/// The door's refusal of any voice.
++pub async fn put_bind<D: FederationDirectory + ?Sized>(
++    dir: &D,
++    author: &str,
++    identity: &str,
++    occurrence: &str,
++    device_class: &str,
++    opts: &BindOptions,
++) -> Result<StatementOutcome, Error> {
++    let mut last = None;
++    for v in occurrence_bind_voices(author, identity, occurrence, device_class, opts) {
++        last = Some(Box::pin(put_statement(dir, &v, None, INGEST_TIER)).await?);
++    }
++    last.ok_or_else(|| Error::InvalidArgument("fixture_occurrence: no voice".into()))
++}
++
++/// **An agent's owner binding**, held as edition-2 statements:
++/// `delegates_to(owner → agent)` at `ownership:responsible_party:agent:v1`
++/// (family `ownership:{relation}:{target_kind}:{version}`), the owner's
++/// statement and the agent's own (`bound_node`), each admitted by the door
++/// and stored ([`crate::federation::admission::agent_owner_of`] reads them).
++///
++/// # Panics
++/// The door refuses a voice; the store refuses it.
++pub async fn put_agent_owner_binding<D: FederationDirectory + ?Sized>(
++    dir: &D,
++    owner: &str,
++    agent: &str,
++    asserted_at_ms: u64,
++) {
++    let family = ciris_verify_core::namespace_match::family_id(
++        "ownership:{relation}:{target_kind}:{version}",
++    );
++    let agent_ref = kid(agent);
++    let payload = det_map(vec![
++        ("asserted_at", Value::Uint(asserted_at_ms)),
++        ("author", Value::Text(kid(owner))),
++        (
++            "dimension",
++            Value::Text("ownership:responsible_party:agent:v1".into()),
++        ),
++    ]);
++    for seed in [owner, agent] {
++        let st = sign_row_statement(
++            &signing_key(seed),
++            &kid(seed),
++            &agent_ref,
++            "delegates_to",
++            &family,
++            &payload,
++            vec![],
++        )
++        .expect("fixture_occurrence: sign an owner binding voice");
++        let keys = held_keys_for(dir, &st)
++            .await
++            .unwrap_or_else(|e| panic!("fixture_occurrence: keys for {seed}: {e}"));
++        let admitted = super::door::admit_row(&st, &keys, None, SelectContext::default())
++            .unwrap_or_else(|e| panic!("fixture_occurrence: owner binding voice of {seed}: {e}"));
++        dir.put_edition2_statement(&admitted)
++            .await
++            .unwrap_or_else(|e| panic!("fixture_occurrence: store {seed}'s voice: {e}"));
++    }
++}
+diff --git a/src/federation/edition2/fixture_switch.rs b/src/federation/edition2/fixture_switch.rs
+index e33342df..f116d47f 100644
+--- a/src/federation/edition2/fixture_switch.rs
++++ b/src/federation/edition2/fixture_switch.rs
+@@ -178,3 +178,9 @@ mod tests {
+         assert!(!emit_edition2(), "I1912: restored");
+     }
+ }
++
++/// v62.0.0 (wave O1) — the shared `identity:occurrence` bind builders
++/// (`edition2::fixture_occurrence`; O1.api.md).
++pub use super::fixture_occurrence::{
++    occurrence_bind_voices, put_agent_owner_binding, put_bind, BindOptions,
++};
+diff --git a/src/federation/edition2/ingest.rs b/src/federation/edition2/ingest.rs
+index 6704e435..1a7fbe05 100644
+--- a/src/federation/edition2/ingest.rs
++++ b/src/federation/edition2/ingest.rs
+@@ -143,7 +143,14 @@ where
+     F: FederationDirectory + ?Sized,
+ {
+     match statement_kid(statement) {
+-        Some(kid) => held_keys_for_kid(dir, &kid).await,
++        Some(kid) => {
++            let held = held_keys_for_kid(dir, &kid).await?;
++            // v62.0.0 (wave O1, I3020; the rc21 rule) — the key-of-issuer
++            // check's occurrence arm: the signer as a live occurrence of its
++            // `iss` at the statement's instant.
++            let seats = super::occurrence::occurrence_seats_for(dir, statement).await?;
++            Ok(held.with_occurrences(seats))
++        }
+         None => Ok(HeldKeys::new()),
+     }
+ }
+@@ -455,6 +462,12 @@ where
+         return Ok(None);
+     };
+     let bytes = bytes?;
++    // v62.0.0 (wave O1; CC 4.2.6) — a recovery key signs no row: refused
++    // after the pure gates, before any key lookup.
++    Box::pin(super::recovery_signer::refuse_recovery_key_signer(
++        dir, &bytes,
++    ))
++    .await?;
+     let keys = held_keys_for(dir, &bytes).await?;
+     let offered: Option<Digest32> = hex::decode(&row.attestation_id)
+         .ok()
+@@ -559,6 +572,15 @@ where
+     F: FederationDirectory + ?Sized,
+ {
+     super::door::require_statement_form(bytes)?;
++    // v62.0.0 (wave O1; CC 4.2.6) — a recovery key signs no row: refused
++    // finally by its key material, nothing held. A directory read: it runs
++    // AFTER the pure statement gates (P1c's `pure_statement_gates` replaces
++    // the form check above) and BEFORE the halt roster read and every key
++    // lookup.
++    Box::pin(super::recovery_signer::refuse_recovery_key_signer(
++        dir, bytes,
++    ))
++    .await?;
+     // v62.0.0 (JSON-cut slice A) — an accord invocation is judged against
+     // the holders of the bundle in force for its accord, never the key
+     // plane (`edition2::halt`).
+@@ -593,6 +615,12 @@ where
+     };
+     // A composer names a held row of its own family (every plane).
+     check_composer_target(dir, &admitted).await?;
++    // v62.0.0 (wave O1; CC 3.3.6) — an occurrence bind's voices: held, and
++    // the bind written to the occurrence table when it lands
++    // (`edition2::occurrence`), never an attestation row.
++    if admitted.family == super::occurrence::OCCURRENCE_FAMILY {
++        return Box::pin(super::occurrence::put_occurrence_voice(dir, &admitted)).await;
++    }
+     if admitted.family == KEY_RECORD_FAMILY || admitted.family == KEY_REVOCATION_FAMILY {
+         let new = dir.put_edition2_statement(&admitted).await?;
+         // v62.0.0 (slice J0) — the read models: the key this statement is
+diff --git a/src/federation/edition2/liveness.rs b/src/federation/edition2/liveness.rs
+index c173dc31..abb6f68e 100644
+--- a/src/federation/edition2/liveness.rs
++++ b/src/federation/edition2/liveness.rs
+@@ -141,6 +141,9 @@ pub struct HeldKeys {
+     revocations: Vec<Vec<u8>>,
+     standing: Arc<dyn RevokerStanding>,
+     seats: BundleSeats,
++    /// v62.0.0 (wave O1, I3020) — the key-of-issuer check's occurrence arm
++    /// ([`super::occurrence::OccurrenceSeats`]).
++    occurrences: super::occurrence::OccurrenceSeats,
+ }
+ 
+ impl Default for HeldKeys {
+@@ -196,6 +199,7 @@ impl HeldKeys {
+             revocations: Vec::new(),
+             standing: Arc::new(SelfOnly),
+             seats: BundleSeats::default(),
++            occurrences: super::occurrence::OccurrenceSeats::none(),
+         }
+     }
+ 
+@@ -207,6 +211,15 @@ impl HeldKeys {
+         self
+     }
+ 
++    /// v62.0.0 (wave O1, I3020; CC 3.3.6, the rc21 rule) — with the live,
++    /// unevicted occurrences the key-of-issuer check admits as keys of their
++    /// identity ([`super::occurrence::occurrence_seats_for`]).
++    #[must_use]
++    pub fn with_occurrences(mut self, occurrences: super::occurrence::OccurrenceSeats) -> Self {
++        self.occurrences = occurrences;
++        self
++    }
++
+     /// With an owner / roster answer for revocations.
+     #[must_use]
+     pub fn with_standing(mut self, standing: Arc<dyn RevokerStanding>) -> Self {
+@@ -247,6 +260,7 @@ impl HeldKeys {
+             revocations: Vec::new(),
+             standing: Arc::clone(&self.standing),
+             seats: self.seats.clone(),
++            occurrences: self.occurrences.clone(),
+         }
+     }
+ 
+@@ -368,6 +382,13 @@ impl HeldKeys {
+         }
+         let statements = self.records.get(kid).map_or(&[][..], Vec::as_slice);
+         let iss_ref = identity_ref(iss);
++        // v62.0.0 (wave O1, I3020; CC 3.3.6, CC 3.1.3, the rc21 rule) — the
++        // occurrence arm: a key admitted as a live, unevicted
++        // `identity:occurrence` of `iss` at the statement's instant is a key
++        // of `iss` ([`super::occurrence::occurrence_seats_for`]).
++        if self.occurrences.admits(&iss_ref, kid) {
++            return KeyOf::Yes;
++        }
+         let rows = self.record_voices(kid, statements, depth);
+         let mut missing: Vec<ChainMissing> = Vec::new();
+         for (row_id, voices) in &rows {
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 96060d48..0db9dcbf 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -19,6 +19,8 @@
+ //! | producing: an edition-2 row or object signed with persist's own composite signer | [`produce`] |
+ //! | the accord's halt and invocation door (one holder's statement latches; dedup by invocation_id / nonce) | [`halt`] |
+ //! | the payload members of each mapped family (the source of `docs/EDITION2_PAYLOADS.md`) | [`payloads`] |
++//! | a recovery key refused as a signer by its key material (CC 4.2.6) | [`recovery_signer`] |
++//! | the `identity:occurrence` bind (two voices, the typed occurrence table) and the key-of-issuer check's occurrence arm | [`occurrence`] |
+ //!
+ //! **The rule this module keeps (CC 2.6.1.12).** A node of this form reads and
+ //! writes this form only. An object of the earlier form (CC 8.11, a JSON object
+@@ -30,15 +32,19 @@
+ 
+ pub mod door;
+ #[cfg(any(test, feature = "test-anchor"))]
++pub mod fixture_occurrence;
++#[cfg(any(test, feature = "test-anchor"))]
+ pub mod fixture_switch;
+ pub mod genesis;
+ pub mod halt;
+ pub mod ingest;
+ pub mod liveness;
+ pub mod names;
++pub mod occurrence;
+ pub mod payloads;
+ pub mod produce;
+ pub mod projection;
++pub mod recovery_signer;
+ pub mod store;
+ 
+ #[cfg(test)]
+@@ -62,11 +68,21 @@ mod key_chain_invariants;
+ #[cfg(test)]
+ mod liveness_invariants;
+ #[cfg(test)]
++mod occurrence_invariants;
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod occurrence_node_bearing_invariants;
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod occurrence_route_invariants;
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod occurrence_tx_invariants;
++#[cfg(test)]
+ mod payloads_invariants;
+ #[cfg(test)]
+ mod produce_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod projection_invariants;
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod recovery_signer_invariants;
+ #[cfg(test)]
+ mod verify_vectors_replay;
+ 
+diff --git a/src/federation/edition2/occurrence.rs b/src/federation/edition2/occurrence.rs
+new file mode 100644
+index 00000000..682e21be
+--- /dev/null
++++ b/src/federation/edition2/occurrence.rs
+@@ -0,0 +1,1106 @@
++//! v62.0.0 (wave O1; CC 3.3.6, CC 3.3.6.2, CC 3.3.6.4, CC 3.1.3) — **the
++//! edition-2 `identity:occurrence` bind, and the key-of-issuer check's
++//! occurrence arm.**
++//!
++//! Every identity occurrence, a user's device or an agent, is one
++//! `identity:occurrence` row (wire `identity:occurrence:v1`). Its payload
++//! carries the members of the earlier `IdentityOccurrence` one to one
++//! ([`super::payloads`], family `identity:occurrence`). The statements over
++//! that one payload are the authority:
++//!
++//! - **the occurrence key's own statement** (`iss` = `sub` =
++//!   `occurrence_key_id`, signed by that very key, role
++//!   [`OCCURRENCE_KEY_ROLE`]): proof of possession, REQUIRED, as a rotation
++//!   record carries its new key's voice. It is held when it arrives and
++//!   lands nothing by itself.
++//! - **the author's statement** (`iss` = `author` = `identity_key_id`): a
++//!   live roster key of the identity, its genesis key or an admitted
++//!   occurrence ([`crate::federation::admission::check_signer_acts_for`],
++//!   the JSON door's rule). It is refused (retryable) until the occurrence
++//!   key's own statement is held. For an agent, the author is the owner's
++//!   roster key, and the agent key gives its own statement.
++//! - **the self-roster door** (CC 3.3.6.4): a user-role key not yet on a
++//!   user self's roster is a roster change. It lands at once by a strict
++//!   majority of the live roster, the proposer counted; each roster key's
++//!   approval is its own author statement over the same payload (a counted
++//!   voice). The lone path (the window `W_self`) is not carried here (O1
++//!   notes, "not done"). A node or agent occurrence is single-signer and
++//!   lands on one author statement.
++//!
++//! When the bind lands it is written to the typed table the JSON door
++//! writes (`federation_identity_occurrences`, its V161 history, and the
++//! `transport_destinations` route it projects) by
++//! [`crate::federation::FederationDirectory::put_identity_occurrence_edition2`].
++//!
++//! **The occurrence arm** (the rc21 rule, CC 3.1.3): a key admitted as a
++//! live, unevicted `identity:occurrence` of `iss` is a key of `iss`. Without
++//! it a user's second device is refused `kid_not_of_iss`.
++//! [`occurrence_seats_for`] reads it for one statement at the statement's
++//! signed instant, under the half-open record window
++//! ([`crate::kernel::key_end::within_record`]) and the #421 revocation rule;
++//! a key no longer live at receipt is held to the past-freshness bound W
++//! (CC 3.3.6.4). [`super::liveness::HeldKeys::key_of`] answers `Yes` for a
++//! seat it carries.
++
++use std::collections::BTreeSet;
++
++use base64::engine::general_purpose::STANDARD as B64;
++use base64::Engine as _;
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::family::{
++    FamilyModel, FamilyRule, RoleParty, RuleAnswer, SelectContext,
++};
++use ciris_verify_core::edition2::{identity_ref, Digest32};
++
++use super::door::AdmittedRow;
++use super::ingest::{kid_of_identity_ref, statement_kid, StatementOutcome};
++use super::liveness::statement_parts;
++use super::names::RowId;
++use crate::federation::self_at_login::{
++    check_xwing_halves, XWingKeyRole, XWingPublicKey, ONION_HOP_XWING_PUBKEY_MEMBER,
++    TRANSIT_XWING_PUBKEY_MEMBER,
++};
++use crate::federation::types::{EncryptionPubkeys, IdentityOccurrence, OccurrenceTransportBinding};
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++/// The family id (header -70002) of an occurrence row.
++pub const OCCURRENCE_FAMILY: &str = "identity:occurrence";
++
++/// The role the occurrence key's own statement fills: the CWT `sub`
++/// (CC 3.3.6, the rc21 second voice). CC's vendored family model (rc20)
++/// names no second signer for `identity:occurrence`; [`WithOccurrenceRole`]
++/// adds this one. TODO(verify-rc21): drop the overlay when Verify vendors it.
++pub const OCCURRENCE_KEY_ROLE: &str = "occurrence_key";
++
++/// The plane name this door's refusals carry.
++pub const PLANE: &str = "identity_occurrence";
++
++/// The five members of `transport_destination`, exactly (CC 3.3.6.2).
++pub const TRANSPORT_MEMBERS: [&str; 5] = [
++    "app_name",
++    "aspects",
++    "destination_hash",
++    "reticulum_ed25519_pubkey",
++    "reticulum_x25519_pubkey",
++];
++
++fn refuse(reason: &'static str, message: impl Into<String>) -> Error {
++    Error::malformed_row(PLANE, reason, message)
++}
++
++fn payload_invalid(message: impl Into<String>) -> Error {
++    refuse(
++        malformed_row::EDITION2_PAYLOAD_INVALID,
++        format!("{OCCURRENCE_FAMILY}: {}", message.into()),
++    )
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The family model: the occurrence key's own voice
++// ─────────────────────────────────────────────────────────────────────────
++
++/// A family model that answers as the inner one, and adds the role
++/// [`OCCURRENCE_KEY_ROLE`] (party: the CWT `sub`) to `identity:occurrence`
++/// (the rc21 reading; CC 3.3.6). The edition-2 door reads every row
++/// statement through `WithOccurrenceRole(&VendoredFamilyModel)`.
++pub struct WithOccurrenceRole<'a>(
++    /// The model answered first (CC's vendored one at the door).
++    pub &'a dyn FamilyModel,
++);
++
++fn with_role(family_id: &str, mut rule: FamilyRule) -> FamilyRule {
++    if family_id == OCCURRENCE_FAMILY && !rule.roles.iter().any(|(r, _)| r == OCCURRENCE_KEY_ROLE) {
++        rule.roles
++            .push((OCCURRENCE_KEY_ROLE.to_owned(), RoleParty::Sub));
++    }
++    rule
++}
++
++impl FamilyModel for WithOccurrenceRole<'_> {
++    fn rule(&self, family_id: &str) -> Option<FamilyRule> {
++        self.0.rule(family_id).map(|r| with_role(family_id, r))
++    }
++
++    fn rule_for(&self, family_id: &str, leaf: Option<&str>, ctx: &SelectContext) -> RuleAnswer {
++        match self.0.rule_for(family_id, leaf, ctx) {
++            RuleAnswer::Rule(r) => RuleAnswer::Rule(with_role(family_id, r)),
++            other => other,
++        }
++    }
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The occurrence arm of the key-of-issuer check (way (d))
++// ─────────────────────────────────────────────────────────────────────────
++
++/// The `(iss, kid)` pairs where `kid` is a live, unevicted occurrence of
++/// the identity `iss` (an identity-ref) at the instant of the statement the
++/// directory was loaded for ([`occurrence_seats_for`]).
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct OccurrenceSeats(BTreeSet<(String, Digest32)>);
++
++impl OccurrenceSeats {
++    /// No occurrence is a key of any identity here.
++    #[must_use]
++    pub fn none() -> Self {
++        OccurrenceSeats::default()
++    }
++
++    /// These `(iss, kid)` pairs.
++    #[must_use]
++    pub fn live(pairs: impl IntoIterator<Item = (String, Digest32)>) -> Self {
++        OccurrenceSeats(pairs.into_iter().collect())
++    }
++
++    /// Is `kid` a live occurrence of the identity `iss` (an identity-ref)?
++    #[must_use]
++    pub fn admits(&self, iss: &str, kid: &Digest32) -> bool {
++        self.0.contains(&(iss.to_owned(), *kid))
++    }
++}
++
++/// **Is an occurrence live at `at`** (POSIX ms; pure): some admitted
++/// assertion `(asserted_at, valid_until)` of it covers `at` under the
++/// half-open record window ([`crate::kernel::key_end::within_record`]), and
++/// no revocation (its `effective_at`) in effect by `at` came at or after
++/// that assertion (the #421 rule: a later assertion re-establishes, a
++/// replayed older revocation is a no-op).
++#[must_use]
++pub fn occurrence_live_at(asserted: &[(u64, Option<u64>)], revocations: &[u64], at: u64) -> bool {
++    asserted.iter().any(|(from, until)| {
++        crate::kernel::key_end::within_record(at, *from, *until)
++            && !revocations.iter().any(|e| *e <= at && *e >= *from)
++    })
++}
++
++fn ms_of(t: chrono::DateTime<chrono::Utc>) -> u64 {
++    u64::try_from(t.timestamp_millis()).unwrap_or(0)
++}
++
++/// **Is `key` a live, unevicted occurrence of `identity`** for a statement
++/// signed at `at_ms`? Live at `at_ms` ([`occurrence_live_at`] over every
++/// admitted assertion of the pair, the V161 history and the held row, and
++/// the pair's revocations); and, when it is no longer live at receipt,
++/// `at_ms` within the past-freshness bound W of this node's clock (CC
++/// 3.3.6.4: an evicted key can backdate by at most W).
++///
++/// # Errors
++/// Directory read failures.
++pub async fn occurrence_live<F>(
++    dir: &F,
++    identity: &str,
++    key: &str,
++    at_ms: u64,
++) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let mut asserted: Vec<(u64, Option<u64>)> = dir
++        .list_identity_occurrence_history_by_occurrence(key)
++        .await?
++        .into_iter()
++        .filter(|h| h.identity_key_id == identity)
++        .map(|h| (ms_of(h.asserted_at), h.valid_until.map(ms_of)))
++        .collect();
++    asserted.extend(
++        dir.list_identity_occurrences_by_occurrence_key(key)
++            .await?
++            .into_iter()
++            .filter(|o| o.identity_key_id == identity)
++            .map(|o| (ms_of(o.asserted_at), o.valid_until.map(ms_of))),
++    );
++    if asserted.is_empty() {
++        return Ok(false);
++    }
++    let revocations: Vec<u64> = dir
++        .list_identity_occurrence_revocations_for(identity)
++        .await?
++        .into_iter()
++        .filter(|r| r.occurrence_key_id == key)
++        .map(|r| ms_of(r.effective_at))
++        .collect();
++    if !occurrence_live_at(&asserted, &revocations, at_ms) {
++        return Ok(false);
++    }
++    let now = ms_of(crate::federation::self_roster::roster_clock());
++    if occurrence_live_at(&asserted, &revocations, now) {
++        return Ok(true);
++    }
++    let w_ms = crate::federation::self_roster::PAST_FRESHNESS_W_SECS.unsigned_abs() * 1000;
++    Ok(at_ms.saturating_add(w_ms) >= now)
++}
++
++/// The `iss` of a statement (CWT label 1 under protected label 15).
++pub(crate) fn statement_iss(statement: &[u8]) -> Option<String> {
++    let (protected, _) = statement_parts(statement)?;
++    protected
++        .get_int(15)?
++        .get_int(1)?
++        .as_text()
++        .map(str::to_owned)
++}
++
++/// The identity-type set of the held key `key` (its `federation_keys`
++/// projection, from its edition-2 `key:record`); empty when not held.
++async fn key_types<F>(dir: &F, key: &str) -> Result<Vec<String>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    use crate::federation::types::identity_type::parse_set;
++    Ok(dir
++        .lookup_public_key(key)
++        .await?
++        .map(|k| {
++            parse_set(&k.identity_type)
++                .into_iter()
++                .map(str::to_owned)
++                .collect()
++        })
++        .unwrap_or_default())
++}
++
++/// A person's identity set: `user` or `accord_holder` (CC 2.4.1.1).
++fn is_person(types: &[String]) -> bool {
++    use crate::federation::types::identity_type::{ACCORD_HOLDER, USER};
++    types.iter().any(|t| t == USER || t == ACCORD_HOLDER)
++}
++
++/// A machine's identity set: `node` or `agent` (CC 2.4.1.1).
++fn is_machine(types: &[String]) -> bool {
++    use crate::federation::types::identity_type::{AGENT, NODE};
++    types.iter().any(|t| t == NODE || t == AGENT)
++}
++
++/// **The identity-set exclusion** (CC 3.3.6 as corrected for rc21; the
++/// RULINGS identity-set rule): an occurrence never binds a machine to a
++/// person. Under a `user` / `accord_holder` identity, a `node` / `agent`
++/// key, or `device_class: agent` (even when the key's type is not held),
++/// is refused [`malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON`]. An
++/// agent's occurrence binds the agent's own identity.
++pub(crate) async fn check_identity_set_exclusion<F>(
++    dir: &F,
++    identity: &str,
++    occurrence: &str,
++    device_class: &str,
++) -> Result<(), Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    if occurrence == identity {
++        return Ok(());
++    }
++    let identity_types = key_types(dir, identity).await?;
++    // v62.0.0 (wave O1; E7) — the other direction of the same rule: a
++    // person's key is never an occurrence of a machine identity (the sets
++    // never cohabit), so a node cannot claim a person's key and with it the
++    // person's vote.
++    if is_machine(&identity_types) && is_person(&key_types(dir, occurrence).await?) {
++        return Err(refuse(
++            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
++            format!(
++                "{OCCURRENCE_FAMILY}: {identity} is a machine's identity and {occurrence} is a \
++                 person's key: an occurrence never binds a person's key to a node or agent \
++                 (CC 3.3.6)"
++            ),
++        ));
++    }
++    if !is_person(&identity_types) {
++        return Ok(());
++    }
++    let agent_class = device_class == crate::federation::types::device_class::AGENT;
++    if agent_class || is_machine(&key_types(dir, occurrence).await?) {
++        return Err(refuse(
++            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
++            format!(
++                "{OCCURRENCE_FAMILY}: {identity} is a person's identity and {occurrence} is \
++                 a machine's key (device_class {device_class}): an occurrence never binds a \
++                 node or agent key to a person; an agent's occurrence binds the agent's own \
++                 identity (CC 3.3.6)"
++            ),
++        ));
++    }
++    Ok(())
++}
++
++/// **The occurrence seats for one statement** (way (d)): when its `kid` is
++/// not the genesis key of its `iss`, and `kid` is a live, unevicted
++/// occurrence of `iss` at the statement's `asserted_at`
++/// ([`occurrence_live`]), the one pair `(iss, kid)`; else none.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn occurrence_seats_for<F>(dir: &F, statement: &[u8]) -> Result<OccurrenceSeats, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let (Some(kid), Some(iss)) = (statement_kid(statement), statement_iss(statement)) else {
++        return Ok(OccurrenceSeats::none());
++    };
++    let Some(genesis) = kid_of_identity_ref(&iss) else {
++        return Ok(OccurrenceSeats::none());
++    };
++    if genesis == kid {
++        return Ok(OccurrenceSeats::none());
++    }
++    let Some(at) = statement_parts(statement)
++        .and_then(|(_, p)| p.get_text("asserted_at").and_then(Value::as_u64))
++    else {
++        return Ok(OccurrenceSeats::none());
++    };
++    let key = identity_ref(&kid);
++    // The identity-set exclusion: a machine's key is never a key of a
++    // person, whatever occurrence row is held.
++    if is_person(&key_types(dir, &iss).await?) && is_machine(&key_types(dir, &key).await?) {
++        return Ok(OccurrenceSeats::none());
++    }
++    if occurrence_live(dir, &iss, &key, at).await? {
++        Ok(OccurrenceSeats::live([(iss, kid)]))
++    } else {
++        Ok(OccurrenceSeats::none())
++    }
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The payload
++// ─────────────────────────────────────────────────────────────────────────
++
++fn text_member<'a>(p: &'a Value, name: &str) -> Result<&'a str, Error> {
++    p.get_text(name)
++        .and_then(Value::as_text)
++        .ok_or_else(|| payload_invalid(format!("`{name}` is required text")))
++}
++
++fn bytes_of<'a>(v: &'a Value, what: &str, len: Option<usize>) -> Result<&'a [u8], Error> {
++    let b = v
++        .as_bytes()
++        .ok_or_else(|| payload_invalid(format!("`{what}` is not bstr")))?;
++    match len {
++        Some(n) if b.len() != n => Err(payload_invalid(format!(
++            "`{what}` is {} bytes, not {n}",
++            b.len()
++        ))),
++        _ => Ok(b),
++    }
++}
++
++fn instant(ms: u64, what: &str) -> Result<chrono::DateTime<chrono::Utc>, Error> {
++    i64::try_from(ms)
++        .ok()
++        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
++        .ok_or_else(|| payload_invalid(format!("`{what}` is out of range")))
++}
++
++/// `transport_destination`: exactly the five members of CC 3.3.6.2, the
++/// `destination_hash` derived from the two keys, `app_name` and `aspects`
++/// (CC 3.3.6.3).
++fn transport_of(v: &Value) -> Result<OccurrenceTransportBinding, Error> {
++    let map = v
++        .as_map()
++        .ok_or_else(|| payload_invalid("`transport_destination` is not a map"))?;
++    let all_known = map
++        .iter()
++        .all(|(k, _)| k.as_text().is_some_and(|k| TRANSPORT_MEMBERS.contains(&k)));
++    if map.len() != TRANSPORT_MEMBERS.len() || !all_known {
++        return Err(payload_invalid(format!(
++            "`transport_destination` is a map of exactly {TRANSPORT_MEMBERS:?} (CC 3.3.6.2)"
++        )));
++    }
++    let member = |m: &str| {
++        v.get_text(m)
++            .ok_or_else(|| payload_invalid(format!("`transport_destination.{m}` is required")))
++    };
++    let x25519 = bytes_of(
++        member("reticulum_x25519_pubkey")?,
++        "transport_destination.reticulum_x25519_pubkey",
++        Some(32),
++    )?;
++    let ed25519 = bytes_of(
++        member("reticulum_ed25519_pubkey")?,
++        "transport_destination.reticulum_ed25519_pubkey",
++        Some(32),
++    )?;
++    let dest = bytes_of(
++        member("destination_hash")?,
++        "transport_destination.destination_hash",
++        Some(16),
++    )?;
++    let app_name = member("app_name")?
++        .as_text()
++        .ok_or_else(|| payload_invalid("`transport_destination.app_name` is not text"))?
++        .to_owned();
++    let aspects: Vec<String> = member("aspects")?
++        .as_array()
++        .and_then(|a| {
++            a.iter()
++                .map(|s| s.as_text().map(str::to_owned))
++                .collect::<Option<Vec<String>>>()
++        })
++        .ok_or_else(|| payload_invalid("`transport_destination.aspects` is not [* tstr]"))?;
++    let derived = ciris_verify_core::transport_binding::compute_destination_hash(
++        &app_name, &aspects, x25519, ed25519,
++    );
++    if derived.as_ref().map(|d| d.as_slice()) != Some(dest) {
++        return Err(payload_invalid(
++            "`transport_destination.destination_hash` does not derive from its keys, app_name \
++             and aspects (CC 3.3.6.3)",
++        ));
++    }
++    Ok(OccurrenceTransportBinding {
++        reticulum_x25519_pubkey_base64: B64.encode(x25519),
++        reticulum_ed25519_pubkey_base64: B64.encode(ed25519),
++        destination_hash_base64: B64.encode(dest),
++        app_name,
++        aspects,
++    })
++}
++
++/// `encryption_pubkeys`: exactly `x25519` (32 bytes) and `ml_kem_768`
++/// (1184 bytes).
++fn encryption_of(v: &Value) -> Result<(Vec<u8>, Vec<u8>), Error> {
++    let map = v
++        .as_map()
++        .ok_or_else(|| payload_invalid("`encryption_pubkeys` is not a map"))?;
++    if map.len() != 2 {
++        return Err(payload_invalid(
++            "`encryption_pubkeys` is a map of exactly `x25519` and `ml_kem_768`",
++        ));
++    }
++    let member = |m: &str| {
++        v.get_text(m)
++            .ok_or_else(|| payload_invalid(format!("`encryption_pubkeys.{m}` is required")))
++    };
++    let x = bytes_of(member("x25519")?, "encryption_pubkeys.x25519", Some(32))?;
++    let m = bytes_of(
++        member("ml_kem_768")?,
++        "encryption_pubkeys.ml_kem_768",
++        Some(1184),
++    )?;
++    Ok((x.to_vec(), m.to_vec()))
++}
++
++/// The X-Wing keys at the payload's top level, each exactly 1216 bytes.
++fn xwing_of(p: &Value, member: &'static str) -> Result<Option<XWingPublicKey>, Error> {
++    let Some(v) = p.get_text(member) else {
++        return Ok(None);
++    };
++    let b = v
++        .as_bytes()
++        .ok_or_else(|| payload_invalid(format!("`{member}` is not bstr")))?;
++    XWingPublicKey::from_bytes(b).map(Some).ok_or_else(|| {
++        refuse(
++            malformed_row::XWING_PUBKEY_WRONG_LENGTH,
++            format!(
++                "`{member}` is {} bytes; an X-Wing public key is exactly 1216 (CC 3.3.6.2)",
++                b.len()
++            ),
++        )
++    })
++}
++
++/// **The payload of an occurrence row, read and checked** (pure):
++/// an `author` is present, `occurrence_key_id` is the `sub`;
++/// `device_class` in the closed set; `valid_until`, when present, later than
++/// `asserted_at` (`valid_until_not_after_asserted_at`, the door's
++/// `check_valid_until_after_asserted_at`);
++/// `transport_destination` and `encryption_pubkeys` of their exact shapes,
++/// the content KEM x25519 not the Reticulum link x25519 (CC 3.3.6.1);
++/// `onion_relay`, when present, exactly `{"opt_out": true}`. The X-Wing keys'
++/// in-row separation needs the signer's keys and is checked by the door.
++///
++/// # Errors
++/// As above; `edition2_payload_invalid` for a shape fault;
++/// `federation_device_class_rejected` for a device class outside the set.
++pub fn read_payload(row: &AdmittedRow) -> Result<IdentityOccurrence, Error> {
++    let p = &row.payload;
++    let identity_key_id = text_member(p, "identity_key_id")?.to_owned();
++    let occurrence_key_id = text_member(p, "occurrence_key_id")?.to_owned();
++    // Who authors it (the identity itself, or an agent's owner) is the
++    // door's: it needs the directory ([`put_occurrence_voice`]).
++    if row.author.is_none() {
++        return Err(payload_invalid(
++            "an occurrence row is authored: `author` is required",
++        ));
++    }
++    if row.sub != occurrence_key_id {
++        return Err(payload_invalid("`occurrence_key_id` is the row's `sub`"));
++    }
++    let device_class = text_member(p, "device_class")?.to_owned();
++    crate::federation::check_device_class(&device_class)?;
++    let asserted_at_ms = row.asserted_at_ms;
++    let valid_until_ms = match p.get_text("valid_until") {
++        None => None,
++        Some(v) => Some(
++            v.as_u64()
++                .ok_or_else(|| payload_invalid("`valid_until` is not uint (ms)"))?,
++        ),
++    };
++    // The door's one window rule (K1): absent, indefinite; present, later
++    // than `asserted_at`.
++    super::door::check_valid_until_after_asserted_at(p)?;
++    let hardware_attestation = match p.get_text("hardware_attestation") {
++        None => None,
++        Some(v) => Some(B64.encode(bytes_of(v, "hardware_attestation", None)?)),
++    };
++    let transport_binding = p
++        .get_text("transport_destination")
++        .map(transport_of)
++        .transpose()?;
++    let encryption = p
++        .get_text("encryption_pubkeys")
++        .map(encryption_of)
++        .transpose()?;
++    if let (Some((x, _)), Some(tb)) = (&encryption, &transport_binding) {
++        if B64.encode(x) == tb.reticulum_x25519_pubkey_base64 {
++            return Err(payload_invalid(
++                "`encryption_pubkeys.x25519` is the Reticulum link x25519: the content KEM key \
++                 is a fresh key (CC 3.3.6.1 key separation)",
++            ));
++        }
++    }
++    if let Some(r) = p.get_text("onion_relay") {
++        let opt_out = r.as_map().is_some_and(|m| m.len() == 1)
++            && matches!(r.get_text("opt_out"), Some(Value::Bool(true)));
++        if !opt_out {
++            return Err(payload_invalid(
++                "`onion_relay` is exactly {\"opt_out\": true} (CC 3.3.6.2)",
++            ));
++        }
++    }
++    Ok(IdentityOccurrence {
++        identity_key_id,
++        occurrence_key_id,
++        device_class,
++        hardware_attestation,
++        asserted_at: instant(asserted_at_ms, "asserted_at")?,
++        valid_until: valid_until_ms
++            .map(|u| instant(u, "valid_until"))
++            .transpose()?,
++        encryption_pubkeys: encryption.map(|(x, m)| EncryptionPubkeys {
++            x25519_base64: B64.encode(x),
++            ml_kem_768_base64: B64.encode(m),
++        }),
++        transport_binding,
++        persist_row_hash: String::new(),
++    })
++}
++
++/// The X-Wing keys' in-row separation (CC 3.3.6.2): each half of
++/// `transit_xwing_pubkey` and `onion_hop_xwing_pubkey` differs from the
++/// Reticulum link x25519 and transport ed25519, the content KEM keys, and
++/// the signing key's two halves; the hop key from the transit key's halves
++/// too. The same rule the transport door applies.
++async fn check_xwing_in_row<F>(dir: &F, row: &AdmittedRow) -> Result<(), Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let transit = xwing_of(&row.payload, TRANSIT_XWING_PUBKEY_MEMBER)?;
++    let hop = xwing_of(&row.payload, ONION_HOP_XWING_PUBKEY_MEMBER)?;
++    if transit.is_none() && hop.is_none() {
++        return Ok(());
++    }
++    let p = &row.payload;
++    let mut keys: Vec<Vec<u8>> = Vec::new();
++    if let Some(td) = p.get_text("transport_destination") {
++        for m in ["reticulum_x25519_pubkey", "reticulum_ed25519_pubkey"] {
++            keys.extend(td.get_text(m).and_then(Value::as_bytes).map(<[u8]>::to_vec));
++        }
++    }
++    if let Some(enc) = p.get_text("encryption_pubkeys") {
++        for m in ["x25519", "ml_kem_768"] {
++            keys.extend(
++                enc.get_text(m)
++                    .and_then(Value::as_bytes)
++                    .map(<[u8]>::to_vec),
++            );
++        }
++    }
++    if let Some(signer) = dir.lookup_public_key(&identity_ref(&row.kid)).await? {
++        keys.extend(B64.decode(&signer.pubkey_ed25519_base64).ok());
++        keys.extend(
++            signer
++                .pubkey_ml_dsa_65_base64
++                .as_deref()
++                .and_then(|s| B64.decode(s).ok()),
++        );
++    }
++    let reuse = |r: crate::federation::self_at_login::XWingReuseRefusal, member: &str| {
++        refuse(
++            r.as_str(),
++            format!(
++                "{OCCURRENCE_FAMILY}: a half of `{member}` is another key on the same row; the \
++                 X-Wing key must be key-separated (CC 3.3.6.2)"
++            ),
++        )
++    };
++    if let Some(t) = &transit {
++        check_xwing_halves(XWingKeyRole::Transit, t, keys.iter().map(Vec::as_slice))
++            .map_err(|r| reuse(r, TRANSIT_XWING_PUBKEY_MEMBER))?;
++    }
++    if let Some(h) = &hop {
++        let mut with_transit: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
++        if let Some(t) = &transit {
++            with_transit.push(t.ml_kem_768());
++            with_transit.push(t.x25519());
++        }
++        check_xwing_halves(XWingKeyRole::OnionHop, h, with_transit)
++            .map_err(|r| reuse(r, ONION_HOP_XWING_PUBKEY_MEMBER))?;
++    }
++    Ok(())
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The door
++// ─────────────────────────────────────────────────────────────────────────
++
++/// An admitted occurrence bind, ready for the typed table
++/// ([`crate::federation::FederationDirectory::put_identity_occurrence_edition2`]).
++#[derive(Clone, Debug)]
++pub struct OccurrenceBind {
++    /// The typed row (`persist_row_hash` is computed by the write).
++    pub occurrence: IdentityOccurrence,
++    /// The identity-ref of the key whose author statement landed it.
++    pub author_key_id: String,
++    /// The bind's row id.
++    pub row_id: RowId,
++    /// The bind's held statements, as received: the landing author
++    /// statement first, then every other voice over the row.
++    pub statements: Vec<Vec<u8>>,
++}
++
++impl OccurrenceBind {
++    /// What the typed row keeps in `signed_envelope`: the row id, the
++    /// landing author key, and the statements themselves, lowercase hex
++    /// (`ceg_statement`: the author's; `ceg_statements`: every voice), the
++    /// way a projected plane carries its statement (CC 2.6.3). `signature`
++    /// is NULL; the signed listing serves this envelope
++    /// ([`edition2_signature_placeholder`]).
++    #[must_use]
++    pub fn envelope(&self) -> serde_json::Value {
++        let hexes: Vec<String> = self.statements.iter().map(hex::encode).collect();
++        let mut env = serde_json::json!({
++            "edition2_row_id": self.row_id.hex(),
++            "author_key_id": self.author_key_id,
++            "ceg_statements": hexes,
++        });
++        if let (Some(o), Some(first)) = (env.as_object_mut(), hexes.first()) {
++            o.insert(
++                super::ingest::STATEMENT_MEMBER.to_owned(),
++                serde_json::Value::String(first.clone()),
++            );
++        }
++        env
++    }
++}
++
++/// The `signature` a signed occurrence listing reports for an edition-2
++/// bind, which has none of the earlier form: empty, no ML-DSA half. Its
++/// authority is the `ceg_statement` its `signed_envelope` carries; a
++/// consumer verifies that statement, never this value.
++#[must_use]
++pub fn edition2_signature_placeholder(
++) -> ciris_verify_core::transport_binding::TransportBindingSignature {
++    ciris_verify_core::transport_binding::TransportBindingSignature {
++        ed25519_signature_base64: String::new(),
++        mldsa65_signature_base64: None,
++    }
++}
++
++/// Is this held statement the occurrence key's own voice over its bind?
++fn is_own_voice(statement: &[u8], occurrence: &str, occurrence_kid: &Digest32) -> bool {
++    statement_kid(statement).as_ref() == Some(occurrence_kid)
++        && statement_iss(statement).as_deref() == Some(occurrence)
++}
++
++/// Does the bind land with these author statements? Not a roster change
++/// (the self pair; a node or agent identity; a key that is not user-role;
++/// a key already on the roster): yes. A roster change of a user self: when a
++/// strict majority of its live roster signed as the identity (CC 3.3.6.4,
++/// the quorum path, the proposer counted).
++async fn lands<F>(
++    dir: &F,
++    identity: &str,
++    occurrence: &str,
++    held: &[Vec<u8>],
++    author_key: &str,
++) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    use crate::federation::self_roster::{is_user_key, roster_now};
++    if occurrence == identity
++        || !is_user_key(dir, identity).await?
++        || !is_user_key(dir, occurrence).await?
++    {
++        return Ok(true);
++    }
++    let roster = roster_now(dir, identity).await?;
++    if roster.contains(occurrence) {
++        return Ok(true);
++    }
++    let mut voters: BTreeSet<String> = held
++        .iter()
++        .filter(|st| statement_iss(st).as_deref() == Some(identity))
++        .filter_map(|st| statement_kid(st))
++        .map(|k| identity_ref(&k))
++        .filter(|k| roster.contains(k))
++        .collect();
++    if roster.contains(author_key) {
++        voters.insert(author_key.to_owned());
++    }
++    Ok(voters.len() * 2 > roster.len())
++}
++
++/// **The `identity:occurrence` door** (module docs): one admitted statement
++/// of the family, from [`super::ingest::put_statement`].
++///
++/// - the occurrence key's own statement is held:
++///   [`StatementOutcome::Voice`];
++/// - an author statement with the occurrence key's own statement held, by a
++///   key that acts for the identity, is held; when the bind lands it is
++///   written to the typed table: [`StatementOutcome::Row`]; while a roster
++///   change waits on more roster keys: [`StatementOutcome::Voice`].
++///
++/// # Errors
++/// - the payload's refusals ([`read_payload`], the X-Wing separation);
++/// - `occurrence_voice_not_own_key`: a statement in the occurrence key's
++///   role not signed by that key itself;
++/// - the retryable `federation_attester_key_unknown`, naming the occurrence
++///   key: an author statement before the occurrence key's own (nothing is
++///   stored);
++/// - `federation_signer_not_acting_for` (the JSON door's rule), a clock-skew
++///   refusal for a future-dated bind; directory failures.
++pub async fn put_occurrence_voice<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    super::payloads::check(&row.family, &row.payload)?;
++    let occurrence = read_payload(row)?;
++    check_xwing_in_row(dir, row).await?;
++    let identity = occurrence.identity_key_id.clone();
++    let occ = occurrence.occurrence_key_id.clone();
++    let occ_kid = kid_of_identity_ref(&occ)
++        .ok_or_else(|| payload_invalid("`occurrence_key_id` is not an identity-ref"))?;
++    check_identity_set_exclusion(dir, &identity, &occ, &occurrence.device_class).await?;
++    let own_role = row.iss == occ && row.iss == row.sub;
++    if own_role && row.kid != occ_kid {
++        return Err(refuse(
++            malformed_row::OCCURRENCE_VOICE_NOT_OWN_KEY,
++            format!(
++                "{OCCURRENCE_FAMILY}: the statement in the occurrence key's role is signed by {}, \
++                 not by the occurrence key {occ} itself (proof of possession)",
++                identity_ref(&row.kid)
++            ),
++        ));
++    }
++    // Who authors the bind: the identity itself; for an agent's identity,
++    // the agent's OWNER (CC 3.3.6: "the author is the owner's roster key,
++    // plus the agent key's own statement"), and no owner refuses it.
++    let author = row.author.clone().unwrap_or_default();
++    let bind_author = if key_types(dir, &identity)
++        .await?
++        .iter()
++        .any(|t| t == crate::federation::types::identity_type::AGENT)
++    {
++        let Some(owner) =
++            crate::federation::admission::agent_owner_of(dir, &identity, row.asserted_at_ms)
++                .await?
++        else {
++            return Err(refuse(
++                malformed_row::AGENT_OCCURRENCE_UNOWNED,
++                format!(
++                    "{OCCURRENCE_FAMILY}: the agent {identity} has no live owner binding \
++                     (`ownership:{{relation}}:agent:{{version}}`) at {}: its occurrence is \
++                     authored by its owner (CC 3.3.6)",
++                    row.asserted_at_ms
++                ),
++            ));
++        };
++        if author != owner {
++            return Err(refuse(
++                malformed_row::AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
++                format!(
++                    "{OCCURRENCE_FAMILY}: the agent {identity}'s occurrence is authored by \
++                     {author}, not by its owner {owner} (CC 3.3.6)"
++                ),
++            ));
++        }
++        owner
++    } else {
++        if author != identity {
++            return Err(payload_invalid(
++                "`identity_key_id` is the row's `author`: the identity authors its own \
++                 occurrence (an agent's owner authors the agent's)",
++            ));
++        }
++        identity.clone()
++    };
++    let author_voice = row.iss == bind_author;
++    if !author_voice {
++        // The occurrence key's own statement: held; it lands nothing alone.
++        let new = dir.put_edition2_statement(row).await?;
++        return Ok(StatementOutcome::Voice {
++            row_id: row.row_id,
++            new,
++        });
++    }
++    // An author statement. (For the self pair, identity = occurrence, the
++    // genesis key's one statement is both voices.)
++    let held = dir.edition2_voices(&row.row_id).await?;
++    let possession = (own_role && row.kid == occ_kid)
++        || (row.kid == occ_kid && identity == occ)
++        || held.iter().any(|st| is_own_voice(st, &occ, &occ_kid));
++    if !possession {
++        return Err(Error::unknown_signer(&occ, PLANE));
++    }
++    let author_key = identity_ref(&row.kid);
++    // The author's key is a live roster key of the author's identity (the
++    // identity's, or the agent's owner's): the JSON door's rule.
++    crate::federation::admission::check_signer_acts_for(dir, &author_key, &bind_author, PLANE)
++        .await?;
++    crate::federation::operational::check_skew_bound(
++        occurrence.asserted_at,
++        crate::host::clock::now(),
++    )?;
++    let new = dir.put_edition2_statement(row).await?;
++    if !lands(dir, &identity, &occ, &held, &author_key).await? {
++        return Ok(StatementOutcome::Voice {
++            row_id: row.row_id,
++            new,
++        });
++    }
++    let mut statements = vec![row.bytes.clone()];
++    statements.extend(held.into_iter().filter(|st| *st != row.bytes));
++    dir.put_identity_occurrence_edition2(OccurrenceBind {
++        occurrence,
++        author_key_id: author_key,
++        row_id: row.row_id,
++        statements,
++    })
++    .await?;
++    Ok(StatementOutcome::Row {
++        row_id: row.row_id,
++        new,
++    })
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The X-Wing keys a bind carries (E8's finding)
++// ─────────────────────────────────────────────────────────────────────────
++
++/// The X-Wing keys a held edition-2 bind of an occurrence carries at its
++/// payload's top level (CC 3.3.6.2).
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct BindXWing {
++    /// `transit_xwing_pubkey`.
++    pub transit: Option<XWingPublicKey>,
++    /// `onion_hop_xwing_pubkey`.
++    pub onion_hop: Option<XWingPublicKey>,
++}
++
++/// **The X-Wing keys of `occurrence_key_id`'s live edition-2 bind**, for a
++/// node that is NOT a seat of the genesis bundle in force (a seat's keys are
++/// the bundle binding's, moved only by a counted `transport:canonical_rebind`:
++/// W1's rule, `transit_xwing_pubkey_for`). Read from the held statement the
++/// typed row carries (`signed_envelope.ceg_statement`), for every identity
++/// the key is a live occurrence of now ([`occurrence_live`]). `None` for a
++/// seat, for no live bind, and when two live binds carry different keys.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn bind_xwing_keys_for<F>(
++    dir: &F,
++    occurrence_key_id: &str,
++) -> Result<Option<BindXWing>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    if super::genesis::genesis_in_force(dir)
++        .await?
++        .seat(occurrence_key_id)
++        .is_some()
++    {
++        return Ok(None);
++    }
++    let now = ms_of(crate::host::clock::now());
++    let mut found: Option<BindXWing> = None;
++    let mut identities: Vec<String> = dir
++        .list_identity_occurrences_by_occurrence_key(occurrence_key_id)
++        .await?
++        .into_iter()
++        .map(|o| o.identity_key_id)
++        .collect();
++    identities.sort();
++    identities.dedup();
++    for identity in identities {
++        if !occurrence_live(dir, &identity, occurrence_key_id, now).await? {
++            continue;
++        }
++        let signed = dir.list_signed_identity_occurrences_for(&identity).await?;
++        let Some(statement) = signed
++            .iter()
++            .find(|s| s.identity_occurrence.occurrence_key_id == occurrence_key_id)
++            .and_then(|s| s.signed_envelope.get(super::ingest::STATEMENT_MEMBER))
++            .and_then(serde_json::Value::as_str)
++            .and_then(|h| hex::decode(h).ok())
++        else {
++            continue;
++        };
++        let Some((_, payload)) = statement_parts(&statement) else {
++            continue;
++        };
++        let (Ok(transit), Ok(onion_hop)) = (
++            xwing_of(&payload, TRANSIT_XWING_PUBKEY_MEMBER),
++            xwing_of(&payload, ONION_HOP_XWING_PUBKEY_MEMBER),
++        ) else {
++            continue;
++        };
++        let keys = BindXWing { transit, onion_hop };
++        match &found {
++            None => found = Some(keys),
++            Some(k) if *k == keys => {}
++            Some(_) => return Ok(None),
++        }
++    }
++    Ok(found)
++}
++
++/// **A non-seat node's transit X-Wing key from its edition-2 bind**
++/// ([`bind_xwing_keys_for`]), passing the cross-row rule at use (a half
++/// equal to any key on the node's current occurrence ⇒ `None`, CC 3.3.6.2).
++/// `transit_xwing_pubkey_for`'s answer when no route-plane binding carries
++/// one.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn bind_transit_xwing_for<F>(
++    dir: &F,
++    occurrence_key_id: &str,
++) -> Result<Option<XWingPublicKey>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let Some(BindXWing {
++        transit: Some(key), ..
++    }) = bind_xwing_keys_for(dir, occurrence_key_id).await?
++    else {
++        return Ok(None);
++    };
++    let others =
++        crate::federation::self_at_login::other_keys_of(dir, occurrence_key_id, &[]).await?;
++    if check_xwing_halves(XWingKeyRole::Transit, &key, others.all()).is_err() {
++        return Ok(None);
++    }
++    Ok(Some(key))
++}
++
++/// **The onion hop X-Wing key of `occurrence_key_id`** (CC 3.3.6.2, CC
++/// 5.4.6): for a seat of the genesis bundle in force, its bundle binding's;
++/// else its live edition-2 bind's ([`bind_xwing_keys_for`]), passing the
++/// cross-row rule at use (also against the transit key's halves).
++///
++/// # Errors
++/// Directory read failures.
++pub async fn onion_hop_xwing_pubkey_for<F>(
++    dir: &F,
++    occurrence_key_id: &str,
++) -> Result<Option<XWingPublicKey>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    if let Some(seat) = super::genesis::genesis_in_force(dir)
++        .await?
++        .seat(occurrence_key_id)
++    {
++        return Ok(XWingPublicKey::from_bytes(&seat.onion_hop_xwing_pubkey));
++    }
++    let Some(BindXWing {
++        transit,
++        onion_hop: Some(key),
++    }) = bind_xwing_keys_for(dir, occurrence_key_id).await?
++    else {
++        return Ok(None);
++    };
++    let others =
++        crate::federation::self_at_login::other_keys_of(dir, occurrence_key_id, &[]).await?;
++    let mut with_transit: Vec<&[u8]> = others.all().collect();
++    if let Some(t) = &transit {
++        with_transit.push(t.ml_kem_768());
++        with_transit.push(t.x25519());
++    }
++    if check_xwing_halves(XWingKeyRole::OnionHop, &key, with_transit).is_err() {
++        return Ok(None);
++    }
++    Ok(Some(key))
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  An occurrence's own agreement, in edition 2 (E7's finding)
++// ─────────────────────────────────────────────────────────────────────────
++
++/// Is `key` a person's key (`user` / `accord_holder` in its record's
++/// identity-type set)?
++///
++/// # Errors
++/// Directory read failures.
++pub async fn is_person_key<F>(dir: &F, key: &str) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    Ok(is_person(&key_types(dir, key).await?))
++}
++
++/// Is `key` a machine's key (`node` / `agent` in its record's identity-type
++/// set)?
++///
++/// # Errors
++/// Directory read failures.
++pub async fn is_machine_key<F>(dir: &F, key: &str) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    Ok(is_machine(&key_types(dir, key).await?))
++}
++
++/// **The instant `occurrence` itself first agreed to be an occurrence of
++/// `identity`, in edition 2**: the earliest `asserted_at` of a held
++/// statement over an `identity:occurrence` row about `occurrence` (CWT
++/// `sub`) that the occurrence key gave itself (`iss` = `sub`, its own key,
++/// the bind's required second voice) and whose payload names `identity`.
++/// The earlier form's agreement (an assertion the occurrence signed as
++/// attester) is the caller's, behind the earlier-form switch.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn own_voice_agreed_from<F>(
++    dir: &F,
++    identity: &str,
++    occurrence: &str,
++) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let Some(occ_kid) = kid_of_identity_ref(occurrence) else {
++        return Ok(None);
++    };
++    let mut first: Option<u64> = None;
++    for st in dir
++        .edition2_statements_about(OCCURRENCE_FAMILY, occurrence)
++        .await?
++    {
++        if !is_own_voice(&st, occurrence, &occ_kid) {
++            continue;
++        }
++        let Some((_, p)) = statement_parts(&st) else {
++            continue;
++        };
++        if p.get_text("identity_key_id").and_then(Value::as_text) != Some(identity) {
++            continue;
++        }
++        if let Some(a) = p.get_text("asserted_at").and_then(Value::as_u64) {
++            first = Some(first.map_or(a, |f| f.min(a)));
++        }
++    }
++    Ok(first
++        .and_then(|a| i64::try_from(a).ok())
++        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis))
++}
+diff --git a/src/federation/edition2/occurrence_invariants.rs b/src/federation/edition2/occurrence_invariants.rs
+new file mode 100644
+index 00000000..d2bf3f1d
+--- /dev/null
++++ b/src/federation/edition2/occurrence_invariants.rs
+@@ -0,0 +1,564 @@
++//! **I3020–I3026, I3030, I3032–I3034, I3044** (wave O1; CC 3.3.6, CC 3.3.6.4, CC 3.1.3, the rc21
++//! rule): the edition-2 `identity:occurrence` bind and the key-of-issuer
++//! check's occurrence arm, on sqlite and postgres.
++//!
++//! - I3020: a user's second device, bound by the user and its own key,
++//!   signs as the user and is admitted (the occurrence arm answers `Yes`).
++//! - I3021: once its occurrence is revoked, the same device signing as the
++//!   user is refused `kid_not_of_iss`.
++//! - I3022: an author statement with no statement of the occurrence key's
++//!   own is refused (retryable, naming the occurrence key) and binds
++//!   nothing.
++//! - I3023: an agent's occurrence binds the agent's own identity and is
++//!   AUTHORED by the agent's owner (its `ownership:…:agent:…` binding
++//!   held): the owner's statement plus the agent occurrence key's own is
++//!   admitted to the occurrence table.
++//! - I3032: the agent identity authoring its own occurrence is refused
++//!   `agent_occurrence_not_owner_authored`.
++//! - I3033: an agent with no owner binding: its bind is refused
++//!   `agent_occurrence_unowned`, and nothing is bound.
++//! - I3034: an edition-2 bind appears in the signed occurrence listing,
++//!   which serves its statements (`ceg_statement`, `ceg_statements`) and no
++//!   earlier-form signature.
++//! - I3024: `valid_until` not after `asserted_at` is refused
++//!   `valid_until_not_after_asserted_at`.
++//! - I3025 (pure): the occurrence window is half-open, and a revocation
++//!   after an assertion ends it until a later assertion.
++//! - I3026 (pure): the door's family model adds the occurrence key's role to
++//!   `identity:occurrence` and to no other family.
++//! - I3030: no occurrence binds a machine to a person (CC 3.3.6, rc21): an
++//!   agent key under a user identity (as `agent` or as `laptop`), and
++//!   `device_class: agent` under a user identity, are refused
++//!   `occurrence_binds_machine_to_person`; and an agent key is never a key
++//!   of its owner's identity (`kid_not_of_iss`).
++//! - I3044: the trusted-LOCAL occurrence door keeps the same exclusion: an
++//!   agent key under a user, a user key under an agent identity, and
++//!   `device_class: agent` under a user are refused
++//!   `occurrence_binds_machine_to_person`; a user's device under the user is
++//!   stored.
++
++use ciris_crypto::composite::CompositeSigningKey;
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::family::{FamilyModel as _, RoleParty, VendoredFamilyModel};
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::door_invariants::fixture::{iref, key, key_record, kid, map};
++use super::ingest::{held_keys_for, put_statement, StatementOutcome, INGEST_TIER};
++use super::liveness::KeyOf;
++use super::occurrence::{
++    occurrence_live_at, WithOccurrenceRole, OCCURRENCE_FAMILY, OCCURRENCE_KEY_ROLE,
++};
++use crate::federation::types::IdentityOccurrenceRevocation;
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++fn reason(e: &Error) -> String {
++    match e {
++        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
++        other => other.kind().to_owned(),
++    }
++}
++
++fn at(ms: u64) -> chrono::DateTime<chrono::Utc> {
++    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(i64::try_from(ms).unwrap()).unwrap()
++}
++
++/// One statement over an `identity:occurrence` payload: `signer` signs as
++/// `iss`; the row's `sub` is the occurrence key, its `author` the identity.
++fn bind(
++    signer: &CompositeSigningKey,
++    iss: &str,
++    identity: &str,
++    occurrence: &str,
++    device_class: &str,
++    asserted_at: u64,
++    valid_until: Option<u64>,
++) -> Vec<u8> {
++    bind_authored(
++        signer,
++        iss,
++        identity,
++        identity,
++        occurrence,
++        device_class,
++        asserted_at,
++        valid_until,
++    )
++}
++
++/// [`bind`] with an `author` other than the identity (an agent's owner).
++#[allow(clippy::too_many_arguments)]
++fn bind_authored(
++    signer: &CompositeSigningKey,
++    iss: &str,
++    author: &str,
++    identity: &str,
++    occurrence: &str,
++    device_class: &str,
++    asserted_at: u64,
++    valid_until: Option<u64>,
++) -> Vec<u8> {
++    let mut m = vec![
++        ("asserted_at", Value::Uint(asserted_at)),
++        ("author", Value::Text(author.to_owned())),
++        ("identity_key_id", Value::Text(identity.to_owned())),
++        ("occurrence_key_id", Value::Text(occurrence.to_owned())),
++        ("device_class", Value::Text(device_class.to_owned())),
++    ];
++    if let Some(u) = valid_until {
++        m.push(("valid_until", Value::Uint(u)));
++    }
++    sign_row_statement(
++        signer,
++        iss,
++        occurrence,
++        "scores",
++        OCCURRENCE_FAMILY,
++        &map(m),
++        vec![],
++    )
++    .unwrap()
++}
++
++/// An authored score row (the I1909 vector family) `signer` signs as `iss`.
++fn row_as(signer: &CompositeSigningKey, iss: &str, asserted_at: u64) -> Vec<u8> {
++    let payload = map(vec![
++        ("asserted_at", Value::Uint(asserted_at)),
++        ("author", Value::Text(iss.to_owned())),
++        ("score", Value::Uint(750_000)),
++        ("confidence", Value::Uint(900_000)),
++        (
++            "dimension",
++            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
++        ),
++    ]);
++    sign_row_statement(
++        signer,
++        iss,
++        iss,
++        "scores",
++        "evidence:.suite:.kind:.cell:.prefix",
++        &payload,
++        vec![],
++    )
++    .unwrap()
++}
++
++async fn put(d: &dyn FederationDirectory, st: &[u8]) -> Result<StatementOutcome, Error> {
++    Box::pin(put_statement(d, st, None, INGEST_TIER)).await
++}
++
++async fn bound(d: &dyn FederationDirectory, identity: &str, occurrence: &str) -> Option<String> {
++    d.list_identity_occurrences_for(identity)
++        .await
++        .unwrap()
++        .into_iter()
++        .find(|o| o.occurrence_key_id == occurrence)
++        .map(|o| o.device_class)
++}
++
++/// The owner binding `delegates_to(owner → agent)` of the family
++/// `ownership:{relation}:{target_kind}:{version}` at
++/// `ownership:responsible_party:agent:v1`: the owner's statement and the
++/// agent's own (its `bound_node` second voice), admitted by the door and
++/// held as edition-2 statements (what `admission::agent_owner_of` reads).
++async fn put_agent_owner_binding(
++    d: &dyn FederationDirectory,
++    owner: &CompositeSigningKey,
++    agent: &CompositeSigningKey,
++    asserted_at: u64,
++) {
++    let family = ciris_verify_core::namespace_match::family_id(
++        "ownership:{relation}:{target_kind}:{version}",
++    );
++    let payload = map(vec![
++        ("asserted_at", Value::Uint(asserted_at)),
++        ("author", Value::Text(iref(owner))),
++        (
++            "dimension",
++            Value::Text("ownership:responsible_party:agent:v1".into()),
++        ),
++    ]);
++    for (signer, iss) in [(owner, iref(owner)), (agent, iref(agent))] {
++        let st = sign_row_statement(
++            signer,
++            &iss,
++            &iref(agent),
++            "delegates_to",
++            &family,
++            &payload,
++            vec![],
++        )
++        .unwrap();
++        let keys = held_keys_for(d, &st).await.unwrap();
++        let admitted = super::door::admit_row(
++            &st,
++            &keys,
++            None,
++            ciris_verify_core::edition2::family::SelectContext::default(),
++        )
++        .unwrap_or_else(|e| panic!("owner binding voice of {iss}: {e}"));
++        d.put_edition2_statement(&admitted).await.unwrap();
++    }
++}
++
++pub(crate) async fn body(d: &dyn FederationDirectory) {
++    let user = key(70);
++    let device = key(71);
++    let lone = key(72);
++    let agent = key(73);
++    let ended = key(74);
++    let agent_key = key(75);
++    for k in [&user, &device, &lone, &ended] {
++        put(d, &key_record(k, &["user"], 0, None)).await.unwrap();
++    }
++    // An agent identity and its occurrence key; an agent key states an end
++    // (CC 2.4.1.1): 1 000 ms to 30 days later.
++    for k in [&agent, &agent_key] {
++        put(
++            d,
++            &key_record(k, &["agent"], 1_000, Some(1_000 + 2_592_000_000)),
++        )
++        .await
++        .unwrap();
++    }
++    let u = iref(&user);
++
++    // I3020: the device's own statement, then the user's, bind it.
++    let own = bind(
++        &device,
++        &iref(&device),
++        &u,
++        &iref(&device),
++        "phone",
++        10_000,
++        None,
++    );
++    let StatementOutcome::Voice { row_id, new: true } = put(d, &own).await.unwrap() else {
++        panic!("I3020: the occurrence key's own statement is held as a voice");
++    };
++    assert_eq!(
++        bound(d, &u, &iref(&device)).await,
++        None,
++        "I3020: one voice binds nothing"
++    );
++    let by_user = bind(&user, &u, &u, &iref(&device), "phone", 10_000, None);
++    assert_eq!(
++        put(d, &by_user).await.unwrap(),
++        StatementOutcome::Row { row_id, new: true },
++        "I3020: the author's statement lands the bind"
++    );
++    assert_eq!(
++        bound(d, &u, &iref(&device)).await.as_deref(),
++        Some("phone"),
++        "I3020: the bind is in the occurrence table"
++    );
++    // The device signs as the user: a key of the user's, and admitted.
++    let signed = row_as(&device, &u, 20_000);
++    let keys = held_keys_for(d, &signed).await.unwrap();
++    assert_eq!(
++        keys.key_of(&kid(&device), &kid(&user)),
++        KeyOf::Yes,
++        "I3020: the occurrence arm"
++    );
++    let out = put(d, &signed).await;
++    assert!(
++        matches!(out, Ok(StatementOutcome::Row { .. })),
++        "I3020: the second device signing as the user is admitted: {out:?}"
++    );
++
++    // I3021: revoked at 30 000 ms, its later statement as the user is not
++    // of the user's.
++    d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
++        identity_key_id: u.clone(),
++        occurrence_key_id: iref(&device),
++        revoked_at: at(30_000),
++        effective_at: at(30_000),
++        reason: None,
++        witness_set: Vec::new(),
++        persist_row_hash: String::new(),
++    })
++    .await
++    .unwrap();
++    let after = row_as(&device, &u, 40_000);
++    let keys = held_keys_for(d, &after).await.unwrap();
++    assert_eq!(
++        keys.key_of(&kid(&device), &kid(&user)),
++        KeyOf::No,
++        "I3021: a revoked occurrence is not a key of its identity"
++    );
++    let e = put(d, &after).await.unwrap_err();
++    assert_eq!(reason(&e), malformed_row::KID_NOT_OF_ISS, "I3021: {e}");
++
++    // I3022: the user's statement alone, the occurrence key silent.
++    let alone = bind(&user, &u, &u, &iref(&lone), "laptop", 11_000, None);
++    let e = put(d, &alone).await.unwrap_err();
++    assert_eq!(
++        e.kind(),
++        "federation_attester_key_unknown",
++        "I3022: retryable, waiting on the occurrence key's own statement: {e}"
++    );
++    assert!(e.to_string().contains(&iref(&lone)), "I3022 names it: {e}");
++    assert_eq!(
++        bound(d, &u, &iref(&lone)).await,
++        None,
++        "I3022: nothing bound"
++    );
++
++    // I3023: an agent's occurrence binds the AGENT's identity, authored by
++    // the agent's OWNER (its owner binding held), plus the agent occurrence
++    // key's own statement.
++    let ai = iref(&agent);
++    let ak = iref(&agent_key);
++    // I3033 (first, before any owner binding): an unowned agent's bind is
++    // refused, at its first voice, and nothing is held.
++    let unowned = bind_authored(&agent_key, &ak, &u, &ai, &ak, "agent", 11_500, None);
++    let e = put(d, &unowned).await.unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::AGENT_OCCURRENCE_UNOWNED,
++        "I3033: {e}"
++    );
++    assert_eq!(bound(d, &ai, &ak).await, None, "I3033: nothing bound");
++    put_agent_owner_binding(d, &user, &agent, 5_000).await;
++    let agent_own = bind_authored(&agent_key, &ak, &u, &ai, &ak, "agent", 12_000, None);
++    assert!(
++        matches!(put(d, &agent_own).await, Ok(StatementOutcome::Voice { .. })),
++        "I3023: the agent key's own statement is held"
++    );
++    let by_owner = bind_authored(&user, &u, &u, &ai, &ak, "agent", 12_000, None);
++    assert!(
++        matches!(put(d, &by_owner).await, Ok(StatementOutcome::Row { .. })),
++        "I3023: the owner's statement lands the agent bind"
++    );
++    assert_eq!(
++        bound(d, &ai, &ak).await.as_deref(),
++        Some("agent"),
++        "I3023: the agent bind is in the occurrence table"
++    );
++    // I3032: the agent identity authoring its own occurrence is refused,
++    // whichever voice arrives.
++    for (signer, iss) in [(&agent, ai.as_str()), (&agent_key, ak.as_str())] {
++        let st = bind_authored(signer, iss, &ai, &ai, &ak, "agent", 13_000, None);
++        let e = put(d, &st).await.unwrap_err();
++        assert_eq!(
++            reason(&e),
++            malformed_row::AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
++            "I3032 ({iss}): {e}"
++        );
++    }
++
++    // I3034: edition-2 binds appear in the signed listing, carrying their
++    // statements (`ceg_statement`, the author's) instead of a signature.
++    for (identity, occ, author_st) in [(&u, iref(&device), &by_user), (&ai, ak.clone(), &by_owner)]
++    {
++        let listed = d
++            .list_signed_identity_occurrences_for(identity)
++            .await
++            .unwrap();
++        let o = listed
++            .iter()
++            .find(|o| o.identity_occurrence.occurrence_key_id == occ)
++            .unwrap_or_else(|| panic!("I3034: {occ} is in the signed listing of {identity}"));
++        assert_eq!(
++            o.signed_envelope
++                .get(super::ingest::STATEMENT_MEMBER)
++                .and_then(serde_json::Value::as_str),
++            Some(hex::encode(author_st).as_str()),
++            "I3034: the listing serves the author's statement"
++        );
++        assert!(
++            o.signed_envelope
++                .get("ceg_statements")
++                .and_then(serde_json::Value::as_array)
++                .is_some_and(|a| a.len() >= 2),
++            "I3034: and every voice"
++        );
++        assert!(
++            o.signature.mldsa65_signature_base64.is_none()
++                && o.signature.ed25519_signature_base64.is_empty(),
++            "I3034: no earlier-form signature"
++        );
++    }
++
++    // I3030: no occurrence binds a machine to a person (CC 3.3.6, rc21).
++    // (a) an agent key under the user, `device_class` agent;
++    // (b) the same key under the user as a `laptop`;
++    // (c) a user-typed key under the user with `device_class` agent.
++    let lone_ref = iref(&lone);
++    for (what, signer, occ, class) in [
++        ("I3030 (a)", &agent_key, ak.as_str(), "agent"),
++        ("I3030 (b)", &agent_key, ak.as_str(), "laptop"),
++        ("I3030 (c)", &lone, lone_ref.as_str(), "agent"),
++    ] {
++        let st = bind(signer, occ, &u, occ, class, 14_000, None);
++        let e = put(d, &st).await.unwrap_err();
++        assert_eq!(
++            reason(&e),
++            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
++            "{what}: {e}"
++        );
++        assert_eq!(bound(d, &u, occ).await, None, "{what}: nothing bound");
++    }
++    // I3044: the trusted-LOCAL door keeps the same exclusion. (a) an agent
++    // key under the user; (b) a user key under the agent identity; (c)
++    // `device_class` agent under the user with a user-typed key; and the
++    // control, (d) a user's device under the user, is stored.
++    let local = |identity: &str, occurrence: &str, class: &str| {
++        crate::federation::types::IdentityOccurrence {
++            identity_key_id: identity.to_owned(),
++            occurrence_key_id: occurrence.to_owned(),
++            device_class: class.to_owned(),
++            hardware_attestation: None,
++            asserted_at: at(2_000),
++            valid_until: None,
++            encryption_pubkeys: None,
++            transport_binding: None,
++            persist_row_hash: String::new(),
++        }
++    };
++    for (what, identity, occurrence, class) in [
++        ("I3044 (a)", u.as_str(), ak.as_str(), "agent"),
++        ("I3044 (b)", ai.as_str(), lone_ref.as_str(), "laptop"),
++        ("I3044 (c)", u.as_str(), lone_ref.as_str(), "agent"),
++    ] {
++        let e = d
++            .put_identity_occurrence_local(local(identity, occurrence, class))
++            .await
++            .unwrap_err();
++        assert_eq!(
++            reason(&e),
++            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
++            "{what}: {e}"
++        );
++        assert_eq!(
++            bound(d, identity, occurrence).await,
++            None,
++            "{what}: nothing stored"
++        );
++    }
++    d.put_identity_occurrence_local(local(&u, &lone_ref, "laptop"))
++        .await
++        .expect("I3044 (d): a user's device under the user is stored");
++
++    // (d) an agent key never signs as its owner's identity (no door binds
++    // it under the user, I3030 (a) and I3044 (a)).
++    let as_owner = row_as(&agent_key, &u, 20_000);
++    let keys = held_keys_for(d, &as_owner).await.unwrap();
++    assert_eq!(
++        keys.key_of(&kid(&agent_key), &kid(&user)),
++        KeyOf::No,
++        "I3030 (d): an agent key is never a key of a person"
++    );
++    let e = put(d, &as_owner).await.unwrap_err();
++    assert_eq!(reason(&e), malformed_row::KID_NOT_OF_ISS, "I3030 (d): {e}");
++
++    // I3024: an end not after the assertion, equal or earlier.
++    for until in [13_000, 12_999] {
++        let st = bind(
++            &ended,
++            &iref(&ended),
++            &u,
++            &iref(&ended),
++            "laptop",
++            13_000,
++            Some(until),
++        );
++        let e = put(d, &st).await.unwrap_err();
++        assert_eq!(
++            reason(&e),
++            malformed_row::VALID_UNTIL_NOT_AFTER_ASSERTED_AT,
++            "I3024 ({until}): {e}"
++        );
++    }
++    assert_eq!(
++        bound(d, &u, &iref(&ended)).await,
++        None,
++        "I3024: nothing bound"
++    );
++}
++
++#[test]
++fn i3025_the_occurrence_window_is_half_open() {
++    let asserted = [(1_000, Some(2_000))];
++    assert!(occurrence_live_at(&asserted, &[], 1_000), "I3025: from");
++    assert!(occurrence_live_at(&asserted, &[], 1_999), "I3025: inside");
++    assert!(
++        !occurrence_live_at(&asserted, &[], 2_000),
++        "I3025: not at valid_until"
++    );
++    assert!(
++        !occurrence_live_at(&asserted, &[], 999),
++        "I3025: not before"
++    );
++    let open = [(1_000, None)];
++    assert!(
++        occurrence_live_at(&open, &[], u64::MAX),
++        "I3025: indefinite"
++    );
++    // A revocation in effect after the assertion ends it ...
++    assert!(
++        occurrence_live_at(&open, &[5_000], 4_999),
++        "I3025: before it"
++    );
++    assert!(
++        !occurrence_live_at(&open, &[5_000], 5_000),
++        "I3025: revoked"
++    );
++    // ... until a later assertion re-establishes it; an older one is void.
++    let again = [(1_000, None), (6_000, None)];
++    assert!(
++        occurrence_live_at(&again, &[5_000], 6_000),
++        "I3025: re-established"
++    );
++    assert!(
++        occurrence_live_at(&[(6_000, None)], &[5_000], 7_000),
++        "I3025: older revocation"
++    );
++}
++
++#[test]
++fn i3026_the_door_model_adds_the_occurrence_key_role_to_its_family_only() {
++    let model = WithOccurrenceRole(&VendoredFamilyModel);
++    let rule = model.rule(OCCURRENCE_FAMILY).expect("I3026: registered");
++    assert!(rule.authored, "I3026: authored");
++    assert!(
++        rule.roles
++            .iter()
++            .any(|(r, p)| r == OCCURRENCE_KEY_ROLE && *p == RoleParty::Sub),
++        "I3026: the occurrence key's own voice"
++    );
++    for other in ["key:revocation", "identity_amendment", "self:delegates_to"] {
++        let r = model.rule(other);
++        assert!(r.is_some(), "I3026: {other} registered");
++        assert_eq!(
++            r,
++            VendoredFamilyModel.rule(other),
++            "I3026: {other} unchanged"
++        );
++    }
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3020_to_i3024_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3020_to_i3024_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
+diff --git a/src/federation/edition2/occurrence_node_bearing_invariants.rs b/src/federation/edition2/occurrence_node_bearing_invariants.rs
+new file mode 100644
+index 00000000..03baae99
+--- /dev/null
++++ b/src/federation/edition2/occurrence_node_bearing_invariants.rs
+@@ -0,0 +1,148 @@
++//! **I3040–I3041** (wave O1; E7's finding; CC 3.2 "Infrastructure does not
++//! vote", CC 3.3.6): `is_node_bearing_key` reads the edition-2 facts, on
++//! sqlite and postgres.
++//!
++//! - I3040: a key whose own edition-2 `key:record` carries `node` is
++//!   node-bearing; and a non-person key bound by an edition-2 bind under a
++//!   node identity (the node's statement plus the key's own) is
++//!   node-bearing through that occurrence, its own voice the agreement.
++//! - I3041: a user key is not node-bearing, and a node cannot make it so: a
++//!   bind of a person's key under a node identity is refused
++//!   `occurrence_binds_machine_to_person`.
++
++use ciris_crypto::composite::CompositeSigningKey;
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::door_invariants::fixture::{iref, key, key_record, map};
++use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
++use super::occurrence::OCCURRENCE_FAMILY;
++use crate::federation::{
++    is_node_bearing_key, malformed_row, occurrence_agreed_from, Error, FederationDirectory,
++};
++
++fn now_ms() -> u64 {
++    u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap()
++}
++
++fn bind(
++    signer: &CompositeSigningKey,
++    iss: &str,
++    identity: &str,
++    occurrence: &str,
++    device_class: &str,
++    asserted_at: u64,
++) -> Vec<u8> {
++    let m = vec![
++        ("asserted_at", Value::Uint(asserted_at)),
++        ("author", Value::Text(identity.to_owned())),
++        ("identity_key_id", Value::Text(identity.to_owned())),
++        ("occurrence_key_id", Value::Text(occurrence.to_owned())),
++        ("device_class", Value::Text(device_class.to_owned())),
++    ];
++    sign_row_statement(
++        signer,
++        iss,
++        occurrence,
++        "scores",
++        OCCURRENCE_FAMILY,
++        &map(m),
++        vec![],
++    )
++    .unwrap()
++}
++
++async fn put(d: &dyn FederationDirectory, st: &[u8]) -> Result<StatementOutcome, Error> {
++    Box::pin(put_statement(d, st, None, INGEST_TIER)).await
++}
++
++pub(crate) async fn body(d: &dyn FederationDirectory) {
++    let node = key(120);
++    let service = key(121);
++    let user = key(122);
++    let t = now_ms();
++    put(
++        d,
++        &key_record(&node, &["node"], t - 86_400_000, Some(t + 200 * 86_400_000)),
++    )
++    .await
++    .unwrap();
++    put(d, &key_record(&service, &["primitive"], 0, None))
++        .await
++        .unwrap();
++    put(d, &key_record(&user, &["user"], 0, None))
++        .await
++        .unwrap();
++    let (n, s, u) = (iref(&node), iref(&service), iref(&user));
++
++    // I3040: the key's own record.
++    assert!(
++        is_node_bearing_key(d, &n).await.unwrap(),
++        "I3040: a node-typed key:record is node-bearing"
++    );
++    assert!(
++        !is_node_bearing_key(d, &s).await.unwrap(),
++        "I3040: unbound, a primitive key is not"
++    );
++    // I3040: a bind under the node, the key's own voice first.
++    let at = t - 3_600_000;
++    assert!(matches!(
++        put(d, &bind(&service, &s, &n, &s, "service", at)).await,
++        Ok(StatementOutcome::Voice { .. })
++    ));
++    assert!(matches!(
++        put(d, &bind(&node, &n, &n, &s, "service", at)).await,
++        Ok(StatementOutcome::Row { .. })
++    ));
++    assert!(
++        occurrence_agreed_from(d, &n, &s).await.unwrap().is_some(),
++        "I3040: the key's own voice is its agreement"
++    );
++    assert!(
++        is_node_bearing_key(d, &s).await.unwrap(),
++        "I3040: bound under a node, with its agreement, it is node-bearing"
++    );
++
++    // I3041: a user key is not node-bearing, and no node bind makes it so.
++    assert!(
++        !is_node_bearing_key(d, &u).await.unwrap(),
++        "I3041: a user key is not node-bearing"
++    );
++    let e = put(d, &bind(&user, &u, &n, &u, "laptop", at))
++        .await
++        .unwrap_err();
++    assert!(
++        matches!(&e, Error::MalformedRow { reason, .. }
++            if *reason == malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON),
++        "I3041: {e}"
++    );
++    assert!(
++        !is_node_bearing_key(d, &u).await.unwrap(),
++        "I3041: still not node-bearing"
++    );
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3040_i3041_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3040_i3041_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
+diff --git a/src/federation/edition2/occurrence_route_invariants.rs b/src/federation/edition2/occurrence_route_invariants.rs
+new file mode 100644
+index 00000000..7f3ec218
+--- /dev/null
++++ b/src/federation/edition2/occurrence_route_invariants.rs
+@@ -0,0 +1,439 @@
++//! **I3037–I3039, I3042–I3043** (wave O1; E8's findings; CC 3.3.6, CC 3.3.6.2): an
++//! occurrence's route and X-Wing keys, on sqlite and postgres.
++//!
++//! - I3037 (expiry): an occurrence past its `valid_until` keeps no live
++//!   route. Its bind projects none at write, and a projection of it held
++//!   anyway (as one written before this fix) is not listed by
++//!   `list_transport_destinations_for` (the half-open window, read). A bind
++//!   with no end keeps its route (the control).
++//! - I3038 (a non-seat node): its transit and onion hop X-Wing keys resolve
++//!   from its held edition-2 bind (`transit_xwing_pubkey_for`,
++//!   `occurrence::onion_hop_xwing_pubkey_for`).
++//! - I3042 (displacement): an expired route displaces nothing: with two
++//!   node keys tied to one owner on one destination, the expired newer
++//!   projection leaves the older live route listed.
++//! - I3043 (the self roster): an occurrence past its `valid_until` is not a
++//!   roster key (`self_roster::roster_now`), so a further device lands on the
++//!   owner's one voice.
++//! - I3039 (a seat): a seat's own later bind carrying another transit key
++//!   is held but not resolved: the seat's keys are the genesis bundle's
++//!   (W1's rule), and the bind resolver gives nothing for a seat.
++
++use ciris_crypto::composite::CompositeSigningKey;
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::door_invariants::fixture::{iref, key, key_record, map};
++use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
++use super::occurrence::{bind_xwing_keys_for, onion_hop_xwing_pubkey_for, OCCURRENCE_FAMILY};
++use crate::federation::self_at_login::{transit_xwing_pubkey_for, XWingPublicKey};
++use crate::federation::FederationDirectory;
++
++const APP: &str = "ciris.federation";
++const ASPECT: &str = "serve";
++
++fn now_ms() -> u64 {
++    u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap()
++}
++
++/// A `transport_destination` member (CC 3.3.6.2) for Reticulum keys
++/// `[x; 32]`, `[e; 32]`, its `destination_hash` derived (CC 3.3.6.3).
++fn transport(x: u8, e: u8) -> Value {
++    let (rx, re) = (vec![x; 32], vec![e; 32]);
++    let dh = ciris_verify_core::transport_binding::compute_destination_hash(
++        APP,
++        &[ASPECT.to_owned()],
++        &rx,
++        &re,
++    )
++    .unwrap();
++    map(vec![
++        ("reticulum_x25519_pubkey", Value::Bytes(rx)),
++        ("reticulum_ed25519_pubkey", Value::Bytes(re)),
++        ("app_name", Value::Text(APP.into())),
++        ("aspects", Value::Array(vec![Value::Text(ASPECT.into())])),
++        ("destination_hash", Value::Bytes(dh.to_vec())),
++    ])
++}
++
++/// One statement over a bind payload carrying `extra` members.
++#[allow(clippy::too_many_arguments)]
++fn bind_with(
++    signer: &CompositeSigningKey,
++    iss: &str,
++    identity: &str,
++    occurrence: &str,
++    device_class: &str,
++    asserted_at: u64,
++    valid_until: Option<u64>,
++    extra: Vec<(&str, Value)>,
++) -> Vec<u8> {
++    let mut m = vec![
++        ("asserted_at", Value::Uint(asserted_at)),
++        ("author", Value::Text(identity.to_owned())),
++        ("identity_key_id", Value::Text(identity.to_owned())),
++        ("occurrence_key_id", Value::Text(occurrence.to_owned())),
++        ("device_class", Value::Text(device_class.to_owned())),
++    ];
++    if let Some(u) = valid_until {
++        m.push(("valid_until", Value::Uint(u)));
++    }
++    m.extend(extra);
++    sign_row_statement(
++        signer,
++        iss,
++        occurrence,
++        "scores",
++        OCCURRENCE_FAMILY,
++        &map(m),
++        vec![],
++    )
++    .unwrap()
++}
++
++async fn put(d: &dyn FederationDirectory, st: &[u8]) -> StatementOutcome {
++    Box::pin(put_statement(d, st, None, INGEST_TIER))
++        .await
++        .unwrap()
++}
++
++/// Bind `device` under `owner` (both user keys): its own voice, then the
++/// owner's.
++async fn bind_device(
++    d: &dyn FederationDirectory,
++    owner: &CompositeSigningKey,
++    device: &CompositeSigningKey,
++    asserted_at: u64,
++    valid_until: Option<u64>,
++    extra: Vec<(&str, Value)>,
++) {
++    let (u, k) = (iref(owner), iref(device));
++    put(
++        d,
++        &bind_with(
++            device,
++            &k,
++            &u,
++            &k,
++            "laptop",
++            asserted_at,
++            valid_until,
++            extra.clone(),
++        ),
++    )
++    .await;
++    let out = put(
++        d,
++        &bind_with(owner, &u, &u, &k, "laptop", asserted_at, valid_until, extra),
++    )
++    .await;
++    assert!(
++        matches!(out, StatementOutcome::Row { .. }),
++        "the bind lands: {out:?}"
++    );
++}
++
++pub(crate) async fn body(d: &dyn FederationDirectory) {
++    let owner = key(110);
++    let expired = key(111);
++    let lasting = key(112);
++    let node = key(113);
++    // A second owner: under the first, the expired bind still counts on the
++    // self roster (`roster_now` reads revocations, not ends), so a further
++    // device there would be a roster change needing two voices.
++    let owner2 = key(114);
++    let third = key(115);
++    for k in [&owner, &owner2, &expired, &lasting, &third] {
++        put(d, &key_record(k, &["user"], 0, None)).await;
++    }
++    let t = now_ms();
++    // A node key live now (a node record states an end).
++    put(
++        d,
++        &key_record(&node, &["node"], t - 86_400_000, Some(t + 200 * 86_400_000)),
++    )
++    .await;
++
++    // I3037: a bind whose window has ended.
++    bind_device(
++        d,
++        &owner,
++        &expired,
++        15_000,
++        Some(16_000),
++        vec![("transport_destination", transport(1, 2))],
++    )
++    .await;
++    let k = iref(&expired);
++    assert!(
++        d.list_transport_destinations_for(&k)
++            .await
++            .unwrap()
++            .is_empty(),
++        "I3037: an expired bind projects no route"
++    );
++    // A projection of it held anyway (written before the fix): not live.
++    let occ = d
++        .list_identity_occurrences_by_occurrence_key(&k)
++        .await
++        .unwrap()
++        .into_iter()
++        .next()
++        .expect("I3037: the bind is held");
++    let stale = occ
++        .transport_binding
++        .as_ref()
++        .expect("I3037: its transport binding")
++        .project_route(&k, occ.asserted_at)
++        .unwrap();
++    d.put_transport_destination(&stale).await.unwrap();
++    assert!(
++        d.list_transport_destinations_for(&k)
++            .await
++            .unwrap()
++            .is_empty(),
++        "I3037: a projection of an expired occurrence is not listed"
++    );
++
++    // I3043: the expired occurrence is not on `owner`'s self roster, so a
++    // further device lands on the owner's one voice (with it counted, the
++    // roster would be two keys and the add would wait on a second).
++    let roster = crate::federation::self_roster::roster_now(d, &iref(&owner))
++        .await
++        .unwrap();
++    assert!(
++        !roster.contains(&k),
++        "I3043: an occurrence past its valid_until is not a roster key: {roster:?}"
++    );
++    bind_device(d, &owner, &third, 17_000, None, Vec::new()).await;
++    // The control: no end, a live route.
++    bind_device(
++        d,
++        &owner2,
++        &lasting,
++        15_000,
++        None,
++        vec![("transport_destination", transport(3, 4))],
++    )
++    .await;
++    assert_eq!(
++        d.list_transport_destinations_for(&iref(&lasting))
++            .await
++            .unwrap()
++            .len(),
++        1,
++        "I3037: a bind with no end keeps its route"
++    );
++
++    // I3038: a non-seat node's X-Wing keys from its bind (the self pair).
++    let n = iref(&node);
++    let (transit, hop) = (vec![5u8; 1216], vec![6u8; 1216]);
++    let st = bind_with(
++        &node,
++        &n,
++        &n,
++        &n,
++        "server",
++        t - 3_600_000,
++        None,
++        vec![
++            ("transport_destination", transport(7, 8)),
++            ("transit_xwing_pubkey", Value::Bytes(transit.clone())),
++            ("onion_hop_xwing_pubkey", Value::Bytes(hop.clone())),
++        ],
++    );
++    assert!(
++        matches!(put(d, &st).await, StatementOutcome::Row { .. }),
++        "I3038: the node's own bind lands"
++    );
++    assert_eq!(
++        transit_xwing_pubkey_for(d, &n).await.unwrap(),
++        XWingPublicKey::from_bytes(&transit),
++        "I3038: the transit key resolves from the bind"
++    );
++    assert_eq!(
++        onion_hop_xwing_pubkey_for(d, &n).await.unwrap(),
++        XWingPublicKey::from_bytes(&hop),
++        "I3038: the onion hop key resolves from the bind"
++    );
++}
++
++/// I3042 on one backend: an expired route displaces nothing. Two node keys
++/// with one live owner (the I1122-B setup) share a destination; the newer
++/// route is the projection of an occurrence already past its end. The older
++/// live route stays listed, and the expired one is not.
++async fn displacement_body(d: &dyn FederationDirectory) {
++    use crate::federation::self_at_login::{BindingProvenance, TransportDestination};
++    use crate::federation::tier_ingest::test_support as ts;
++    use crate::federation::types::identity_type::{NODE, USER};
++    use crate::federation::types::{IdentityOccurrence, OccurrenceTransportBinding};
++    use base64::Engine as _;
++    let tag = format!("o1d{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
++    let (owner, old_node, new_node) = (
++        format!("{tag}-owner"),
++        format!("{tag}-oldnode"),
++        format!("{tag}-newnode"),
++    );
++    ts::register_identity_key(d, &owner, USER).await;
++    for k in [&old_node, &new_node] {
++        ts::register_identity_key(d, k, NODE).await;
++    }
++    ts::put_owner_binding(d, &owner, &old_node).await;
++    ts::put_owner_binding(d, &owner, &new_node).await;
++    // The tie that lets a newer route displace (the control: without it the
++    // witness could not tell).
++    let (a, b) = (
++        crate::federation::admission::owner_of(d, &old_node)
++            .await
++            .unwrap(),
++        crate::federation::admission::owner_of(d, &new_node)
++            .await
++            .unwrap(),
++    );
++    assert!(
++        a.is_some() && a == b,
++        "I3042: the two node keys share one owner"
++    );
++    let raw = [0xab_u8; 16];
++    let dest = hex::encode(raw);
++    let older = TransportDestination {
++        occurrence_key_id: old_node.clone(),
++        transport_kind: "reticulum".into(),
++        destination: dest.clone(),
++        asserted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(10_000).unwrap(),
++        last_seen_at: None,
++        transport_ed25519_pubkey_base64: None,
++        transport_x25519_pubkey_base64: None,
++        binding_provenance: BindingProvenance::Rooted,
++        epoch: 0,
++        retired_at: None,
++    };
++    d.put_transport_destination(&older).await.unwrap();
++    // The newer key's occurrence, ended at 21 000 ms; its projection held.
++    let b64 = base64::engine::general_purpose::STANDARD;
++    let occ = IdentityOccurrence {
++        identity_key_id: new_node.clone(),
++        occurrence_key_id: new_node.clone(),
++        device_class: "server".into(),
++        hardware_attestation: None,
++        asserted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(20_000).unwrap(),
++        valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp_millis(21_000).unwrap()),
++        encryption_pubkeys: None,
++        transport_binding: Some(OccurrenceTransportBinding {
++            reticulum_x25519_pubkey_base64: b64.encode([1u8; 32]),
++            reticulum_ed25519_pubkey_base64: b64.encode([2u8; 32]),
++            destination_hash_base64: b64.encode(raw),
++            app_name: APP.into(),
++            aspects: vec![ASPECT.into()],
++        }),
++        persist_row_hash: String::new(),
++    };
++    d.put_identity_occurrence_local(occ.clone()).await.unwrap();
++    let stale = occ
++        .transport_binding
++        .as_ref()
++        .unwrap()
++        .project_route(&new_node, occ.asserted_at)
++        .unwrap();
++    d.put_transport_destination(&stale).await.unwrap();
++    let listed: Vec<String> = d
++        .list_transport_destinations_by_destination(&dest)
++        .await
++        .unwrap()
++        .into_iter()
++        .map(|r| r.occurrence_key_id)
++        .collect();
++    assert_eq!(
++        listed,
++        vec![old_node.clone()],
++        "I3042: the older live route stays; the expired one displaces nothing and is not listed"
++    );
++    assert_eq!(
++        d.list_transport_destinations_for(&old_node)
++            .await
++            .unwrap()
++            .len(),
++        1,
++        "I3042: the older key keeps its route"
++    );
++}
++
++/// I3039 on one backend: a seat's solo bind is held, never resolved.
++async fn seat_body(d: &dyn FederationDirectory) {
++    use super::fixture_genesis::{bundle_v2, install_v2, test_key};
++    install_v2(d).await.unwrap();
++    let seat = &bundle_v2().seats[0];
++    let k = test_key(seat.seed);
++    let s = seat.identity_ref.clone();
++    let solo = vec![9u8; 1216];
++    let st = bind_with(
++        &k,
++        &s,
++        &s,
++        &s,
++        "server",
++        now_ms() - 60_000,
++        None,
++        vec![
++            ("transport_destination", transport(10, 11)),
++            ("transit_xwing_pubkey", Value::Bytes(solo.clone())),
++            ("onion_hop_xwing_pubkey", Value::Bytes(vec![12u8; 1216])),
++        ],
++    );
++    assert!(
++        matches!(put(d, &st).await, StatementOutcome::Row { .. }),
++        "I3039: the seat's own bind is held"
++    );
++    assert_ne!(
++        transit_xwing_pubkey_for(d, &s).await.unwrap(),
++        XWingPublicKey::from_bytes(&solo),
++        "I3039: a seat's solo transit key is not live"
++    );
++    assert_eq!(
++        bind_xwing_keys_for(d, &s).await.unwrap(),
++        None,
++        "I3039: the bind resolver reads nothing for a seat"
++    );
++    assert_eq!(
++        onion_hop_xwing_pubkey_for(d, &s).await.unwrap(),
++        XWingPublicKey::from_bytes(&seat.onion_hop_xwing_pubkey),
++        "I3039: a seat's hop key is its bundle binding's"
++    );
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3037_to_i3039_sqlite() {
++    use crate::store::Backend as _;
++    for which in 0..3 {
++        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        match which {
++            0 => Box::pin(body(&b)).await,
++            1 => Box::pin(displacement_body(&b)).await,
++            _ => Box::pin(seat_body(&b)).await,
++        }
++    }
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3037_to_i3039_postgres() {
++    use crate::store::Backend as _;
++    for which in 0..3 {
++        let Some(dsn) = crate::test_pg::empty_dsn() else {
++            return;
++        };
++        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        match which {
++            0 => Box::pin(body(&b)).await,
++            1 => Box::pin(displacement_body(&b)).await,
++            _ => Box::pin(seat_body(&b)).await,
++        }
++    }
++}
+diff --git a/src/federation/edition2/occurrence_tx_invariants.rs b/src/federation/edition2/occurrence_tx_invariants.rs
+new file mode 100644
+index 00000000..16d752fe
+--- /dev/null
++++ b/src/federation/edition2/occurrence_tx_invariants.rs
+@@ -0,0 +1,157 @@
++//! **I3035–I3036** (wave O1; C1's atomic genesis import, "a row is the
++//! same row inside a bundle and alone"): the edition-2 occurrence write as a
++//! transaction-level helper, on sqlite and postgres.
++//!
++//! - I3035: the helper writes nothing of its own: inside a transaction the
++//!   caller rolls back (a fault before commit), no occurrence row and no
++//!   history row is left; inside one it commits, both are there.
++//! - I3036: a genesis bundle's placed seats land in the occurrence table
++//!   with the bundle (C1's `put_edition2_genesis` calls the helper inside
++//!   its one transaction; C2's ceremony).
++
++use super::door_invariants::fixture::{iref, key, key_record};
++use super::ingest::{put_statement, INGEST_TIER};
++use super::names::RowId;
++use super::occurrence::OccurrenceBind;
++use crate::federation::occurrence_admit::{plan_edition2_occurrence, PlannedOccurrence};
++use crate::federation::types::IdentityOccurrence;
++use crate::federation::FederationDirectory;
++
++/// A self-pair bind of `seed`'s key (a seat's shape), planned.
++async fn planned_self_pair(d: &dyn FederationDirectory, seed: u8) -> (String, PlannedOccurrence) {
++    let k = key(seed);
++    Box::pin(put_statement(
++        d,
++        &key_record(&k, &["user"], 0, None),
++        None,
++        INGEST_TIER,
++    ))
++    .await
++    .unwrap();
++    let r = iref(&k);
++    let bind = OccurrenceBind {
++        occurrence: IdentityOccurrence {
++            identity_key_id: r.clone(),
++            occurrence_key_id: r.clone(),
++            device_class: "server".to_owned(),
++            hardware_attestation: None,
++            asserted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(10_000).unwrap(),
++            valid_until: None,
++            encryption_pubkeys: None,
++            transport_binding: None,
++            persist_row_hash: String::new(),
++        },
++        author_key_id: r.clone(),
++        row_id: RowId([seed; 32]),
++        statements: Vec::new(),
++    };
++    let (planned, route) = plan_edition2_occurrence(bind).unwrap();
++    assert!(route.is_none(), "no transport, no route");
++    (r, planned)
++}
++
++async fn held(d: &dyn FederationDirectory, r: &str) -> (usize, usize) {
++    let rows = d.list_identity_occurrences_for(r).await.unwrap().len();
++    let hist = d
++        .list_identity_occurrence_history_by_occurrence(r)
++        .await
++        .unwrap()
++        .len();
++    (rows, hist)
++}
++
++/// I3036 on one backend: every placed seat is bound as its own occurrence.
++async fn genesis_seats(d: &dyn FederationDirectory) {
++    use super::fixture_genesis::{bundle_v2, install_v2};
++    install_v2(d).await.unwrap();
++    for seat in &bundle_v2().seats {
++        let bound = d
++            .list_identity_occurrences_for(&seat.identity_ref)
++            .await
++            .unwrap();
++        assert!(
++            bound
++                .iter()
++                .any(|o| o.occurrence_key_id == seat.identity_ref),
++            "I3036: seat {} is in the occurrence table",
++            seat.identity_ref
++        );
++    }
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3035_i3036_sqlite() {
++    use crate::store::sqlite::sqlite_store_edition2_occurrence;
++    use crate::store::sqlite_conn_model::write_tx;
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    let (r, planned) = Box::pin(planned_self_pair(&b, 81)).await;
++    {
++        let conn = b.conn_handle();
++        let mut c = conn.lock();
++        let tx = write_tx(&mut c).unwrap();
++        assert!(sqlite_store_edition2_occurrence(&tx, &planned).unwrap());
++        // A fault before commit: the caller's transaction rolls back.
++        drop(tx);
++    }
++    assert_eq!(
++        held(&b, &r).await,
++        (0, 0),
++        "I3035: nothing survives a rollback"
++    );
++    {
++        let conn = b.conn_handle();
++        let mut c = conn.lock();
++        let tx = write_tx(&mut c).unwrap();
++        assert!(sqlite_store_edition2_occurrence(&tx, &planned).unwrap());
++        tx.commit().unwrap();
++    }
++    assert_eq!(
++        held(&b, &r).await,
++        (1, 1),
++        "I3035: the caller's commit keeps both"
++    );
++    Box::pin(genesis_seats(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3035_i3036_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    let (r, planned) = Box::pin(planned_self_pair(&b, 81)).await;
++    {
++        let mut c = b.checkout().await.unwrap();
++        let tx = c.transaction().await.unwrap();
++        assert!(b.pg_store_edition2_occurrence(&tx, &planned).await.unwrap());
++        // A fault before commit: the caller's transaction rolls back.
++        drop(tx);
++    }
++    assert_eq!(
++        held(&b, &r).await,
++        (0, 0),
++        "I3035: nothing survives a rollback"
++    );
++    {
++        let mut c = b.checkout().await.unwrap();
++        let tx = c.transaction().await.unwrap();
++        assert!(b.pg_store_edition2_occurrence(&tx, &planned).await.unwrap());
++        tx.commit().await.unwrap();
++    }
++    assert_eq!(
++        held(&b, &r).await,
++        (1, 1),
++        "I3035: the caller's commit keeps both"
++    );
++    Box::pin(genesis_seats(&b)).await;
++}
+diff --git a/src/federation/edition2/payloads.rs b/src/federation/edition2/payloads.rs
+index 50182260..9e8f1bbf 100644
+--- a/src/federation/edition2/payloads.rs
++++ b/src/federation/edition2/payloads.rs
+@@ -287,6 +287,34 @@ pub const FAMILIES: &[FamilyPayload] = &[
+         ],
+         table: "federation_{family,community}_membership_{revocations,widenings}",
+     },
++    FamilyPayload {
++        family: "identity:occurrence",
++        replaces: "SignedIdentityOccurrence / IdentityOccurrence (an identity:occurrence:v1 row)",
++        authorship: "authored (by a live roster key of the identity); the occurrence key's own statement is a second voice, role occurrence_key (party sub)",
++        sub: "the occurrence key's identity-ref (occurrence_key_id)",
++        members: &[
++            m("identity_key_id", Ty::IdentityRef, R, "identity_key_id (equals author)"),
++            m("occurrence_key_id", Ty::IdentityRef, R, "occurrence_key_id (equals sub)"),
++            m("device_class", Ty::Tstr, R, "device_class: phone | laptop | server | embedded | agent | service"),
++            m("hardware_attestation", Ty::Bstr, O, "hardware_attestation (base64 in the earlier form)"),
++            m("transport_destination", Ty::Map, O, "transport_destination: exactly reticulum_x25519_pubkey (bstr 32), reticulum_ed25519_pubkey (bstr 32), app_name (tstr), aspects ([* tstr]), destination_hash (bstr 16, derived per CC 3.3.6.3)"),
++            m("transit_xwing_pubkey", Ty::Bstr, O, "transport_destination's transit_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2)"),
++            m("onion_hop_xwing_pubkey", Ty::Bstr, O, "transport_destination's onion_hop_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2)"),
++            m("onion_relay", Ty::Map, O, "exactly {\"opt_out\": true}, on a node that opts out of relaying (CC 3.3.6.2)"),
++            m("encryption_pubkeys", Ty::Map, O, "encryption_pubkeys: exactly x25519 (bstr 32) and ml_kem_768 (bstr 1184)"),
++            m("build_manifest_hash", Ty::Digest, O, "build_manifest_hash"),
++            m("valid_until", Ty::Ms, O, "valid_until (absent: indefinite; present: later than asserted_at)"),
++        ],
++        refs: &[
++            RefRole { role: "also:cites", presence: O, from: "build_manifest_ref: the provenance:build_manifest:{target} row" },
++        ],
++        voices: &[
++            Voice { from: "SignedIdentityOccurrence.signature (TransportBindingSignature) under attesting_key_id", becomes: "the author's statement: a live roster key of the identity (iss = identity_key_id)" },
++            Voice { from: "none (the earlier form carried no proof of possession)", becomes: "the occurrence key's own statement over the same payload (iss = sub), required before the author's" },
++            Voice { from: "the self-roster door's assent rows (objection:assent:v1)", becomes: "further roster keys' statements as the identity over the same payload, a strict majority of the live roster counted" },
++        ],
++        table: "federation_identity_occurrences (+ federation_identity_occurrence_history, transport_destinations)",
++    },
+     FamilyPayload {
+         family: "identity:occurrence_revocation",
+         replaces: "FramedOccurrenceRevocation / IdentityOccurrenceRevocation (an identity:occurrence_revocation:v1 row)",
+diff --git a/src/federation/edition2/recovery_signer.rs b/src/federation/edition2/recovery_signer.rs
+new file mode 100644
+index 00000000..3a3603e5
+--- /dev/null
++++ b/src/federation/edition2/recovery_signer.rs
+@@ -0,0 +1,224 @@
++//! v62.0.0 (wave O1; CC 4.2.6, the RULINGS entry) — **a recovery key is
++//! refused as a signing key, by its public key material.**
++//!
++//! A holder's recovery key signs one thing: a genesis bundle's recovery
++//! voice, which the bundle reader (`edition2::genesis`) judges. At the row
++//! door ([`super::ingest::put_statement`]) a statement whose signing key is a
++//! recovery key committed or spent by any genesis bundle held is refused
++//! finally ([`crate::federation::malformed_row::RECOVERY_KEY_IS_NOT_A_SIGNER`]),
++//! before the key-of-issuer check and the liveness lookups, and nothing is
++//! held. Without this, the key's record (filed under the HOLDER's identity,
++//! the recovery bundle names it) left the statement waiting on an unknown
++//! signer, a wait that would admit it on a later look.
++//!
++//! The statement header carries only the signing key's thumbprint. Its
++//! public key is read from the key records this node holds that record that
++//! thumbprint: the statement itself when it is a `key:record`, the records
++//! filed under the key's own identity, and the rows the held bundles name.
++//! Each candidate key is matched by its commitment
++//! (`recovery_commitment([key])`, Verify's) against every bundle's
++//! `lineage_commitments` and `spent_commitments`.
++//!
++//! **One key per commitment (CC rc20 2.6.1.11 / 4.2.6).** "Each commitment
++//! is the CC 3.2 T3 commitment over the holder's one recovery key";
++//! `recovery_commitments` is `{ + identity-ref => hash-digest }`, one entry
++//! per holder. Verify's reader opens a commitment exactly this way
++//! (`recovery_commitment(core::slice::from_ref(rk))`, genesis.rs 1466,
++//! 1676, 1747). The single-key match is therefore the reader's own reading,
++//! and a commitment over a set of several keys never counts a recovery.
++//! The digest is opaque, so a bundle reader cannot see the set's size; the
++//! one-key rule is CC's and the reader's, and nothing else opens it.
++
++use std::collections::BTreeSet;
++
++use ciris_crypto::composite::CompositePublicKey;
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::keys::{check_key_record, KEY_RECORD_FAMILY};
++use ciris_verify_core::edition2::recovery::recovery_commitment;
++use ciris_verify_core::edition2::{identity_ref, thumbprint, Digest32};
++
++use super::ingest::statement_kid;
++use super::liveness::statement_parts;
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++/// The public key a `key:record` statement records (its payload `key`),
++/// whether or not the record keeps the end rule.
++fn recorded_key(statement: &[u8]) -> Option<CompositePublicKey> {
++    let (protected, payload) = statement_parts(statement)?;
++    if protected.get_int(-70002).and_then(Value::as_text) != Some(KEY_RECORD_FAMILY) {
++        return None;
++    }
++    check_key_record(&payload).ok().map(|r| r.key).or_else(|| {
++        let k = payload.get_text("key")?.get_int(-1)?.as_bytes()?;
++        CompositePublicKey::from_bytes(k).ok()
++    })
++}
++
++/// **Is `kid` a recovery key** (pure): one of `records` records a key of
++/// that thumbprint whose single-key commitment is in `commitments`.
++#[must_use]
++pub fn is_recovery_key<'a>(
++    kid: &Digest32,
++    records: impl IntoIterator<Item = &'a [u8]>,
++    commitments: &BTreeSet<Digest32>,
++) -> bool {
++    if commitments.is_empty() {
++        return false;
++    }
++    records.into_iter().filter_map(recorded_key).any(|k| {
++        thumbprint(&k) == *kid
++            && commitments.contains(&recovery_commitment(std::slice::from_ref(&k)))
++    })
++}
++
++/// The recovery keys of the genesis lineage in force (CC 4.2.6): every
++/// commitment any Valid held bundle names or has spent, and the kids of the
++/// recovery keys whose records those bundles name (each record's key hashed
++/// to one of them). Read once per held bundle set ([`recovery_keys_in_force`]).
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct RecoveryKeys {
++    commitments: BTreeSet<Digest32>,
++    kids: BTreeSet<Digest32>,
++}
++
++impl RecoveryKeys {
++    /// The recovery keys of these placements, with `statements` the rows
++    /// their bundles name.
++    #[must_use]
++    pub fn of(placements: &[super::genesis::GenesisPlacement], statements: &[Vec<u8>]) -> Self {
++        let commitments: BTreeSet<Digest32> = placements
++            .iter()
++            .flat_map(|p| {
++                p.lineage_commitments
++                    .iter()
++                    .chain(p.spent_commitments.iter())
++                    .copied()
++            })
++            .collect();
++        let kids = statements
++            .iter()
++            .filter_map(|st| recorded_key(st))
++            .filter(|k| commitments.contains(&recovery_commitment(std::slice::from_ref(k))))
++            .map(|k| thumbprint(&k))
++            .collect();
++        RecoveryKeys { commitments, kids }
++    }
++
++    /// No commitment is held (pre-genesis): nothing to refuse.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.commitments.is_empty()
++    }
++
++    /// Is `kid` a recovery key: one the held bundles name, or one whose key
++    /// one of `records` carries and hashes to a held commitment?
++    #[must_use]
++    pub fn holds<'a>(&self, kid: &Digest32, records: impl IntoIterator<Item = &'a [u8]>) -> bool {
++        self.kids.contains(kid) || is_recovery_key(kid, records, &self.commitments)
++    }
++}
++
++const CACHE_LEN: usize = 8;
++
++/// The recovery keys by the held bundle voices they were read from (the
++/// reading is a pure function of the voices and the rows they name, which
++/// are content-addressed by them). Only a reading with a Valid bundle is
++/// kept, so a lineage completed by a later row is re-read.
++static RECOVERY_KEYS_CACHE: std::sync::Mutex<Vec<(Digest32, RecoveryKeys)>> =
++    std::sync::Mutex::new(Vec::new());
++
++fn voices_key(voices: &[Vec<u8>]) -> Digest32 {
++    use sha2::Digest as _;
++    let mut sorted: Vec<&Vec<u8>> = voices.iter().collect();
++    sorted.sort();
++    sorted.dedup();
++    let mut h = sha2::Sha256::new();
++    for v in sorted {
++        h.update((v.len() as u64).to_be_bytes());
++        h.update(v);
++    }
++    h.finalize().into()
++}
++
++/// **The recovery keys in force**: one directory read of the held bundle
++/// voices; on a cache miss, C1's [`super::genesis::genesis_in_force`]
++/// (itself cached by content) and the derivation above.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn recovery_keys_in_force<F>(dir: &F) -> Result<RecoveryKeys, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let voices = dir
++        .edition2_objects(super::genesis::GENESIS_BUNDLE_TYP)
++        .await?;
++    if voices.is_empty() {
++        return Ok(RecoveryKeys::default());
++    }
++    let key = voices_key(&voices);
++    let hit = RECOVERY_KEYS_CACHE
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++        .iter()
++        .find(|(k, _)| *k == key)
++        .map(|(_, r)| r.clone());
++    if let Some(r) = hit {
++        return Ok(r);
++    }
++    let held = super::genesis::genesis_in_force(dir).await?;
++    let keys = RecoveryKeys::of(&held.valid, &held.statements);
++    if !held.valid.is_empty() {
++        let mut c = RECOVERY_KEYS_CACHE
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if !c.iter().any(|(k, _)| *k == key) {
++            if c.len() >= CACHE_LEN {
++                c.remove(0);
++            }
++            c.push((key, keys.clone()));
++        }
++    }
++    Ok(keys)
++}
++
++/// **Refuse a statement signed by a recovery key** (module docs). Called
++/// after the pure statement gates and before any key lookup:
++/// [`super::ingest::put_statement`] and [`super::ingest::verify_carried`].
++///
++/// # Errors
++/// [`malformed_row::RECOVERY_KEY_IS_NOT_A_SIGNER`] (terminal); directory
++/// failures.
++pub async fn refuse_recovery_key_signer<F>(dir: &F, statement: &[u8]) -> Result<(), Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let Some(kid) = statement_kid(statement) else {
++        return Ok(());
++    };
++    let keys = recovery_keys_in_force(dir).await?;
++    if keys.is_empty() {
++        return Ok(());
++    }
++    // A committed recovery key no bundle names yet: its key is known only
++    // from a record of it (the statement itself, or one filed under it).
++    let own = if keys.kids.contains(&kid) {
++        Vec::new()
++    } else {
++        dir.edition2_statements_about(KEY_RECORD_FAMILY, &identity_ref(&kid))
++            .await?
++    };
++    let records = std::iter::once(statement).chain(own.iter().map(Vec::as_slice));
++    if keys.holds(&kid, records) {
++        return Err(Error::malformed_row(
++            super::door::PLANE,
++            malformed_row::RECOVERY_KEY_IS_NOT_A_SIGNER,
++            format!(
++                "the signing key {} is a recovery key a held genesis bundle commits to: a \
++                 recovery key signs no row, only its bundle's recovery voice (CC 4.2.6)",
++                identity_ref(&kid)
++            ),
++        ));
++    }
++    Ok(())
++}
+diff --git a/src/federation/edition2/recovery_signer_invariants.rs b/src/federation/edition2/recovery_signer_invariants.rs
+new file mode 100644
+index 00000000..963f9431
+--- /dev/null
++++ b/src/federation/edition2/recovery_signer_invariants.rs
+@@ -0,0 +1,170 @@
++//! **I3027–I3029, I3031** (wave O1; CC 4.2.6): a recovery key is refused as a
++//! signing key by its public key material, at the row door, on sqlite and
++//! postgres. The genesis lineage is C2's test ceremony (`fixture_genesis`)
++//! through C1's import door.
++//!
++//! - I3027: after a recovery spends holder 1's recovery key, a row signed by
++//!   that key's material as the holder is refused
++//!   `recovery_key_is_not_a_signer`, finally (not a wait), and no voice or
++//!   row of it is held.
++//! - I3028: the recovery commits a next recovery key whose record no bundle
++//!   names; its own self-signed `key:record` is refused by the same token
++//!   (the statement carries the key material), and nothing is held.
++//! - I3031 (pure): a commitment is opened as the reader opens it, over the
++//!   one recovery key (CC 4.2.6): a key whose single-key commitment is held
++//!   is a recovery key, and a key inside a several-key commitment matches
++//!   nothing (no such commitment counts a recovery either).
++//! - I3029: controls. An ordinary key's record is admitted with the lineage
++//!   held, and before any genesis is held the recovery key's own record is
++//!   not refused by this rule (nothing commits to it yet).
++
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::door_invariants::fixture::{key_record, map};
++use super::fixture_genesis::{
++    bundle_v2, install_ceremony_v2, install_v2, recover_v2, test_key, HOLDER_SEEDS,
++    NEXT_RECOVERY_SEED_OFFSET, RECOVERY_SEED_OFFSET,
++};
++use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
++use super::names::RowId;
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++fn reason(e: &Error) -> String {
++    match e {
++        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
++        other => other.kind().to_owned(),
++    }
++}
++
++async fn nothing_held(d: &dyn FederationDirectory, st: &[u8], what: &str) {
++    let id = RowId::of_statement(st).expect("a row id");
++    assert!(
++        d.edition2_voices(&id).await.unwrap().is_empty(),
++        "{what}: no voice held"
++    );
++    assert!(
++        d.get_attestation(&id.hex()).await.unwrap().is_none(),
++        "{what}: no row held"
++    );
++}
++
++pub(crate) async fn body(d: &dyn FederationDirectory) {
++    let n = HOLDER_SEEDS[0];
++    let spent = test_key(n + RECOVERY_SEED_OFFSET);
++    let next = test_key(n + NEXT_RECOVERY_SEED_OFFSET);
++
++    // I3029 (control, pre-genesis): nothing commits to the key yet.
++    let pre = key_record(&next, &["user"], 0, None);
++    let out = Box::pin(put_statement(d, &pre, None, INGEST_TIER)).await;
++    assert!(
++        !matches!(&out, Err(e) if reason(e) == malformed_row::RECOVERY_KEY_IS_NOT_A_SIGNER),
++        "I3029: no bundle held, no recovery key: {out:?}"
++    );
++
++    install_v2(d).await.unwrap();
++    let r = recover_v2(bundle_v2(), n);
++    install_ceremony_v2(d, &r).await.unwrap();
++    let holder = bundle_v2().holder_identity_ref(0).to_owned();
++
++    // I3027: the spent recovery key signs as the holder.
++    let payload = map(vec![
++        ("author", Value::Text(holder.clone())),
++        ("asserted_at", Value::Uint(r.asserted_at_ms + 1000)),
++    ]);
++    let row = sign_row_statement(
++        &spent,
++        &holder,
++        &holder,
++        "scores",
++        "key:revocation",
++        &payload,
++        vec![],
++    )
++    .unwrap();
++    let e = Box::pin(put_statement(d, &row, None, INGEST_TIER))
++        .await
++        .expect_err("I3027: admitted");
++    assert_eq!(
++        reason(&e),
++        malformed_row::RECOVERY_KEY_IS_NOT_A_SIGNER,
++        "I3027: {e:?}"
++    );
++    assert!(
++        !matches!(e, Error::AttesterKeyUnknown { .. } | Error::Backend(_)),
++        "I3027: final"
++    );
++    nothing_held(d, &row, "I3027").await;
++
++    // I3028: the committed (unspent) next recovery key's own record.
++    let rec = key_record(&next, &["user"], r.asserted_at_ms, None);
++    let e = Box::pin(put_statement(d, &rec, None, INGEST_TIER))
++        .await
++        .expect_err("I3028: admitted");
++    assert_eq!(
++        reason(&e),
++        malformed_row::RECOVERY_KEY_IS_NOT_A_SIGNER,
++        "I3028: {e:?}"
++    );
++    nothing_held(d, &rec, "I3028").await;
++
++    // I3029 (control): an ordinary key with the lineage held.
++    let plain = key_record(&test_key(200), &["user"], 0, None);
++    assert!(
++        matches!(
++            Box::pin(put_statement(d, &plain, None, INGEST_TIER)).await,
++            Ok(StatementOutcome::KeyPlane { .. })
++        ),
++        "I3029: an ordinary key is admitted"
++    );
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3027_to_i3029_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3027_to_i3029_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
++
++#[test]
++fn i3031_a_commitment_is_opened_over_one_key() {
++    use super::door_invariants::fixture::{key, kid};
++    use super::recovery_signer::is_recovery_key;
++    use ciris_verify_core::edition2::recovery::recovery_commitment;
++    use std::collections::BTreeSet;
++    let rk = key(90);
++    let other = key(91);
++    let rec = key_record(&rk, &["user"], 0, None);
++    let one: BTreeSet<_> = [recovery_commitment(std::slice::from_ref(rk.public_key()))].into();
++    assert!(
++        is_recovery_key(&kid(&rk), [rec.as_slice()], &one),
++        "I3031: the one-key commitment"
++    );
++    let set: BTreeSet<_> = [recovery_commitment(&[
++        rk.public_key().clone(),
++        other.public_key().clone(),
++    ])]
++    .into();
++    assert!(
++        !is_recovery_key(&kid(&rk), [rec.as_slice()], &set),
++        "I3031: a several-key digest is not the reader's commitment"
++    );
++}
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index 7d19bfe2..3fc1f060 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -1551,6 +1551,11 @@ where
+     let history = directory
+         .list_identity_occurrence_history_by_occurrence(key_id)
+         .await?;
++    // v62.0.0 (wave O1; E7) — the identity-set exclusion: in edition 2 a
++    // person's key is never an occurrence of a node (RULINGS; CC 3.3.6,
++    // rc21), so its edition-2 agreement is not read. The earlier form's
++    // reading stays behind the earlier-form switch.
++    let person = edition2::occurrence::is_person_key(directory, key_id).await?;
+     let identities: std::collections::BTreeSet<&str> = history
+         .iter()
+         .map(|a| a.identity_key_id.as_str())
+@@ -1565,7 +1570,9 @@ where
+         if !node_identity {
+             continue;
+         }
+-        let Some(agreed_from) = agreed_from_in(&history, identity, key_id) else {
++        let Some(agreed_from) =
++            agreed_from_either(directory, &history, identity, key_id, person).await?
++        else {
+             continue;
+         };
+         let revocations: Vec<chrono::DateTime<chrono::Utc>> = directory
+@@ -1595,6 +1602,39 @@ where
+     Ok((false, intervals))
+ }
+ 
++/// v62.0.0 (wave O1; E7) — the earliest agreement of `occurrence` to
++/// `identity` in either form: its own edition-2 voice over a bind
++/// ([`edition2::occurrence::own_voice_agreed_from`]; not read when
++/// `excluded`: a person's key under a machine identity, the identity-set
++/// exclusion), and, while the earlier-form doors are
++/// open ([`edition2::door::earlier_form_doors_shut`]), an earlier-form
++/// assertion it signed as attester ([`agreed_from_in`]).
++async fn agreed_from_either<F>(
++    directory: &F,
++    history: &[types::OccurrenceAssertion],
++    identity: &str,
++    occurrence: &str,
++    excluded: bool,
++) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let earlier = if edition2::door::earlier_form_doors_shut() {
++        None
++    } else {
++        agreed_from_in(history, identity, occurrence)
++    };
++    let e2 = if excluded {
++        None
++    } else {
++        edition2::occurrence::own_voice_agreed_from(directory, identity, occurrence).await?
++    };
++    Ok(match (earlier, e2) {
++        (Some(a), Some(b)) => Some(a.min(b)),
++        (a, b) => a.or(b),
++    })
++}
++
+ /// The earliest instant `occurrence` itself signed an assertion binding it to
+ /// `identity`, in `history`.
+ fn agreed_from_in(
+@@ -1633,7 +1673,12 @@ where
+     let history = directory
+         .list_identity_occurrence_history_by_occurrence(occurrence)
+         .await?;
+-    Ok(agreed_from_in(&history, identity, occurrence))
++    // v62.0.0 (wave O1; E7) — either form's agreement (the edition-2 own
++    // voice; the earlier form behind the switch), with the identity-set
++    // exclusion.
++    let excluded = edition2::occurrence::is_person_key(directory, occurrence).await?
++        && edition2::occurrence::is_machine_key(directory, identity).await?;
++    agreed_from_either(directory, &history, identity, occurrence, excluded).await
+ }
+ 
+ /// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself ever agree
+@@ -5687,6 +5732,27 @@ pub trait FederationDirectory: Send + Sync {
+         ))
+     }
+ 
++    /// v62.0.0 (wave O1; CC 3.3.6, CC 3.3.6.4) — write an admitted
++    /// edition-2 `identity:occurrence` bind to the occurrence table, in one
++    /// transaction: the last-signed-wins upsert (strictly newer
++    /// `asserted_at` only, at a fresh serve position) with `attesting_key_id`
++    /// the landing author key, `signed_envelope` the bind's row id
++    /// ([`edition2::occurrence::OccurrenceBind::envelope`]) and `signature`
++    /// NULL (the statements are held in `ceg_statements`), and the V161
++    /// history row; then the route its transport binding projects and the
++    /// owner's epoch re-wrap, as the JSON door does. Storage only: every gate
++    /// is [`edition2::occurrence::put_occurrence_voice`]'s. Returns whether
++    /// the upsert took the record.
++    async fn put_identity_occurrence_edition2(
++        &self,
++        bind: edition2::occurrence::OccurrenceBind,
++    ) -> Result<bool, Error> {
++        let _ = bind;
++        Err(Error::Unsupported {
++            method: "put_identity_occurrence_edition2",
++        })
++    }
++
+     /// v3.12.0 — list every currently-stored occurrence of
+     /// `identity_key_id`. The DEK-cascade fan-out path
+     /// (#152 v3.13+): when a `cohort_scope: self` Contribution
+@@ -13651,6 +13717,34 @@ pub mod malformed_row {
+     /// the family of the row its `refs.target` names: a composer carries
+     /// its target's family.
+     pub const COMPOSER_FAMILY_MISMATCH: &str = "composer_family_mismatch";
++    /// v62.0.0 (wave O1; CC 3.3.6, the rc21 second voice) — a statement over
++    /// an `identity:occurrence` row in the occurrence key's role (`iss` =
++    /// `sub` = `occurrence_key_id`) not signed by that key itself: it proves
++    /// no possession of the key the bind names.
++    pub const OCCURRENCE_VOICE_NOT_OWN_KEY: &str = "occurrence_voice_not_own_key";
++    /// v62.0.0 (wave O1; CC 4.2.6) — an edition-2 statement whose signing
++    /// key is a recovery key a held genesis bundle commits to (committed or
++    /// spent), matched by its public key material: a recovery key signs no
++    /// row, only its bundle's recovery voice
++    /// (`federation::edition2::recovery_signer`). Final, never a wait.
++    pub const RECOVERY_KEY_IS_NOT_A_SIGNER: &str = "recovery_key_is_not_a_signer";
++    /// v62.0.0 (wave O1; CC 3.3.6 as corrected for rc21) — an
++    /// `identity:occurrence` under a person's identity (`user` /
++    /// `accord_holder`) whose occurrence key is a `node` / `agent` key, or
++    /// whose `device_class` is `agent`: an occurrence never binds a machine
++    /// to a person; an agent's occurrence binds the agent's own identity.
++    pub const OCCURRENCE_BINDS_MACHINE_TO_PERSON: &str = "occurrence_binds_machine_to_person";
++    /// v62.0.0 (wave O1; CC 3.3.6, CC 3.2) — an `identity:occurrence` of an
++    /// agent identity with no live owner binding
++    /// (`ownership:{relation}:agent:{version}`,
++    /// `admission::agent_owner_of`): an agent's occurrence is authored by its
++    /// owner, and there is none.
++    pub const AGENT_OCCURRENCE_UNOWNED: &str = "agent_occurrence_unowned";
++    /// v62.0.0 (wave O1; CC 3.3.6) — an agent identity's `identity:occurrence`
++    /// whose `author` is not the agent's owner (the agent itself, or another
++    /// identity): "the author is the owner's roster key, plus the agent key's
++    /// own statement".
++    pub const AGENT_OCCURRENCE_NOT_OWNER_AUTHORED: &str = "agent_occurrence_not_owner_authored";
+ 
+     /// Every token, for the from-disk witnesses and adopters' tables.
+     pub const ALL: &[&str] = &[
+@@ -13699,6 +13793,11 @@ pub mod malformed_row {
+         ACCORD_INVOCATION_INVALID,
+         ACCORD_INVOCATION_REPLAYED,
+         COMPOSER_FAMILY_MISMATCH,
++        OCCURRENCE_VOICE_NOT_OWN_KEY,
++        RECOVERY_KEY_IS_NOT_A_SIGNER,
++        OCCURRENCE_BINDS_MACHINE_TO_PERSON,
++        AGENT_OCCURRENCE_UNOWNED,
++        AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
+     ];
+ }
+ 
+diff --git a/src/federation/occurrence_admit.rs b/src/federation/occurrence_admit.rs
+index d26302ce..3227bf65 100644
+--- a/src/federation/occurrence_admit.rs
++++ b/src/federation/occurrence_admit.rs
+@@ -76,6 +76,15 @@ pub(crate) trait OccurrenceStore: FederationDirectory + Sized {
+ 
+     /// The wire-index entry of the pair's `identity:occurrence:v1` row.
+     async fn index_occurrence_row(&self, row_id: Option<&str>) -> Result<(), Error>;
++
++    /// v62.0.0 (wave O1) — in ONE transaction: an edition-2 bind's
++    /// last-signed-wins upsert (strictly newer `asserted_at` only, at a fresh
++    /// serve position), `attesting_key_id` and `signed_envelope` from
++    /// `planned.signed`, `signature` NULL, and its #930 history row whether
++    /// or not it applied. No earlier-form `identity:occurrence:v1` row is
++    /// minted: the bind is its edition-2 statements. Returns whether the
++    /// upsert took the record.
++    async fn store_edition2_occurrence(&self, planned: PlannedOccurrence) -> Result<bool, Error>;
+ }
+ 
+ /// The device-class and encryption-key gates, the row hash, the column
+@@ -103,9 +112,17 @@ fn plan_occurrence(
+     // #446 — the binding's route is materialized into the
+     // `transport_destinations` read model AFTER the write (only when it
+     // applied, for the signed door).
++    // v62.0.0 (wave O1; E8's finding) — an occurrence already out of its
++    // half-open window at write projects no route (the read side filters
++    // one that expires later: `transport_routes::fold_one_live_key`).
++    // The end of the half-open window only: an assertion stamped within the
++    // clock-skew tolerance ahead of now still projects.
++    let now = crate::host::clock::now();
++    let in_window = row.valid_until.is_none_or(|u| now < u);
+     let projected_route = row
+         .transport_binding
+         .as_ref()
++        .filter(|_| in_window)
+         .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at))
+         .transpose()?;
+     Ok((
+@@ -126,6 +143,16 @@ pub(crate) async fn put_identity_occurrence_planned<D: OccurrenceStore>(
+     occurrence: SignedIdentityOccurrence,
+ ) -> Result<(), Error> {
+     super::edition2::door::refuse_earlier_form("identity_occurrence")?;
++    // v62.0.0 (wave O1) — the identity-set exclusion on every occurrence
++    // door: no machine key under a person, no person key under a machine
++    // (`occurrence_binds_machine_to_person`), as the edition-2 door.
++    super::edition2::occurrence::check_identity_set_exclusion(
++        dir,
++        &occurrence.identity_occurrence.identity_key_id,
++        &occurrence.identity_occurrence.occurrence_key_id,
++        &occurrence.identity_occurrence.device_class,
++    )
++    .await?;
+     // v14.0.0 (CIRISPersist#418) — the hybrid signature over the exact
+     // producer envelope, the signer's authority and §5.6.8.8.2 C4 key
+     // separation, BEFORE any write. One gate for HTTP and the wire.
+@@ -176,6 +203,16 @@ pub(crate) async fn put_identity_occurrence_local_planned<D: OccurrenceStore>(
+     dir: &D,
+     occurrence: IdentityOccurrence,
+ ) -> Result<(), Error> {
++    // v62.0.0 (wave O1) — the trusted-local door keeps the identity-set
++    // exclusion too: a local write binds no machine key under a person and
++    // no person key under a machine (`occurrence_binds_machine_to_person`).
++    super::edition2::occurrence::check_identity_set_exclusion(
++        dir,
++        &occurrence.identity_key_id,
++        &occurrence.occurrence_key_id,
++        &occurrence.device_class,
++    )
++    .await?;
+     let (planned, projected_route) = plan_occurrence(occurrence, None)?;
+     dir.store_planned_local_occurrence(planned).await?;
+     // #446 — the trusted-local path projects too: it is an accepted write.
+@@ -184,3 +221,86 @@ pub(crate) async fn put_identity_occurrence_local_planned<D: OccurrenceStore>(
+     }
+     Ok(())
+ }
++
++/// v62.0.0 (wave O1) — the route an accepted occurrence projects into
++/// `transport_destinations` (#446): written AFTER the occurrence's own
++/// transaction commits ([`after_edition2_occurrence`]).
++pub(crate) type ProjectedRoute = super::TransportDestination;
++
++/// v62.0.0 (wave O1; C1's atomic genesis import) — **the edition-2 bind's
++/// plan, pure**: the JSON door's plan (device class, encryption keys, the
++/// row hash, the route), with the bind's author and its statements as the
++/// stored container. No I/O. The writes are the backends' tx-level helpers
++/// (`sqlite::sqlite_store_edition2_occurrence`,
++/// `PostgresBackend::pg_store_edition2_occurrence`), which a caller runs
++/// inside its own transaction; the follow-on steps are
++/// [`after_edition2_occurrence`], after that transaction commits.
++///
++/// # Errors
++/// `federation_device_class_rejected`; a malformed encryption key; the row
++/// hash or route encoding.
++pub(crate) fn plan_edition2_occurrence(
++    bind: super::edition2::occurrence::OccurrenceBind,
++) -> Result<(PlannedOccurrence, Option<ProjectedRoute>), Error> {
++    let envelope = bind.envelope();
++    let super::edition2::occurrence::OccurrenceBind {
++        occurrence: row,
++        author_key_id,
++        ..
++    } = bind;
++    plan_occurrence(
++        row,
++        Some(PlannedOccurrenceSignature {
++            attesting_key_id: author_key_id,
++            signed_envelope: envelope,
++            // Not written: the bind's authority is its held statements.
++            signature_json: String::new(),
++        }),
++    )
++}
++
++/// v62.0.0 (wave O1) — **what follows an edition-2 bind's commit**, never
++/// inside a transaction: when the upsert `applied`, the route projection
++/// and the owner's epoch re-wrap (`identity != occurrence` only; a genesis
++/// seat's self pair has none).
++///
++/// # Errors
++/// The route projection's write.
++pub(crate) async fn after_edition2_occurrence<D: FederationDirectory + ?Sized>(
++    dir: &D,
++    applied: bool,
++    identity: &str,
++    occurrence: &str,
++    route: Option<&ProjectedRoute>,
++) -> Result<(), Error> {
++    if !applied {
++        return Ok(());
++    }
++    if let Some(route) = route {
++        super::transport_routes::project_occurrence_route(dir, route).await?;
++    }
++    if identity != occurrence {
++        super::rewrap_after_admission(dir, identity, occurrence).await;
++    }
++    Ok(())
++}
++
++/// v62.0.0 (wave O1; CC 3.3.6) — the door's write: every backend's
++/// `put_identity_occurrence_edition2`. The gates ran in
++/// [`super::edition2::occurrence::put_occurrence_voice`]; this plans
++/// ([`plan_edition2_occurrence`]), writes in the backend's own transaction
++/// (`store_edition2_occurrence`, which wraps the tx-level helper), then runs
++/// [`after_edition2_occurrence`].
++pub(crate) async fn put_identity_occurrence_edition2_planned<D: OccurrenceStore>(
++    dir: &D,
++    bind: super::edition2::occurrence::OccurrenceBind,
++) -> Result<bool, Error> {
++    let pair = (
++        bind.occurrence.identity_key_id.clone(),
++        bind.occurrence.occurrence_key_id.clone(),
++    );
++    let (planned, route) = plan_edition2_occurrence(bind)?;
++    let applied = dir.store_edition2_occurrence(planned).await?;
++    after_edition2_occurrence(dir, applied, &pair.0, &pair.1, route.as_ref()).await?;
++    Ok(applied)
++}
+diff --git a/src/federation/self_at_login.rs b/src/federation/self_at_login.rs
+index 426de3b1..65872f1b 100644
+--- a/src/federation/self_at_login.rs
++++ b/src/federation/self_at_login.rs
+@@ -585,7 +585,7 @@ pub struct TransitKexOtherKeys {
+ }
+ 
+ impl TransitKexOtherKeys {
+-    fn all(&self) -> impl Iterator<Item = &[u8]> {
++    pub(crate) fn all(&self) -> impl Iterator<Item = &[u8]> {
+         self.federation_signing
+             .iter()
+             .chain(&self.transport_identity)
+@@ -1087,7 +1087,7 @@ pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?S
+ /// transport key must be separated from at use (the four
+ /// [`TransitKexOtherKeys`] groups), shared by [`transit_kex_pair_for`] and
+ /// [`transit_xwing_pubkey_for`] so the cross-row rule exists once.
+-async fn other_keys_of<D: crate::federation::FederationDirectory + ?Sized>(
++pub(crate) async fn other_keys_of<D: crate::federation::FederationDirectory + ?Sized>(
+     dir: &D,
+     occurrence_key_id: &str,
+     live: &[&SignedTransportDestination],
+@@ -1194,7 +1194,9 @@ pub async fn transit_xwing_pubkey_for<D: crate::federation::FederationDirectory
+         }
+     }
+     let Some((key, row)) = found else {
+-        return Ok(None);
++        // v62.0.0 (wave O1; E8's finding) — no route-plane key: the
++        // edition-2 bind's, for a node that is not a seat.
++        return super::edition2::occurrence::bind_transit_xwing_for(dir, occurrence_key_id).await;
+     };
+     if super::transport_rebind::is_seated_serve_node(occurrence_key_id)
+         && super::transport_rebind::rebind_held_for(dir, occurrence_key_id)
+diff --git a/src/federation/self_roster.rs b/src/federation/self_roster.rs
+index 114cd2f4..86e2e12c 100644
+--- a/src/federation/self_roster.rs
++++ b/src/federation/self_roster.rs
+@@ -295,17 +295,27 @@ where
+ }
+ 
+ /// **The live roster of `identity` now**: the genesis key and every ACTIVE
+-/// occurrence (revocations applied, the #421 re-establishment rule) whose key
+-/// is user-role.
++/// occurrence (revocations applied, the #421 re-establishment rule; v62.0.0,
++/// within its half-open window) whose key is user-role.
+ pub async fn roster_now<D>(dir: &D, identity: &str) -> Result<BTreeSet<String>, Error>
+ where
+     D: FederationDirectory + ?Sized,
+ {
+     let mut roster = BTreeSet::new();
+-    if !genesis_evicted_at(dir, identity, roster_clock()).await? {
++    let now = roster_clock();
++    if !genesis_evicted_at(dir, identity, now).await? {
+         roster.insert(identity.to_owned());
+     }
++    // v62.0.0 (wave O1) — an occurrence past its `valid_until` is not a
++    // roster key: its window is half-open (`kernel::key_end::within_record`),
++    // not only its revocation ends it (CC 3.3.6.4: "A roster key's occurrence
++    // MAY state an end").
++    let ms = |t: DateTime<Utc>| u64::try_from(t.timestamp_millis()).unwrap_or(0);
+     for o in dir.list_identity_occurrences_active(identity).await? {
++        if !crate::kernel::key_end::within_record(ms(now), ms(o.asserted_at), o.valid_until.map(ms))
++        {
++            continue;
++        }
+         if o.occurrence_key_id != identity && is_user_key(dir, &o.occurrence_key_id).await? {
+             roster.insert(o.occurrence_key_id);
+         }
+diff --git a/src/federation/transport_routes.rs b/src/federation/transport_routes.rs
+index 9cc38bf2..d077ffda 100644
+--- a/src/federation/transport_routes.rs
++++ b/src/federation/transport_routes.rs
+@@ -149,6 +149,50 @@ async fn displaces<F: FederationDirectory + ?Sized>(
+     Ok(owners.of(&newer.occurrence_key_id).await? == Some(owner))
+ }
+ 
++/// v62.0.0 (wave O1; E8's finding) — **a route an occurrence projected, read
++/// against that occurrence's window.** A route row is an occurrence's
++/// projection when one of the held occurrences of its key projects exactly it
++/// (`OccurrenceTransportBinding::project_route`: kind, destination, the
++/// occurrence's own `asserted_at`, epoch 0). It is expired at `now_ms` when
++/// every occurrence that projects it is out of its half-open window
++/// (`kernel::key_end::within_record`): no route once `now ≥ valid_until`.
++/// A route no occurrence projects (an announce, a signed route) is not read
++/// here.
++async fn expired_projection<F: FederationDirectory + ?Sized>(
++    dir: &F,
++    windows: &mut std::collections::HashMap<String, Vec<super::IdentityOccurrence>>,
++    row: &TransportDestination,
++    now_ms: u64,
++) -> Result<bool, Error> {
++    if row.epoch != 0 || row.retired_at.is_some() {
++        return Ok(false);
++    }
++    if !windows.contains_key(&row.occurrence_key_id) {
++        let held = dir
++            .list_identity_occurrences_by_occurrence_key(&row.occurrence_key_id)
++            .await?;
++        windows.insert(row.occurrence_key_id.clone(), held);
++    }
++    let ms = |t: chrono::DateTime<chrono::Utc>| u64::try_from(t.timestamp_millis()).unwrap_or(0);
++    let projecting: Vec<&super::IdentityOccurrence> = windows[&row.occurrence_key_id]
++        .iter()
++        .filter(|o| {
++            o.transport_binding.as_ref().is_some_and(|tb| {
++                tb.project_route(&o.occurrence_key_id, o.asserted_at)
++                    .is_ok_and(|p| {
++                        p.transport_kind == row.transport_kind
++                            && p.destination == row.destination
++                            && p.asserted_at == row.asserted_at
++                    })
++            })
++        })
++        .collect();
++    Ok(!projecting.is_empty()
++        && projecting.iter().all(|o| {
++            !crate::kernel::key_end::within_record(now_ms, ms(o.asserted_at), o.valid_until.map(ms))
++        }))
++}
++
+ async fn fold_with<F: FederationDirectory + ?Sized>(
+     dir: &F,
+     owners: &mut Owners<'_, F>,
+@@ -156,8 +200,15 @@ async fn fold_with<F: FederationDirectory + ?Sized>(
+ ) -> Result<Vec<TransportDestination>, Error> {
+     let mut by_destination: std::collections::HashMap<String, Vec<TransportDestination>> =
+         std::collections::HashMap::new();
++    let mut windows: std::collections::HashMap<String, Vec<super::IdentityOccurrence>> =
++        std::collections::HashMap::new();
++    let now_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+     let mut out = Vec::with_capacity(rows.len());
+     for row in rows {
++        // v62.0.0 (wave O1) — an expired occurrence keeps no live route.
++        if expired_projection(dir, &mut windows, &row, now_ms).await? {
++            continue;
++        }
+         if !by_destination.contains_key(&row.destination) {
+             let held = dir
+                 .list_transport_destinations_by_destination_unfolded(&row.destination)
+@@ -166,6 +217,11 @@ async fn fold_with<F: FederationDirectory + ?Sized>(
+         }
+         let mut displaced = false;
+         for other in &by_destination[&row.destination] {
++            // v62.0.0 (wave O1) — only a live route displaces: an expired
++            // occurrence's projection displaces nothing.
++            if expired_projection(dir, &mut windows, other, now_ms).await? {
++                continue;
++            }
+             if displaces(owners, other, &row).await? {
+                 displaced = true;
+                 break;
+diff --git a/src/federation/transport_routes_invariants.rs b/src/federation/transport_routes_invariants.rs
+index 181bb05a..74c8bf19 100644
+--- a/src/federation/transport_routes_invariants.rs
++++ b/src/federation/transport_routes_invariants.rs
+@@ -343,7 +343,11 @@ pub(crate) mod bodies {
+         use base64::Engine as _;
+         let b64 = base64::engine::general_purpose::STANDARD;
+         let identity = format!("{tag}-occid");
+-        ts::register_identity_key(d, &identity, USER).await;
++        // v62.0.0 (wave O1) — a NODE identity: a node or agent key is never
++        // an occurrence of a person (`occurrence_binds_machine_to_person`,
++        // every occurrence door), so the two machine occurrences bind under a
++        // machine identity.
++        ts::register_identity_key(d, &identity, NODE).await;
+         for (occ, ty, want) in [
+             (format!("{tag}-occnode"), NODE, 1usize),
+             (format!("{tag}-occagent"), AGENT, 0usize),
+diff --git a/src/store/postgres.rs b/src/store/postgres.rs
+index ecf6cf56..f6d1e741 100644
+--- a/src/store/postgres.rs
++++ b/src/store/postgres.rs
+@@ -2946,7 +2946,8 @@ impl crate::federation::occurrence_admit::OccurrenceStore for PostgresBackend {
+                     pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
+                     transport_binding = EXCLUDED.transport_binding, \
+                     admitted_at = EXCLUDED.admitted_at \
+-                 WHERE cirislens.federation_identity_occurrences.signature IS NULL",
++                 WHERE cirislens.federation_identity_occurrences.signature IS NULL \
++                   AND cirislens.federation_identity_occurrences.signed_envelope IS NULL",
+                 &[
+                     &row.identity_key_id,
+                     &row.occurrence_key_id,
+@@ -2974,6 +2975,119 @@ impl crate::federation::occurrence_admit::OccurrenceStore for PostgresBackend {
+     ) -> Result<(), crate::federation::Error> {
+         self.index_plane_row(row_id).await
+     }
++
++    async fn store_edition2_occurrence(
++        &self,
++        planned: crate::federation::occurrence_admit::PlannedOccurrence,
++    ) -> Result<bool, crate::federation::Error> {
++        // v62.0.0 (wave O1) — the door's own transaction around the
++        // tx-level helper C1's genesis import also calls.
++        let mut client = self
++            .get_client()
++            .await
++            .map_err(crate::store::Error::into_federation)?;
++        let tx = client.transaction().await.map_err(|e| {
++            crate::federation::Error::Backend(format!("edition-2 identity_occurrence tx: {e}"))
++        })?;
++        let applied = self.pg_store_edition2_occurrence(&tx, &planned).await?;
++        tx.commit().await.map_err(|e| {
++            crate::federation::Error::Backend(format!("edition-2 identity_occurrence commit: {e}"))
++        })?;
++        Ok(applied)
++    }
++}
++
++impl PostgresBackend {
++    /// v62.0.0 (wave O1; C1's atomic genesis import) — **the edition-2
++    /// bind's writes, inside the caller's transaction** `tx`: the
++    /// last-signed-wins upsert (strictly newer `asserted_at` only, at a
++    /// fresh serve position; `signature` NULL, the statements in
++    /// `signed_envelope`) and its #930 history row whether or not it
++    /// applied. No transaction of its own, no commit, nothing after: the
++    /// caller runs `occurrence_admit::after_edition2_occurrence` once its
++    /// transaction commits. Returns whether the upsert took the record.
++    ///
++    /// # Errors
++    /// No author in `planned`; the envelope's encoding; storage faults (an
++    /// FK miss is `InvalidArgument`).
++    pub(crate) async fn pg_store_edition2_occurrence<C>(
++        &self,
++        tx: &C,
++        planned: &crate::federation::occurrence_admit::PlannedOccurrence,
++    ) -> Result<bool, crate::federation::Error>
++    where
++        C: deadpool_postgres::GenericClient + Sync,
++    {
++        let row = &planned.row;
++        let signed = planned.signed.as_ref().ok_or_else(|| {
++            crate::federation::Error::Backend("store_edition2_occurrence: no author".into())
++        })?;
++        let signed_envelope_text = pg_envelope_text(&signed.signed_envelope, "signed_envelope")?;
++        let admitted_at = self
++            .next_plane_position(tx, "federation_identity_occurrences")
++            .await?;
++        let applied: i64 = tx
++            .query_one(
++                "WITH hist AS (\
++                    INSERT INTO cirislens.federation_identity_occurrence_history (\
++                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
++                        attesting_key_id, signed_envelope, signature\
++                    ) VALUES ($1, $2, $5, $6, $10, $11, NULL) ON CONFLICT DO NOTHING\
++                 ), up AS (\
++                 INSERT INTO cirislens.federation_identity_occurrences (\
++                    identity_key_id, occurrence_key_id, device_class, \
++                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
++                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
++                    attesting_key_id, signed_envelope, signature, transport_binding, \
++                    admitted_at\
++                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12, $13) \
++                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
++                    device_class = EXCLUDED.device_class, \
++                    hardware_attestation = EXCLUDED.hardware_attestation, \
++                    asserted_at = EXCLUDED.asserted_at, \
++                    valid_until = EXCLUDED.valid_until, \
++                    persist_row_hash = EXCLUDED.persist_row_hash, \
++                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
++                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
++                    attesting_key_id = EXCLUDED.attesting_key_id, \
++                    signed_envelope = EXCLUDED.signed_envelope, \
++                    signature = NULL, \
++                    transport_binding = EXCLUDED.transport_binding, \
++                    admitted_at = EXCLUDED.admitted_at \
++                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at \
++                 RETURNING 1) SELECT COUNT(*) FROM up",
++                &[
++                    &row.identity_key_id,
++                    &row.occurrence_key_id,
++                    &row.device_class,
++                    &row.hardware_attestation,
++                    &row.asserted_at,
++                    &row.valid_until,
++                    &row.persist_row_hash,
++                    &planned.enc_x25519,
++                    &planned.enc_ml_kem,
++                    &signed.attesting_key_id,
++                    &signed_envelope_text,
++                    &planned.transport_binding_json,
++                    &admitted_at,
++                ],
++            )
++            .await
++            .and_then(|r| r.try_get::<_, i64>(0))
++            .map_err(|e| {
++                let msg = e.to_string();
++                if msg.contains("foreign key") {
++                    crate::federation::Error::InvalidArgument(format!(
++                        "FK constraint violated on identity_occurrence insert: {msg}"
++                    ))
++                } else {
++                    crate::federation::Error::Backend(format!(
++                        "insert edition-2 identity_occurrence: {msg}"
++                    ))
++                }
++            })?;
++        Ok(applied > 0)
++    }
+ }
+ 
+ /// v61 (CIRISPersist#934, S4b) — the group supersede executor on postgres.
+@@ -11601,6 +11715,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+             .await
+     }
+ 
++    async fn put_identity_occurrence_edition2(
++        &self,
++        bind: crate::federation::edition2::occurrence::OccurrenceBind,
++    ) -> Result<bool, crate::federation::Error> {
++        // v62.0.0 (wave O1) — the gates are the edition-2 door's.
++        crate::federation::occurrence_admit::put_identity_occurrence_edition2_planned(self, bind)
++            .await
++    }
++
+     async fn list_identity_occurrences_for(
+         &self,
+         identity_key_id: &str,
+@@ -11648,7 +11771,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+                  WHERE identity_key_id = $1 \
+                    AND attesting_key_id IS NOT NULL \
+                    AND signed_envelope IS NOT NULL \
+-                   AND signature IS NOT NULL \
++                   AND (signature IS NOT NULL \
++                        OR jsonb_exists(signed_envelope::jsonb, 'ceg_statement')) \
+                  ORDER BY occurrence_key_id ASC",
+                 &[&identity_key_id],
+             )
+@@ -23038,9 +23162,14 @@ fn pg_row_to_signed_identity_occurrence(
+         &row.safe_get_with::<String, _, _, _>("signed_envelope", mk_err)?,
+         "signed_envelope",
+     )?;
+-    let signature_text: String = row.safe_get_with("signature", mk_err)?;
+-    let signature = serde_json::from_str(&signature_text)
+-        .map_err(|e| crate::federation::Error::Backend(format!("signature decode: {e}")))?;
++    // v62.0.0 (wave O1) — an edition-2 bind has no earlier signature: its
++    // authority is the statement its envelope carries (`ceg_statement`).
++    let signature_text: Option<String> = row.safe_get_with("signature", mk_err)?;
++    let signature = match signature_text {
++        Some(t) => serde_json::from_str(&t)
++            .map_err(|e| crate::federation::Error::Backend(format!("signature decode: {e}")))?,
++        None => crate::federation::edition2::occurrence::edition2_signature_placeholder(),
++    };
+     let identity_occurrence = pg_row_to_identity_occurrence(row)?;
+     Ok(crate::federation::SignedIdentityOccurrence {
+         identity_occurrence,
+diff --git a/src/store/sqlite.rs b/src/store/sqlite.rs
+index ae68f51a..6c2cab02 100644
+--- a/src/store/sqlite.rs
++++ b/src/store/sqlite.rs
+@@ -5057,6 +5057,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+             .await
+     }
+ 
++    async fn put_identity_occurrence_edition2(
++        &self,
++        bind: crate::federation::edition2::occurrence::OccurrenceBind,
++    ) -> Result<bool, crate::federation::Error> {
++        // v62.0.0 (wave O1) — the gates are the edition-2 door's.
++        crate::federation::occurrence_admit::put_identity_occurrence_edition2_planned(self, bind)
++            .await
++    }
++
+     async fn list_identity_occurrences_for(
+         &self,
+         identity_key_id: &str,
+@@ -5104,7 +5113,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+                      WHERE identity_key_id = ?1 \
+                        AND attesting_key_id IS NOT NULL \
+                        AND signed_envelope IS NOT NULL \
+-                       AND signature IS NOT NULL \
++                       AND (signature IS NOT NULL \
++                            OR json_extract(signed_envelope, '$.ceg_statement') IS NOT NULL) \
+                      ORDER BY occurrence_key_id ASC",
+                     )?;
+                     let rows = stmt.query_map([&key], sqlite_row_to_signed_identity_occurrence)?;
+@@ -17541,7 +17551,9 @@ fn sqlite_row_to_signed_identity_occurrence(
+     let identity_occurrence = sqlite_row_to_identity_occurrence(row)?;
+     let attesting_key_id: String = row.get("attesting_key_id")?;
+     let signed_envelope_json: String = row.get("signed_envelope")?;
+-    let signature_json: String = row.get("signature")?;
++    // v62.0.0 (wave O1) — an edition-2 bind has no earlier signature: its
++    // authority is the statement its envelope carries (`ceg_statement`).
++    let signature_json: Option<String> = row.get("signature")?;
+     let json_err = |e: serde_json::Error| {
+         rusqlite::Error::FromSqlConversionFailure(
+             0,
+@@ -17552,7 +17564,10 @@ fn sqlite_row_to_signed_identity_occurrence(
+     let signed_envelope: serde_json::Value =
+         serde_json::from_str(&signed_envelope_json).map_err(json_err)?;
+     let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+-        serde_json::from_str(&signature_json).map_err(json_err)?;
++        match signature_json {
++            Some(j) => serde_json::from_str(&j).map_err(json_err)?,
++            None => crate::federation::edition2::occurrence::edition2_signature_placeholder(),
++        };
+     Ok(crate::federation::SignedIdentityOccurrence {
+         identity_occurrence,
+         attesting_key_id,
+@@ -25977,7 +25992,8 @@ impl crate::federation::occurrence_admit::OccurrenceStore for SqliteBackend {
+                     pubkey_ml_kem_768_base64 = excluded.pubkey_ml_kem_768_base64, \
+                     transport_binding = excluded.transport_binding, \
+                     admitted_at = excluded.admitted_at \
+-                 WHERE federation_identity_occurrences.signature IS NULL",
++                 WHERE federation_identity_occurrences.signature IS NULL \
++                   AND federation_identity_occurrences.signed_envelope IS NULL",
+                 rusqlite::params![
+                     row.identity_key_id,
+                     row.occurrence_key_id,
+@@ -26018,6 +26034,112 @@ impl crate::federation::occurrence_admit::OccurrenceStore for SqliteBackend {
+     ) -> Result<(), crate::federation::Error> {
+         self.index_plane_row(row_id).await
+     }
++
++    async fn store_edition2_occurrence(
++        &self,
++        planned: crate::federation::occurrence_admit::PlannedOccurrence,
++    ) -> Result<bool, crate::federation::Error> {
++        // v62.0.0 (wave O1) — the door's own transaction around the
++        // tx-level helper C1's genesis import also calls.
++        self.write(move |conn| -> Result<bool, crate::federation::Error> {
++            let tx = write_tx(conn).map_err(edition2_occurrence_err)?;
++            let applied = sqlite_store_edition2_occurrence(&tx, &planned)?;
++            tx.commit().map_err(edition2_occurrence_err)?;
++            Ok(applied)
++        })
++        .await
++    }
++}
++
++/// v62.0.0 (wave O1) — a storage fault of the edition-2 occurrence write,
++/// typed as the signed door types it (an FK miss is `InvalidArgument`).
++fn edition2_occurrence_err(e: rusqlite::Error) -> crate::federation::Error {
++    let msg = e.to_string();
++    if msg.contains("FOREIGN KEY") {
++        crate::federation::Error::InvalidArgument(format!(
++            "FK constraint violated on identity_occurrence insert: {msg}"
++        ))
++    } else {
++        crate::federation::Error::Backend(format!("insert edition-2 identity_occurrence: {msg}"))
++    }
++}
++
++/// v62.0.0 (wave O1; C1's atomic genesis import) — **the edition-2 bind's
++/// writes, inside the caller's transaction**: the last-signed-wins upsert
++/// (strictly newer `asserted_at` only, at a fresh serve position;
++/// `signature` NULL, the statements in `signed_envelope`) and its #930
++/// history row whether or not it applied. No transaction of its own, no
++/// commit, nothing after: the caller runs
++/// `occurrence_admit::after_edition2_occurrence` once its transaction
++/// commits. Returns whether the upsert took the record.
++///
++/// # Errors
++/// No author in `planned`; the envelope's encoding; storage faults.
++pub(crate) fn sqlite_store_edition2_occurrence(
++    tx: &Connection,
++    planned: &crate::federation::occurrence_admit::PlannedOccurrence,
++) -> Result<bool, crate::federation::Error> {
++    let row = &planned.row;
++    let signed = planned.signed.as_ref().ok_or_else(|| {
++        crate::federation::Error::Backend("store_edition2_occurrence: no author".into())
++    })?;
++    let signed_envelope_json = serde_json::to_string(&signed.signed_envelope)
++        .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
++    let admitted_at =
++        sqlite_next_plane_position(tx, "federation_identity_occurrences", POS_ASSERTED)
++            .map_err(edition2_occurrence_err)?;
++    let applied = tx
++        .execute(
++            "INSERT INTO federation_identity_occurrences (\
++                identity_key_id, occurrence_key_id, device_class, \
++                hardware_attestation, asserted_at, valid_until, persist_row_hash, \
++                pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
++                attesting_key_id, signed_envelope, signature, transport_binding, \
++                admitted_at\
++             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13) \
++             ON CONFLICT(identity_key_id, occurrence_key_id) DO UPDATE SET \
++                device_class = excluded.device_class, \
++                hardware_attestation = excluded.hardware_attestation, \
++                asserted_at = excluded.asserted_at, \
++                valid_until = excluded.valid_until, \
++                persist_row_hash = excluded.persist_row_hash, \
++                pubkey_x25519_base64 = excluded.pubkey_x25519_base64, \
++                pubkey_ml_kem_768_base64 = excluded.pubkey_ml_kem_768_base64, \
++                attesting_key_id = excluded.attesting_key_id, \
++                signed_envelope = excluded.signed_envelope, \
++                signature = NULL, \
++                transport_binding = excluded.transport_binding, \
++                admitted_at = excluded.admitted_at \
++             WHERE excluded.asserted_at > federation_identity_occurrences.asserted_at",
++            rusqlite::params![
++                row.identity_key_id,
++                row.occurrence_key_id,
++                row.device_class,
++                row.hardware_attestation,
++                row.asserted_at.to_rfc3339(),
++                row.valid_until.map(|t| t.to_rfc3339()),
++                row.persist_row_hash,
++                planned.enc_x25519,
++                planned.enc_ml_kem,
++                signed.attesting_key_id,
++                signed_envelope_json,
++                planned.transport_binding_json,
++                admitted_at.to_rfc3339(),
++            ],
++        )
++        .map_err(edition2_occurrence_err)?;
++    sqlite_append_occurrence_history(
++        tx,
++        &row.identity_key_id,
++        &row.occurrence_key_id,
++        &row.asserted_at,
++        row.valid_until.as_ref(),
++        Some(signed.attesting_key_id.as_str()),
++        Some(signed_envelope_json.as_str()),
++        None,
++    )
++    .map_err(edition2_occurrence_err)?;
++    Ok(applied > 0)
+ }
+ 
+ /// v61 (CIRISPersist#934, S4b) — the group supersede executor on sqlite.
+diff --git a/src/store/sqlite_conn_model.rs b/src/store/sqlite_conn_model.rs
+index 559a85e6..38447659 100644
+--- a/src/store/sqlite_conn_model.rs
++++ b/src/store/sqlite_conn_model.rs
+@@ -449,6 +449,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+     // v61 (CIRISPersist#934, S4b) — the identity-occurrence executor.
+     ("store_planned_occurrence", ConnClass::Write),
+     ("store_planned_local_occurrence", ConnClass::Write),
++    // v62.0.0 (wave O1) — the edition-2 bind: the door's transaction, and
++    // the tx-level helper C1's genesis import calls inside its own.
++    ("store_edition2_occurrence", ConnClass::Write),
++    ("sqlite_store_edition2_occurrence", ConnClass::HelperWrite),
+     // v61 (CIRISPersist#934, S4b) — the transport-destination executor.
+     ("store_planned_destination", ConnClass::Write),
+     ("store_planned_signed_destination", ConnClass::Write),

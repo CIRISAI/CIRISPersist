@@ -1,0 +1,975 @@
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index 35475526..2641c88c 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -3349,6 +3349,8 @@ pub async fn check_promotion_admission(
+     // the promotion chokepoint too: a local-tier licence does not cross with a
+     // malformed payload, an unsorted or repeated set, or a processor id.
+     super::operational::check_licence_payload(row)?;
++    // v62 (CC rc21, CC 3.1) — the key-segment gate at the promotion chokepoint.
++    super::namespace::key_segment::check_dimension_key_segments(&row.attestation_envelope)?;
+     check_capacity_consent_admission(directory, row, crate::host::clock::now()).await?;
+ 
+     // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`
+@@ -5272,10 +5274,8 @@ pub async fn licences_issued_under(
+             }
+         }
+     }
+-    let prefix = format!(
+-        "{}{authority_id}",
+-        crate::federation::licensure::LICENSURE_DIMENSION_PREFIX
+-    );
++    // v62 (CC rc21) — a key authority is its bare segment in the dimension.
++    let prefix = crate::federation::licensure::licensure_stem_of(authority_id);
+     let mut out: Vec<super::Attestation> = Vec::new();
+     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+     for issuer in &issuers {
+@@ -5291,6 +5291,7 @@ pub async fn licences_issued_under(
+             // the authority is the dimension's own segment, read exactly.
+             let names_authority = envelope_dimension(&row.attestation_envelope)
+                 .and_then(crate::federation::licensure::authority_of)
++                .as_deref()
+                 == Some(authority_id);
+             if names_authority
+                 && seen.insert(row.attestation_id.clone())
+@@ -5365,6 +5366,7 @@ pub async fn check_licensure_delegator_is_authority(
+     let Some(authority_id) = crate::federation::licensure::authority_of(dimension) else {
+         return Ok(());
+     };
++    let authority_id: &str = &authority_id;
+     // v54.0.0 (Codex round 3 on PR #1050) — resolved BEFORE any shortcut. A
+     // community's id can also resolve to a key (an infrastructure community's
+     // id IS its substrate key, `is_authorized_infrastructure_community`), and
+@@ -5488,6 +5490,7 @@ pub async fn check_partner_record_revision(
+     else {
+         return Ok(());
+     };
++    let authority_id: &str = &authority_id;
+     let authority = resolve_licensure_authority(directory, authority_id).await?;
+     if !licensure_issuance_at(directory, &authority, row, row.asserted_at)
+         .await?
+@@ -5495,10 +5498,8 @@ pub async fn check_partner_record_revision(
+     {
+         return Ok(());
+     }
+-    let prefix = format!(
+-        "{}{authority_id}",
+-        crate::federation::licensure::LICENSURE_DIMENSION_PREFIX
+-    );
++    // v62 (CC rc21) — a key authority is its bare segment in the dimension.
++    let prefix = crate::federation::licensure::licensure_stem_of(authority_id);
+     let mut held = Vec::new();
+     let mut pages = AttestationQuery::to(&row.attested_key_id, FOLD_PAGE)
+         .dimension_prefix(&prefix)
+@@ -5511,6 +5512,7 @@ pub async fn check_partner_record_revision(
+         if h.attestation_id == row.attestation_id
+             || envelope_dimension(&h.attestation_envelope)
+                 .and_then(crate::federation::licensure::authority_of)
++                .as_deref()
+                 != Some(authority_id)
+         {
+             continue;
+@@ -5625,6 +5627,7 @@ pub async fn check_licence_audience(
+     else {
+         return Ok(());
+     };
++    let authority_id: &str = &authority_id;
+     let refuse = |reason: &'static str, detail: String| {
+         Err(Error::InvalidArgument(format!(
+             "{LICENCE_AUDIENCE_REFUSED}: {reason}: licence {} under {authority_id:?}: {detail} \
+@@ -5655,6 +5658,7 @@ pub async fn check_licence_audience(
+         };
+         if envelope_dimension(&original.attestation_envelope)
+             .and_then(crate::federation::licensure::authority_of)
++            .as_deref()
+             != Some(authority_id)
+             || original.attested_key_id != row.attested_key_id
+         {
+@@ -18434,7 +18438,7 @@ pub async fn check_reconsideration_admission(
+         if let Some(authority_id) = envelope_dimension(&t.attestation_envelope)
+             .and_then(crate::federation::licensure::authority_of)
+         {
+-            holders.extend(licence_authority_set(directory, authority_id).await?);
++            holders.extend(licence_authority_set(directory, &authority_id).await?);
+         }
+     }
+     let is_ruling = row
+@@ -20511,6 +20515,105 @@ mod tests {
+         }
+     }
+ 
++    /// **I2964 (v62, CC rc21 CC 3.1; CLM-scope-attenuation)** — a key caveat
++    /// is written with the key's bare segment (one `:`-segment, no colon of
++    /// its own), and `scope_covers` stays DIRECTIONAL over it: the root and
++    /// the parent cover the caveat, the caveat covers its sub-caveat and
++    /// itself; the caveat never covers its parent; another key's caveat is
++    /// not covered, nor is a caveat on a prefix of the segment; and the
++    /// relation is antisymmetric over all of them.
++    #[test]
++    fn i2964_scope_covers_is_directional_over_a_key_segment() {
++        use crate::federation::namespace::key_segment::tests::segment;
++        let (a, b) = (segment('Q'), segment('g'));
++        let parent = "infra:attest:licensure";
++        let caveat_a = format!("{parent}:{a}");
++        let caveat_b = format!("{parent}:{b}");
++        let sub_a = format!("{caveat_a}:board");
++        let cut_a = format!("{parent}:{}", &a[..20]);
++        for (held, wanted, expect, why) in [
++            (
++                "infra:attest",
++                caveat_a.as_str(),
++                true,
++                "the root covers the caveat",
++            ),
++            (
++                parent,
++                caveat_a.as_str(),
++                true,
++                "the parent covers the caveat",
++            ),
++            (
++                caveat_a.as_str(),
++                caveat_a.as_str(),
++                true,
++                "a caveat covers itself",
++            ),
++            (
++                caveat_a.as_str(),
++                sub_a.as_str(),
++                true,
++                "the caveat covers its sub-caveat",
++            ),
++            (
++                caveat_a.as_str(),
++                parent,
++                false,
++                "a child never covers its parent",
++            ),
++            (caveat_a.as_str(), "infra:attest", false, "nor the root"),
++            (
++                sub_a.as_str(),
++                caveat_a.as_str(),
++                false,
++                "nor its own parent caveat",
++            ),
++            (
++                caveat_a.as_str(),
++                caveat_b.as_str(),
++                false,
++                "another key's caveat",
++            ),
++            (
++                cut_a.as_str(),
++                caveat_a.as_str(),
++                false,
++                "a prefix of the segment",
++            ),
++            (
++                cut_a.as_str(),
++                sub_a.as_str(),
++                false,
++                "a prefix of the segment, deeper",
++            ),
++        ] {
++            assert_eq!(
++                scope_covers(held, wanted),
++                expect,
++                "I2964: scope_covers({held:?}, {wanted:?}) — {why}"
++            );
++        }
++        let tokens = [
++            "infra:attest".to_owned(),
++            parent.to_owned(),
++            caveat_a.clone(),
++            caveat_b,
++            sub_a,
++            cut_a,
++        ];
++        for x in &tokens {
++            for y in &tokens {
++                if x != y && scope_covers(x, y) {
++                    assert!(
++                        !scope_covers(y, x),
++                        "I2964: {x:?} and {y:?} cover each other"
++                    );
++                }
++            }
++        }
++    }
++
+     /// v42.0.0 (CIRISPersist#814 part 4) — the relation is ANTISYMMETRIC on
+     /// distinct tokens: if `a` covers `b` and they differ, `b` must not cover
+     /// `a`. Stated as a property because the failure mode is a symmetric
+diff --git a/src/federation/attestation_admit.rs b/src/federation/attestation_admit.rs
+index 9a72c73e..f83218fd 100644
+--- a/src/federation/attestation_admit.rs
++++ b/src/federation/attestation_admit.rs
+@@ -768,6 +768,12 @@ where
+     // payment-processor identifier anywhere in its envelope. Pure; the same
+     // gate at every door.
+     crate::federation::operational::check_licence_payload(&row)?;
++    // v62 (CC rc21, CC 3.1) — a key in a family name is its bare thumbprint
++    // segment: a URN in a `dimension`, or a second spelling of a key segment,
++    // is a malformed row. Pure; the same gate at every door.
++    crate::federation::namespace::key_segment::check_dimension_key_segments(
++        &row.attestation_envelope,
++    )?;
+ 
+     // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
+     // `consent:state:*` row is refused unless its signed envelope carries
+@@ -1539,6 +1545,8 @@ where
+     // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
+     // holder claim, so only the struct is checked here.
+     crate::federation::media_source::check_media_source(&envelope_value)?;
++    // v62 (CC rc21, CC 3.1) — the key-segment gate, at the local door too.
++    crate::federation::namespace::key_segment::check_dimension_key_segments(&envelope_value)?;
+     // v61 (CC 2.6.2) — a signed instant is `.sssZ` at the local door too:
+     // a row written in another form could never be promoted. `expires_at` is
+     // the door's own to stamp from the typed column (#598), so it is not read
+diff --git a/src/federation/key_segment_invariants.rs b/src/federation/key_segment_invariants.rs
+new file mode 100644
+index 00000000..30ad58f8
+--- /dev/null
++++ b/src/federation/key_segment_invariants.rs
+@@ -0,0 +1,239 @@
++//! v62 (CC rc21, CC 3.1 "A shape beyond the class") — **a key in a family
++//! name is its bare thumbprint segment**, and the licensure authority gate
++//! matches a v62 key through it, on every backend.
++//!
++//! - **I2965** — the board is a v62 key (an identity-ref). Its licences name
++//!   it as `licensure:<segment>:v1`:
++//!   (a) the board's own licence admits and folds
++//!       (`status_set_for(holder, <identity-ref>)` is `{issued}`);
++//!   (b) a licence by the board's `license`-scoped officer, naming the edge,
++//!       admits: the door read the authority as the board's key;
++//!   (c) the same licence by a key with no edge from the board is refused
++//!       `licensure_delegator_not_authority`, and nothing is stored;
++//!   (d) the officer's licence folds as the board's.
++//! - **I2966** — a licence whose dimension carries the board's URN
++//!   (`licensure:urn:ietf:params:oauth:ckt:sha-256:<…>:v1`) is a malformed
++//!   row (`envelope_member_invalid`) at the direct door and at the replicated
++//!   door; so is a key-shaped segment with trailing bits. Nothing is stored.
++//!   A `delegates_to` whose scope caveat `infra:attest:licensure:…` carries
++//!   the URN is a malformed row.
++//!
++//! Earlier-form (JSON) rows, as the rest of the suite until the fixture flip;
++//! the dimension's spelling is the same in edition 2.
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++pub(crate) mod bodies {
++    use crate::federation::admission::steward_liveness_test_support::{
++        register, signed_row, store,
++    };
++    use crate::federation::admission::DELEGATION_SCOPE_LICENSE;
++    use crate::federation::licensure::{licensure_stem_of, status_set_for, LicensureStatus};
++    use crate::federation::namespace::key_segment::tests::{kid, segment};
++    use crate::federation::tier_ingest::test_support::reseal;
++    use crate::federation::types::{attestation_type, identity_type};
++    use crate::federation::{
++        malformed_row, Attestation, Error, FederationDirectory, SignedAttestation,
++    };
++    use std::collections::BTreeSet;
++
++    const REFUSAL: &str = "licensure_delegator_not_authority";
++
++    /// A licence on `holder` whose dimension is `{stem}:v1`, verbatim.
++    fn licence(issuer: &str, holder: &str, stem: &str, delegation_id: Option<&str>) -> Attestation {
++        let mut envelope = serde_json::json!({
++            "id": uuid::Uuid::new_v4().to_string(),
++            "dimension": format!("{stem}:v1"),
++            "status": "issued",
++            "score": 1.0,
++            "confidence": 0.9,
++        });
++        if let Some(d) = delegation_id {
++            envelope["delegation_id"] = serde_json::Value::String(d.to_owned());
++        }
++        let mut row = signed_row(issuer, holder, attestation_type::SCORES, envelope);
++        reseal(&mut row);
++        row
++    }
++
++    fn assert_malformed(e: &Error, what: &str) {
++        match e {
++            Error::MalformedRow { reason, .. } => {
++                assert_eq!(*reason, malformed_row::ENVELOPE_MEMBER_INVALID, "{what}")
++            }
++            other => panic!("{what}: expected a malformed row, got {other:?}"),
++        }
++    }
++
++    /// **I2965 + I2966** — see the module doc.
++    pub(crate) async fn i2965_the_licensure_gate_matches_a_v62_key(
++        d: &dyn FederationDirectory,
++        tag: &str,
++    ) {
++        // The test signer seeds from the first 32 bytes of a key id and every
++        // identity-ref shares its first 34, so exactly ONE identity-ref key
++        // is registered here.
++        let board = kid('Q');
++        let stem = licensure_stem_of(&board);
++        assert_eq!(stem, format!("licensure:{}", segment('Q')));
++        let holder = format!("{tag}-holder");
++        let holder2 = format!("{tag}-holder2");
++        let clerk = format!("{tag}-clerk");
++        let stranger = format!("{tag}-stranger");
++        register(d, &board, &[identity_type::USER]).await;
++        for k in [&holder, &holder2] {
++            register(d, k, &[identity_type::USER]).await;
++        }
++        for k in [&clerk, &stranger] {
++            register(d, k, &[identity_type::PRIMITIVE]).await;
++        }
++
++        // (a) The board's own licence, its key written bare.
++        store(d, &licence(&board, &holder, &stem, None))
++            .await
++            .unwrap_or_else(|e| panic!("I2965 (a): the board's own licence admits: {e}"));
++        assert_eq!(
++            status_set_for(d, &holder, &board, chrono::Utc::now())
++                .await
++                .expect("fold"),
++            BTreeSet::from([LicensureStatus::Issued]),
++            "I2965 (a): asked by the board's key id, the fold reads its licence"
++        );
++
++        // (b) The board's licensing officer.
++        let mut edge = signed_row(
++            &board,
++            &clerk,
++            attestation_type::DELEGATES_TO,
++            serde_json::json!({
++                "id": uuid::Uuid::new_v4().to_string(),
++                "scope": [DELEGATION_SCOPE_LICENSE],
++            }),
++        );
++        edge.subject_key_ids = vec![clerk.clone()];
++        reseal(&mut edge);
++        store(d, &edge)
++            .await
++            .unwrap_or_else(|e| panic!("I2965 (b): the board appoints its officer: {e}"));
++        store(
++            d,
++            &licence(&clerk, &holder2, &stem, Some(&edge.attestation_id)),
++        )
++        .await
++        .unwrap_or_else(|e| panic!("I2965 (b): the officer's licence admits: {e}"));
++
++        // (c) A key with no edge from the board.
++        let forged = licence(&stranger, &holder, &stem, Some(&edge.attestation_id));
++        let err = store(d, &forged)
++            .await
++            .expect_err("I2965 (c): a stranger's licence for the board is refused");
++        assert!(
++            err.to_string().contains(REFUSAL),
++            "I2965 (c): refused by the licensure gate, got {err}"
++        );
++        assert!(d
++            .get_attestation(&forged.attestation_id)
++            .await
++            .expect("read")
++            .is_none());
++
++        // (d) The officer's licence is the board's licensure.
++        assert_eq!(
++            status_set_for(d, &holder2, &board, chrono::Utc::now())
++                .await
++                .expect("fold"),
++            BTreeSet::from([LicensureStatus::Issued]),
++            "I2965 (d): the officer's licence folds as the board's"
++        );
++
++        // I2966 — the URN in the dimension, and a second spelling of the
++        // segment, are malformed rows, at the direct and replicated doors.
++        let mut bits = segment('Q');
++        bits.pop();
++        bits.push('B');
++        for (bad_stem, what) in [
++            (format!("licensure:{board}"), "the URN"),
++            (format!("licensure:{bits}"), "trailing bits"),
++        ] {
++            let row = licence(&board, &holder, &bad_stem, None);
++            assert_malformed(
++                &store(d, &row).await.expect_err(what),
++                &format!("I2966 (direct): {what}"),
++            );
++            let e = d
++                .apply_replicated_attestation(SignedAttestation {
++                    attestation: row.clone(),
++                })
++                .await
++                .expect_err(what);
++            assert_malformed(&e, &format!("I2966 (replicated): {what}"));
++            assert!(d
++                .get_attestation(&row.attestation_id)
++                .await
++                .expect("read")
++                .is_none());
++        }
++
++        // I2966 — a scope caveat names its key by the bare segment too: the
++        // board's delegation whose caveat carries the board's URN is a
++        // malformed row at the door (tier 1, ahead of every authority gate).
++        // The bare-segment caveat's acceptance by the gate is I2962's.
++        let mut grant = signed_row(
++            &board,
++            &clerk,
++            attestation_type::DELEGATES_TO,
++            serde_json::json!({
++                "id": uuid::Uuid::new_v4().to_string(),
++                "scope": [format!("infra:attest:licensure:{board}")],
++            }),
++        );
++        grant.subject_key_ids = vec![clerk.clone()];
++        reseal(&mut grant);
++        assert_malformed(
++            &store(d, &grant)
++                .await
++                .expect_err("I2966: a URN caveat is refused"),
++            "I2966 (scope): the URN",
++        );
++        assert!(d
++            .get_attestation(&grant.attestation_id)
++            .await
++            .expect("read")
++            .is_none());
++    }
++}
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod tests {
++    use super::bodies;
++
++    fn tag(n: &str) -> String {
++        format!("{n}{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i2965_sqlite() {
++        use crate::store::Backend as _;
++        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        bodies::i2965_the_licensure_gate_matches_a_v62_key(&b, &tag("s")).await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i2965_postgres() {
++        use crate::store::Backend as _;
++        let Some(dsn) = crate::test_pg::empty_dsn() else {
++            eprintln!("I2965 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
++            return;
++        };
++        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        bodies::i2965_the_licensure_gate_matches_a_v62_key(&b, &tag("p")).await;
++        eprintln!("i2965_postgres: RAN");
++    }
++}
+diff --git a/src/federation/licensure.rs b/src/federation/licensure.rs
+index 7e782963..d9d887f7 100644
+--- a/src/federation/licensure.rs
++++ b/src/federation/licensure.rs
+@@ -113,11 +113,30 @@ impl LicensureStatus {
+ ///
+ /// A trailing `:v{n}` is part of neither the prefix nor the authority: the
+ /// dimension `licensure:acme:v1` is authority `acme`.
++///
++/// v62 (CC rc21, CC 3.1) — a KEY authority is written into the dimension as
++/// its bare thumbprint segment (`licensure:<43 base64url>:v1`) and read back
++/// as the identity-ref it names
++/// ([`key_segment::key_id_of_param`](super::namespace::key_segment::key_id_of_param)),
++/// so the authority this returns compares with key ids (`attesting_key_id`,
++/// `lookup_public_key`, `status_set_for`'s `authority_id`) by equality. An
++/// earlier-form id is returned as itself.
+ #[must_use]
+-pub fn authority_of(dimension: &str) -> Option<&str> {
++pub fn authority_of(dimension: &str) -> Option<std::borrow::Cow<'_, str>> {
+     let rest = dimension.strip_prefix(LICENSURE_DIMENSION_PREFIX)?;
+     let authority = rest.split(':').next().unwrap_or("");
+-    (!authority.is_empty()).then_some(authority)
++    (!authority.is_empty()).then(|| super::namespace::key_segment::key_id_of_param(authority))
++}
++
++/// v62 (CC rc21, CC 3.1) — `licensure:{authority}` for the authority
++/// `authority_id` (a key id): the dimension stem a query or producer writes,
++/// with a key authority as its bare segment. The inverse of [`authority_of`].
++#[must_use]
++pub fn licensure_stem_of(authority_id: &str) -> String {
++    format!(
++        "{LICENSURE_DIMENSION_PREFIX}{}",
++        super::namespace::key_segment::family_param_of(authority_id)
++    )
+ }
+ 
+ /// Read the envelope's declared status, if it is in the closed vocabulary.
+@@ -280,7 +299,7 @@ pub fn fold_status_set(
+         else {
+             continue;
+         };
+-        if authority_of(dimension) != Some(authority_id) {
++        if authority_of(dimension).as_deref() != Some(authority_id) {
+             continue;
+         }
+         // v42.0.0 — a RETRACTION carries no replacement body, so it must not
+@@ -537,8 +556,8 @@ mod tests {
+ 
+     #[test]
+     fn authority_parsing_814() {
+-        assert_eq!(authority_of("licensure:acme"), Some("acme"));
+-        assert_eq!(authority_of("licensure:acme:v1"), Some("acme"));
++        assert_eq!(authority_of("licensure:acme").as_deref(), Some("acme"));
++        assert_eq!(authority_of("licensure:acme:v1").as_deref(), Some("acme"));
+         assert_eq!(authority_of("licensure:"), None, "empty authority");
+         assert_eq!(authority_of("licensure"), None, "not a licensure dimension");
+         assert_eq!(
+@@ -549,4 +568,54 @@ mod tests {
+         );
+         assert_eq!(authority_of("scores:acme"), None);
+     }
++
++    /// **I2963 (v62, CC rc21 CC 3.1)** — a key authority is written as its
++    /// bare segment and read back as its identity-ref: `authority_of` on
++    /// `licensure:<segment>[:v1]` is the identity-ref (never the segment, and
++    /// never `urn`); `licensure_stem_of` writes the segment; the two are
++    /// inverse; and the pure fold matches a v62 kid's rows, not another's.
++    #[test]
++    fn i2963_a_v62_key_authority_is_written_bare_and_read_as_its_ref() {
++        use crate::federation::namespace::key_segment::tests::{kid, segment};
++        let (a, a_seg) = (kid('Q'), segment('Q'));
++        let b = kid('g');
++        assert_eq!(licensure_stem_of(&a), format!("licensure:{a_seg}"));
++        assert_eq!(licensure_stem_of("acme"), "licensure:acme");
++        for d in [
++            format!("licensure:{a_seg}"),
++            format!("licensure:{a_seg}:v1"),
++        ] {
++            assert_eq!(authority_of(&d).as_deref(), Some(a.as_str()), "{d}");
++        }
++        assert_eq!(
++            authority_of(&format!("{}:v1", licensure_stem_of(&a))).as_deref(),
++            Some(a.as_str()),
++            "write then read is the identity"
++        );
++        // A URN written into the dimension is not read as the key (the door
++        // refuses it as malformed: `key_segment::check_dimension_key_segments`).
++        assert_eq!(
++            authority_of(&format!("licensure:{a}:v1")).as_deref(),
++            Some("urn")
++        );
++        // `lic_row` writes `licensure:{x}:v1` verbatim, so the rows are
++        // written with the bare segment, as a producer writes them.
++        let rows = vec![
++            lic_row("a1", &segment('Q'), "issued"),
++            lic_row("b1", &segment('g'), "revoked"),
++        ];
++        assert_eq!(
++            fold_status_set(&rows, &a, chrono::Utc::now()),
++            BTreeSet::from([LicensureStatus::Issued]),
++            "I2963: the fold, asked by key id, reads the authority's own rows"
++        );
++        assert_eq!(
++            fold_status_set(&rows, &b, chrono::Utc::now()),
++            BTreeSet::from([LicensureStatus::Revoked])
++        );
++        assert!(
++            fold_status_set(&rows, &a_seg, chrono::Utc::now()).is_empty(),
++            "I2963: the authority id is the key id, not its segment"
++        );
++    }
+ }
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index 7d19bfe2..db33b251 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -838,6 +838,11 @@ pub(crate) mod subject_read_1225_invariants;
+ // reaches the backend's `list_attestations_naming_by_dimension`.
+ #[cfg(test)]
+ mod directory_double_1232_invariants;
++// v62 (CC rc21, CC 3.1) — I2965/I2966: a key in a family name is its bare
++// thumbprint segment; the licensure gate matches a v62 key through it, and a
++// URN in a dimension is a malformed row, on every backend.
++#[cfg(test)]
++mod key_segment_invariants;
+ // v61.1.0 (CIRISPersist#1226) — I1610–I1615: the cohort revoke door carries
+ // the one-voice countersign, verified, on every backend.
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+diff --git a/src/federation/namespace/key_segment.rs b/src/federation/namespace/key_segment.rs
+new file mode 100644
+index 00000000..d9db6701
+--- /dev/null
++++ b/src/federation/namespace/key_segment.rs
+@@ -0,0 +1,340 @@
++//! v62 (CC rc21, CC 3.1 "A shape beyond the class") — **a key written into a
++//! family name is its BARE thumbprint.**
++//!
++//! An edition-2 key id is an identity-ref,
++//! `urn:ietf:params:oauth:ckt:sha-256:<43 base64url>` (RFC 9679 §5.7; CC
++//! 2.6.1.1). Payload members (`iss`, `author`, `sub`, role parties) carry the
++//! full URN. Where a family name embeds a key, as `licensure:{authority_id}`
++//! does, the `dimension` segment is the bare thumbprint: the 43 unpadded
++//! base64url characters after the prefix, with no colon and zero trailing
++//! bits. The edition-2 family label (-70002) is the TEMPLATE
++//! (`licensure:.authority_id`), so the thumbprint appears only in the
++//! payload's `dimension` member, where the namespace matcher reads it as a
++//! verbatim, case-preserving value segment.
++//!
++//! This module is the ONE place that writes a key into a family name and
++//! reads one back. Segment parsing stays plain `:`-splitting: a key segment
++//! has no colon. A URN written into a family name is malformed
++//! ([`check_dimension_key_segments`]).
++//!
++//! The prefix is fixed, so [`segment_of`] and [`identity_ref_of`] are
++//! inverse one-to-one maps.
++
++use super::super::{malformed_row, Error};
++
++/// `urn:ietf:params:oauth:ckt:sha-256:`.
++pub use ciris_verify_core::edition2::IDENTITY_REF_PREFIX;
++
++/// The length of a key segment: 32 bytes as unpadded base64url.
++pub const KEY_SEGMENT_LEN: usize = 43;
++
++/// The last characters a 43-char base64url string may end in when it
++/// encodes exactly 32 bytes (zero trailing bits): one spelling per key.
++const ZERO_TRAILING_BITS_LAST: &[u8] = b"AEIMQUYcgkosw048";
++
++/// Is `s` a key segment: exactly 43 base64url characters (`[A-Za-z0-9_-]`)
++/// with zero trailing bits?
++#[must_use]
++pub fn is_key_segment(s: &str) -> bool {
++    let b = s.as_bytes();
++    b.len() == KEY_SEGMENT_LEN
++        && b.iter()
++            .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
++        && ZERO_TRAILING_BITS_LAST.contains(&b[KEY_SEGMENT_LEN - 1])
++}
++
++/// The key segment of an identity-ref: the 43 characters after
++/// [`IDENTITY_REF_PREFIX`]. `None` when `identity_ref` is not a well-formed
++/// identity-ref.
++#[must_use]
++pub fn segment_of(identity_ref: &str) -> Option<String> {
++    if !ciris_verify_core::edition2::is_identity_ref(identity_ref) {
++        return None;
++    }
++    identity_ref
++        .strip_prefix(IDENTITY_REF_PREFIX)
++        .filter(|s| is_key_segment(s))
++        .map(str::to_owned)
++}
++
++/// The identity-ref a key segment names. `None` when `segment` is not a key
++/// segment.
++#[must_use]
++pub fn identity_ref_of(segment: &str) -> Option<String> {
++    is_key_segment(segment).then(|| format!("{IDENTITY_REF_PREFIX}{segment}"))
++}
++
++/// **A key id as a family-name segment**: an identity-ref is written as its
++/// bare segment; any other id (an earlier-form key id, while those doors
++/// are open) is written as itself.
++#[must_use]
++pub fn family_param_of(key_id: &str) -> std::borrow::Cow<'_, str> {
++    match segment_of(key_id) {
++        Some(s) => std::borrow::Cow::Owned(s),
++        None => std::borrow::Cow::Borrowed(key_id),
++    }
++}
++
++/// **A family-name segment as a key id**: a key segment is read as the
++/// identity-ref it names; any other segment (an earlier-form key id) is read
++/// as itself. The inverse of [`family_param_of`].
++#[must_use]
++pub fn key_id_of_param(segment: &str) -> std::borrow::Cow<'_, str> {
++    match identity_ref_of(segment) {
++        Some(r) => std::borrow::Cow::Owned(r),
++        None => std::borrow::Cow::Borrowed(segment),
++    }
++}
++
++/// The families whose `{…}` parameter after the stem names a KEY, by stem.
++/// The parameter is the segment right after the stem.
++pub const KEY_BEARING_STEMS: &[&str] = &["licensure:", "moderation_track_record:"];
++
++/// The scope tokens whose parameter after the stem names a KEY (CC rc21 lists
++/// `infra:attest:licensure:{authority_id}`). The bare parent
++/// (`infra:attest:licensure`) carries no parameter and is not matched.
++pub const KEY_BEARING_SCOPE_STEMS: &[&str] = &["infra:attest:licensure:"];
++
++/// **The key-segment gate** (pure; every door). Refused as
++/// [`Error::MalformedRow`] with [`malformed_row::ENVELOPE_MEMBER_INVALID`]:
++///
++/// - a `dimension` that carries an identity-ref URN anywhere: a family name
++///   never carries the URN, only the bare segment;
++/// - in a key-bearing position ([`KEY_BEARING_STEMS`]), a segment that is
++///   shaped like a key segment (43 base64url characters) but has non-zero
++///   trailing bits, which is a second spelling of a key;
++/// - once the earlier-form doors are shut
++///   ([`EARLIER_FORM_DOORS_SHUT`](crate::federation::edition2::door::EARLIER_FORM_DOORS_SHUT)),
++///   in a key-bearing position, ANY segment that is not a key segment (a
++///   b64url of the wrong length, an earlier-form key id). Until then, an
++///   earlier-form key id there is still a key id.
++///
++/// The same rules apply to each `scope` token of the envelope (a
++/// `delegates_to`'s scope, bare string or array) against
++/// [`KEY_BEARING_SCOPE_STEMS`]: a key caveat names its key by the bare
++/// segment too. A row with neither member is not this gate's business.
++///
++/// # Errors
++///
++/// [`Error::MalformedRow`] as above.
++pub fn check_dimension_key_segments(envelope: &serde_json::Value) -> Result<(), Error> {
++    if let Some(dimension) = envelope
++        .get("dimension")
++        .and_then(serde_json::Value::as_str)
++    {
++        check_key_params("dimension", dimension, KEY_BEARING_STEMS)?;
++    }
++    // A `delegates_to`'s `scope`: a bare token or an array of tokens.
++    let tokens: Vec<&str> = match envelope.get("scope") {
++        Some(serde_json::Value::String(s)) => vec![s.as_str()],
++        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect(),
++        _ => Vec::new(),
++    };
++    for token in tokens {
++        check_key_params("scope", token, KEY_BEARING_SCOPE_STEMS)?;
++    }
++    Ok(())
++}
++
++/// One family name or scope token `text` (from envelope member `member`)
++/// against `stems`: the rules [`check_dimension_key_segments`] states.
++fn check_key_params(member: &str, text: &str, stems: &[&str]) -> Result<(), Error> {
++    let refuse = |detail: String| {
++        Err(Error::malformed_row(
++            "attestation",
++            malformed_row::ENVELOPE_MEMBER_INVALID,
++            format!("`{member}` {text:?}: {detail} (CC 3.1, rc21)"),
++        ))
++    };
++    if text.contains(IDENTITY_REF_PREFIX) {
++        return refuse(
++            "a family name or scope token carries the bare key segment, never the \
++             identity-ref URN"
++                .to_owned(),
++        );
++    }
++    for stem in stems {
++        let Some(rest) = text.strip_prefix(stem) else {
++            continue;
++        };
++        let param = rest.split(':').next().unwrap_or("");
++        if is_key_segment(param) {
++            return Ok(());
++        }
++        let key_shaped = param.len() == KEY_SEGMENT_LEN
++            && param
++                .bytes()
++                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
++        if key_shaped {
++            return refuse(format!(
++                "{param:?} is not a key segment: its last character carries trailing bits"
++            ));
++        }
++        if crate::federation::edition2::door::EARLIER_FORM_DOORS_SHUT {
++            return refuse(format!(
++                "{param:?} in `{stem}{{…}}` is not a key segment (43 base64url characters, \
++                 zero trailing bits)"
++            ));
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++
++    /// A well-formed key segment: 42×`fill` then `A` (zero trailing bits).
++    pub(crate) fn segment(fill: char) -> String {
++        let mut s: String = std::iter::repeat_n(fill, KEY_SEGMENT_LEN - 1).collect();
++        s.push('A');
++        assert!(is_key_segment(&s), "{s}");
++        s
++    }
++
++    /// The identity-ref of [`segment`]`(fill)`.
++    pub(crate) fn kid(fill: char) -> String {
++        identity_ref_of(&segment(fill)).expect("a key segment names an identity-ref")
++    }
++
++    /// **I2960** — `is_key_segment`: 43 base64url characters with zero
++    /// trailing bits, and nothing else.
++    #[test]
++    fn i2960_a_key_segment_has_one_spelling() {
++        assert!(is_key_segment(&segment('Q')));
++        assert!(is_key_segment(&segment('-')));
++        assert!(is_key_segment(&segment('_')));
++        let s = segment('Q');
++        assert!(!is_key_segment(&s[..42]), "42 characters");
++        assert!(!is_key_segment(&format!("{s}A")), "44 characters");
++        let mut bits = s.clone();
++        bits.pop();
++        bits.push('B');
++        assert!(!is_key_segment(&bits), "non-zero trailing bits");
++        let mut pad = s.clone();
++        pad.pop();
++        pad.push('=');
++        assert!(!is_key_segment(&pad), "padding");
++        let mut plus = s.clone();
++        plus.replace_range(0..1, "+");
++        assert!(!is_key_segment(&plus), "standard base64");
++        assert!(!is_key_segment(&kid('Q')), "the URN is not a segment");
++        assert!(!is_key_segment(&"ab".repeat(32)), "64 hex");
++        assert!(!is_key_segment("acme"));
++        assert!(!is_key_segment(""));
++    }
++
++    /// **I2961** — `segment_of` and `identity_ref_of` are inverse one-to-one
++    /// maps, and agree with Verify's identity-ref grammar.
++    #[test]
++    fn i2961_segment_and_identity_ref_are_inverse() {
++        for fill in ['Q', 'g', '-', '_', '0', 'z'] {
++            let seg = segment(fill);
++            let r = identity_ref_of(&seg).unwrap();
++            assert!(ciris_verify_core::edition2::is_identity_ref(&r), "{r}");
++            assert_eq!(segment_of(&r).as_deref(), Some(seg.as_str()));
++            assert_eq!(identity_ref_of(&segment_of(&r).unwrap()), Some(r.clone()));
++            assert_eq!(family_param_of(&r), seg.as_str());
++            assert_eq!(key_id_of_param(&seg), r.as_str());
++        }
++        // A real thumbprint round-trips through Verify's own identity_ref.
++        let thumb = [0x5au8; 32];
++        let r = ciris_verify_core::edition2::identity_ref(&thumb);
++        let seg = segment_of(&r).expect("Verify's identity-ref has a segment");
++        assert!(is_key_segment(&seg));
++        assert_eq!(identity_ref_of(&seg), Some(r));
++        // Not identity-refs / not segments.
++        assert_eq!(segment_of("acme"), None);
++        assert_eq!(
++            segment_of(&segment('Q')),
++            None,
++            "a bare segment is not a ref"
++        );
++        assert_eq!(identity_ref_of("acme"), None);
++        assert_eq!(identity_ref_of(&kid('Q')), None, "a ref is not a segment");
++        // Earlier-form ids pass through both directions unchanged.
++        assert_eq!(family_param_of("acme"), "acme");
++        assert_eq!(key_id_of_param("acme"), "acme");
++    }
++
++    /// **I2962** — the key-segment gate, on `dimension` and on `scope` tokens: a bare segment admits; a URN
++    /// anywhere in a dimension, and a key-shaped segment with trailing bits
++    /// in a key-bearing position, are malformed rows; an earlier-form id in
++    /// a key-bearing position follows `EARLIER_FORM_DOORS_SHUT`; other
++    /// families and rows without a dimension are untouched.
++    #[test]
++    fn i2962_the_key_segment_gate() {
++        let dim = |d: String| serde_json::json!({ "dimension": d });
++        let malformed = |r: Result<(), Error>, what: &str| match r {
++            Err(Error::MalformedRow { reason, .. }) => {
++                assert_eq!(reason, malformed_row::ENVELOPE_MEMBER_INVALID, "{what}");
++            }
++            other => panic!("{what}: expected a malformed row, got {other:?}"),
++        };
++        let seg = segment('Q');
++        check_dimension_key_segments(&dim(format!("licensure:{seg}:v1"))).expect("bare");
++        check_dimension_key_segments(&dim(format!("licensure:{seg}"))).expect("bare, no tail");
++        check_dimension_key_segments(&dim(format!("moderation_track_record:{seg}:v1")))
++            .expect("bare");
++        malformed(
++            check_dimension_key_segments(&dim(format!("licensure:{}:v1", kid('Q')))),
++            "a URN in the authority position",
++        );
++        malformed(
++            check_dimension_key_segments(&dim(format!("credits:rust:en:{}:v1", kid('Q')))),
++            "a URN in any family name",
++        );
++        let mut bits = seg.clone();
++        bits.pop();
++        bits.push('B');
++        malformed(
++            check_dimension_key_segments(&dim(format!("licensure:{bits}:v1"))),
++            "trailing bits",
++        );
++        let earlier = check_dimension_key_segments(&dim("licensure:acme:v1".to_owned()));
++        if crate::federation::edition2::door::EARLIER_FORM_DOORS_SHUT {
++            malformed(earlier, "an earlier-form id once the doors are shut");
++        } else {
++            earlier.expect("an earlier-form id while the doors are open");
++        }
++        check_dimension_key_segments(&dim("credits:rust:en:alice:v1".to_owned())).unwrap();
++
++        // Scope tokens: the key caveat names its key by the bare segment.
++        let scope = |v: serde_json::Value| serde_json::json!({ "scope": v });
++        check_dimension_key_segments(&scope(serde_json::json!([
++            "infra:attest",
++            "infra:attest:licensure",
++            format!("infra:attest:licensure:{seg}"),
++            format!("infra:attest:licensure:{seg}:board"),
++        ])))
++        .expect("bare segment caveats");
++        check_dimension_key_segments(&scope(serde_json::json!(format!(
++            "infra:attest:licensure:{seg}"
++        ))))
++        .expect("a bare-string scope");
++        malformed(
++            check_dimension_key_segments(&scope(serde_json::json!([
++                "infra:attest",
++                format!("infra:attest:licensure:{}", kid('Q')),
++            ]))),
++            "a URN in a scope caveat",
++        );
++        malformed(
++            check_dimension_key_segments(&scope(serde_json::json!(format!(
++                "infra:attest:licensure:{bits}"
++            )))),
++            "trailing bits in a scope caveat",
++        );
++        let earlier =
++            check_dimension_key_segments(&scope(serde_json::json!("infra:attest:licensure:acme")));
++        if crate::federation::edition2::door::EARLIER_FORM_DOORS_SHUT {
++            malformed(
++                earlier,
++                "an earlier-form scope caveat once the doors are shut",
++            );
++        } else {
++            earlier.expect("an earlier-form scope caveat while the doors are open");
++        }
++        check_dimension_key_segments(&serde_json::json!({ "x": 1 })).unwrap();
++    }
++}
+diff --git a/src/federation/namespace/mod.rs b/src/federation/namespace/mod.rs
+index 75541592..c1759d5b 100644
+--- a/src/federation/namespace/mod.rs
++++ b/src/federation/namespace/mod.rs
+@@ -25,6 +25,9 @@
+ 
+ pub mod cc_manifests;
+ pub mod conformance;
++// v62 (CC rc21, CC 3.1) — a key written into a family name is its bare
++// thumbprint segment; the one encoder/decoder and its admission gate.
++pub mod key_segment;
+ pub mod matcher;
+ pub mod registry;
+ pub mod supersets;
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index 4db4606b..5ed89a86 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -837,6 +837,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     // descriptor is refused by member. (The holder claim's size gate retired
+     // with `holds_bytes` in v55.0.0; the custody parse requires it.)
+     ("check_media_source", Class::Gate),
++    // v62 (CC rc21, CC 3.1) — a key in a family name is its bare thumbprint
++    // segment (`namespace::key_segment`).
++    ("check_dimension_key_segments", Class::Gate),
+     // v45.0.0 (#871, FSD §5) — the placement rule: a rendition whose
+     // original THIS node holds must name the original's `cohort_scope`.
+     // One name at the six write doors on every backend.

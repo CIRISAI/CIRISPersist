@@ -1,0 +1,3189 @@
+diff --git a/benches/kernel_paths.rs b/benches/kernel_paths.rs
+index 01a7d978..1ea5f48f 100644
+--- a/benches/kernel_paths.rs
++++ b/benches/kernel_paths.rs
+@@ -830,8 +830,9 @@ fn bench_held_head(c: &mut Criterion) {
+         let cell: OnceCell<LineageFixture> = OnceCell::new();
+         let fx = || cell.get_or_init(|| rt.block_on(lineage_fixture(len)));
+         // A forked version: a valid, quorum-signed version whose prior is the
+-        // founding version, not the held head. The door refuses it (persist's
+-        // `held_head_verdict`; the kernel holds it as a second tip).
++        // founding version, not the held head. v62.0.0 (kernel pass 2, K1):
++        // the door holds it as a second tip (`held_head_verdict` answers
++        // through the kernel; CC 2.7.8), idempotently on every re-offer.
+         // Two forks, each signed up front: off the founding version, and off
+         // the held head's parent (a stale prior one version back).
+         for (case, prior) in [("fork_from_root", 0usize), ("fork_from_parent", 1)] {
+@@ -853,8 +854,8 @@ fn bench_held_head(c: &mut Criterion) {
+                     ))
+                     .expect("prepare fork");
+                 let r = rt.block_on(submit_version(d, &v));
+-                assert!(r.is_err(), "{case}: the fork is refused: {r:?}");
+-                b.iter(|| black_box(rt.block_on(submit_version(d, &v)).is_err()));
++                assert!(r.is_ok(), "{case}: the fork is held as a tip: {r:?}");
++                b.iter(|| black_box(rt.block_on(submit_version(d, &v)).is_ok()));
+             });
+         }
+     }
+diff --git a/migrations/postgres/lens/V300__edition2_baseline.sql b/migrations/postgres/lens/V300__edition2_baseline.sql
+index 46475395..0ad0ddd5 100644
+--- a/migrations/postgres/lens/V300__edition2_baseline.sql
++++ b/migrations/postgres/lens/V300__edition2_baseline.sql
+@@ -3528,3 +3528,21 @@ CREATE TABLE cirislens.ceg_row_names (
+     PRIMARY KEY (row_id, named_row_id, role)
+ );
+ CREATE INDEX ceg_row_names_named ON cirislens.ceg_row_names (named_row_id, role, row_id);
++
++-- Kernel pass 2 (v62.0.0, K1, I2812; CC 2.7.8 "Two versions of one head wait
++-- as tips"): a family / community version whose prev_head_digest does not
++-- name the held head is held here beside the head, never refused. The live
++-- row stays the head; a held tip re-offered once the version it names is the
++-- head runs the whole supersede door and leaves this table. snapshot is the
++-- signed wrapper as offered.
++CREATE TABLE cirislens.federation_group_tips (
++    cohort               text NOT NULL
++        CHECK (cohort IN ('family', 'community', 'affiliations')),
++    group_key_id         text NOT NULL,
++    persist_row_hash     text NOT NULL,
++    prev_head_digest     text NOT NULL,
++    snapshot             jsonb NOT NULL,
++    change_authorization jsonb,
++    held_at              timestamp with time zone NOT NULL,
++    PRIMARY KEY (cohort, group_key_id, persist_row_hash)
++);
+diff --git a/migrations/sqlite/lens/V300__edition2_baseline.sql b/migrations/sqlite/lens/V300__edition2_baseline.sql
+index 0a34dc7c..46f1f3e8 100644
+--- a/migrations/sqlite/lens/V300__edition2_baseline.sql
++++ b/migrations/sqlite/lens/V300__edition2_baseline.sql
+@@ -2798,3 +2798,22 @@ CREATE TABLE ceg_row_names (
+     PRIMARY KEY (row_id, named_row_id, role)
+ );
+ CREATE INDEX ceg_row_names_named ON ceg_row_names (named_row_id, role, row_id);
++
++-- Kernel pass 2 (v62.0.0, K1, I2812; CC 2.7.8 "Two versions of one head wait
++-- as tips"): a family / community version whose prev_head_digest does not
++-- name the held head is held here beside the head, never refused. The live
++-- row stays the head; a held tip re-offered once the version it names is the
++-- head runs the whole supersede door and leaves this table. snapshot is the
++-- signed wrapper as offered.
++CREATE TABLE federation_group_tips (
++    cohort               TEXT NOT NULL
++        CHECK (cohort IN ('family', 'community', 'affiliations')),
++    group_key_id         TEXT NOT NULL,
++    persist_row_hash     TEXT NOT NULL,
++    prev_head_digest     TEXT NOT NULL,
++    snapshot             TEXT NOT NULL CHECK (json_valid(snapshot)),
++    change_authorization TEXT
++        CHECK (change_authorization IS NULL OR json_valid(change_authorization)),
++    held_at              TEXT NOT NULL,    -- RFC-3339
++    PRIMARY KEY (cohort, group_key_id, persist_row_hash)
++);
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index 35475526..bfd24193 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -18779,8 +18779,9 @@ pub fn grant_chain_instant(row: &super::Attestation) -> chrono::DateTime<chrono:
+ ///
+ /// A no-op for any row that is not a [`attestation_type::DELEGATES_TO`]. For
+ /// `delegates_to(A → B)` it asks whether `B` already reaches `A` through live
+-/// `delegates_to` edges ([`delegation_path_hops`]), and if so refuses with
+-/// [`Error::DelegationCycle`] (`federation_delegation_cycle`).
++/// `delegates_to` edges ([`delegation_path_hops`]), and if so refused with
++/// `Error::DelegationCycle` (`federation_delegation_cycle`; v62.0.0, kernel
++/// pass 2, K1: the variant is removed, as nothing raises it).
+ ///
+ /// # Trust-plane edges are not in the cycle graph
+ ///
+diff --git a/src/federation/canonical_community.rs b/src/federation/canonical_community.rs
+index 5232bb69..4cefc2db 100644
+--- a/src/federation/canonical_community.rs
++++ b/src/federation/canonical_community.rs
+@@ -3124,6 +3124,22 @@ where
+                 Some(authorization),
+             )
+             .await?;
++        // v62.0.0 (kernel pass 2, K1, I2811) — the supersede door holds a
++        // version that does not name the held head as a tip rather than
++        // refusing it. A chain hop held as a tip (a concurrent write moved
++        // the head) did not extend the chain: it stops here, as the stale
++        // refusal stopped it before (`lost_race` reads the Conflict).
++        let head_now = directory
++            .lookup_community(id)
++            .await?
++            .map(|c| c.persist_row_hash);
++        if head_now.as_deref() != Some(row_hash(&version.community)?.as_str()) {
++            return Err(Error::Conflict(format!(
++                "trust-root chain {id}: version {} was held as a tip beside the head, not \
++                 applied over it (the head moved); retryable",
++                i + 1
++            )));
++        }
+         written += 1;
+     }
+     Ok(Some(written))
+diff --git a/src/federation/cohort.rs b/src/federation/cohort.rs
+index 36fdf0e1..807abd69 100644
+--- a/src/federation/cohort.rs
++++ b/src/federation/cohort.rs
+@@ -797,6 +797,32 @@ pub struct GroupVersion {
+     pub is_current: bool,
+ }
+ 
++/// v62.0.0 (kernel pass 2, I2812; CC 2.7.8 "Two versions of one head wait as
++/// tips") — **a version held as a tip** of a `family` / `community`: an
++/// offered version whose `prev_head_digest` does not name the held head,
++/// held in `federation_group_tips` beside the head rather than refused. The
++/// head ([`GroupVersion::is_current`]) does not move for it; re-offered once
++/// the version it names is the head, it extends through the whole door.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct GroupTip {
++    /// The version-history discriminator (`family` / `community` /
++    /// `affiliations`).
++    pub cohort: String,
++    /// The group's `federation_keys.key_id`.
++    pub group_key_id: String,
++    /// The tip's own `persist_row_hash`.
++    pub persist_row_hash: String,
++    /// The version it names (`prev_head_digest`; empty for none).
++    pub prev_head_digest: String,
++    /// The signed wrapper (`SignedFamily` / `SignedCommunity`), as offered.
++    pub snapshot: serde_json::Value,
++    /// The membership-change justification it carried, or `None`.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub change_authorization: Option<serde_json::Value>,
++    /// When this node first held it.
++    pub held_at: DateTime<Utc>,
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/src/federation/directory_double.rs b/src/federation/directory_double.rs
+index f3b0c6f3..a20e26fa 100644
+--- a/src/federation/directory_double.rs
++++ b/src/federation/directory_double.rs
+@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
+     }
+ }
+ 
+-// 141 delegations, generated. Every one: fault first, then delegate.
++// 142 delegations, generated. Every one: fault first, then delegate.
+ #[async_trait::async_trait]
+ impl FederationDirectory for FaultInjectingDirectory {
+     async fn adopt_genesis_reanchor(
+@@ -649,6 +649,16 @@ impl FederationDirectory for FaultInjectingDirectory {
+             .list_family_membership_widenings_for(family_key_id)
+             .await
+     }
++    async fn list_group_tips(
++        &self,
++        cohort: cohort::Cohort,
++        group_key_id: &str,
++    ) -> Result<Vec<cohort::GroupTip>, Error> {
++        if let Some(e) = self.faulted("list_group_tips") {
++            return Err(e);
++        }
++        self.inner.list_group_tips(cohort, group_key_id).await
++    }
+     async fn list_group_versions(
+         &self,
+         cohort: cohort::Cohort,
+diff --git a/src/federation/edition2/door.rs b/src/federation/edition2/door.rs
+index ee8e32bf..e76d337b 100644
+--- a/src/federation/edition2/door.rs
++++ b/src/federation/edition2/door.rs
+@@ -253,6 +253,9 @@ pub fn admit_row(
+         ));
+     }
+     refuse_edition_one(&payload)?;
++    // v62.0.0 (kernel pass 2, K1; CC ruling) — a stated window must cover
++    // some instant: read from the statement alone, before any key is asked.
++    check_valid_until_after_asserted_at(&payload)?;
+ 
+     let ctx = door_context(bytes, ctx);
+     let (row, role) = match verify_row_in_family_with(bytes, keys, &VendoredFamilyModel, &ctx) {
+@@ -369,6 +372,33 @@ fn chain_waiting(missing: &[ChainMissing]) -> Error {
+     Error::unknown_signer(&named, PLANE)
+ }
+ 
++/// v62.0.0 (kernel pass 2, K1; CC ruling: a record covers `t` when
++/// `asserted_at <= t < valid_until`, half-open everywhere) — **a stated
++/// window covers some instant.** A payload of any family (`key:record` and
++/// every family carrying a `valid_until` member) that states `valid_until`
++/// at or before its own `asserted_at` is refused
++/// `valid_until_not_after_asserted_at`
++/// ([`crate::federation::malformed_row::VALID_UNTIL_NOT_AFTER_ASSERTED_AT`]).
++/// A payload that states no `valid_until`, or no readable `asserted_at`,
++/// is not judged here (its family's own member rules are).
++///
++/// # Errors
++/// The malformed-row refusal above.
++pub fn check_valid_until_after_asserted_at(payload: &Value) -> Result<(), Error> {
++    let at = payload.get_text("asserted_at").and_then(Value::as_u64);
++    let until = payload.get_text("valid_until").and_then(Value::as_u64);
++    match (at, until) {
++        (Some(at), Some(until)) if until <= at => Err(refuse(
++            crate::federation::malformed_row::VALID_UNTIL_NOT_AFTER_ASSERTED_AT,
++            format!(
++                "valid_until {until} is not after asserted_at {at}: the window \
++                 [asserted_at, valid_until) covers no instant"
++            ),
++        )),
++        _ => Ok(()),
++    }
++}
++
+ /// The refusal for a `key:record` payload that breaks its rule.
+ #[must_use]
+ pub fn key_record_refusal(sub: &str, payload: &Value, e: &KeyRecordError) -> Error {
+diff --git a/src/federation/edition2/genesis.rs b/src/federation/edition2/genesis.rs
+index e722df7b..fa6a0a17 100644
+--- a/src/federation/edition2/genesis.rs
++++ b/src/federation/edition2/genesis.rs
+@@ -193,6 +193,9 @@ pub fn verify_bundle(
+         if o.object_id != id.0 {
+             continue;
+         }
++        // v62.0.0 (kernel pass 2, K1) — a stated window covers some instant
++        // (objects too).
++        super::door::check_valid_until_after_asserted_at(&o.payload)?;
+         // Every statement's `iat` is required and is ⌊asserted_at / 1000⌋
+         // (the settled bundle/2 rule; CC 2.6.2).
+         let asserted_at = o.payload.get_text("asserted_at").and_then(Value::as_u64);
+diff --git a/src/federation/edition2/liveness.rs b/src/federation/edition2/liveness.rs
+index c173dc31..8880e4e3 100644
+--- a/src/federation/edition2/liveness.rs
++++ b/src/federation/edition2/liveness.rs
+@@ -9,7 +9,7 @@
+ //! **The reading** ([`HeldKeys::liveness`]):
+ //! - A key is **live** at an instant when one of its valid records covers that
+ //!   instant, and no revocation by one of the three revokers has taken effect
+-//!   by then. A record covers `[asserted_at, valid_until]`, or
++//!   by then. A record covers `[asserted_at, valid_until)` (half-open, CC ruling; [`crate::kernel::key_end::within_record`]), or
+ //!   `[asserted_at, ∞)` where it states no end.
+ //! - Renewals that do not name each other all count, so the key lives to the
+ //!   greatest end they state.
+@@ -71,11 +71,19 @@
+ //! [`KeyOf`] and [`ChainMissing`] are its shape; at the pin they are
+ //! replaced by Verify's and [`HeldKeys::key_of`] becomes persist's impl.
+ //!
+-//! TODO(key_end): when slice C's kernel adapter is merged, this reading is
+-//! the kernel's `key_end` conclusion (`well_formed`, `conclude_rule`, `live`,
+-//! `ended`, `retained`) over `KeyEndRow`s built from these records. Until
+-//! then it is a persist read with the same inputs. No row but a record of
+-//! the key and a revocation by one of the three enters it.
++//! **Through the kernel** (v62.0.0, kernel pass 2, K1, I2814–I2817): whether
++//! a held, verified record covers the instant is the kernel's `key_end`
++//! conclusion ([`crate::kernel::key_end`]: `well_formed` under the end rule
++//! and the `key_record_max_secs` ceiling, `conclude_rule`, `live`) over the
++//! key's records and its own revocations, never a sweep. The kernel reads a
++//! record as covering `[asserted_at, valid_until)` (CC 2.6.2: "has not yet
++//! reached its `valid_until`"), so a statement signed AT `valid_until` is
++//! not covered (retryable); the earlier inclusive reading is the
++//! differential's reference, the named class `key_end_half_open`. What stays
++//! persist's: verifying each record (Verify's `verify_row_statement`), and
++//! the owner / roster revokers ([`RevokerStanding`]), which the kernel's
++//! key-end reading does not count (CC 2.4.1.1: "No other row enters that
++//! reading") and persist keeps until a ruling.
+ 
+ use std::collections::BTreeMap;
+ use std::sync::Arc;
+@@ -97,9 +105,10 @@ const MAX_DEPTH: usize = ciris_verify_core::edition2::keys::MAX_RECORD_DEPTH;
+ /// Who besides the key itself may revoke it (CC 2.4.1.1, "Who may revoke a
+ /// key"): its owner under the owner-binding, and the roster that seats it.
+ ///
+-/// TODO(key_end): the edition-2 owner-binding and roster rows are read by the
+-/// kernel adapter (slice C). Until it lands, a host that holds them answers
+-/// here.
++/// v62.0.0 (kernel pass 2, K1): the kernel's key-end reading counts the
++/// key's own revocation only (CC 2.4.1.1); these two revokers are persist's,
++/// kept on top of it until a ruling. A host that holds the edition-2
++/// owner-binding and roster rows answers here.
+ pub trait RevokerStanding: Send + Sync {
+     /// Does `revoker` (an identity-ref) hold standing to revoke `subject` (an
+     /// identity-ref), other than as the key itself?
+@@ -275,14 +284,48 @@ impl HeldKeys {
+             Ok(valid) => valid,
+             Err(other) => return other,
+         };
+-        if with_revocations && self.revoked(kid, at, depth) {
++        let honoured = if with_revocations {
++            self.honoured_at(kid, depth)
++        } else {
++            Vec::new()
++        };
++        // The three revokers (persist's; the kernel counts the key's own,
++        // presented below too): final.
++        if in_effect(&honoured, at) {
+             return Liveness::Revoked;
+         }
+-        // Renewals all count: the instant is covered by any one of them.
++        // v62.0.0 (kernel pass 2, K1, I2817) — whether a record covers the
++        // instant is the kernel's key-end conclusion over the key's records
++        // and its own revocations. Renewals all count: the instant is
++        // covered by any one of them.
++        let key = hex::encode(kid);
++        let views = key_end_views(&key, kid, &valid, &honoured);
++        let answer = crate::kernel::key_end::key_live(&views, &key, at);
++        #[cfg(test)]
++        crate::kernel::differential::key_end(
++            &key,
++            at,
++            // persist's former reading, inclusive of `valid_until` (the
++            // differential's reference)
++            valid
++                .iter()
++                .any(|v| inclusive((v.record.asserted_at, v.record.valid_until), at)),
++            answer.value,
++            // every record that covered `at` inclusively ends exactly there
++            valid
++                .iter()
++                .filter(|v| inclusive((v.record.asserted_at, v.record.valid_until), at))
++                .all(|v| v.record.valid_until == Some(at)),
++        );
++        if !answer.value {
++            return Liveness::NotCovered;
++        }
++        let kept: Vec<crate::kernel::view::RowId> = answer.rows;
+         valid
+             .into_iter()
++            .filter(|v| kept.contains(&crate::kernel::view::RowId(v.row_id)))
+             .map(|v| v.record)
+-            .filter(|r| r.asserted_at <= at && r.valid_until.is_none_or(|u| at <= u))
++            .filter(|r| covers((r.asserted_at, r.valid_until), at))
+             .max_by_key(|r| r.valid_until.unwrap_or(u64::MAX))
+             .map_or(Liveness::NotCovered, |r| Liveness::Live(Box::new(r)))
+     }
+@@ -330,6 +373,7 @@ impl HeldKeys {
+                         Ok(rec) if rec.kid == *kid => valid.push(ValidRecord {
+                             record: rec,
+                             row_id: row.row_id,
++                            signer: row.kid,
+                             statement: st.clone(),
+                         }),
+                         _ => {}
+@@ -552,16 +596,6 @@ impl HeldKeys {
+ 
+     /// Has a revocation by one of the three revokers taken effect for `kid`
+     /// by `at`?
+-    fn revoked(&self, kid: &Digest32, at: u64, depth: usize) -> bool {
+-        self.honoured_at(kid, depth)
+-            .iter()
+-            .any(|r| match r.revoked_after {
+-                // Absent: revoke-all.
+-                None => true,
+-                // Statements signed before the bound still stand.
+-                Some(bound) => at >= bound,
+-            })
+-    }
+ 
+     /// The held `key:revocation`s of `kid` this reading honours: valid, about
+     /// `kid`, and by one of the three revokers (the key itself, or a revoker
+@@ -627,15 +661,85 @@ pub struct ValidRecord {
+     pub record: KeyRecord,
+     /// The record row's id.
+     pub row_id: Digest32,
++    /// v62.0.0 (kernel pass 2, K1) — the kid whose voice over the row is
++    /// this statement (the key itself, or a predecessor's over a rotation).
++    pub signer: Digest32,
+     /// The statement as held.
+     pub statement: Vec<u8>,
+ }
+ 
+-/// Does a record's `[asserted_at, valid_until]` window cover `at`?
++/// Does a record's window cover `at`? v62.0.0 (CC ruling, kernel pass 2,
++/// K1): half-open, `[asserted_at, valid_until)`, through the one boundary
++/// function ([`crate::kernel::key_end::within_record`]) — the key-of-iss
++/// chain's predecessor record covering a rotation's instant, and a key's own
++/// liveness, read the same window.
+ fn covers((from, until): (u64, Option<u64>), at: u64) -> bool {
++    crate::kernel::key_end::within_record(at, from, until)
++}
++
++/// The former, inclusive window `[asserted_at, valid_until]`: the
++/// differential's reference only (test builds).
++#[cfg(test)]
++fn inclusive((from, until): (u64, Option<u64>), at: u64) -> bool {
+     from <= at && until.is_none_or(|u| at <= u)
+ }
+ 
++/// Has one of the honoured revocations taken effect at `at`?
++fn in_effect(honoured: &[HonouredRevocation], at: u64) -> bool {
++    honoured.iter().any(|r| match r.revoked_after {
++        // Absent: revoke-all.
++        None => true,
++        // Statements signed before the bound still stand.
++        Some(bound) => at >= bound,
++    })
++}
++
++/// v62.0.0 (kernel pass 2, K1) — the key's verified records, one view per
++/// record row with the keys whose voices over it verified, and its OWN
++/// honoured revocations, as the kernel's key-end rows
++/// ([`crate::kernel::key_end::KeyEndView`]).
++fn key_end_views(
++    key: &str,
++    kid: &Digest32,
++    valid: &[ValidRecord],
++    honoured: &[HonouredRevocation],
++) -> Vec<crate::kernel::key_end::KeyEndView> {
++    use crate::kernel::key_end::{end_rule, KeyEndKind, KeyEndView};
++    use crate::kernel::view::RowId;
++    let mut by_row: BTreeMap<Digest32, (&KeyRecord, Vec<String>)> = BTreeMap::new();
++    for v in valid {
++        let e = by_row
++            .entry(v.row_id)
++            .or_insert_with(|| (&v.record, Vec::new()));
++        let signer = hex::encode(v.signer);
++        if !e.1.contains(&signer) {
++            e.1.push(signer);
++        }
++    }
++    let mut out: Vec<KeyEndView> = by_row
++        .into_iter()
++        .map(|(row_id, (rec, sigs))| {
++            KeyEndView::of_record(
++                RowId(row_id),
++                key,
++                KeyEndKind::Record {
++                    from: rec.asserted_at,
++                    until: rec.valid_until,
++                    sigs,
++                    end: end_rule(&rec.identity_type),
++                },
++            )
++        })
++        .collect();
++    out.extend(
++        honoured
++            .iter()
++            .filter(|r| r.row.kid == *kid)
++            .map(|r| KeyEndView::self_revocation(RowId(r.row.row_id), key, r.revoked_after)),
++    );
++    out
++}
++
+ /// One verified voice over a record row of a key.
+ struct Voice {
+     record: KeyRecord,
+diff --git a/src/federation/edition2/liveness_invariants.rs b/src/federation/edition2/liveness_invariants.rs
+index 6977b68a..1569bade 100644
+--- a/src/federation/edition2/liveness_invariants.rs
++++ b/src/federation/edition2/liveness_invariants.rs
+@@ -2,8 +2,10 @@
+ //! only the three revokers end a key (CC 2.4.1.1, CC 2.6.1.7).
+ //!
+ //! - With no record held, a statement waits (retryable). A record makes the
+-//!   key live over `[asserted_at, valid_until]`. Before `asserted_at` and
+-//!   after `valid_until` the statement is retryable, not final. A renewal
++//!   key live over `[asserted_at, valid_until)` — v62.0.0 (kernel pass 2,
++//!   K1): the kernel's key-end reading (CC 2.6.2, "has not yet reached its
++//!   `valid_until`"); at and after `valid_until`, and before `asserted_at`,
++//!   the statement is retryable, not final. A renewal
+ //!   extends the key to the greatest end, and a renewal signed after the end
+ //!   revives it.
+ //! - The end rule at the door:
+@@ -85,8 +87,15 @@ fn i1905_only_an_edition2_record_makes_a_key_live() {
+         "I1905 at start"
+     );
+     assert_eq!(
+-        verdict(&held, &statement_at(&k, 10_000)),
++        verdict(&held, &statement_at(&k, 9_999)),
+         "valid",
++        "I1905 before the end"
++    );
++    // v62.0.0 (kernel pass 2, K1, I2817) — at `valid_until` the record has
++    // ended (the kernel's half-open reading).
++    assert_eq!(
++        verdict(&held, &statement_at(&k, 10_000)),
++        "waiting",
+         "I1905 at end"
+     );
+     assert_eq!(
+@@ -282,3 +291,30 @@ fn i1905_only_the_three_revokers_end_a_key() {
+         ciris_verify_core::edition2::KeyLookup::Invalid
+     ));
+ }
++
++/// **I2817** (v62.0.0, kernel pass 2, K1; CC 2.4.1.1, CC 2.6.2) — a key's
++/// liveness is the kernel's key-end conclusion: live over
++/// `[asserted_at, valid_until)` of a held record, `NotCovered` (retryable) at
++/// `valid_until` itself, and live again under a renewal; the key's own
++/// revocation still ends it (final).
++#[test]
++fn i2817_liveness_is_the_kernels_key_end() {
++    let k = key(21);
++    let mut held = HeldKeys::new();
++    held.insert_record(key_record(&k, &["node"], 1_000, Some(10_000)))
++        .unwrap();
++    assert!(
++        matches!(held.liveness(&kid(&k), 9_999), Liveness::Live(_)),
++        "I2817: inside the record"
++    );
++    assert!(
++        matches!(held.liveness(&kid(&k), 10_000), Liveness::NotCovered),
++        "I2817: at valid_until the record has ended"
++    );
++    held.insert_record(key_record(&k, &["node"], 10_000, Some(20_000)))
++        .unwrap();
++    assert!(
++        matches!(held.liveness(&kid(&k), 10_000), Liveness::Live(r) if r.valid_until == Some(20_000)),
++        "I2817: the renewal covers its own start"
++    );
++}
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 96060d48..b3ed4e0c 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -69,6 +69,10 @@ mod produce_invariants;
+ mod projection_invariants;
+ #[cfg(test)]
+ mod verify_vectors_replay;
++// v62.0.0 (kernel pass 2, K1) — I2819–I2820: the half-open window and
++// `valid_until_not_after_asserted_at`, on sqlite and postgres.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod window_invariants;
+ 
+ pub use ciris_verify_core::edition2::Digest32;
+ 
+diff --git a/src/federation/edition2/window_invariants.rs b/src/federation/edition2/window_invariants.rs
+new file mode 100644
+index 00000000..be50f9b0
+--- /dev/null
++++ b/src/federation/edition2/window_invariants.rs
+@@ -0,0 +1,125 @@
++//! v62.0.0 (kernel pass 2, K1) — **I2820: a record's window is half-open,
++//! and a window that covers nothing is refused**, on sqlite and postgres.
++//!
++//! CC ruling: a record covers `t` when `asserted_at <= t < valid_until`,
++//! half-open everywhere ([`crate::kernel::key_end::within_record`]).
++//!
++//! - A node key held by a record over `[1_000, 10_000)`: a statement it
++//!   signs at `valid_until - 1` is not waiting on its key; at `valid_until`
++//!   and `valid_until + 1` it waits (`federation_attester_key_unknown`,
++//!   retryable).
++//! - A `key:record` stating `valid_until == asserted_at`, or before it, is
++//!   refused `valid_until_not_after_asserted_at` at the door, and nothing is
++//!   held.
++
++use super::door_invariants::fixture::*;
++use super::ingest::{put_statement, INGEST_TIER};
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++fn reason(e: &Error) -> String {
++    match e {
++        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
++        other => other.kind().to_owned(),
++    }
++}
++
++/// A statement `k` signs at `at`.
++fn signed_at(k: &ciris_crypto::composite::CompositeSigningKey, at: u64) -> Vec<u8> {
++    row_with_refs(k, at, map(vec![("target", ref2(&[0xaa; 32]))]))
++}
++
++const WAITS: &str = "federation_attester_key_unknown";
++
++/// **I2820** — see the module doc.
++pub(crate) async fn body(d: &dyn FederationDirectory) {
++    // The refusal: a window that covers no instant.
++    let z = key(72);
++    for (why, until) in [("equal", 5_000), ("before", 4_999)] {
++        let e = put_statement(
++            d,
++            &key_record(&z, &["node"], 5_000, Some(until)),
++            None,
++            INGEST_TIER,
++        )
++        .await
++        .expect_err("I2820: an empty window is refused");
++        assert_eq!(
++            reason(&e),
++            malformed_row::VALID_UNTIL_NOT_AFTER_ASSERTED_AT,
++            "I2820 ({why}): {e:?}"
++        );
++    }
++    assert!(
++        d.edition2_statements_about("key:record", &iref(&z))
++            .await
++            .unwrap()
++            .is_empty(),
++        "I2820: nothing held"
++    );
++    // One millisecond of window is a window.
++    put_statement(
++        d,
++        &key_record(&z, &["node"], 5_000, Some(5_001)),
++        None,
++        INGEST_TIER,
++    )
++    .await
++    .unwrap_or_else(|e| panic!("I2820: [5_000, 5_001) is admitted: {e:?}"));
++
++    // The boundary.
++    let k = key(70);
++    put_statement(
++        d,
++        &key_record(&k, &["node"], 1_000, Some(10_000)),
++        None,
++        INGEST_TIER,
++    )
++    .await
++    .unwrap_or_else(|e| panic!("I2820: the record: {e:?}"));
++    for at in [10_000, 10_001] {
++        let e = put_statement(d, &signed_at(&k, at), None, INGEST_TIER)
++            .await
++            .expect_err("I2820: no record covers the instant");
++        assert_eq!(
++            e.kind(),
++            WAITS,
++            "I2820 at {at}: retryable, waits on the key: {e:?}"
++        );
++    }
++    // Last: the statement is a key-plane row of `k`'s own, so it is judged
++    // once nothing after it reads `k`.
++    if let Err(e) = put_statement(d, &signed_at(&k, 9_999), None, INGEST_TIER).await {
++        assert_ne!(
++            e.kind(),
++            WAITS,
++            "I2820 at 9_999: the record covers it: {e:?}"
++        );
++    }
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2820_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2820_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        eprintln!("i2820 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Box::pin(body(&b)).await;
++    eprintln!("i2820 postgres: RAN");
++}
+diff --git a/src/federation/group_amendment.rs b/src/federation/group_amendment.rs
+index 6a033c4b..055fa598 100644
+--- a/src/federation/group_amendment.rs
++++ b/src/federation/group_amendment.rs
+@@ -18,7 +18,12 @@
+ //!   silently on SQL and overwrite on memory);
+ //! - a proof naming a prior version this node does not hold: refused as
+ //!   STALE ([`Error::Conflict`]; retryable — the intermediate version may not
+-//!   have arrived);
++//!   have arrived) — v62.0.0 (kernel pass 2, I2811): only when the version's
++//!   own `prev_head_digest` names the held head (or none). A version naming
++//!   another version, whose proof names that same version, is a TIP (CC
++//!   2.7.8): it passes the same checks against THIS node's head and is held
++//!   beside it ([`ReplicatedCommunityOutcome::HeldAsTip`]); the head does
++//!   not move;
+ //! - otherwise the change envelope must describe the offered record and
+ //!   [`FederationDirectory::verify_membership_quorum`] must admit it against
+ //!   THIS node's prior roster under the group's own protocol. Then the record
+@@ -27,8 +32,10 @@
+ //!   no authority of its own.
+ 
+ use super::cohort::Cohort;
++use super::group_supersede_admit::HeadVerdict;
+ use super::types::{GroupSupersedeProof, SignedCommunity, SignedFamily};
+ use super::{Error, FederationDirectory};
++use crate::kernel::head::HeadReading;
+ 
+ /// v50.0.0 (CIRISPersist#925/#931, review) — which door a community record
+ /// entered through. The door, never the signer, decides whether the CC 3.2
+@@ -61,6 +68,10 @@ pub enum ReplicatedCommunityOutcome {
+         /// Why.
+         reason: ReplicatedCommunityRefusal,
+     },
++    /// v62.0.0 (kernel pass 2, I2811; CC 2.7.8) — the version names another
++    /// version than the held head: held as a tip beside it
++    /// (`federation_group_tips`); the head did not move. APPENDED.
++    HeldAsTip,
+ }
+ 
+ /// v50.0.0 (CIRISPersist#931) — why a replicated community record was refused.
+@@ -98,6 +109,9 @@ pub(crate) enum CommunityWrite {
+     Unchanged,
+     /// The held row was replaced by the offered version.
+     Superseded,
++    /// v62.0.0 (kernel pass 2) — the offered version was held as a tip; the
++    /// held row was not replaced.
++    HeldAsTip,
+ }
+ 
+ /// v50.0.0 (#931; PR #921 review F3) — the store step's result as a typed
+@@ -111,6 +125,7 @@ pub(crate) fn replicated_community_outcome(
+         Ok(CommunityWrite::Inserted) => Ok(ReplicatedCommunityOutcome::Inserted),
+         Ok(CommunityWrite::Unchanged) => Ok(ReplicatedCommunityOutcome::Unchanged),
+         Ok(CommunityWrite::Superseded) => Ok(ReplicatedCommunityOutcome::Superseded),
++        Ok(CommunityWrite::HeldAsTip) => Ok(ReplicatedCommunityOutcome::HeldAsTip),
+         Err(Error::Conflict(_)) => Ok(ReplicatedCommunityOutcome::Refused {
+             reason: ReplicatedCommunityRefusal::ConflictingRecord,
+         }),
+@@ -157,6 +172,9 @@ struct Offer<'a> {
+     /// A family's `consensus_protocol_entrenched`; `None` for a community.
+     entrenched: Option<bool>,
+     proof: Option<&'a GroupSupersedeProof>,
++    /// v62.0.0 (kernel pass 2) — the version's own signed `prev_head_digest`:
++    /// the version it succeeds, which its proof must name.
++    prev_head_digest: &'a str,
+     /// v52.0.0 (#956) — when the amendment's only change removes one member
+     /// from the held family record: that member and the held record. Its
+     /// signature alone authorizes it.
+@@ -211,6 +229,7 @@ where
+         consensus_protocol: &f.consensus_protocol,
+         entrenched: Some(f.consensus_protocol_entrenched),
+         proof: family.supersede_proof.as_ref(),
++        prev_head_digest: &f.prev_head_digest,
+         self_leave: super::family_dissolution::self_leave_member(&held, f).map(|l| (l, &held)),
+         recovery: super::accord_recovery::verify_accord_recovery(dir, family)
+             .await?
+@@ -242,7 +261,27 @@ where
+         .map_err(|e| Error::Backend(format!("family amendment snapshot serialize: {e}")))?;
+     dir.supersede_group_row(Cohort::Family, snapshot, Some(authorization(&offer)))
+         .await?;
+-    Ok(OccupiedRoute::Settled(CommunityWrite::Superseded))
++    // v62.0.0 (kernel pass 2, I2811) — a version the executor held as a tip
++    // left the head where it was.
++    let head = dir
++        .lookup_family(&f.family_key_id)
++        .await?
++        .map(|h| h.persist_row_hash);
++    Ok(OccupiedRoute::Settled(written_as(
++        head.as_deref(),
++        &offer.offered_hash,
++    )))
++}
++
++/// v62.0.0 (kernel pass 2, I2811) — what a supersede that returned `Ok` did,
++/// read from the head the group holds after it: the offered version is the
++/// head (`Superseded`), or it was held as a tip beside it (`HeldAsTip`).
++fn written_as(head_after: Option<&str>, offered_hash: &str) -> CommunityWrite {
++    if head_after == Some(offered_hash) {
++        CommunityWrite::Superseded
++    } else {
++        CommunityWrite::HeldAsTip
++    }
+ }
+ 
+ /// v57.0.0 (CIRISPersist#934 step 2) — what an occupied community id gets,
+@@ -309,6 +348,7 @@ where
+         consensus_protocol: &c.consensus_protocol,
+         entrenched: None,
+         proof: community.supersede_proof.as_ref(),
++        prev_head_digest: &c.prev_head_digest,
+         self_leave: None,
+         recovery: false,
+     };
+@@ -369,7 +409,15 @@ where
+             Ok(
+                 match lost_race(dir, &c.community_key_id, &offered_hash, written).await? {
+                     Some(0) => OccupiedRoute::Settled(CommunityWrite::Unchanged),
+-                    _ => OccupiedRoute::Settled(CommunityWrite::Superseded),
++                    _ => {
++                        // v62.0.0 (kernel pass 2, I2811) — held as a tip, or
++                        // the head
++                        let head = dir
++                            .lookup_community(&c.community_key_id)
++                            .await?
++                            .map(|h| h.persist_row_hash);
++                        OccupiedRoute::Settled(written_as(head.as_deref(), &offered_hash))
++                    }
+                 },
+             )
+         }
+@@ -472,10 +520,14 @@ where
+             &offer.offered_hash,
+         ));
+     };
+-    check_proof_names_prior(
++    // v62.0.0 (kernel pass 2, I2811) — the proof names the version the
++    // offered version names: the held head (a successor), or another (a tip,
++    // judged below against this node's head and held beside it).
++    check_proof_names_versions_prior(
+         offer.kind,
+         offer.group_key_id,
+         proof,
++        offer.prev_head_digest,
+         &stored.persist_row_hash,
+     )?;
+     // v53.0.0 (CC 4.2.6) — a recovery's proof is not a membership change
+@@ -597,13 +649,22 @@ pub(crate) fn check_proof_names_prior(
+ /// not judged: a node that never held the earlier versions takes the served
+ /// version as it finds it, as it always has (a served family carries no
+ /// chain), so a non-empty value there is not evidence of anything.
++///
++/// v62.0.0 (kernel pass 2, I2811; CC 2.7.8) — **a fork is held as a tip.**
++/// The version that does not name the held head is no longer refused: the
++/// kernel's reading of the two versions
++/// ([`crate::kernel::head::head_answer`]) is a tip beside the head (or a
++/// row waiting for the head it names), and the answer is
++/// [`HeadVerdict::Tip`]: the executor holds it, the head does not move.
++/// The former rule ([`prev_head_names_held`]) still decides
++/// [`HeadVerdict::Extends`], and is the differential's reference.
+ pub(crate) fn check_prev_head_names_held(
+     kind: &str,
+     group_key_id: &str,
+     offered_prev_head_digest: &str,
+     stored_persist_row_hash: &str,
+     authorization: Option<&serde_json::Value>,
+-) -> Result<(), Error> {
++) -> Result<HeadVerdict, Error> {
+     let verdict = prev_head_names_held(
+         kind,
+         group_key_id,
+@@ -620,7 +681,50 @@ pub(crate) fn check_prev_head_names_held(
+         offered_prev_head_digest.is_empty() && authorization.is_some(),
+         verdict.is_ok(),
+     );
+-    verdict
++    let reading = crate::kernel::head::head_answer(
++        group_key_id,
++        Some(stored_persist_row_hash),
++        offered_prev_head_digest,
++    )
++    .value;
++    match (verdict, reading) {
++        (Ok(()), _) => Ok(HeadVerdict::Extends),
++        (Err(_), HeadReading::Tip) => Ok(HeadVerdict::Tip),
++        // the kernel reads a version that names no held head as a tip; one
++        // that names the held head is admitted above, so this arm is the
++        // former refusal, kept rather than turned into an admission
++        (Err(e), HeadReading::Extends | HeadReading::NothingHeld) => Err(e),
++    }
++}
++
++/// v62.0.0 (kernel pass 2, I2811) — **the proof rides on the version it
++/// proves.** A `supersede_proof` names the prior its quorum replaced; the
++/// version's own signed `prev_head_digest` names the version it succeeds.
++/// When the version names the held head (or none), the proof must name the
++/// held head ([`check_proof_names_prior`]: a STALE proof otherwise,
++/// retryable). When it names another version, it is a tip, and the proof
++/// must name that same version: a proof naming a third is a contradiction
++/// inside one row, refused for its shape before the kernel (CIRISKernel
++/// `DIFFERENCES.md` row 8).
++pub(crate) fn check_proof_names_versions_prior(
++    kind: &str,
++    group_key_id: &str,
++    proof: &GroupSupersedeProof,
++    offered_prev_head_digest: &str,
++    stored_persist_row_hash: &str,
++) -> Result<(), Error> {
++    if offered_prev_head_digest.is_empty() || offered_prev_head_digest == stored_persist_row_hash {
++        return check_proof_names_prior(kind, group_key_id, proof, stored_persist_row_hash);
++    }
++    if proof.prior_persist_row_hash == offered_prev_head_digest {
++        return Ok(());
++    }
++    Err(Error::Conflict(format!(
++        "{kind} {group_key_id}: supersede_proof_contradicts_prev_head — the proof replaces \
++         persist_row_hash {named:?}, but the version it rides on names prev_head_digest \
++         {offered_prev_head_digest:?}; a proof and its version name one prior (CC 2.7.8)",
++        named = proof.prior_persist_row_hash
++    )))
+ }
+ 
+ /// [`check_prev_head_names_held`]'s rule.
+diff --git a/src/federation/group_amendment_invariants.rs b/src/federation/group_amendment_invariants.rs
+index 2115e7a6..13a009f4 100644
+--- a/src/federation/group_amendment_invariants.rs
++++ b/src/federation/group_amendment_invariants.rs
+@@ -419,7 +419,9 @@ pub mod bodies {
+         assert_eq!(kind.stored(b, &id).await.2, v1_hash, "{tag} I178");
+ 
+         // (4) A amends again (unanimous now: all three sign) before B has the
+-        //     first amendment. Offered first, the second is STALE.
++        //     first amendment. Offered first, the second names a version B
++        //     does not hold: v62.0.0 (kernel pass 2, K1; CC 2.7.8, I2812) it
++        //     is held as a tip waiting for that version, and B's head stays.
+         let v3 = Content {
+             name: "household, renamed twice",
+             protocol: consensus_protocol::MAJORITY,
+@@ -435,14 +437,16 @@ pub mod bodies {
+             "{tag} I178: A is at version 3"
+         );
+         let served_v3 = kind.served(a, &id).await;
+-        let e = kind
+-            .put(b, served_v3.clone())
++        kind.put(b, served_v3.clone())
+             .await
+-            .expect_err("a proof naming a version B does not hold must be refused");
+-        assert!(
+-            is_conflict_containing(&e, "stale supersede_proof")
+-                && is_conflict_containing(&e, "retryable"),
+-            "{tag} I178: the stale refusal says so: {e}"
++            .unwrap_or_else(|e| panic!("{tag} I178: v3 is held as a tip on B: {e}"));
++        assert_eq!(
++            b.list_group_tips(kind.cohort(), &id)
++                .await
++                .unwrap_or_else(|e| panic!("{tag} I178: list_group_tips: {e}"))
++                .len(),
++            1,
++            "{tag} I178: B holds v3 as a tip"
+         );
+         assert_eq!(
+             kind.stored(b, &id).await.2,
+diff --git a/src/federation/group_supersede_admit.rs b/src/federation/group_supersede_admit.rs
+index 58c5ae34..228cfd13 100644
+--- a/src/federation/group_supersede_admit.rs
++++ b/src/federation/group_supersede_admit.rs
+@@ -14,6 +14,22 @@
+ //!
+ //! None: the supersede is judged on the offered head's proof and
+ //! `prev_head_digest` against the held head's `persist_row_hash`.
++//!
++//! # A fork is held as a tip (v62.0.0, kernel pass 2)
++//!
++//! CC 2.7.8: "Two versions of one head wait as tips." A version whose
++//! `prev_head_digest` does not name the held head (a sibling of it, a
++//! successor of a version not yet held, a second founding version) is no
++//! longer refused: the kernel reads it as a tip
++//! ([`crate::kernel::head::head_answer`]) and the executor holds it in
++//! `federation_group_tips` beside the head, which stays where it is
++//! ([`HeadVerdict::Tip`]). A version naming the held head becomes the head
++//! ([`HeadVerdict::Extends`]) and leaves the tips: re-offered once the head
++//! it names is held, a held tip runs the whole door again and extends.
++//! What stays refused is persist's: an unheld group (nothing to supersede),
++//! and a `supersede_proof` that contradicts the version it rides on (a
++//! matter of one row's shape, before the kernel; CIRISKernel
++//! `DIFFERENCES.md` row 8).
+ 
+ use super::cohort::Cohort;
+ use super::group_plane::{self, GroupKind, GroupRowLink, GroupSigned};
+@@ -67,17 +83,45 @@ pub(crate) struct PlannedSupersede {
+     pub(crate) authorization: Option<serde_json::Value>,
+ }
+ 
++/// v62.0.0 (kernel pass 2, I2811) — **what the held-head verdict decided**
++/// for an offered version of a held group.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum HeadVerdict {
++    /// The version names the held head (or is an accord birth recorded as
++    /// replacing exactly the held row): it becomes the head.
++    Extends,
++    /// The version names another version, or none: held as a tip beside
++    /// the head, which does not move (CC 2.7.8, "Two versions of one head
++    /// wait as tips").
++    Tip,
++}
++
++/// What the executor wrote for a supersede.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct SupersedeWritten {
++    /// The head's version after the write: the new version for
++    /// [`HeadVerdict::Extends`], the held head's unchanged version for
++    /// [`HeadVerdict::Tip`].
++    pub(crate) version: u32,
++    /// What the verdict decided.
++    pub(crate) verdict: HeadVerdict,
++}
++
+ /// **The supersede's verdict against the held head**, asked by the executor
+ /// inside the transaction that replaces it. `held_row_hash` is the held live
+ /// row's `persist_row_hash`, `None` when no row is held.
+ ///
+ /// - an unheld group has nothing to supersede;
+-/// - v49.0.0 (#910.5) — a proof names the version it replaces;
+-/// - v53.0.0 (CC 3.2 T6) — the version names the head it succeeds.
++/// - v49.0.0 (#910.5) — a proof names the version it replaces; v62.0.0
++///   (kernel pass 2): the version's own `prev_head_digest` is that version,
++///   so a proof naming another is a contradiction inside one row;
++/// - v53.0.0 (CC 3.2 T6) — the version names the head it succeeds, and
++///   becomes the head; v62.0.0 (kernel pass 2, I2811): a version that names
++///   another is held as a tip ([`HeadVerdict::Tip`]), never refused.
+ pub(crate) fn held_head_verdict(
+     planned: &PlannedSupersede,
+     held_row_hash: Option<&str>,
+-) -> Result<(), Error> {
++) -> Result<HeadVerdict, Error> {
+     let key = planned.head.group_key_id();
+     let Some(held) = held_row_hash else {
+         return Err(Error::InvalidArgument(format!(
+@@ -87,7 +131,13 @@ pub(crate) fn held_head_verdict(
+     };
+     let proof = planned.head.supersede_proof();
+     if let Some(p) = proof {
+-        super::group_amendment::check_proof_names_prior(planned.cohort_str, key, p, held)?;
++        super::group_amendment::check_proof_names_versions_prior(
++            planned.cohort_str,
++            key,
++            p,
++            planned.head.prev_head_digest(),
++            held,
++        )?;
+     }
+     super::group_amendment::check_prev_head_names_held(
+         planned.cohort_str,
+@@ -142,11 +192,29 @@ pub(crate) fn decode_planned_head(
+ pub(crate) trait GroupSupersedeStore:
+     FederationDirectory + group_plane::GroupPlaneStore + super::community_admit::CommunityStore + Sized
+ {
+-    /// In ONE transaction: read the held head, ask [`held_head_verdict`],
+-    /// snapshot the prior into `federation_group_versions`, rewrite the live
+-    /// row (the signature with the record it authorizes, #651) at a fresh
+-    /// serve position, bump `version`. Returns the new version.
+-    async fn store_planned_supersede(&self, planned: PlannedSupersede) -> Result<u32, Error>;
++    /// In ONE transaction: read the held head, ask [`held_head_verdict`];
++    /// on [`HeadVerdict::Extends`], snapshot the prior into
++    /// `federation_group_versions`, rewrite the live row (the signature with
++    /// the record it authorizes, #651) at a fresh serve position, bump
++    /// `version`, and drop the new head from `federation_group_tips`; on
++    /// [`HeadVerdict::Tip`] (v62.0.0, kernel pass 2), hold the offered
++    /// signed version in `federation_group_tips` (idempotent on its
++    /// `persist_row_hash`) and leave the live row as it is.
++    async fn store_planned_supersede(
++        &self,
++        planned: PlannedSupersede,
++    ) -> Result<SupersedeWritten, Error>;
++}
++
++impl PlannedHead {
++    /// v62.0.0 (kernel pass 2, K1) — the signed wrapper as JSON, for the tip row.
++    pub(crate) fn signed_json(&self) -> Result<serde_json::Value, Error> {
++        match self {
++            Self::Family(f) => serde_json::to_value(f),
++            Self::Community(c) => serde_json::to_value(c),
++        }
++        .map_err(|e| Error::Backend(format!("tip snapshot serialize: {e}")))
++    }
+ }
+ 
+ /// The door: every backend's `supersede_group_row`.
+@@ -179,13 +247,19 @@ pub(crate) async fn supersede_group_row_planned<D: GroupSupersedeStore>(
+     let cohort_str = check_supersede_cohort(cohort)?;
+     let group_key_id = super::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
+     let head = decode_planned_head(cohort, new_snapshot)?;
+-    let version = dir
++    let written = dir
+         .store_planned_supersede(PlannedSupersede {
+             cohort_str,
+             head,
+             authorization,
+         })
+         .await?;
++    let version = written.version;
++    // v62.0.0 (kernel pass 2, I2811) — a tip is held beside the head: the
++    // head's `group:roster:v1` row stays the head's.
++    if written.verdict == HeadVerdict::Tip {
++        return Ok(version);
++    }
+     // v61 (CIRISPersist#991) — the new head's `group:roster:v1` row replaces
+     // the prior head's.
+     group_plane::sync_group_row_offered(
+diff --git a/src/federation/kernel_adapter_invariants.rs b/src/federation/kernel_adapter_invariants.rs
+index 8f05b984..3fa13604 100644
+--- a/src/federation/kernel_adapter_invariants.rs
++++ b/src/federation/kernel_adapter_invariants.rs
+@@ -20,9 +20,9 @@
+ //!   (a `unanimous` widening after a removal needs only those remaining).
+ //! - **I1846** — a reference cycle (two rows naming each other's peer-chosen
+ //!   id) never hangs the trust walk and gives no edge.
+-//! - **I1843** — a fork of a held head (two versions naming one head): persist
+-//!   refuses it; the kernel holds it as a tip (CC 2.7.8). Witnessed, not
+-//!   switched.
++//! - **I1843** — a fork of a held head (two versions naming one head): the
++//!   kernel holds it as a tip (CC 2.7.8). v62.0.0 (kernel pass 2, K1):
++//!   switched — persist holds it too, and the head does not move.
+ 
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ pub(crate) mod bodies {
+@@ -165,11 +165,12 @@ pub(crate) mod bodies {
+ 
+     /// **I1843** — a FORK of a held head: two versions naming one head. The
+     /// family's v1 is held; v2 naming v1 is admitted (the head moves); v3
+-    /// naming v1 too — v2's sibling — is the fork. Persist refuses it
+-    /// `lineage_prev_head_mismatch` (`held_head_verdict`, unchanged in this
+-    /// slice); the kernel reads it as a tip beside v2 (CC 2.7.8: "Two
+-    /// versions of one head wait as tips"). The differential witness records
+-    /// the call as the `fork_as_tip` departure, on both backends.
++    /// naming v1 too — v2's sibling — is the fork. The kernel reads it as a
++    /// tip beside v2 (CC 2.7.8: "Two versions of one head wait as tips"),
++    /// and v62.0.0 (kernel pass 2, K1) persist holds it so: the supersede is
++    /// `Ok` at the held head's version, and the head is still v2. The
++    /// differential witness records the former refusal as the `fork_as_tip`
++    /// departure, on both backends.
+     pub(crate) async fn i1843_a_fork_of_the_held_head_is_a_tip_to_the_kernel(
+         d: &dyn FederationDirectory,
+         s: &str,
+@@ -199,13 +200,15 @@ pub(crate) mod bodies {
+         v3.prev_head_digest = v1.persist_row_hash.clone();
+         v3.family_name = "v3".into();
+         v3.persist_row_hash = String::new();
+-        let e = d
++        let v = d
+             .supersede_family(ts::sign_family(&holders[0], v3), None)
+             .await
+-            .expect_err("I1843: persist refuses the fork (held_head_verdict, this slice)");
+-        assert!(
+-            matches!(&e, crate::federation::Error::Conflict(m) if m.contains("lineage_prev_head_mismatch")),
+-            "I1843: {e:?}"
++            .expect("I1843: persist holds the fork as a tip (kernel pass 2)");
++        assert_eq!(v, 2, "I1843: the head's version, unchanged");
++        assert_eq!(
++            d.lookup_family(&fam).await.unwrap().expect("held"),
++            held,
++            "I1843: the head did not move"
+         );
+         assert_eq!(
+             head_reading(
+diff --git a/src/federation/kernel_pass2_invariants.rs b/src/federation/kernel_pass2_invariants.rs
+new file mode 100644
+index 00000000..e3e21d39
+--- /dev/null
++++ b/src/federation/kernel_pass2_invariants.rs
+@@ -0,0 +1,341 @@
++//! v62.0.0 (kernel pass 2, K1) — **I2811–I2816: forks held as tips, the
++//! answer's read set, and a key's end through the kernel.** The backend
++//! bodies run on sqlite and on postgres.
++//!
++//! - **I2811** (CC 2.7.8, "Two versions of one head wait as tips") — a
++//!   version of a held family that names another version than the head (a
++//!   sibling of the head) is held as a tip, not refused: the supersede is
++//!   `Ok` at the head's version, the head does not move, the tip is listed
++//!   once however often it is offered, and it is in no version history.
++//! - **I2812** (CC 2.7.8, a row waiting for the head it names) — a version
++//!   offered before its predecessor is held as a tip; once the predecessor
++//!   is the head, the same version offered again extends it and leaves the
++//!   tips.
++//! - **I2813** (pure) — the held-head verdict, by truth table: a successor
++//!   extends; a sibling, a second founding version and a version naming an
++//!   unheld one are tips; a proof naming the version's own prior rides with
++//!   it; a proof naming another prior than the version's is refused (the
++//!   stale proof when the version names the head,
++//!   `supersede_proof_contradicts_prev_head` when it names another); an
++//!   unheld group is refused.
++//! - **I2810** (pure, in `kernel::head`) — the head answer carries its read
++//!   set; **I2814–I2816** (pure, in `kernel::key_end`) — a key's end.
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++pub(crate) mod bodies {
++    use crate::federation::cohort::Cohort;
++    use crate::federation::operational::test_support as ops;
++    use crate::federation::tier_ingest::test_support as ts;
++    use crate::federation::types::identity_type;
++    use crate::federation::FederationDirectory;
++
++    /// A family of three holders under `quorum:2/3`, at version 1.
++    async fn family_v1(
++        d: &dyn FederationDirectory,
++        tag: &str,
++        s: &str,
++    ) -> (String, Vec<String>, crate::federation::types::Family) {
++        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}-{s}")).collect();
++        for h in &holders {
++            ops::register_typed_key(d, h, identity_type::NODE)
++                .await
++                .expect("register");
++        }
++        let fam = format!("{tag}-fam-{s}");
++        ops::seed_test_family(d, &fam, &holders, "quorum:2/3")
++            .await
++            .expect("v1");
++        let v1 = d.lookup_family(&fam).await.unwrap().expect("held");
++        (fam, holders, v1)
++    }
++
++    /// `base` renamed `name`, naming `prev`, its hash cleared for the door.
++    fn version_of(
++        base: &crate::federation::types::Family,
++        prev: &str,
++        name: &str,
++    ) -> crate::federation::types::Family {
++        let mut v = base.clone();
++        v.prev_head_digest = prev.to_owned();
++        v.family_name = name.to_owned();
++        v.persist_row_hash = String::new();
++        v
++    }
++
++    fn hash_of(f: &crate::federation::types::Family) -> String {
++        crate::federation::types::compute_persist_row_hash(f).expect("hash")
++    }
++
++    /// **I2811** — see the module doc.
++    pub(crate) async fn i2811_a_fork_is_held_as_a_tip_and_the_head_stays(
++        d: &dyn FederationDirectory,
++        s: &str,
++    ) {
++        let (fam, holders, v1) = family_v1(d, "i2811", s).await;
++        let v2 = version_of(&v1, &v1.persist_row_hash, "v2");
++        assert_eq!(
++            d.supersede_family(ts::sign_family(&holders[0], v2), None)
++                .await
++                .expect("I2811: v2 names the held head"),
++            2
++        );
++        let head = d.lookup_family(&fam).await.unwrap().expect("held");
++        let v3 = version_of(&v1, &v1.persist_row_hash, "v3");
++        for round in 0..2 {
++            let v = d
++                .supersede_family(ts::sign_family(&holders[0], v3.clone()), None)
++                .await
++                .unwrap_or_else(|e| panic!("I2811 ({round}): the sibling is held: {e}"));
++            assert_eq!(v, 2, "I2811 ({round}): the head's version, unchanged");
++        }
++        assert_eq!(
++            d.lookup_family(&fam).await.unwrap().expect("held"),
++            head,
++            "I2811: the head did not move"
++        );
++        let tips = d
++            .list_group_tips(Cohort::Family, &fam)
++            .await
++            .expect("I2811: list_group_tips");
++        assert_eq!(
++            tips.len(),
++            1,
++            "I2811: one tip, however often offered: {tips:?}"
++        );
++        assert_eq!(tips[0].cohort, "family", "I2811");
++        assert_eq!(tips[0].group_key_id, fam, "I2811");
++        assert_eq!(
++            tips[0].persist_row_hash,
++            hash_of(&v3),
++            "I2811: the tip is v3"
++        );
++        assert_eq!(
++            tips[0].prev_head_digest, v1.persist_row_hash,
++            "I2811: it names v1, the head's predecessor"
++        );
++        assert_eq!(
++            tips[0]
++                .snapshot
++                .get("family")
++                .and_then(|f| f.get("family_name"))
++                .and_then(|n| n.as_str()),
++            Some("v3"),
++            "I2811: the signed wrapper is held as offered"
++        );
++        let history = d.list_group_versions(Cohort::Family, &fam).await.unwrap();
++        assert_eq!(
++            history.iter().map(|v| v.version).collect::<Vec<_>>(),
++            vec![1, 2],
++            "I2811: a tip is no version of the history"
++        );
++        assert!(
++            d.list_group_tips(Cohort::Family, "i2811-no-such-group")
++                .await
++                .expect("I2811: an unknown group")
++                .is_empty(),
++            "I2811: an unknown group holds no tip"
++        );
++        assert!(
++            matches!(
++                d.list_group_tips(Cohort::SelfId, &fam).await,
++                Err(crate::federation::Error::InvalidArgument(_))
++            ),
++            "I2811: the `self` cohort is not versioned"
++        );
++    }
++
++    /// **I2812** — see the module doc.
++    pub(crate) async fn i2812_a_version_held_before_its_predecessor_extends_when_reoffered(
++        d: &dyn FederationDirectory,
++        s: &str,
++    ) {
++        let (fam, holders, v1) = family_v1(d, "i2812", s).await;
++        let v2 = version_of(&v1, &v1.persist_row_hash, "v2");
++        let v3 = version_of(&v1, &hash_of(&v2), "v3");
++        // v3 arrives first: it names a version this node does not hold
++        assert_eq!(
++            d.supersede_family(ts::sign_family(&holders[0], v3.clone()), None)
++                .await
++                .expect("I2812: v3 is held, waiting for v2"),
++            1,
++            "I2812: the head is still v1"
++        );
++        let tips = d.list_group_tips(Cohort::Family, &fam).await.unwrap();
++        assert_eq!(tips.len(), 1, "I2812: {tips:?}");
++        assert_eq!(tips[0].prev_head_digest, hash_of(&v2), "I2812");
++        // v2 arrives and extends v1
++        assert_eq!(
++            d.supersede_family(ts::sign_family(&holders[0], v2), None)
++                .await
++                .expect("I2812: v2 extends v1"),
++            2
++        );
++        // v3 offered again extends v2 and leaves the tips
++        assert_eq!(
++            d.supersede_family(ts::sign_family(&holders[0], v3.clone()), None)
++                .await
++                .expect("I2812: v3 extends v2"),
++            3
++        );
++        let head = d.lookup_family(&fam).await.unwrap().expect("held");
++        assert_eq!(head.persist_row_hash, hash_of(&v3), "I2812: v3 is the head");
++        assert!(
++            d.list_group_tips(Cohort::Family, &fam)
++                .await
++                .unwrap()
++                .is_empty(),
++            "I2812: the head is no tip"
++        );
++    }
++}
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod pure {
++    use crate::federation::group_supersede_admit::{
++        held_head_verdict, HeadVerdict, PlannedHead, PlannedSupersede,
++    };
++    use crate::federation::types::consensus_protocol as cp;
++    use crate::federation::types::{Family, GroupSupersedeProof, SignedFamily};
++
++    fn proof(prior: &str) -> GroupSupersedeProof {
++        GroupSupersedeProof {
++            prior_persist_row_hash: prior.to_owned(),
++            change_envelope: serde_json::json!({}),
++            quorum_signatures: Vec::new(),
++        }
++    }
++
++    fn family(prev: &str, proof: Option<GroupSupersedeProof>) -> PlannedSupersede {
++        PlannedSupersede {
++            cohort_str: "family",
++            head: PlannedHead::Family(SignedFamily {
++                family: Family {
++                    prev_head_digest: prev.to_owned(),
++                    charter_digest: String::new(),
++                    family_key_id: "i2813-family".to_owned(),
++                    family_name: "I2813".into(),
++                    members: Vec::new(),
++                    founded_at: "2026-01-01T00:00:00Z".parse().expect("instant"),
++                    consensus_protocol: cp::MAJORITY.to_owned(),
++                    consensus_protocol_entrenched: false,
++                    dissolved_at: None,
++                    persist_row_hash: String::new(),
++                },
++                authority_key_id: String::new(),
++                scrub_signature_classical: String::new(),
++                scrub_signature_pqc: None,
++                supersede_proof: proof,
++                cosignatures: Vec::new(),
++            }),
++            authorization: None,
++        }
++    }
++
++    fn conflict(r: Result<HeadVerdict, crate::federation::Error>, token: &str) -> bool {
++        matches!(r, Err(crate::federation::Error::Conflict(m)) if m.contains(token))
++    }
++
++    /// **I2813** — see the module doc.
++    #[test]
++    fn i2813_the_held_head_verdict_by_truth_table() {
++        const HELD: &str = "i2813-held";
++        const OTHER: &str = "i2813-other";
++        const THIRD: &str = "i2813-third";
++        let v = |prev: &str, p: Option<&str>| {
++            held_head_verdict(&family(prev, p.map(proof)), Some(HELD))
++        };
++        assert_eq!(
++            v(HELD, None).unwrap(),
++            HeadVerdict::Extends,
++            "I2813: a successor"
++        );
++        assert_eq!(v(HELD, Some(HELD)).unwrap(), HeadVerdict::Extends, "I2813");
++        assert_eq!(
++            v(OTHER, None).unwrap(),
++            HeadVerdict::Tip,
++            "I2813: a sibling"
++        );
++        assert_eq!(
++            v("", None).unwrap(),
++            HeadVerdict::Tip,
++            "I2813: a second founding"
++        );
++        assert_eq!(
++            v(OTHER, Some(OTHER)).unwrap(),
++            HeadVerdict::Tip,
++            "I2813: a proof naming the version's own prior rides with it"
++        );
++        assert!(
++            conflict(v(HELD, Some(OTHER)), "stale supersede_proof"),
++            "I2813: the version names the head, its proof another"
++        );
++        assert!(
++            conflict(
++                v(OTHER, Some(THIRD)),
++                "supersede_proof_contradicts_prev_head"
++            ),
++            "I2813: a proof naming a third prior contradicts its version"
++        );
++        assert!(
++            matches!(
++                held_head_verdict(&family(HELD, None), None),
++                Err(crate::federation::Error::InvalidArgument(_))
++            ),
++            "I2813: an unheld group has nothing to supersede"
++        );
++    }
++}
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod runners {
++    fn tag(b: &str) -> String {
++        format!("{b}{}", uuid::Uuid::new_v4().simple())
++    }
++
++    macro_rules! on_sqlite_and_postgres {
++        ($name:ident, $body:path) => {
++            mod $name {
++                use super::tag;
++
++                #[cfg(feature = "sqlite")]
++                #[tokio::test]
++                async fn sqlite() {
++                    use crate::store::Backend as _;
++                    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++                        .await
++                        .unwrap();
++                    b.run_migrations().await.unwrap();
++                    Box::pin($body(&b, &tag("s"))).await;
++                }
++
++                #[cfg(feature = "postgres")]
++                #[tokio::test]
++                async fn postgres() {
++                    use crate::store::Backend as _;
++                    let Some(dsn) = crate::test_pg::empty_dsn() else {
++                        eprintln!(
++                            "{} postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED",
++                            stringify!($name)
++                        );
++                        return;
++                    };
++                    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++                        .await
++                        .unwrap();
++                    b.run_migrations().await.unwrap();
++                    Box::pin($body(&b, &tag("p"))).await;
++                    eprintln!("{} postgres: RAN", stringify!($name));
++                }
++            }
++        };
++    }
++
++    on_sqlite_and_postgres!(
++        i2811,
++        crate::federation::kernel_pass2_invariants::bodies::i2811_a_fork_is_held_as_a_tip_and_the_head_stays
++    );
++    on_sqlite_and_postgres!(
++        i2812,
++        crate::federation::kernel_pass2_invariants::bodies::i2812_a_version_held_before_its_predecessor_extends_when_reoffered
++    );
++}
+diff --git a/src/federation/lineage_head_invariants.rs b/src/federation/lineage_head_invariants.rs
+index d366882a..db818de2 100644
+--- a/src/federation/lineage_head_invariants.rs
++++ b/src/federation/lineage_head_invariants.rs
+@@ -10,8 +10,10 @@
+ //! - **I440** both members are signed, persisted and served: the row hash
+ //!   covers them, and every backend returns what was written.
+ //! - **I441** a supersede whose `prev_head_digest` is not the held head (empty,
+-//!   or another digest) is refused `lineage_prev_head_mismatch`, on the family
+-//!   and the community arm; the one naming the held head is admitted.
++//!   or another digest) does not move the head, on the family and the
++//!   community arm; the one naming the held head is admitted. v62.0.0 (kernel
++//!   pass 2, K1; CC 2.7.8): such a version is held as a tip (I2811), no
++//!   longer refused `lineage_prev_head_mismatch`.
+ //! - **I442** a quorate charter of a family whose head names no charter
+ //!   confers nothing; a version naming it makes the root valid, and that
+ //!   version's `prev_head_digest` is the head it replaced.
+@@ -118,10 +120,6 @@ pub(crate) mod bodies {
+         d.lookup_family(family).await.unwrap().expect("family held")
+     }
+ 
+-    fn is_prev_mismatch(e: &Error) -> bool {
+-        matches!(e, Error::Conflict(m) if m.contains("lineage_prev_head_mismatch"))
+-    }
+-
+     /// **I440** — the two members are signed, persisted and served.
+     pub async fn i440_members_are_signed_and_persisted(d: &dyn FederationDirectory, tag: &str) {
+         let (holders, _) = people(d, tag).await;
+@@ -197,15 +195,15 @@ pub(crate) mod bodies {
+             next.prev_head_digest = prev;
+             next.family_name = format!("renamed-{why}");
+             next.persist_row_hash = String::new();
+-            let e = d
++            let v = d
+                 .supersede_family(ts::sign_family(&holders[0], next), None)
+                 .await
+-                .expect_err("a version naming another predecessor is refused");
+-            assert!(is_prev_mismatch(&e), "{tag} I441 family ({why}): {e:?}");
++                .unwrap_or_else(|e| panic!("{tag} I441 family ({why}): held as a tip: {e}"));
++            assert_eq!(v, 1, "{tag} I441 family ({why}): the head's version");
+             assert_eq!(
+                 head(d, &fam).await,
+                 held,
+-                "{tag} I441: nothing written ({why})"
++                "{tag} I441: the head did not move ({why})"
+             );
+         }
+         let mut next = held.clone();
+@@ -247,11 +245,14 @@ pub(crate) mod bodies {
+         let mut next = held.clone();
+         next.community_name = "renamed".to_owned();
+         next.persist_row_hash = String::new();
+-        let e = d
+-            .supersede_community(ts::sign_community(&holders[0], next.clone()), None)
++        d.supersede_community(ts::sign_community(&holders[0], next.clone()), None)
+             .await
+-            .expect_err("a community version naming no predecessor is refused");
+-        assert!(is_prev_mismatch(&e), "{tag} I441 community: {e:?}");
++            .unwrap_or_else(|e| panic!("{tag} I441 community: held as a tip: {e}"));
++        assert_eq!(
++            d.lookup_community(&id).await.unwrap().unwrap(),
++            held,
++            "{tag} I441 community: the head did not move"
++        );
+         next.prev_head_digest = held.persist_row_hash.clone();
+         d.supersede_community(ts::sign_community(&holders[0], next), None)
+             .await
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index 7d19bfe2..13fc3d74 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -854,6 +854,9 @@ mod withdraws_order_roster_receipt_invariants;
+ // v62.0.0 (slice C) — I1840–I1843: the doors the kernel adapter switched.
+ #[cfg(test)]
+ mod kernel_adapter_invariants;
++// v62.0.0 (kernel pass 2, K1) — I2811–I2813: forks held as tips.
++#[cfg(test)]
++mod kernel_pass2_invariants;
+ // v61.1.0 (CIRISPersist#1188) — I1621/I1622: the pure survivors of the
+ // v61.0.0 mutation run (the consensus_protocol vocabulary, the supersede's
+ // held-head verdict). I1620 and I1623–I1626 sit beside their helpers.
+@@ -3597,6 +3600,18 @@ pub fn cohort_target_of_envelope(envelope: &serde_json::Value) -> Option<&str> {
+ /// [`SignedRevocation`] — wrappers carrying a record the caller has
+ /// signed but persist has not yet stored. Persist verifies the
+ /// scrub-signature on receipt before writing.
++/// v62.0.0 (kernel pass 2, K1) — the prior a locally built
++/// `supersede_proof` names: the version the record's own `prev_head_digest`
++/// names, or (a record naming none) the held head. A proof and its record
++/// name one prior (`group_amendment::check_proof_names_versions_prior`).
++fn proof_prior(record_prev_head_digest: &str, held_head: String) -> String {
++    if record_prev_head_digest.is_empty() {
++        held_head
++    } else {
++        record_prev_head_digest.to_owned()
++    }
++}
++
+ #[async_trait::async_trait]
+ pub trait FederationDirectory: Send + Sync {
+     /// v48.0.0 (CIRISPersist#905) — `self` as the trait object. A default
+@@ -8266,6 +8281,25 @@ pub trait FederationDirectory: Send + Sync {
+         group_key_id: &str,
+     ) -> Result<Vec<cohort::GroupVersion>, Error>;
+ 
++    /// v62.0.0 (kernel pass 2, K1, I2812; CC 2.7.8 "Two versions of one head
++    /// wait as tips") — the versions of a `family` / `community` /
++    /// `affiliations` group this node holds as TIPS beside its head
++    /// (`federation_group_tips`): offered versions whose `prev_head_digest`
++    /// did not name the held head, held rather than refused. Ascending by
++    /// `held_at`, then `persist_row_hash`. Empty for an unknown group or one
++    /// with no tip. [`Error::InvalidArgument`] for the `self` cohort.
++    /// Default = `Unsupported`; the sqlite and postgres backends override.
++    async fn list_group_tips(
++        &self,
++        cohort: cohort::Cohort,
++        group_key_id: &str,
++    ) -> Result<Vec<cohort::GroupTip>, Error> {
++        let _ = (cohort, group_key_id);
++        Err(Error::Unsupported {
++            method: "list_group_tips",
++        })
++    }
++
+     /// #249 Cut G2 (§3) — supersede a family with new content (a re-baselined
+     /// roster and/or a new `consensus_protocol`) as a new version. Validates
+     /// the new `consensus_protocol` form, then composes
+@@ -8846,8 +8880,14 @@ pub trait FederationDirectory: Send + Sync {
+         });
+         // v49.0.0 (#910.5) — the record carries what authorized it, so a
+         // peer can apply it against ITS OWN prior version and roster.
++        // v62.0.0 (kernel pass 2, K1) — the proof names the version the
++        // record names (`prev_head_digest`), so a version naming another than
++        // the held head is a tip, not a proof contradicting its own record.
+         new.supersede_proof = Some(types::GroupSupersedeProof {
+-            prior_persist_row_hash: prior.persist_row_hash,
++            prior_persist_row_hash: proof_prior(
++                &new.family.prev_head_digest,
++                prior.persist_row_hash,
++            ),
+             change_envelope,
+             quorum_signatures: signatures,
+         });
+@@ -8897,11 +8937,13 @@ pub trait FederationDirectory: Send + Sync {
+         });
+         // v49.0.0 (#910.5) — see [`Self::supersede_family_with_quorum`].
+         new.supersede_proof = Some(types::GroupSupersedeProof {
+-            prior_persist_row_hash: self
+-                .lookup_community(&new.community.community_key_id)
+-                .await?
+-                .map(|c| c.persist_row_hash)
+-                .unwrap_or_default(),
++            prior_persist_row_hash: proof_prior(
++                &new.community.prev_head_digest,
++                self.lookup_community(&new.community.community_key_id)
++                    .await?
++                    .map(|c| c.persist_row_hash)
++                    .unwrap_or_default(),
++            ),
+             change_envelope,
+             quorum_signatures: signatures,
+         });
+@@ -8950,11 +8992,13 @@ pub trait FederationDirectory: Send + Sync {
+         });
+         // v49.0.0 (#910.5) — see [`Self::supersede_family_with_quorum`].
+         new.supersede_proof = Some(types::GroupSupersedeProof {
+-            prior_persist_row_hash: self
+-                .lookup_community(&new.community.community_key_id)
+-                .await?
+-                .map(|c| c.persist_row_hash)
+-                .unwrap_or_default(),
++            prior_persist_row_hash: proof_prior(
++                &new.community.prev_head_digest,
++                self.lookup_community(&new.community.community_key_id)
++                    .await?
++                    .map(|c| c.persist_row_hash)
++                    .unwrap_or_default(),
++            ),
+             change_envelope,
+             quorum_signatures: signatures,
+         });
+@@ -12550,31 +12594,6 @@ pub enum Error {
+         detail: String,
+     },
+ 
+-    /// v54.0.0 (CIRISPersist#1031, CC 4.1.1 — the anti-pattern table's
+-    /// "Cycles (A → B → A)" row: "Substrate MUST detect cycles on the
+-    /// `delegates_to` graph and reject the cycle-closing emission"). A
+-    /// `delegates_to(attesting → attested)` was REFUSED because `attested`
+-    /// already reaches `attesting` through live `delegates_to` edges within the
+-    /// absolute depth ceiling, so storing it would close a cycle between
+-    /// distinct keys. A self-edge is the root charter's self-declaration and is
+-    /// not refused. The row is not stored (verify-before-mutation, AV-9). Stable
+-    /// `kind()` token `federation_delegation_cycle`. See
+-    /// [`admission::check_delegation_cycle_admission`].
+-    #[error(
+-        "delegates_to {attesting_key_id:?} -> {attested_key_id:?} closes a delegation cycle: \
+-         {attested_key_id:?} already reaches {attesting_key_id:?} through {hops} live \
+-         delegates_to hop(s) (CC 4.1.1 — the cycle-closing emission is refused)"
+-    )]
+-    DelegationCycle {
+-        /// The refused edge's granter (`attesting_key_id`).
+-        attesting_key_id: String,
+-        /// The refused edge's recipient (`attested_key_id`).
+-        attested_key_id: String,
+-        /// Length of the existing path `attested → … → attesting` that this
+-        /// edge would close (at least 1).
+-        hops: usize,
+-    },
+-
+     /// v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C, CIRISConstitution#163)
+     /// — a term-bearing `delegates_to` was REFUSED because its signed term is
+     /// missing, unreadable, or longer than the bound that governs it. A
+@@ -13651,6 +13670,12 @@ pub mod malformed_row {
+     /// the family of the row its `refs.target` names: a composer carries
+     /// its target's family.
+     pub const COMPOSER_FAMILY_MISMATCH: &str = "composer_family_mismatch";
++    /// v62.0.0 (kernel pass 2, K1; CC ruling, half-open windows) — a row or
++    /// object that states `valid_until` at or before its own `asserted_at`:
++    /// its window `[asserted_at, valid_until)` covers no instant. Read from
++    /// the statement alone, at the edition-2 door
++    /// (`edition2::door::check_valid_until_after_asserted_at`).
++    pub const VALID_UNTIL_NOT_AFTER_ASSERTED_AT: &str = "valid_until_not_after_asserted_at";
+ 
+     /// Every token, for the from-disk witnesses and adopters' tables.
+     pub const ALL: &[&str] = &[
+@@ -13699,6 +13724,8 @@ pub mod malformed_row {
+         ACCORD_INVOCATION_INVALID,
+         ACCORD_INVOCATION_REPLAYED,
+         COMPOSER_FAMILY_MISMATCH,
++        // v62.0.0 (kernel pass 2, K1) — appended.
++        VALID_UNTIL_NOT_AFTER_ASSERTED_AT,
+     ];
+ }
+ 
+@@ -13846,7 +13873,6 @@ impl Error {
+             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
+             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
+             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
+-            Error::DelegationCycle { .. } => "federation_delegation_cycle",
+             Error::DelegationTermRequired { .. } => "federation_delegation_term_required",
+             Error::AffiliationCohortMismatch { .. } => "federation_affiliation_cohort_mismatch",
+             Error::AffiliationConfigInvalid { .. } => "federation_affiliation_config_invalid",
+diff --git a/src/federation/mutation_survivors_1188_invariants.rs b/src/federation/mutation_survivors_1188_invariants.rs
+index b4e3c9a9..299872fa 100644
+--- a/src/federation/mutation_survivors_1188_invariants.rs
++++ b/src/federation/mutation_survivors_1188_invariants.rs
+@@ -15,9 +15,10 @@
+ //!   against the held head (`group_supersede_admit::held_head_verdict`)
+ //!   reads the offered head's proof and names the group it refuses: a proof
+ //!   naming another prior is a stale proof even when `prev_head_digest`
+-//!   names the held head; an unheld group, a stale proof and a lineage
+-//!   mismatch each name the group's key; a head naming the held version (by
+-//!   proof and by `prev_head_digest`) passes.
++//!   names the held head; an unheld group and a stale proof each name the
++//!   group's key; a head naming the held version (by proof and by
++//!   `prev_head_digest`) passes. v62.0.0 (kernel pass 2, K1): a head naming
++//!   another version is held as a tip (I2811), no longer a lineage refusal.
+ 
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod pure {
+@@ -198,14 +199,15 @@ mod pure {
+                 "I1622 {kind}: {e}"
+             );
+             names(&e, "stale-proof");
+-            // A version that names another predecessor.
+-            let e = held_head_verdict(&head(&key, "i1622-another-head", None), Some(HELD))
+-                .expect_err("I1622: a version names the head it succeeds");
+-            assert!(
+-                is_conflict(&e, "lineage_prev_head_mismatch"),
+-                "I1622 {kind}: {e}"
++            // A version that names another predecessor: v62.0.0 (kernel
++            // pass 2, K1) — held as a tip beside the head, never refused
++            // (CC 2.7.8; I2811).
++            assert_eq!(
++                held_head_verdict(&head(&key, "i1622-another-head", None), Some(HELD))
++                    .unwrap_or_else(|e| panic!("I1622 {kind}: a sibling is a tip: {e}")),
++                crate::federation::group_supersede_admit::HeadVerdict::Tip,
++                "I1622 {kind}"
+             );
+-            names(&e, "lineage");
+         }
+     }
+ }
+diff --git a/src/federation/trust_root.rs b/src/federation/trust_root.rs
+index 3c4c4320..3c780040 100644
+--- a/src/federation/trust_root.rs
++++ b/src/federation/trust_root.rs
+@@ -1448,11 +1448,12 @@ where
+     // same root); the user's other rows are no part of this edge
+     let candidates: Vec<&Attestation> = by_user.iter().filter(|a| shaped(a)).collect();
+     if candidates.is_empty() {
+-        return Ok(crate::kernel::Answer {
+-            value: false,
+-            rows: Vec::new(),
+-            rule: "trust::reaches/1",
+-        });
++        return Ok(crate::kernel::Answer::reading(
++            false,
++            Vec::new(),
++            vec![crate::kernel::DepKey::Standing(user_key_id.to_owned())],
++            "trust::reaches/1",
++        ));
+     }
+     // a rotation reaches back through the grants it replaces, whatever their
+     // own expiry: the chain's links are read too (CC 3.2 T2)
+diff --git a/src/ffi/directory_capsule.rs b/src/ffi/directory_capsule.rs
+index 3b4dc81b..112137d4 100644
+--- a/src/ffi/directory_capsule.rs
++++ b/src/ffi/directory_capsule.rs
+@@ -9860,6 +9860,11 @@ mod tests {
+         ("purge_delete_tombstoned_attestation", INHERITED_DEFAULT),
+         ("purge_delete_tombstoned_trace", INHERITED_DEFAULT),
+         ("purge_mark_finalized", INHERITED_DEFAULT),
++        (
++            "list_group_tips",
++            "v62.0.0 (kernel pass 2, K1): a node-local read of the tips this \
++          node holds; no DirectoryOp carries it yet",
++        ),
+     ];
+ 
+     /// **I1162 — proxy parity.** Every `FederationDirectory` method the
+diff --git a/src/ffi/pyo3.rs b/src/ffi/pyo3.rs
+index 1237d484..02d91683 100644
+--- a/src/ffi/pyo3.rs
++++ b/src/ffi/pyo3.rs
+@@ -33253,10 +33253,6 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
+         // node-role key is caller-side authorization failure; ValueError
+         // (4xx). "Infrastructure must not have agency."
+         crate::federation::Error::NodeAgencyForbidden { .. } => PyValueError::new_err(kind),
+-        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — a cycle-closing
+-        // `delegates_to` joins the node-agency arm it sits beside on the
+-        // put door: a caller-side delegation refusal, ValueError (4xx).
+-        crate::federation::Error::DelegationCycle { .. } => PyValueError::new_err(kind),
+         // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — an affiliation addressed
+         // as a community (or the reverse), and a malformed or invalid
+         // affiliation record: caller-side refusals of a group write, the
+diff --git a/src/kernel/consensus.rs b/src/kernel/consensus.rs
+index c14652ed..e3ea5e97 100644
+--- a/src/kernel/consensus.rs
++++ b/src/kernel/consensus.rs
+@@ -347,11 +347,27 @@ pub fn ballot_rows(b: &Ballot<'_>, arm: &Arm) -> Vec<KRow> {
+ pub fn admits(b: &Ballot<'_>) -> Result<Answer<bool>, NoCell> {
+     let elig = eligible_seats(b);
+     let arm = arm_over(b, &elig)?;
+-    Ok(Answer {
+-        value: count_over(b, &arm, &elig),
+-        rows: Vec::new(),
+-        rule: "seat::seat_rule/Conf::Group (count over the resolved head)",
+-    })
++    Ok(Answer::reading(
++        count_over(b, &arm, &elig),
++        Vec::new(),
++        ballot_reads(b),
++        "seat::seat_rule/Conf::Group (count over the resolved head)",
++    ))
++}
++
++/// v62.0.0 (kernel pass 2, I2810) — what a ballot's count reads: the
++/// standing of every seat on the resolved head, of every voice, and of the
++/// person the change names. The group's own [`DepKey::Roster`] is the
++/// caller's to add: a ballot carries the roster it resolved, not the group's
++/// key id.
++fn ballot_reads(b: &Ballot<'_>) -> Vec<super::DepKey> {
++    b.roster
++        .iter()
++        .map(|s| s.key_id.clone())
++        .chain(b.signers.iter().cloned())
++        .chain(b.subject.map(str::to_owned))
++        .map(super::DepKey::Standing)
++        .collect()
+ }
+ 
+ /// [`admits`] over the eligible seats the caller already resolved
+@@ -373,11 +389,12 @@ pub fn admits_by_rows(b: &Ballot<'_>) -> Result<Answer<bool>, NoCell> {
+     let kept = layers::kept(&rows, |_| true);
+     let c = layers::conclude(kept, |p| seat_rule(p, law, &NoCut, &|_| true), None);
+     let counted = rows.last().expect("the counted row is last").id;
+-    Ok(Answer {
+-        value: c.concluded_id(&counted),
+-        rows: rows.iter().map(|r| r.id).collect(),
+-        rule: "seat::seat_rule/Conf::Group",
+-    })
++    Ok(Answer::reading(
++        c.concluded_id(&counted),
++        rows.iter().map(|r| r.id).collect(),
++        ballot_reads(b),
++        "seat::seat_rule/Conf::Group",
++    ))
+ }
+ 
+ /// The seat rule's `Conf::Group` arm (`ciris_kernel::seat::seat_rule`) over
+diff --git a/src/kernel/differential.rs b/src/kernel/differential.rs
+index 07a34d37..5fef1c52 100644
+--- a/src/kernel/differential.rs
++++ b/src/kernel/differential.rs
+@@ -12,8 +12,9 @@
+ //! | [`Class::Custom`] | CC 4.4.3.6's protocol table has six arms, no `custom:` | `consensus::evaluate` |
+ //! | [`Class::WeightedWhole`] | CC 3.3.4 "Each weight and the threshold is a whole number" | `consensus::evaluate` |
+ //! | [`Class::NodeCosign`] | CC 3.2 *The first binding (MUST)*: counts "only when the node's own key cosigned it" | `owner_of` |
+-//! | [`Class::ForkAsTip`] | CC 2.7.8 "Two versions of one head wait as tips" | `held_head_verdict` |
++//! | [`Class::ForkAsTip`] | CC 2.7.8 "Two versions of one head wait as tips" | `held_head_verdict` (switched in kernel pass 2: persist's side is its former refusal, the reference) |
+ //! | [`Class::CycleVisitedOnce`] | CC 4.4.3.34 / KERNEL.md 5: the walk visits a cycle once; nothing is refused for closing one | the delegation cycle gate |
++//! | [`Class::KeyEndHalfOpen`] | CC 2.6.2's freshness row: "the attestation has not yet reached its `valid_until`" | `HeldKeys::liveness` (kernel pass 2) |
+ //!
+ //! **Counting.** With `CIRIS_KERNEL_DIFF_LOG=<file>` set, each call appends
+ //! one tab-separated line `function  class  key  persist  kernel  test` (the key
+@@ -40,6 +41,10 @@ pub enum Class {
+     ForkAsTip,
+     /// A cycle-closing delegation is not refused.
+     CycleVisitedOnce,
++    /// v62.0.0 (kernel pass 2, K1) — at exactly a record's `valid_until`
++    /// the record has ended (the kernel's `[from, until)`); persist's
++    /// former reading covered it.
++    KeyEndHalfOpen,
+     /// None of the above: a disagreement no CC sentence explains.
+     Unexplained,
+ }
+@@ -54,6 +59,7 @@ impl Class {
+             Class::NodeCosign => "node_cosign",
+             Class::ForkAsTip => "fork_as_tip",
+             Class::CycleVisitedOnce => "cycle_visited_once",
++            Class::KeyEndHalfOpen => "key_end_half_open",
+             Class::Unexplained => "UNEXPLAINED",
+         }
+     }
+@@ -275,3 +281,26 @@ pub fn held_head(
+         &format!("{reading:?}"),
+     );
+ }
++
++/// v62.0.0 (kernel pass 2, K1) — `HeldKeys::liveness`: persist's former
++/// coverage reading (inclusive of `valid_until`) against the kernel's
++/// key-end conclusion, after the revocations (which are persist's, and
++/// read before either). `at_an_end`: some valid record states exactly `at`
++/// as its `valid_until`.
++pub fn key_end(key: &str, at: u64, persist_covers: bool, kernel_live: bool, at_an_end: bool) {
++    let class = if persist_covers == kernel_live {
++        Class::Agree
++    } else if persist_covers && !kernel_live && at_an_end {
++        Class::KeyEndHalfOpen
++    } else {
++        Class::Unexplained
++    };
++    let at_s = at.to_string();
++    record(
++        "HeldKeys::liveness",
++        class,
++        &key_of(&[key, &at_s]),
++        &persist_covers.to_string(),
++        &kernel_live.to_string(),
++    );
++}
+diff --git a/src/kernel/head.rs b/src/kernel/head.rs
+index 75f9e03c..b0b3ee80 100644
+--- a/src/kernel/head.rs
++++ b/src/kernel/head.rs
+@@ -4,16 +4,28 @@
+ //!
+ //! CC 2.7.8: "Two versions of one head wait as tips. The roster is then the
+ //! members common to all tips, until a version naming the tips makes one head
+-//! again." Persist's `held_head_verdict` refuses an offered version that does
+-//! not name the held head; the kernel holds it, as a tip beside the held head
+-//! (it names a version this node holds) or as a row waiting for the head it
+-//! names. This slice WITNESSES that departure ([`super::differential`]); the
+-//! switch to forks-as-tips is the next slice's (I1837).
++//! again." The kernel holds an offered version that does not name the held
++//! head, as a tip beside the held head (it names a version this node holds)
++//! or as a row waiting for the head it names.
+ //!
+-//! What stays persist's: a `supersede_proof` that names another prior is a
+-//! contradiction inside one row, refused for its shape before the kernel.
++//! v62.0.0 (kernel pass 2, I2811) — **switched.** Persist's
++//! `held_head_verdict` answers through [`head_answer`]: a [`HeadReading::Tip`]
++//! is held (`federation_group_tips`), never refused, and the head stays
++//! where it is. The differential still records the former refusal as the
++//! named `fork_as_tip` departure ([`super::differential`]), so a run shows
++//! every call that the switch changed.
++//!
++//! What stays persist's: a `supersede_proof` that names another prior than
++//! the version it rides on is a contradiction inside one row, refused for
++//! its shape before the kernel.
++//!
++//! Not presented (named in the K1 notes): the roster read as "the members
++//! common to all tips" and the version naming the tips that "makes one head
++//! again" — a `group:roster` version names one `prev` today, so no version
++//! can name two tips.
+ 
+ use super::view::{Micros, RowId};
++use super::{Answer, DepKey};
+ use ciris_kernel::head::{Entry, Kind};
+ use ciris_kernel::Row;
+ 
+@@ -96,10 +108,65 @@ pub fn head_reading(
+     }
+ }
+ 
++/// v62.0.0 (kernel pass 2, I2811, I2810) — [`head_reading`] as an
++/// [`Answer`]: the rows it read (the held head and the version the offer
++/// names, when it names one) and its read set, the group's roster (a new
++/// version of the group can change the reading; nothing else can).
++#[must_use]
++pub fn head_answer(group: &str, held: Option<&str>, offered_prev: &str) -> Answer<HeadReading> {
++    let value = head_reading(group, held, offered_prev, "");
++    let rows: Vec<RowId> = held
++        .map(RowId::of_hash)
++        .into_iter()
++        .chain(
++            (!offered_prev.is_empty() && held != Some(offered_prev))
++                .then(|| RowId::of_hash(offered_prev)),
++        )
++        .collect();
++    Answer::reading(
++        value,
++        rows,
++        vec![DepKey::Roster(group.to_owned())],
++        "graph::Graph::frontier",
++    )
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    /// I2811 / I2810 — the answer is the reading, rests on the two versions
++    /// it read, and reads the group's roster only.
++    #[test]
++    fn i2811_the_head_answer_is_the_reading_over_the_versions_it_read() {
++        let h = "aa".repeat(32);
++        let other = "bb".repeat(32);
++        let a = head_answer("g", Some(&h), &other);
++        assert_eq!(a.value, HeadReading::Tip, "I2811: a sibling is a tip");
++        assert_eq!(
++            a.rows,
++            vec![RowId::of_hash(&h), RowId::of_hash(&other)],
++            "I2810: the rows read are the held head and the version named"
++        );
++        assert_eq!(a.reads, vec![DepKey::Roster("g".into())], "I2810");
++        assert!(a.read_any(&[DepKey::Roster("g".into())]), "I2810");
++        assert!(
++            !a.read_any(&[DepKey::Roster("another".into())]),
++            "I2810: another group's version cannot change the reading"
++        );
++        let e = head_answer("g", Some(&h), &h);
++        assert_eq!(e.value, HeadReading::Extends, "I2811");
++        assert_eq!(e.rows, vec![RowId::of_hash(&h)], "I2810: one version read");
++        let f = head_answer("g", Some(&h), "");
++        assert_eq!(
++            f.value,
++            HeadReading::Tip,
++            "I2811: a second founding version"
++        );
++        assert_eq!(f.rows, vec![RowId::of_hash(&h)], "I2810");
++        assert_eq!(head_answer("g", None, &h).value, HeadReading::NothingHeld);
++    }
++
+     #[test]
+     fn i1837_a_version_naming_the_held_head_extends_it_and_any_other_is_a_tip() {
+         let h = "aa".repeat(32);
+diff --git a/src/kernel/key_end.rs b/src/kernel/key_end.rs
+new file mode 100644
+index 00000000..ef4f6e6c
+--- /dev/null
++++ b/src/kernel/key_end.rs
+@@ -0,0 +1,373 @@
++//! v62.0.0 (kernel pass 2, K1) — **a key's own end**, as the kernel reads it
++//! (`ciris_kernel::key_end`; CC 2.4.1.1 "A key's own end (normative)", CC
++//! 2.7.5).
++//!
++//! CC 2.4.1.1: "A key is live at an instant when one of its records covers
++//! that instant and its own revocation has not taken effect by then. It has
++//! ended when every one of its records has ended." The edition-2 key plane
++//! ([`crate::federation::edition2::liveness::HeldKeys`]) presents each held
++//! `key:record` of the key that verified, and each of the key's OWN
++//! `key:revocation`s, as a [`KeyEndView`]; the kernel decides which records
++//! are well formed under the end rule (`key_end::well_formed`, ceiling
++//! [`KEY_RECORD_CEIL_MS`]), which conclude (`key_end::conclude_rule`), and
++//! whether the key is [`live`](key_live) or [`ended`](key_ended) at an
++//! instant. No sweep reads a clock; the instant is the caller's argument.
++//!
++//! | presented | kernel field | persist source |
++//! |---|---|---|
++//! | a record row | `Record { key, from, until, sigs, end }` | Verify's `KeyRecord` (`asserted_at`, `valid_until`, `identity_type`), the verified voices over the row |
++//! | a self-revocation | `revocation() = (key, revoked_after)` | an honoured `key:revocation` the key signed itself; no `revoked_after` revokes from 0 |
++//!
++//! What stays persist's: signature verification and the record's chain to
++//! its predecessor (Verify's `verify_row_statement`; a record reaches the
++//! kernel only once a voice over it verified, so each record is presented
++//! as concluding on its own: `names` is empty, never a renewal or a
++//! rotation the kernel re-walks); and the owner / roster revokers of
++//! `RevokerStanding`, which the kernel's key-end reading does not count (CC
++//! 2.4.1.1: "No other row enters that reading") — persist keeps them on top
++//! of this answer until a ruling (K1 notes).
++//!
++//! **The boundary** (CC ruling, v62.0.0: half-open everywhere). A record
++//! covers `t` when `asserted_at <= t < valid_until` ([`within_record`], the
++//! one function every coverage reading calls). Persist read it inclusive of
++//! `valid_until` before, as Verify 23.1.3's `KeyRecordDirectory` still does
++//! (Verify follows in 23.3.1): the one instant where the readings differ is
++//! the named differential class `key_end_half_open`.
++
++use super::view::RowId;
++use super::{Answer, DepKey};
++use ciris_kernel::key_end::{self as ke, EndRule, KeyEndRow, Record};
++use ciris_kernel::layers;
++use ciris_kernel::Row;
++
++/// `key_record_max_secs` (CC 2.4.1.1; Verify's `KEY_RECORD_MAX_SECS`,
++/// 31,536,000 s) in the milliseconds every instant here is read in: a
++/// `node` / `agent` record's `valid_until` is at most this after its
++/// `asserted_at`.
++pub const KEY_RECORD_CEIL_MS: u64 = 31_536_000 * 1000;
++
++/// **The one boundary of a record's window** (CC ruling, v62.0.0: half-open
++/// everywhere): a record stating `[from, until)` covers `at` when
++/// `from <= at < until`; no `until` covers every instant from `from`. Every
++/// coverage reading in persist calls this — a key's liveness (the kernel's
++/// `key_end::live` reads the same window), the key-of-issuer chain's
++/// predecessor record covering a rotation, an occurrence's window — so the
++/// boundary is one line. Instants are POSIX ms.
++#[must_use]
++pub fn within_record(at: u64, from: u64, until: Option<u64>) -> bool {
++    from <= at && until.is_none_or(|u| at < u)
++}
++
++/// The end rule of a record, read from its `identity_type` set alone (CC
++/// 2.4.1.1): a `node` or `agent` key MUST state an end, a `user` or
++/// `accord_holder` key MUST NOT, any other role may. A set mixing the two
++/// groups is refused before this (Verify's `check_key_record`); read here,
++/// the machine rule wins, so such a set states an end or concludes nothing.
++#[must_use]
++pub fn end_rule(identity_type: &[String]) -> EndRule {
++    let has = |r: &str| identity_type.iter().any(|t| t == r);
++    if has("node") || has("agent") {
++        EndRule::Required
++    } else if has("user") || has("accord_holder") {
++        EndRule::Forbidden
++    } else {
++        EndRule::Optional
++    }
++}
++
++/// What a [`KeyEndView`] presents.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum KeyEndKind {
++    /// A `key:record` of `key`.
++    Record {
++        /// Its signed `asserted_at`, ms.
++        from: u64,
++        /// Its signed `valid_until`, ms.
++        until: Option<u64>,
++        /// The keys whose voices over the row verified.
++        sigs: Vec<String>,
++        /// Its end rule ([`end_rule`]).
++        end: EndRule,
++    },
++    /// The key's own `key:revocation`, in effect from `after` (ms).
++    Revocation {
++        /// Its `revoked_after`; `0` for a revocation that states none.
++        after: u64,
++    },
++}
++
++/// One row of a key's end, as the kernel's `key_end::KeyEndRow` reads it.
++#[derive(Clone, Debug)]
++pub struct KeyEndView {
++    id: RowId,
++    names: Vec<RowId>,
++    key: String,
++    signer: String,
++    kind: KeyEndKind,
++}
++
++impl KeyEndView {
++    /// A record row `id` of `key` (its voices are `kind`'s `sigs`).
++    #[must_use]
++    pub fn of_record(id: RowId, key: &str, kind: KeyEndKind) -> Self {
++        KeyEndView {
++            id,
++            names: Vec::new(),
++            key: key.to_owned(),
++            signer: key.to_owned(),
++            kind,
++        }
++    }
++
++    /// The key's own revocation `id`, in effect from `revoked_after` (`None`:
++    /// from the first instant).
++    #[must_use]
++    pub fn self_revocation(id: RowId, key: &str, revoked_after: Option<u64>) -> Self {
++        KeyEndView {
++            id,
++            names: Vec::new(),
++            key: key.to_owned(),
++            signer: key.to_owned(),
++            kind: KeyEndKind::Revocation {
++                after: revoked_after.unwrap_or(0),
++            },
++        }
++    }
++}
++
++impl Row for KeyEndView {
++    type Id = RowId;
++    type Key = String;
++    fn id(&self) -> &RowId {
++        &self.id
++    }
++    fn names(&self) -> &[RowId] {
++        &self.names
++    }
++    fn signer(&self) -> &String {
++        &self.signer
++    }
++}
++
++impl KeyEndRow for KeyEndView {
++    type T = u64;
++    fn record(&self) -> Option<Record<'_, String, u64>> {
++        match &self.kind {
++            KeyEndKind::Record {
++                from,
++                until,
++                sigs,
++                end,
++            } => Some(Record {
++                key: &self.key,
++                from: *from,
++                until: *until,
++                succ_of: None,
++                at_old: None,
++                sigs: sigs.as_slice(),
++                end: *end,
++            }),
++            KeyEndKind::Revocation { .. } => None,
++        }
++    }
++    fn revocation(&self) -> Option<(&String, u64)> {
++        match &self.kind {
++            KeyEndKind::Revocation { after } => Some((&self.key, *after)),
++            KeyEndKind::Record { .. } => None,
++        }
++    }
++}
++
++/// The kernel's two layers over `rows`: kept under the end rule's door,
++/// then concluded.
++#[allow(clippy::redundant_closure)] // the rule's lifetimes are higher-ranked
++fn concluded(rows: &[KeyEndView]) -> layers::Concluded<'_, KeyEndView> {
++    let kept = layers::kept(rows, |r| ke::well_formed(r, KEY_RECORD_CEIL_MS));
++    layers::conclude(kept, |p| ke::conclude_rule(p), None)
++}
++
++/// The concluded record rows of `key` (the rows the answer rests on).
++fn concluded_records(c: &layers::Concluded<'_, KeyEndView>, key: &str) -> Vec<RowId> {
++    c.cs()
++        .iter()
++        .map(|&i| c.g.row(i))
++        .filter(|r| r.key == key && r.record().is_some())
++        .map(|r| r.id)
++        .collect()
++}
++
++/// **Is `key` live at `at`** (ms): one of its concluded records covers
++/// `at` and its own revocation has not taken effect (`key_end::live`). The
++/// read set is the key plane of `key` alone (CC 2.4.1.1: "No other row
++/// enters that reading").
++#[must_use]
++pub fn key_live(rows: &[KeyEndView], key: &str, at: u64) -> Answer<bool> {
++    let c = concluded(rows);
++    let value = ke::live(&c, &key.to_owned(), at);
++    Answer::reading(
++        value,
++        concluded_records(&c, key),
++        vec![DepKey::Keys(key.to_owned())],
++        "key_end::live",
++    )
++}
++
++/// **Has `key` ended at `at`** (ms): every record of it ends by `at`, or it
++/// revoked itself by then (`key_end::ended`). A record not yet begun has not
++/// ended.
++#[must_use]
++pub fn key_ended(rows: &[KeyEndView], key: &str, at: u64) -> Answer<bool> {
++    let c = concluded(rows);
++    let value = ke::ended(&c, &key.to_owned(), at);
++    Answer::reading(
++        value,
++        concluded_records(&c, key),
++        vec![DepKey::Keys(key.to_owned())],
++        "key_end::ended",
++    )
++}
++
++/// The records of `key` the kernel's door keeps and concludes (well formed
++/// under the end rule): the records [`key_live`] reads.
++#[must_use]
++pub fn kept_records(rows: &[KeyEndView], key: &str) -> Vec<RowId> {
++    concluded_records(&concluded(rows), key)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const K: &str = "k";
++
++    fn rec(i: u8, from: u64, until: Option<u64>, end: EndRule) -> KeyEndView {
++        KeyEndView::of_record(
++            RowId([i; 32]),
++            K,
++            KeyEndKind::Record {
++                from,
++                until,
++                sigs: vec![K.to_owned()],
++                end,
++            },
++        )
++    }
++
++    /// **I2814** — a machine key is live over `[asserted_at, valid_until)`
++    /// of a record that keeps the end rule; renewals all count; a record
++    /// over the ceiling, one with no end, and a person's record with one
++    /// make the key live nowhere.
++    #[test]
++    fn i2814_a_key_is_live_over_its_records_under_the_end_rule() {
++        let rows = vec![rec(1, 1_000, Some(10_000), EndRule::Required)];
++        assert!(!key_live(&rows, K, 999).value, "I2814: before");
++        assert!(key_live(&rows, K, 1_000).value, "I2814: at start");
++        assert!(key_live(&rows, K, 9_999).value, "I2814: inside");
++        assert!(
++            !key_live(&rows, K, 10_000).value,
++            "I2814: at valid_until the record has ended (half-open)"
++        );
++        assert_eq!(key_live(&rows, K, 5_000).rows, vec![RowId([1; 32])]);
++        assert_eq!(
++            key_live(&rows, K, 5_000).reads,
++            vec![DepKey::Keys(K.into())],
++            "I2810: the key plane of the key alone"
++        );
++        // a renewal signed after the end revives it
++        let mut renewed = rows.clone();
++        renewed.push(rec(2, 20_000, Some(40_000), EndRule::Required));
++        assert!(!key_live(&renewed, K, 15_000).value, "I2814: the gap");
++        assert!(key_live(&renewed, K, 30_000).value, "I2814: renewed");
++        // the door
++        let over = vec![rec(3, 0, Some(KEY_RECORD_CEIL_MS + 1), EndRule::Required)];
++        assert!(!key_live(&over, K, 1).value, "I2814: over the ceiling");
++        assert!(kept_records(&over, K).is_empty(), "I2814");
++        let at_ceiling = vec![rec(3, 0, Some(KEY_RECORD_CEIL_MS), EndRule::Required)];
++        assert!(key_live(&at_ceiling, K, 1).value, "I2814: at the ceiling");
++        let no_end = vec![rec(4, 0, None, EndRule::Required)];
++        assert!(
++            !key_live(&no_end, K, 1).value,
++            "I2814: a machine key states an end"
++        );
++        let person = vec![rec(5, 0, None, EndRule::Forbidden)];
++        assert!(
++            key_live(&person, K, u64::MAX).value,
++            "I2814: a person's key has no end"
++        );
++        let person_end = vec![rec(6, 0, Some(10), EndRule::Forbidden)];
++        assert!(
++            !key_live(&person_end, K, 1).value,
++            "I2814: a person's key states none"
++        );
++        let backwards = vec![rec(7, 10, Some(5), EndRule::Required)];
++        assert!(
++            !key_live(&backwards, K, 7).value,
++            "I2814: until before from"
++        );
++    }
++
++    /// **I2819** — the boundary: `within_record` agrees with the kernel's
++    /// `live` at `valid_until - 1`, `valid_until` and `valid_until + 1`, and
++    /// at `asserted_at`.
++    #[test]
++    fn i2819_within_record_is_the_kernels_window() {
++        let rows = vec![rec(1, 1_000, Some(10_000), EndRule::Required)];
++        for (at, want) in [
++            (999, false),
++            (1_000, true),
++            (9_999, true),
++            (10_000, false),
++            (10_001, false),
++        ] {
++            assert_eq!(
++                within_record(at, 1_000, Some(10_000)),
++                want,
++                "I2819 at {at}"
++            );
++            assert_eq!(
++                key_live(&rows, K, at).value,
++                want,
++                "I2819: the kernel at {at}"
++            );
++        }
++        assert!(within_record(u64::MAX, 5, None), "I2819: no end");
++        assert!(
++            !within_record(5, 5, Some(5)),
++            "I2819: an empty window covers nothing"
++        );
++    }
++
++    /// **I2815** — the end rule from the role set (CC 2.4.1.1).
++    #[test]
++    fn i2815_the_end_rule_reads_the_role_set() {
++        let set = |r: &[&str]| r.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
++        assert_eq!(end_rule(&set(&["node"])), EndRule::Required);
++        assert_eq!(end_rule(&set(&["agent", "steward"])), EndRule::Required);
++        assert_eq!(end_rule(&set(&["user"])), EndRule::Forbidden);
++        assert_eq!(end_rule(&set(&["accord_holder"])), EndRule::Forbidden);
++        assert_eq!(end_rule(&set(&["steward"])), EndRule::Optional);
++    }
++
++    /// **I2816** — the key's own revocation ends it from `revoked_after`;
++    /// with none it ends it outright; a key has ended when every record has.
++    #[test]
++    fn i2816_its_own_revocation_ends_a_key() {
++        let base = vec![rec(1, 0, Some(10_000), EndRule::Required)];
++        let mut bounded = base.clone();
++        bounded.push(KeyEndView::self_revocation(RowId([9; 32]), K, Some(5_000)));
++        assert!(
++            key_live(&bounded, K, 4_999).value,
++            "I2816: before the bound"
++        );
++        assert!(!key_live(&bounded, K, 5_000).value, "I2816: from the bound");
++        assert!(key_ended(&bounded, K, 5_000).value, "I2816");
++        let mut outright = base.clone();
++        outright.push(KeyEndView::self_revocation(RowId([9; 32]), K, None));
++        assert!(!key_live(&outright, K, 1).value, "I2816: revoked outright");
++        assert!(!key_ended(&base, K, 9_999).value, "I2816: a record covers");
++        assert!(
++            key_ended(&base, K, 10_000).value,
++            "I2816: every record ended"
++        );
++    }
++}
+diff --git a/src/kernel/mod.rs b/src/kernel/mod.rs
+index 1584bd83..87904da4 100644
+--- a/src/kernel/mod.rs
++++ b/src/kernel/mod.rs
+@@ -14,13 +14,16 @@
+ //! | [`owner`] | a node's owner bindings as offers of the `owner` seat over its key | `seat::Seats::holders` |
+ //! | [`trust`] | a user's acceptance edges | `derived::fold_default`, `trust::reaches` |
+ //! | [`head`] | a group's held head and an offered version | `head::Entry`, `graph::Graph::frontier` |
++//! | [`key_end`] | an edition-2 key's records and its own revocations | `key_end::KeyEndRow`, `well_formed`, `conclude_rule`, `live`, `ended` |
+ //!
+-//! Every answer carries the rows it rests on and the rule that gave it
+-//! ([`Answer`], KERNEL_SEAMS §5.3's `Answer`, its `rows` and `rule`; the
+-//! read set, `valid_until` and the digest are the next slice's).
++//! Every answer carries the rows it rests on, the dependency keys it read
++//! and the rule that gave it ([`Answer`], KERNEL_SEAMS §5.3's `Answer`: its
++//! `rows`, `reads` and `rule`). v62.0.0 (kernel pass 2, I2810): the read set
++//! is carried; `valid_until` and the digest are not yet.
+ 
+ pub mod consensus;
+ pub mod head;
++pub mod key_end;
+ pub mod law;
+ pub mod owner;
+ pub mod trust;
+@@ -55,6 +58,58 @@ pub struct Answer<T> {
+     pub value: T,
+     /// The rows the value rests on.
+     pub rows: Vec<view::RowId>,
++    /// v62.0.0 (kernel pass 2, I2810) — **the read set**: the dependency
++    /// keys the answer read (KERNEL_SEAMS §5.4, "the light cone"). A row
++    /// whose write set ([`DepKey`]s it can change) meets this set may change
++    /// the answer; a row whose write set does not, cannot. Sorted, each key
++    /// once ([`Answer::reading`]).
++    pub reads: Vec<DepKey>,
+     /// The kernel rule that gave it.
+     pub rule: &'static str,
+ }
++
++impl<T> Answer<T> {
++    /// An answer over `rows`, having read `reads` (sorted and deduplicated
++    /// here, so two answers that read the same keys carry the same set).
++    #[must_use]
++    pub fn reading(
++        value: T,
++        rows: Vec<view::RowId>,
++        mut reads: Vec<DepKey>,
++        rule: &'static str,
++    ) -> Self {
++        reads.sort();
++        reads.dedup();
++        Answer {
++            value,
++            rows,
++            reads,
++            rule,
++        }
++    }
++
++    /// Whether a row that can change `writes` may change this answer: the
++    /// write set meets the read set (KERNEL_SEAMS §5.4's invalidation test).
++    #[must_use]
++    pub fn read_any(&self, writes: &[DepKey]) -> bool {
++        writes.iter().any(|w| self.reads.binary_search(w).is_ok())
++    }
++}
++
++/// v62.0.0 (kernel pass 2, I2810) — **a dependency key** (KERNEL_SEAMS
++/// §5.4): what an answer reads by, and what a row writes by. Persist's
++/// keys are its own identifiers (a key id, a group key id, a row's
++/// digest), carried as they are stored.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum DepKey {
++    /// One object's lifecycle: a row and what composes it.
++    Object(view::RowId),
++    /// The rows that cite a row (its composers, the versions naming it).
++    Refs(view::RowId),
++    /// A group's head, membership and protocol, by its group key id.
++    Roster(String),
++    /// A key's standing: the seats over it, the edges it signs or receives.
++    Standing(String),
++    /// A key's records and its own revocations (the key plane), by key id.
++    Keys(String),
++}
+diff --git a/src/kernel/owner.rs b/src/kernel/owner.rs
+index c8af8c64..9f267755 100644
+--- a/src/kernel/owner.rs
++++ b/src/kernel/owner.rs
+@@ -25,8 +25,14 @@
+ //! `withdraws` naming the node, not the row) withdraws every binding of that
+ //! granter's to the node.
+ //!
+-//! The genesis-record path of the CC sentence is not presented: no persist
+-//! genesis bundle carries an owner binding today (left for the next slice).
++//! **The genesis-record path** (v62.0.0, kernel pass 2, K1, I2818): a
++//! binding the node's genesis record carries counts as the node's consent,
++//! as its cosignature does ([`owner_rows_with_genesis`]: presented with the
++//! node as the conferrer). The caller hands the carried bindings' row ids
++//! in; no persist reader produces them yet — the genesis payload rule (which
++//! member of the node's genesis record carries its first binding) is CC's
++//! and has not landed (`edition2::genesis` module docs) — so the doors call
++//! [`owner_rows`], which carries none (K1 notes).
+ 
+ use super::law::{seat_law, SEAT_OWNER};
+ use super::view::{micros, KRow, NoCut, RowId, SeatFields};
+@@ -79,7 +85,9 @@ pub enum Cosign {
+ }
+ 
+ /// The rows the owner seat of `node` is read from: one offer per binding the
+-/// reader's present admits, one withdrawal per winning retraction.
++/// reader's present admits, one withdrawal per winning retraction. No
++/// binding is carried by the node's genesis record
++/// ([`owner_rows_with_genesis`]).
+ #[must_use]
+ pub fn owner_rows(
+     node: &str,
+@@ -88,6 +96,34 @@ pub fn owner_rows(
+     now: chrono::DateTime<chrono::Utc>,
+     is_user: &dyn Fn(&str) -> bool,
+     cosign: Cosign,
++) -> Vec<KRow> {
++    owner_rows_with_genesis(
++        node,
++        rows,
++        retractions_about_node,
++        now,
++        is_user,
++        cosign,
++        &BTreeSet::new(),
++    )
++}
++
++/// v62.0.0 (kernel pass 2, K1, I2818) — [`owner_rows`], where
++/// `genesis_carried` holds the row ids of the owner bindings the node's
++/// genesis record carries. CC 3.2, *The first binding (MUST)*: "an
++/// owner-binding counts toward ownership only when the node's own key
++/// cosigned it, or the node's genesis record carries it": a carried binding
++/// is presented as conferred by the node (its signer the node, the owner's
++/// signature the acceptance), whether or not the node cosigned it.
++#[must_use]
++pub fn owner_rows_with_genesis(
++    node: &str,
++    rows: &[Attestation],
++    retractions_about_node: &[Attestation],
++    now: chrono::DateTime<chrono::Utc>,
++    is_user: &dyn Fn(&str) -> bool,
++    cosign: Cosign,
++    genesis_carried: &BTreeSet<RowId>,
+ ) -> Vec<KRow> {
+     // CC 3.2, the ownerless-lock reclaim: a third-party `withdraws` the door
+     // admitted only on a verified m-of-n reclaim quorum (rule 5) ends the
+@@ -128,7 +164,9 @@ pub fn owner_rows(
+     let mut out: Vec<KRow> = Vec::with_capacity(bindings.len());
+     for b in &bindings {
+         let voices = verified_voices(b);
+-        let node_cosigned = cosign == Cosign::Assumed || voices.contains(node);
++        let id = id_of[b.attestation_id.as_str()];
++        let node_cosigned =
++            cosign == Cosign::Assumed || voices.contains(node) || genesis_carried.contains(&id);
+         let signer = if node_cosigned {
+             node.to_owned()
+         } else {
+@@ -136,7 +174,7 @@ pub fn owner_rows(
+         };
+         let cosigners: Vec<String> = voices.into_iter().filter(|k| *k != signer).collect();
+         out.push(
+-            KRow::new(id_of[b.attestation_id.as_str()], Vec::new(), signer)
++            KRow::new(id, Vec::new(), signer)
+                 .at(micros(b.asserted_at))
+                 .with_seat(SeatFields {
+                     to: vec![b.attesting_key_id.clone()],
+@@ -236,11 +274,13 @@ pub fn owner_holders(rows: &[KRow], node: &str) -> Answer<BTreeSet<String>> {
+         .filter(|r| r.obj == obj)
+         .map(|r| r.offer)
+         .collect();
+-    Answer {
+-        value,
+-        rows: read,
+-        rule: "seat::Seats::holders/owner",
+-    }
++    // v62.0.0 (kernel pass 2, I2810) — the read set: the node's standing
++    // (the seats over its key) and every presented row's citers (a
++    // retraction naming a binding ends it)
++    let reads = std::iter::once(super::DepKey::Standing(node.to_owned()))
++        .chain(rows.iter().map(|r| super::DepKey::Refs(r.id)))
++        .collect();
++    Answer::reading(value, read, reads, "seat::Seats::holders/owner")
+ }
+ 
+ #[cfg(test)]
+@@ -395,6 +435,40 @@ mod tests {
+         );
+     }
+ 
++    /// **I2818** — CC 3.2, *The first binding*: a binding the node's genesis
++    /// record carries seats its owner without the node's cosignature; one it
++    /// does not carry still needs it.
++    #[test]
++    fn i2818_a_binding_the_genesis_record_carries_counts() {
++        let now = chrono::Utc::now();
++        let b = binding("b", "O", "N", false);
++        let other = binding("c", "P", "N", false);
++        let carried: BTreeSet<RowId> =
++            std::iter::once(RowId::of_hash(&b.persist_row_hash)).collect();
++        let view = owner_rows_with_genesis(
++            "N",
++            &[b.clone(), other.clone()],
++            &[],
++            now,
++            &|_| true,
++            Cosign::Required,
++            &carried,
++        );
++        let held = owner_holders(&view, "N");
++        assert_eq!(
++            held.value,
++            std::iter::once("O".to_owned()).collect::<BTreeSet<_>>(),
++            "I2818: the carried binding seats O; P's uncosigned one seats nobody"
++        );
++        assert!(
++            held.rows.contains(&RowId::of_hash(&b.persist_row_hash)),
++            "I2818: the answer rests on the carried binding"
++        );
++        // without the genesis record, neither counts
++        let bare = owner_rows("N", &[b, other], &[], now, &|_| true, Cosign::Required);
++        assert!(owner_holders(&bare, "N").value.is_empty(), "I2818");
++    }
++
+     /// CANARY for the adapter's own-withdrawal filter in [`owner_rows`]
+     /// (`.filter(|r| r.attesting_key_id != node)`, CC 3.2: a node cannot
+     /// outrun its owner). The kernel's `Conf::Own` seat ends on the
+diff --git a/src/kernel/trust.rs b/src/kernel/trust.rs
+index 9746c9ce..28a544e0 100644
+--- a/src/kernel/trust.rs
++++ b/src/kernel/trust.rs
+@@ -154,11 +154,18 @@ pub fn edge_leg(rows: &[KRow], user: &str, root: &str) -> Answer<bool> {
+             depth: 0,
+         });
+     }
+-    Answer {
+-        value: reaches(&edges, &user.to_owned(), &(), 1, &root.to_owned()),
+-        rows: live,
+-        rule: "trust::reaches/1",
+-    }
++    // v62.0.0 (kernel pass 2, I2810) — the read set: the user's standing
++    // (its edges toward the root) and every presented row's citers (a
++    // composer naming one can end it)
++    let reads = std::iter::once(super::DepKey::Standing(user.to_owned()))
++        .chain(rows.iter().map(|r| super::DepKey::Refs(r.id)))
++        .collect();
++    Answer::reading(
++        reaches(&edges, &user.to_owned(), &(), 1, &root.to_owned()),
++        live,
++        reads,
++        "trust::reaches/1",
++    )
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/store/edition_baseline.rs b/src/store/edition_baseline.rs
+index fd0a9046..0c6696a1 100644
+--- a/src/store/edition_baseline.rs
++++ b/src/store/edition_baseline.rs
+@@ -35,9 +35,15 @@ pub(crate) const EDITION_ONE_HEAD: i32 = 216;
+ /// - `store_edition_deletions` — the local-tier record of an earlier store's
+ ///   deletion ([`crate::store::edition_upgrade`]).
+ /// - `ceg_statements`, `ceg_row_names` — slice E2a's edition-2 statements.
++/// - `federation_group_tips` — kernel pass 2 (K1, I2812): a group version
++///   held as a tip beside the head (CC 2.7.8).
+ #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+-pub(crate) const EDITION_TWO_ADDITIONS: &[&str] =
+-    &["store_edition_deletions", "ceg_statements", "ceg_row_names"];
++pub(crate) const EDITION_TWO_ADDITIONS: &[&str] = &[
++    "store_edition_deletions",
++    "ceg_statements",
++    "ceg_row_names",
++    "federation_group_tips",
++];
+ 
+ /// The columns edition 2 adds to edition 1's `federation_keys`: the
+ /// projection of a verified edition-2 key:record (slice E2a) keeps every FK to
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index 4db4606b..6550e3c6 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -159,6 +159,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     ("check_supersede_cohort", Class::Gate),
+     ("decode_planned_head", Class::Gate),
+     ("store_planned_supersede", Class::Plumbing),
++    // v62.0.0 (kernel pass 2, K1) — the offered signed version encoded for a
++    // held tip's row: an encode failure, no question about the caller.
++    ("signed_json", Class::Plumbing),
+     // v61 (CIRISPersist#934, S4b) — the family doors.
+     ("put_family_planned", Class::Plan),
+     ("put_family_local_planned", Class::Plan),
+@@ -1124,11 +1127,15 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     ("route_occupied_family", Class::Gate),
+     // v49.0.0 (CIRISPersist#910.5) — inside every backend's supersede
+     // transaction: a proof over a version this node does not hold is refused
+-    // as stale. Gate.
+-    ("check_proof_names_prior", Class::Gate),
++    // as stale. v62.0.0 (kernel pass 2, K1): the proof must name the
++    // version's own prior (the held head for a successor, another for a tip);
++    // a proof contradicting its version is refused. Gate.
++    ("check_proof_names_versions_prior", Class::Gate),
+     // v53.0.0 (CC 3.2 T6) — inside every backend's supersede transaction: a
+     // version whose signed `prev_head_digest` is not the head this node holds
+-    // is refused. Gate.
++    // is refused. v62.0.0 (kernel pass 2, K1): held as a tip instead (CC
++    // 2.7.8); the call still decides which, and refuses nothing else today.
++    // Gate.
+     ("check_prev_head_names_held", Class::Gate),
+     // v39.0.0 — the whole crossing decision: custody verification, every
+     // inherited co-scrub, `check_promotion_admission`, and the nine
+diff --git a/src/store/postgres.rs b/src/store/postgres.rs
+index ecf6cf56..a536d8db 100644
+--- a/src/store/postgres.rs
++++ b/src/store/postgres.rs
+@@ -2983,11 +2983,24 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for PostgresB
+     async fn store_planned_supersede(
+         &self,
+         planned: crate::federation::group_supersede_admit::PlannedSupersede,
+-    ) -> Result<u32, crate::federation::Error> {
+-        use crate::federation::group_supersede_admit::{held_head_verdict, PlannedHead};
++    ) -> Result<crate::federation::group_supersede_admit::SupersedeWritten, crate::federation::Error>
++    {
++        use crate::federation::group_supersede_admit::{
++            held_head_verdict, HeadVerdict, PlannedHead, SupersedeWritten,
++        };
+         use crate::federation::Error;
+         let cohort_discriminator = planned.cohort_str;
+         let now = crate::host::clock::now();
++        // v62.0.0 (kernel pass 2, I2811) — the offered signed version, as a
++        // held tip stores it.
++        let tip_snapshot = planned.head.signed_json()?;
++        let tip_written = |version: i32| -> Result<SupersedeWritten, Error> {
++            Ok(SupersedeWritten {
++                version: u32::try_from(version)
++                    .map_err(|_| Error::Backend("supersede: negative version".into()))?,
++                verdict: HeadVerdict::Tip,
++            })
++        };
+         let mut client = self
+             .get_client()
+             .await
+@@ -3025,7 +3038,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for PostgresB
+                 };
+                 // v61 (CIRISPersist#934) — the shared verdict, on the row
+                 // read FOR UPDATE.
+-                held_head_verdict(
++                let verdict = held_head_verdict(
+                     &planned,
+                     prior.as_ref().map(|(_, f)| f.persist_row_hash.as_str()),
+                 )?;
+@@ -3034,6 +3047,31 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for PostgresB
+                         "supersede: the verdict admitted an unheld family".into(),
+                     ));
+                 };
++                // v62.0.0 (kernel pass 2, I2811) — a tip is held beside the
++                // head; the live row (locked FOR UPDATE) is not touched.
++                if verdict == HeadVerdict::Tip {
++                    tx.execute(
++                        "INSERT INTO cirislens.federation_group_tips \
++                            (cohort, group_key_id, persist_row_hash, prev_head_digest, \
++                             snapshot, change_authorization, held_at) \
++                         VALUES ('family', $1, $2, $3, $4, $5, $6) \
++                         ON CONFLICT (cohort, group_key_id, persist_row_hash) DO NOTHING",
++                        &[
++                            &new_fam.family_key_id,
++                            &new_fam.persist_row_hash,
++                            &new_fam.prev_head_digest,
++                            &tip_snapshot,
++                            &planned.authorization,
++                            &now,
++                        ],
++                    )
++                    .await
++                    .map_err(|e| Error::Backend(format!("insert group tip: {e}")))?;
++                    tx.commit()
++                        .await
++                        .map_err(|e| Error::Backend(format!("commit: {e}")))?;
++                    return tip_written(prior_version);
++                }
+                 let snapshot = serde_json::to_value(&prior_fam)
+                     .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
+                 tx.execute(
+@@ -3091,6 +3129,15 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for PostgresB
+                 )
+                 .await
+                 .map_err(|e| Error::Backend(format!("update family: {e}")))?;
++                // v62.0.0 (kernel pass 2, I2811) — the new head is no longer
++                // a tip.
++                tx.execute(
++                    "DELETE FROM cirislens.federation_group_tips \
++                     WHERE cohort = 'family' AND group_key_id = $1 AND persist_row_hash = $2",
++                    &[&new_fam.family_key_id, &new_fam.persist_row_hash],
++                )
++                .await
++                .map_err(|e| Error::Backend(format!("delete group tip: {e}")))?;
+                 tx.commit()
+                     .await
+                     .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+@@ -3129,7 +3176,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for PostgresB
+                     None => None,
+                 };
+                 // v61 (CIRISPersist#934) — the shared verdict.
+-                held_head_verdict(
++                let verdict = held_head_verdict(
+                     &planned,
+                     prior.as_ref().map(|(_, c)| c.persist_row_hash.as_str()),
+                 )?;
+@@ -3138,6 +3185,31 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for PostgresB
+                         "supersede: the verdict admitted an unheld community".into(),
+                     ));
+                 };
++                // v62.0.0 (kernel pass 2, I2811) — see the family arm.
++                if verdict == HeadVerdict::Tip {
++                    tx.execute(
++                        "INSERT INTO cirislens.federation_group_tips \
++                            (cohort, group_key_id, persist_row_hash, prev_head_digest, \
++                             snapshot, change_authorization, held_at) \
++                         VALUES ($7, $1, $2, $3, $4, $5, $6) \
++                         ON CONFLICT (cohort, group_key_id, persist_row_hash) DO NOTHING",
++                        &[
++                            &new_comm.community_key_id,
++                            &new_comm.persist_row_hash,
++                            &new_comm.prev_head_digest,
++                            &tip_snapshot,
++                            &planned.authorization,
++                            &now,
++                            &cohort_discriminator,
++                        ],
++                    )
++                    .await
++                    .map_err(|e| Error::Backend(format!("insert group tip: {e}")))?;
++                    tx.commit()
++                        .await
++                        .map_err(|e| Error::Backend(format!("commit: {e}")))?;
++                    return tip_written(prior_version);
++                }
+                 let snapshot = serde_json::to_value(&prior_comm)
+                     .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
+                 tx.execute(
+@@ -3195,13 +3267,29 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for PostgresB
+                 )
+                 .await
+                 .map_err(|e| Error::Backend(format!("update community: {e}")))?;
++                // v62.0.0 (kernel pass 2, I2811) — see the family arm.
++                tx.execute(
++                    "DELETE FROM cirislens.federation_group_tips \
++                     WHERE cohort = $1 AND group_key_id = $2 AND persist_row_hash = $3",
++                    &[
++                        &cohort_discriminator,
++                        &new_comm.community_key_id,
++                        &new_comm.persist_row_hash,
++                    ],
++                )
++                .await
++                .map_err(|e| Error::Backend(format!("delete group tip: {e}")))?;
+                 tx.commit()
+                     .await
+                     .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+                 next
+             }
+         };
+-        u32::try_from(next).map_err(|_| Error::Backend("supersede: negative version".into()))
++        Ok(SupersedeWritten {
++            version: u32::try_from(next)
++                .map_err(|_| Error::Backend("supersede: negative version".into()))?,
++            verdict: HeadVerdict::Extends,
++        })
+     }
+ }
+ 
+@@ -11894,6 +11982,50 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+         Ok(out)
+     }
+ 
++    /// v62.0.0 (kernel pass 2, K1, I2812) — the versions held as tips.
++    async fn list_group_tips(
++        &self,
++        cohort: crate::federation::cohort::Cohort,
++        group_key_id: &str,
++    ) -> Result<Vec<crate::federation::cohort::GroupTip>, crate::federation::Error> {
++        use crate::federation::cohort::{Cohort, GroupTip};
++        use crate::federation::Error;
++        if cohort == Cohort::SelfId {
++            return Err(Error::InvalidArgument(
++                "list_group_tips: the `self` cohort is not versioned".to_string(),
++            ));
++        }
++        let cohort_str = cohort.as_str();
++        let client = self
++            .get_client()
++            .await
++            .map_err(crate::store::Error::into_federation)?;
++        let rows = client
++            .query(
++                "SELECT persist_row_hash, prev_head_digest, snapshot, change_authorization, \
++                        held_at \
++                 FROM cirislens.federation_group_tips \
++                 WHERE cohort = $1 AND group_key_id = $2 \
++                 ORDER BY held_at ASC, persist_row_hash ASC",
++                &[&cohort_str, &group_key_id],
++            )
++            .await
++            .map_err(|e| Error::Backend(format!("list_group_tips: {e}")))?;
++        let mut out = Vec::with_capacity(rows.len());
++        for r in rows {
++            out.push(GroupTip {
++                cohort: cohort_str.to_owned(),
++                group_key_id: group_key_id.to_owned(),
++                persist_row_hash: r.safe_get_with("persist_row_hash", Error::Backend)?,
++                prev_head_digest: r.safe_get_with("prev_head_digest", Error::Backend)?,
++                snapshot: r.safe_get_with("snapshot", Error::Backend)?,
++                change_authorization: r.safe_get_with("change_authorization", Error::Backend)?,
++                held_at: r.safe_get_with("held_at", Error::Backend)?,
++            });
++        }
++        Ok(out)
++    }
++
+     async fn lookup_family(
+         &self,
+         family_key_id: &str,
+diff --git a/src/store/sqlite.rs b/src/store/sqlite.rs
+index ae68f51a..a19fcabc 100644
+--- a/src/store/sqlite.rs
++++ b/src/store/sqlite.rs
+@@ -5366,6 +5366,64 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+         .map_err(|e| Error::Backend(format!("list_group_versions: {e}")))
+     }
+ 
++    /// v62.0.0 (kernel pass 2, K1, I2812) — the versions held as tips.
++    async fn list_group_tips(
++        &self,
++        cohort: crate::federation::cohort::Cohort,
++        group_key_id: &str,
++    ) -> Result<Vec<crate::federation::cohort::GroupTip>, crate::federation::Error> {
++        use crate::federation::cohort::{Cohort, GroupTip};
++        use crate::federation::Error;
++        if cohort == Cohort::SelfId {
++            return Err(Error::InvalidArgument(
++                "list_group_tips: the `self` cohort is not versioned".to_string(),
++            ));
++        }
++        let cs = cohort.as_str().to_owned();
++        let key = group_key_id.to_owned();
++        self.read(move |conn| -> Result<Vec<GroupTip>, rusqlite::Error> {
++            let mut stmt = conn.prepare(
++                "SELECT persist_row_hash, prev_head_digest, snapshot, change_authorization, \
++                        held_at \
++                 FROM federation_group_tips \
++                 WHERE cohort = ?1 AND group_key_id = ?2 \
++                 ORDER BY held_at ASC, persist_row_hash ASC",
++            )?;
++            let rows = stmt.query_map(rusqlite::params![cs, key], |r| {
++                let persist_row_hash: String = r.get("persist_row_hash")?;
++                let prev_head_digest: String = r.get("prev_head_digest")?;
++                let snapshot_text: String = r.get("snapshot")?;
++                let auth_text: Option<String> = r.get("change_authorization")?;
++                let held_at: String = r.get("held_at")?;
++                Ok((
++                    persist_row_hash,
++                    prev_head_digest,
++                    snapshot_text,
++                    auth_text,
++                    held_at,
++                ))
++            })?;
++            let mut out = Vec::new();
++            for row in rows {
++                let (persist_row_hash, prev_head_digest, snapshot_text, auth_text, held_at) = row?;
++                out.push(GroupTip {
++                    cohort: cs.clone(),
++                    group_key_id: key.clone(),
++                    persist_row_hash,
++                    prev_head_digest,
++                    snapshot: serde_json::from_str(&snapshot_text)
++                        .unwrap_or(serde_json::Value::Null),
++                    change_authorization: auth_text
++                        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()),
++                    held_at: parse_rfc3339(&held_at),
++                });
++            }
++            Ok(out)
++        })
++        .await
++        .map_err(|e| Error::Backend(format!("list_group_tips: {e}")))
++    }
++
+     async fn lookup_family(
+         &self,
+         family_key_id: &str,
+@@ -26027,10 +26085,17 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
+     async fn store_planned_supersede(
+         &self,
+         planned: crate::federation::group_supersede_admit::PlannedSupersede,
+-    ) -> Result<u32, crate::federation::Error> {
+-        use crate::federation::group_supersede_admit::{held_head_verdict, PlannedHead};
++    ) -> Result<crate::federation::group_supersede_admit::SupersedeWritten, crate::federation::Error>
++    {
++        use crate::federation::group_supersede_admit::{
++            held_head_verdict, HeadVerdict, PlannedHead, SupersedeWritten,
++        };
+         use crate::federation::Error;
+         let now = crate::host::clock::now().to_rfc3339();
++        // v62.0.0 (kernel pass 2, I2811) — the offered signed version, as a
++        // held tip stores it.
++        let tip_json = serde_json::to_string(&planned.head.signed_json()?)
++            .map_err(|e| Error::Backend(format!("tip snapshot encode: {e}")))?;
+         let cohort_str = planned.cohort_str;
+         let auth_json = match &planned.authorization {
+             Some(v) => Some(
+@@ -26063,7 +26128,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
+                     .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+                 let members_json = serde_json::to_string(&new_fam.members)
+                     .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+-                self.write(move |conn| -> Result<u32, rusqlite::Error> {
++                self.write(move |conn| -> Result<(u32, HeadVerdict), rusqlite::Error> {
+                     let tx = write_tx(conn)?;
+                     let prior = tx
+                         .query_row(
+@@ -26077,7 +26142,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
+                         .optional()?;
+                     // v61 (CIRISPersist#934) — the shared verdict, on the
+                     // row this transaction replaces.
+-                    held_head_verdict(
++                    let verdict = held_head_verdict(
+                         &planned,
+                         prior.as_ref().map(|(_, f)| f.persist_row_hash.as_str()),
+                     )
+@@ -26085,6 +26150,27 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
+                     let Some((prior_version, prior_fam)) = prior else {
+                         return Err(rusqlite::Error::QueryReturnedNoRows);
+                     };
++                    // v62.0.0 (kernel pass 2, I2811) — a tip is held beside
++                    // the head; the live row is not touched.
++                    if verdict == HeadVerdict::Tip {
++                        tx.execute(
++                            "INSERT INTO federation_group_tips \
++                                (cohort, group_key_id, persist_row_hash, prev_head_digest, \
++                                 snapshot, change_authorization, held_at) \
++                             VALUES ('family', ?1, ?2, ?3, ?4, ?5, ?6) \
++                             ON CONFLICT (cohort, group_key_id, persist_row_hash) DO NOTHING",
++                            rusqlite::params![
++                                new_fam.family_key_id,
++                                new_fam.persist_row_hash,
++                                new_fam.prev_head_digest,
++                                tip_json,
++                                auth_json,
++                                now,
++                            ],
++                        )?;
++                        tx.commit()?;
++                        return Ok((prior_version, HeadVerdict::Tip));
++                    }
+                     let snapshot = serde_json::to_string(&prior_fam)
+                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                     tx.execute(
+@@ -26140,8 +26226,15 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
+                             new_fam.charter_digest,
+                         ],
+                     )?;
++                    // v62.0.0 (kernel pass 2, I2811) — the new head is no
++                    // longer a tip.
++                    tx.execute(
++                        "DELETE FROM federation_group_tips \
++                         WHERE cohort = 'family' AND group_key_id = ?1 AND persist_row_hash = ?2",
++                        rusqlite::params![new_fam.family_key_id, new_fam.persist_row_hash],
++                    )?;
+                     tx.commit()?;
+-                    Ok(next)
++                    Ok((next, HeadVerdict::Extends))
+                 })
+                 .await
+             }
+@@ -26171,7 +26264,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
+                     ),
+                     None => None,
+                 };
+-                self.write(move |conn| -> Result<u32, rusqlite::Error> {
++                self.write(move |conn| -> Result<(u32, HeadVerdict), rusqlite::Error> {
+                     let tx = write_tx(conn)?;
+                     let prior = tx
+                         .query_row(
+@@ -26183,7 +26276,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
+                         )
+                         .optional()?;
+                     // v61 (CIRISPersist#934) — the shared verdict.
+-                    held_head_verdict(
++                    let verdict = held_head_verdict(
+                         &planned,
+                         prior.as_ref().map(|(_, c)| c.persist_row_hash.as_str()),
+                     )
+@@ -26191,6 +26284,27 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
+                     let Some((prior_version, prior_comm)) = prior else {
+                         return Err(rusqlite::Error::QueryReturnedNoRows);
+                     };
++                    // v62.0.0 (kernel pass 2, I2811) — see the family arm.
++                    if verdict == HeadVerdict::Tip {
++                        tx.execute(
++                            "INSERT INTO federation_group_tips \
++                                (cohort, group_key_id, persist_row_hash, prev_head_digest, \
++                                 snapshot, change_authorization, held_at) \
++                             VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6) \
++                             ON CONFLICT (cohort, group_key_id, persist_row_hash) DO NOTHING",
++                            rusqlite::params![
++                                new_comm.community_key_id,
++                                new_comm.persist_row_hash,
++                                new_comm.prev_head_digest,
++                                tip_json,
++                                auth_json,
++                                now,
++                                cohort_str,
++                            ],
++                        )?;
++                        tx.commit()?;
++                        return Ok((prior_version, HeadVerdict::Tip));
++                    }
+                     let snapshot = serde_json::to_string(&prior_comm)
+                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                     tx.execute(
+@@ -26243,19 +26357,31 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
+                             new_comm.charter_digest,
+                         ],
+                     )?;
++                    // v62.0.0 (kernel pass 2, I2811) — see the family arm.
++                    tx.execute(
++                        "DELETE FROM federation_group_tips \
++                         WHERE cohort = ?1 AND group_key_id = ?2 AND persist_row_hash = ?3",
++                        rusqlite::params![
++                            cohort_str,
++                            new_comm.community_key_id,
++                            new_comm.persist_row_hash
++                        ],
++                    )?;
+                     tx.commit()?;
+-                    Ok(next)
++                    Ok((next, HeadVerdict::Extends))
+                 })
+                 .await
+             }
+         };
+-        written.map_err(|e| {
+-            if let Some(r) = refused.lock().expect("verdict slot").take() {
+-                r
+-            } else {
+-                Error::Backend(format!("supersede {cohort_str}: {e}"))
+-            }
+-        })
++        written
++            .map(|(version, verdict)| SupersedeWritten { version, verdict })
++            .map_err(|e| {
++                if let Some(r) = refused.lock().expect("verdict slot").take() {
++                    r
++                } else {
++                    Error::Backend(format!("supersede {cohort_str}: {e}"))
++                }
++            })
+     }
+ }
+ 

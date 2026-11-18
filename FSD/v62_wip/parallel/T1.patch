@@ -1,0 +1,3767 @@
+diff --git a/src/federation/cosign.rs b/src/federation/cosign.rs
+index 30a7822a..e6544fc7 100644
+--- a/src/federation/cosign.rs
++++ b/src/federation/cosign.rs
+@@ -988,6 +988,14 @@ where
+ {
+     match short {
+         None => Ok(signed),
++        // v62.0.0 (wave T1) — an edition-2 group statement's typed record is
++        // never held as an earlier-form object: its voices are kept in
++        // `ceg_statements`, and the edition-2 door reads the shortfall
++        // (`edition2::group`).
++        Some(shortfall) if super::edition2::group::vouched() => {
++            super::edition2::group::note_short();
++            Err(shortfall)
++        }
+         Some(shortfall) => Err(hold(dir, signed, shortfall).await),
+     }
+ }
+diff --git a/src/federation/directory_double.rs b/src/federation/directory_double.rs
+index f3b0c6f3..75a657c7 100644
+--- a/src/federation/directory_double.rs
++++ b/src/federation/directory_double.rs
+@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
+     }
+ }
+ 
+-// 141 delegations, generated. Every one: fault first, then delegate.
++// 142 delegations, generated. Every one: fault first, then delegate.
+ #[async_trait::async_trait]
+ impl FederationDirectory for FaultInjectingDirectory {
+     async fn adopt_genesis_reanchor(
+@@ -271,6 +271,19 @@ impl FederationDirectory for FaultInjectingDirectory {
+         }
+         self.inner.drop_cosign_rows(quorum_key).await
+     }
++    async fn drop_group_tips(
++        &self,
++        cohort: cohort::Cohort,
++        group_key_id: &str,
++        persist_row_hashes: &[String],
++    ) -> Result<(), Error> {
++        if let Some(e) = self.faulted("drop_group_tips") {
++            return Err(e);
++        }
++        self.inner
++            .drop_group_tips(cohort, group_key_id, persist_row_hashes)
++            .await
++    }
+     async fn enter_mesh(
+         &self,
+         attestation_id: &str,
+diff --git a/src/federation/edition2/door.rs b/src/federation/edition2/door.rs
+index ee8e32bf..de6dd4b7 100644
+--- a/src/federation/edition2/door.rs
++++ b/src/federation/edition2/door.rs
+@@ -446,7 +446,10 @@ pub(crate) async fn with_earlier_form_doors_shut<T>(
+ /// # Errors
+ /// [`token::EARLIER_FORM_OBJECT`] once the doors are shut.
+ pub fn refuse_earlier_form(plane: &'static str) -> Result<(), Error> {
+-    if earlier_form_doors_shut() {
++    // v62.0.0 (wave T1) — a group statement's typed record running the typed
++    // door under the edition-2 door's vouch is no earlier-form object: its
++    // proof is its statements (`edition2::group`).
++    if earlier_form_doors_shut() && !super::group::vouched() {
+         return Err(Error::malformed_row(
+             plane,
+             token::EARLIER_FORM_OBJECT,
+diff --git a/src/federation/edition2/group.rs b/src/federation/edition2/group.rs
+new file mode 100644
+index 00000000..0b0f4723
+--- /dev/null
++++ b/src/federation/edition2/group.rs
+@@ -0,0 +1,1707 @@
++//! v62.0.0 (wave T1; CC 3.1.3, CC 3.1.3.2, CC 3.2 T6, CC 2.6.1.9, CC 2.7.8)
++//! — **the group planes at the edition-2 door: one rule set, two codecs.**
++//!
++//! A `group:roster` statement (a family's or community's record at a
++//! version) and a counted `membership:{stage}` statement (stages `widening`
++//! and `removal`) land in persist's typed group tables:
++//!
++//! | family | lands in |
++//! |---|---|
++//! | `group:roster`, version 1 | `federation_families` / `federation_communities` |
++//! | `group:roster`, a later version (`refs.head`) | the same row, the prior snapshotted into `federation_group_versions`; a fork held in `federation_group_tips` (K1) |
++//! | `membership:{stage}`, `removal` | `federation_{family,community}_membership_revocations` |
++//! | `membership:{stage}`, `widening` | `federation_{family,community}_membership_widenings` |
++//!
++//! # One rule set
++//!
++//! The statement is mapped onto the typed record it replaces
++//! ([`record_of_roster`], [`membership_of`]): every payload member one to
++//! one (`docs/EDITION2_PAYLOADS.md`). The typed record then goes through
++//! the SAME door the JSON form runs (`put_family`, `put_community`,
++//! `put_{family,community}_membership_{revocation,widening}`): authorship,
++//! the founding rule (#955), the occupied-id route and the supersede proof
++//! (#910.5, K1's tips), the roster authority at the group's
++//! `consensus_protocol` (#908), the member's acceptance of a growth, the
++//! trust-root, geographic, infrastructure and steward gates. No gate is
++//! copied here.
++//!
++//! What the earlier form carried as signatures is now the row's voices
++//! (CC 2.6.1.9): every held statement over the same payload, one per signer.
++//! Each voice was verified by the edition-2 door when it arrived. The door's
++//! signature checks read a **vouch** instead of a JSON scrub: while
++//! [`put_group_statement`] runs the typed door, a task-local [`Vouch`] names
++//! the one signing envelope the record maps to and, for each voice, its
++//! signer and a marker (the voice's composite signature). The earlier-form
++//! verifier admits exactly those signer/marker pairs over exactly that
++//! envelope (`tier_ingest::verify_envelope_hybrid_signature`), and the
++//! supersede quorum counts exactly those signers over exactly the change
++//! envelope built here (`FederationDirectory::verify_membership_quorum`).
++//! Nothing else is vouched: a held row's own signature, read by any gate in
++//! the same task, is verified as before.
++//!
++//! # Counted
++//!
++//! A row is counted at its group's protocol. Every voice is kept in
++//! `ceg_statements` once the door has judged the row with it:
++//! - **met**: the typed record lands ([`StatementOutcome::Row`]);
++//! - **short** ([`StatementOutcome::Pending`]): the voices so far do not meet
++//!   the protocol (the roster authority's shortfall, the supersede quorum's
++//!   `Insufficient`, both noted structurally by the door that found them), or
++//!   a founding roster some listed member has not signed yet
++//!   (`membership_founding_member_unsigned`). The voice is kept; a later
++//!   voice re-runs the door over all of them;
++//! - **refused**: any other refusal, and the voice is NOT kept.
++//!
++//! # A later version
++//!
++//! A roster version names the version it extends by `refs.head` (CC ruling;
++//! P1's payload table). The earlier form's `prev_head_digest` is the
++//! predecessor's typed `persist_row_hash`, which is a pure function of the
++//! predecessor's own statement, so it is re-derived from the held chain
++//! ([`prev_head_digest`]). A predecessor that is not held waits (the
++//! retryable `federation_withdraws_target_unheld`, the ordering gap of a row
++//! naming a row). The supersede proof's change envelope is the one
++//! `build_membership_change_envelope` gives for the record from this node's
++//! held state, and its signatures are the voices.
++
++use std::collections::{BTreeMap, BTreeSet};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++
++use ciris_verify_core::cde::{self, Value};
++use ciris_verify_core::namespace_match;
++use sha2::Digest as _;
++
++use super::door::AdmittedRow;
++use super::ingest::{json_of, StatementOutcome};
++use super::liveness::statement_parts;
++use super::names::{names_of, single, Name, RowId};
++use crate::federation::cohort::Cohort;
++use crate::federation::group_plane::GroupKind;
++use crate::federation::types::{
++    Community, CommunityMember, CommunityMembershipRevocation, CommunityMembershipWidening, Family,
++    FamilyMember, FamilyMembershipRevocation, FamilyMembershipWidening, GroupSupersedeProof,
++    RosterCosignature, SignedCommunity, SignedCommunityMembershipRevocation,
++    SignedCommunityMembershipWidening, SignedFamily, SignedFamilyMembershipRevocation,
++    SignedFamilyMembershipWidening,
++};
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++/// The plane name this module's refusals carry.
++pub const PLANE: &str = "edition2_group";
++
++/// The roster family (header -70002), a family with no parameter.
++pub const GROUP_ROSTER_PREFIX: &str = "group:roster";
++/// The membership family's registry prefix; its header id is
++/// `namespace_match::family_id` of it (`membership:.stage`).
++pub const MEMBERSHIP_PREFIX: &str = "membership:{stage}";
++/// The membership leaf a widening is.
++pub const WIDENING_LEAF: &str = "widening";
++/// The membership leaf a removal is.
++pub const REMOVAL_LEAF: &str = "removal";
++/// The `refs` role a later roster version names the version it extends by,
++/// and the one a membership change names the roster it is counted over by.
++pub const HEAD_ROLE: &str = "head";
++/// v62.0.0 (wave T1; CC 2.6.1.9) — the `refs` role a merge names its further
++/// tips by, beside `refs.head` (a set).
++pub const FURTHER_HEADS_ROLE: &str = "further_heads";
++/// The `refs.also` roles the charter in force may ride under: `cites` (CC's
++/// closed registry, P1) and `charter` (the base table's spelling).
++pub const CHARTER_ROLES: [&str; 2] = ["also:cites", "also:charter"];
++/// How many predecessor versions [`prev_head_digest`] follows.
++pub const MAX_ROSTER_CHAIN: usize = 4096;
++
++/// Which group plane an edition-2 row is.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum GroupPlane {
++    /// `group:roster`: a family's or community's record at a version.
++    Roster,
++    /// `membership:{stage}`, leaf `widening`: a member added.
++    Widening,
++    /// `membership:{stage}`, leaf `removal`: a member removed.
++    Removal,
++}
++
++/// **Is this row a group plane's?** `group:roster`, or `membership:{stage}`
++/// at a counted leaf (`widening`, `removal`; Verify's matcher binds the
++/// leaf from `dimension`). A composer (`withdraws`, `recants`,
++/// `supersedes`) carries its target's family but is not the target's plane:
++/// `None`. Every other membership stage (`proposal`, `acceptance`, ...) is
++/// an authored row of the attestation plane: `None`.
++#[must_use]
++pub fn group_plane_of(row_type: &str, family: &str, payload: &Value) -> Option<GroupPlane> {
++    if super::ingest::COMPOSER_ROW_TYPES.contains(&row_type) {
++        return None;
++    }
++    if family == namespace_match::family_id(GROUP_ROSTER_PREFIX) {
++        return Some(GroupPlane::Roster);
++    }
++    if family != namespace_match::family_id(MEMBERSHIP_PREFIX) {
++        return None;
++    }
++    let dimension = payload.get_text("dimension").and_then(Value::as_text)?;
++    let prefix = namespace_match::prefix_of_family_id(family)?;
++    let leaf = namespace_match::bind_leaf(prefix, dimension).ok()?.leaf;
++    match leaf.as_str() {
++        WIDENING_LEAF => Some(GroupPlane::Widening),
++        REMOVAL_LEAF => Some(GroupPlane::Removal),
++        _ => None,
++    }
++}
++
++/// The payload table (`edition2::payloads::FAMILIES`) a header family id is
++/// the family of: the template whose `namespace_match::family_id` is it.
++#[must_use]
++pub fn payload_family_of(header_family: &str) -> Option<&'static str> {
++    super::payloads::FAMILIES
++        .iter()
++        .map(|f| f.family)
++        .find(|f| namespace_match::family_id(f) == header_family)
++}
++
++fn invalid(message: impl Into<String>) -> Error {
++    Error::malformed_row(PLANE, malformed_row::EDITION2_PAYLOAD_INVALID, message)
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The vouch
++// ─────────────────────────────────────────────────────────────────────────
++
++/// **What the edition-2 door vouches for** while a group statement's typed
++/// record runs the typed door: the one signing envelope, each voice's signer
++/// and marker, and the one change envelope a supersede quorum counts over.
++#[derive(Debug)]
++pub(crate) struct Vouch {
++    /// SHA-256 (hex) of the record's canonical signing envelope.
++    envelope_hash: String,
++    /// Each voice's signer (identity-ref) → its marker (the composite
++    /// signature, base64), the value placed in the record's signature
++    /// columns.
++    voices: BTreeMap<String, String>,
++    /// The supersede proof's change envelope, for a later version.
++    change_envelope: Option<serde_json::Value>,
++    /// Set by the door that found the voices short of the protocol.
++    short: AtomicBool,
++}
++
++tokio::task_local! {
++    static VOUCH: Arc<Vouch>;
++}
++
++/// Is a group statement's typed record running the typed door in this task?
++/// The earlier-form refusal passes it (`door::refuse_earlier_form`), the
++/// cosign hold returns its shortfall instead of holding an earlier-form
++/// object (`cosign::hold_if_short`), and no earlier-form group-plane row is
++/// minted for it (`group_plane::sync_group_row_offered`).
++#[must_use]
++pub(crate) fn vouched() -> bool {
++    VOUCH.try_with(|_| ()).is_ok()
++}
++
++/// **The earlier-form verifier's vouch**: `key_id` signed the envelope whose
++/// canonical SHA-256 is `envelope_hash`, with `classical` as its signature
++/// column, exactly when the vouch in scope names that envelope and that
++/// signer with that marker. `false` outside a vouch.
++#[must_use]
++pub(crate) fn vouched_signature(key_id: &str, envelope_hash: &str, classical: &str) -> bool {
++    VOUCH
++        .try_with(|v| {
++            v.envelope_hash == envelope_hash && v.voices.get(key_id).is_some_and(|m| m == classical)
++        })
++        .unwrap_or(false)
++}
++
++/// **The supersede quorum's vouch**: the voices' signers, when the vouch in
++/// scope names exactly `change_envelope`. `None` otherwise (the quorum's
++/// signatures are verified as before).
++#[must_use]
++pub(crate) fn vouched_quorum_signers(
++    change_envelope: &serde_json::Value,
++) -> Option<BTreeSet<String>> {
++    VOUCH
++        .try_with(|v| {
++            (v.change_envelope.as_ref() == Some(change_envelope))
++                .then(|| v.voices.keys().cloned().collect())
++        })
++        .ok()
++        .flatten()
++}
++
++/// The door that found the vouched voices short of the protocol notes it
++/// here (structurally, before it returns the shortfall). A no-op outside a
++/// vouch.
++pub(crate) fn note_short() {
++    let _ = VOUCH.try_with(|v| v.short.store(true, Ordering::SeqCst));
++}
++
++/// SHA-256 (hex) of an envelope's canonical image, as the earlier-form
++/// verifier computes it.
++fn envelope_hash(envelope: &serde_json::Value) -> Result<String, Error> {
++    let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope).map_err(|e| {
++        Error::InvalidArgument(format!("edition-2 group envelope canonicalize: {e}"))
++    })?;
++    Ok(hex::encode(sha2::Sha256::digest(&canonical)))
++}
++
++/// What the typed door did under a vouch.
++enum Landing {
++    /// The record landed (or was already held, or was held as a tip).
++    Landed,
++    /// The voices are short of the protocol; the door's refusal is kept for
++    /// the log.
++    Short(Error),
++}
++
++/// Run `door` with `vouch` in scope and read what it decided.
++async fn run_vouched<Fut>(vouch: Vouch, door: Fut) -> Result<Landing, Error>
++where
++    Fut: std::future::Future<Output = Result<(), Error>> + Send,
++{
++    let vouch = Arc::new(vouch);
++    let out = VOUCH.scope(vouch.clone(), door).await;
++    match out {
++        Ok(()) => Ok(Landing::Landed),
++        Err(e) if vouch.short.load(Ordering::SeqCst) => Ok(Landing::Short(e)),
++        Err(e) if is_founding_unsigned(&e) => Ok(Landing::Short(e)),
++        Err(e) => Err(e),
++    }
++}
++
++/// v52.0.0 (#955) — a founding roster admits only the members who signed it:
++/// in edition 2 each signature is its own statement, so a founding some
++/// listed member has not voiced yet is counted short, never refused.
++/// Detected by the typed rule, not by text.
++fn is_founding_unsigned(e: &Error) -> bool {
++    matches!(
++        e,
++        Error::MembershipAcceptanceRefused { rule, .. }
++            if *rule == crate::federation::membership_acceptance::RULE_FOUNDING_MEMBER_UNSIGNED
++    )
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  Voices
++// ─────────────────────────────────────────────────────────────────────────
++
++/// A statement's composite signature (its fourth member), standard base64:
++/// the marker a voice's signer is vouched with, and the value the typed
++/// record's signature columns hold.
++fn composite_signature_b64(statement: &[u8]) -> String {
++    use base64::Engine as _;
++    let sig = match cde::decode(statement) {
++        Ok(Value::Tag(18, inner)) => inner
++            .as_array()
++            .and_then(|a| a.get(3))
++            .and_then(Value::as_bytes)
++            .map(<[u8]>::to_vec)
++            .unwrap_or_default(),
++        _ => Vec::new(),
++    };
++    base64::engine::general_purpose::STANDARD.encode(sig)
++}
++
++/// A statement's CWT `iss` (protected header label 15, claim 1).
++fn statement_iss(statement: &[u8]) -> Option<String> {
++    let (protected, _) = statement_parts(statement)?;
++    protected
++        .get_int(15)?
++        .get_int(1)?
++        .as_text()
++        .map(str::to_owned)
++}
++
++/// The row's voices: each held statement over its payload, and the one now
++/// offered, one per signer (the first held voice of a signer is its voice).
++async fn voices_of<F>(dir: &F, row: &AdmittedRow) -> Result<BTreeMap<String, String>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let mut voices = BTreeMap::new();
++    for st in dir.edition2_voices(&row.row_id).await? {
++        if let Some(iss) = statement_iss(&st) {
++            voices
++                .entry(iss)
++                .or_insert_with(|| composite_signature_b64(&st));
++        }
++    }
++    voices
++        .entry(row.iss.clone())
++        .or_insert_with(|| composite_signature_b64(&row.bytes));
++    Ok(voices)
++}
++
++/// The record's signature columns from its voices: the primary is the
++/// group key's own voice where it spoke (CC: "the group key's own
++/// statement"), else the first signer in order; every other voice is a
++/// co-signature. Deterministic in the set of voices, so every node that
++/// holds the same voices judges the same record.
++fn signature_columns(
++    voices: &BTreeMap<String, String>,
++    group: &str,
++) -> (String, String, Vec<RosterCosignature>) {
++    let primary = if voices.contains_key(group) {
++        group.to_owned()
++    } else {
++        voices.keys().next().cloned().unwrap_or_default()
++    };
++    let marker = voices.get(&primary).cloned().unwrap_or_default();
++    let cosignatures = voices
++        .iter()
++        .filter(|(k, _)| **k != primary)
++        .map(|(k, m)| RosterCosignature {
++            authority_key_id: k.clone(),
++            scrub_signature_classical: m.clone(),
++            scrub_signature_pqc: Some(m.clone()),
++        })
++        .collect();
++    (primary, marker, cosignatures)
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The payload readers (statement → typed record)
++// ─────────────────────────────────────────────────────────────────────────
++
++fn ms_instant(member: &str, ms: u64) -> Result<chrono::DateTime<chrono::Utc>, Error> {
++    i64::try_from(ms)
++        .ok()
++        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
++        .ok_or_else(|| invalid(format!("`{member}` is out of range")))
++}
++
++fn text_of<'a>(p: &'a Value, member: &str) -> Option<&'a str> {
++    p.get_text(member).and_then(Value::as_text)
++}
++
++fn req_text<'a>(p: &'a Value, member: &str) -> Result<&'a str, Error> {
++    text_of(p, member).ok_or_else(|| invalid(format!("`{member}` is required text")))
++}
++
++fn opt_ms(p: &Value, member: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error> {
++    match p.get_text(member) {
++        None => Ok(None),
++        Some(v) => v
++            .as_u64()
++            .ok_or_else(|| invalid(format!("`{member}` is not uint (ms)")))
++            .and_then(|ms| ms_instant(member, ms))
++            .map(Some),
++    }
++}
++
++fn req_ms(p: &Value, member: &str) -> Result<chrono::DateTime<chrono::Utc>, Error> {
++    opt_ms(p, member)?.ok_or_else(|| invalid(format!("`{member}` is required (uint, ms)")))
++}
++
++fn group_kind_of(p: &Value) -> Result<GroupKind, Error> {
++    match req_text(p, "group_kind")? {
++        "family" => Ok(GroupKind::Family),
++        "community" => Ok(GroupKind::Community),
++        other => Err(invalid(format!(
++            "`group_kind` {other:?} is neither \"family\" nor \"community\""
++        ))),
++    }
++}
++
++/// `reason`: a code of the closed registry (P1: uint) or the base table's
++/// text, else `body.note` (P1's free text).
++fn reason_of(p: &Value) -> Option<String> {
++    match p.get_text("reason") {
++        Some(Value::Uint(n)) => Some(n.to_string()),
++        Some(Value::Text(t)) => Some(t.clone()),
++        _ => p
++            .get_text("body")
++            .and_then(|b| b.get_text("note"))
++            .and_then(Value::as_text)
++            .map(str::to_owned),
++    }
++}
++
++fn identity_refs_of(p: &Value, member: &str) -> Vec<String> {
++    p.get_text(member)
++        .and_then(Value::as_array)
++        .map(|a| {
++            a.iter()
++                .filter_map(Value::as_text)
++                .map(str::to_owned)
++                .collect()
++        })
++        .unwrap_or_default()
++}
++
++/// One roster's reading: what [`prev_head_digest`] and the record mapping
++/// read from a `group:roster` statement.
++#[derive(Clone, Debug)]
++pub struct RosterView {
++    /// Family or community.
++    pub kind: GroupKind,
++    /// The group's identity-ref (`group`, equal to `sub`).
++    pub group: String,
++    /// The version (a consistency check: one past its `refs.head`'s).
++    pub version: u64,
++    /// The version it extends (`refs.head`), absent on version 1.
++    pub head: Option<RowId>,
++    /// v62.0.0 (wave T1; CC 2.7.8, CC 2.6.1.9) — the further tips a MERGE
++    /// names beside `refs.head` (`refs.further_heads`, a set): "a version
++    /// naming the tips makes one head again". Empty on any other version.
++    pub further_heads: Vec<RowId>,
++    /// What its `refs` name.
++    pub names: Vec<Name>,
++    /// The payload.
++    pub payload: Value,
++}
++
++/// Read a `group:roster` payload whose CWT `sub` is `sub`.
++///
++/// # Errors
++/// `edition2_payload_invalid` for a payload that does not read: no kind,
++/// a `group` that is not `sub`, no version, unreadable `refs`.
++pub fn roster_view(sub: &str, payload: &Value) -> Result<RosterView, Error> {
++    let kind = group_kind_of(payload)?;
++    let group = req_text(payload, "group")?.to_owned();
++    if group != sub {
++        return Err(invalid(format!(
++            "group:roster: `group` {group:?} is not the row's subject {sub:?}"
++        )));
++    }
++    let version = payload
++        .get_text("version")
++        .and_then(Value::as_u64)
++        .ok_or_else(|| invalid("group:roster: `version` is required (uint)"))?;
++    let names = names_of(payload).map_err(|e| invalid(format!("group:roster: refs: {e:?}")))?;
++    Ok(RosterView {
++        kind,
++        group,
++        version,
++        head: single(&names, HEAD_ROLE),
++        further_heads: names
++            .iter()
++            .filter(|n| n.role == FURTHER_HEADS_ROLE)
++            .map(|n| n.row)
++            .collect(),
++        names,
++        payload: payload.clone(),
++    })
++}
++
++impl RosterView {
++    /// Every version this one names as a head: `refs.head`, then each of
++    /// `refs.further_heads`.
++    #[must_use]
++    pub fn parents(&self) -> Vec<RowId> {
++        self.head
++            .iter()
++            .copied()
++            .chain(self.further_heads.iter().copied())
++            .collect()
++    }
++
++    /// Is this version a merge (it names further tips)?
++    #[must_use]
++    pub fn is_merge(&self) -> bool {
++        !self.further_heads.is_empty()
++    }
++}
++
++/// [`roster_view`] of a held statement's bytes.
++///
++/// # Errors
++/// As [`roster_view`]; `edition2_payload_invalid` for bytes that are not a
++/// `group:roster` row statement.
++pub fn roster_view_of_statement(statement: &[u8]) -> Result<RosterView, Error> {
++    let (protected, payload) =
++        statement_parts(statement).ok_or_else(|| invalid("a held roster does not read"))?;
++    let family = protected.get_int(-70002).and_then(Value::as_text);
++    if family != Some(GROUP_ROSTER_PREFIX) {
++        return Err(invalid(format!(
++            "refs.head names a row of {family:?}, not a group:roster version"
++        )));
++    }
++    let sub = protected
++        .get_int(15)
++        .and_then(|c| c.get_int(2))
++        .and_then(Value::as_text)
++        .ok_or_else(|| invalid("a held roster names no subject"))?;
++    roster_view(sub, &payload)
++}
++
++fn roster_members(p: &Value) -> Result<Vec<CommunityMember>, Error> {
++    let Some(arr) = p.get_text("members").and_then(Value::as_array) else {
++        return Err(invalid("group:roster: `members` is required"));
++    };
++    arr.iter()
++        .map(|m| {
++            Ok(CommunityMember {
++                key_id: req_text(m, "key")?.to_owned(),
++                joined_at: req_ms(m, "joined_at")?,
++                role: text_of(m, "role").map(str::to_owned),
++            })
++        })
++        .collect()
++}
++
++/// The charter in force a roster names (`refs.also.cites`; the base table's
++/// `refs.also:charter`), as the earlier record's hex `charter_digest`.
++fn charter_of(names: &[Name]) -> String {
++    CHARTER_ROLES
++        .iter()
++        .find_map(|r| single(names, r))
++        .map(|r| r.hex())
++        .unwrap_or_default()
++}
++
++/// A community's `policy_blob`: the payload's `policy` map, with the CC 3.2
++/// members P1 lifts beside it (`cohort_subkind`, `cohort_subkind_payload`,
++/// `membership`) written back into it. `None` when none is present.
++fn policy_blob_of(p: &Value) -> Option<serde_json::Value> {
++    let mut blob = p.get_text("policy").map(json_of);
++    for member in ["cohort_subkind", "cohort_subkind_payload", "membership"] {
++        if let Some(v) = p.get_text(member) {
++            let obj = blob.get_or_insert_with(|| serde_json::json!({}));
++            if let Some(o) = obj.as_object_mut() {
++                o.insert(member.to_owned(), json_of(v));
++            }
++        }
++    }
++    blob
++}
++
++/// The typed record a roster version maps to.
++#[derive(Clone, Debug, PartialEq)]
++pub enum GroupRecord {
++    /// A family's record.
++    Family(Family),
++    /// A community's record.
++    Community(Community),
++}
++
++impl GroupRecord {
++    /// The record's `persist_row_hash`, as the typed door stamps it.
++    ///
++    /// # Errors
++    /// Serialization failure.
++    pub fn persist_row_hash(&self) -> Result<String, Error> {
++        match self {
++            Self::Family(f) => crate::federation::types::compute_persist_row_hash(f),
++            Self::Community(c) => crate::federation::types::compute_persist_row_hash(c),
++        }
++    }
++}
++
++/// **The roster mapping**: a roster version as the typed record it
++/// replaces, every member one to one, `prev_head_digest` given (the
++/// predecessor's typed hash, empty on version 1).
++///
++/// # Errors
++/// `edition2_payload_invalid` for a member that does not read.
++pub fn record_of_roster(view: &RosterView, prev_head_digest: String) -> Result<GroupRecord, Error> {
++    let p = &view.payload;
++    let name = req_text(p, "name")?.to_owned();
++    let members = roster_members(p)?;
++    let founded_at = req_ms(p, "founded_at")?;
++    let consensus_protocol = req_text(p, "consensus_protocol")?.to_owned();
++    let charter_digest = charter_of(&view.names);
++    Ok(match view.kind {
++        GroupKind::Family => GroupRecord::Family(Family {
++            family_key_id: view.group.clone(),
++            family_name: name,
++            members: members
++                .into_iter()
++                .map(|m| FamilyMember {
++                    key_id: m.key_id,
++                    joined_at: m.joined_at,
++                    role: m.role,
++                })
++                .collect(),
++            founded_at,
++            consensus_protocol,
++            consensus_protocol_entrenched: matches!(
++                p.get_text("consensus_protocol_entrenched"),
++                Some(Value::Bool(true))
++            ),
++            dissolved_at: opt_ms(p, "dissolved_at")?,
++            prev_head_digest,
++            charter_digest,
++            persist_row_hash: String::new(),
++        }),
++        GroupKind::Community => GroupRecord::Community(Community {
++            community_key_id: view.group.clone(),
++            community_name: name,
++            members,
++            founded_at,
++            consensus_protocol,
++            policy_blob: policy_blob_of(p),
++            prev_head_digest,
++            charter_digest,
++            persist_row_hash: String::new(),
++        }),
++    })
++}
++
++/// A version of the held chain: its reading and its typed `persist_row_hash`.
++type Chain = BTreeMap<RowId, (RosterView, String)>;
++
++/// The `persist_row_hash`es this node's lineage of `group` holds: the head's
++/// and every superseded version's (`federation_group_versions`).
++async fn held_lineage<F>(dir: &F, view: &RosterView) -> Result<BTreeSet<String>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let (cohort, head) = match view.kind {
++        GroupKind::Family => (
++            Cohort::Family,
++            dir.lookup_family(&view.group)
++                .await?
++                .map(|f| f.persist_row_hash),
++        ),
++        GroupKind::Community => {
++            let c = dir.lookup_community(&view.group).await?;
++            let cohort = match &c {
++                Some(c) => crate::federation::affiliation_config::declared_cohort(c)?,
++                None => Cohort::Community,
++            };
++            (cohort, c.map(|c| c.persist_row_hash))
++        }
++    };
++    let Some(head) = head else {
++        return Ok(BTreeSet::new());
++    };
++    let mut out = BTreeSet::from([head]);
++    for v in dir.list_group_versions(cohort, &view.group).await? {
++        if let Some(h) = snapshot_hash(&v.snapshot) {
++            out.insert(h);
++        }
++    }
++    Ok(out)
++}
++
++/// **The `prev_head_digest` of a version** from its parents' typed hashes.
++/// One parent: that parent's. A merge (CC 2.7.8) names several tips, and the
++/// typed record names one: the named version this node's lineage holds as
++/// the head (or held as the head before the merge superseded it), so the
++/// supersede executor reads the merge as extending the head; when no named
++/// version is in the lineage, `refs.head`'s.
++fn chosen_prev(view: &RosterView, chain: &Chain, lineage: &BTreeSet<String>) -> String {
++    let parents = view.parents();
++    let hash = |id: &RowId| chain.get(id).map(|(_, h)| h.clone()).unwrap_or_default();
++    if view.is_merge() {
++        if let Some(h) = parents.iter().map(hash).find(|h| lineage.contains(h)) {
++            return h;
++        }
++    }
++    parents.first().map(hash).unwrap_or_default()
++}
++
++/// Load the held chain behind `start` into `chain`: each named version's
++/// reading and typed hash, through every parent (`refs.head` and
++/// `refs.further_heads`), down to version 1.
++async fn load_chain<F>(
++    dir: &F,
++    view: &RosterView,
++    row_id: &RowId,
++    start: &[RowId],
++    lineage: &BTreeSet<String>,
++    chain: &mut Chain,
++) -> Result<(), Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let mut stack: Vec<RowId> = start.to_vec();
++    let mut read: BTreeMap<RowId, RosterView> = BTreeMap::new();
++    while let Some(id) = stack.last().copied() {
++        if chain.contains_key(&id) {
++            stack.pop();
++            continue;
++        }
++        if read.len() > MAX_ROSTER_CHAIN {
++            return Err(invalid(format!(
++                "group:roster: the chain behind {} is longer than {MAX_ROSTER_CHAIN} versions",
++                row_id.hex()
++            )));
++        }
++        if !read.contains_key(&id) {
++            let held = dir.edition2_voices(&id).await?;
++            let Some(st) = held.first() else {
++                return Err(Error::WithdrawsTargetUnheld {
++                    attestation_id: row_id.hex(),
++                    target_attestation_id: id.hex(),
++                });
++            };
++            let v = roster_view_of_statement(st)?;
++            if v.group != view.group || v.kind != view.kind {
++                return Err(invalid(format!(
++                    "group:roster: {} names a roster of another group ({:?})",
++                    row_id.hex(),
++                    v.group
++                )));
++            }
++            read.insert(id, v);
++        }
++        let v = &read[&id];
++        let missing: Vec<RowId> = v
++            .parents()
++            .into_iter()
++            .filter(|p| !chain.contains_key(p))
++            .collect();
++        if missing.is_empty() {
++            let v = read.remove(&id).expect("read above");
++            let hash = record_of_roster(&v, chosen_prev(&v, chain, lineage))?.persist_row_hash()?;
++            chain.insert(id, (v, hash));
++            stack.pop();
++        } else {
++            stack.extend(missing);
++        }
++    }
++    Ok(())
++}
++
++/// **The version's `prev_head_digest`**: empty on version 1 (no
++/// `refs.head`); otherwise the typed `persist_row_hash` of the version it
++/// extends, re-derived from the held chain of predecessor statements back to
++/// version 1 (every parent of a merge included). Checks the version is one
++/// past the greatest version it names, and every named version is a roster
++/// of the same group.
++///
++/// # Errors
++/// - the retryable `federation_withdraws_target_unheld` for a named version
++///   this node does not hold yet (an ordering gap);
++/// - `edition2_payload_invalid` for a version that does not follow what it
++///   names (1 with no `refs.head`; `refs.further_heads` with no `refs.head`),
++///   a named version of another group or kind, or a chain past
++///   [`MAX_ROSTER_CHAIN`].
++pub async fn prev_head_digest<F>(
++    dir: &F,
++    view: &RosterView,
++    row_id: &RowId,
++) -> Result<String, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    Ok(merge_reading(dir, view, row_id).await?.prev)
++}
++
++/// What a version names, read against this node's lineage.
++pub struct MergeReading {
++    /// The version's `prev_head_digest` ([`chosen_prev`]).
++    pub prev: String,
++    /// The typed hashes of the OTHER versions a merge names (empty on any
++    /// other version): the tips the merge makes one head with.
++    pub merged: Vec<String>,
++}
++
++/// [`prev_head_digest`] with the merged tips' typed hashes.
++///
++/// # Errors
++/// As [`prev_head_digest`].
++pub async fn merge_reading<F>(
++    dir: &F,
++    view: &RosterView,
++    row_id: &RowId,
++) -> Result<MergeReading, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let parents = view.parents();
++    if view.head.is_none() {
++        if view.is_merge() {
++            return Err(invalid(
++                "group:roster: refs.further_heads names tips beside no refs.head",
++            ));
++        }
++        if view.version != 1 {
++            return Err(invalid(format!(
++                "group:roster: version {} names no refs.head (only version 1 has none)",
++                view.version
++            )));
++        }
++        return Ok(MergeReading {
++            prev: String::new(),
++            merged: Vec::new(),
++        });
++    }
++    let lineage = held_lineage(dir, view).await?;
++    let mut chain = Chain::new();
++    load_chain(dir, view, row_id, &parents, &lineage, &mut chain).await?;
++    let greatest = parents
++        .iter()
++        .filter_map(|p| chain.get(p).map(|(v, _)| v.version))
++        .max()
++        .unwrap_or(0);
++    if view.version != greatest.saturating_add(1) {
++        return Err(invalid(format!(
++            "group:roster: version {} does not follow the greatest version {greatest} it names",
++            view.version
++        )));
++    }
++    let prev = chosen_prev(view, &chain, &lineage);
++    let merged = parents
++        .iter()
++        .filter_map(|p| chain.get(p).map(|(_, h)| h.clone()))
++        .filter(|h| *h != prev)
++        .collect();
++    Ok(MergeReading { prev, merged })
++}
++
++/// One counted membership change's reading.
++#[derive(Clone, Debug)]
++pub struct MembershipView {
++    /// Family or community.
++    pub kind: GroupKind,
++    /// The group's identity-ref.
++    pub group: String,
++    /// The member's identity-ref (equal to `sub`).
++    pub member: String,
++    /// The roster version the change is counted over (`refs.head`).
++    pub head: Option<RowId>,
++}
++
++/// The typed membership record a counted change maps to.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum MembershipRecord {
++    /// A family removal.
++    FamilyRemoval(FamilyMembershipRevocation),
++    /// A community removal.
++    CommunityRemoval(CommunityMembershipRevocation),
++    /// A family widening.
++    FamilyWidening(FamilyMembershipWidening),
++    /// A community widening.
++    CommunityWidening(CommunityMembershipWidening),
++}
++
++/// **The membership mapping**: a counted `membership:{stage}` payload whose
++/// `sub` is `sub` as the typed record it replaces.
++///
++/// # Errors
++/// `edition2_payload_invalid` for a payload that does not read: a `member`
++/// that is not `sub`, a missing instant.
++pub fn membership_of(
++    plane: GroupPlane,
++    sub: &str,
++    payload: &Value,
++) -> Result<(MembershipView, MembershipRecord), Error> {
++    let p = payload;
++    let kind = group_kind_of(p)?;
++    let group = req_text(p, "group")?.to_owned();
++    let member = req_text(p, "member")?.to_owned();
++    if member != sub {
++        return Err(invalid(format!(
++            "membership: `member` {member:?} is not the row's subject {sub:?}"
++        )));
++    }
++    let names = names_of(p).map_err(|e| invalid(format!("membership: refs: {e:?}")))?;
++    let effective_at = req_ms(p, "effective_at")?;
++    let record = match (plane, kind) {
++        (GroupPlane::Removal, GroupKind::Family) => {
++            MembershipRecord::FamilyRemoval(FamilyMembershipRevocation {
++                family_key_id: group.clone(),
++                removed_identity_key_id: member.clone(),
++                removed_at: req_ms(p, "removed_at")?,
++                effective_at,
++                reason: reason_of(p),
++                witness_set: identity_refs_of(p, "witness_set"),
++                persist_row_hash: String::new(),
++            })
++        }
++        (GroupPlane::Removal, GroupKind::Community) => {
++            MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
++                community_key_id: group.clone(),
++                removed_identity_key_id: member.clone(),
++                removed_at: req_ms(p, "removed_at")?,
++                effective_at,
++                reason: reason_of(p),
++                witness_set: identity_refs_of(p, "witness_set"),
++                persist_row_hash: String::new(),
++            })
++        }
++        (GroupPlane::Widening, GroupKind::Family) => {
++            MembershipRecord::FamilyWidening(FamilyMembershipWidening {
++                family_key_id: group.clone(),
++                member_key_id: member.clone(),
++                joined_at: req_ms(p, "joined_at")?,
++                effective_at,
++                role: text_of(p, "role").map(str::to_owned),
++                persist_row_hash: String::new(),
++            })
++        }
++        (GroupPlane::Widening, GroupKind::Community) => {
++            MembershipRecord::CommunityWidening(CommunityMembershipWidening {
++                community_key_id: group.clone(),
++                member_key_id: member.clone(),
++                joined_at: req_ms(p, "joined_at")?,
++                effective_at,
++                role: text_of(p, "role").map(str::to_owned),
++                persist_row_hash: String::new(),
++            })
++        }
++        (GroupPlane::Roster, _) => {
++            return Err(invalid("a group:roster row is not a membership change"));
++        }
++    };
++    Ok((
++        MembershipView {
++            kind,
++            group,
++            member,
++            head: single(&names, HEAD_ROLE),
++        },
++        record,
++    ))
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The door
++// ─────────────────────────────────────────────────────────────────────────
++
++/// **A group statement at the edition-2 door** (called by
++/// `ingest::put_statement` once [`admit_row`](super::door::admit_row) admitted
++/// it and [`group_plane_of`] named its plane). The payload is checked against
++/// its table, mapped onto its typed record, and judged by the typed door with
++/// every voice of the row ([`Vouch`]). `replicated` is the replicated door
++/// (an offered id): the gates that bind only the local door are skipped, as
++/// for a replicated group-plane row.
++///
++/// # Errors
++/// `edition2_payload_invalid`; the typed door's refusals; the retryable
++/// waits (an unheld predecessor or roster head, an unknown key).
++pub async fn put_group_statement<F>(
++    dir: &F,
++    row: &AdmittedRow,
++    plane: GroupPlane,
++    replicated: bool,
++) -> Result<StatementOutcome, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    if let Some(table) = payload_family_of(&row.family) {
++        super::payloads::check(table, &row.payload)?;
++    }
++    let voices = voices_of(dir, row).await?;
++    let landing = match plane {
++        GroupPlane::Roster => Box::pin(put_roster(dir, row, voices)).await?,
++        GroupPlane::Widening | GroupPlane::Removal => {
++            Box::pin(put_membership(dir, row, plane, voices, replicated)).await?
++        }
++    };
++    let new = dir.put_edition2_statement(row).await?;
++    Ok(match landing {
++        Landing::Landed => StatementOutcome::Row {
++            row_id: row.row_id,
++            new,
++        },
++        Landing::Short(e) => {
++            tracing::debug!(
++                row_id = %row.row_id.hex(),
++                family = %row.family,
++                reason = %e,
++                "edition-2 group row kept short of its protocol"
++            );
++            StatementOutcome::Pending {
++                row_id: row.row_id,
++                new,
++            }
++        }
++    })
++}
++
++/// A roster version: founding (version 1) or later (`refs.head`).
++async fn put_roster<F>(
++    dir: &F,
++    row: &AdmittedRow,
++    voices: BTreeMap<String, String>,
++) -> Result<Landing, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let view = roster_view(&row.sub, &row.payload)?;
++    let MergeReading { prev, merged } = merge_reading(dir, &view, &row.row_id).await?;
++    let record = record_of_roster(&view, prev.clone())?;
++    let offered_hash = record.persist_row_hash()?;
++    let landing = Box::pin(put_roster_record(dir, row, &view, record, &prev, voices)).await?;
++    // v62.0.0 (wave T1; CC 2.7.8) — a merge that became the head makes one
++    // head again: the other tips it names leave `federation_group_tips`.
++    if matches!(landing, Landing::Landed) && !merged.is_empty() {
++        drop_merged_tips(dir, &view, &offered_hash, &merged).await?;
++    }
++    Ok(landing)
++}
++
++/// The tips a landed merge names leave the tip store, once the merge is the
++/// head this node holds (a merge held as a tip itself merges nothing yet).
++async fn drop_merged_tips<F>(
++    dir: &F,
++    view: &RosterView,
++    offered_hash: &str,
++    merged: &[String],
++) -> Result<(), Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let (cohort, head) = match view.kind {
++        GroupKind::Family => (
++            Cohort::Family,
++            dir.lookup_family(&view.group)
++                .await?
++                .map(|f| f.persist_row_hash),
++        ),
++        GroupKind::Community => match dir.lookup_community(&view.group).await? {
++            Some(c) => (
++                crate::federation::affiliation_config::declared_cohort(&c)?,
++                Some(c.persist_row_hash),
++            ),
++            None => (Cohort::Community, None),
++        },
++    };
++    if head.as_deref() != Some(offered_hash) {
++        return Ok(());
++    }
++    match dir.drop_group_tips(cohort, &view.group, merged).await {
++        Ok(()) | Err(Error::Unsupported { .. }) => Ok(()),
++        Err(e) => Err(e),
++    }
++}
++
++/// The typed door for one roster version's record.
++async fn put_roster_record<F>(
++    dir: &F,
++    row: &AdmittedRow,
++    view: &RosterView,
++    record: GroupRecord,
++    prev: &str,
++    voices: BTreeMap<String, String>,
++) -> Result<Landing, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let (primary, marker, cosignatures) = signature_columns(&voices, &view.group);
++    match record {
++        GroupRecord::Family(family) => {
++            let proof = match view.head {
++                None => None,
++                Some(head) => Some(
++                    supersede_proof(
++                        dir,
++                        Cohort::Family,
++                        &family.family_key_id,
++                        family.members.iter().map(|m| m.key_id.clone()).collect(),
++                        family.consensus_protocol_entrenched,
++                        &family.consensus_protocol,
++                        family.dissolved_at,
++                        prev,
++                        row,
++                        &head,
++                    )
++                    .await?,
++                ),
++            };
++            let vouch = Vouch {
++                envelope_hash: envelope_hash(&family.signing_envelope())?,
++                voices,
++                change_envelope: proof.as_ref().map(|p| p.change_envelope.clone()),
++                short: AtomicBool::new(false),
++            };
++            let signed = SignedFamily {
++                family,
++                authority_key_id: primary,
++                scrub_signature_classical: marker.clone(),
++                scrub_signature_pqc: Some(marker),
++                supersede_proof: proof,
++                cosignatures,
++            };
++            run_vouched(vouch, dir.put_family(signed)).await
++        }
++        GroupRecord::Community(community) => {
++            let proof = match view.head {
++                None => None,
++                Some(head) => Some(
++                    supersede_proof(
++                        dir,
++                        Cohort::Community,
++                        &community.community_key_id,
++                        community.members.iter().map(|m| m.key_id.clone()).collect(),
++                        false,
++                        &community.consensus_protocol,
++                        None,
++                        prev,
++                        row,
++                        &head,
++                    )
++                    .await?,
++                ),
++            };
++            let vouch = Vouch {
++                envelope_hash: envelope_hash(&community.signing_envelope())?,
++                voices,
++                change_envelope: proof.as_ref().map(|p| p.change_envelope.clone()),
++                short: AtomicBool::new(false),
++            };
++            let signed = SignedCommunity {
++                community,
++                authority_key_id: primary,
++                scrub_signature_classical: marker.clone(),
++                scrub_signature_pqc: Some(marker),
++                supersede_proof: proof,
++                cosignatures,
++                lineage: Vec::new(),
++            };
++            run_vouched(vouch, dir.put_community(signed)).await
++        }
++    }
++}
++
++/// **A later version's supersede proof**: the version it extends
++/// (`prior_persist_row_hash`, its typed hash) and the change envelope this
++/// node's held state gives for the offered roster
++/// (`build_membership_change_envelope`). Its signatures are the voices,
++/// counted through the vouch. A group this node does not hold yet waits on
++/// the version `refs.head` names.
++///
++/// A family version that dissolves the family (its payload's
++/// `dissolved_at`, CIRISPersist#956) carries that instant in the change
++/// envelope (`family_dissolution::DISSOLVED_AT_MEMBER`, RFC 3339 at ms), so
++/// the door's own checks read it as the dissolution the voices signed:
++/// `check_dissolution_matches_envelope` (the record's `dissolved_at` is the
++/// signed one) and `check_dissolve_is_terminal_only` (nothing else changes).
++#[allow(clippy::too_many_arguments)]
++async fn supersede_proof<F>(
++    dir: &F,
++    cohort: Cohort,
++    group: &str,
++    member_key_ids: Vec<String>,
++    entrenched: bool,
++    consensus_protocol: &str,
++    dissolved_at: Option<chrono::DateTime<chrono::Utc>>,
++    prior: &str,
++    row: &AdmittedRow,
++    head: &RowId,
++) -> Result<GroupSupersedeProof, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let held = match cohort {
++        Cohort::Family => dir.lookup_family(group).await?.is_some(),
++        _ => dir.lookup_community(group).await?.is_some(),
++    };
++    if !held {
++        return Err(Error::WithdrawsTargetUnheld {
++            attestation_id: row.row_id.hex(),
++            target_attestation_id: head.hex(),
++        });
++    }
++    let mut change_envelope = dir
++        .build_membership_change_envelope(
++            cohort,
++            group,
++            &member_key_ids,
++            entrenched,
++            Some(consensus_protocol),
++        )
++        .await?;
++    if let (Some(at), Some(o)) = (dissolved_at, change_envelope.as_object_mut()) {
++        o.insert(
++            crate::federation::family_dissolution::DISSOLVED_AT_MEMBER.to_owned(),
++            serde_json::Value::String(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
++        );
++    }
++    Ok(GroupSupersedeProof {
++        prior_persist_row_hash: prior.to_owned(),
++        change_envelope,
++        quorum_signatures: Vec::new(),
++    })
++}
++
++/// The roster version a membership change names by `refs.head` must be a
++/// held `group:roster` row of the same group (an unheld one waits).
++async fn check_membership_head<F>(
++    dir: &F,
++    row: &AdmittedRow,
++    view: &MembershipView,
++) -> Result<(), Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let Some(head) = view.head else {
++        return Ok(());
++    };
++    let held = dir.edition2_voices(&head).await?;
++    let Some(st) = held.first() else {
++        return Err(Error::WithdrawsTargetUnheld {
++            attestation_id: row.row_id.hex(),
++            target_attestation_id: head.hex(),
++        });
++    };
++    let roster = roster_view_of_statement(st)?;
++    if roster.group != view.group || roster.kind != view.kind {
++        return Err(invalid(format!(
++            "membership: refs.head of {} names a roster of another group ({:?})",
++            row.row_id.hex(),
++            roster.group
++        )));
++    }
++    Ok(())
++}
++
++/// A counted membership change: the typed membership door, under the vouch
++/// (and the replicated marker on the replicated door).
++async fn put_membership<F>(
++    dir: &F,
++    row: &AdmittedRow,
++    plane: GroupPlane,
++    voices: BTreeMap<String, String>,
++    replicated: bool,
++) -> Result<Landing, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let (view, record) = membership_of(plane, &row.sub, &row.payload)?;
++    check_membership_head(dir, row, &view).await?;
++    // A membership change is proposed by a member, never by the group key:
++    // the primary is the first signer in order.
++    let (primary, marker, cosignatures) = signature_columns(&voices, "");
++    let envelope = match &record {
++        MembershipRecord::FamilyRemoval(r) => r.signing_envelope(),
++        MembershipRecord::CommunityRemoval(r) => r.signing_envelope(),
++        MembershipRecord::FamilyWidening(w) => w.signing_envelope(),
++        MembershipRecord::CommunityWidening(w) => w.signing_envelope(),
++    };
++    let vouch = Vouch {
++        envelope_hash: envelope_hash(&envelope)?,
++        voices,
++        change_envelope: None,
++        short: AtomicBool::new(false),
++    };
++    let pqc = Some(marker.clone());
++    let door = async move {
++        match record {
++            MembershipRecord::FamilyRemoval(r) => {
++                dir.put_family_membership_revocation(SignedFamilyMembershipRevocation {
++                    family_membership_revocation: r,
++                    authority_key_id: primary,
++                    scrub_signature_classical: marker,
++                    scrub_signature_pqc: pqc,
++                    cosignatures,
++                })
++                .await
++            }
++            MembershipRecord::CommunityRemoval(r) => {
++                dir.put_community_membership_revocation(SignedCommunityMembershipRevocation {
++                    community_membership_revocation: r,
++                    authority_key_id: primary,
++                    scrub_signature_classical: marker,
++                    scrub_signature_pqc: pqc,
++                    cosignatures,
++                })
++                .await
++            }
++            MembershipRecord::FamilyWidening(w) => {
++                dir.put_family_membership_widening(SignedFamilyMembershipWidening {
++                    family_membership_widening: w,
++                    authority_key_id: primary,
++                    scrub_signature_classical: marker,
++                    scrub_signature_pqc: pqc,
++                    cosignatures,
++                })
++                .await
++            }
++            MembershipRecord::CommunityWidening(w) => {
++                dir.put_community_membership_widening(SignedCommunityMembershipWidening {
++                    community_membership_widening: w,
++                    authority_key_id: primary,
++                    scrub_signature_classical: marker,
++                    scrub_signature_pqc: pqc,
++                    cosignatures,
++                })
++                .await
++            }
++        }
++    };
++    if replicated {
++        run_vouched(
++            vouch,
++            crate::federation::group_plane::as_replicated_group_row(door),
++        )
++        .await
++    } else {
++        run_vouched(vouch, door).await
++    }
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The roster while the head is forked (CC 2.7.8)
++// ─────────────────────────────────────────────────────────────────────────
++
++/// A version snapshot's `persist_row_hash`: the bare record's, or the signed
++/// wrapper's record's (`family` / `community`).
++fn snapshot_hash(s: &serde_json::Value) -> Option<String> {
++    let record = |k: &str| s.get(k).and_then(|r| r.get("persist_row_hash"));
++    s.get("persist_row_hash")
++        .or_else(|| record("family"))
++        .or_else(|| record("community"))
++        .and_then(serde_json::Value::as_str)
++        .filter(|h| !h.is_empty())
++        .map(str::to_owned)
++}
++
++/// A version snapshot's listed members' key ids (bare record or signed
++/// wrapper).
++fn snapshot_members(s: &serde_json::Value) -> BTreeSet<String> {
++    let record = s.get("family").or_else(|| s.get("community")).unwrap_or(s);
++    record
++        .get("members")
++        .and_then(serde_json::Value::as_array)
++        .map(|a| {
++            a.iter()
++                .filter_map(|m| m.get("key_id").and_then(serde_json::Value::as_str))
++                .map(str::to_owned)
++                .collect()
++        })
++        .unwrap_or_default()
++}
++
++/// v62.0.0 (wave T1; CC 2.7.8, "Two versions of one head wait as tips. The
++/// roster is then the members common to all tips, until a version naming
++/// the tips makes one head again") — **the members the forked tips have in
++/// common**, or `None` when the head is not forked.
++///
++/// The tips are the leaves of the held version graph: the head
++/// (`head_hash`, which no held tip names) and each held tip
++/// (`federation_group_tips`, K1) that descends from a held version (the
++/// head, a version in `federation_group_versions`, or another such tip) and
++/// that no other such tip names. A tip waiting on a version this node does
++/// not hold is not in the graph yet and narrows nothing. The caller keeps,
++/// of the head's own authorized roster, only the members in the returned
++/// set: the roster is the members common to all tips.
++///
++/// A directory with no tip store (`list_group_tips` unsupported) has no
++/// tips: `None`.
++///
++/// # Errors
++/// Directory read failures.
++pub async fn forked_tip_members<F>(
++    dir: &F,
++    cohort: Cohort,
++    group: &str,
++    head_hash: &str,
++) -> Result<Option<BTreeSet<String>>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let tips = match dir.list_group_tips(cohort, group).await {
++        Ok(t) => t,
++        Err(Error::Unsupported { .. }) => return Ok(None),
++        Err(e) => return Err(e),
++    };
++    if tips.is_empty() {
++        return Ok(None);
++    }
++    // A version naming none (`""`) is a root, as the head's own lineage is.
++    let mut rooted: BTreeSet<String> = BTreeSet::from([head_hash.to_owned(), String::new()]);
++    for v in dir.list_group_versions(cohort, group).await? {
++        if let Some(h) = snapshot_hash(&v.snapshot) {
++            rooted.insert(h);
++        }
++    }
++    let mut in_graph: Vec<usize> = Vec::new();
++    loop {
++        let before = in_graph.len();
++        for (i, t) in tips.iter().enumerate() {
++            if !in_graph.contains(&i) && rooted.contains(&t.prev_head_digest) {
++                rooted.insert(t.persist_row_hash.clone());
++                in_graph.push(i);
++            }
++        }
++        if in_graph.len() == before {
++            break;
++        }
++    }
++    let named: BTreeSet<&str> = in_graph
++        .iter()
++        .map(|&i| tips[i].prev_head_digest.as_str())
++        .collect();
++    let mut common: Option<BTreeSet<String>> = None;
++    for &i in &in_graph {
++        if named.contains(tips[i].persist_row_hash.as_str()) {
++            continue;
++        }
++        let members = snapshot_members(&tips[i].snapshot);
++        common = Some(match common {
++            None => members,
++            Some(c) => c.intersection(&members).cloned().collect(),
++        });
++    }
++    Ok(common)
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++//  The payload writers (typed record → statement payload)
++// ─────────────────────────────────────────────────────────────────────────
++
++fn text(s: &str) -> Value {
++    Value::Text(s.to_owned())
++}
++
++/// A deterministic map: entries sorted by their keys' encodings.
++fn det_map(mut m: Vec<(&str, Value)>) -> Value {
++    m.sort_by_key(|(k, _)| cde::encode(&text(k)));
++    Value::Map(m.into_iter().map(|(k, v)| (text(k), v)).collect())
++}
++
++fn ms_of(member: &str, at: chrono::DateTime<chrono::Utc>) -> Result<Value, Error> {
++    u64::try_from(at.timestamp_millis())
++        .map(Value::Uint)
++        .map_err(|_| invalid(format!("`{member}` is before the epoch")))
++}
++
++/// A JSON value as CBOR, for an open map member (`policy`). Text, integers,
++/// booleans, null, arrays and text-keyed maps (sorted by key encoding);
++/// a non-integer number is refused (CC 2.6.1.5: no floats).
++///
++/// # Errors
++/// `edition2_payload_invalid` for a non-integer number.
++pub fn cbor_of_json(v: &serde_json::Value) -> Result<Value, Error> {
++    use serde_json::Value as J;
++    Ok(match v {
++        J::Null => Value::Null,
++        J::Bool(b) => Value::Bool(*b),
++        J::String(s) => Value::Text(s.clone()),
++        J::Number(n) => {
++            if let Some(u) = n.as_u64() {
++                Value::Uint(u)
++            } else if let Some(i) = n.as_i64() {
++                // i < 0 here: CBOR's negative integer -1 - n.
++                Value::Nint(i.unsigned_abs() - 1)
++            } else {
++                return Err(invalid(format!("{n} is not an integer (CC 2.6.1.5)")));
++            }
++        }
++        J::Array(a) => Value::Array(a.iter().map(cbor_of_json).collect::<Result<_, _>>()?),
++        J::Object(o) => {
++            let mut m: Vec<(Value, Value)> = o
++                .iter()
++                .map(|(k, v)| Ok::<(Value, Value), Error>((text(k), cbor_of_json(v)?)))
++                .collect::<Result<_, Error>>()?;
++            m.sort_by_key(|(k, _)| cde::encode(k));
++            Value::Map(m)
++        }
++    })
++}
++
++/// **The inverse of [`record_of_roster`]**: a typed group record as its
++/// `group:roster` payload at `version`, extending `head` (none on version
++/// 1), stated at `asserted_at_ms`. `prev_head_digest` and
++/// `persist_row_hash` are not carried (the row id and `refs.head` replace
++/// them); the charter rides `refs.also.cites`. For producers and fixtures.
++///
++/// # Errors
++/// An instant before the epoch; a non-integer number in a community's
++/// `policy_blob`.
++pub fn roster_payload(
++    record: &GroupRecord,
++    version: u64,
++    head: Option<&RowId>,
++    asserted_at_ms: u64,
++) -> Result<Value, Error> {
++    roster_payload_merging(record, version, head, &[], asserted_at_ms)
++}
++
++/// [`roster_payload`] of a MERGE (CC 2.7.8): beside `refs.head` it names
++/// the further tips it makes one head with, `refs.further_heads` (a set,
++/// sorted by encoding, unique; CC 2.6.1.9). Empty `further` is
++/// [`roster_payload`].
++///
++/// # Errors
++/// As [`roster_payload`].
++pub fn roster_payload_merging(
++    record: &GroupRecord,
++    version: u64,
++    head: Option<&RowId>,
++    further: &[RowId],
++    asserted_at_ms: u64,
++) -> Result<Value, Error> {
++    let member_entry = |key: &str, joined: chrono::DateTime<chrono::Utc>, role: Option<&str>| {
++        let mut e = vec![
++            ("key", text(key)),
++            ("joined_at", ms_of("joined_at", joined)?),
++        ];
++        if let Some(r) = role {
++            e.push(("role", text(r)));
++        }
++        Ok::<Value, Error>(det_map(e))
++    };
++    let (kind, group, name, members, founded_at, protocol, charter) = match record {
++        GroupRecord::Family(f) => (
++            "family",
++            &f.family_key_id,
++            &f.family_name,
++            f.members
++                .iter()
++                .map(|m| member_entry(&m.key_id, m.joined_at, m.role.as_deref()))
++                .collect::<Result<Vec<_>, _>>()?,
++            f.founded_at,
++            &f.consensus_protocol,
++            &f.charter_digest,
++        ),
++        GroupRecord::Community(c) => (
++            "community",
++            &c.community_key_id,
++            &c.community_name,
++            c.members
++                .iter()
++                .map(|m| member_entry(&m.key_id, m.joined_at, m.role.as_deref()))
++                .collect::<Result<Vec<_>, _>>()?,
++            c.founded_at,
++            &c.consensus_protocol,
++            &c.charter_digest,
++        ),
++    };
++    let mut members = members;
++    members.sort_by_key(|m| m.get_text("key").map(cde::encode).unwrap_or_default());
++    let mut p = vec![
++        ("asserted_at", Value::Uint(asserted_at_ms)),
++        ("group_kind", text(kind)),
++        ("group", text(group)),
++        ("name", text(name)),
++        ("version", Value::Uint(version)),
++        ("members", Value::Array(members)),
++        ("founded_at", ms_of("founded_at", founded_at)?),
++        ("consensus_protocol", text(protocol)),
++    ];
++    match record {
++        GroupRecord::Family(f) => {
++            if f.consensus_protocol_entrenched {
++                p.push(("consensus_protocol_entrenched", Value::Bool(true)));
++            }
++            if let Some(d) = f.dissolved_at {
++                p.push(("dissolved_at", ms_of("dissolved_at", d)?));
++            }
++        }
++        GroupRecord::Community(c) => {
++            if let Some(b) = &c.policy_blob {
++                p.push(("policy", cbor_of_json(b)?));
++            }
++        }
++    }
++    let mut refs: Vec<(&str, Value)> = Vec::new();
++    if let Some(h) = head {
++        refs.push((HEAD_ROLE, ciris_verify_core::edition2::row_ref(&h.0)));
++    }
++    if !further.is_empty() {
++        let mut set: Vec<Value> = further
++            .iter()
++            .map(|r| ciris_verify_core::edition2::row_ref(&r.0))
++            .collect();
++        set.sort_by_key(cde::encode);
++        set.dedup();
++        refs.push((FURTHER_HEADS_ROLE, Value::Array(set)));
++    }
++    if !charter.is_empty() {
++        let d: [u8; 32] = hex::decode(charter)
++            .ok()
++            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
++            .ok_or_else(|| invalid("charter_digest is not a 64-hex row id"))?;
++        refs.push((
++            "also",
++            det_map(vec![("cites", ciris_verify_core::edition2::row_ref(&d))]),
++        ));
++    }
++    if !refs.is_empty() {
++        p.push(("refs", det_map(refs)));
++    }
++    Ok(det_map(p))
++}
++
++/// **The inverse of [`membership_of`]**: a typed membership record as its
++/// counted `membership:{stage}` payload (dimension
++/// `membership:{removal|widening}:v1`), counted over the roster version
++/// `head`, stated at the record's `effective_at`. A `reason` that is a
++/// decimal code rides `reason` (uint); any other text rides `body.note`.
++///
++/// # Errors
++/// An instant before the epoch.
++pub fn membership_payload(record: &MembershipRecord, head: Option<&RowId>) -> Result<Value, Error> {
++    let mut p: Vec<(&str, Value)> = Vec::new();
++    let (stage, kind, group, member, effective_at) = match record {
++        MembershipRecord::FamilyRemoval(r) => (
++            REMOVAL_LEAF,
++            "family",
++            &r.family_key_id,
++            &r.removed_identity_key_id,
++            r.effective_at,
++        ),
++        MembershipRecord::CommunityRemoval(r) => (
++            REMOVAL_LEAF,
++            "community",
++            &r.community_key_id,
++            &r.removed_identity_key_id,
++            r.effective_at,
++        ),
++        MembershipRecord::FamilyWidening(w) => (
++            WIDENING_LEAF,
++            "family",
++            &w.family_key_id,
++            &w.member_key_id,
++            w.effective_at,
++        ),
++        MembershipRecord::CommunityWidening(w) => (
++            WIDENING_LEAF,
++            "community",
++            &w.community_key_id,
++            &w.member_key_id,
++            w.effective_at,
++        ),
++    };
++    p.push(("asserted_at", ms_of("effective_at", effective_at)?));
++    p.push(("dimension", text(&format!("membership:{stage}:v1"))));
++    p.push(("group_kind", text(kind)));
++    p.push(("group", text(group)));
++    p.push(("member", text(member)));
++    p.push(("effective_at", ms_of("effective_at", effective_at)?));
++    fn removal(
++        p: &mut Vec<(&str, Value)>,
++        removed_at: chrono::DateTime<chrono::Utc>,
++        reason: Option<&str>,
++        witness_set: &[String],
++    ) -> Result<(), Error> {
++        p.push(("removed_at", ms_of("removed_at", removed_at)?));
++        if let Some(r) = reason {
++            match r.parse::<u64>() {
++                Ok(code) => p.push(("reason", Value::Uint(code))),
++                Err(_) => p.push(("body", det_map(vec![("note", text(r))]))),
++            }
++        }
++        if !witness_set.is_empty() {
++            let mut w: Vec<Value> = witness_set.iter().map(|k| text(k)).collect();
++            w.sort_by_key(cde::encode);
++            w.dedup();
++            p.push(("witness_set", Value::Array(w)));
++        }
++        Ok(())
++    }
++    match record {
++        MembershipRecord::FamilyRemoval(r) => {
++            removal(&mut p, r.removed_at, r.reason.as_deref(), &r.witness_set)?;
++        }
++        MembershipRecord::CommunityRemoval(r) => {
++            removal(&mut p, r.removed_at, r.reason.as_deref(), &r.witness_set)?;
++        }
++        MembershipRecord::FamilyWidening(w) => {
++            p.push(("joined_at", ms_of("joined_at", w.joined_at)?));
++            if let Some(r) = &w.role {
++                p.push(("role", text(r)));
++            }
++        }
++        MembershipRecord::CommunityWidening(w) => {
++            p.push(("joined_at", ms_of("joined_at", w.joined_at)?));
++            if let Some(r) = &w.role {
++                p.push(("role", text(r)));
++            }
++        }
++    }
++    if let Some(h) = head {
++        p.push((
++            "refs",
++            det_map(vec![(
++                HEAD_ROLE,
++                ciris_verify_core::edition2::row_ref(&h.0),
++            )]),
++        ));
++    }
++    Ok(det_map(p))
++}
+diff --git a/src/federation/edition2/group_codec_invariants.rs b/src/federation/edition2/group_codec_invariants.rs
+new file mode 100644
+index 00000000..89b1df08
+--- /dev/null
++++ b/src/federation/edition2/group_codec_invariants.rs
+@@ -0,0 +1,240 @@
++//! v62.0.0 (wave T1) — the group planes' codec, without a store.
++//!
++//! - **I2990**: a typed group record (family, community with a policy blob)
++//!   written as its `group:roster` payload and signed reads back as the same
++//!   record (`roster_payload` ∘ `record_of_roster` is the identity, the
++//!   charter included), and every voice of the version shares one row id.
++//! - **I2991**: each typed membership record (family / community × removal /
++//!   widening) written as its counted `membership:{stage}` payload reads back
++//!   as itself, naming the roster version by `refs.head`.
++//! - **I2992**: `group_plane_of` names the plane of `group:roster` and of the
++//!   two counted membership leaves only: an authored membership stage and a
++//!   composer of a roster are not a group plane.
++
++use chrono::{TimeZone, Utc};
++use ciris_verify_core::cde::Value;
++
++use super::door_invariants::fixture::*;
++use super::group::{
++    group_plane_of, membership_of, membership_payload, record_of_roster, roster_payload,
++    roster_view_of_statement, GroupPlane, GroupRecord, MembershipRecord, GROUP_ROSTER_PREFIX,
++    MEMBERSHIP_PREFIX,
++};
++use super::liveness::statement_parts;
++use super::names::RowId;
++use crate::federation::types::{
++    Community, CommunityMember, CommunityMembershipRevocation, CommunityMembershipWidening, Family,
++    FamilyMember, FamilyMembershipRevocation, FamilyMembershipWidening,
++};
++
++fn at(ms: i64) -> chrono::DateTime<Utc> {
++    Utc.timestamp_millis_opt(ms).single().unwrap()
++}
++
++fn sign(
++    k: &ciris_crypto::composite::CompositeSigningKey,
++    sub: &str,
++    prefix: &str,
++    p: &Value,
++) -> Vec<u8> {
++    ciris_verify_core::edition2::sign_row_statement(
++        k,
++        &iref(k),
++        sub,
++        "scores",
++        &ciris_verify_core::namespace_match::family_id(prefix),
++        p,
++        vec![],
++    )
++    .unwrap()
++}
++
++fn family() -> Family {
++    Family {
++        family_key_id: iref(&key(90)),
++        family_name: "codec family".into(),
++        members: vec![
++            FamilyMember {
++                key_id: iref(&key(91)),
++                joined_at: at(1_000),
++                role: Some("founder".into()),
++            },
++            FamilyMember {
++                key_id: iref(&key(92)),
++                joined_at: at(1_500),
++                role: None,
++            },
++        ],
++        founded_at: at(1_000),
++        consensus_protocol: "majority".into(),
++        consensus_protocol_entrenched: true,
++        dissolved_at: None,
++        prev_head_digest: String::new(),
++        charter_digest: hex::encode([0x42; 32]),
++        persist_row_hash: String::new(),
++    }
++}
++
++fn community() -> Community {
++    Community {
++        community_key_id: iref(&key(93)),
++        community_name: "codec community".into(),
++        members: vec![CommunityMember {
++            key_id: iref(&key(91)),
++            joined_at: at(2_000),
++            role: Some("founder".into()),
++        }],
++        founded_at: at(2_000),
++        consensus_protocol: "quorum:1/1".into(),
++        policy_blob: Some(serde_json::json!({"cohort_scope": "community", "max": 12})),
++        prev_head_digest: String::new(),
++        charter_digest: String::new(),
++        persist_row_hash: String::new(),
++    }
++}
++
++/// I2990 — a roster round trip, for both kinds, with and without a head.
++#[test]
++fn i2990_roster_payload_reads_back_as_its_record() {
++    let head = RowId([0x31; 32]);
++    for (record, version, head) in [
++        (GroupRecord::Family(family()), 1, None),
++        (GroupRecord::Family(family()), 2, Some(&head)),
++        (GroupRecord::Community(community()), 1, None),
++    ] {
++        let p = roster_payload(&record, version, head, 9_000).unwrap();
++        let group = match &record {
++            GroupRecord::Family(f) => f.family_key_id.clone(),
++            GroupRecord::Community(c) => c.community_key_id.clone(),
++        };
++        let st = sign(&key(91), &group, GROUP_ROSTER_PREFIX, &p);
++        let view = roster_view_of_statement(&st).unwrap();
++        assert_eq!(view.version, version, "I2990 version");
++        assert_eq!(view.head, head.copied(), "I2990 refs.head");
++        let back = record_of_roster(&view, String::new()).unwrap();
++        // A roster's members are a set, in key order (identity-refs are of
++        // one length, so their encodings sort as the text does).
++        let mut expected = record.clone();
++        match &mut expected {
++            GroupRecord::Family(f) => f.members.sort_by(|a, b| a.key_id.cmp(&b.key_id)),
++            GroupRecord::Community(c) => c.members.sort_by(|a, b| a.key_id.cmp(&b.key_id)),
++        }
++        assert_eq!(back, expected, "I2990 the record reads back");
++        // Every voice of the version is a voice of ONE row.
++        let other = sign(&key(92), &group, GROUP_ROSTER_PREFIX, &p);
++        assert_eq!(
++            RowId::of_statement(&st),
++            RowId::of_statement(&other),
++            "I2990 one row id per version"
++        );
++        assert_ne!(st, other, "I2990 two voices");
++        let (_, payload) = statement_parts(&st).unwrap();
++        assert_eq!(
++            group_plane_of(
++                "scores",
++                &ciris_verify_core::namespace_match::family_id(GROUP_ROSTER_PREFIX),
++                &payload
++            ),
++            Some(GroupPlane::Roster),
++            "I2990 plane"
++        );
++    }
++}
++
++/// I2991 — each counted membership record round-trips.
++#[test]
++fn i2991_membership_payload_reads_back_as_its_record() {
++    let head = RowId([0x32; 32]);
++    let g = iref(&key(90));
++    let m = iref(&key(92));
++    let records = [
++        MembershipRecord::FamilyRemoval(FamilyMembershipRevocation {
++            family_key_id: g.clone(),
++            removed_identity_key_id: m.clone(),
++            removed_at: at(5_000),
++            effective_at: at(5_000),
++            reason: Some("3".into()),
++            witness_set: vec![iref(&key(91))],
++            persist_row_hash: String::new(),
++        }),
++        MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
++            community_key_id: g.clone(),
++            removed_identity_key_id: m.clone(),
++            removed_at: at(5_000),
++            effective_at: at(6_000),
++            reason: None,
++            witness_set: vec![],
++            persist_row_hash: String::new(),
++        }),
++        MembershipRecord::FamilyWidening(FamilyMembershipWidening {
++            family_key_id: g.clone(),
++            member_key_id: m.clone(),
++            joined_at: at(7_000),
++            effective_at: at(7_000),
++            role: Some("member".into()),
++            persist_row_hash: String::new(),
++        }),
++        MembershipRecord::CommunityWidening(CommunityMembershipWidening {
++            community_key_id: g.clone(),
++            member_key_id: m.clone(),
++            joined_at: at(7_000),
++            effective_at: at(8_000),
++            role: None,
++            persist_row_hash: String::new(),
++        }),
++    ];
++    for record in records {
++        let plane = match record {
++            MembershipRecord::FamilyRemoval(_) | MembershipRecord::CommunityRemoval(_) => {
++                GroupPlane::Removal
++            }
++            _ => GroupPlane::Widening,
++        };
++        let p = membership_payload(&record, Some(&head)).unwrap();
++        let st = sign(&key(91), &m, MEMBERSHIP_PREFIX, &p);
++        let (_, payload) = statement_parts(&st).unwrap();
++        assert_eq!(
++            group_plane_of(
++                "scores",
++                &ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX),
++                &payload
++            ),
++            Some(plane),
++            "I2991 plane"
++        );
++        let (view, back) = membership_of(plane, &m, &payload).unwrap();
++        assert_eq!(back, record, "I2991 the record reads back");
++        assert_eq!(view.head, Some(head), "I2991 refs.head");
++        assert_eq!(view.group, g, "I2991 group");
++    }
++}
++
++/// I2992 — only the roster and the two counted leaves are group planes.
++#[test]
++fn i2992_only_the_counted_planes_are_group_planes() {
++    let membership = ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX);
++    let roster = ciris_verify_core::namespace_match::family_id(GROUP_ROSTER_PREFIX);
++    let dim = |d: &str| map(vec![("dimension", Value::Text(d.into()))]);
++    assert_eq!(
++        group_plane_of("scores", &membership, &dim("membership:proposal:v1")),
++        None,
++        "I2992 an authored stage is the attestation plane's"
++    );
++    assert_eq!(
++        group_plane_of("scores", &membership, &map(vec![])),
++        None,
++        "I2992 no dimension binds no leaf"
++    );
++    for composer in ["withdraws", "recants", "supersedes"] {
++        assert_eq!(
++            group_plane_of(composer, &roster, &map(vec![])),
++            None,
++            "I2992 a composer of a roster is not the roster's plane"
++        );
++    }
++    assert_eq!(
++        group_plane_of("scores", "key:record", &map(vec![])),
++        None,
++        "I2992 another family"
++    );
++}
+diff --git a/src/federation/edition2/group_fixtures.rs b/src/federation/edition2/group_fixtures.rs
+new file mode 100644
+index 00000000..e1f7ab23
+--- /dev/null
++++ b/src/federation/edition2/group_fixtures.rs
+@@ -0,0 +1,410 @@
++//! v62.0.0 (wave T1) — **the edition-2 twins of the typed-plane builders.**
++//!
++//! The typed-plane builders (`tier_ingest::test_support::sign_family`,
++//! `sign_community`, `sign_{family,community}_membership_{revocation,
++//! widening}`, `sign_*_by_consensus`, `*_naming_held`) return earlier-form
++//! `Signed*` structs. Each function here turns one of those structs into the
++//! edition-2 statements it is: the payload ([`super::group::roster_payload`],
++//! [`super::group::membership_payload`]) signed once per signer (the
++//! struct's authority, then each co-signer), so a held test keeps its
++//! builder and swaps `dir.put_family(s)` for
++//! `put_voices(dir, &family_voices(&s, 1, None, at)).await`.
++//!
++//! Ids follow E0's fixture model (`fixture_switch`): a key id in the struct
++//! is a SEED or an identity-ref E0 minted; the statement carries
++//! `kid_or_keep(..)` of it, and each signer signs with `signing_key(..)`.
++//! So the typed row lands under `kid(seed)`: assert with `e2::kid(..)`.
++//!
++//! A membership change names the roster version it is counted over
++//! (`refs.head`, required by CC's payload table): pass the row id of the
++//! roster's statement ([`row_id_of`]).
++
++use ciris_crypto::composite::CompositeSigningKey;
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::{identity_ref, sign_row_statement, thumbprint};
++use ciris_verify_core::namespace_match;
++
++use super::fixture_switch::{kid_or_keep, signing_key};
++use super::group::{
++    membership_payload, prev_head_digest, record_of_roster, roster_payload,
++    roster_view_of_statement, GroupRecord, MembershipRecord, GROUP_ROSTER_PREFIX,
++    MEMBERSHIP_PREFIX,
++};
++use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
++use super::names::RowId;
++use crate::federation::group_plane::GroupKind;
++use crate::federation::types::{
++    Community, CommunityMember, Family, FamilyMember, RosterCosignature, SignedCommunity,
++    SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening, SignedFamily,
++    SignedFamilyMembershipRevocation, SignedFamilyMembershipWidening,
++};
++use crate::federation::{Error, FederationDirectory};
++
++/// Sign a group payload as `key`'s voice: row type `scores`, the family's
++/// header id (`namespace_match::family_id` of `family_prefix`), `sub` the
++/// row's subject.
++///
++/// # Panics
++/// A payload with no `asserted_at`.
++#[must_use]
++pub fn sign_group_payload(
++    key: &CompositeSigningKey,
++    sub: &str,
++    family_prefix: &str,
++    payload: &Value,
++) -> Vec<u8> {
++    let iss = identity_ref(&thumbprint(key.public_key()));
++    sign_row_statement(
++        key,
++        &iss,
++        sub,
++        "scores",
++        &namespace_match::family_id(family_prefix),
++        payload,
++        vec![],
++    )
++    .expect("group_fixtures: sign a group statement")
++}
++
++/// The row id every voice of `statement` shares (a counted row).
++///
++/// # Panics
++/// Not a row statement.
++#[must_use]
++pub fn row_id_of(statement: &[u8]) -> RowId {
++    RowId::of_statement(statement).expect("group_fixtures: not a row statement")
++}
++
++/// One voice per signer of a roster version (`record` at `version`,
++/// extending `head`), stated at `asserted_at_ms`.
++///
++/// # Panics
++/// A record that does not encode (an instant before the epoch, a float in a
++/// policy blob).
++#[must_use]
++pub fn roster_voices(
++    record: &GroupRecord,
++    version: u64,
++    head: Option<&RowId>,
++    asserted_at_ms: u64,
++    signers: &[&CompositeSigningKey],
++) -> Vec<Vec<u8>> {
++    let p = roster_payload(record, version, head, asserted_at_ms)
++        .expect("group_fixtures: roster payload");
++    let group = match record {
++        GroupRecord::Family(f) => &f.family_key_id,
++        GroupRecord::Community(c) => &c.community_key_id,
++    };
++    signers
++        .iter()
++        .map(|k| sign_group_payload(k, group, GROUP_ROSTER_PREFIX, &p))
++        .collect()
++}
++
++/// One voice per signer of a MERGE version (CC 2.7.8): `record` at
++/// `version`, naming `head` and the further tips `further`.
++///
++/// # Panics
++/// A record that does not encode.
++#[must_use]
++pub fn merge_voices(
++    record: &GroupRecord,
++    version: u64,
++    head: &RowId,
++    further: &[RowId],
++    asserted_at_ms: u64,
++    signers: &[&CompositeSigningKey],
++) -> Vec<Vec<u8>> {
++    let p =
++        super::group::roster_payload_merging(record, version, Some(head), further, asserted_at_ms)
++            .expect("group_fixtures: merge payload");
++    let group = match record {
++        GroupRecord::Family(f) => &f.family_key_id,
++        GroupRecord::Community(c) => &c.community_key_id,
++    };
++    signers
++        .iter()
++        .map(|k| sign_group_payload(k, group, GROUP_ROSTER_PREFIX, &p))
++        .collect()
++}
++
++/// One voice per signer of a counted membership change, counted over the
++/// roster version `head`.
++///
++/// # Panics
++/// A record that does not encode.
++#[must_use]
++pub fn membership_voices(
++    record: &MembershipRecord,
++    head: Option<&RowId>,
++    signers: &[&CompositeSigningKey],
++) -> Vec<Vec<u8>> {
++    let p = membership_payload(record, head).expect("group_fixtures: membership payload");
++    let member = match record {
++        MembershipRecord::FamilyRemoval(r) => &r.removed_identity_key_id,
++        MembershipRecord::CommunityRemoval(r) => &r.removed_identity_key_id,
++        MembershipRecord::FamilyWidening(w) => &w.member_key_id,
++        MembershipRecord::CommunityWidening(w) => &w.member_key_id,
++    };
++    signers
++        .iter()
++        .map(|k| sign_group_payload(k, member, MEMBERSHIP_PREFIX, &p))
++        .collect()
++}
++
++/// Put each voice through the one entry (`ingest::put_statement`, tier
++/// `federation`), in order; the last outcome. The first refusal returns.
++///
++/// # Errors
++/// The first refusal.
++///
++/// # Panics
++/// No voice given.
++pub async fn put_voices<D: FederationDirectory + ?Sized>(
++    dir: &D,
++    voices: &[Vec<u8>],
++) -> Result<StatementOutcome, Error> {
++    let mut last = None;
++    for v in voices {
++        last = Some(put_statement(dir, v, None, INGEST_TIER).await?);
++    }
++    Ok(last.expect("group_fixtures: put_voices of no voice"))
++}
++
++// ── The typed-struct twins (E0's seed model) ──────────────────────────────
++
++fn signer_keys(authority: &str, cosignatures: &[RosterCosignature]) -> Vec<CompositeSigningKey> {
++    std::iter::once(authority)
++        .chain(cosignatures.iter().map(|c| c.authority_key_id.as_str()))
++        .map(signing_key)
++        .collect()
++}
++
++fn voices_with(
++    keys: &[CompositeSigningKey],
++    f: impl Fn(&[&CompositeSigningKey]) -> Vec<Vec<u8>>,
++) -> Vec<Vec<u8>> {
++    let refs: Vec<&CompositeSigningKey> = keys.iter().collect();
++    f(&refs)
++}
++
++/// A family record with every key id as its identity-ref.
++#[must_use]
++pub fn family_with_kids(f: &Family) -> Family {
++    Family {
++        family_key_id: kid_or_keep(&f.family_key_id),
++        members: f
++            .members
++            .iter()
++            .map(|m| FamilyMember {
++                key_id: kid_or_keep(&m.key_id),
++                joined_at: m.joined_at,
++                role: m.role.clone(),
++            })
++            .collect(),
++        ..f.clone()
++    }
++}
++
++/// A community record with every key id as its identity-ref.
++#[must_use]
++pub fn community_with_kids(c: &Community) -> Community {
++    Community {
++        community_key_id: kid_or_keep(&c.community_key_id),
++        members: c
++            .members
++            .iter()
++            .map(|m| CommunityMember {
++                key_id: kid_or_keep(&m.key_id),
++                joined_at: m.joined_at,
++                role: m.role.clone(),
++            })
++            .collect(),
++        ..c.clone()
++    }
++}
++
++/// **`sign_family`'s twin**: the roster voices of `signed` (its authority,
++/// then each co-signer) at `version`, extending `head`.
++#[must_use]
++pub fn family_voices(
++    signed: &SignedFamily,
++    version: u64,
++    head: Option<&RowId>,
++    asserted_at_ms: u64,
++) -> Vec<Vec<u8>> {
++    let record = GroupRecord::Family(family_with_kids(&signed.family));
++    voices_with(
++        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
++        |k| roster_voices(&record, version, head, asserted_at_ms, k),
++    )
++}
++
++/// **`sign_community`'s twin**: as [`family_voices`].
++#[must_use]
++pub fn community_voices(
++    signed: &SignedCommunity,
++    version: u64,
++    head: Option<&RowId>,
++    asserted_at_ms: u64,
++) -> Vec<Vec<u8>> {
++    let record = GroupRecord::Community(community_with_kids(&signed.community));
++    voices_with(
++        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
++        |k| roster_voices(&record, version, head, asserted_at_ms, k),
++    )
++}
++
++/// **`sign_family_membership_revocation`'s twin** (and the
++/// `*_by_consensus` one: its co-signers are voices too).
++#[must_use]
++pub fn family_revocation_voices(
++    signed: &SignedFamilyMembershipRevocation,
++    head: Option<&RowId>,
++) -> Vec<Vec<u8>> {
++    let mut r = signed.family_membership_revocation.clone();
++    r.family_key_id = kid_or_keep(&r.family_key_id);
++    r.removed_identity_key_id = kid_or_keep(&r.removed_identity_key_id);
++    r.witness_set = r.witness_set.iter().map(|k| kid_or_keep(k)).collect();
++    let record = MembershipRecord::FamilyRemoval(r);
++    voices_with(
++        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
++        |k| membership_voices(&record, head, k),
++    )
++}
++
++/// **`sign_community_membership_revocation`'s twin**.
++#[must_use]
++pub fn community_revocation_voices(
++    signed: &SignedCommunityMembershipRevocation,
++    head: Option<&RowId>,
++) -> Vec<Vec<u8>> {
++    let mut r = signed.community_membership_revocation.clone();
++    r.community_key_id = kid_or_keep(&r.community_key_id);
++    r.removed_identity_key_id = kid_or_keep(&r.removed_identity_key_id);
++    r.witness_set = r.witness_set.iter().map(|k| kid_or_keep(k)).collect();
++    let record = MembershipRecord::CommunityRemoval(r);
++    voices_with(
++        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
++        |k| membership_voices(&record, head, k),
++    )
++}
++
++/// **`sign_family_membership_widening`'s twin**.
++#[must_use]
++pub fn family_widening_voices(
++    signed: &SignedFamilyMembershipWidening,
++    head: Option<&RowId>,
++) -> Vec<Vec<u8>> {
++    let mut w = signed.family_membership_widening.clone();
++    w.family_key_id = kid_or_keep(&w.family_key_id);
++    w.member_key_id = kid_or_keep(&w.member_key_id);
++    let record = MembershipRecord::FamilyWidening(w);
++    voices_with(
++        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
++        |k| membership_voices(&record, head, k),
++    )
++}
++
++/// **`sign_community_membership_widening`'s twin**.
++#[must_use]
++pub fn community_widening_voices(
++    signed: &SignedCommunityMembershipWidening,
++    head: Option<&RowId>,
++) -> Vec<Vec<u8>> {
++    let mut w = signed.community_membership_widening.clone();
++    w.community_key_id = kid_or_keep(&w.community_key_id);
++    w.member_key_id = kid_or_keep(&w.member_key_id);
++    let record = MembershipRecord::CommunityWidening(w);
++    voices_with(
++        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
++        |k| membership_voices(&record, head, k),
++    )
++}
++
++// ── The `*_naming_held` twins ─────────────────────────────────────────────
++
++/// **The held head of `group`** (an identity-ref): the row id of the
++/// `group:roster` version whose typed record is the one `federation_families`
++/// / `federation_communities` holds, and its version. `None` when the group
++/// is not held, or no held statement maps to its head (an earlier-form
++/// record).
++///
++/// # Panics
++/// A directory read failure.
++pub async fn held_head<D: FederationDirectory + ?Sized>(
++    dir: &D,
++    group: &str,
++) -> Option<(RowId, u64)> {
++    let family_hash = dir
++        .lookup_family(group)
++        .await
++        .expect("lookup_family")
++        .map(|f| f.persist_row_hash);
++    let held = match family_hash {
++        Some(h) => Some(h),
++        None => dir
++            .lookup_community(group)
++            .await
++            .expect("lookup_community")
++            .map(|c| c.persist_row_hash),
++    }?;
++    let statements = dir
++        .edition2_statements_about(&namespace_match::family_id(GROUP_ROSTER_PREFIX), group)
++        .await
++        .expect("edition2_statements_about");
++    for st in statements {
++        let Ok(view) = roster_view_of_statement(&st) else {
++            continue;
++        };
++        let id = row_id_of(&st);
++        let Ok(prev) = prev_head_digest(dir, &view, &id).await else {
++            continue;
++        };
++        let Ok(hash) = record_of_roster(&view, prev).and_then(|r| r.persist_row_hash()) else {
++            continue;
++        };
++        if hash == held {
++            return Some((id, view.version));
++        }
++    }
++    None
++}
++
++/// **`family_naming_held`'s twin**: [`family_voices`] at the version after
++/// the held head, naming it by `refs.head` (version 1 with no head when the
++/// family is not held).
++pub async fn family_voices_naming_held<D: FederationDirectory + ?Sized>(
++    dir: &D,
++    signed: &SignedFamily,
++    asserted_at_ms: u64,
++) -> Vec<Vec<u8>> {
++    match held_head(dir, &kid_or_keep(&signed.family.family_key_id)).await {
++        Some((id, v)) => family_voices(signed, v + 1, Some(&id), asserted_at_ms),
++        None => family_voices(signed, 1, None, asserted_at_ms),
++    }
++}
++
++/// **`community_naming_held`'s twin**: as [`family_voices_naming_held`].
++pub async fn community_voices_naming_held<D: FederationDirectory + ?Sized>(
++    dir: &D,
++    signed: &SignedCommunity,
++    asserted_at_ms: u64,
++) -> Vec<Vec<u8>> {
++    match held_head(dir, &kid_or_keep(&signed.community.community_key_id)).await {
++        Some((id, v)) => community_voices(signed, v + 1, Some(&id), asserted_at_ms),
++        None => community_voices(signed, 1, None, asserted_at_ms),
++    }
++}
++
++/// The kind of group a held roster statement is (for a caller choosing the
++/// membership twin).
++///
++/// # Panics
++/// Not a `group:roster` statement.
++#[must_use]
++pub fn group_kind_of_roster(statement: &[u8]) -> GroupKind {
++    roster_view_of_statement(statement)
++        .expect("group_fixtures: not a roster")
++        .kind
++}
+diff --git a/src/federation/edition2/group_invariants.rs b/src/federation/edition2/group_invariants.rs
+new file mode 100644
+index 00000000..d111f060
+--- /dev/null
++++ b/src/federation/edition2/group_invariants.rs
+@@ -0,0 +1,901 @@
++//! v62.0.0 (wave T1) — **the group planes at the edition-2 door**, on sqlite
++//! and postgres. Every voice goes through the one entry
++//! (`ingest::put_statement`); every typed row is read back through the
++//! directory's own readers.
++//!
++//! - **I2993** a founding `group:roster` is counted: each voice before the
++//!   last listed member's is `Pending` and nothing is in
++//!   `federation_families`; the last one lands the family, its members the
++//!   voices' identity-refs. A re-put voice is `Row { new: false }`.
++//! - **I2994** a later version names the version it extends by `refs.head`:
++//!   short of the held protocol it is `Pending` and the head does not move;
++//!   met, it is the head, its `prev_head_digest` the held version's
++//!   `persist_row_hash`, the prior kept in `federation_group_versions`.
++//! - **I2995** a fork (a second version naming an older head) is held as a
++//!   tip beside the head (K1's `federation_group_tips`); the head stays.
++//! - **I2996** a version whose `refs.head` is not held waits (the retryable
++//!   `federation_withdraws_target_unheld`), and its voice is not kept.
++//! - **I2997** a version that does not follow its `refs.head`'s version (or a
++//!   later version with no `refs.head`) is `edition2_payload_invalid`.
++//! - **I2998** a counted removal short of the family's protocol is `Pending`
++//!   and absent from `federation_family_membership_revocations`; the voice
++//!   that meets it lands it, and the member leaves the active roster. The
++//!   replicated door (an offered id) admits a voice the same way.
++//! - **I2999** a widening meets the JSON door's own growth gate: with its
++//!   standing met but no acceptance held, it is refused
++//!   `membership_acceptance_unresolved` and its voice is not kept.
++//! - **I3000** a community: its founding lands in `federation_communities`,
++//!   and a counted removal in `federation_community_membership_revocations`.
++//! - **I3001** while the head is forked (K1 holds the fork as a tip), the
++//!   roster is the members common to all tips (CC 2.7.8): a fork that drops
++//!   a member drops it from `active_family_members`.
++//! - **I3002** disjoint tips leave an empty roster.
++//! - **I3003** a dissolution version lands: short, the family is live; met,
++//!   `dissolved_at` is held and the family has no members.
++//! - **I3004** a widening lands once the member's consent (an edition-2
++//!   proposal and acceptance) is held.
++//! - **I3005** a held fork heals: a merge naming the head and the tip
++//!   (`refs.further_heads`) is counted over their common members, becomes the
++//!   one head, the tip leaves the tip store, and a later version extends the
++//!   merge.
++
++use chrono::{TimeZone, Utc};
++use ciris_crypto::composite::CompositeSigningKey;
++use ciris_verify_core::cde::Value;
++
++use super::door_invariants::fixture::{iref, key, key_record};
++use super::group::{
++    membership_payload, roster_payload, GroupRecord, MembershipRecord, GROUP_ROSTER_PREFIX,
++    MEMBERSHIP_PREFIX,
++};
++use super::ingest::{apply_replicated_statement, put_statement, StatementOutcome, INGEST_TIER};
++use super::names::RowId;
++use crate::federation::cohort::Cohort;
++use crate::federation::types::{
++    Community, CommunityMember, CommunityMembershipRevocation, Family, FamilyMember,
++    FamilyMembershipRevocation, FamilyMembershipWidening,
++};
++use crate::federation::{malformed_row, Error, FederationDirectory};
++
++type K = CompositeSigningKey;
++
++fn at(ms: i64) -> chrono::DateTime<Utc> {
++    Utc.timestamp_millis_opt(ms).single().unwrap()
++}
++
++fn sign(k: &K, sub: &str, prefix: &str, p: &Value) -> Vec<u8> {
++    ciris_verify_core::edition2::sign_row_statement(
++        k,
++        &iref(k),
++        sub,
++        "scores",
++        &ciris_verify_core::namespace_match::family_id(prefix),
++        p,
++        vec![],
++    )
++    .unwrap()
++}
++
++fn roster(rec: &GroupRecord, version: u64, head: Option<&RowId>, at_ms: u64, k: &K) -> Vec<u8> {
++    let group = match rec {
++        GroupRecord::Family(f) => f.family_key_id.clone(),
++        GroupRecord::Community(c) => c.community_key_id.clone(),
++    };
++    let p = roster_payload(rec, version, head, at_ms).unwrap();
++    sign(k, &group, GROUP_ROSTER_PREFIX, &p)
++}
++
++fn membership(rec: &MembershipRecord, head: &RowId, k: &K) -> Vec<u8> {
++    let member = match rec {
++        MembershipRecord::FamilyRemoval(r) => r.removed_identity_key_id.clone(),
++        MembershipRecord::CommunityRemoval(r) => r.removed_identity_key_id.clone(),
++        MembershipRecord::FamilyWidening(w) => w.member_key_id.clone(),
++        MembershipRecord::CommunityWidening(w) => w.member_key_id.clone(),
++    };
++    let p = membership_payload(rec, Some(head)).unwrap();
++    sign(k, &member, MEMBERSHIP_PREFIX, &p)
++}
++
++fn family(g: &K, name: &str, protocol: &str, members: &[(&K, Option<&str>)]) -> GroupRecord {
++    GroupRecord::Family(Family {
++        family_key_id: iref(g),
++        family_name: name.into(),
++        members: members
++            .iter()
++            .map(|(k, role)| FamilyMember {
++                key_id: iref(k),
++                joined_at: at(1_000),
++                role: role.map(str::to_owned),
++            })
++            .collect(),
++        founded_at: at(1_000),
++        consensus_protocol: protocol.into(),
++        consensus_protocol_entrenched: false,
++        dissolved_at: None,
++        prev_head_digest: String::new(),
++        charter_digest: String::new(),
++        persist_row_hash: String::new(),
++    })
++}
++
++async fn register(d: &dyn FederationDirectory, keys: &[&K]) {
++    for k in keys {
++        put_statement(d, &key_record(k, &["user"], 0, None), None, INGEST_TIER)
++            .await
++            .unwrap();
++    }
++}
++
++async fn put(d: &dyn FederationDirectory, st: &[u8]) -> Result<StatementOutcome, Error> {
++    put_statement(d, st, None, INGEST_TIER).await
++}
++
++fn reason(e: &Error) -> String {
++    match e {
++        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
++        other => other.kind().to_owned(),
++    }
++}
++
++fn pending(o: &StatementOutcome) -> bool {
++    matches!(o, StatementOutcome::Pending { new: true, .. })
++}
++
++fn landed(o: &StatementOutcome) -> Option<RowId> {
++    match o {
++        StatementOutcome::Row { row_id, new: true } => Some(*row_id),
++        _ => None,
++    }
++}
++
++fn sorted(mut v: Vec<String>) -> Vec<String> {
++    v.sort();
++    v
++}
++
++/// I2993–I2997: the roster's versions.
++pub(crate) async fn roster_body(d: &dyn FederationDirectory) {
++    let (a, b, c, g) = (key(151), key(152), key(153), key(154));
++    register(d, &[&a, &b, &c]).await;
++    let gid = iref(&g);
++    let members = [(&a, None), (&b, None), (&c, None)];
++
++    // I2993 — founding, counted.
++    let v1 = family(&g, "fam one", "majority", &members);
++    let o = put(d, &roster(&v1, 1, None, 2_000, &a)).await.unwrap();
++    assert!(pending(&o), "I2993 first voice: {o:?}");
++    assert!(
++        d.lookup_family(&gid).await.unwrap().is_none(),
++        "I2993 not yet"
++    );
++    let o = put(d, &roster(&v1, 1, None, 2_000, &b)).await.unwrap();
++    assert!(pending(&o), "I2993 second voice: {o:?}");
++    let o = put(d, &roster(&v1, 1, None, 2_000, &c)).await.unwrap();
++    let v1_id = landed(&o).unwrap_or_else(|| panic!("I2993 the last listed voice: {o:?}"));
++    let held1 = d.lookup_family(&gid).await.unwrap().expect("I2993 landed");
++    assert_eq!(
++        sorted(held1.members.iter().map(|m| m.key_id.clone()).collect()),
++        sorted(vec![iref(&a), iref(&b), iref(&c)]),
++        "I2993 members"
++    );
++    assert_eq!(held1.consensus_protocol, "majority", "I2993 protocol");
++    assert!(held1.prev_head_digest.is_empty(), "I2993 version 1");
++    let o = put(d, &roster(&v1, 1, None, 2_000, &a)).await.unwrap();
++    assert!(
++        matches!(o, StatementOutcome::Row { new: false, .. }),
++        "I2993 a re-put voice: {o:?}"
++    );
++
++    // I2994 — a later version extends the head.
++    let v2 = family(&g, "fam two", "unanimous", &members);
++    let o = put(d, &roster(&v2, 2, Some(&v1_id), 3_000, &a))
++        .await
++        .unwrap();
++    assert!(
++        pending(&o),
++        "I2994 one of three is short of majority: {o:?}"
++    );
++    assert_eq!(
++        d.lookup_family(&gid).await.unwrap().unwrap().family_name,
++        "fam one",
++        "I2994 the head did not move"
++    );
++    let o = put(d, &roster(&v2, 2, Some(&v1_id), 3_000, &b))
++        .await
++        .unwrap();
++    assert!(
++        landed(&o).is_some(),
++        "I2994 two of three meet majority: {o:?}"
++    );
++    let held2 = d.lookup_family(&gid).await.unwrap().unwrap();
++    assert_eq!(held2.family_name, "fam two", "I2994 the head moved");
++    assert_eq!(held2.consensus_protocol, "unanimous", "I2994 protocol");
++    assert_eq!(
++        held2.prev_head_digest, held1.persist_row_hash,
++        "I2994 refs.head is the held version's persist_row_hash"
++    );
++    let versions = d.list_group_versions(Cohort::Family, &gid).await.unwrap();
++    assert_eq!(versions.len(), 2, "I2994 history");
++    assert!(
++        versions.iter().any(|v| v.is_current && v.version == 2),
++        "I2994 version 2 is current: {versions:?}"
++    );
++
++    // I2995 — a fork is held as a tip (needs K1's federation_group_tips).
++    let fork = family(&g, "fork", "majority", &members);
++    for k in [&a, &b] {
++        let o = put(d, &roster(&fork, 2, Some(&v1_id), 4_000, k))
++            .await
++            .unwrap();
++        assert!(pending(&o), "I2995 short of unanimous: {o:?}");
++    }
++    let o = put(d, &roster(&fork, 2, Some(&v1_id), 4_000, &c))
++        .await
++        .unwrap();
++    assert!(landed(&o).is_some(), "I2995 met: {o:?}");
++    assert_eq!(
++        d.lookup_family(&gid).await.unwrap().unwrap().family_name,
++        "fam two",
++        "I2995 the head stays"
++    );
++    let tips = d.list_group_tips(Cohort::Family, &gid).await.unwrap();
++    assert_eq!(tips.len(), 1, "I2995 one tip: {tips:?}");
++    assert_eq!(
++        tips[0].prev_head_digest, held1.persist_row_hash,
++        "I2995 the tip names version 1"
++    );
++
++    // I2996 — an unheld head waits; the voice is not kept.
++    let v3 = family(&g, "fam three", "unanimous", &members);
++    let st = roster(&v3, 3, Some(&RowId([0x5a; 32])), 5_000, &a);
++    let e = put(d, &st).await.unwrap_err();
++    assert_eq!(
++        e.kind(),
++        "federation_withdraws_target_unheld",
++        "I2996 waits"
++    );
++    let id = RowId::of_statement(&st).unwrap();
++    assert!(
++        d.edition2_voices(&id).await.unwrap().is_empty(),
++        "I2996 not kept"
++    );
++
++    // I2997 — the version follows its head's.
++    let e = put(d, &roster(&v3, 5, Some(&v1_id), 5_000, &a))
++        .await
++        .unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_PAYLOAD_INVALID,
++        "I2997 version 5 after version 1"
++    );
++    let e = put(d, &roster(&v3, 2, None, 5_000, &a)).await.unwrap_err();
++    assert_eq!(
++        reason(&e),
++        malformed_row::EDITION2_PAYLOAD_INVALID,
++        "I2997 a later version with no refs.head"
++    );
++}
++
++/// I2998–I2999: counted membership changes on a family.
++pub(crate) async fn membership_body(d: &dyn FederationDirectory) {
++    let (a, b, c, n, g, g3) = (key(161), key(162), key(163), key(164), key(165), key(166));
++    register(d, &[&a, &b, &c, &n]).await;
++    let gid = iref(&g);
++    let f = family(&g, "fam", "majority", &[(&a, None), (&b, None), (&c, None)]);
++    let mut head = None;
++    for k in [&a, &b, &c] {
++        head = landed(&put(d, &roster(&f, 1, None, 2_000, k)).await.unwrap());
++    }
++    let head = head.expect("I2998 the family is founded");
++
++    // I2998 — a removal, counted at majority.
++    let removal = MembershipRecord::FamilyRemoval(FamilyMembershipRevocation {
++        family_key_id: gid.clone(),
++        removed_identity_key_id: iref(&c),
++        removed_at: at(5_000),
++        effective_at: at(5_000),
++        reason: None,
++        witness_set: Vec::new(),
++        persist_row_hash: String::new(),
++    });
++    let o = put(d, &membership(&removal, &head, &a)).await.unwrap();
++    assert!(pending(&o), "I2998 one of three: {o:?}");
++    assert!(
++        d.list_family_membership_revocations_for(&gid)
++            .await
++            .unwrap()
++            .is_empty(),
++        "I2998 short: no row"
++    );
++    // The meeting voice through the replicated door, under its offered id.
++    let st = membership(&removal, &head, &b);
++    let id = RowId::of_statement(&st).unwrap();
++    let o = apply_replicated_statement(d, &st, &id.0).await.unwrap();
++    assert!(
++        matches!(
++            o,
++            super::ingest::ReplicatedStatementOutcome::Admitted(StatementOutcome::Row { .. })
++        ),
++        "I2998 met on the replicated door: {o:?}"
++    );
++    let held = d
++        .list_family_membership_revocations_for(&gid)
++        .await
++        .unwrap();
++    assert_eq!(held.len(), 1, "I2998 landed");
++    assert_eq!(held[0].removed_identity_key_id, iref(&c), "I2998 member");
++    assert_eq!(
++        sorted(
++            d.active_family_members(&gid)
++                .await
++                .unwrap()
++                .into_iter()
++                .map(|m| m.key_id)
++                .collect()
++        ),
++        sorted(vec![iref(&a), iref(&b)]),
++        "I2998 the member left the roster"
++    );
++
++    // I2999 — a widening meets the growth gate (founder_only: a's voice
++    // alone has standing; no acceptance is held).
++    let gid3 = iref(&g3);
++    let f3 = family(
++        &g3,
++        "fam3",
++        "founder_only",
++        &[(&a, Some("founder")), (&b, None)],
++    );
++    let mut head3 = None;
++    for k in [&a, &b] {
++        head3 = landed(&put(d, &roster(&f3, 1, None, 2_000, k)).await.unwrap());
++    }
++    let head3 = head3.expect("I2999 founded");
++    let widening = MembershipRecord::FamilyWidening(FamilyMembershipWidening {
++        family_key_id: gid3.clone(),
++        member_key_id: iref(&n),
++        joined_at: at(6_000),
++        effective_at: at(6_000),
++        role: None,
++        persist_row_hash: String::new(),
++    });
++    let st = membership(&widening, &head3, &a);
++    let e = put(d, &st).await.unwrap_err();
++    assert!(
++        matches!(
++            &e,
++            Error::MembershipAcceptanceRefused { rule, .. }
++                if *rule == crate::federation::membership_acceptance::RULE_ACCEPTANCE_UNRESOLVED
++        ),
++        "I2999 the growth gate: {e:?}"
++    );
++    assert!(
++        d.edition2_voices(&RowId::of_statement(&st).unwrap())
++            .await
++            .unwrap()
++            .is_empty(),
++        "I2999 a refused voice is not kept"
++    );
++    assert!(
++        d.list_family_membership_widenings_for(&gid3)
++            .await
++            .unwrap()
++            .is_empty(),
++        "I2999 no row"
++    );
++}
++
++/// I3000: a community.
++pub(crate) async fn community_body(d: &dyn FederationDirectory) {
++    let (a, b, g) = (key(171), key(172), key(173));
++    register(d, &[&a, &b]).await;
++    let gid = iref(&g);
++    let c = GroupRecord::Community(Community {
++        community_key_id: gid.clone(),
++        community_name: "room".into(),
++        members: [(&a, Some("founder")), (&b, None)]
++            .iter()
++            .map(|(k, role)| CommunityMember {
++                key_id: iref(k),
++                joined_at: at(1_000),
++                role: role.map(str::to_owned),
++            })
++            .collect(),
++        founded_at: at(1_000),
++        consensus_protocol: "majority".into(),
++        policy_blob: None,
++        prev_head_digest: String::new(),
++        charter_digest: String::new(),
++        persist_row_hash: String::new(),
++    });
++    let o = put(d, &roster(&c, 1, None, 2_000, &a)).await.unwrap();
++    assert!(pending(&o), "I3000 founding short: {o:?}");
++    assert!(d.lookup_community(&gid).await.unwrap().is_none(), "I3000");
++    let o = put(d, &roster(&c, 1, None, 2_000, &b)).await.unwrap();
++    let head = landed(&o).unwrap_or_else(|| panic!("I3000 founded: {o:?}"));
++    let held = d
++        .lookup_community(&gid)
++        .await
++        .unwrap()
++        .expect("I3000 landed");
++    assert_eq!(held.community_name, "room", "I3000 name");
++
++    let removal = MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
++        community_key_id: gid.clone(),
++        removed_identity_key_id: iref(&b),
++        removed_at: at(5_000),
++        effective_at: at(5_000),
++        reason: None,
++        witness_set: Vec::new(),
++        persist_row_hash: String::new(),
++    });
++    let o = put(d, &membership(&removal, &head, &a)).await.unwrap();
++    assert!(pending(&o), "I3000 removal short of majority: {o:?}");
++    let o = put(d, &membership(&removal, &head, &b)).await.unwrap();
++    assert!(landed(&o).is_some(), "I3000 removal met: {o:?}");
++    let held = d
++        .list_community_membership_revocations_for(&gid)
++        .await
++        .unwrap();
++    assert_eq!(held.len(), 1, "I3000 the removal landed");
++}
++
++/// I3001–I3002: the roster while the head is forked (CC 2.7.8: "the roster
++/// is then the members common to all tips").
++pub(crate) async fn fork_roster_body(d: &dyn FederationDirectory) {
++    let (a, b, c, e, g, g2) = (key(181), key(182), key(183), key(184), key(185), key(186));
++    register(d, &[&a, &b, &c, &e]).await;
++    let active = |gid: String| async move {
++        sorted(
++            d.active_family_members(&gid)
++                .await
++                .unwrap()
++                .into_iter()
++                .map(|m| m.key_id)
++                .collect(),
++        )
++    };
++
++    // I3001 — a fork with an overlap: the common members, through the door.
++    let gid = iref(&g);
++    let abc = [(&a, None), (&b, None), (&c, None)];
++    let v1 = family(&g, "v1", "majority", &abc);
++    let mut v1_id = None;
++    for k in [&a, &b, &c] {
++        v1_id = landed(&put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap());
++    }
++    let v1_id = v1_id.expect("I3001 founded");
++    let head = family(&g, "head", "majority", &abc);
++    for k in [&a, &b] {
++        put(d, &roster(&head, 2, Some(&v1_id), 3_000, k))
++            .await
++            .unwrap();
++    }
++    assert_eq!(
++        d.lookup_family(&gid).await.unwrap().unwrap().family_name,
++        "head",
++        "I3001 the head moved"
++    );
++    assert_eq!(
++        active(gid.clone()).await,
++        sorted(vec![iref(&a), iref(&b), iref(&c)]),
++        "I3001 one head: its roster"
++    );
++    let fork = family(&g, "fork", "majority", &[(&a, None), (&b, None)]);
++    for k in [&a, &b] {
++        put(d, &roster(&fork, 2, Some(&v1_id), 4_000, k))
++            .await
++            .unwrap();
++    }
++    assert_eq!(
++        d.list_group_tips(Cohort::Family, &gid).await.unwrap().len(),
++        1,
++        "I3001 the fork is a tip"
++    );
++    assert_eq!(
++        active(gid.clone()).await,
++        sorted(vec![iref(&a), iref(&b)]),
++        "I3001 the roster is the members common to both tips"
++    );
++
++    // I3002 — a fork with disjoint members: an empty roster. The door's
++    // add rule (#955 Q2, judged against THIS node's head) never admits a tip
++    // listing a member the head does not, so the tip is held through the
++    // supersede executor K1's verdict writes (`supersede_group_row`): the
++    // read rule is what this witnesses.
++    let gid2 = iref(&g2);
++    let abce = [(&a, None), (&b, None), (&c, None), (&e, None)];
++    let w1 = family(&g2, "w1", "majority", &abce);
++    let mut w1_id = None;
++    for k in [&a, &b, &c, &e] {
++        w1_id = landed(&put(d, &roster(&w1, 1, None, 2_000, k)).await.unwrap());
++    }
++    let w1_id = w1_id.expect("I3002 founded");
++    let w1_hash = d
++        .lookup_family(&gid2)
++        .await
++        .unwrap()
++        .unwrap()
++        .persist_row_hash;
++    let ab = family(&g2, "ab", "majority", &[(&a, None), (&b, None)]);
++    for k in [&a, &b, &c] {
++        put(d, &roster(&ab, 2, Some(&w1_id), 3_000, k))
++            .await
++            .unwrap();
++    }
++    assert_eq!(
++        active(gid2.clone()).await,
++        sorted(vec![iref(&a), iref(&b)]),
++        "I3002 the head's roster"
++    );
++    let GroupRecord::Family(mut ce) = family(&g2, "ce", "majority", &[(&c, None), (&e, None)])
++    else {
++        unreachable!()
++    };
++    ce.prev_head_digest = w1_hash;
++    let snapshot = serde_json::to_value(crate::federation::types::SignedFamily {
++        family: ce,
++        authority_key_id: iref(&c),
++        scrub_signature_classical: String::new(),
++        scrub_signature_pqc: None,
++        supersede_proof: None,
++        cosignatures: Vec::new(),
++    })
++    .unwrap();
++    d.supersede_group_row(Cohort::Family, snapshot, None)
++        .await
++        .unwrap();
++    assert_eq!(
++        d.list_group_tips(Cohort::Family, &gid2)
++            .await
++            .unwrap()
++            .len(),
++        1,
++        "I3002 held as a tip"
++    );
++    assert!(
++        active(gid2.clone()).await.is_empty(),
++        "I3002 disjoint tips have no member in common"
++    );
++}
++
++/// I3003: a dissolution version lands (CIRISPersist#956). Its payload's
++/// `dissolved_at` rides the change envelope the door builds, so the door's
++/// own `check_dissolution_matches_envelope` reads it as the signed one.
++pub(crate) async fn dissolution_body(d: &dyn FederationDirectory) {
++    let (a, b, c, g) = (key(191), key(192), key(193), key(194));
++    register(d, &[&a, &b, &c]).await;
++    let gid = iref(&g);
++    let abc = [(&a, None), (&b, None), (&c, None)];
++    let v1 = family(&g, "to dissolve", "majority", &abc);
++    let mut v1_id = None;
++    for k in [&a, &b, &c] {
++        v1_id = landed(&put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap());
++    }
++    let v1_id = v1_id.expect("I3003 founded");
++    let GroupRecord::Family(mut f2) = family(&g, "to dissolve", "majority", &abc) else {
++        unreachable!()
++    };
++    f2.dissolved_at = Some(at(7_000));
++    let v2 = GroupRecord::Family(f2);
++    let o = put(d, &roster(&v2, 2, Some(&v1_id), 7_000, &a))
++        .await
++        .unwrap();
++    assert!(pending(&o), "I3003 one of three: {o:?}");
++    assert!(
++        d.lookup_family(&gid)
++            .await
++            .unwrap()
++            .unwrap()
++            .dissolved_at
++            .is_none(),
++        "I3003 short: not dissolved"
++    );
++    let o = put(d, &roster(&v2, 2, Some(&v1_id), 7_000, &b))
++        .await
++        .unwrap();
++    assert!(landed(&o).is_some(), "I3003 met: {o:?}");
++    let held = d.lookup_family(&gid).await.unwrap().unwrap();
++    assert_eq!(held.dissolved_at, Some(at(7_000)), "I3003 dissolved");
++    assert!(
++        d.active_family_members(&gid).await.unwrap().is_empty(),
++        "I3003 a dissolved family has no members"
++    );
++}
++
++/// I3004: a widening LANDS. The member's consent is held as edition-2 rows
++/// (E0's `proposal_row` / `acceptance_row`, flipped by the switch and put
++/// with `put_signed`); the founder's voice then meets `founder_only` and the
++/// growth gate, and the widening lands in
++/// `federation_family_membership_widenings`.
++pub(crate) async fn widening_body(d: &dyn FederationDirectory) {
++    use super::fixture_switch as e2;
++    use crate::federation::membership_acceptance::test_support::{acceptance_row, proposal_row};
++    let founder = e2::put_key(d, "t1-founder", &["user"]).await;
++    let other = e2::put_key(d, "t1-other", &["user"]).await;
++    let joiner = e2::put_key(d, "t1-joiner", &["user"]).await;
++    let (kf, ko) = (e2::signing_key("t1-founder"), e2::signing_key("t1-other"));
++    let g = key(195);
++    let gid = iref(&g);
++    let f = family(
++        &g,
++        "growing",
++        "founder_only",
++        &[(&kf, Some("founder")), (&ko, None)],
++    );
++    let mut head = None;
++    for k in [&kf, &ko] {
++        head = landed(&put(d, &roster(&f, 1, None, 2_000, k)).await.unwrap());
++    }
++    let head = head.expect("I3004 founded");
++    assert_eq!(
++        iref(&kf),
++        founder,
++        "I3004 the fixture key is the registered one"
++    );
++    assert_eq!(iref(&ko), other, "I3004");
++
++    let t = at(6_000);
++    let p = proposal_row("t1-founder", "family", &gid, &joiner, None, t);
++    e2::put_signed(d, &p).await.expect("I3004 proposal held");
++    let a = acceptance_row("t1-joiner", &p, t);
++    e2::put_signed(d, &a).await.expect("I3004 acceptance held");
++
++    let widening = MembershipRecord::FamilyWidening(FamilyMembershipWidening {
++        family_key_id: gid.clone(),
++        member_key_id: joiner.clone(),
++        joined_at: t,
++        effective_at: t,
++        role: None,
++        persist_row_hash: String::new(),
++    });
++    let o = put(d, &membership(&widening, &head, &kf)).await.unwrap();
++    assert!(landed(&o).is_some(), "I3004 the widening lands: {o:?}");
++    let held = d.list_family_membership_widenings_for(&gid).await.unwrap();
++    assert_eq!(held.len(), 1, "I3004 one widening");
++    assert_eq!(held[0].member_key_id, joiner, "I3004 the member");
++    assert!(
++        d.active_family_members(&gid)
++            .await
++            .unwrap()
++            .iter()
++            .any(|m| m.key_id == joiner),
++        "I3004 the member joined the roster"
++    );
++}
++
++/// I3005: a held fork HEALS (CC 2.7.8: "until a version naming the tips
++/// makes one head again"; a version is counted over the members of the heads
++/// it names). A merge naming the head (`refs.head`) and the tip
++/// (`refs.further_heads`) is counted over the members common to them: one
++/// voice of the two is short; both make it the head, and the tip leaves the
++/// tip store.
++pub(crate) async fn fork_heals_body(d: &dyn FederationDirectory) {
++    let (a, b, c, g) = (key(201), key(202), key(203), key(204));
++    register(d, &[&a, &b, &c]).await;
++    let gid = iref(&g);
++    let abc = [(&a, None), (&b, None), (&c, None)];
++    let ab = [(&a, None), (&b, None)];
++    let v1 = family(&g, "v1", "majority", &abc);
++    let mut v1_id = None;
++    for k in [&a, &b, &c] {
++        v1_id = landed(&put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap());
++    }
++    let v1_id = v1_id.expect("I3005 founded");
++    let head = family(&g, "head", "majority", &abc);
++    let mut head_id = None;
++    for k in [&a, &b] {
++        head_id = landed(
++            &put(d, &roster(&head, 2, Some(&v1_id), 3_000, k))
++                .await
++                .unwrap(),
++        );
++    }
++    let head_id = head_id.expect("I3005 the head");
++    let fork = family(&g, "fork", "majority", &ab);
++    let mut fork_id = None;
++    for k in [&a, &b] {
++        fork_id = landed(
++            &put(d, &roster(&fork, 2, Some(&v1_id), 4_000, k))
++                .await
++                .unwrap(),
++        );
++    }
++    let fork_id = fork_id.expect("I3005 the fork");
++    assert_eq!(
++        d.list_group_tips(Cohort::Family, &gid).await.unwrap().len(),
++        1,
++        "I3005 forked"
++    );
++
++    let merge = family(&g, "healed", "majority", &ab);
++    let voice = |k: &K| {
++        let p = super::group::roster_payload_merging(&merge, 3, Some(&head_id), &[fork_id], 5_000)
++            .unwrap();
++        sign(k, &gid, GROUP_ROSTER_PREFIX, &p)
++    };
++    let o = put(d, &voice(&a)).await.unwrap();
++    assert!(
++        pending(&o),
++        "I3005 one of the two common members is short: {o:?}"
++    );
++    assert_eq!(
++        d.lookup_family(&gid).await.unwrap().unwrap().family_name,
++        "head",
++        "I3005 short: still forked"
++    );
++    let o = put(d, &voice(&b)).await.unwrap();
++    assert!(landed(&o).is_some(), "I3005 the merge is met: {o:?}");
++    let held = d.lookup_family(&gid).await.unwrap().unwrap();
++    assert_eq!(held.family_name, "healed", "I3005 one head again");
++    assert!(
++        d.list_group_tips(Cohort::Family, &gid)
++            .await
++            .unwrap()
++            .is_empty(),
++        "I3005 the merged tip left the tip store"
++    );
++    assert_eq!(
++        sorted(
++            d.active_family_members(&gid)
++                .await
++                .unwrap()
++                .into_iter()
++                .map(|m| m.key_id)
++                .collect()
++        ),
++        sorted(vec![iref(&a), iref(&b)]),
++        "I3005 the merged head's roster"
++    );
++    // A version after the merge extends it (its chain reads through both
++    // parents of the merge).
++    let after = family(&g, "after", "majority", &ab);
++    let mut after_id = None;
++    for k in [&a, &b] {
++        after_id = landed(
++            &put(d, &roster(&after, 4, Some(&o_row(&o)), 6_000, k))
++                .await
++                .unwrap(),
++        );
++    }
++    assert!(after_id.is_some(), "I3005 a version extends the merge");
++    assert_eq!(
++        d.lookup_family(&gid).await.unwrap().unwrap().family_name,
++        "after",
++        "I3005 the head moved past the merge"
++    );
++}
++
++fn o_row(o: &StatementOutcome) -> RowId {
++    match o {
++        StatementOutcome::Row { row_id, .. } | StatementOutcome::Pending { row_id, .. } => *row_id,
++        other => panic!("not a group row: {other:?}"),
++    }
++}
++
++#[cfg(feature = "sqlite")]
++async fn sqlite() -> crate::store::sqlite::SqliteBackend {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    b
++}
++
++#[cfg(feature = "postgres")]
++async fn postgres() -> Option<crate::store::postgres::PostgresBackend> {
++    use crate::store::Backend as _;
++    let dsn = crate::test_pg::empty_dsn()?;
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    Some(b)
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2993_i2997_roster_versions_sqlite() {
++    Box::pin(roster_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2993_i2997_roster_versions_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(roster_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i2998_i2999_membership_sqlite() {
++    Box::pin(membership_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i2998_i2999_membership_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(membership_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3000_community_sqlite() {
++    Box::pin(community_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3000_community_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(community_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3001_i3002_fork_roster_sqlite() {
++    Box::pin(fork_roster_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3001_i3002_fork_roster_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(fork_roster_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3003_dissolution_sqlite() {
++    Box::pin(dissolution_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3003_dissolution_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(dissolution_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3004_widening_lands_sqlite() {
++    Box::pin(widening_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3004_widening_lands_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(widening_body(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3005_fork_heals_sqlite() {
++    Box::pin(fork_heals_body(&sqlite().await)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3005_fork_heals_postgres() {
++    let Some(b) = postgres().await else {
++        return;
++    };
++    Box::pin(fork_heals_body(&b)).await;
++}
+diff --git a/src/federation/edition2/ingest.rs b/src/federation/edition2/ingest.rs
+index 6704e435..a14d40ab 100644
+--- a/src/federation/edition2/ingest.rs
++++ b/src/federation/edition2/ingest.rs
+@@ -538,6 +538,18 @@ pub enum StatementOutcome {
+         /// Was the statement new.
+         new: bool,
+     },
++    /// v62.0.0 (wave T1, CC 2.6.1.9) — a voice of a COUNTED group row
++    /// (`group:roster`, `membership:{stage}` at `widening` / `removal`),
++    /// kept: the row's voices so far are short of its group's
++    /// `consensus_protocol`, or a founding roster lists a member who has not
++    /// voiced it yet. Nothing is in the typed table yet; a later voice
++    /// re-runs the door over all of them ([`super::group`]). APPENDED.
++    Pending {
++        /// The row id.
++        row_id: super::names::RowId,
++        /// Was the statement new.
++        new: bool,
++    },
+ }
+ 
+ /// **The one entry for an edition-2 statement**, local or replicated.
+@@ -593,6 +605,20 @@ where
+     };
+     // A composer names a held row of its own family (every plane).
+     check_composer_target(dir, &admitted).await?;
++    // v62.0.0 (wave T1) — the group planes: a `group:roster` version or a
++    // counted membership change lands in its typed table through the typed
++    // door, counted over every voice of the row (`edition2::group`).
++    if let Some(plane) =
++        super::group::group_plane_of(&admitted.row_type, &admitted.family, &admitted.payload)
++    {
++        return Box::pin(super::group::put_group_statement(
++            dir,
++            &admitted,
++            plane,
++            offered_id.is_some(),
++        ))
++        .await;
++    }
+     if admitted.family == KEY_RECORD_FAMILY || admitted.family == KEY_REVOCATION_FAMILY {
+         let new = dir.put_edition2_statement(&admitted).await?;
+         // v62.0.0 (slice J0) — the read models: the key this statement is
+@@ -695,7 +721,8 @@ where
+             let new = match &out {
+                 StatementOutcome::KeyPlane { new, .. }
+                 | StatementOutcome::Voice { new, .. }
+-                | StatementOutcome::Row { new, .. } => *new,
++                | StatementOutcome::Row { new, .. }
++                | StatementOutcome::Pending { new, .. } => *new,
+             };
+             Ok(if new {
+                 ReplicatedStatementOutcome::Admitted(out)
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 96060d48..a33e382b 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -19,6 +19,7 @@
+ //! | producing: an edition-2 row or object signed with persist's own composite signer | [`produce`] |
+ //! | the accord's halt and invocation door (one holder's statement latches; dedup by invocation_id / nonce) | [`halt`] |
+ //! | the payload members of each mapped family (the source of `docs/EDITION2_PAYLOADS.md`) | [`payloads`] |
++//! | the group planes: a `group:roster` version and a counted membership change judged by the typed group doors, counted over every voice (v62.0.0, wave T1) | [`group`] |
+ //!
+ //! **The rule this module keeps (CC 2.6.1.12).** A node of this form reads and
+ //! writes this form only. An object of the earlier form (CC 8.11, a JSON object
+@@ -32,6 +33,9 @@ pub mod door;
+ #[cfg(any(test, feature = "test-anchor"))]
+ pub mod fixture_switch;
+ pub mod genesis;
++pub mod group;
++#[cfg(any(test, feature = "test-anchor"))]
++pub mod group_fixtures;
+ pub mod halt;
+ pub mod ingest;
+ pub mod liveness;
+@@ -54,6 +58,10 @@ mod genesis_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod genesis_store_invariants;
+ #[cfg(test)]
++mod group_codec_invariants;
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod group_invariants;
++#[cfg(test)]
+ mod halt_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod ingest_invariants;
+diff --git a/src/federation/group_plane.rs b/src/federation/group_plane.rs
+index c0e4fb5e..a97449d3 100644
+--- a/src/federation/group_plane.rs
++++ b/src/federation/group_plane.rs
+@@ -1004,6 +1004,16 @@ where
+     if !dir.group_plane_present().await? {
+         return Ok(GroupRowSync::NotHeld);
+     }
++    // v62.0.0 (wave T1) — an edition-2 group statement's typed record mints
++    // no earlier-form row: its statements (`ceg_statements`) are its proof,
++    // so the projection's pointer is cleared.
++    if super::edition2::group::vouched() {
++        return Ok(if dir.link_group_plane_row(link, None).await? {
++            GroupRowSync::WithoutRow
++        } else {
++            GroupRowSync::NotHeld
++        });
++    }
+     let row = match dir.read_group_object(&link).await? {
+         Some(stored) => match offered {
+             Some(o) if o.link() == link && o.same_object_at_substrate(&stored) => {
+@@ -1043,6 +1053,14 @@ pub(crate) fn applying_replicated_group_row() -> bool {
+     REPLICATED_GROUP_ROW.try_with(|()| ()).is_ok()
+ }
+ 
++/// v62.0.0 (wave T1) — run `fut` as a REPLICATED group-plane row's typed
++/// door ([`applying_replicated_group_row`] reads `true`): the edition-2
++/// door's replicated statement (`edition2::group`) skips the gates that bind
++/// only the local door, exactly as [`apply_group_plane_row`] does.
++pub(crate) async fn as_replicated_group_row<T>(fut: impl std::future::Future<Output = T>) -> T {
++    REPLICATED_GROUP_ROW.scope((), fut).await
++}
++
+ /// Which door a group-plane row arrived through: a community record's door
+ /// decides on it whether the CC 3.2 infrastructure gate runs (#931).
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index 7d19bfe2..d5abdd85 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -2619,7 +2619,7 @@ where
+         .iter()
+         .map(family_member_as_roster_member)
+         .collect();
+-    Ok(authorized_roster_at(
++    let mut roster: Vec<types::FamilyMember> = authorized_roster_at(
+         &record,
+         RosterRules::of_family(family).with_persons(&persons),
+         &events,
+@@ -2627,7 +2627,20 @@ where
+     )
+     .into_iter()
+     .map(roster_member_as_family_member)
+-    .collect())
++    .collect();
++    // v62.0.0 (wave T1; CC 2.7.8) — while the head is forked, the roster is
++    // the members common to all tips.
++    if let Some(common) = Box::pin(edition2::group::forked_tip_members(
++        directory,
++        cohort::Cohort::Family,
++        &family.family_key_id,
++        &family.persist_row_hash,
++    ))
++    .await?
++    {
++        roster.retain(|m| common.contains(&m.key_id));
++    }
++    Ok(roster)
+ }
+ 
+ /// v49.0.0 (CIRISPersist#912) — the authorized roster of a STORED room at
+@@ -2655,9 +2668,13 @@ where
+     .await?;
+     let rules = RosterRules::of_community(community, &nodes).with_persons(&persons);
+     let spans = authorized_roster_spans_at(&community.members, rules, &events, as_of);
++    // v62.0.0 (wave T1; CC 2.7.8) — while the head is forked, the roster is
++    // the members common to all tips.
++    let common = Box::pin(community_forked_tip_members(directory, community)).await?;
+     Ok(
+         authorized_roster_at(&community.members, rules, &events, as_of)
+             .into_iter()
++            .filter(|m| common.as_ref().is_none_or(|c| c.contains(&m.key_id)))
+             .map(|m| {
+                 let start = spans.get(&m.key_id).copied().flatten();
+                 (m, start)
+@@ -2666,6 +2683,26 @@ where
+     )
+ }
+ 
++/// v62.0.0 (wave T1; CC 2.7.8) — [`edition2::group::forked_tip_members`]
++/// for a stored room, under the cohort its record declares (an
++/// affiliation's versions are `affiliations`).
++async fn community_forked_tip_members<F>(
++    directory: &F,
++    community: &Community,
++) -> Result<Option<std::collections::BTreeSet<String>>, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let cohort = affiliation_config::declared_cohort(community)?;
++    edition2::group::forked_tip_members(
++        directory,
++        cohort,
++        &community.community_key_id,
++        &community.persist_row_hash,
++    )
++    .await
++}
++
+ /// v49.0.0 (CIRISPersist#908, FSD §3) — the authorized roster of a STORED room
+ /// at `as_of`: the one fold every directory read uses.
+ pub async fn authorized_community_roster_at<F>(
+@@ -2690,12 +2727,18 @@ where
+     if reads.dissolved_at.is_some_and(|at| at <= as_of) {
+         return Ok(Vec::new());
+     }
+-    Ok(authorized_roster_at(
++    let mut roster = authorized_roster_at(
+         &community.members,
+         RosterRules::of_community(community, &reads.nodes).with_persons(&reads.persons),
+         &reads.events,
+         as_of,
+-    ))
++    );
++    // v62.0.0 (wave T1; CC 2.7.8) — while the head is forked, the roster is
++    // the members common to all tips.
++    if let Some(common) = Box::pin(community_forked_tip_members(directory, community)).await? {
++        roster.retain(|m| common.contains(&m.key_id));
++    }
++    Ok(roster)
+ }
+ 
+ /// v61.4.0 — the directory reads [`authorized_community_roster_at`] folds:
+@@ -8266,6 +8309,26 @@ pub trait FederationDirectory: Send + Sync {
+         group_key_id: &str,
+     ) -> Result<Vec<cohort::GroupVersion>, Error>;
+ 
++    /// v62.0.0 (wave T1; CC 2.7.8 "until a version naming the tips makes one
++    /// head again") — **the tips a merge made one head with leave the tip
++    /// store**: delete the `federation_group_tips` rows of `group_key_id`
++    /// under `cohort` whose `persist_row_hash` is in `persist_row_hashes`.
++    /// Idempotent; a hash held as no tip is no change. Called by the
++    /// edition-2 roster door ([`edition2::group`]) after a merge version
++    /// became the head. Storage only. Default = `Unsupported`; the sqlite and
++    /// postgres backends override.
++    async fn drop_group_tips(
++        &self,
++        cohort: cohort::Cohort,
++        group_key_id: &str,
++        persist_row_hashes: &[String],
++    ) -> Result<(), Error> {
++        let _ = (cohort, group_key_id, persist_row_hashes);
++        Err(Error::Unsupported {
++            method: "drop_group_tips",
++        })
++    }
++
+     /// #249 Cut G2 (§3) — supersede a family with new content (a re-baselined
+     /// roster and/or a new `consensus_protocol`) as a new version. Validates
+     /// the new `consensus_protocol` form, then composes
+@@ -8590,6 +8653,18 @@ pub trait FederationDirectory: Send + Sync {
+         let bytes = ag::accord_family_signing_bytes(change_envelope)
+             .map_err(|e| refuse(format!("canonicalize: {e}")))?;
+         let mut signers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
++        // v62.0.0 (wave T1) — an edition-2 roster version's quorum is its
++        // voices: the edition-2 door vouches for exactly this change envelope
++        // (`edition2::group::vouched_quorum_signers`), and each voice's
++        // statement was verified when it arrived. Counted only where the
++        // signer holds a prior seat, as a verified signature is below.
++        if let Some(vouched) = edition2::group::vouched_quorum_signers(change_envelope) {
++            for m in &prior_roster {
++                if vouched.contains(&m.member_id) {
++                    signers.insert(m.member_id.clone());
++                }
++            }
++        }
+         for sig in signatures {
+             let Some(member) = prior_roster.iter().find(|m| m.member_id == sig.member_id) else {
+                 continue;
+@@ -8644,9 +8719,12 @@ pub trait FederationDirectory: Send + Sync {
+             }) {
+                 consensus::Verdict::Admit => {}
+                 consensus::Verdict::Insufficient { detail, .. } => {
++                    // v62.0.0 (wave T1) — short, not refused, for an edition-2
++                    // roster version: its voices are kept until they meet it.
++                    edition2::group::note_short();
+                     return Err(refuse(format!(
+                         "consensus_protocol not met ({direction:?}): {detail}"
+-                    )))
++                    )));
+                 }
+                 consensus::Verdict::Unevaluable { reason } => {
+                     return Err(refuse(format!(
+diff --git a/src/federation/tier_ingest.rs b/src/federation/tier_ingest.rs
+index f2f9d6b8..f609d0ac 100644
+--- a/src/federation/tier_ingest.rs
++++ b/src/federation/tier_ingest.rs
+@@ -378,6 +378,19 @@ where
+         .map_err(|e| reject(format!("attestation_envelope canonicalize: {e}")))?;
+     let computed_hash = hex::encode(Sha256::digest(&canonical));
+ 
++    // v62.0.0 (wave T1) — an edition-2 group statement's typed record: the
++    // edition-2 door verified each voice's statement when it arrived, and
++    // vouches for exactly this envelope, this signer and this marker
++    // (`edition2::group::vouched_signature`). Any other signature, in the
++    // same task or not, is verified below as before.
++    if super::edition2::group::vouched_signature(
++        attesting_key_id,
++        &computed_hash,
++        scrub_signature_classical,
++    ) {
++        return Ok(computed_hash);
++    }
++
+     // (2) Resolve the attester's REGISTERED pubkeys — never pubkeys carried
+     // on the row alone. Unknown/unregistered attester ⇒ reject (fail-secure).
+     // v54.1.0 (CIRISPersist#1042) — typed as the ORDERING gap it is
+diff --git a/src/ffi/directory_capsule.rs b/src/ffi/directory_capsule.rs
+index 3b4dc81b..a2389a98 100644
+--- a/src/ffi/directory_capsule.rs
++++ b/src/ffi/directory_capsule.rs
+@@ -9789,6 +9789,11 @@ mod tests {
+         ("add_community_member", PRE_1162),
+         ("supersede_group_row", PRE_1162),
+         ("list_group_versions", PRE_1162),
++        (
++            "drop_group_tips",
++            "v62.0.0 (wave T1): the merge's tip retirement is the edition-2 \
++          roster door's own write; no DirectoryOp carries it",
++        ),
+         ("enter_mesh", PRE_1162),
+         ("put_accord_proposal", PRE_1162),
+         ("get_accord_proposal", PRE_1162),
+diff --git a/src/store/postgres.rs b/src/store/postgres.rs
+index ecf6cf56..26737417 100644
+--- a/src/store/postgres.rs
++++ b/src/store/postgres.rs
+@@ -11796,6 +11796,36 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+         .await
+     }
+ 
++    // v62.0.0 (wave T1; CC 2.7.8) — a merge's tips leave the tip store.
++    async fn drop_group_tips(
++        &self,
++        cohort: crate::federation::cohort::Cohort,
++        group_key_id: &str,
++        persist_row_hashes: &[String],
++    ) -> Result<(), crate::federation::Error> {
++        use crate::federation::cohort::Cohort;
++        use crate::federation::Error;
++        if cohort == Cohort::SelfId {
++            return Err(Error::InvalidArgument(
++                "drop_group_tips: the `self` cohort is not versioned".to_string(),
++            ));
++        }
++        let cohort_str = cohort.as_str();
++        let client = self
++            .get_client()
++            .await
++            .map_err(crate::store::Error::into_federation)?;
++        client
++            .execute(
++                "DELETE FROM cirislens.federation_group_tips \
++                 WHERE cohort = $1 AND group_key_id = $2 AND persist_row_hash = ANY($3)",
++                &[&cohort_str, &group_key_id, &persist_row_hashes],
++            )
++            .await
++            .map_err(|e| Error::Backend(format!("drop_group_tips: {e}")))?;
++        Ok(())
++    }
++
+     // #249 Cut G2 (§8) — full version chain: history rows + the live current.
+     async fn list_group_versions(
+         &self,
+diff --git a/src/store/sqlite.rs b/src/store/sqlite.rs
+index ae68f51a..30d3484c 100644
+--- a/src/store/sqlite.rs
++++ b/src/store/sqlite.rs
+@@ -5265,6 +5265,38 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+         .await
+     }
+ 
++    // v62.0.0 (wave T1; CC 2.7.8) — a merge's tips leave the tip store.
++    async fn drop_group_tips(
++        &self,
++        cohort: crate::federation::cohort::Cohort,
++        group_key_id: &str,
++        persist_row_hashes: &[String],
++    ) -> Result<(), crate::federation::Error> {
++        use crate::federation::cohort::Cohort;
++        use crate::federation::Error;
++        if cohort == Cohort::SelfId {
++            return Err(Error::InvalidArgument(
++                "drop_group_tips: the `self` cohort is not versioned".to_string(),
++            ));
++        }
++        let cs = cohort.as_str().to_owned();
++        let key = group_key_id.to_owned();
++        let hashes = persist_row_hashes.to_vec();
++        self.write(move |conn| -> Result<(), rusqlite::Error> {
++            let tx = conn.transaction()?;
++            for h in &hashes {
++                tx.execute(
++                    "DELETE FROM federation_group_tips \
++                     WHERE cohort = ?1 AND group_key_id = ?2 AND persist_row_hash = ?3",
++                    rusqlite::params![cs, key, h],
++                )?;
++            }
++            tx.commit()
++        })
++        .await
++        .map_err(|e| Error::Backend(format!("drop_group_tips: {e}")))
++    }
++
+     // #249 Cut G2 (§8) — full version chain: history rows + the live current.
+     async fn list_group_versions(
+         &self,
+diff --git a/src/store/sqlite_conn_model.rs b/src/store/sqlite_conn_model.rs
+index 559a85e6..f4e09036 100644
+--- a/src/store/sqlite_conn_model.rs
++++ b/src/store/sqlite_conn_model.rs
+@@ -437,6 +437,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+     // v62.0.0 (slice J0) — the edition-2 read models, the cross-form
+     // refusal's edition read, and the statement serve listing.
+     ("upsert_edition2_key_projection", ConnClass::Write),
++    // v62.0.0 (wave T1; CC 2.7.8) — a merge's tips leave the tip store.
++    ("drop_group_tips", ConnClass::Write),
+     ("key_edition", ConnClass::Read),
+     ("edition2_statements_since", ConnClass::Read),
+     // v61 (CIRISPersist#934, S4b) — the group supersede executor.

@@ -1,0 +1,2910 @@
+diff --git a/src/federation/key_grant_invariants.rs b/src/federation/key_grant_invariants.rs
+index 42d7e943..6d3e62a6 100644
+--- a/src/federation/key_grant_invariants.rs
++++ b/src/federation/key_grant_invariants.rs
+@@ -2,15 +2,26 @@
+ //! two-node witnesses, I59–I67.**
+ //!
+ //! "Two nodes" is two backends, each with its own signer and its own
+-//! content-KEM keyring, connected only by taking an envelope from one and
+-//! handing it to the other's apply door. No shared directory: every node
+-//! resolves every signer from its OWN `federation_keys`, exactly as a peer
+-//! would (CEG §0).
++//! content-KEM keyring, connected only by taking a statement from one and
++//! handing it to the other's replicated statement door. No shared
++//! directory: every node resolves every signer from its OWN key plane,
++//! exactly as a peer would (CEG §0).
+ //!
+ //! Generic over the backend so the same drive runs on sqlite and postgres —
+ //! the `#[cfg(test)]` wrappers at the bottom instantiate two (or three)
+ //! in-memory sqlite backends, and two (or three) `test_pg::empty_dsn()`
+ //! databases when the postgres feature and a test cluster are present.
++//!
++//! v62.0.0 (wave E11) — **edition 2 throughout.** Keys are E0 `key:record`
++//! statements named by kid; a community or family is its `group:roster`
++//! voices (T1) and a removal its `membership:removal` voices; a key grant is
++//! a `key_grant:{axis}` statement (T2) — the production emitters state it
++//! since cut B — and it crosses to a peer as that statement, through
++//! [`apply_replicated_statement`]; an owner binding is the owner's
++//! `delegates_to` statement plus the node's own voice; a signed occurrence
++//! is an O1 `identity:occurrence` bind (the identity authors it, the
++//! occurrence key gives its own voice). Node/agent-signed rows are dated
++//! now-relative (E0 v1.11).
+ 
+ /// The fixture and the exercises: [`Node`], the crossings
+ /// ([`carry_key_grant`](two_node::carry_key_grant),
+@@ -21,11 +32,17 @@ pub mod two_node {
+     use crate::federation::adopt_cascade::{adopt_sealed_blob, AdoptDisposition};
+     use crate::federation::at_rest_cascade::blob_invariants::{hold_ctx, node_signer};
+     use crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer;
++    use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
+     use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
++    use crate::federation::edition2::fixture_switch as e2;
++    use crate::federation::edition2::ingest::{
++        apply_replicated_statement, ReplicatedStatementOutcome, StatementOutcome,
++    };
++    use crate::federation::edition2::names::RowId;
+     use crate::federation::key_grant::{
+-        admit_replicated_key_grant, emit_content_key_grant_with_local_signer,
+-        emit_epoch_key_grant_with_local_signer, KeyGrantAdmission, KeyGrantAxis, KeyGrantEmission,
+-        KeyGrantRow, SignedKeyGrantRow,
++        emit_content_key_grant_with_local_signer, emit_epoch_key_grant_with_local_signer,
++        project_key_grant_row, KeyGrantAdmission, KeyGrantAxis, KeyGrantEmission,
++        KeyGrantProjection, KeyGrantRow, SignedKeyGrantRow,
+     };
+     use crate::federation::tier_ingest::test_support as ts;
+     use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY, SELF};
+@@ -43,7 +60,8 @@ pub mod two_node {
+         pub backend: &'a B,
+         /// The node's hybrid signer (the minter / author on this node).
+         pub signer: Arc<crate::signing::LocalSigner>,
+-        /// `signer.derived_key_id()` — the node's occurrence key everywhere.
++        /// `signer.federation_id()` (v62.0.0: the identity-ref of the
++        /// signer's composite key) — the node's occurrence key everywhere.
+         pub key: String,
+         /// This node's content-KEM identity: what a peer wraps to when it
+         /// wraps to this node's occurrence, and what only this node can open.
+@@ -57,7 +75,10 @@ pub mod two_node {
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+         let signer = node_signer(backend, alias).await;
+-        let key = signer.derived_key_id();
++        // v62.0.0 (cut B) — the node's federation id is its composite key's
++        // identity-ref (`kid(alias)`), the key every edition-2 row it signs
++        // names.
++        let key = signer.federation_id().await;
+         let id = backend
+             .load_or_init_content_kem_identity()
+             .await
+@@ -73,11 +94,6 @@ pub mod two_node {
+         }
+     }
+ 
+-    /// Every node learns every other node's derived key — the ONE piece of
+-    /// shared knowledge two real nodes have after a key-record exchange. The
+-    /// pubkeys are the alias's deterministic pair (`ts::hybrid_pubkeys`), so
+-    /// a signature made on one node verifies on the other against a row the
+-    /// other node registered itself.
+     /// A [`Node`] whose own key is registered on its backend under `role`
+     /// (`identity_type::NODE` when an owner binding must target it — #851).
+     /// The same construction as [`node`] (via `node_signer`), role aside.
+@@ -85,10 +101,11 @@ pub mod two_node {
+     where
+         B: BlobStorage + FederationDirectory + Sync,
+     {
++        // v62.0.0 — the alias's edition-2 `key:record` (`kid(alias)`), the key
++        // its LocalSigner signs as.
+         ts::register_hybrid_key_as(backend, alias, alias, role).await;
+         let signer = ts::local_signer(alias);
+-        let key = signer.derived_key_id();
+-        ts::register_hybrid_key_as(backend, &key, alias, role).await;
++        let key = signer.federation_id().await;
+         let id = backend
+             .load_or_init_content_kem_identity()
+             .await
+@@ -104,9 +121,12 @@ pub mod two_node {
+         }
+     }
+ 
+-    /// Register every node's key on every node as a USER (the historical
+-    /// fixture role). Use [`introduce_as`] with `identity_type::NODE` when an
+-    /// owner binding must target the key (#851).
++    /// Every node learns every other node's key — the ONE piece of shared
++    /// knowledge two real nodes have after a key-record exchange: each
++    /// alias's edition-2 `key:record` (`kid(alias)`), registered as a USER
++    /// (the historical fixture role). Use [`introduce_as`] with
++    /// `identity_type::NODE` when an owner binding must target the key
++    /// (#851).
+     pub async fn introduce<B>(nodes: &[&Node<'_, B>], aliases: &[&str])
+     where
+         B: BlobStorage + FederationDirectory + Sync,
+@@ -128,10 +148,238 @@ pub mod two_node {
+         }
+     }
+ 
++    /// v62.0.0 (E11) — POSIX ms of an instant (`e2::ms`).
++    pub fn ms(at: chrono::DateTime<chrono::Utc>) -> u64 {
++        e2::ms(at)
++    }
++
++    /// v62.0.0 (E11) — **the community `comm`'s founding roster** as one
++    /// `group:roster` version (T1): the authority's statement and each
++    /// listed member's voice, built ONCE so every node holds the same
++    /// version under the same row id (a later removal names it by
++    /// `refs.head`). `comm` and every member are seeds or E0 kids.
++    pub fn community_roster_voices<S: AsRef<str>>(
++        comm: &str,
++        name: &str,
++        members: &[S],
++    ) -> Vec<Vec<u8>> {
++        let now = chrono::Utc::now();
++        let signed = ts::sign_community(
++            comm,
++            crate::federation::types::Community {
++                prev_head_digest: String::new(),
++                charter_digest: String::new(),
++                community_key_id: comm.to_owned(),
++                community_name: name.to_owned(),
++                members: members
++                    .iter()
++                    .map(|k| crate::federation::types::CommunityMember {
++                        key_id: k.as_ref().to_owned(),
++                        joined_at: now,
++                        role: None,
++                    })
++                    .collect(),
++                founded_at: now,
++                consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
++                    .to_owned(),
++                policy_blob: None,
++                persist_row_hash: String::new(),
++            },
++        );
++        e2::community_voices(&signed, 1, None, ms(now))
++    }
++
++    /// v62.0.0 (E11) — **the family `fam`'s founding roster** (T1), as
++    /// [`community_roster_voices`].
++    pub fn family_roster_voices<S: AsRef<str>>(
++        fam: &str,
++        name: &str,
++        members: &[S],
++    ) -> Vec<Vec<u8>> {
++        let now = chrono::Utc::now();
++        let signed = ts::sign_family(
++            fam,
++            crate::federation::types::Family {
++                prev_head_digest: String::new(),
++                charter_digest: String::new(),
++                family_key_id: fam.to_owned(),
++                family_name: name.to_owned(),
++                members: members
++                    .iter()
++                    .map(|k| crate::federation::types::FamilyMember {
++                        key_id: k.as_ref().to_owned(),
++                        joined_at: now,
++                        role: None,
++                    })
++                    .collect(),
++                founded_at: now,
++                consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
++                    .to_owned(),
++                consensus_protocol_entrenched: false,
++                dissolved_at: None,
++                persist_row_hash: String::new(),
++            },
++        );
++        e2::family_voices(&signed, 1, None, ms(now))
++    }
++
++    /// v62.0.0 (E11) — **`member`'s removal from the community `comm`**: the
++    /// `membership:removal` voices (T1) naming the version `dir` holds as the
++    /// head, one per key in `signers` (seeds or kids; the departing member's
++    /// own voice among them, #908). Give every member a voice when the
++    /// protocol must be met outright.
++    ///
++    /// # Panics
++    /// `dir` holds no version of `comm`.
++    pub async fn community_removal_voices<D: FederationDirectory + ?Sized, S: AsRef<str>>(
++        dir: &D,
++        comm: &str,
++        member: &str,
++        removed_at: chrono::DateTime<chrono::Utc>,
++        effective_at: chrono::DateTime<chrono::Utc>,
++        signers: &[S],
++    ) -> Vec<Vec<u8>> {
++        let (head, _) = e2::held_head(dir, &e2::kid(comm))
++            .await
++            .unwrap_or_else(|| panic!("the community {comm} is held"));
++        let record = crate::federation::edition2::group::MembershipRecord::CommunityRemoval(
++            crate::federation::types::CommunityMembershipRevocation {
++                community_key_id: e2::kid(comm),
++                removed_identity_key_id: e2::kid(member),
++                removed_at,
++                effective_at,
++                reason: None,
++                witness_set: vec![],
++                persist_row_hash: String::new(),
++            },
++        );
++        let keys: Vec<_> = signers
++            .iter()
++            .map(|s| e2::signing_key(s.as_ref()))
++            .collect();
++        let refs: Vec<&_> = keys.iter().collect();
++        e2::membership_voices(&record, Some(&head), &refs)
++    }
++
++    /// v62.0.0 (E11) — **an owner binding, edition 2**: `owner`'s
++    /// `delegates_to(owner → node)` statement (the flipped
++    /// `owner_binding_attestation`, re-dated to `at` so a node-typed key's
++    /// own record covers it, E0 v1.11) and then the node's own voice over
++    /// the same payload. `owner` and `node` are seeds or E0 kids.
++    pub fn owner_binding_voices(
++        owner: &str,
++        node: &str,
++        at: chrono::DateTime<chrono::Utc>,
++    ) -> Vec<Vec<u8>> {
++        let id = format!("ob-{}", uuid::Uuid::new_v4().simple());
++        let mut earlier = e2::with_earlier_form(|| ts::owner_binding_attestation(&id, owner, node));
++        let at = crate::federation::admission::truncate_to_substrate_resolution(at);
++        earlier.asserted_at = at;
++        earlier.scrub_timestamp = at;
++        let row = e2::row_of(&earlier, owner);
++        let st = e2::carried_statement(&row).expect("an edition-2 owner binding");
++        let node_voice = e2::voice_of(&st, node);
++        vec![st, node_voice]
++    }
++
++    /// v62.0.0 (E11) — **statements cross to `to` as a peer delivers them**:
++    /// each through the replicated statement door
++    /// ([`apply_replicated_statement`]) under the row id its own bytes name.
++    /// A statement that waits on another (a bind's author voice before the
++    /// occurrence key's own; a voice before its key) is re-offered after the
++    /// others, as a replication loop retries a held cursor; the last
++    /// refusal of a statement that never lands is returned.
++    ///
++    /// # Errors
++    /// The door's refusal of a statement that never landed.
++    pub async fn deliver_statements<D: FederationDirectory + ?Sized>(
++        to: &D,
++        statements: &[Vec<u8>],
++    ) -> Result<Vec<ReplicatedStatementOutcome>, Error> {
++        let mut pending: Vec<&Vec<u8>> = statements.iter().collect();
++        let mut out = Vec::with_capacity(statements.len());
++        loop {
++            let landed_before = out.len();
++            let mut waiting = Vec::new();
++            let mut last_err = None;
++            for st in pending {
++                let id = RowId::of_statement(st).ok_or_else(|| {
++                    Error::InvalidArgument("key_grant_invariants: not a row statement".into())
++                })?;
++                match Box::pin(apply_replicated_statement(to, st, &id.0)).await {
++                    Ok(o) => out.push(o),
++                    Err(e) => {
++                        waiting.push(st);
++                        last_err = Some(e);
++                    }
++                }
++            }
++            if waiting.is_empty() {
++                return Ok(out);
++            }
++            if out.len() == landed_before {
++                // A pass that landed nothing: what still waits never will.
++                return Err(last_err.expect("a waiting statement carries its refusal"));
++            }
++            pending = waiting;
++        }
++    }
++
++    /// v62.0.0 (E11) — **the O1 `identity:occurrence` bind statements `dir`
++    /// holds for `identity`**, as its signed listing serves them
++    /// (`signed_envelope["ceg_statements"]`, every voice): what a peer
++    /// pulls to learn the identity's occurrences.
++    pub async fn bind_statements_for<D: FederationDirectory + ?Sized>(
++        dir: &D,
++        identity: &str,
++    ) -> Vec<Vec<u8>> {
++        let mut out = Vec::new();
++        for occ in dir
++            .list_signed_identity_occurrences_for(identity)
++            .await
++            .expect("the signed occurrence listing")
++        {
++            if let Some(all) = occ
++                .signed_envelope
++                .get("ceg_statements")
++                .and_then(serde_json::Value::as_array)
++            {
++                for h in all.iter().filter_map(serde_json::Value::as_str) {
++                    out.push(hex::decode(h).expect("a statement is hex"));
++                }
++            }
++        }
++        out
++    }
++
++    /// The content-KEM pubkeys as an O1 bind's `encryption_pubkeys` member
++    /// (`{x25519: bstr32, ml_kem_768: bstr1184}`).
++    pub fn encryption_member(
++        kem: &EncryptionPubkeys,
++    ) -> (&'static str, ciris_verify_core::cde::Value) {
++        use base64::Engine as _;
++        use ciris_verify_core::cde::{self, Value};
++        let b = |s: &str| {
++            Value::Bytes(
++                base64::engine::general_purpose::STANDARD
++                    .decode(s)
++                    .expect("a base64 KEM pubkey"),
++            )
++        };
++        let mut m = vec![
++            (Value::Text("ml_kem_768".into()), b(&kem.ml_kem_768_base64)),
++            (Value::Text("x25519".into()), b(&kem.x25519_base64)),
++        ];
++        m.sort_by_key(|(k, _)| cde::encode(k));
++        ("encryption_pubkeys", Value::Map(m))
++    }
++
+     /// Seed the same community on every node: the community key, each
+     /// member identity, and each member's occurrence = the member's NODE
+-    /// (its derived key, with the node's content-KEM pubkeys). A member
+-    /// with `None` node is on the roster with no occurrence anywhere.
++    /// (its derived key, with the node's content-KEM pubkeys; a trusted-local
++    /// write on each node). A member with `None` node is on the roster with
++    /// no occurrence anywhere. v62.0.0: the roster is ONE `group:roster`
++    /// version (T1) put on every node, so its row id is the same everywhere.
+     pub async fn seed_community_everywhere<B>(
+         nodes: &[&Node<'_, B>],
+         comm: &str,
+@@ -139,6 +387,8 @@ pub mod two_node {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync,
+     {
++        let names: Vec<&str> = members.iter().map(|(ident, _)| *ident).collect();
++        let voices = community_roster_voices(comm, "Two-node Co-op", &names);
+         for n in nodes {
+             ts::register_hybrid_key_as(n.backend, comm, comm, USER).await;
+             for (ident, occ) in members {
+@@ -147,7 +397,7 @@ pub mod two_node {
+                     n.backend
+                         .put_identity_occurrence_local(
+                             crate::federation::types::IdentityOccurrence {
+-                                identity_key_id: (*ident).to_owned(),
++                                identity_key_id: e2::kid(ident),
+                                 occurrence_key_id: o.key.clone(),
+                                 device_class: crate::federation::types::device_class::LAPTOP.into(),
+                                 hardware_attestation: None,
+@@ -162,38 +412,18 @@ pub mod two_node {
+                         .unwrap_or_else(|e| panic!("occurrence {} of {ident}: {e}", o.key));
+                 }
+             }
+-            let roster = members
+-                .iter()
+-                .map(|(ident, _)| crate::federation::types::CommunityMember {
+-                    key_id: (*ident).to_owned(),
+-                    joined_at: chrono::Utc::now(),
+-                    role: None,
+-                })
+-                .collect();
+-            n.backend
+-                .put_community(ts::sign_community(
+-                    comm,
+-                    crate::federation::types::Community {
+-                        prev_head_digest: String::new(),
+-                        charter_digest: String::new(),
+-                        community_key_id: comm.to_owned(),
+-                        community_name: "Two-node Co-op".into(),
+-                        members: roster,
+-                        founded_at: chrono::Utc::now(),
+-                        consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+-                            .to_owned(),
+-                        policy_blob: None,
+-                        persist_row_hash: String::new(),
+-                    },
+-                ))
++            // v62.0.0 (T1) — the room is its `group:roster` voices (the
++            // authority and every listed member), on every node.
++            e2::put_voices(n.backend, &voices)
+                 .await
+                 .unwrap_or_else(|e| panic!("seed community {comm}: {e}"));
+         }
+     }
+ 
+     /// The wire crossing for ONE row: take the row `attestation_id` stored on
+-    /// `from` and hand it to `to`'s apply door, whoever it is for (a relay
+-    /// that forwards what it holds). Nothing else moves.
++    /// `from` and hand its statement to `to`'s replicated statement door,
++    /// whoever it is for (a relay that forwards what it holds). Nothing else
++    /// moves.
+     pub async fn carry_key_grant<B>(
+         from: &Node<'_, B>,
+         to: &Node<'_, B>,
+@@ -208,15 +438,16 @@ pub mod two_node {
+             .await
+             .expect("read the emitted row")
+             .expect("the emitted row exists on the emitter");
+-        admit_replicated_key_grant(to.backend, SignedKeyGrantRow { attestation: row }).await
++        admit_replicated(to.backend, SignedKeyGrantRow { attestation: row }).await
+     }
+ 
+     /// v55.0.0 (#989) — **the wire crossing through the plane**: every row
+     /// `emission` names that `from`'s serve gate
+     /// ([`may_receive`](crate::federation::replication_audience::may_receive),
+-    /// on `from`'s own directory) would send to `to`, each through `to`'s
+-    /// apply door. A row for another recipient does not cross: a key-grant
+-    /// row reaches its recipient's node and no other (CC 6.1.5.3).
++    /// on `from`'s own directory) would send to `to`, each as its statement
++    /// through `to`'s replicated statement door. A row for another recipient
++    /// does not cross: a key-grant row reaches its recipient's node and no
++    /// other (CC 6.1.5.3).
+     pub async fn carry_key_grants<B>(
+         from: &Node<'_, B>,
+         to: &Node<'_, B>,
+@@ -239,19 +470,73 @@ pub mod two_node {
+             {
+                 continue;
+             }
+-            out.push(
+-                admit_replicated_key_grant(to.backend, SignedKeyGrantRow { attestation: row })
+-                    .await?,
+-            );
++            out.push(admit_replicated(to.backend, SignedKeyGrantRow { attestation: row }).await?);
+         }
+         Ok(out)
+     }
+ 
++    /// v62.0.0 (E11) — **admit one replicated key-grant row as its
++    /// statement**: the `key_grant:{axis}` statement the row carries
++    /// (`ceg_statement`) through `to`'s replicated statement door
++    /// ([`apply_replicated_statement`]), which runs the edition-2 door, the
++    /// attestation plane's gates (the key-grant rule among them) and the
++    /// grant projection (T2). Reported as the earlier door reported it: the
++    /// plane's outcome, and whether the wrap is projected or pending
++    /// ([`project_key_grant_row`] re-run over the stored row, a union). A
++    /// store-conflict refusal is `attestation_refused`, typed.
++    ///
++    /// # Errors
++    /// The door's and the gates' refusals.
++    ///
++    /// # Panics
++    /// A row that carries no statement.
++    pub async fn admit_replicated<B>(
++        to: &B,
++        signed: SignedKeyGrantRow,
++    ) -> Result<KeyGrantAdmission, Error>
++    where
++        B: BlobStorage + FederationDirectory + Sync,
++    {
++        let row = signed.attestation;
++        let parsed = KeyGrantRow::from_attestation(&row)?;
++        let st = e2::carried_statement(&row).unwrap_or_else(|| {
++            panic!(
++                "an edition-2 key-grant row carries its statement: {}",
++                row.attestation_id
++            )
++        });
++        let offered = e2::rid_digest(&row);
++        let attestation = match Box::pin(apply_replicated_statement(to, &st, &offered)).await? {
++            ReplicatedStatementOutcome::Admitted(_) => ReplicatedAttestationOutcome::Inserted,
++            ReplicatedStatementOutcome::Unchanged(_) => ReplicatedAttestationOutcome::Unchanged,
++            ReplicatedStatementOutcome::Refused { reason } => {
++                return Err(Error::KeyGrantRefused {
++                    reason: "attestation_refused",
++                    detail: format!("the statement door refused the row: {reason:?}"),
++                    attestation_reason: Some(reason),
++                });
++            }
++        };
++        let stored = to
++            .get_attestation(&e2::rid(&row))
++            .await?
++            .unwrap_or_else(|| panic!("the admitted key-grant row {} is stored", e2::rid(&row)));
++        let projection = project_key_grant_row(to, &stored).await?;
++        Ok(KeyGrantAdmission {
++            recipient_key_id: parsed.wrap.recipient_key_id.clone(),
++            axis: parsed.axis,
++            attestation,
++            projected: matches!(projection, KeyGrantProjection::Projected { .. }),
++            pending: projection == KeyGrantProjection::Pending,
++        })
++    }
++
+     /// v55.0.0 (#989) — **the key-grant rows `signer` emitted that the plane
+     /// delivers to `recipient`**, read off `dir`'s replication cursor and
+     /// kept by its serve gate
+     /// ([`may_receive`](crate::federation::replication_audience::may_receive)):
+-    /// what a host hands `recipient`'s apply door.
++    /// what a host hands `recipient`'s apply door. v62.0.0: each row carries
++    /// its `key_grant:{axis}` statement; [`admit_replicated`] delivers it.
+     pub async fn key_grant_rows_for<D>(
+         dir: &D,
+         signer: &str,
+@@ -365,18 +650,23 @@ pub mod two_node {
+         row: &KeyGrantRow,
+         at: chrono::DateTime<chrono::Utc>,
+     ) -> SignedKeyGrantRow {
+-        let key = signer.derived_key_id();
+-        let mut input = row.emit_input().expect("emit input");
+-        let canonical = crate::federation::attestation_emit::stamp_and_canonicalize(
+-            &mut input,
+-            &key,
+-            crate::federation::admission::truncate_to_substrate_resolution(at),
++        // v62.0.0 (T2) — an edition-2 `key_grant:{axis}` statement by the
++        // signer's key (its identity-ref resolves to the E0 seed it was
++        // minted from), mapped to the row a host carries.
++        let (_, iref) = crate::federation::edition2::produce::signer_identity(signer)
++            .await
++            .expect("a composite signer");
++        let at_ms = u64::try_from(
++            crate::federation::admission::truncate_to_substrate_resolution(at).timestamp_millis(),
+         )
+-        .expect("canonicalize");
+-        let sig = signer.sign_hybrid(&canonical).await.expect("hybrid sign");
+-        let (row, _) = crate::federation::attestation_emit::assemble(key, &canonical, sig, input)
+-            .expect("assemble");
+-        SignedKeyGrantRow { attestation: row }
++        .expect("after the epoch");
++        let st = e2::key_grant_statement(&e2::seed_of(&iref), row, at_ms);
++        SignedKeyGrantRow {
++            attestation: e2::row_of_statement(
++                &st,
++                crate::federation::types::attestation_tier::FEDERATION,
++            ),
++        }
+     }
+ 
+     /// The row this node holds for `axis` to `recipient`, as a [`KeyGrantRow`].
+@@ -406,6 +696,15 @@ pub mod two_node {
+         }
+     }
+ 
++    /// v62.0.0 (E11) — a refusal's token: a malformed-row refusal's reason,
++    /// else the error's kind.
++    fn token_of(e: &Error) -> &'static str {
++        match e {
++            Error::MalformedRow { reason, .. } => reason,
++            other => other.kind(),
++        }
++    }
++
+     // ── I60 ──────────────────────────────────────────────────────────────
+     /// **A `KeyGrant` whose signer is not the set's minter, or not an active
+     /// member of the community at `asserted_at`, is refused at admission;
+@@ -415,15 +714,15 @@ pub mod two_node {
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let comm = format!("{tag}-comm-{run}");
+-        let alice = format!("{tag}-alice-{run}");
+-        let bob = format!("{tag}-bob-{run}");
++        let comm = e2::kid(&format!("{tag}-comm-{run}"));
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let bob = e2::kid(&format!("{tag}-bob-{run}"));
+         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+ 
+         // Mallory: a registered key on BOTH nodes, a member of nothing.
+         let mallory_alias = format!("{tag}-mallory-{run}");
+         let mallory = node_signer(a.backend, &mallory_alias).await;
+-        let mallory_key = mallory.derived_key_id();
++        let mallory_key = mallory.federation_id().await;
+         ts::register_hybrid_key_as(b.backend, &mallory_key, &mallory_alias, USER).await;
+ 
+         // A mints (C, A, 0) and wraps to both nodes' occurrences.
+@@ -442,7 +741,7 @@ pub mod two_node {
+ 
+         // (1) Mallory signs A's row, claiming A's counter.
+         let forged = sign_row_unstored(&mallory, &honest).await;
+-        let err = admit_replicated_key_grant(b.backend, forged)
++        let err = admit_replicated(b.backend, forged)
+             .await
+             .expect_err("a row signed by someone other than its minter must be refused");
+         assert_eq!(
+@@ -461,7 +760,7 @@ pub mod two_node {
+             },
+             wrap: honest.wrap.clone(),
+         };
+-        let err = admit_replicated_key_grant(b.backend, sign_row_unstored(&mallory, &own).await)
++        let err = admit_replicated(b.backend, sign_row_unstored(&mallory, &own).await)
+             .await
+             .expect_err("a non-member's row must be refused");
+         assert_eq!(
+@@ -473,7 +772,7 @@ pub mod two_node {
+         // (3) A wrap that is not v2, signed by the honest minter.
+         let mut v1 = honest.clone();
+         v1.wrap.wrap_algorithm = "v1".into();
+-        let err = admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &v1).await)
++        let err = admit_replicated(b.backend, sign_row_unstored(&a.signer, &v1).await)
+             .await
+             .expect_err("a non-v2 wrap must be refused");
+         assert_eq!(
+@@ -492,7 +791,7 @@ pub mod two_node {
+             },
+             wrap: honest.wrap.clone(),
+         };
+-        let err = admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &ghost).await)
++        let err = admit_replicated(b.backend, sign_row_unstored(&a.signer, &ghost).await)
+             .await
+             .expect_err("a row for an unknown community must be refused");
+         assert_eq!(
+@@ -505,10 +804,9 @@ pub mod two_node {
+         //     occurrence of any member: the recipient rule refuses it.
+         let mut stranger = honest.clone();
+         stranger.wrap.recipient_key_id = mallory_key.clone();
+-        let err =
+-            admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &stranger).await)
+-                .await
+-                .expect_err("a wrap to a non-member must be refused");
++        let err = admit_replicated(b.backend, sign_row_unstored(&a.signer, &stranger).await)
++            .await
++            .expect_err("a wrap to a non-member must be refused");
+         assert_eq!(
+             refusal_reason(&err),
+             "recipient_not_in_audience",
+@@ -548,9 +846,9 @@ pub mod two_node {
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let comm = format!("{tag}-comm-{run}");
+-        let alice = format!("{tag}-alice-{run}");
+-        let bob = format!("{tag}-bob-{run}");
++        let comm = e2::kid(&format!("{tag}-comm-{run}"));
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let bob = e2::kid(&format!("{tag}-bob-{run}"));
+         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+ 
+         // A seals under (C, A, 0) — the fan-out wraps to B's occurrence
+@@ -711,9 +1009,9 @@ pub mod two_node {
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let comm = format!("{tag}-comm-{run}");
+-        let alice = format!("{tag}-alice-{run}");
+-        let bob = format!("{tag}-bob-{run}");
++        let comm = e2::kid(&format!("{tag}-comm-{run}"));
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let bob = e2::kid(&format!("{tag}-bob-{run}"));
+         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+         let sealed = encrypt_and_cascade_community(a.backend, &comm, b"v1", None, Some(&a.key))
+             .await
+@@ -764,10 +1062,9 @@ pub mod two_node {
+         let mut rewrap = KeyGrantRow::from_attestation(&to_b).unwrap();
+         rewrap.wrap.wrapped_dek =
+             "{\"algorithm\":\"x25519_mlkem768_aes256_gcm_hkdf_sha256\"}".into();
+-        let later =
+-            admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &rewrap).await)
+-                .await
+-                .unwrap_or_else(|e| panic!("{tag} I62: a re-wrap is admitted: {e}"));
++        let later = admit_replicated(b.backend, sign_row_unstored(&a.signer, &rewrap).await)
++            .await
++            .unwrap_or_else(|e| panic!("{tag} I62: a re-wrap is admitted: {e}"));
+         assert!(later.projected, "{tag} I62: {later:?}");
+         assert_eq!(
+             b.backend
+@@ -783,10 +1080,9 @@ pub mod two_node {
+         // nothing: refused at the gate (`recipient_not_in_audience`).
+         let mut outside = rewrap.clone();
+         outside.wrap.recipient_key_id = format!("{tag}-late-occ-{run}");
+-        let err =
+-            admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &outside).await)
+-                .await
+-                .expect_err("a wrap to a non-occurrence is refused");
++        let err = admit_replicated(b.backend, sign_row_unstored(&a.signer, &outside).await)
++            .await
++            .expect_err("a wrap to a non-occurrence is refused");
+         assert_eq!(refusal_reason(&err), "recipient_not_in_audience");
+         assert_eq!(
+             b.backend
+@@ -830,10 +1126,10 @@ pub mod two_node {
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let comm = format!("{tag}-comm-{run}");
+-        let alice = format!("{tag}-alice-{run}");
+-        let bob = format!("{tag}-bob-{run}");
+-        let xavier = format!("{tag}-xavier-{run}");
++        let comm = e2::kid(&format!("{tag}-comm-{run}"));
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let bob = e2::kid(&format!("{tag}-bob-{run}"));
++        let xavier = e2::kid(&format!("{tag}-xavier-{run}"));
+         // X has an occurrence on A's node (it is A's device that X uses);
+         // what matters is X is on the roster and gets wrapped to.
+         seed_community_everywhere(
+@@ -843,7 +1139,7 @@ pub mod two_node {
+         )
+         .await;
+         // Give X an occurrence with keys on both nodes so B wraps to it.
+-        let x_occ = format!("{tag}-x-occ-{run}");
++        let x_occ = e2::kid(&format!("{tag}-x-occ-{run}"));
+         for n in [a, b] {
+             ts::register_hybrid_key_as(n.backend, &x_occ, &x_occ, USER).await;
+             crate::federation::at_rest_cascade::blob_invariants::join_as_occurrence(
+@@ -876,24 +1172,25 @@ pub mod two_node {
+             removed_at >= e0_minted,
+             "{tag} I63: the removal is newer than the mint"
+         );
+-        let rev = ts::sign_community_membership_revocation(
+-            &xavier, /* v49.0.0 (#908): the member leaves on their own signature */
+-            crate::federation::types::CommunityMembershipRevocation {
+-                community_key_id: comm.clone(),
+-                removed_identity_key_id: xavier.clone(),
+-                removed_at,
+-                effective_at: removed_at,
+-                reason: None,
+-                witness_set: vec![],
+-                persist_row_hash: String::new(),
+-            },
+-        );
+-        a.backend
+-            .put_community_membership_revocation(rev.clone())
+-            .await
+-            .unwrap();
+-        b.backend
+-            .put_community_membership_revocation(rev)
++        // v62.0.0 (T1) — the removal is its `membership:removal` voices
++        // naming the held roster version: X's own (v49.0.0, #908: the member
++        // leaves on their own signature) and the other members', so the
++        // community's majority is met outright. Put on A, then DELIVERED to B
++        // through B's replicated statement door.
++        let rev = community_removal_voices(
++            a.backend,
++            &comm,
++            &xavier,
++            removed_at,
++            removed_at,
++            &[&xavier, &alice, &bob],
++        )
++        .await;
++        match e2::put_voices(a.backend, &rev).await {
++            Ok(StatementOutcome::Row { .. }) => {}
++            other => panic!("{tag} I63: A holds the removal: {other:?}"),
++        }
++        deliver_statements(b.backend, &rev)
+             .await
+             .unwrap_or_else(|e| panic!("{tag} I63: B admits A's revocation: {e}"));
+ 
+@@ -951,10 +1248,10 @@ pub mod two_node {
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let comm = format!("{tag}-comm-{run}");
+-        let alice = format!("{tag}-alice-{run}");
+-        let bob = format!("{tag}-bob-{run}");
+-        let carol = format!("{tag}-carol-{run}");
++        let comm = e2::kid(&format!("{tag}-comm-{run}"));
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let bob = e2::kid(&format!("{tag}-bob-{run}"));
++        let carol = e2::kid(&format!("{tag}-carol-{run}"));
+         seed_community_everywhere(
+             &[a, b, c],
+             &comm,
+@@ -1114,7 +1411,7 @@ pub mod two_node {
+             }
+         }
+         let row = row.expect("A's self-axis row names A's key");
+-        let got = admit_replicated_key_grant(
++        let got = admit_replicated(
+             b.backend,
+             SignedKeyGrantRow {
+                 attestation: row.clone(),
+@@ -1125,7 +1422,7 @@ pub mod two_node {
+             panic!("{tag} I1519: a node hosting an occurrence of the recipient admits: {e}")
+         });
+         assert_eq!(got.recipient_key_id, a.key, "{tag} I1519");
+-        let err = admit_replicated_key_grant(
++        let err = admit_replicated(
+             c.backend,
+             SignedKeyGrantRow {
+                 attestation: row.clone(),
+@@ -1138,49 +1435,44 @@ pub mod two_node {
+             "recipient_not_in_audience",
+             "{tag} I1519: {err}"
+         );
+-        // v61.0.1 (CIRISPersist#1184) — a refusal by the attestation plane is
+-        // carried TYPED. A copy of the admitted row under its own id with its
+-        // wrap's ciphertext altered is a different attestation under a held
+-        // id, which the plane refuses as conflicting before it reads a
+-        // signature. The variant rides on the error, so no host reads it out
+-        // of the message.
+-        let mut altered = row.clone();
+-        let mut wrap: serde_json::Value = serde_json::from_str(
+-            altered.attestation_envelope["wrapped_dek"]
+-                .as_str()
+-                .expect("a wrapped_dek string"),
+-        )
+-        .expect("the wrap is JSON");
++        // v61.0.1 (CIRISPersist#1184), v62.0.0 (E11) — a different row
++        // offered under a HELD id is refused, typed, before anything is
++        // stored. In edition 2 a row's id is the one this node computes from
++        // the statement's bytes (CC 2.6.1.3): A's own re-signed wrap with its
++        // ciphertext altered is a different statement, and a peer offering it
++        // under the id of the row B holds is refused `row_id_mismatch`, so no
++        // host reads the cause out of the message.
++        let mut altered = KeyGrantRow::from_attestation(&row).expect("a key-grant row");
++        let mut wrap: serde_json::Value =
++            serde_json::from_str(&altered.wrap.wrapped_dek).expect("the wrap is JSON");
+         wrap["ciphertext_b64"] = serde_json::json!(base64::Engine::encode(
+             &base64::engine::general_purpose::STANDARD,
+             [0u8; 48]
+         ));
+-        altered.attestation_envelope["wrapped_dek"] = serde_json::json!(wrap.to_string());
+-        let err = admit_replicated_key_grant(
+-            b.backend,
+-            SignedKeyGrantRow {
+-                attestation: altered,
+-            },
+-        )
+-        .await
+-        .expect_err("a different attestation under a held id");
+-        match &err {
+-            Error::KeyGrantRefused {
+-                reason,
+-                attestation_reason,
+-                ..
+-            } => {
+-                assert_eq!(*reason, "attestation_refused", "{tag} I1519: {err}");
+-                assert_eq!(
+-                    *attestation_reason,
+-                    Some(
+-                        crate::federation::attestation_apply::AttestationRefusalReason::ConflictingAttestation
+-                    ),
+-                    "{tag} I1519 (#1184): the plane's refusal is typed: {err}"
+-                );
+-            }
+-            other => panic!("{tag} I1519 (#1184): expected KeyGrantRefused, got {other:?}"),
+-        }
++        altered.wrap.wrapped_dek = wrap.to_string();
++        let altered = sign_row_unstored(&a.signer, &altered).await.attestation;
++        let altered_st = e2::carried_statement(&altered).expect("an edition-2 row");
++        assert_ne!(
++            e2::rid(&altered),
++            e2::rid(&row),
++            "{tag} I1519: a different row"
++        );
++        let err = apply_replicated_statement(b.backend, &altered_st, &e2::rid_digest(&row))
++            .await
++            .expect_err("a different row under a held id");
++        assert_eq!(
++            token_of(&err),
++            crate::federation::malformed_row::EDITION2_ROW_ID_MISMATCH,
++            "{tag} I1519 (#1184): the refusal is typed: {err}"
++        );
++        assert!(
++            b.backend
++                .get_attestation(&e2::rid(&altered))
++                .await
++                .unwrap()
++                .is_none(),
++            "{tag} I1519: nothing is stored under the offered or the computed id"
++        );
+     }
+ 
+     /// **Content axis**: the owner's second occurrence on B opens a self blob
+@@ -1194,7 +1486,7 @@ pub mod two_node {
+     {
+         use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let owner = format!("{tag}-owner-{run}");
++        let owner = e2::kid(&format!("{tag}-owner-{run}"));
+         // The owner's identity, with BOTH devices as active occurrences, on
+         // both nodes' directories.
+         for n in [a, a2] {
+@@ -1244,7 +1536,7 @@ pub mod two_node {
+         // Revoked NOW: `IdentityOccurrenceRevocation::revokes` treats an
+         // occurrence asserted after its revocation as re-established.
+         let lost = node_signer(a2.backend, &format!("{tag}-lost-{run}")).await;
+-        let lost_key = lost.derived_key_id();
++        let lost_key = lost.federation_id().await;
+         a2.backend
+             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                 identity_key_id: owner.clone(),
+@@ -1274,7 +1566,7 @@ pub mod two_node {
+             )
+             .await
+             .unwrap_or_else(|e| panic!("{tag} I65: the lost device's occurrence is revoked: {e}"));
+-        let outsider = format!("{tag}-outsider-{run}");
++        let outsider = e2::kid(&format!("{tag}-outsider-{run}"));
+         let forged = KeyGrantRow {
+             axis: KeyGrantAxis::Content {
+                 at_rest_sha256: hex::encode(sha),
+@@ -1289,7 +1581,7 @@ pub mod two_node {
+         };
+         let forged_row = sign_row_unstored(&lost, &forged).await;
+         let forged_id = forged_row.attestation.attestation_id.clone();
+-        let err = admit_replicated_key_grant(a2.backend, forged_row)
++        let err = admit_replicated(a2.backend, forged_row)
+             .await
+             .expect_err("a revoked device does not speak for the owner");
+         assert_eq!(
+@@ -1425,7 +1717,7 @@ pub mod two_node {
+         // the owner admits a third device on a2. The peer-authored blob is
+         // not this node's to re-wrap (no self-retention here) — the walk
+         // skips it rather than aborting, and grants it nothing.
+-        let dev3 = format!("{tag}-dev3-{run}");
++        let dev3 = e2::kid(&format!("{tag}-dev3-{run}"));
+         ts::register_hybrid_key_as(a2.backend, &dev3, &dev3, USER).await;
+         a2.backend
+             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+@@ -1479,7 +1771,7 @@ pub mod two_node {
+         use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+         use crate::federation::key_grant::{project_key_grant_row, KeyGrantProjection};
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let owner = format!("{tag}-owner-{run}");
++        let owner = e2::kid(&format!("{tag}-owner-{run}"));
+         for n in [a, a2] {
+             ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
+             for dev in [a, a2] {
+@@ -1591,9 +1883,11 @@ pub mod two_node {
+         use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+         use crate::federation::types::cohort_scope::FAMILY;
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let fam = format!("{tag}-fam-{run}");
+-        let alice = format!("{tag}-alice-{run}");
+-        let bob = format!("{tag}-bob-{run}");
++        let fam = e2::kid(&format!("{tag}-fam-{run}"));
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let bob = e2::kid(&format!("{tag}-bob-{run}"));
++        let household =
++            family_roster_voices(&fam, "I199 Household", &[alice.as_str(), bob.as_str()]);
+         for n in [a, b] {
+             ts::register_hybrid_key_as(n.backend, &fam, &fam, USER).await;
+             for (ident, dev) in [(&alice, a), (&bob, b)] {
+@@ -1615,31 +1909,9 @@ pub mod two_node {
+                     .await
+                     .unwrap_or_else(|e| panic!("{tag} I199: occurrence of {ident}: {e}"));
+             }
+-            let members = [&alice, &bob]
+-                .iter()
+-                .map(|k| crate::federation::types::FamilyMember {
+-                    key_id: (*k).clone(),
+-                    joined_at: chrono::Utc::now(),
+-                    role: None,
+-                })
+-                .collect();
+-            n.backend
+-                .put_family(ts::sign_family(
+-                    &fam,
+-                    crate::federation::types::Family {
+-                        prev_head_digest: String::new(),
+-                        charter_digest: String::new(),
+-                        family_key_id: fam.clone(),
+-                        family_name: "I199 Household".into(),
+-                        members,
+-                        founded_at: chrono::Utc::now(),
+-                        consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+-                            .to_owned(),
+-                        consensus_protocol_entrenched: false,
+-                        dissolved_at: None,
+-                        persist_row_hash: String::new(),
+-                    },
+-                ))
++            // v62.0.0 (T1) — the family is ONE `group:roster` version (the
++            // authority and both members' voices), the same on every node.
++            e2::put_voices(n.backend, &household)
+                 .await
+                 .unwrap_or_else(|e| panic!("{tag} I199: seed family: {e}"));
+         }
+@@ -1751,17 +2023,17 @@ pub mod two_node {
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let comm = format!("{tag}-comm-{run}");
+-        let alice = format!("{tag}-alice-{run}");
+-        let bob = format!("{tag}-bob-{run}");
+-        let xavier = format!("{tag}-xavier-{run}");
++        let comm = e2::kid(&format!("{tag}-comm-{run}"));
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let bob = e2::kid(&format!("{tag}-bob-{run}"));
++        let xavier = e2::kid(&format!("{tag}-xavier-{run}"));
+         seed_community_everywhere(
+             &[a, b],
+             &comm,
+             &[(&alice, Some(a)), (&bob, Some(b)), (&xavier, None)],
+         )
+         .await;
+-        let x_occ = format!("{tag}-x-occ-{run}");
++        let x_occ = e2::kid(&format!("{tag}-x-occ-{run}"));
+         for n in [a, b] {
+             ts::register_hybrid_key_as(n.backend, &x_occ, &x_occ, USER).await;
+             crate::federation::at_rest_cascade::blob_invariants::join_as_occurrence(
+@@ -1781,22 +2053,21 @@ pub mod two_node {
+         // sleep below waits for this instant, not a fixed duration.
+         let removed_at = chrono::Utc::now();
+         let effective_at = removed_at + chrono::Duration::seconds(3);
+-        let rev = ts::sign_community_membership_revocation(
+-            &xavier, /* v49.0.0 (#908): the member leaves on their own signature */
+-            crate::federation::types::CommunityMembershipRevocation {
+-                community_key_id: comm.clone(),
+-                removed_identity_key_id: xavier.clone(),
+-                removed_at,
+-                effective_at,
+-                reason: None,
+-                witness_set: vec![],
+-                persist_row_hash: String::new(),
+-            },
+-        );
+-        a.backend
+-            .put_community_membership_revocation(rev)
+-            .await
+-            .unwrap_or_else(|e| panic!("{tag} I71: a future-effective removal is admitted: {e}"));
++        // v62.0.0 (T1) — the removal's `membership:removal` voices: X's own
++        // (v49.0.0, #908) and the other members', meeting the majority.
++        let rev = community_removal_voices(
++            a.backend,
++            &comm,
++            &xavier,
++            removed_at,
++            effective_at,
++            &[&xavier, &alice, &bob],
++        )
++        .await;
++        match e2::put_voices(a.backend, &rev).await {
++            Ok(StatementOutcome::Row { .. }) => {}
++            other => panic!("{tag} I71: a future-effective removal is admitted: {other:?}"),
++        }
+         // Between admission and effect: the revoker's bump, then a seal —
+         // an epoch minted AFTER `removed_at` that still grants X.
+         a.backend
+@@ -1860,9 +2131,17 @@ pub mod two_node {
+     /// **I77 (#851 §20.1) — admission asks about the PRINCIPAL.** The
+     /// minter is an owned node with NO occurrence row on the admitting node:
+     /// refused while no live owner binding lifts it; admitted once the
+-    /// owner's binding (a replicated attestation) is on B and the owner is an
++    /// owner's binding (a replicated statement) is on B and the owner is an
+     /// active member; refused again once the owner is removed at
+     /// `asserted_at`.
++    ///
++    /// v62.0.0 (E11) — the owner binding is the owner's `delegates_to`
++    /// statement plus the node's own voice, delivered through the replicated
++    /// statement door; the rosters and the removal are T1 voices. Leg (7)'s
++    /// attack (carol binding A's key under herself) is now refused at the
++    /// signed door (`occurrence_binds_machine_to_person`: a node key is never
++    /// a person's occurrence, O1), so its row exists only as a trusted-local
++    /// write, which is where the revocation rule is still asked.
+     pub async fn exercise_i77_owned_node_minter_admitted_by_principal<B>(
+         a: &Node<'_, B>,
+         b: &Node<'_, B>,
+@@ -1871,73 +2150,63 @@ pub mod two_node {
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let comm = format!("{tag}-comm-{run}");
+-        let alice = format!("{tag}-alice-{run}");
+-        let bob = format!("{tag}-bob-{run}");
+-        // alice is a deterministic-keyed USER on both nodes (the owner-binding
+-        // helper signs as her); bob likewise; the community on both.
++        let comm = e2::kid(&format!("{tag}-comm-{run}"));
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let bob = e2::kid(&format!("{tag}-bob-{run}"));
++        // The seeds the nodes' keys were minted from (their runner aliases).
++        let (a_seed, b_seed) = (e2::seed_of(&a.key), e2::seed_of(&b.key));
++        // alice is a deterministic-keyed USER on both nodes (the owner binding
++        // is her statement); bob likewise; the community on both, as ONE
++        // roster version.
++        let roster =
++            community_roster_voices(&comm, "Principal Co-op", &[alice.as_str(), bob.as_str()]);
+         for n in [a, b] {
+             ts::register_identity_key(n.backend, &alice, USER).await;
+             ts::register_identity_key(n.backend, &bob, USER).await;
+             ts::register_hybrid_key_as(n.backend, &comm, &comm, USER).await;
+-            n.backend
+-                .put_community(ts::sign_community(
+-                    &comm,
+-                    crate::federation::types::Community {
+-                        prev_head_digest: String::new(),
+-                        charter_digest: String::new(),
+-                        community_key_id: comm.clone(),
+-                        community_name: "Principal Co-op".into(),
+-                        members: [&alice, &bob]
+-                            .into_iter()
+-                            .map(|k| crate::federation::types::CommunityMember {
+-                                key_id: k.clone(),
+-                                joined_at: chrono::Utc::now(),
+-                                role: None,
+-                            })
+-                            .collect(),
+-                        founded_at: chrono::Utc::now(),
+-                        consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+-                            .to_owned(),
+-                        policy_blob: None,
+-                        persist_row_hash: String::new(),
+-                    },
+-                ))
++            e2::put_voices(n.backend, &roster)
+                 .await
+                 .unwrap_or_else(|e| panic!("{tag} I77: seed community: {e}"));
+         }
+-        // On A only: A's own occurrence under alice (the local decrypt target,
+-        // trusted-local — exactly what does NOT replicate) and B's occurrence
+-        // under bob, so A's fan-out has a far recipient.
+-        for (ident, o) in [(&alice, a), (&bob, b)] {
+-            a.backend
+-                .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+-                    identity_key_id: ident.clone(),
+-                    occurrence_key_id: o.key.clone(),
++        let local_occurrence =
++            |identity: &str,
++             occurrence: &str,
++             kem: &EncryptionPubkeys,
++             asserted_at: chrono::DateTime<chrono::Utc>| {
++                crate::federation::types::IdentityOccurrence {
++                    identity_key_id: identity.to_owned(),
++                    occurrence_key_id: occurrence.to_owned(),
+                     device_class: crate::federation::types::device_class::SERVER.into(),
+                     hardware_attestation: None,
+-                    asserted_at: chrono::Utc::now(),
++                    asserted_at,
+                     valid_until: None,
+-                    encryption_pubkeys: Some(o.kem.clone()),
++                    encryption_pubkeys: Some(kem.clone()),
+                     transport_binding: None,
+                     persist_row_hash: String::new(),
+-                })
++                }
++            };
++        // On A only: A's own occurrence under alice (the local decrypt target,
++        // trusted-local — exactly what does NOT replicate) and B's occurrence
++        // under bob, so A's fan-out has a far recipient.
++        for (ident, o) in [(&alice, a), (&bob, b)] {
++            a.backend
++                .put_identity_occurrence_local(local_occurrence(
++                    ident,
++                    &o.key,
++                    &o.kem,
++                    chrono::Utc::now(),
++                ))
+                 .await
+                 .unwrap();
+         }
+         // On B: bob's own occurrence (B's decrypt target), NOTHING for A.
+         b.backend
+-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+-                identity_key_id: bob.clone(),
+-                occurrence_key_id: b.key.clone(),
+-                device_class: crate::federation::types::device_class::SERVER.into(),
+-                hardware_attestation: None,
+-                asserted_at: chrono::Utc::now(),
+-                valid_until: None,
+-                encryption_pubkeys: Some(b.kem.clone()),
+-                transport_binding: None,
+-                persist_row_hash: String::new(),
+-            })
++            .put_identity_occurrence_local(local_occurrence(
++                &bob,
++                &b.key,
++                &b.kem,
++                chrono::Utc::now(),
++            ))
+             .await
+             .unwrap();
+         let sealed =
+@@ -1967,13 +2236,10 @@ pub mod two_node {
+             "signer_not_active_member",
+             "{tag} I77: {err}"
+         );
+-        // (2) alice's owner binding for A lands on B (a replicated
+-        // attestation — what the mesh already carries): admitted.
+-        let binding = ts::owner_binding_attestation(&format!("ob-{run}"), &alice, &a.key);
+-        b.backend
+-            .apply_replicated_attestation(crate::federation::SignedAttestation {
+-                attestation: binding,
+-            })
++        // (2) alice's owner binding for A lands on B (her statement and A's
++        // own voice, delivered — what the mesh already carries): admitted.
++        let bound_at = chrono::Utc::now() - chrono::Duration::minutes(1);
++        deliver_statements(b.backend, &owner_binding_voices(&alice, &a.key, bound_at))
+             .await
+             .unwrap_or_else(|e| panic!("{tag} I77: B admits alice's owner binding for A: {e}"));
+         let admission = carry_key_grant(a, b, &to_b.attestation_id)
+@@ -1988,113 +2254,95 @@ pub mod two_node {
+             "{tag} I77: B's own wrap projected"
+         );
+         // (3) alice removed, effective before a later row's asserted_at: the
+-        // principal is no longer a member — refused.
+-        // v49.0.0 (#908): alice leaves on her own signature.
+-        let rev = ts::sign_community_membership_revocation(
++        // principal is no longer a member — refused. v49.0.0 (#908): alice
++        // leaves on her own signature; bob's voice meets the majority.
++        let removed_at = chrono::Utc::now();
++        let rev = community_removal_voices(
++            b.backend,
++            &comm,
+             &alice,
+-            crate::federation::types::CommunityMembershipRevocation {
+-                community_key_id: comm.clone(),
+-                removed_identity_key_id: alice.clone(),
+-                removed_at: chrono::Utc::now(),
+-                effective_at: chrono::Utc::now(),
+-                reason: None,
+-                witness_set: vec![],
+-                persist_row_hash: String::new(),
+-            },
+-        );
+-        b.backend
+-            .put_community_membership_revocation(rev)
+-            .await
+-            .unwrap();
++            removed_at,
++            removed_at,
++            &[&alice, &bob],
++        )
++        .await;
++        match e2::put_voices(b.backend, &rev).await {
++            Ok(StatementOutcome::Row { .. }) => {}
++            other => panic!("{tag} I77: B holds alice's removal: {other:?}"),
++        }
+         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+         // A later row: A re-signs its wrap to B at a fresh instant (the
+         // emitter re-emits nothing it already holds as a row).
+         let wrap_to_b = held_row(a, &axis, &b.key).await;
+-        let err =
+-            admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &wrap_to_b).await)
+-                .await
+-                .expect_err("{tag} I77: the removed owner's instrument is refused");
++        let err = admit_replicated(b.backend, sign_row_unstored(&a.signer, &wrap_to_b).await)
++            .await
++            .expect_err("{tag} I77: the removed owner's instrument is refused");
+         assert_eq!(
+             refusal_reason(&err),
+             "signer_not_active_member",
+             "{tag} I77: {err}"
+         );
+-        // (4) PR #852 round two — the peer holds the node's occurrence row
+-        // (under alice) but NO owner binding: a NODE minter lifts only
+-        // through the live binding, never through the row. A fresh
+-        // backend, seeded like B was but with A's occurrence and without
+-        // alice's binding or removal.
++        // A fresh sqlite peer seeded like B was: A's key as a NODE, alice and
++        // bob, the same roster version, bob's occurrence B as the recipient
++        // (v55.0.0, #989 — the recipient rule asks that the wrap's recipient
++        // may hold the key).
+         #[cfg(feature = "sqlite")]
+-        {
+-            let c = crate::store::sqlite::SqliteBackend::open_in_memory()
++        async fn peer(
++            a_seed: &str,
++            b_seed: &str,
++            identities: &[&str],
++            roster: &[Vec<u8>],
++        ) -> crate::store::sqlite::SqliteBackend {
++            let p = crate::store::sqlite::SqliteBackend::open_in_memory()
+                 .await
+                 .unwrap();
+-            crate::store::Backend::run_migrations(&c).await.unwrap();
++            crate::store::Backend::run_migrations(&p).await.unwrap();
+             ts::register_hybrid_key_as(
+-                &c,
+-                &a.key,
+-                "i77-a",
++                &p,
++                a_seed,
++                a_seed,
+                 crate::federation::types::identity_type::NODE,
+             )
+             .await;
+-            ts::register_identity_key(&c, &alice, USER).await;
+-            ts::register_identity_key(&c, &bob, USER).await;
+-            ts::register_hybrid_key_as(&c, &comm, &comm, USER).await;
+-            c.put_community(ts::sign_community(
+-                &comm,
+-                crate::federation::types::Community {
+-                    prev_head_digest: String::new(),
+-                    charter_digest: String::new(),
+-                    community_key_id: comm.clone(),
+-                    community_name: "Principal Co-op".into(),
+-                    members: [&alice, &bob]
+-                        .into_iter()
+-                        .map(|k| crate::federation::types::CommunityMember {
+-                            key_id: k.clone(),
+-                            joined_at: chrono::Utc::now(),
+-                            role: None,
+-                        })
+-                        .collect(),
+-                    founded_at: chrono::Utc::now(),
+-                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+-                        .to_owned(),
+-                    policy_blob: None,
+-                    persist_row_hash: String::new(),
+-                },
++            ts::register_hybrid_key_as(&p, b_seed, b_seed, USER).await;
++            for ident in identities {
++                ts::register_identity_key(&p, ident, USER).await;
++            }
++            e2::put_voices(&p, roster)
++                .await
++                .unwrap_or_else(|e| panic!("I77: seed community on a peer: {e}"));
++            p
++        }
++        // (4) PR #852 round two — the peer holds the node's occurrence row
++        // (under alice) but NO owner binding: a NODE minter lifts only
++        // through the live binding, never through the row.
++        #[cfg(feature = "sqlite")]
++        {
++            let c = peer(
++                &a_seed,
++                &b_seed,
++                &[alice.as_str(), bob.as_str(), comm.as_str()],
++                &roster,
++            )
++            .await;
++            c.put_identity_occurrence_local(local_occurrence(
++                &alice,
++                &a.key,
++                &a.kem,
++                chrono::Utc::now(),
+             ))
+             .await
+             .unwrap();
+-            c.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+-                identity_key_id: alice.clone(),
+-                occurrence_key_id: a.key.clone(),
+-                device_class: crate::federation::types::device_class::SERVER.into(),
+-                hardware_attestation: None,
+-                asserted_at: chrono::Utc::now(),
+-                valid_until: None,
+-                encryption_pubkeys: Some(a.kem.clone()),
+-                transport_binding: None,
+-                persist_row_hash: String::new(),
+-            })
+-            .await
+-            .unwrap();
+-            // The recipient: bob's occurrence B (v55.0.0, #989 — the
+-            // recipient rule asks that the wrap's recipient may hold the key).
+-            ts::register_hybrid_key_as(&c, &b.key, "i77-b", USER).await;
+-            c.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+-                identity_key_id: bob.clone(),
+-                occurrence_key_id: b.key.clone(),
+-                device_class: crate::federation::types::device_class::SERVER.into(),
+-                hardware_attestation: None,
+-                asserted_at: chrono::Utc::now(),
+-                valid_until: None,
+-                encryption_pubkeys: Some(b.kem.clone()),
+-                transport_binding: None,
+-                persist_row_hash: String::new(),
+-            })
++            c.put_identity_occurrence_local(local_occurrence(
++                &bob,
++                &b.key,
++                &b.kem,
++                chrono::Utc::now(),
++            ))
+             .await
+             .unwrap();
+             let row = to_b.clone();
+-            let err = admit_replicated_key_grant(
++            let err = admit_replicated(
+                 &c,
+                 SignedKeyGrantRow {
+                     attestation: row.clone(),
+@@ -2108,14 +2356,12 @@ pub mod two_node {
+                 "{tag} I77 (4): {err}"
+             );
+             // …and with the binding it is admitted; then (5) the occurrence
+-            // REVOKED (effective before the set's asserted_at) with the
++            // REVOKED (effective before the row's asserted_at) with the
+             // binding still live: refused — the revocation gate wins.
+-            c.apply_replicated_attestation(crate::federation::SignedAttestation {
+-                attestation: ts::owner_binding_attestation(&format!("ob-c-{run}"), &alice, &a.key),
+-            })
+-            .await
+-            .unwrap();
+-            admit_replicated_key_grant(
++            deliver_statements(&c, &owner_binding_voices(&alice, &a.key, bound_at))
++                .await
++                .unwrap_or_else(|e| panic!("{tag} I77 (4): alice's binding on the peer: {e}"));
++            admit_replicated(
+                 &c,
+                 SignedKeyGrantRow {
+                     attestation: row.clone(),
+@@ -2138,7 +2384,7 @@ pub mod two_node {
+             .unwrap();
+             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+             let row2 = sign_row_unstored(&a.signer, &wrap_to_b).await;
+-            let err = admit_replicated_key_grant(&c, row2)
++            let err = admit_replicated(&c, row2)
+                 .await
+                 .expect_err("{tag} I77 (5): a revoked occurrence is not lifted by a live binding");
+             assert_eq!(
+@@ -2153,65 +2399,30 @@ pub mod two_node {
+         // live and alice's absent. The revocation on ANY row is final.
+         #[cfg(feature = "sqlite")]
+         {
+-            let d = crate::store::sqlite::SqliteBackend::open_in_memory()
+-                .await
+-                .unwrap();
+-            crate::store::Backend::run_migrations(&d).await.unwrap();
+-            ts::register_hybrid_key_as(
+-                &d,
+-                &a.key,
+-                "i77-a",
+-                crate::federation::types::identity_type::NODE,
++            let d = peer(
++                &a_seed,
++                &b_seed,
++                &[alice.as_str(), bob.as_str(), comm.as_str()],
++                &roster,
+             )
+             .await;
+-            ts::register_identity_key(&d, &alice, USER).await;
+-            ts::register_identity_key(&d, &bob, USER).await;
+-            ts::register_hybrid_key_as(&d, &comm, &comm, USER).await;
+-            d.put_community(ts::sign_community(
+-                &comm,
+-                crate::federation::types::Community {
+-                    prev_head_digest: String::new(),
+-                    charter_digest: String::new(),
+-                    community_key_id: comm.clone(),
+-                    community_name: "Principal Co-op".into(),
+-                    members: [&alice, &bob]
+-                        .into_iter()
+-                        .map(|k| crate::federation::types::CommunityMember {
+-                            key_id: k.clone(),
+-                            joined_at: chrono::Utc::now(),
+-                            role: None,
+-                        })
+-                        .collect(),
+-                    founded_at: chrono::Utc::now(),
+-                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+-                        .to_owned(),
+-                    policy_blob: None,
+-                    persist_row_hash: String::new(),
+-                },
+-            ))
+-            .await
+-            .unwrap();
+             let long_ago = chrono::Utc::now() - chrono::Duration::seconds(30);
+             for ident in [&alice, &bob] {
+-                d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+-                    identity_key_id: ident.clone(),
+-                    occurrence_key_id: a.key.clone(),
+-                    device_class: crate::federation::types::device_class::SERVER.into(),
+-                    hardware_attestation: None,
+-                    asserted_at: long_ago,
+-                    valid_until: None,
+-                    encryption_pubkeys: Some(a.kem.clone()),
+-                    transport_binding: None,
+-                    persist_row_hash: String::new(),
+-                })
+-                .await
+-                .unwrap();
++                d.put_identity_occurrence_local(local_occurrence(ident, &a.key, &a.kem, long_ago))
++                    .await
++                    .unwrap();
+             }
+-            d.apply_replicated_attestation(crate::federation::SignedAttestation {
+-                attestation: ts::owner_binding_attestation(&format!("ob-d-{run}"), &bob, &a.key),
+-            })
++            d.put_identity_occurrence_local(local_occurrence(
++                &bob,
++                &b.key,
++                &b.kem,
++                chrono::Utc::now(),
++            ))
+             .await
+             .unwrap();
++            deliver_statements(&d, &owner_binding_voices(&bob, &a.key, bound_at))
++                .await
++                .unwrap_or_else(|e| panic!("{tag} I77 (6): bob's binding on the peer: {e}"));
+             d.put_identity_occurrence_revocation_local(
+                 crate::federation::types::IdentityOccurrenceRevocation {
+                     identity_key_id: bob.clone(),
+@@ -2227,7 +2438,7 @@ pub mod two_node {
+             .unwrap();
+             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+             let row3 = sign_row_unstored(&a.signer, &wrap_to_b).await;
+-            let err = admit_replicated_key_grant(&d, row3)
++            let err = admit_replicated(&d, row3)
+                 .await
+                 .expect_err("{tag} I77 (6): a revocation on ANY row for the key is final");
+             assert_eq!(
+@@ -2238,117 +2449,60 @@ pub mod two_node {
+         }
+         // (7) PR #852 round four — a revocation counts only on the row of
+         // the identity the lift resolves to. carol (a member, the attacker)
+-        // binds A's key under HERSELF (an identity may attest any key as its
+-        // occurrence) and revokes that row; alice's binding is live and
+-        // alice's row unrevoked: A's set is still admitted.
++        // tries to bind A's key under HERSELF: the signed door refuses it
++        // (v62.0.0, O1: a node key is never a person's occurrence). The row
++        // can still exist as a trusted-local write; carol revokes THAT row,
++        // and with alice's binding live and alice's row unrevoked A's row is
++        // still admitted.
+         #[cfg(feature = "sqlite")]
+         {
+-            let e = crate::store::sqlite::SqliteBackend::open_in_memory()
+-                .await
+-                .unwrap();
+-            crate::store::Backend::run_migrations(&e).await.unwrap();
+-            let carol = format!("{tag}-carol-{run}");
+-            ts::register_hybrid_key_as(
++            let carol = e2::kid(&format!("{tag}-carol-{run}"));
++            let carol_roster = community_roster_voices(
++                &comm,
++                "Principal Co-op",
++                &[alice.as_str(), bob.as_str(), carol.as_str()],
++            );
++            let e = peer(
++                &a_seed,
++                &b_seed,
++                &[alice.as_str(), bob.as_str(), carol.as_str(), comm.as_str()],
++                &carol_roster,
++            )
++            .await;
++            let err = e2::put_bind(
+                 &e,
++                &carol,
++                &carol,
+                 &a.key,
+-                "i77-a",
+-                crate::federation::types::identity_type::NODE,
++                crate::federation::types::device_class::SERVER,
++                &e2::BindOptions::default(),
+             )
+-            .await;
+-            for ident in [&alice, &bob, &carol] {
+-                ts::register_identity_key(&e, ident, USER).await;
+-            }
+-            ts::register_hybrid_key_as(&e, &comm, &comm, USER).await;
+-            e.put_community(ts::sign_community(
+-                &comm,
+-                crate::federation::types::Community {
+-                    prev_head_digest: String::new(),
+-                    charter_digest: String::new(),
+-                    community_key_id: comm.clone(),
+-                    community_name: "Principal Co-op".into(),
+-                    members: [&alice, &bob, &carol]
+-                        .into_iter()
+-                        .map(|k| crate::federation::types::CommunityMember {
+-                            key_id: k.clone(),
+-                            joined_at: chrono::Utc::now(),
+-                            role: None,
+-                        })
+-                        .collect(),
+-                    founded_at: chrono::Utc::now(),
+-                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+-                        .to_owned(),
+-                    policy_blob: None,
+-                    persist_row_hash: String::new(),
+-                },
+-            ))
+             .await
+-            .unwrap();
+-            e.apply_replicated_attestation(crate::federation::SignedAttestation {
+-                attestation: ts::owner_binding_attestation(&format!("ob-e-{run}"), &alice, &a.key),
+-            })
++            .expect_err("{tag} I77 (7): a person cannot bind a node's key as her occurrence");
++            assert_eq!(
++                token_of(&err),
++                crate::federation::malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
++                "{tag} I77 (7): {err}"
++            );
++            deliver_statements(&e, &owner_binding_voices(&alice, &a.key, bound_at))
++                .await
++                .unwrap_or_else(|e| panic!("{tag} I77 (7): alice's binding on the peer: {e}"));
++            e.put_identity_occurrence_local(local_occurrence(
++                &bob,
++                &b.key,
++                &b.kem,
++                chrono::Utc::now(),
++            ))
+             .await
+             .unwrap();
+-            // The recipient: bob's occurrence B (v55.0.0, #989).
+-            ts::register_hybrid_key_as(&e, &b.key, "i77-b", USER).await;
+-            e.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+-                identity_key_id: bob.clone(),
+-                occurrence_key_id: b.key.clone(),
+-                device_class: crate::federation::types::device_class::SERVER.into(),
+-                hardware_attestation: None,
+-                asserted_at: chrono::Utc::now(),
+-                valid_until: None,
+-                encryption_pubkeys: Some(b.kem.clone()),
+-                transport_binding: None,
+-                persist_row_hash: String::new(),
+-            })
++            e.put_identity_occurrence_local(local_occurrence(
++                &carol,
++                &a.key,
++                &a.kem,
++                chrono::Utc::now() - chrono::Duration::seconds(30),
++            ))
+             .await
+             .unwrap();
+-            // carol's identity-signed content-only occurrence binding A's key.
+-            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+-                chrono::Utc::now().timestamp_millis() - 30_000,
+-            )
+-            .unwrap();
+-            let env = serde_json::json!({
+-                "attesting_key_id": carol,
+-                "identity_key_id": carol,
+-                "occurrence_key_id": a.key,
+-                "device_class": crate::federation::types::device_class::SERVER,
+-                "encryption_pubkeys": {
+-                    "x25519_base64": a.kem.x25519_base64,
+-                    "ml_kem_768_base64": a.kem.ml_kem_768_base64,
+-                },
+-                "asserted_at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+-                "valid_until": serde_json::Value::Null,
+-                "hardware_attestation": serde_json::Value::Null,
+-            });
+-            let carol_signer = ts::local_signer(&carol);
+-            let (signed_envelope, signature) =
+-                ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+-                    &crate::signing::LocalSelfSigner::new(carol_signer.as_ref()),
+-                    env,
+-                )
+-                .await
+-                .unwrap();
+-            e.put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+-                identity_occurrence: crate::federation::types::IdentityOccurrence {
+-                    identity_key_id: carol.clone(),
+-                    occurrence_key_id: a.key.clone(),
+-                    device_class: crate::federation::types::device_class::SERVER.into(),
+-                    hardware_attestation: None,
+-                    asserted_at: at,
+-                    valid_until: None,
+-                    encryption_pubkeys: Some(a.kem.clone()),
+-                    transport_binding: None,
+-                    persist_row_hash: String::new(),
+-                },
+-                attesting_key_id: carol.clone(),
+-                signed_envelope,
+-                signature,
+-            })
+-            .await
+-            .unwrap_or_else(|err| {
+-                panic!("{tag} I77 (7): an identity may bind a key as its occurrence: {err}")
+-            });
+             e.put_identity_occurrence_revocation_local(
+                 crate::federation::types::IdentityOccurrenceRevocation {
+                     identity_key_id: carol.clone(),
+@@ -2364,81 +2518,52 @@ pub mod two_node {
+             .unwrap();
+             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+             let row4 = sign_row_unstored(&a.signer, &wrap_to_b).await;
+-            admit_replicated_key_grant(&e, row4)
+-                .await
+-                .unwrap_or_else(|err| {
+-                    panic!("{tag} I77 (7): carol's revocation of HER row must not disable A: {err}")
+-                });
++            admit_replicated(&e, row4).await.unwrap_or_else(|err| {
++                panic!("{tag} I77 (7): carol's revocation of HER row must not disable A: {err}")
++            });
+         }
+         // (8) PR #852 round five — ownership moved alice → dave: A keeps an
+         // unrevoked occurrence row under alice (the member); the live binding
+         // is dave's, who is NOT on the roster. A NODE minter has exactly one
+-        // principal — its live owner — so the set is refused; the stale row
++        // principal — its live owner — so the row is refused; the stale row
+         // and the member-occurrence walk are not fallbacks.
+         #[cfg(feature = "sqlite")]
+         {
+-            let f = crate::store::sqlite::SqliteBackend::open_in_memory()
+-                .await
+-                .unwrap();
+-            crate::store::Backend::run_migrations(&f).await.unwrap();
+-            let dave = format!("{tag}-dave-{run}");
+-            ts::register_hybrid_key_as(
+-                &f,
+-                &a.key,
+-                "i77-a",
+-                crate::federation::types::identity_type::NODE,
++            let dave = e2::kid(&format!("{tag}-dave-{run}"));
++            let f = peer(
++                &a_seed,
++                &b_seed,
++                &[alice.as_str(), bob.as_str(), dave.as_str(), comm.as_str()],
++                &roster,
+             )
+             .await;
+-            for ident in [&alice, &bob, &dave] {
+-                ts::register_identity_key(&f, ident, USER).await;
+-            }
+-            ts::register_hybrid_key_as(&f, &comm, &comm, USER).await;
+-            f.put_community(ts::sign_community(
+-                &comm,
+-                crate::federation::types::Community {
+-                    prev_head_digest: String::new(),
+-                    charter_digest: String::new(),
+-                    community_key_id: comm.clone(),
+-                    community_name: "Principal Co-op".into(),
+-                    members: [&alice, &bob]
+-                        .into_iter()
+-                        .map(|k| crate::federation::types::CommunityMember {
+-                            key_id: k.clone(),
+-                            joined_at: chrono::Utc::now(),
+-                            role: None,
+-                        })
+-                        .collect(),
+-                    founded_at: chrono::Utc::now(),
+-                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+-                        .to_owned(),
+-                    policy_blob: None,
+-                    persist_row_hash: String::new(),
+-                },
++            f.put_identity_occurrence_local(local_occurrence(
++                &alice,
++                &a.key,
++                &a.kem,
++                chrono::Utc::now() - chrono::Duration::seconds(30),
+             ))
+             .await
+             .unwrap();
+-            f.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+-                identity_key_id: alice.clone(),
+-                occurrence_key_id: a.key.clone(),
+-                device_class: crate::federation::types::device_class::SERVER.into(),
+-                hardware_attestation: None,
+-                asserted_at: chrono::Utc::now() - chrono::Duration::seconds(30),
+-                valid_until: None,
+-                encryption_pubkeys: Some(a.kem.clone()),
+-                transport_binding: None,
+-                persist_row_hash: String::new(),
+-            })
+-            .await
+-            .unwrap();
+-            f.apply_replicated_attestation(crate::federation::SignedAttestation {
+-                attestation: ts::owner_binding_attestation(&format!("ob-f-{run}"), &dave, &a.key),
+-            })
++            f.put_identity_occurrence_local(local_occurrence(
++                &bob,
++                &b.key,
++                &b.kem,
++                chrono::Utc::now(),
++            ))
+             .await
+             .unwrap();
+-            let row5 = to_b.clone();
+-            let err = admit_replicated_key_grant(&f, SignedKeyGrantRow { attestation: row5 })
++            deliver_statements(&f, &owner_binding_voices(&dave, &a.key, bound_at))
+                 .await
+-                .expect_err("{tag} I77 (8): a stale row under a former owner is not a principal");
++                .unwrap_or_else(|e| panic!("{tag} I77 (8): dave's binding on the peer: {e}"));
++            let err = admit_replicated(
++                &f,
++                SignedKeyGrantRow {
++                    attestation: to_b.clone(),
++                },
++            )
++            .await
++            .expect_err("{tag} I77 (8): a stale row under a former owner is not a principal");
+             assert_eq!(
+                 refusal_reason(&err),
+                 "signer_not_active_member",
+@@ -2447,121 +2572,95 @@ pub mod two_node {
+         }
+     }
+ 
+-    /// **I76 (#851 §20.2) — the content-only signed occurrence.** A node
+-    /// signs its own occurrence (no transport destination, KEM pubkeys
+-    /// present): refused while nothing lifts the node to the identity;
+-    /// admitted once a live owner binding does; a second row claiming
+-    /// ANOTHER identity is refused. The admitted row is advertised by the
+-    /// plane's since-read; a trusted-local row is not (I78).
++    /// **I76 (#851 §20.2) — the content-only signed occurrence.** The
++    /// identity binds its device with KEM pubkeys and no transport
++    /// destination; the bind is admitted and advertised; a trusted-local
++    /// row is not (I78).
++    ///
++    /// v62.0.0 (E11, O1) — an occurrence is an `identity:occurrence` bind:
++    /// the occurrence key's own statement, then the identity's (the author).
++    /// A node no longer vouches for itself through its owner binding: the
++    /// identity authors, and a node's key is never a person's occurrence
++    /// (`occurrence_binds_machine_to_person`, whatever binding is live). The
++    /// legs map:
++    /// - (1) unbound → the device's own voice alone lands nothing;
++    /// - (2) admitted, advertised → the identity's voice lands the bind, and
++    ///   the signed listing serves it with its statements;
++    /// - (3)/(6) another identity / a diverging attester → a bind whose
++    ///   author is not its identity is refused `edition2_payload_invalid`;
++    /// - (8) future-dated → the skew bound refuses the author's voice;
++    /// - (9) a node vouching for a sibling key → the node's own key under
++    ///   its owner is refused, and an agent's occurrence binds the AGENT's
++    ///   identity, authored by its owner (CC 3.3.6).
+     pub async fn exercise_i76_content_only_occurrence<B>(n: &Node<'_, B>, alias: &str, tag: &str)
+     where
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+-        // `alias` names the node's twin in leg (5), a sqlite-only leg.
++        use crate::federation::malformed_row;
++        use crate::federation::types::device_class::{AGENT, PHONE, SERVER};
+         let _ = alias;
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let alice = format!("{tag}-alice-{run}");
+-        let carol = format!("{tag}-carol-{run}");
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let carol = e2::kid(&format!("{tag}-carol-{run}"));
+         ts::register_identity_key(n.backend, &alice, USER).await;
+         ts::register_identity_key(n.backend, &carol, USER).await;
+-        let content_only = |identity: &str| {
+-            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+-                chrono::Utc::now().timestamp_millis(),
+-            )
+-            .unwrap();
+-            let env = serde_json::json!({
+-                "attesting_key_id": n.key,
+-                "identity_key_id": identity,
+-                "occurrence_key_id": n.key,
+-                "device_class": crate::federation::types::device_class::SERVER,
+-                "encryption_pubkeys": {
+-                    "x25519_base64": n.kem.x25519_base64,
+-                    "ml_kem_768_base64": n.kem.ml_kem_768_base64,
+-                },
+-                "asserted_at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+-                "valid_until": serde_json::Value::Null,
+-                "hardware_attestation": serde_json::Value::Null,
+-            });
+-            (identity.to_owned(), env, at)
++        // alice's personal device: a USER key (a person's occurrence key).
++        let phone = e2::put_key(n.backend, &format!("{tag}-phone-{run}"), &[USER]).await;
++        let opts = |at: chrono::DateTime<chrono::Utc>| e2::BindOptions {
++            asserted_at_ms: ms(at),
++            valid_until_ms: None,
++            extra: vec![encryption_member(&n.kem)],
+         };
+-        let sign = |identity: String, env: serde_json::Value, at: chrono::DateTime<chrono::Utc>| async move {
+-            let (signed_envelope, signature) =
+-                ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+-                    &crate::signing::LocalSelfSigner::new(n.signer.as_ref()),
+-                    env,
+-                )
++        // (1) The device's own statement alone: kept as a voice, lands nothing.
++        let voices =
++            e2::occurrence_bind_voices(&alice, &alice, &phone, PHONE, &opts(chrono::Utc::now()));
++        assert_eq!(voices.len(), 2, "{tag} I76: the own voice and the author's");
++        match e2::put_statement(n.backend, &voices[0]).await {
++            Ok(StatementOutcome::Voice { .. }) => {}
++            other => panic!("{tag} I76: the device's own voice is kept, alone: {other:?}"),
++        }
++        assert!(
++            n.backend
++                .lookup_identity_for_occurrence(&phone)
+                 .await
+-                .unwrap();
+-            crate::federation::SignedIdentityOccurrence {
+-                identity_occurrence: crate::federation::types::IdentityOccurrence {
+-                    identity_key_id: identity,
+-                    occurrence_key_id: n.key.clone(),
+-                    device_class: crate::federation::types::device_class::SERVER.into(),
+-                    hardware_attestation: None,
+-                    asserted_at: at,
+-                    valid_until: None,
+-                    encryption_pubkeys: Some(n.kem.clone()),
+-                    transport_binding: None,
+-                    persist_row_hash: String::new(),
+-                },
+-                attesting_key_id: n.key.clone(),
+-                signed_envelope,
+-                signature,
+-            }
+-        };
+-        // (1) Unbound: refused.
+-        let (i, e, at) = content_only(&alice);
+-        let err = n
+-            .backend
+-            .put_identity_occurrence(sign(i, e, at).await)
+-            .await
+-            .expect_err("{tag} I76: an unbound node cannot vouch for itself");
+-        assert_eq!(
+-            err.kind(),
+-            "federation_signer_not_acting_for",
+-            "{tag} I76: the refusal is signer_acts_for: {err}"
++                .unwrap()
++                .is_none(),
++            "{tag} I76: nothing binds on the device's word alone"
+         );
+-        // (2) alice's live owner binding lifts the node: admitted, advertised.
+-        n.backend
+-            .apply_replicated_attestation(crate::federation::SignedAttestation {
+-                attestation: ts::owner_binding_attestation(&format!("ob-{run}"), &alice, &n.key),
+-            })
+-            .await
+-            .unwrap();
+-        let (i, e, at) = content_only(&alice);
+-        let admitted = sign(i, e, at).await;
+-        n.backend
+-            .put_identity_occurrence(admitted.clone())
+-            .await
+-            .unwrap_or_else(|e| panic!("{tag} I76: the owner binding lifts the node: {e}"));
++        // (2) alice's statement lands the bind: content-only, advertised.
++        match e2::put_statement(n.backend, &voices[1]).await {
++            Ok(StatementOutcome::Row { .. }) => {}
++            other => panic!("{tag} I76: the identity's voice lands the bind: {other:?}"),
++        }
+         let row = n
+             .backend
+-            .lookup_identity_for_occurrence(&n.key)
++            .lookup_identity_for_occurrence(&phone)
+             .await
+             .unwrap()
+             .expect("the occurrence exists");
+         assert_eq!(row.identity_key_id, alice);
+         assert!(row.encryption_pubkeys.is_some() && row.transport_binding.is_none());
+-        let served = crate::federation::key_plane::test_support::served_identity_occurrences(
+-            n.backend.as_dyn_directory(),
+-            1_000,
+-        )
+-        .await
+-        .unwrap();
+         assert!(
+-            served
++            n.backend
++                .list_signed_identity_occurrences_for(&alice)
++                .await
++                .unwrap()
+                 .iter()
+-                .any(|s| s.occurrence.identity_occurrence.occurrence_key_id == n.key),
+-            "{tag} I78: the published occurrence is advertised by the plane"
++                .any(|s| s.identity_occurrence.occurrence_key_id == phone),
++            "{tag} I78: the bind is advertised by the signed listing"
++        );
++        let served = bind_statements_for(n.backend, &alice).await;
++        assert!(
++            voices.iter().all(|v| served.contains(v)),
++            "{tag} I78: the listing serves every voice of the bind"
+         );
+         // I78: a trusted-local row is never advertised.
+-        let local_occ = format!("{tag}-local-{run}");
+-        ts::register_hybrid_key_as(n.backend, &local_occ, &local_occ, USER).await;
++        let local_occ = e2::put_key(n.backend, &format!("{tag}-local-{run}"), &[USER]).await;
+         n.backend
+             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                 identity_key_id: alice.clone(),
+                 occurrence_key_id: local_occ.clone(),
+-                device_class: crate::federation::types::device_class::SERVER.into(),
++                device_class: SERVER.into(),
+                 hardware_attestation: None,
+                 asserted_at: chrono::Utc::now(),
+                 valid_until: None,
+@@ -2571,248 +2670,114 @@ pub mod two_node {
+             })
+             .await
+             .unwrap();
+-        let served = crate::federation::key_plane::test_support::served_identity_occurrences(
+-            n.backend.as_dyn_directory(),
+-            1_000,
+-        )
+-        .await
+-        .unwrap();
+         assert!(
+-            !served
++            !n.backend
++                .list_signed_identity_occurrences_for(&alice)
++                .await
++                .unwrap()
+                 .iter()
+-                .any(|s| s.occurrence.identity_occurrence.occurrence_key_id == local_occ),
++                .any(|s| s.identity_occurrence.occurrence_key_id == local_occ),
+             "{tag} I78: a trusted-local row is not on the plane"
+         );
+-        // (3) The same node claiming ANOTHER identity: refused.
+-        let (i, e, at) = content_only(&carol);
+-        let err = n
+-            .backend
+-            .put_identity_occurrence(sign(i, e, at).await)
+-            .await
+-            .expect_err("{tag} I76: a node bound to alice cannot claim carol");
++        // (3)/(6) A bind of alice's device under carol that carol did not
++        // author (alice's statement naming carol's identity): refused.
++        let err = e2::put_bind(
++            n.backend,
++            &alice,
++            &carol,
++            &phone,
++            PHONE,
++            &opts(chrono::Utc::now()),
++        )
++        .await
++        .expect_err("{tag} I76: an identity is bound only by its own statement");
+         assert_eq!(
+-            err.kind(),
+-            "federation_signer_not_acting_for",
+-            "{tag} I76: {err}"
++            token_of(&err),
++            malformed_row::EDITION2_PAYLOAD_INVALID,
++            "{tag} I76: the author is the identity: {err}"
+         );
+-        // (10) Hybrid-only (operator directive) — a content-only occurrence
+-        // whose signature carries no ML-DSA-65 half is refused before any
+-        // verification, however valid the Ed25519 half.
+-        {
+-            let mut classical_only = admitted.clone();
+-            classical_only.signature.mldsa65_signature_base64 = None;
+-            let err = n
+-                .backend
+-                .put_identity_occurrence(classical_only)
+-                .await
+-                .expect_err("{tag} I76 (10): a classical-only occurrence signature is refused");
+-            assert!(
+-                err.to_string().contains("ML-DSA-65") && err.to_string().contains("hybrid-only"),
+-                "{tag} I76 (10): the refusal names the missing half: {err}"
+-            );
+-        }
+-        // (8) PR #852 round five — a future-dated content-only occurrence is
+-        // refused by the write-gate skew bound, however consistent envelope
+-        // and row are: a compromised node with a live binding must not
+-        // out-rank authentic replacements or escape a later revocation.
+-        {
+-            let future = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+-                (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp_millis(),
+-            )
+-            .unwrap();
+-            let env = serde_json::json!({
+-                "attesting_key_id": n.key,
+-                "identity_key_id": alice,
+-                "occurrence_key_id": n.key,
+-                "device_class": crate::federation::types::device_class::SERVER,
+-                "encryption_pubkeys": {
+-                    "x25519_base64": n.kem.x25519_base64,
+-                    "ml_kem_768_base64": n.kem.ml_kem_768_base64,
+-                },
+-                "asserted_at": future.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+-                "valid_until": serde_json::Value::Null,
+-                "hardware_attestation": serde_json::Value::Null,
++        // (8) PR #852 round five — a future-dated bind is refused by the
++        // write-gate skew bound: a compromised key must not out-rank
++        // authentic replacements or escape a later revocation.
++        let future = chrono::Utc::now() + chrono::Duration::hours(1);
++        let err = e2::put_bind(n.backend, &alice, &alice, &phone, PHONE, &opts(future))
++            .await
++            .expect_err("{tag} I76 (8): a future-dated occurrence is refused");
++        assert!(
++            err.to_string().to_lowercase().contains("skew")
++                || err.to_string().to_lowercase().contains("future"),
++            "{tag} I76 (8): the refusal is the skew bound: {err}"
++        );
++        // (9) The node's own key under its owner: refused, a live owner
++        // binding notwithstanding — a node is owned, never a person's device.
++        for v in owner_binding_voices(
++            &alice,
++            &n.key,
++            chrono::Utc::now() - chrono::Duration::minutes(1),
++        ) {
++            e2::put_statement(n.backend, &v).await.unwrap_or_else(|e| {
++                panic!("{tag} I76 (9): alice's owner binding of the node: {e}")
+             });
+-            let err = n
+-                .backend
+-                .put_identity_occurrence(sign(alice.clone(), env, future).await)
+-                .await
+-                .expect_err("{tag} I76 (8): a future-dated occurrence is refused");
+-            assert!(
+-                err.to_string().to_lowercase().contains("skew")
+-                    || err.to_string().to_lowercase().contains("future"),
+-                "{tag} I76 (8): the refusal is the skew bound: {err}"
+-            );
+         }
+-        // (9) PR #852 round five — a NODE vouching for a SIBLING key under its
+-        // owner: admitted where its owner binding is live; refused on a
+-        // backend that holds only its occurrence row (no binding) — the raw
+-        // row never vouches, for the node's own key or any other.
+-        {
+-            let sibling = format!("{tag}-sibling-{run}");
+-            // v59.0.0 (#1099) — an AGENT sibling: a node vouches for a
+-            // non-roster key of its owner. A user-role key is a roster key, and
+-            // a node is not one, so it cannot add one (CC 3.3.6.3; I1140).
+-            ts::register_hybrid_key_as(
+-                n.backend,
+-                &sibling,
+-                &sibling,
+-                crate::federation::types::identity_type::AGENT,
+-            )
++        let err = e2::put_bind(
++            n.backend,
++            &alice,
++            &alice,
++            &n.key,
++            SERVER,
++            &opts(chrono::Utc::now()),
++        )
++        .await
++        .expect_err("{tag} I76 (9): a node key is no person's occurrence");
++        assert_eq!(
++            token_of(&err),
++            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
++            "{tag} I76 (9): {err}"
++        );
++        // …and an AGENT's occurrence binds the agent's own identity, authored
++        // by its owner (v59.0.0, #1099: an agent key is no roster key of a
++        // person; CC 3.3.6).
++        let agent = e2::put_key(n.backend, &format!("{tag}-agent-{run}"), &[AGENT]).await;
++        let agent_key = e2::put_key(n.backend, &format!("{tag}-agent-key-{run}"), &[AGENT]).await;
++        let err = e2::put_bind(
++            n.backend,
++            &alice,
++            &alice,
++            &agent_key,
++            AGENT,
++            &opts(chrono::Utc::now()),
++        )
++        .await
++        .expect_err("{tag} I76 (9): an agent key under a person is refused");
++        assert_eq!(
++            token_of(&err),
++            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
++            "{tag} I76 (9): {err}"
++        );
++        e2::put_agent_owner_binding(n.backend, &alice, &agent, ms(chrono::Utc::now()) - 60_000)
+             .await;
+-            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+-                chrono::Utc::now().timestamp_millis(),
+-            )
+-            .unwrap();
+-            let env = serde_json::json!({
+-                "attesting_key_id": n.key,
+-                "identity_key_id": alice,
+-                "occurrence_key_id": sibling,
+-                "device_class": crate::federation::types::device_class::AGENT,
+-                "encryption_pubkeys": {
+-                    "x25519_base64": n.kem.x25519_base64,
+-                    "ml_kem_768_base64": n.kem.ml_kem_768_base64,
+-                },
+-                "asserted_at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+-                "valid_until": serde_json::Value::Null,
+-                "hardware_attestation": serde_json::Value::Null,
+-            });
+-            let (signed_envelope, signature) =
+-                ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+-                    &crate::signing::LocalSelfSigner::new(n.signer.as_ref()),
+-                    env,
+-                )
+-                .await
+-                .unwrap();
+-            let sibling_row = crate::federation::SignedIdentityOccurrence {
+-                identity_occurrence: crate::federation::types::IdentityOccurrence {
+-                    identity_key_id: alice.clone(),
+-                    occurrence_key_id: sibling.clone(),
+-                    device_class: crate::federation::types::device_class::AGENT.into(),
+-                    hardware_attestation: None,
+-                    asserted_at: at,
+-                    valid_until: None,
+-                    encryption_pubkeys: Some(n.kem.clone()),
+-                    transport_binding: None,
+-                    persist_row_hash: String::new(),
+-                },
+-                attesting_key_id: n.key.clone(),
+-                signed_envelope,
+-                signature,
+-            };
+-            n.backend
+-                .put_identity_occurrence(sibling_row.clone())
+-                .await
+-                .unwrap_or_else(|e| {
+-                    panic!("{tag} I76 (9): a bound node vouches for a sibling: {e}")
+-                });
+-            #[cfg(feature = "sqlite")]
+-            {
+-                let o2 = crate::store::sqlite::SqliteBackend::open_in_memory()
+-                    .await
+-                    .unwrap();
+-                crate::store::Backend::run_migrations(&o2).await.unwrap();
+-                let _twin =
+-                    node_as(&o2, alias, crate::federation::types::identity_type::NODE).await;
+-                ts::register_identity_key(&o2, &alice, USER).await;
+-                ts::register_hybrid_key_as(&o2, &sibling, &sibling, USER).await;
+-                o2.put_identity_occurrence_local(admitted.identity_occurrence.clone())
+-                    .await
+-                    .unwrap();
+-                let err = o2
+-                    .put_identity_occurrence(sibling_row)
+-                    .await
+-                    .expect_err("{tag} I76 (9): the node's raw row never vouches for a sibling");
+-                assert!(
+-                    err.to_string().contains("nor a node it owns")
+-                        || err.to_string().contains("acts for"),
+-                    "{tag} I76 (9): {err}"
+-                );
+-            }
+-        }
+-        // (7) PR #852 round four — the typed instant must be millisecond-exact:
+-        // a relay that keeps the signed millisecond but adds an unsigned
+-        // sub-millisecond part (enough to hop a same-millisecond revocation)
+-        // is refused.
++        match e2::put_bind(
++            n.backend,
++            &alice,
++            &agent,
++            &agent_key,
++            AGENT,
++            &opts(chrono::Utc::now()),
++        )
++        .await
+         {
+-            let mut sub_ms = admitted.clone();
+-            sub_ms.identity_occurrence.asserted_at =
+-                admitted.identity_occurrence.asserted_at + chrono::Duration::microseconds(500);
+-            let err = n
+-                .backend
+-                .put_identity_occurrence(sub_ms)
+-                .await
+-                .expect_err("{tag} I76 (7): a sub-millisecond typed instant is refused");
+-            assert!(
+-                err.to_string().contains("asserted_at"),
+-                "{tag} I76 (7): {err}"
+-            );
++            Ok(StatementOutcome::Row { .. }) => {}
++            other => panic!("{tag} I76 (9): the owner binds its agent's occurrence: {other:?}"),
+         }
+-        // (6) PR #852 round two — the envelope's attester must be the
+-        // wrapper's signer: a valid signature under an envelope that names
+-        // ANOTHER key as attester is refused.
+-        {
+-            let (i, mut e, at) = content_only(&alice);
+-            e["attesting_key_id"] = serde_json::Value::String(carol.clone());
+-            let err = n
+-                .backend
+-                .put_identity_occurrence(sign(i, e, at).await)
++        assert_eq!(
++            n.backend
++                .lookup_identity_for_occurrence(&agent_key)
+                 .await
+-                .expect_err(
+-                    "{tag} I76 (6): envelope attester diverging from the wrapper is refused",
+-                );
+-            assert!(
+-                err.to_string().contains("attesting_key_id"),
+-                "{tag} I76 (6): the refusal names the field: {err}"
+-            );
+-        }
+-        // (4) PR #852 review — a RELAY forwards the admitted row with the
+-        // typed `asserted_at` pushed into the future under the valid
+-        // signature: every persisted field is bound to the envelope.
+-        let mut forward_dated = admitted.clone();
+-        forward_dated.identity_occurrence.asserted_at =
+-            admitted.identity_occurrence.asserted_at + chrono::Duration::days(365);
+-        let err = n
+-            .backend
+-            .put_identity_occurrence(forward_dated)
+-            .await
+-            .expect_err("{tag} I76: a typed asserted_at diverging from the envelope is refused");
+-        assert!(
+-            err.to_string().contains("asserted_at"),
+-            "{tag} I76: the refusal names the diverging field: {err}"
++                .unwrap()
++                .map(|o| o.identity_key_id),
++            Some(agent.clone()),
++            "{tag} I76 (9): the agent's occurrence is the agent's"
+         );
+-        // (5) PR #852 review — the occurrence row alone never vouches: on a
+-        // backend that holds the admitted row but NO owner binding, the same
+-        // node's self-signed re-submission is refused. (An in-memory sqlite
+-        // twin, so this leg runs under the sqlite feature only.)
+-        #[cfg(feature = "sqlite")]
+-        {
+-            let other = crate::store::sqlite::SqliteBackend::open_in_memory()
+-                .await
+-                .unwrap();
+-            crate::store::Backend::run_migrations(&other).await.unwrap();
+-            // The same node (same alias ⇒ same deterministic signer and key),
+-            // registered on the fresh backend with its REAL pubkeys.
+-            let twin = node_as(&other, alias, crate::federation::types::identity_type::NODE).await;
+-            assert_eq!(twin.key, n.key);
+-            ts::register_identity_key(&other, &alice, USER).await;
+-            other
+-                .put_identity_occurrence_local(admitted.identity_occurrence.clone())
+-                .await
+-                .unwrap();
+-            let (i, e, at) = content_only(&alice);
+-            let err = other
+-                .put_identity_occurrence(sign(i, e, at).await)
+-                .await
+-                .expect_err(
+-                "{tag} I76: the row a prior admission left never vouches without the live binding",
+-            );
+-            assert_eq!(
+-                err.kind(),
+-                "federation_signer_not_acting_for",
+-                "{tag} I76: {err}"
+-            );
+-        }
+     }
+ 
+     /// **I60b — a set from a minter occurrence that is no longer active is
+@@ -2835,9 +2800,9 @@ pub mod two_node {
+         B: BlobStorage + FederationDirectory + Sync,
+     {
+         let run = uuid::Uuid::new_v4().simple().to_string();
+-        let comm = format!("{tag}-comm-{run}");
+-        let alice = format!("{tag}-alice-{run}");
+-        let bob = format!("{tag}-bob-{run}");
++        let comm = e2::kid(&format!("{tag}-comm-{run}"));
++        let alice = e2::kid(&format!("{tag}-alice-{run}"));
++        let bob = e2::kid(&format!("{tag}-bob-{run}"));
+         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+         encrypt_and_cascade_community(a.backend, &comm, b"while active", None, Some(&a.key))
+             .await
+@@ -2894,7 +2859,7 @@ pub mod two_node {
+         };
+         let late = sign_row_unstored(&a.signer, &held_row(a, &axis, &b.key).await).await;
+         assert_ne!(late.attestation.attestation_id, early_row.attestation_id);
+-        let err = admit_replicated_key_grant(b.backend, late)
++        let err = admit_replicated(b.backend, late)
+             .await
+             .expect_err("{tag} I60b: a row asserted after the revocation is refused");
+         assert_eq!(
+@@ -3205,6 +3170,8 @@ mod tests {
+     #[cfg(feature = "sqlite")]
+     mod sqlite {
+         use super::super::two_node::*;
++        use crate::federation::edition2::fixture_switch as e2;
++        use crate::federation::tier_ingest::test_support as ts;
+         use crate::store::sqlite::SqliteBackend;
+         use crate::store::Backend as _;
+ 
+@@ -3364,7 +3331,7 @@ mod tests {
+                     .await
+                     .unwrap();
+             engine
+-                .register_self_federation_key(USER, &alias, None, serde_json::json!({}), vec![])
++                .register_self_federation_key(USER, None, None)
+                 .await
+                 .unwrap();
+             let sq = engine.sqlite_backend().unwrap().clone();
+@@ -3374,7 +3341,7 @@ mod tests {
+                     x25519_base64: id.x25519_pubkey_b64,
+                     ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+                 };
+-            let owner = format!("i68-owner-{run}");
++            let owner = e2::kid(&format!("i68-owner-{run}"));
+             ts::register_hybrid_key_as(sq.as_ref(), &owner, &owner, USER).await;
+             let occurrence =
+                 |occ: &str, pk: EncryptionPubkeys| crate::federation::types::IdentityOccurrence {
+@@ -3426,7 +3393,7 @@ mod tests {
+             );
+             // A NEW device of the owner, with its own content-KEM identity.
+             let other = fresh().await;
+-            let dev2 = format!("i68-dev2-{run}");
++            let dev2 = e2::kid(&format!("i68-dev2-{run}"));
+             ts::register_hybrid_key_as(sq.as_ref(), &dev2, &dev2, USER).await;
+             sq.put_identity_occurrence_local(occurrence(
+                 &dev2,
+@@ -3464,23 +3431,95 @@ mod tests {
+             assert_eq!(rows_for(sq.clone(), me.clone()).await.len(), 2);
+         }
+ 
++        /// v62.0.0 (E11) — **the key plane crossing**: every `key:record`
++        /// statement `from` serves an anonymous reader
++        /// ([`statements_served_to`](crate::federation::edition2::serve::statements_served_to)),
++        /// delivered through `to`'s replicated statement door. Returns how
++        /// many were new on `to`.
++        async fn deliver_keys(from: &SqliteBackend, to: &SqliteBackend) -> usize {
++            use crate::federation::edition2::emit::{family_of_statement, KEY_RECORD_FAMILY};
++            use crate::federation::edition2::ingest::ReplicatedStatementOutcome;
++            let page =
++                crate::federation::edition2::serve::statements_served_to(from, None, 1_000, None)
++                    .await
++                    .unwrap();
++            let keys: Vec<Vec<u8>> = page
++                .statements
++                .into_iter()
++                .map(|s| s.bytes)
++                .filter(|b| family_of_statement(b).is_some_and(|(f, _)| f == KEY_RECORD_FAMILY))
++                .collect();
++            deliver_statements(to, &keys)
++                .await
++                .unwrap_or_else(|e| panic!("the far node admits the key records: {e}"))
++                .iter()
++                .filter(|o| matches!(o, ReplicatedStatementOutcome::Admitted(_)))
++                .count()
++        }
++
++        /// v62.0.0 (E11) — **the key-grant crossing through the plane**:
++        /// every key-grant row `from` serves on its cursor that its serve gate
++        /// (`may_receive`, on `from`'s own directory) sends to `to_key`, each
++        /// as its statement through `to`'s replicated statement door. Returns
++        /// how many crossed.
++        async fn deliver_key_grants(
++            from: &SqliteBackend,
++            to: &SqliteBackend,
++            to_key: &str,
++        ) -> usize {
++            use crate::federation::FederationDirectory;
++            let mut n = 0;
++            for served in from.list_attestations_since(None, 1_000).await.unwrap() {
++                let row = served.attestation;
++                if !crate::federation::key_grant::is_key_grant_row(&row)
++                    || !crate::federation::replication_audience::may_receive(from, to_key, &row)
++                        .await
++                        .unwrap()
++                        .allowed()
++                    || to
++                        .get_attestation(&row.attestation_id)
++                        .await
++                        .unwrap()
++                        .is_some()
++                {
++                    continue;
++                }
++                let signer = row.attesting_key_id.clone();
++                admit_replicated(
++                    to,
++                    crate::federation::key_grant::SignedKeyGrantRow { attestation: row },
++                )
++                .await
++                .unwrap_or_else(|e| {
++                    panic!("the far node admits the key-grant row by {signer}: {e}")
++                });
++                n += 1;
++            }
++            n
++        }
++
+         /// **I75 (#851 §20.4) — THE END TO END, DELIVERED.** Two Engines. Every
+         /// row crosses only through a since-read and the gated door on the
+-        /// other side: keys through the Key plane, owner bindings through the
+-        /// attestation cursor, occurrences through
+-        /// `list_signed_identity_occurrences_since` → `put_identity_occurrence`,
+-        /// the key-grant row through the cursor, the sender's serve gate and
+-        /// the generic `apply_replicated_attestation` (v55.0.0, #989: it
+-        /// projects the wrap). Nothing is copied by hand — the plane I61 could
+-        /// not run.
++        /// other side: keys through the key plane, occurrences through the
++        /// signed occurrence listing, the key-grant row through the cursor and
++        /// the sender's serve gate. Nothing is copied by hand — the plane I61
++        /// could not run.
++        ///
++        /// v62.0.0 (E11) — every crossing is a statement through the
++        /// replicated statement door. Each identity binds its own node as an
++        /// O1 `identity:occurrence` (the identity authors it, the node gives
++        /// its own voice), so the nodes are USER-typed device keys and no
++        /// owner binding is needed: a node no longer publishes its own
++        /// occurrence under its owner (that producer,
++        /// `Engine::publish_self_occurrence`, has no edition-2 form).
+         #[tokio::test]
+         async fn i75_end_to_end_delivered_by_the_planes_sqlite() {
+-            use crate::federation::tier_ingest::test_support as ts;
+             use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
++            use crate::federation::types::device_class::SERVER;
+             use crate::federation::types::identity_type::USER;
+             use crate::federation::{
+-                AdoptDisposition, BlobBody, BlobProvenance, BlobStorage, FederationDirectory,
+-                SignedAttestation, SignedKeyRecord,
++                AdoptDisposition, BlobBody, BlobProvenance, BlobStorage, EncryptionPubkeys,
++                FederationDirectory,
+             };
+             let run = uuid::Uuid::new_v4().simple().to_string();
+             let (alias_a, alias_b) = (format!("i75-a-{run}"), format!("i75-b-{run}"));
+@@ -3496,16 +3535,10 @@ mod tests {
+             )
+             .await
+             .unwrap();
+-            for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+-                e.register_self_federation_key(
+-                    crate::federation::types::identity_type::NODE,
+-                    alias,
+-                    None,
+-                    serde_json::json!({}),
+-                    vec![],
+-                )
+-                .await
+-                .unwrap();
++            for e in [&engine_a, &engine_b] {
++                e.register_self_federation_key(USER, None, None)
++                    .await
++                    .unwrap();
+             }
+             let (sa, sb) = (
+                 engine_a.sqlite_backend().unwrap().clone(),
+@@ -3515,129 +3548,26 @@ mod tests {
+                 engine_a.local_derived_key_id().await.unwrap(),
+                 engine_b.local_derived_key_id().await.unwrap(),
+             );
+-            // ── the planes ────────────────────────────────────────────
+-            async fn deliver_keys(from: &SqliteBackend, to: &SqliteBackend) -> usize {
+-                let mut n = 0;
+-                for served in crate::federation::key_plane::test_support::served_key_records(
+-                    from.as_dyn_directory(),
+-                    None,
+-                    1_000,
+-                )
+-                .await
+-                .unwrap()
+-                {
+-                    if FederationDirectory::lookup_public_key(to, &served.record.key_id)
+-                        .await
+-                        .unwrap()
+-                        .is_none()
+-                    {
+-                        to.put_public_key(SignedKeyRecord {
+-                            record: served.record,
+-                        })
+-                        .await
+-                        .unwrap();
+-                        n += 1;
+-                    }
+-                }
+-                n
+-            }
+-            async fn deliver_attestations(
+-                from: &SqliteBackend,
+-                to: &crate::Engine,
+-                to_backend: &SqliteBackend,
+-            ) -> usize {
+-                let to_key = to.local_derived_key_id().await.unwrap();
+-                let mut n = 0;
+-                for served in from.list_attestations_since(None, 1_000).await.unwrap() {
+-                    let row = served.attestation;
+-                    // v55.0.0 (#989) — a key-grant row crosses only to its
+-                    // recipient's node: the sender's serve gate decides.
+-                    if crate::federation::key_grant::is_key_grant_row(&row)
+-                        && !crate::federation::replication_audience::may_receive(
+-                            from, &to_key, &row,
+-                        )
+-                        .await
+-                        .unwrap()
+-                        .allowed()
+-                    {
+-                        continue;
+-                    }
+-                    if to_backend
+-                        .get_attestation(&row.attestation_id)
+-                        .await
+-                        .unwrap()
+-                        .is_some()
+-                    {
+-                        continue;
+-                    }
+-                    let kind = format!(
+-                        "{} (tier={}, pqc_sig={})",
+-                        row.attestation_type,
+-                        row.tier,
+-                        row.scrub_signature_pqc.is_some()
+-                    );
+-                    let signer = row.attesting_key_id.clone();
+-                    // v55.0.0 (#989) — ONE door for every row, a key-grant row
+-                    // included: the typed attestation apply projects its wrap
+-                    // (Edge's pull path needs no key-grant routing).
+-                    to_backend
+-                        .apply_replicated_attestation(SignedAttestation { attestation: row })
+-                        .await
+-                        .unwrap_or_else(|e| {
+-                            panic!("I75: the far node admits the row {kind} by {signer}: {e}")
+-                        });
+-                    n += 1;
+-                }
+-                n
+-            }
+-            async fn deliver_occurrences(from: &SqliteBackend, to: &SqliteBackend) -> usize {
+-                let mut n = 0;
+-                for served in
+-                    crate::federation::key_plane::test_support::served_identity_occurrences(
+-                        from.as_dyn_directory(),
+-                        1_000,
+-                    )
+-                    .await
+-                    .unwrap()
+-                {
+-                    let occ = served.occurrence;
+-                    if to
+-                        .lookup_identity_for_occurrence(&occ.identity_occurrence.occurrence_key_id)
+-                        .await
+-                        .unwrap()
+-                        .is_some()
+-                    {
+-                        continue;
+-                    }
+-                    to.put_identity_occurrence(occ)
+-                        .await
+-                        .unwrap_or_else(|e| panic!("I75: the far node admits the occurrence: {e}"));
+-                    n += 1;
+-                }
+-                n
+-            }
++            // The fixtures sign as the engines' own composites.
++            assert_eq!(
++                e2::kid(&alias_a),
++                a_key,
++                "I75: the engine signs as kid(alias)"
++            );
++            assert_eq!(
++                e2::kid(&alias_b),
++                b_key,
++                "I75: the engine signs as kid(alias)"
++            );
+             // ── identities and the community, each born on ONE node ───
+             let (alice, bob, comm) = (
+-                format!("i75-alice-{run}"),
+-                format!("i75-bob-{run}"),
+-                format!("i75-comm-{run}"),
++                e2::kid(&format!("i75-alice-{run}")),
++                e2::kid(&format!("i75-bob-{run}")),
++                e2::kid(&format!("i75-comm-{run}")),
+             );
+             ts::register_identity_key(sa.as_ref(), &alice, USER).await;
+             ts::register_identity_key(sb.as_ref(), &bob, USER).await;
+-            // v58.0.0 (CIRISPersist#991) — a self-signed registration, so the
+-            // community key is on the plane and crosses as its row.
+             ts::register_identity_key(sa.as_ref(), &comm, USER).await;
+-            // alice owns A (born on A); bob owns B (born on B) — attestations.
+-            sa.apply_replicated_attestation(SignedAttestation {
+-                attestation: ts::owner_binding_attestation(&format!("ob-a-{run}"), &alice, &a_key),
+-            })
+-            .await
+-            .unwrap();
+-            sb.apply_replicated_attestation(SignedAttestation {
+-                attestation: ts::owner_binding_attestation(&format!("ob-b-{run}"), &bob, &b_key),
+-            })
+-            .await
+-            .unwrap();
+             // Keys cross (both ways) so each side can verify the other's rows.
+             assert!(deliver_keys(&sa, &sb).await >= 3, "I75: A's keys reach B");
+             assert!(deliver_keys(&sb, &sa).await >= 2, "I75: B's keys reach A");
+@@ -3647,58 +3577,55 @@ mod tests {
+                 .expect("A's key on B");
+             assert!(
+                 a_on_b.pubkey_ml_dsa_65_base64.is_some(),
+-                "I75: A's key record on B carries the ML-DSA-65 pubkey (hybrid rows verify)"
++                "I75: A's key record on B carries the ML-DSA-65 pubkey (composite rows verify)"
+             );
+-            // The community row (roster plane: the signed row, both sides).
+-            let community = ts::sign_community(
+-                &comm,
+-                crate::federation::types::Community {
+-                    prev_head_digest: String::new(),
+-                    charter_digest: String::new(),
+-                    community_key_id: comm.clone(),
+-                    community_name: "Delivered Co-op".into(),
+-                    members: [&alice, &bob]
+-                        .into_iter()
+-                        .map(|k| crate::federation::types::CommunityMember {
+-                            key_id: k.clone(),
+-                            joined_at: chrono::Utc::now(),
+-                            role: None,
+-                        })
+-                        .collect(),
+-                    founded_at: chrono::Utc::now(),
+-                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+-                        .to_owned(),
+-                    policy_blob: None,
+-                    persist_row_hash: String::new(),
+-                },
+-            );
+-            sa.put_community(community.clone()).await.unwrap();
+-            sb.put_community(community).await.unwrap();
+-            // Bindings cross.
+-            deliver_attestations(&sa, &engine_b, &sb).await;
+-            deliver_attestations(&sb, &engine_a, &sa).await;
+-            // ── each node publishes its OWN occurrence (§20.3) ────────
+-            engine_a
+-                .publish_self_occurrence(
+-                    &alice,
+-                    crate::federation::types::device_class::SERVER,
+-                    None,
+-                )
++            // The community (roster plane: the same version, both sides).
++            let roster = community_roster_voices(&comm, "Delivered Co-op", &[&alice, &bob]);
++            for s in [&sa, &sb] {
++                e2::put_voices(s.as_ref(), &roster)
++                    .await
++                    .unwrap_or_else(|e| panic!("I75: the community: {e}"));
++            }
++            // ── each identity binds its own node (O1) ─────────────────
++            let kem =
++                |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
++                    x25519_base64: id.x25519_pubkey_b64,
++                    ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
++                };
++            for (s, ident, alias) in [(&sa, &alice, &alias_a), (&sb, &bob, &alias_b)] {
++                let opts = e2::BindOptions {
++                    extra: vec![encryption_member(&kem(s
++                        .load_or_init_content_kem_identity()
++                        .await
++                        .unwrap()))],
++                    ..e2::BindOptions::default()
++                };
++                match e2::put_bind(s.as_ref(), ident, ident, alias, SERVER, &opts).await {
++                    Ok(crate::federation::edition2::ingest::StatementOutcome::Row { .. }) => {}
++                    other => panic!("I75: {ident} binds its node: {other:?}"),
++                }
++            }
++            // Occurrences cross through the signed listing and the gated door.
++            deliver_statements(sb.as_ref(), &bind_statements_for(sa.as_ref(), &alice).await)
+                 .await
+-                .expect("I75: A publishes its occurrence under alice");
+-            engine_b
+-                .publish_self_occurrence(&bob, crate::federation::types::device_class::SERVER, None)
++                .unwrap_or_else(|e| panic!("I75: A's occurrence reaches B: {e}"));
++            deliver_statements(sa.as_ref(), &bind_statements_for(sb.as_ref(), &bob).await)
+                 .await
+-                .expect("I75: B publishes its occurrence under bob");
+-            // Occurrences cross through the plane and the gated door.
++                .unwrap_or_else(|e| panic!("I75: B's occurrence reaches A: {e}"));
+             assert_eq!(
+-                deliver_occurrences(&sa, &sb).await,
+-                1,
++                sb.lookup_identity_for_occurrence(&a_key)
++                    .await
++                    .unwrap()
++                    .map(|o| o.identity_key_id),
++                Some(alice.clone()),
+                 "I75: A's occurrence reaches B"
+             );
+             assert_eq!(
+-                deliver_occurrences(&sb, &sa).await,
+-                1,
++                sa.lookup_identity_for_occurrence(&b_key)
++                    .await
++                    .unwrap()
++                    .map(|o| o.identity_key_id),
++                Some(bob.clone()),
+                 "I75: B's occurrence reaches A"
+             );
+             // ── A seals; B's node is IN the set ───────────────────────
+@@ -3715,7 +3642,7 @@ mod tests {
+             let sha = r.at_rest_sha256;
+             // B's row crosses through the cursor and the serve gate.
+             assert!(
+-                deliver_attestations(&sa, &engine_b, &sb).await >= 1,
++                deliver_key_grants(&sa, &sb, &b_key).await >= 1,
+                 "I75: the row reaches B"
+             );
+             assert!(
+@@ -3806,20 +3733,20 @@ mod tests {
+             engine
+                 .register_self_federation_key(
+                     crate::federation::types::identity_type::NODE,
+-                    &alias,
+                     None,
+-                    serde_json::json!({}),
+-                    vec![],
++                    None,
+                 )
+                 .await
+                 .unwrap();
+             let s = engine.sqlite_backend().unwrap().clone();
+             let me = engine.local_derived_key_id().await.unwrap();
+-            let alice = format!("i91-alice-{run}");
++            let alice = e2::kid(&format!("i91-alice-{run}"));
+             ts::register_identity_key(s.as_ref(), &alice, USER).await;
+             // alice owns this node — the binding the lift resolves through.
+             s.apply_replicated_attestation(SignedAttestation {
+-                attestation: ts::owner_binding_attestation(&format!("ob-{run}"), &alice, &me),
++                attestation: crate::federation::edition2::fixture_switch::with_earlier_form(|| {
++                    ts::owner_binding_attestation(&format!("ob-{run}"), &alice, &me)
++                }),
+             })
+             .await
+             .unwrap();
+@@ -3936,10 +3863,8 @@ mod tests {
+             for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+                 e.register_self_federation_key(
+                     crate::federation::types::identity_type::NODE,
+-                    alias,
+                     None,
+-                    serde_json::json!({}),
+-                    vec![],
++                    None,
+                 )
+                 .await
+                 .unwrap();
+@@ -3972,8 +3897,8 @@ mod tests {
+                     ml_kem_768_base64: B64.encode(ml_pub),
+                 }
+             };
+-            let input =
+-                |signer: Option<std::sync::Arc<crate::signing::LocalSigner>>| SelfAtLoginInput {
++            let input = |signer: Option<std::sync::Arc<crate::signing::LocalSigner>>| {
++                SelfAtLoginInput {
+                     identity_key_id: identity.clone(),
+                     identity_signer: signer,
+                     app: SelfAtLoginOccurrence {
+@@ -3994,7 +3919,8 @@ mod tests {
+                     },
+                     bilateral_pair_id: uuid::Uuid::new_v4().to_string(),
+                     delegation_scope: None,
+-                };
++                }
++            };
+ 
+             // ── leg 1: with the signer, the rows are ON THE PLANE ─────────
+             let outcome = engine_a
+@@ -4078,10 +4004,8 @@ mod tests {
+             engine_c
+                 .register_self_federation_key(
+                     crate::federation::types::identity_type::NODE,
+-                    &format!("i92-c-{run}"),
+                     None,
+-                    serde_json::json!({}),
+-                    vec![],
++                    None,
+                 )
+                 .await
+                 .unwrap();
+@@ -4135,10 +4059,8 @@ mod tests {
+             engine
+                 .register_self_federation_key(
+                     crate::federation::types::identity_type::NODE,
+-                    &alias,
+                     None,
+-                    serde_json::json!({}),
+-                    vec![],
++                    None,
+                 )
+                 .await
+                 .unwrap();
+@@ -4227,10 +4149,8 @@ mod tests {
+             engine
+                 .register_self_federation_key(
+                     crate::federation::types::identity_type::NODE,
+-                    &alias,
+                     None,
+-                    serde_json::json!({}),
+-                    vec![],
++                    None,
+                 )
+                 .await
+                 .unwrap();
+@@ -4358,7 +4278,7 @@ mod tests {
+                     .await
+                     .unwrap();
+             engine
+-                .register_self_federation_key(USER, &alias, None, serde_json::json!({}), vec![])
++                .register_self_federation_key(USER, None, None)
+                 .await
+                 .unwrap();
+             let sq = engine.sqlite_backend().unwrap().clone();
+@@ -4371,7 +4291,7 @@ mod tests {
+             // A community of me (occurrence: this node) and a member whose
+             // occurrence lives elsewhere (a second in-memory identity).
+             let other = fresh().await;
+-            let member_occ = format!("i70-member-occ-{run}");
++            let member_occ = e2::kid(&format!("i70-member-occ-{run}"));
+             ts::register_hybrid_key_as(sq.as_ref(), &member_occ, &member_occ, USER).await;
+             let node = Node {
+                 backend: sq.as_ref(),
+@@ -4379,8 +4299,11 @@ mod tests {
+                 key: me.clone(),
+                 kem: kem(sq.load_or_init_content_kem_identity().await.unwrap()),
+             };
+-            let comm = format!("i70-comm-{run}");
+-            let (alice, bob) = (format!("i70-alice-{run}"), format!("i70-bob-{run}"));
++            let comm = e2::kid(&format!("i70-comm-{run}"));
++            let (alice, bob) = (
++                e2::kid(&format!("i70-alice-{run}")),
++                e2::kid(&format!("i70-bob-{run}")),
++            );
+             seed_community_everywhere(&[&node], &comm, &[(&alice, Some(&node)), (&bob, None)])
+                 .await;
+             sq.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+@@ -4458,12 +4381,12 @@ mod tests {
+             );
+             assert_eq!(epoch_sets(sq.clone(), me.clone()).await, 2);
+             // (4) The boot sweep on a fresh community left dirty by a "crash".
+-            let comm2 = format!("i70-comm2-{run}");
++            let comm2 = e2::kid(&format!("i70-comm2-{run}"));
+             // Seeded by hand: alice (this node's identity) is already
+             // registered — one occurrence, one identity — and joins a second
+             // community with bob2.
+-            let bob2 = format!("i70-bob2-{run}");
+-            let member_occ2 = format!("i70-member-occ2-{run}");
++            let bob2 = e2::kid(&format!("i70-bob2-{run}"));
++            let member_occ2 = e2::kid(&format!("i70-member-occ2-{run}"));
+             for k in [&comm2, &bob2, &member_occ2] {
+                 ts::register_hybrid_key_as(sq.as_ref(), k, k, USER).await;
+             }
+@@ -4555,7 +4478,7 @@ mod tests {
+             .await
+             .unwrap();
+             for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+-                e.register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
++                e.register_self_federation_key(USER, None, None)
+                     .await
+                     .expect("register the engine's own key");
+             }
+@@ -4581,8 +4504,11 @@ mod tests {
+                 kem: kem(sb.load_or_init_content_kem_identity().await.unwrap()),
+             };
+             introduce(&[&a, &b], &[&alias_a, &alias_b]).await;
+-            let comm = format!("eng-comm-{run}");
+-            let (alice, bob) = (format!("eng-alice-{run}"), format!("eng-bob-{run}"));
++            let comm = e2::kid(&format!("eng-comm-{run}"));
++            let (alice, bob) = (
++                e2::kid(&format!("eng-alice-{run}")),
++                e2::kid(&format!("eng-bob-{run}")),
++            );
+             seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))])
+                 .await;
+ 

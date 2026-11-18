@@ -1,0 +1,374 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d1febe48..07dda0e0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,100 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
+ 
+ ## [62.0.0] - UNRELEASED
+ 
++v62 moves persist onto the CIRIS kernel crate (`kernel-v0.2.0`) and the CIRIS Constitution v1.0-rc20 clean mesh (tag d4bd2a6): **nothing carries.** A v62 node reads and writes only edition-2 statements (CBOR/COSE, composite-signed), starts from `ceg-genesis-bundle/2`, and deletes its v61 store the first time it opens it. The sections below each slice's heading record that slice's changes; this first part is the release as an adopter meets it. `docs/EDITION2_MIGRATION.md` is the step-by-step guide, and `docs/EDITION2_PAYLOADS.md` lists each family's payload members. Every decision cited here is in `FSD/v62_docs/RULINGS.md`.
++
++### BREAKING: the release in one list
++
++- **The wire is edition 2 only** (CC 2.6.1.12). Every earlier-form door refuses an earlier-form object by name, before it parses or verifies: `federation_malformed_row` with reason `earlier_form_object` (Python `ValueError`). An edition-1 row-ref is `row_ref_edition_1`. The doors keep their names and refuse; nothing is admitted through them. This applies to the Rust `FederationDirectory` doors, the PyO3 doors, the capsule's earlier-form `DirectoryOp` arms and the HTTP routes. A v62 node and a v61 node do not exchange rows.
++- **The store is deleted at upgrade** (CC 2.7.9; slice E2b). The first v62 open of a v61 store deletes it and creates an empty edition-2 store. There is no archive and no held copy. Only the per-plane row counts are kept, in the node-local `store_edition_deletions`. A live legal hold refuses the open and deletes nothing (`store_earlier_store_legal_hold`). `UpgradeMode::DryRun` reports what would go and deletes nothing.
++- **One schema baseline, V300** (both dialects). Edition 1's V001..V216 are gone; future migrations are V301 onward. A history row below V300 is refused (`MigrationError::EditionOneHistory`).
++- **Genesis is `ceg-genesis-bundle/2`** (CC 2.6.1.11, 5.3.4). Bundle/1, its JSON seeds and the baked bundle/1 are removed. A fresh node is pre-genesis and roots nothing until it holds a bundle. **Canonical standing is membership in `serve_nodes` of the bundle in force**, by identity-ref (ruling C), never a key type, a label or a co-scrub.
++- **A key is live only by an edition-2 `key:record`** (CC 2.4.1.1). A `node` or `agent` record ends at most 365 days after it is asserted (`key_record_out_of_window`); a `user` or `accord_holder` record carries no end. Holders carry their keys over themselves, by signing a new `key:record`. Only the key itself, its owner, and the roster that seats it can end a key.
++- **Composite signatures only** (CC 2.6.1.7). Every statement, head and object is signed with the ML-DSA-65 + Ed25519 composite. There are no standalone component signatures and no PQC half to attach later. The two exceptions are the per-chunk media trailer and the CC 6.1.3 substrate objects (for example the wholeness witness and the fountain aggregation meta).
++- **Key ids are identity-refs** (CC 2.6.1.1): `urn:ietf:params:oauth:ckt:sha-256:<base64url thumbprint>` of the key's genesis key. It survives rotation. The earlier `alias-<fingerprint>` ids are gone.
++- **Row ids are computed by the node** (CC 2.6.1.3): SHA-256 over the row's deterministic encoding. An offered id that differs is refused `row_id_mismatch`. Nothing is stored under an id a peer gives. `original_content_hash` is gone.
++- **The accord halt** (CC 4.2.1.1) is one row with ONE composite statement from a SINGLE accord holder, with no count. The signer is judged against the holders of the genesis bundle in force for the invocation's `accord_root`. With no bundle held, or a `kid` the roster does not place, the halt **waits**: it is never refused while its roster is unknown. A signer that is not a holder is refused `iss_not_holder`. The reading and its tokens are CIRISVerify 23.3.0's (`valid`; `waiting:{kid,bundle,kid+bundle}`; `refused:{token}`). A repeated `invocation_id` or `nonce` of the same accord within the held invocation's `valid_until` is refused `accord_invocation_replayed`.
++- **Composers carry their target's family** (CC 2.4.1.1, CC-READING next edition). A `withdraws`, `recants` or `supersedes` names its target by `refs.target` and must be of the target's family, or it is refused `composer_family_mismatch`. A composer whose target this node does not hold waits.
++- **The key-of-issuer check** (CC 2.6.1.7, CC-READING next edition). A key signs only for its own identity, unless a rotation chain or the genesis bundle in force seats it for that identity. Otherwise the row is refused `kid_not_of_iss`. A missing link in the chain waits (the retryable `federation_attester_key_unknown`).
++- **CIRISVerify is pinned at `v23.3.0`** (ffd7af1), all crates together.
++
++### Adoption notes for v62.0.0 (CIRISEdge, CIRISServer, CIRISAgent, CIRISBridge)
++
++These notes cover the whole release. The per-slice notes further down give each slice's detail.
++
++#### Every adopter
++
++- **Flip the CIRISVerify pins to `v23.3.0` together with persist's.** Splitting them gives two `ciris_crypto` versions in one build. The halt reading, the key-of-issuer check and the bundle reader are 23.3.0's.
++- **Plan the upgrade as a clean install.** Every node loses its v61 rows: keys, attestations, communities, blobs, traces, ledgers, secrets. Before upgrading, run the dry run, `ciris_persist::store::edition_upgrade::delete_earlier_store(target_of_dsn(dsn).unwrap(), UpgradeMode::DryRun)`, which reports the per-plane counts and the legal-hold answer and changes nothing. A refusal at open (`store_earlier_store_legal_hold`, `store_foreign_store`, `store_earlier_store_single_process_host`; Python `RuntimeError` led by the token) is an operator action, never a retry.
++- **Re-register every key as an edition-2 `key:record`** after the upgrade. A `node` or `agent` record must end within 365 days, so schedule its renewal: a renewal extends the key to the greatest end, and a key whose records have all ended stops verifying.
++- **Treat key ids and row ids as opaque text you were given, never text you build.** A key id is an identity-ref; a row id is lowercase hex in `attestation_id` / `persist_row_hash`. Do not derive either from a fingerprint, a JCS hash or an envelope hash: `register::key_id_fingerprint` is removed.
++- **Sign rows as edition-2 statements.** Use persist's producer (`edition2::produce::sign_row` in Rust, `sign_row` / `sign_composite` on the PyO3 surface) or Verify's minter with a composite key. The family names and payload members are in `docs/EDITION2_PAYLOADS.md`. Delegations use the families CC confirmed: `self:delegates_to` (capability, moderator, steward, guardianship), `ownership:{relation}:{target_kind}:{version}` with the node's own statement as the second voice, `self:delegates_to:agent_occurrence`, and `trust:{job}:{version}`. A trust grant is a `delegates_to` row, and its revocation is the granter's `withdraws`. A co-signature is a further statement over the same payload, counted as a voice (CC 2.6.1.9), never a payload member.
++- **Hand inbound statements to the edition-2 doors.** `Engine::put_edition2_statement(bytes, offered_row_id)` for a statement you produced or received directly; `ingest::apply_replicated_statement` for one a peer delivered. `put_edition2_statement` answers what it kept (`StatementOutcome::{KeyPlane, Voice, Row}`, each with the row id and whether it was new); `apply_replicated_statement` answers `Admitted` / `Unchanged` / `Refused { StoreConflict }`, all of which advance a replication cursor. Anything else is a refusal by name. A statement waiting on a key, a chain link, a bundle or a composer's target is retryable: park it and offer it again when the missing row arrives. The refusal reasons that are new in v62: `earlier_form_object`, `row_ref_edition_1`, `edition2_statement_invalid`, `edition2_family_invalid`, `edition2_payload_invalid`, `edition2_not_a_row`, `row_id_mismatch`, `key_record_out_of_window`, `kid_not_of_iss`, `iss_not_holder`, `accord_invocation_invalid`, `accord_invocation_replayed`, `composer_family_mismatch`, `earlier_form_signer_is_edition2`. Each is a `federation_malformed_row` reason, Python `ValueError`.
++- **Serve statements as received, through `edition2_statements_since(cursor, limit)`**: held statements in this node's admission order after the cursor `(admitted_us, statement_id)`, at most 1000 a page. Key a replication wire on the statement id or the row id.
++- **Kernel departures** (rulings, all kernel-right): a group whose `consensus_protocol` is `reverse_quorum:*` or `custom:*` admits no membership change; a `weighted:` rubric must use whole numbers; an owner binding names an owner only with the node's own cosignature (C557); a `delegates_to` that closes a cycle is no longer refused (`federation_delegation_cycle` is never raised; a walk visits each key once); a fork of a held head is held as a tip.
++- **The planes** (ruling): detection events, cirisnode attestations and receipts are MESH rows; traces (`trace:complete:v1` replicates), the fountain and the audit chain are SPLIT; the Lens envelope and the secrets API are LOCAL and never replicate. A touch claim and a stream DEK are node-local; a stream DEK's wraps are `key_grant:stream` rows. A location proof is a `location_proof:v1` row signed by its subject only. A sealed manifest is unsigned blob bytes. `trust:blessing` is a new family.
++- **Identity sets.** `identity_type` is a set: `user` / `accord_holder` never share a record with `node` / `agent`, and `node` never with `agent`. `canonical` is a conferral, not a key type, and `substrate_persist` confers nothing.
++- **Removed APIs** are listed under "Removed (v62.0.0)" below. Every rename and removal is a clean break with no alias.
++
++#### CIRISEdge
++
++- **Producers.** The ~20 sites that call `ceg_produce_canonicalize` and fill `scrub_signature_classical` / `scrub_signature_pqc` by hand (`chat.rs`, `files.rs`, `membership.rs`, `community_roster.rs`, `group_content/store.rs`, `touch_claim.rs`, `replication/attestation_bind.rs`, `transport/self_route.rs`, `transport/realtime_av_alm/delivered.rs`, `bin/edge_node.rs`) sign an edition-2 row instead. A touch claim is node-local and does not replicate. Edge's own transport envelope (`identity.rs`, `verify.rs`) is not a persist row; persist does not rule on it.
++- **Doors.** `put_attestation_authored`, `put_attestation`, `put_attestation_synced`, `put_public_key` and `put_signed_transport_destination` move to `put_edition2_statement` / `apply_replicated_statement`. The wrappers in `ffi/kept_directory.rs` and `replication/counting_directory_930.rs` move to the capsule ops `PutEdition2Statement` and `ApplyReplicatedStatement`. The earlier-form capsule ops keep their numbers and refuse. `attach_*_pqc_signature` is removed: a composite has no half to attach.
++- **Replication wire.** Summary / Deliver carry statement bytes, keyed by statement id or row id, never `Signed*` JSON keyed on `envelope_hash`. Serve from `edition2_statements_since`; apply with `apply_replicated_statement`. A statement waiting on a key does not advance the cursor; `Admitted`, `Unchanged` and a store conflict do.
++- **Genesis.** The bundle/1 reads of `serve_nodes[].record.key_id` (`edge.rs`, `peer_obligation.rs`, `reticulum.rs`) read the bundles in force instead (`bundles_in_force`, PyO3 `bundles_in_force_json`): `serve_nodes` and `holders` are identity-ref sets.
++- **Transport keys.** `transit_xwing_pubkey` and `onion_hop_xwing_pubkey` are one 1216-byte member each (pk_M ‖ pk_X). A seat's X-Wing key is live from its genesis binding or a counted `transport:canonical_rebind`; a key a seat publishes alone is not live. Resolve with `transit_xwing_pubkey_for` (slice E1).
++- **Fingerprints.** `verify.rs`'s use of `register::key_id_fingerprint` becomes the identity-ref of the key's thumbprint.
++
++#### CIRISServer
++
++- **Genesis ceremony.** `final_genesis.rs` (`/v1/accord/final-genesis{,/plan,/sign}`) produces `ceg-genesis-bundle/2` voices: every holder signs the bundle's CBOR payload, never `canonical_seed.json`. The payload is the charter (`recovery_commitments` keyed by holder identity-ref, `scope`, and the optional `halt_fuse_secs`, `attach_window_secs` and witness members), with `holders` and `serve_nodes` as explicit sets and `iat` = ⌊asserted_at / 1000⌋. A later bundle needs a strict majority of its predecessor's holders, plus each added and each re-committed holder; a recovery bundle is signed by the recovery key alone and changes only that seat. Short of its count, a bundle concludes nothing (`genesis_bundle_count_unmet`).
++- **Canonical standing.** Put the canonical's identity-ref in `serve_nodes`. Read standing with `is_canonical` / `list_canonical_servers`, never from `identity_type`. `canonical_genesis_bundle()` and `effective_accord_holder_records()` are removed; `mesh_genesis.rs` and `trust_root_api.rs` read the bundles in force.
++- **Trust-root routes.** `/v1/trust-root/bundle` serves `{"statements": [hex…], …}` plus the rows the bundle names (CC 5.3.4). `/v1/trust-root/import`, `/v1/federation/test-genesis-bundle` and `CIRIS_TEST_GENESIS_BUNDLE` take bundle/2; a bundle/1 body is `earlier_form_object`.
++- **Producers.** The 16 `ceg_produce_canonicalize` sites (accord_duty, add_device, admin_ops, attest, auth/ownership, commons_surface, equivocation, family_api, location, mesh_config_surface, peer, sign_object) sign edition-2 rows. `auth/ownership.rs`'s `KeyRecord` with `original_content_hash` becomes a `key:record` statement. An owner binding is `ownership:{relation}:{target_kind}:{version}` with the node's statement as the second voice.
++- **Cosign routes.** `/v1/accord/duty/cosign` and `/v1/families/{id}/changes/cosign` take a further statement over the same payload, not a JCS scrub.
++- **Accord proposal, participation and decision are gone.** A roster change is a later genesis bundle at the holders' count. The `put_accord_{proposal,participation,decision}_json` doors refuse.
++- **Halt.** Route an invocation (`accord:invoke:{constitutional,notify,drill}:…`) through `put_edition2_statement`. Until the node holds the accord's bundle in force, an invocation waits; it is never refused for an unknown roster. Surface `iss_not_holder` and `accord_invocation_replayed` as refusals, and `waiting:*` as a retry.
++- **Key ids.** `fedcode::derive_key_id` is the earlier-form key id. Use the identity-ref persist returns (`register_self_federation_key`, `local_derived_key_id`).
++- **Doors.** `put_attestation_authored`, `put_attestation` (the allegiance import in `mesh_genesis.rs` included), `put_public_key`, `put_revocation` and `put_signed_transport_destination` move to the edition-2 doors. The `emit_attestation(_self)` sites and `attestation_upsert_local` keep their shape.
++- **Harness.** `agent_boot.py`'s `register_federation_key(json.dumps(rec))` refuses `earlier_form_object`; register through `register_self_federation_key` or a `key:record` statement.
++- **Pipeline ingest.** `POST /api/v1/pipeline/ingest` verified the Lens `PipelineEnvelope` against earlier-form keys. The Lens envelope is LOCAL by ruling; it is never a mesh row.
++
++#### CIRISAgent
++
++- **`register_self_federation_key` returns an identity-ref.** The Agent overwrites `_actor_key_id` from it, which is correct as long as the id stays opaque. Do not compare it with a stored v61 id: the v61 store is gone.
++- **`lookup_public_key`** keeps its JSON shape for an edition-2 key: `pubkey_ed25519_base64` and `pubkey_ml_dsa_65_base64` are the composite's two halves, and `identity_type` is the record's set, comma-joined. Do not verify an earlier-form signature against such a key: persist refuses that `earlier_form_signer_is_edition2`.
++- **Signing.** Composite signatures only. A separate Ed25519 or ML-DSA-65 signature in `substrate_signing.py` is allowed only if the object is a CC 6.1.3 substrate object; otherwise sign with the composite (`sign_composite`).
++- **Traces** are SPLIT: `trace:complete:v1` replicates, the rest stays on the node. The Agent's trace canonicalisation comes from CIRISVerify, not persist.
++- `attestation_upsert_local` (the unsigned local tier) is unchanged.
++
++#### CIRISBridge
++
++- **Upgrading the canonical's CIRISServer to a persist-62 build deletes the canonical's store** on its first open. Run the dry run against the canonical's store before the deploy and read its counts and legal-hold answer. If the open refuses, the deploy must stop: re-running it does not help.
++- **The pre-upgrade snapshot.** The role's upgrade snapshot (`data.bak.*`) of a v61 store is a copy that no v62 node can open. The ruling provides no archive; decide with the project owner whether such a copy is kept, and for how long.
++- **The identity directory is not the store.** Persist deletes only its own store (the SQLite file, or its PostgreSQL schemas). The node's keystore stays, and the node re-registers the same key as an edition-2 `key:record` that ends within 365 days. A deploy that keeps the canonical in service must renew that record before it ends.
++- **Canonical standing comes from the genesis bundle in force,** not from `ciris_server_key_id`. The canonical is canonical when its identity-ref is in the bundle's `serve_nodes`. The `<key_id>-<fp>` wire identity (`fedcode::derive_key_id`) is the earlier form; the keystore alias may stay as it is.
++- **Pre-genesis.** Until the canonical holds a `ceg-genesis-bundle/2`, it roots nothing. Order the rollout so the bundle is installed before peers are expected to treat it as canonical.
++- **Every peer must be on v62.** v61 and v62 nodes do not exchange rows.
++
++### Removed (v62.0.0)
++
++Clean break, no aliases.
++
++- **The PQC cold path** (a composite is atomic): `FederationDirectory::{attach_key_pqc_signature, attach_attestation_pqc_signature, list_hybrid_pending_keys, list_hybrid_pending_attestations}`; `KeyRecordWrite::AttachPqc`, `PlannedKeyRecord::CompletePqc`, `plan_key_attach_pqc`, `admission::check_key_pqc_attachment`; `HybridPendingRow`; PyO3 `Engine.attach_attestation_pqc_signature`, `attach_key_pqc_signature`, `run_pqc_sweep`, `cold_path_pqc_sign` and the `pqc_sweep_on_init` constructor argument; the v31 re-stamp migration (`federation::migration`).
++- **`adopt_scrub_upgrade`** (`Engine`, `FederationDirectory`, PyO3).
++- **Genesis bundle/1**: `canonical_genesis_bundle()`, `effective_accord_holder_records()`, the bundle/1 import and install doors, the baked JSON bundle and the JSON genesis seeds.
++- **Fingerprint key ids**: `register::key_id_fingerprint`.
++- **The accord's proposal, participation and decision** planes.
++- **`original_content_hash`** as a signed input. A row is named by its row id.
++- **Earlier-form doors** are not removed by name: each refuses `earlier_form_object`. The capsule's earlier-form `DirectoryOp` arms stay, refusing, so the op numbering is unchanged.
++- **Edition 1's migrations** (V001..V216) and their checksums (slice E2b).
++
++### Added (v62.0.0 host surfaces)
++
++- **PyO3** (`Engine`): `put_edition2_statement`, `apply_replicated_statement`, `sign_row`, `sign_composite`, `bundles_in_force_json`, `edition2_statements_since`. Refusals map to `ValueError(federation_malformed_row: <reason>)`; a wait is the retryable `federation_attester_key_unknown`. The earlier-form PyO3 doors raise `ValueError(federation_malformed_row: earlier_form_object)`.
++- **Capsule** (`DirectoryOp`, append-only): `PutEdition2Statement`, `ApplyReplicatedStatement`.
++- **HTTP**: `GET /v1/trust-root/bundle` and `/v1/steward-key` serve bundle/2 statements as hex with the rows the bundle names.
++
+ ### Changed (v62 JSON-cut slice A: inbound doors)
+ 
+ - **The earlier-form refusal switch** (`federation::edition2::door`; CC 2.6.1.12). `EARLIER_FORM_DOORS_SHUT` (`false` until slice F) and the one shared refusal `refuse_earlier_form(plane)` / `refuse_earlier_form_row(plane, row)` are the first line of 28 earlier-form doors (attestation put and replicated apply, key record write and replicated apply, revocation, family, community, membership, occurrence, consent, transport, accord proposal / participation / decision, accord carriage, evidence, blob, key grant, lineage cosign, steward purge). Inert while the switch is off; then each refuses `earlier_form_object` by name before it parses or verifies. A row that carries its edition-2 statement (`ceg_statement`) is the edition-2 door's mapping and passes.
+diff --git a/README.md b/README.md
+index f7da05b9..bbe7e9f2 100644
+--- a/README.md
++++ b/README.md
+@@ -244,6 +244,8 @@ that are merged, clean, unlocked, idle and cold for an hour.
+ | [docs/FEDERATION_DIRECTORY.md](docs/FEDERATION_DIRECTORY.md) | The federation directory: keys, attestations, trust anchors |
+ | [docs/COHABITATION.md](docs/COHABITATION.md) | Sharing one `Engine` between components in a process |
+ | [docs/INTEGRATION_LENS.md](docs/INTEGRATION_LENS.md) | Integrating CIRISLens with persist |
++| [docs/EDITION2_MIGRATION.md](docs/EDITION2_MIGRATION.md) | Moving to edition 2 (v62): the upgrade, genesis bundle/2, keys, producing, receiving and serving statements |
++| [docs/EDITION2_PAYLOADS.md](docs/EDITION2_PAYLOADS.md) | Each edition-2 family's payload members |
+ | [WIRE_VOCABULARY_KINDS.md](WIRE_VOCABULARY_KINDS.md) | The wire vocabulary's kinds and what each means |
+ | [docs/V61_TASK_PLAN.md](docs/V61_TASK_PLAN.md) | The plan for the next release |
+ | [CHANGELOG.md](CHANGELOG.md) | Release history |
+diff --git a/docs/EDITION2_MIGRATION.md b/docs/EDITION2_MIGRATION.md
+new file mode 100644
+index 00000000..916cd730
+--- /dev/null
++++ b/docs/EDITION2_MIGRATION.md
+@@ -0,0 +1,250 @@
++# Moving to edition 2 (persist v62)
++
++v62.0.0 (CIRIS Constitution v1.0-rc20, tag d4bd2a6; CIRISVerify v23.3.0).
++
++This guide is for the projects that build on persist: CIRISEdge,
++CIRISServer, CIRISAgent, and CIRISBridge, which deploys the canonical. It says
++what changes, what to do before, during and after the upgrade, and how to
++produce, receive and serve rows afterwards. The CHANGELOG's `## [62.0.0]`
++section lists every change and refusal token. [EDITION2_PAYLOADS.md](EDITION2_PAYLOADS.md)
++lists each family's payload members. The decisions behind the release are in
++`FSD/v62_docs/RULINGS.md`.
++
++## What changes
++
++The Constitution's rc20 rule is "nothing carries, clean mesh". For an adopter
++that means:
++
++| Before (v61, edition 1) | v62 (edition 2) |
++|---|---|
++| Signed JSON objects (`Signed*`), canonicalised with JCS | CBOR/COSE statements in the deterministic encoding (CDE, CC 2.6.1.2) |
++| A hybrid signature: an Ed25519 part, with the ML-DSA-65 part sometimes attached later | One composite signature (ML-DSA-65 + Ed25519), signed at once |
++| Key ids such as `alias-<fingerprint>` | Identity-refs: `urn:ietf:params:oauth:ckt:sha-256:<base64url thumbprint>` of the key's genesis key, unchanged by rotation |
++| Row ids that the producer or a peer could supply | Row ids the node computes from the row (SHA-256 over its deterministic encoding) |
++| `ceg-genesis-bundle/1` and baked JSON seeds | `ceg-genesis-bundle/2`; a fresh node is pre-genesis |
++| Canonical standing from a co-scrub or a label | Canonical standing from `serve_nodes` of the bundle in force |
++| Accord proposal, participation and decision rows | A later genesis bundle at the holders' count |
++| Migrations V001..V216 | One baseline, V300 |
++
++A v62 node accepts only edition 2. An earlier-form object is refused by name
++(`federation_malformed_row`, reason `earlier_form_object`; Python `ValueError`)
++at every door, before it is parsed or verified. A v61 node and a v62 node do
++not exchange rows, so the whole mesh moves together.
++
++## Before you upgrade
++
++1. **Pin CIRISVerify `v23.3.0`** in every crate that depends on it, together
++   with persist's pin. A split pin builds two `ciris_crypto` versions.
++2. **Run the dry run** against each store you will upgrade. It reports what
++   the upgrade would delete, per plane, and whether a legal hold would stop
++   it. It changes nothing.
++
++   ```rust
++   use ciris_persist::store::edition_upgrade::{delete_earlier_store, target_of_dsn, UpgradeMode};
++   let report = delete_earlier_store(target_of_dsn(dsn).unwrap(), UpgradeMode::DryRun).await?;
++   ```
++
++3. **Resolve any legal hold** with counsel. A live hold refuses the upgrade
++   and deletes nothing (`store_earlier_store_legal_hold`).
++4. **Move anything of your own out of persist's PostgreSQL schemas.** A host
++   table inside a persist schema, or a host view over a persist table, makes
++   the upgrade refuse (`store_foreign_store`).
++5. **Decide what happens to any copy you keep of the v61 store.** No v62 node
++   can open it, and the ruling provides no archive.
++
++## At the upgrade
++
++The first v62 open of a v61 store deletes it and creates an empty edition-2
++store. Every open path reaches the same step: `Engine::with_signer*`, the PyO3
++`Engine(...)`, `SqliteBackend::open*` and `PostgresBackend::run_migrations`.
++
++- **SQLite:** the file and its `-wal`, `-shm` and `-journal` are deleted.
++- **PostgreSQL:** persist drops only its own footprint, in one transaction
++  that rolls back if anything outside that footprint would change.
++- **What is kept:** the per-plane row counts, in the node-local
++  `store_edition_deletions` record. No content is kept.
++- **What is not touched:** the node's keystore. Persist deletes its store,
++  not the node's keys.
++
++A refusal at open is an operator action, never a retry. The three tokens are
++`store_earlier_store_legal_hold`, `store_foreign_store` and
++`store_earlier_store_single_process_host` (Python: `RuntimeError` whose message
++leads with the token).
++
++## After the upgrade
++
++### Genesis
++
++A fresh node is pre-genesis: it roots nothing until it holds a
++`ceg-genesis-bundle/2` (CC 2.6.1.11, 5.3.4).
++
++- **The first bundle** has no `prev` and is signed by every holder. Its
++  payload is the charter: `recovery_commitments` keyed by holder identity-ref,
++  `scope`, and the optional `halt_fuse_secs`, `attach_window_secs` and witness
++  members. `holders` and `serve_nodes` are explicit sets of identity-refs. The
++  map is closed, and `iat` is ⌊asserted_at / 1000⌋. The rows it names are
++  listed by row id in `refs.also.cites`; a named row the node does not hold
++  makes the bundle wait.
++- **A later bundle** needs a strict majority of its predecessor's holders,
++  plus each added holder and each re-committed holder. Short of that it
++  concludes nothing (`genesis_bundle_count_unmet`).
++- **A recovery** is a later bundle signed by the recovery key alone, changing
++  only that seat.
++- **Canonical standing** is membership in `serve_nodes` of the bundle in force,
++  by identity-ref. Read it with `is_canonical` / `list_canonical_servers`.
++- **Serving the bundle:** `GET /v1/trust-root/bundle` answers
++  `{"statements": [hex…], …}` with the rows the bundle names.
++
++### Keys
++
++- **Only an edition-2 `key:record` makes a key live** (CC 2.4.1.1). Each holder
++  carries its own key over by signing a new record; nothing is imported.
++- **Ends:** a `node` or `agent` record ends at most 365 days after it is
++  asserted (`key_record_out_of_window`). A `user` or `accord_holder` record
++  carries no end. Renew before the end: a renewal extends the key to the
++  greatest end among its records.
++- **Identity sets:** `identity_type` is a set. `user` and `accord_holder`
++  never share a record with `node` or `agent`, and `node` never with `agent`.
++  `canonical` is not a key type.
++- **Who can end a key:** the key itself, its owner, and the roster that seats
++  it. No one else.
++- **Your node's id:** `register_self_federation_key` and `local_derived_key_id`
++  return the node's identity-ref. Store it as opaque text.
++
++### Signing for another identity
++
++A key signs only for its own identity, unless a rotation chain or the genesis
++bundle in force seats it for that identity. A row whose key is not of its
++`iss` is refused `kid_not_of_iss`. A missing link in the chain makes the row
++wait (the retryable `federation_attester_key_unknown`, naming what is missing).
++To rotate, the new key signs its own `key:record`, naming the predecessor's
++record under `refs.target`, and the predecessor signs the same row.
++
++## Producing rows
++
++- **Sign with the composite.** Use persist's producer
++  (`edition2::produce::sign_row` in Rust; `sign_row` / `sign_composite` on the
++  PyO3 `Engine`) or CIRISVerify's minter with a composite key. There are no
++  standalone Ed25519 or ML-DSA-65 signatures, except the per-chunk media
++  trailer and the CC 6.1.3 substrate objects.
++- **Use the family's payload members** from [EDITION2_PAYLOADS.md](EDITION2_PAYLOADS.md).
++  A payload that does not match its family's list is refused
++  `edition2_payload_invalid`, naming the member.
++- **Name other rows under `refs`**, by row id. Never carry a peer-supplied id or
++  an `original_content_hash`.
++- **A co-signature is a further statement** over the same payload (CC 2.6.1.9),
++  counted as a voice. It is never a payload member.
++- **Delegations** use these families:
++  - capability, moderator, steward and guardianship: `self:delegates_to`;
++  - an owner binding: `ownership:{relation}:{target_kind}:{version}`, with the
++    node's own statement as the second voice (without it, the binding names no
++    owner);
++  - an agent occurrence: `self:delegates_to:agent_occurrence`;
++  - a trust edge: `trust:{job}:{version}`. A trust grant is a `delegates_to`
++    row, and its revocation is the granter's `withdraws`.
++- **Composers** (`withdraws`, `recants`, `supersedes`) name their target under
++  `refs.target` and carry the target's family. Another family is refused
++  `composer_family_mismatch`.
++
++## Receiving rows
++
++| Entry point | Use it for | Answer |
++|---|---|---|
++| `Engine::put_edition2_statement(bytes, offered_row_id)` (PyO3 `put_edition2_statement`) | a statement this node produced or was handed directly | `StatementOutcome::{KeyPlane, Voice, Row}`, with the row id and whether it was new |
++| `ingest::apply_replicated_statement(dir, bytes, offered_id)` (PyO3 `apply_replicated_statement`) | a statement a peer delivered | `Admitted`, `Unchanged` or `Refused { StoreConflict }`; each advances the replication cursor |
++| capsule `PutEdition2Statement` / `ApplyReplicatedStatement` | the same, across the directory capsule | the same |
++
++**Waits are retryable.** A statement waits when the node lacks something it
++names: the signer's key record, a link in a rotation chain, the bundle in
++force, or a composer's target. Park it, do not advance the cursor past it, and
++offer it again when the missing row arrives.
++
++**Refusals are final** for those bytes. The edition-2 reasons, each a
++`federation_malformed_row` reason (Python `ValueError`):
++
++| Reason | Meaning |
++|---|---|
++| `earlier_form_object` | an edition-1 object at any door |
++| `row_ref_edition_1` | an edition-1 row-ref inside an edition-2 statement |
++| `edition2_statement_invalid` | CIRISVerify's verdict refused the statement (its reason follows) |
++| `edition2_family_invalid` | the row is not valid in its family |
++| `edition2_payload_invalid` | a payload member is missing, unlisted or of the wrong type |
++| `edition2_not_a_row` | an object offered at a row door |
++| `row_id_mismatch` | the offered id is not the id the node computes |
++| `key_record_out_of_window` | a key record's end does not agree with its identity set |
++| `kid_not_of_iss` | the signing key is not a key of the statement's identity |
++| `earlier_form_signer_is_edition2` | an earlier-form signature checked against an edition-2 key |
++| `composer_family_mismatch` | a composer of another family than its target |
++| `iss_not_holder` | an accord invocation signed by someone who is not a holder |
++| `accord_invocation_invalid` | an accord invocation CIRISVerify's halt reader refused (its token follows) |
++| `accord_invocation_replayed` | an invocation repeating a held one's `invocation_id` or `nonce` within its `valid_until` |
++
++## The accord halt
++
++An invocation (`accord:invoke:{constitutional,notify,drill}:…`) is one row
++with one composite statement from a single accord holder; there is no count
++(CC 4.2.1.1). Hand it to `put_edition2_statement`.
++
++- The signer is judged against the holders of the bundle in force for the
++  invocation's `accord_root`.
++- With no bundle held, or a key the roster does not place, the invocation
++  **waits**. It is never refused while the roster is unknown.
++- A signer that is not a holder is refused `iss_not_holder`.
++- The reading and its tokens are CIRISVerify 23.3.0's: `valid`,
++  `waiting:{kid,bundle,kid+bundle}`, `refused:{token}`.
++- A valid constitutional invocation latches the accord's halt.
++
++## Serving rows
++
++Serve statements as received, never re-encoded:
++`FederationDirectory::edition2_statements_since(cursor, limit)` (PyO3
++`edition2_statements_since`) returns held statements in this node's admission
++order after the cursor `(admitted_us, statement_id)`, at most 1000 a page. Key
++any replication wire on the statement id or the row id.
++
++## Planes
++
++| Plane | What |
++|---|---|
++| MESH (replicates) | detection events, cirisnode attestations, receipts, every directory row |
++| SPLIT | traces (`trace:complete:v1` replicates), the fountain, the audit chain (local) |
++| LOCAL (never replicates) | the Lens envelope, the secrets API, touch claims, stream DEKs (their wraps are `key_grant:stream` rows) |
++
++A location proof is a `location_proof:v1` row signed by its subject only. A
++sealed manifest is unsigned blob bytes.
++
++## Checklists
++
++**CIRISEdge**
++- Producers sign edition-2 rows; the hand-filled `scrub_signature_*` sites go.
++- `put_attestation*`, `put_public_key` and `put_signed_transport_destination`
++  move to the edition-2 doors; the capsule wrappers move to the new ops.
++- Summary / Deliver carry statement bytes keyed by statement id or row id.
++- Genesis reads use `bundles_in_force`; `serve_nodes` and `holders` are
++  identity-ref sets.
++- X-Wing keys are live only from a genesis binding or a counted
++  `transport:canonical_rebind`.
++
++**CIRISServer**
++- The final-genesis routes produce `ceg-genesis-bundle/2` voices.
++- The canonical's identity-ref goes in `serve_nodes`.
++- The trust-root routes and `CIRIS_TEST_GENESIS_BUNDLE` use bundle/2.
++- The cosign routes take a further statement, not a JCS scrub.
++- Accord changes are later bundles; the proposal, participation and decision
++  doors refuse.
++- Invocations go through `put_edition2_statement`; `waiting:*` is a retry.
++
++**CIRISAgent**
++- Keep `_actor_key_id` opaque; it is an identity-ref.
++- `lookup_public_key` keeps its JSON shape; its two pubkeys are the
++  composite's halves.
++- Separate component signatures are allowed only for CC 6.1.3 substrate
++  objects.
++
++**CIRISBridge**
++- Run the dry run against the canonical's store before the deploy.
++- Stop the deploy on a refusal at open; re-running does not help.
++- Keep the keystore; the canonical re-registers its key and renews it within
++  365 days.
++- Install the bundle before peers rely on the canonical.
++- Upgrade every peer: v61 and v62 nodes do not exchange rows.

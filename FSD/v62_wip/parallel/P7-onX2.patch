@@ -1,0 +1,921 @@
+diff --git a/src/ffi/pyo3.rs b/src/ffi/pyo3.rs
+index e11be45f..a273d97b 100644
+--- a/src/ffi/pyo3.rs
++++ b/src/ffi/pyo3.rs
+@@ -17106,6 +17106,21 @@ impl PyEngine {
+     /// `verify_trace_via_directory`, which checked the Ed25519 half only, so it
+     /// accepted a trace with no PQC half, or a bad one, that ingest refuses.
+     ///
++    /// **v62.0.0 (CC 2.6.1.7) — the composite form.** A trace whose
++    /// `signature_key_id` is an edition-2 identity-ref and which carries no
++    /// `signature_ml_dsa_65` / `pubkey_ml_dsa_65` / `pqc_key_id` is verified
++    /// with ONE composite ML-DSA-65-Ed25519 signature (`signature`, base64)
++    /// over `b"ciris-persist:trace:complete:v1" || canonical_bytes`, under the
++    /// kid's edition-2 key, live at the trace's signed `completed_at`. Its
++    /// refusals: `verify_unknown_key` (no valid key record held),
++    /// `verify_signer_not_live` (revoked / not covered / waiting),
++    /// `verify_invalid_signature`, `verify_signature_mismatch` (including a
++    /// trace signed by a key not of its kid). Every other trace is the
++    /// earlier bound-hybrid form: `ValueError(("earlier_form_object", ..))`
++    /// once the earlier-form doors are shut, and
++    /// `("earlier_form_signer_is_edition2", ..)` when a component is named
++    /// by an edition-2 key; while the doors are open it runs the steps below.
++    ///
+     /// Returns `{"verified": True, "schema_version": "2.7.0"|"2.7.9"|"3.0.0"}`
+     /// on success. On failure raises the exception `receive_and_persist`
+     /// raises for the same cause, with the same stable token in `args[0]`:
+diff --git a/src/ingest.rs b/src/ingest.rs
+index c160aeb4..21a46a41 100644
+--- a/src/ingest.rs
++++ b/src/ingest.rs
+@@ -1461,7 +1461,20 @@ pub(crate) fn trace_canonicalizer(schema_version: &str) -> &'static dyn Canonica
+ /// also the whole of `Engine.verify_trace`, the dry-run, so the two give one
+ /// verdict for one trace because they run one function.
+ ///
+-/// In order: resolve the Ed25519 key by `signature_key_id` through
++/// **v62.0.0 (CC 2.6.1.7) — the form decides the door**
++/// ([`crate::verify::ed25519::trace_signature_form`]):
++/// - a **composite** trace (`signature_key_id` an edition-2 identity-ref,
++///   `signature` ONE composite ML-DSA-65-Ed25519 signature, no PQC member)
++///   goes to [`verify_composite_trace_for_admission`]: the kid's live
++///   edition-2 key, at the signed `completed_at`, over
++///   [`trace_signature_message`](crate::verify::ed25519::trace_signature_message);
++/// - a **bound-hybrid** trace (the earlier form) first meets
++///   [`refuse_earlier_form_trace`] (`earlier_form_object` once the doors are
++///   shut; `earlier_form_signer_is_edition2` for a component named by an
++///   edition-2 key), then, while the doors are open, the earlier-form steps
++///   below. Slice F deletes them with the switch.
++///
++/// The earlier form, in order: resolve the Ed25519 key by `signature_key_id` through
+ /// [`Backend::lookup_public_key`] (a miss is `verify_unknown_key`); choose the
+ /// canonicalizer by [`trace_canonicalizer`]; resolve the ML-DSA-65 key from
+ /// the federation directory by `pqc_key_id` when the trace carries a PQC
+@@ -1490,6 +1503,18 @@ where
+     B: Backend + crate::federation::FederationDirectory + ?Sized,
+     D: Canonicalizer + ?Sized,
+ {
++    // v62.0.0 (CC 2.6.1.7, RULINGS "composite signatures only") — the form
++    // decides the door. A composite-signed trace is verified under its kid's
++    // live edition-2 key and nothing else; the bound-hybrid form is the
++    // earlier form, refused by name once the earlier-form doors are shut.
++    match crate::verify::ed25519::trace_signature_form(trace) {
++        crate::verify::ed25519::TraceSignatureForm::Composite(kid) => {
++            return verify_composite_trace_for_admission(backend, trace, &kid, body_sha256).await;
++        }
++        crate::verify::ed25519::TraceSignatureForm::BoundHybrid => {
++            refuse_earlier_form_trace(backend, trace).await?;
++        }
++    }
+     let key_id = &trace.signature_key_id;
+     // v18.0.0 (#473) — fully-qualified: the pipeline's B is now bound by
+     // BOTH `Backend` and `FederationDirectory`, which each expose a
+@@ -1676,6 +1701,159 @@ where
+     }
+ }
+ 
++/// v62.0.0 — the plane name a trace refusal carries (the `plane` of the
++/// shared earlier-form refusals, [`crate::federation::edition2::door::refuse_earlier_form`]
++/// and [`crate::federation::edition2::projection::refuse_edition2_signer`]).
++pub const TRACE_PLANE: &str = "trace";
++
++/// A federation refusal at the trace door as the ingest error it surfaces
++/// as: a named refusal ([`crate::federation::Error::MalformedRow`]) keeps its
++/// token as [`IngestError::TraceRefused`]'s `kind` (Python `ValueError`,
++/// `(kind, detail)`; lens HTTP 422); a directory fault is a store error
++/// (`RuntimeError`, 5xx), never a refusal of the trace.
++fn trace_refusal(e: crate::federation::Error) -> IngestError {
++    match e {
++        crate::federation::Error::MalformedRow {
++            reason, message, ..
++        } => IngestError::TraceRefused {
++            kind: reason,
++            detail: message,
++        },
++        other => IngestError::Store(StoreError::Backend(format!(
++            "trace door directory read: {other}"
++        ))),
++    }
++}
++
++/// v62.0.0 (CC 2.6.1.12, RULINGS "composite signatures only") — **the
++/// earlier-form gate of the trace door.** A bound-hybrid trace
++/// ([`crate::verify::ed25519::TraceSignatureForm::BoundHybrid`]) is:
++///
++/// 1. refused `earlier_form_object` once the earlier-form doors are shut
++///    ([`crate::federation::edition2::door::refuse_earlier_form`], the one
++///    switch every door reads), before any key read or verify;
++/// 2. while they are open, refused `earlier_form_signer_is_edition2` when
++///    `signature_key_id` or `pqc_key_id` names an edition-2 key: a
++///    composite's components are never checked as standalone signers, and
++///    the projected `federation_keys` row is a read model, never a key an
++///    earlier-form signature verifies under.
++///
++/// # Errors
++/// [`IngestError::TraceRefused`] with the token; a directory fault as
++/// [`IngestError::Store`].
++async fn refuse_earlier_form_trace<B>(backend: &B, trace: &CompleteTrace) -> Result<(), IngestError>
++where
++    B: crate::federation::FederationDirectory + ?Sized,
++{
++    crate::federation::edition2::door::refuse_earlier_form(TRACE_PLANE).map_err(trace_refusal)?;
++    let mut signers: Vec<&str> = vec![trace.signature_key_id.as_str()];
++    if let Some(pqc) = trace.pqc_key_id.as_deref() {
++        signers.push(pqc);
++    }
++    crate::federation::edition2::projection::refuse_edition2_signer(backend, TRACE_PLANE, &signers)
++        .await
++        .map_err(trace_refusal)
++}
++
++/// v62.0.0 (CC 2.6.1.7) — **the composite trace door.** The trace's kid
++/// (`signature_key_id`, an edition-2 identity-ref) resolves through the
++/// edition-2 key plane
++/// ([`crate::federation::edition2::ingest::held_keys_for_kid`]); the key
++/// must be live ([`crate::federation::edition2::liveness::HeldKeys::liveness`],
++/// the half-open reading every edition-2 statement gets) at the trace's
++/// SIGNED `completed_at`, the instant the producer sealed it, as a statement
++/// is read at its own `asserted_at`; and the ONE composite signature must
++/// verify under that key over
++/// [`trace_signature_message`](crate::verify::ed25519::trace_signature_message)
++/// ([`crate::verify::ed25519::verify_trace_composite`]). No component key is
++/// looked up and no earlier-form directory (`accord_public_keys`,
++/// `federation_keys`) is read.
++///
++/// Refusals, all before anything is written:
++/// - no valid record of the kid held: `verify_unknown_key` (retryable: the
++///   key may not have arrived);
++/// - revoked, not covered at `completed_at`, or waiting on a deeper key:
++///   `verify_signer_not_live` (the detail names which);
++/// - not base64, or not a composite's length: `verify_invalid_signature`;
++/// - does not verify under the kid's key (a trace signed by any other key,
++///   or altered after signing): `verify_signature_mismatch`.
++///
++/// # Errors
++/// As listed; a key-plane read failure as [`IngestError::Store`].
++async fn verify_composite_trace_for_admission<B>(
++    backend: &B,
++    trace: &CompleteTrace,
++    kid: &crate::federation::edition2::Digest32,
++    body_sha256: &str,
++) -> Result<(), IngestError>
++where
++    B: crate::federation::FederationDirectory + ?Sized,
++{
++    use crate::federation::edition2::liveness::Liveness;
++    let key_id = &trace.signature_key_id;
++    let held = crate::federation::edition2::ingest::held_keys_for_kid(backend, kid)
++        .await
++        .map_err(|e| {
++            IngestError::Store(StoreError::Backend(format!(
++                "trace signer key plane read for {key_id}: {e}"
++            )))
++        })?;
++    // The SIGNED instant (part of every canonical shape), at ms. Before the
++    // epoch reads as 0, which no agent key's record covers.
++    let at = u64::try_from(trace.completed_at.parsed().timestamp_millis()).unwrap_or(0);
++    let not_live = |why: String| {
++        tracing::warn!(
++            envelope_signer_id = %key_id,
++            wire_body_sha256 = %body_sha256,
++            trace_id = %trace.trace_id,
++            reason = %why,
++            "ciris-persist: verify_signer_not_live — composite trace signer not live at completed_at"
++        );
++        IngestError::Verify(VerifyError::SignerNotLive(why))
++    };
++    let record = match held.liveness(kid, at) {
++        Liveness::Live(record) => record,
++        Liveness::NotHeld | Liveness::Invalid => {
++            tracing::warn!(
++                envelope_signer_id = %key_id,
++                wire_body_sha256 = %body_sha256,
++                trace_id = %trace.trace_id,
++                "ciris-persist: verify_unknown_key — no valid edition-2 key:record of the trace's kid is held"
++            );
++            return Err(IngestError::Verify(VerifyError::UnknownKey(key_id.clone())));
++        }
++        Liveness::Revoked => return Err(not_live(format!("revoked: {key_id}"))),
++        Liveness::NotCovered => {
++            return Err(not_live(format!(
++                "not_covered: no record of {key_id} covers completed_at {}",
++                trace.completed_at.wire()
++            )))
++        }
++        Liveness::Waiting(missing) => {
++            return Err(not_live(format!(
++                "waiting: a record of {key_id} waits on {} key(s) this node does not hold",
++                missing.len()
++            )))
++        }
++    };
++    let canon = trace_canonicalizer(trace.trace_schema_version.as_str());
++    crate::verify::ed25519::verify_trace_composite(trace, canon, &record.key).map_err(|e| {
++        let sig_b64_prefix: String = trace.signature.chars().take(16).collect();
++        tracing::warn!(
++            envelope_signer_id = %key_id,
++            wire_body_sha256 = %body_sha256,
++            trace_id = %trace.trace_id,
++            verify_error = %e.kind(),
++            signature_b64_prefix = %sig_b64_prefix,
++            "ciris-persist: composite trace signature rejected"
++        );
++        IngestError::Verify(e)
++    })
++}
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod trace_composite_invariants;
++
+ #[cfg(all(test, feature = "sqlite"))]
+ mod tests {
+     use super::*;
+diff --git a/src/ingest/trace_composite_invariants.rs b/src/ingest/trace_composite_invariants.rs
+new file mode 100644
+index 00000000..bbaeae91
+--- /dev/null
++++ b/src/ingest/trace_composite_invariants.rs
+@@ -0,0 +1,468 @@
++//! v62.0.0 (wave P7; CC 2.6.1.7, RULINGS "composite signatures only") — **the
++//! composite trace door, on every backend** (sqlite, and postgres when a test
++//! DSN is set).
++//!
++//! A trace (`trace:complete:v1`, the SPLIT plane) carries ONE composite
++//! ML-DSA-65-Ed25519 signature over
++//! [`trace_signature_message`](crate::verify::ed25519::trace_signature_message),
++//! verified under the live edition-2 key its kid (`signature_key_id`, an
++//! identity-ref) names. The bound-hybrid form is the earlier form.
++//!
++//! - **I3460** a composite-signed trace is admitted at ingest's verify step
++//!   ([`verify_trace_for_admission`], also `Engine.verify_trace`), with the
++//!   earlier-form doors open AND shut.
++//! - **I3461** the same trace through the whole pipeline
++//!   ([`IngestPipeline::receive_and_persist`], `VerifyMode::Full`): one
++//!   signature verified, its rows land.
++//! - **I3462** a bound-hybrid trace is refused `earlier_form_object` once the
++//!   doors are shut, before any key read; with the doors open it is NOT
++//!   refused by that name (the switch, not the form check, gates it).
++//! - **I3463** a classical-only trace (no PQC member, an earlier-form key id)
++//!   is the earlier form too: `earlier_form_object` under the shut doors.
++//! - **I3464** a trace that names an edition-2 kid AND carries a PQC member is
++//!   the earlier form: `earlier_form_object` shut; open, the cross-form
++//!   refusal `earlier_form_signer_is_edition2` (a composite's components are
++//!   never standalone signers).
++//! - **I3465** a trace signed by a key not of its kid (key B signs, the kid
++//!   names live key A) is refused `verify_signature_mismatch`.
++//! - **I3466** a composite trace altered after signing is refused
++//!   `verify_signature_mismatch`.
++//! - **I3467** a kid no valid key record is held for is refused
++//!   `verify_unknown_key`.
++//! - **I3468** a kid whose key is held but not live at the trace's signed
++//!   `completed_at` is refused `verify_signer_not_live`.
++//! - **I3469** the form is read from the envelope members alone, and the
++//!   signed message is `TRACE_SIGNATURE_CONTEXT || canonical_bytes_for_trace`.
++//! - **I3470** a composite signature over the canonical bytes WITHOUT the
++//!   domain tag is refused `verify_signature_mismatch` (the tag is load-bearing).
++//! - **I3471** a composite signature of the wrong length is refused
++//!   `verify_invalid_signature`.
++
++use super::*;
++use crate::federation::edition2::door::with_earlier_form_doors_shut;
++use crate::federation::edition2::fixture_switch as e2;
++use crate::federation::edition2::token;
++use crate::federation::FederationDirectory;
++use crate::schema::SchemaVersion;
++use crate::verify::ed25519::{
++    canonical_bytes_for_trace, trace_signature_form, trace_signature_message, TraceSignatureForm,
++    TRACE_SIGNATURE_CONTEXT,
++};
++use crate::verify::PythonJsonDumpsCanonicalizer;
++use base64::Engine as _;
++use chrono::{DateTime, Duration, SecondsFormat, Utc};
++
++fn unique(tag: &str) -> String {
++    format!(
++        "p7-{tag}-{}",
++        &uuid::Uuid::new_v4().simple().to_string()[..12]
++    )
++}
++
++fn wire(at: DateTime<Utc>) -> crate::schema::WireDateTime {
++    at.to_rfc3339_opts(SecondsFormat::Micros, true)
++        .parse()
++        .expect("rfc3339")
++}
++
++fn component(
++    component_type: crate::schema::ComponentType,
++    event_type: crate::schema::ReasoningEventType,
++    at: DateTime<Utc>,
++    data: serde_json::Value,
++) -> crate::schema::TraceComponent {
++    crate::schema::TraceComponent {
++        component_type,
++        event_type,
++        timestamp: wire(at),
++        data: data.as_object().cloned().unwrap_or_default(),
++        agent_id_hash: None,
++    }
++}
++
++/// An unsigned 2.7.0 trace sealed at `completed`, under `signature_key_id`.
++fn trace_at(completed: DateTime<Utc>, signature_key_id: &str) -> CompleteTrace {
++    let started = completed - Duration::seconds(20);
++    CompleteTrace {
++        trace_id: unique("trace"),
++        thought_id: "th-p7".into(),
++        task_id: Some("task-p7".into()),
++        agent_id_hash: "deadbeef".into(),
++        started_at: wire(started),
++        completed_at: wire(completed),
++        trace_level: crate::schema::TraceLevel::Generic,
++        trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
++        components: vec![
++            component(
++                crate::schema::ComponentType::Observation,
++                crate::schema::ReasoningEventType::ThoughtStart,
++                started,
++                serde_json::json!({ "attempt_index": 0 }),
++            ),
++            component(
++                crate::schema::ComponentType::Action,
++                crate::schema::ReasoningEventType::ActionResult,
++                completed,
++                serde_json::json!({
++                    "attempt_index": 0,
++                    "audit_sequence_number": 42,
++                    "audit_entry_hash": "abcd",
++                    "audit_signature": "BBBB",
++                    "llm_calls": 0,
++                    "tokens_total": 100,
++                    "cost_cents": 0.1,
++                }),
++            ),
++        ],
++        deployment_profile: None,
++        cohort_scope: "federation".into(),
++        cohort_target_id: None,
++        signature: String::new(),
++        signature_key_id: signature_key_id.to_owned(),
++        signature_ml_dsa_65: None,
++        pubkey_ml_dsa_65: None,
++        pqc_key_id: None,
++        run_kind: None,
++    }
++}
++
++/// The Agent's v62 signing step: ONE composite signature by `seed`'s key over
++/// [`trace_signature_message`], standard base64, in `signature`.
++fn sign_composite(trace: &mut CompleteTrace, seed: &str) {
++    let canon = trace_canonicalizer(trace.trace_schema_version.as_str());
++    let message = trace_signature_message(trace, canon).expect("trace message");
++    let sig = e2::signing_key(seed)
++        .sign(&message)
++        .expect("composite sign");
++    trace.signature = BASE64.encode(sig);
++}
++
++/// Now, less an hour: inside a default `agent` key window (E0 v1.11: rows a
++/// node/agent key signs are now-relative).
++fn recently() -> DateTime<Utc> {
++    crate::host::clock::now() - Duration::hours(1)
++}
++
++async fn verdict<D>(d: &D, trace: &CompleteTrace) -> Result<(), IngestError>
++where
++    D: Backend + FederationDirectory + ?Sized,
++{
++    verify_trace_for_admission(d, trace, "p7-body", &PythonJsonDumpsCanonicalizer).await
++}
++
++fn kind_of(r: Result<(), IngestError>) -> &'static str {
++    match r {
++        Ok(()) => "admitted",
++        Err(e) => e.kind(),
++    }
++}
++
++/// I3460 + I3465 + I3466 + I3467 + I3468 + I3470 + I3471 on one backend.
++async fn exercise_composite_door<D>(d: &D)
++where
++    D: Backend + FederationDirectory + ?Sized,
++{
++    let a = unique("agent-a");
++    let b = unique("agent-b");
++    let kid_a = e2::put_key(d, &a, &["agent"]).await;
++    let _kid_b = e2::put_key(d, &b, &["agent"]).await;
++
++    // I3460 — admitted, doors open and shut.
++    let mut t = trace_at(recently(), &kid_a);
++    sign_composite(&mut t, &a);
++    assert_eq!(
++        trace_signature_form(&t),
++        TraceSignatureForm::Composite(e2::kid_digest(&a)),
++        "I3460: an identity-ref kid with no PQC member is the composite form"
++    );
++    assert_eq!(
++        kind_of(verdict(d, &t).await),
++        "admitted",
++        "I3460: doors open"
++    );
++    assert_eq!(
++        kind_of(with_earlier_form_doors_shut(verdict(d, &t)).await),
++        "admitted",
++        "I3460: the switch shuts the earlier form only"
++    );
++
++    // I3465 — B signs, the kid names A.
++    let mut wrong = trace_at(recently(), &kid_a);
++    sign_composite(&mut wrong, &b);
++    assert_eq!(
++        kind_of(verdict(d, &wrong).await),
++        "verify_signature_mismatch",
++        "I3465: a trace signed by a key not of its kid is refused"
++    );
++
++    // I3466 — altered after signing (a signed member).
++    let mut altered = t.clone();
++    altered.thought_id = "th-p7-altered".into();
++    assert_eq!(
++        kind_of(verdict(d, &altered).await),
++        "verify_signature_mismatch",
++        "I3466: a signed member changed after signing"
++    );
++
++    // I3467 — a kid with no record held.
++    let c = unique("agent-unheld");
++    let mut unheld = trace_at(recently(), &e2::kid(&c));
++    sign_composite(&mut unheld, &c);
++    assert_eq!(
++        kind_of(verdict(d, &unheld).await),
++        "verify_unknown_key",
++        "I3467: no valid record of the kid is held"
++    );
++
++    // I3468 — held, but no record covers the signed completed_at (a default
++    // agent window starts ~180 days back).
++    let mut stale = trace_at(crate::host::clock::now() - Duration::days(400), &kid_a);
++    sign_composite(&mut stale, &a);
++    assert_eq!(
++        kind_of(verdict(d, &stale).await),
++        "verify_signer_not_live",
++        "I3468: not covered at the trace's signed instant"
++    );
++
++    // I3470 — the same key over the bare canonical bytes (no domain tag).
++    let mut untagged = trace_at(recently(), &kid_a);
++    let canon = trace_canonicalizer(untagged.trace_schema_version.as_str());
++    let bare = canonical_bytes_for_trace(&untagged, canon).unwrap();
++    untagged.signature = BASE64.encode(e2::signing_key(&a).sign(&bare).unwrap());
++    assert_eq!(
++        kind_of(verdict(d, &untagged).await),
++        "verify_signature_mismatch",
++        "I3470: the domain tag is part of the signed message"
++    );
++
++    // I3471 — an Ed25519-length signature under a composite kid.
++    let mut short = trace_at(recently(), &kid_a);
++    short.signature = BASE64.encode([7u8; 64]);
++    assert_eq!(
++        kind_of(verdict(d, &short).await),
++        "verify_invalid_signature",
++        "I3471: not a composite's length"
++    );
++}
++
++/// I3462 + I3463 + I3464 on one backend.
++async fn exercise_earlier_form_refusals<D>(d: &D)
++where
++    D: Backend + FederationDirectory + ?Sized,
++{
++    // I3462 — the bound-hybrid shape (signature bytes are never read).
++    let mut hybrid = trace_at(recently(), "ciris-agent-key:p7-hybrid");
++    hybrid.signature = BASE64.encode([1u8; 64]);
++    hybrid.signature_ml_dsa_65 = Some(BASE64.encode([2u8; 3309]));
++    hybrid.pqc_key_id = Some("p7-mldsa".into());
++    assert_eq!(
++        trace_signature_form(&hybrid),
++        TraceSignatureForm::BoundHybrid
++    );
++    let shut = with_earlier_form_doors_shut(verdict(d, &hybrid)).await;
++    match &shut {
++        Err(IngestError::TraceRefused { kind, .. }) => {
++            assert_eq!(*kind, token::EARLIER_FORM_OBJECT, "I3462: refused by name");
++        }
++        other => panic!("I3462: expected TraceRefused(earlier_form_object), got {other:?}"),
++    }
++    let open = kind_of(verdict(d, &hybrid).await);
++    assert_ne!(
++        open,
++        token::EARLIER_FORM_OBJECT,
++        "I3462: with the doors open the switch does not refuse it"
++    );
++    assert_eq!(
++        open, "verify_unknown_key",
++        "I3462: open, it reaches the earlier-form lookup"
++    );
++
++    // I3463 — classical-only, an earlier-form key id.
++    let mut classical = trace_at(recently(), "ciris-agent-key:p7-classical");
++    classical.signature = BASE64.encode([1u8; 64]);
++    assert_eq!(
++        trace_signature_form(&classical),
++        TraceSignatureForm::BoundHybrid
++    );
++    assert_eq!(
++        kind_of(with_earlier_form_doors_shut(verdict(d, &classical)).await),
++        token::EARLIER_FORM_OBJECT,
++        "I3463: classical-only is the earlier form"
++    );
++
++    // I3464 — an edition-2 kid with a PQC member riding along.
++    let m = unique("agent-mixed");
++    let kid_m = e2::put_key(d, &m, &["agent"]).await;
++    let mut mixed = trace_at(recently(), &kid_m);
++    sign_composite(&mut mixed, &m);
++    mixed.signature_ml_dsa_65 = Some(BASE64.encode([2u8; 3309]));
++    assert_eq!(
++        trace_signature_form(&mixed),
++        TraceSignatureForm::BoundHybrid
++    );
++    assert_eq!(
++        kind_of(with_earlier_form_doors_shut(verdict(d, &mixed)).await),
++        token::EARLIER_FORM_OBJECT,
++        "I3464: shut, refused as the earlier form"
++    );
++    assert_eq!(
++        kind_of(verdict(d, &mixed).await),
++        crate::federation::malformed_row::EARLIER_FORM_SIGNER_IS_EDITION2,
++        "I3464: open, an edition-2 key is never a standalone component signer"
++    );
++}
++
++/// I3461 on one backend: the whole pipeline admits a composite trace.
++async fn exercise_pipeline_admits<D>(d: &D)
++where
++    D: Backend + FederationDirectory + ?Sized,
++{
++    let a = unique("agent-pipe");
++    let kid_a = e2::put_key(d, &a, &["agent"]).await;
++    let mut t = trace_at(recently(), &kid_a);
++    sign_composite(&mut t, &a);
++    let body = serde_json::json!({
++        "events": [{
++            "event_type": "complete_trace",
++            "trace_level": "generic",
++            "trace": serde_json::to_value(&t).unwrap(),
++        }],
++        "batch_timestamp": crate::host::clock::now().to_rfc3339(),
++        "consent_timestamp": "2025-01-01T00:00:00Z",
++        "trace_level": "generic",
++        "trace_schema_version": "2.7.0",
++    })
++    .to_string()
++    .into_bytes();
++
++    let signer_key_id = "p7-scrub-key-v1".to_owned();
++    let mut sw = ciris_keyring::Ed25519SoftwareSigner::new(&signer_key_id);
++    sw.import_key(&[0xA7u8; 32]).expect("import_key");
++    let signer: Box<dyn HardwareSigner> = Box::new(sw);
++    let pipeline = IngestPipeline {
++        backend: d,
++        canonicalizer: &PythonJsonDumpsCanonicalizer,
++        scrubber: &crate::scrub::NullScrubber,
++        signer: &*signer,
++        signer_key_id: &signer_key_id,
++    };
++    let summary = pipeline
++        .receive_and_persist(&body)
++        .await
++        .unwrap_or_else(|e| {
++            panic!(
++                "I3461: the composite trace is admitted, got {} ({e})",
++                e.kind()
++            )
++        });
++    assert_eq!(summary.signatures_verified, 1, "I3461: persist verified it");
++    assert!(summary.trace_events_inserted > 0, "I3461: its rows land");
++}
++
++/// I3469 — pure: the form and the message.
++#[test]
++fn i3469_form_and_message() {
++    let k = e2::kid("p7-pure");
++    let t = trace_at(Utc::now(), &k);
++    assert_eq!(
++        trace_signature_form(&t),
++        TraceSignatureForm::Composite(e2::kid_digest("p7-pure"))
++    );
++    for (label, mut u) in [
++        ("signature_ml_dsa_65", t.clone()),
++        ("pubkey_ml_dsa_65", t.clone()),
++        ("pqc_key_id", t.clone()),
++    ] {
++        match label {
++            "signature_ml_dsa_65" => u.signature_ml_dsa_65 = Some("x".into()),
++            "pubkey_ml_dsa_65" => u.pubkey_ml_dsa_65 = Some("x".into()),
++            _ => u.pqc_key_id = Some("x".into()),
++        }
++        assert_eq!(
++            trace_signature_form(&u),
++            TraceSignatureForm::BoundHybrid,
++            "I3469: {label} makes it the earlier form"
++        );
++    }
++    let mut earlier = t.clone();
++    earlier.signature_key_id = "ciris-agent-key:p7".into();
++    assert_eq!(
++        trace_signature_form(&earlier),
++        TraceSignatureForm::BoundHybrid
++    );
++
++    let canon = trace_canonicalizer(t.trace_schema_version.as_str());
++    let message = trace_signature_message(&t, canon).unwrap();
++    let canonical = canonical_bytes_for_trace(&t, canon).unwrap();
++    assert_eq!(
++        &message[..TRACE_SIGNATURE_CONTEXT.len()],
++        TRACE_SIGNATURE_CONTEXT
++    );
++    assert_eq!(
++        &message[TRACE_SIGNATURE_CONTEXT.len()..],
++        canonical.as_slice()
++    );
++}
++
++#[cfg(feature = "sqlite")]
++mod sqlite {
++    use super::*;
++
++    async fn backend() -> crate::store::sqlite::SqliteBackend {
++        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        b
++    }
++
++    #[tokio::test]
++    async fn i3460_composite_door_sqlite() {
++        let b = backend().await;
++        Box::pin(exercise_composite_door(&b)).await;
++    }
++
++    #[tokio::test]
++    async fn i3462_earlier_form_refusals_sqlite() {
++        let b = backend().await;
++        Box::pin(exercise_earlier_form_refusals(&b)).await;
++    }
++
++    #[tokio::test]
++    async fn i3461_pipeline_admits_composite_sqlite() {
++        let b = backend().await;
++        Box::pin(exercise_pipeline_admits(&b)).await;
++    }
++}
++
++#[cfg(feature = "postgres")]
++mod postgres {
++    use super::*;
++
++    async fn backend() -> Option<crate::store::postgres::PostgresBackend> {
++        let dsn = crate::test_pg::empty_dsn()?;
++        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        Some(b)
++    }
++
++    #[tokio::test]
++    async fn i3460_composite_door_postgres() {
++        let Some(b) = backend().await else { return };
++        Box::pin(exercise_composite_door(&b)).await;
++    }
++
++    #[tokio::test]
++    async fn i3462_earlier_form_refusals_postgres() {
++        let Some(b) = backend().await else { return };
++        Box::pin(exercise_earlier_form_refusals(&b)).await;
++    }
++
++    #[tokio::test]
++    async fn i3461_pipeline_admits_composite_postgres() {
++        let Some(b) = backend().await else { return };
++        Box::pin(exercise_pipeline_admits(&b)).await;
++    }
++}
+diff --git a/src/server/pipeline.rs b/src/server/pipeline.rs
+index d9ebf1ac..c8d34f11 100644
+--- a/src/server/pipeline.rs
++++ b/src/server/pipeline.rs
+@@ -294,6 +294,51 @@ where
+     //    fails fast on a compromised-edge / forged-inner-trace path.
+     for event in &envelope.envelope.events {
+         let BatchEvent::CompleteTrace { trace, .. } = event;
++        // v62.0.0 (wave P7; CC 2.6.1.7) — a composite-signed inner trace runs
++        // ingest's own verify step (ONE composite signature under its kid's
++        // live edition-2 key), so this pre-queue check and the persister give
++        // one verdict. Any other inner trace is the earlier form: refused by
++        // name once the earlier-form doors are shut, else checked as before.
++        if let crate::verify::ed25519::TraceSignatureForm::Composite(_) =
++            crate::verify::ed25519::trace_signature_form(trace)
++        {
++            match crate::ingest::verify_trace_for_admission(
++                &*state.directory,
++                trace,
++                "pipeline_inner_trace",
++                &crate::verify::PythonJsonDumpsCanonicalizer,
++            )
++            .await
++            {
++                Ok(()) => continue,
++                Err(crate::ingest::IngestError::Store(e)) => {
++                    tracing::error!(error = %e, "agent key plane read failed");
++                    return (
++                        StatusCode::SERVICE_UNAVAILABLE,
++                        Json(ErrorResponse {
++                            kind: "store_lookup_failed",
++                            detail: format!("{e}"),
++                            retry_after_seconds: Some(5),
++                        }),
++                    )
++                        .into_response();
++                }
++                Err(e) => {
++                    return invariant_response(
++                        KIND_INNER_SIGNATURE,
++                        format!("agent composite signature refused: {} ({e})", e.kind()),
++                    );
++                }
++            }
++        }
++        if let Err(e) =
++            crate::federation::edition2::door::refuse_earlier_form(crate::ingest::TRACE_PLANE)
++        {
++            return invariant_response(
++                crate::federation::edition2::token::EARLIER_FORM_OBJECT,
++                format!("{e}"),
++            );
++        }
+         let key = match Backend::lookup_public_key(&*state.directory, &trace.signature_key_id).await
+         {
+             Ok(Some(k)) => k,
+diff --git a/src/verify/ed25519.rs b/src/verify/ed25519.rs
+index c6f94119..5b28556c 100644
+--- a/src/verify/ed25519.rs
++++ b/src/verify/ed25519.rs
+@@ -664,6 +664,128 @@ where
+     )
+ }
+ 
++/// v62.0.0 (CC 2.6.1.7, RULINGS "composite signatures only") — **the domain
++/// tag that opens the bytes a trace's composite signature covers**
++/// ([`trace_signature_message`]).
++///
++/// It keeps a trace signature from ever reading as any other object signed by
++/// the same composite key: a COSE `Sig_structure` opens with a CBOR array
++/// head, a secrets request with `ciris-persist:secrets-request:v1`, and a
++/// trace with this text. The name is the CC family of the object
++/// (`trace:complete:v1`, RULINGS "Planes": SPLIT).
++pub const TRACE_SIGNATURE_CONTEXT: &[u8] = b"ciris-persist:trace:complete:v1";
++
++/// v62.0.0 — **the exact bytes an Agent signs, with ONE composite
++/// ML-DSA-65-Ed25519 signature, for a trace:**
++///
++/// ```text
++/// TRACE_SIGNATURE_CONTEXT || canonical_bytes_for_trace(trace, canonicalizer)
++/// ```
++///
++/// `canonical_bytes_for_trace` is unchanged (the shape is dispatched by the
++/// signed `trace_schema_version`, with the signed `run_kind` joined; the
++/// canonicalizer is the one [`canon_version_for_trace_schema`] names: RFC
++/// 8785 JCS for major ≥ 3, Python-compat below). The tag is fixed-length
++/// and the canonical bytes follow it directly, so the message is
++/// unambiguous. The composite primitive then applies its own LAMPS -19
++/// representative (`ciris_crypto::composite::message_representative`): the
++/// Agent hands THESE bytes to its composite signer as the message, never a
++/// hash of them.
++///
++/// # Errors
++/// As [`canonical_bytes_for_trace`].
++pub fn trace_signature_message<C>(
++    trace: &CompleteTrace,
++    canonicalizer: &C,
++) -> Result<Vec<u8>, Error>
++where
++    C: Canonicalizer + ?Sized,
++{
++    let canonical = canonical_bytes_for_trace(trace, canonicalizer)?;
++    let mut out = Vec::with_capacity(TRACE_SIGNATURE_CONTEXT.len() + canonical.len());
++    out.extend_from_slice(TRACE_SIGNATURE_CONTEXT);
++    out.extend_from_slice(&canonical);
++    Ok(out)
++}
++
++/// v62.0.0 — the two signature forms a trace can arrive in.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TraceSignatureForm {
++    /// The v62 form: `signature_key_id` is an edition-2 identity-ref (the
++    /// kid, carried as its thumbprint here) and `signature` is ONE composite
++    /// signature over [`trace_signature_message`]. None of the three
++    /// earlier-form PQC members (`signature_ml_dsa_65`, `pubkey_ml_dsa_65`,
++    /// `pqc_key_id`) is present.
++    Composite([u8; 32]),
++    /// The earlier form (v7.2.0, #225): an Ed25519 `signature` plus a bound
++    /// ML-DSA-65 `signature_ml_dsa_65` over `canonical || ed25519_sig`, the
++    /// components looked up separately by `signature_key_id` / `pqc_key_id`.
++    /// Any trace that is not [`TraceSignatureForm::Composite`] is this form,
++    /// including a classical-only one and a trace that mixes an identity-ref
++    /// kid with a PQC member.
++    BoundHybrid,
++}
++
++/// v62.0.0 — **which form is this trace signed in?** Read from the envelope
++/// members only (no key read, no verify). See [`TraceSignatureForm`].
++#[must_use]
++pub fn trace_signature_form(trace: &CompleteTrace) -> TraceSignatureForm {
++    if trace.signature_ml_dsa_65.is_some()
++        || trace.pubkey_ml_dsa_65.is_some()
++        || trace.pqc_key_id.is_some()
++    {
++        return TraceSignatureForm::BoundHybrid;
++    }
++    match crate::federation::edition2::ingest::kid_of_identity_ref(&trace.signature_key_id) {
++        Some(kid) => TraceSignatureForm::Composite(kid),
++        None => TraceSignatureForm::BoundHybrid,
++    }
++}
++
++/// v62.0.0 (CC 2.6.1.7) — **verify a trace's ONE composite signature** under
++/// `key`, over [`trace_signature_message`]. Pure: the key is the caller's,
++/// resolved by the trace's kid through the edition-2 key plane
++/// ([`crate::ingest::verify_trace_for_admission`]). Both halves must verify
++/// (the composite primitive does not say which failed).
++///
++/// # Errors
++/// [`Error::InvalidSignature`] when `signature` is not base64 or not a
++/// composite signature's length; [`Error::SignatureMismatch`] when it does
++/// not verify under `key`; the canonicalizer's errors.
++pub fn verify_trace_composite<C>(
++    trace: &CompleteTrace,
++    canonicalizer: &C,
++    key: &ciris_crypto::composite::CompositePublicKey,
++) -> Result<(), Error>
++where
++    C: Canonicalizer + ?Sized,
++{
++    let sig =
++        decode_signature(&trace.signature).map_err(|e| Error::InvalidSignature(e.to_string()))?;
++    if sig.len() != ciris_crypto::composite::SIGNATURE_LEN {
++        return Err(Error::InvalidSignature(format!(
++            "expected a {}-byte composite (ML-DSA-65-Ed25519) signature, got {} bytes",
++            ciris_crypto::composite::SIGNATURE_LEN,
++            sig.len()
++        )));
++    }
++    let message = trace_signature_message(trace, canonicalizer)?;
++    tracing::info!(
++        target: "federation_canonical_match",
++        wire = trace.trace_schema_version.as_str(),
++        trace_id = trace.trace_id.as_str(),
++        form = "composite",
++        "federation_canonical_match_total"
++    );
++    match key.verify(&message, &sig) {
++        Ok(()) => Ok(()),
++        Err(ciris_crypto::CryptoError::InvalidSignature { reason }) => {
++            Err(Error::InvalidSignature(reason))
++        }
++        Err(_) => Err(Error::SignatureMismatch),
++    }
++}
++
+ /// v4.6 (CIRISPersist#171 / #176 / CEG §0.9) — map a trace's **signed**
+ /// `trace_schema_version` to its canonicalization version (the #176
+ /// signed-epoch version gate). The JCS flip is a **major-version** era
+diff --git a/src/verify/mod.rs b/src/verify/mod.rs
+index fb583b23..3b01d89d 100644
+--- a/src/verify/mod.rs
++++ b/src/verify/mod.rs
+@@ -91,6 +91,14 @@ pub enum Error {
+     /// from [`crate::verify::hybrid::VerifyError::kind`].
+     #[error("hybrid verify failed: {0}")]
+     HybridVerify(String),
++
++    /// v62.0.0 (CC 2.6.1.7) — a composite-signed trace whose kid names an
++    /// edition-2 key this node holds valid records of, but which is not live
++    /// at the trace's signed `completed_at` (the key plane's half-open
++    /// reading, `HeldKeys::liveness`): revoked, no record covers the instant,
++    /// or a record waits on a deeper key. Carries which of the three.
++    #[error("signer not live: {0}")]
++    SignerNotLive(String),
+ }
+ 
+ impl Error {
+@@ -106,6 +114,7 @@ impl Error {
+             Error::UnsupportedSchemaVersion(_) => "verify_unsupported_schema_version",
+             Error::HybridRequired => "verify_hybrid_required",
+             Error::HybridVerify(_) => "verify_hybrid_failed",
++            Error::SignerNotLive(_) => "verify_signer_not_live",
+         }
+     }
+ }

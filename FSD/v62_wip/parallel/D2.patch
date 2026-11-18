@@ -1,0 +1,2071 @@
+diff --git a/src/ffi/directory_capsule.rs b/src/ffi/directory_capsule.rs
+index 3b4dc81b..885c3696 100644
+--- a/src/ffi/directory_capsule.rs
++++ b/src/ffi/directory_capsule.rs
+@@ -1390,6 +1390,47 @@ pub enum DirectoryOp {
+     /// installed policy, not the default. Result rides
+     /// `HardwareAttestationPolicy`. APPEND-ONLY (Growth).
+     HardwareAttestationPolicy {},
++    /// v62.0.0 (JSON-cut slice D, CC 2.6.1, 2.6.1.12) — **the edition-2
++    /// statement door**, [`crate::federation::edition2::ingest::put_statement`]
++    /// at tier `federation`, run inside persist's `.so` over persist's own
++    /// directory: one `COSE_Sign1` statement as received. An earlier-form
++    /// object is refused `earlier_form_object` by the door itself. Result
++    /// rides `Edition2StatementOutcome`. APPEND-ONLY (Growth).
++    PutEdition2Statement {
++        /// The statement's bytes as received.
++        statement: Vec<u8>,
++        /// The row id the carrier names it by, if any: it must be the one
++        /// this node computes (`row_id_mismatch`).
++        offered_row_id: Option<[u8; 32]>,
++    },
++    /// v62.0.0 (JSON-cut slice D) — **the replicated statement door**,
++    /// [`crate::federation::edition2::ingest::apply_replicated_statement`]:
++    /// one statement a peer delivered under the id it offered. A statement
++    /// whose signer's key record is not held is the retryable
++    /// `federation_attester_key_unknown` error (the cursor must not advance);
++    /// a lost race is `Refused`. Result rides `ReplicatedStatementOutcome`.
++    /// APPEND-ONLY (Growth).
++    ApplyReplicatedStatement {
++        /// The statement's bytes as the peer delivered them.
++        statement: Vec<u8>,
++        /// The row id the peer offered it as.
++        offered_row_id: [u8; 32],
++    },
++    /// v62.0.0 (JSON-cut slice D) —
++    /// [`FederationDirectory::edition2_statements_since`]: the held
++    /// statements after `cursor`, in this node's admission order, as
++    /// received. Result rides `Edition2StatementPage`. APPEND-ONLY (Growth).
++    Edition2StatementsSince {
++        /// Resume after this position (`None`: from the first).
++        cursor: Option<Edition2Cursor>,
++        /// At most this many (the store clamps to its page bound).
++        limit: u32,
++    },
++    /// v62.0.0 (JSON-cut slice D, CC 2.6.1.11, 2.7.8) —
++    /// [`crate::federation::edition2::genesis::bundles_in_force`]: the tips of
++    /// the held genesis lineage as CIRISVerify places them (two are a fork).
++    /// Result rides `BundlesInForce`. APPEND-ONLY (Growth).
++    BundlesInForce {},
+ }
+ 
+ /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
+@@ -1667,6 +1708,394 @@ pub enum DirectoryOpResult {
+     OptionalString(Option<String>),
+     /// v61.4.0 (CIRISPersist#1244 round 2) — `hardware_attestation_policy`. APPEND-ONLY (Growth).
+     HardwareAttestationPolicy(crate::federation::HardwareAttestationPolicy),
++    /// v62.0.0 (JSON-cut slice D) — what `PutEdition2Statement` did.
++    /// APPEND-ONLY (Growth).
++    Edition2StatementOutcome(Edition2StatementOutcome),
++    /// v62.0.0 (JSON-cut slice D) — `ApplyReplicatedStatement`'s typed
++    /// outcome: a `Refused` is a policy outcome carried HERE, never flattened
++    /// to [`Self::Err`]. APPEND-ONLY (Growth).
++    ReplicatedStatementOutcome(Edition2ReplicatedOutcome),
++    /// v62.0.0 (JSON-cut slice D) — `edition2_statements_since`.
++    /// APPEND-ONLY (Growth).
++    Edition2StatementPage(Vec<Edition2ServedStatement>),
++    /// v62.0.0 (JSON-cut slice D) — `bundles_in_force`. APPEND-ONLY (Growth).
++    BundlesInForce(Vec<Edition2BundleInForce>),
++}
++
++// ── v62.0.0 (JSON-cut slice D) — the edition-2 payload types ────────────
++//
++// The edition-2 store's own types (`RowId`, `StatementCursor`,
++// `ServedStatement`, `BundleInForce`, `StatementOutcome`) carry no serde
++// derive; these are their wire mirrors, converted at the dispatch arm. Each is
++// NEW at v62, so it is growth, and its own shape is pinned by
++// `DIRECTORY_ABI_VERSION` from here on (the digest gate reads enum bodies
++// only).
++
++/// The wire mirror of [`crate::federation::edition2::store::StatementCursor`]:
++/// a position in this node's admission order.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
++pub struct Edition2Cursor {
++    /// The admission position, POSIX µs.
++    pub admitted_us: i64,
++    /// The statement id.
++    pub statement_id: [u8; 32],
++}
++
++impl From<crate::federation::edition2::store::StatementCursor> for Edition2Cursor {
++    fn from(c: crate::federation::edition2::store::StatementCursor) -> Self {
++        Self {
++            admitted_us: c.admitted_us,
++            statement_id: c.statement_id,
++        }
++    }
++}
++
++impl From<Edition2Cursor> for crate::federation::edition2::store::StatementCursor {
++    fn from(c: Edition2Cursor) -> Self {
++        Self {
++            admitted_us: c.admitted_us,
++            statement_id: c.statement_id,
++        }
++    }
++}
++
++/// The wire mirror of [`crate::federation::edition2::store::ServedStatement`]:
++/// one held statement as received (CC 2.6.1.2), with its position.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Edition2ServedStatement {
++    /// Pass the last one served back as the cursor.
++    pub cursor: Edition2Cursor,
++    /// The statement's bytes as received.
++    pub bytes: Vec<u8>,
++}
++
++impl From<crate::federation::edition2::store::ServedStatement> for Edition2ServedStatement {
++    fn from(s: crate::federation::edition2::store::ServedStatement) -> Self {
++        Self {
++            cursor: s.cursor.into(),
++            bytes: s.bytes,
++        }
++    }
++}
++
++/// The wire mirror of [`crate::federation::edition2::ingest::StatementOutcome`]:
++/// where the edition-2 door kept a statement. `row_id` is the id THIS node
++/// computed.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Edition2StatementOutcome {
++    /// A key-plane row (`key:record`, `key:revocation`).
++    KeyPlane {
++        /// The row id.
++        row_id: [u8; 32],
++        /// Was it new.
++        new: bool,
++    },
++    /// A further voice of a row already held.
++    Voice {
++        /// The row id.
++        row_id: [u8; 32],
++        /// Was the statement new.
++        new: bool,
++    },
++    /// A row admitted through the attestation gates.
++    Row {
++        /// The row id.
++        row_id: [u8; 32],
++        /// Was the statement new.
++        new: bool,
++    },
++    /// v62.0.0 (T1) — a counted row short of its count: the statement is
++    /// held, the row waits for its voices. APPENDED.
++    Pending {
++        /// The row id.
++        row_id: [u8; 32],
++        /// Was the statement new.
++        new: bool,
++    },
++}
++
++impl From<crate::federation::edition2::ingest::StatementOutcome> for Edition2StatementOutcome {
++    fn from(o: crate::federation::edition2::ingest::StatementOutcome) -> Self {
++        use crate::federation::edition2::ingest::StatementOutcome as S;
++        match o {
++            S::KeyPlane { row_id, new } => Self::KeyPlane {
++                row_id: row_id.0,
++                new,
++            },
++            S::Voice { row_id, new } => Self::Voice {
++                row_id: row_id.0,
++                new,
++            },
++            S::Row { row_id, new } => Self::Row {
++                row_id: row_id.0,
++                new,
++            },
++            S::Pending { row_id, new } => Self::Pending {
++                row_id: row_id.0,
++                new,
++            },
++        }
++    }
++}
++
++/// The wire mirror of
++/// [`crate::federation::edition2::ingest::ReplicatedStatementOutcome`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Edition2ReplicatedOutcome {
++    /// New here and kept.
++    Admitted(Edition2StatementOutcome),
++    /// Already held byte for byte: nothing changed.
++    Unchanged(Edition2StatementOutcome),
++    /// Not kept; the store is untouched. Advances the sender's cursor.
++    Refused {
++        /// Which branch refused.
++        reason: crate::federation::attestation_apply::AttestationRefusalReason,
++    },
++}
++
++impl From<crate::federation::edition2::ingest::ReplicatedStatementOutcome>
++    for Edition2ReplicatedOutcome
++{
++    fn from(o: crate::federation::edition2::ingest::ReplicatedStatementOutcome) -> Self {
++        use crate::federation::edition2::ingest::ReplicatedStatementOutcome as R;
++        match o {
++            R::Admitted(s) => Self::Admitted(s.into()),
++            R::Unchanged(s) => Self::Unchanged(s.into()),
++            R::Refused { reason } => Self::Refused { reason },
++        }
++    }
++}
++
++/// The wire mirror of one tip of
++/// [`crate::federation::edition2::genesis::bundles_in_force`] (Verify's
++/// `GenesisPlacement`): the members PyO3's `bundles_in_force_json` serves,
++/// with the identity-refs only (a consumer that needs a seat's keys reads its
++/// key record).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Edition2BundleInForce {
++    /// The bundle's object id.
++    pub object_id: [u8; 32],
++    /// `version`.
++    pub version: u32,
++    /// `refs.prev`, on a later bundle.
++    pub prev: Option<[u8; 32]>,
++    /// `asserted_at`, POSIX ms.
++    pub asserted_at: u64,
++    /// The accord's name.
++    pub family_key_id: String,
++    /// The roster's identity-refs, in `holders` order.
++    pub holders: Vec<String>,
++    /// The seats' identity-refs, in `serve_nodes` order.
++    pub serve_nodes: Vec<String>,
++    /// The identity-refs whose statements counted, sorted.
++    pub counted: Vec<String>,
++}
++
++impl From<&crate::federation::edition2::genesis::GenesisPlacement> for Edition2BundleInForce {
++    fn from(t: &crate::federation::edition2::genesis::GenesisPlacement) -> Self {
++        Self {
++            object_id: t.object_id,
++            version: t.version,
++            prev: t.prev,
++            asserted_at: t.asserted_at,
++            family_key_id: t.family_key_id.clone(),
++            holders: t.holders.iter().map(|h| h.identity_ref.clone()).collect(),
++            serve_nodes: t.seats.iter().map(|x| x.identity_ref.clone()).collect(),
++            counted: t.counted.clone(),
++        }
++    }
++}
++
++/// v62.0.0 (JSON-cut slice D) — an [`Error`] flattened for the capsule WITH
++/// its stable reading: `"{kind}: {plane}: {reason}: {message}"` for a
++/// [`Error::MalformedRow`] (the prefix is Python's
++/// `ValueError("federation_malformed_row: {plane}: {reason}")`), and
++/// `"{kind}: {message}"` for every other error, so a consumer tells the
++/// retryable `federation_attester_key_unknown` from a terminal refusal
++/// without parsing prose. Used by the edition-2 ops and the earlier-form
++/// refusal; the older ops keep their `to_string()` flattening.
++#[must_use]
++pub fn typed_error_string(e: &Error) -> String {
++    match e {
++        Error::MalformedRow {
++            plane,
++            reason,
++            message,
++        } => format!("{}: {plane}: {reason}: {message}", e.kind()),
++        other => format!("{}: {other}", other.kind()),
++    }
++}
++
++/// v62.0.0 (JSON-cut slice D, CC 2.6.1.12) — **the earlier-form refusal at
++/// the capsule.** Each op that carries an earlier-form signed object (a JSON
++/// object signed over its JCS image) answers
++/// [`crate::federation::edition2::door::refuse_earlier_form`]'s refusal
++/// before dispatch, under the plane the Rust door names. It is inert until
++/// [`crate::federation::edition2::door::EARLIER_FORM_DOORS_SHUT`] is `true`.
++/// A row that carries its edition-2 statement (`ceg_statement`) is the
++/// edition-2 door's mapping and passes
++/// ([`crate::federation::edition2::door::refuse_earlier_form_row`]).
++///
++/// # Errors
++/// `federation_malformed_row` / `earlier_form_object` once the doors are shut.
++pub fn refuse_earlier_form_op(op: &DirectoryOp) -> Result<(), Error> {
++    use crate::federation::edition2::door::{refuse_earlier_form, refuse_earlier_form_row};
++    match op {
++        DirectoryOp::PutAttestation { attestation }
++        | DirectoryOp::PutAttestationAuthored { attestation }
++        | DirectoryOp::ApplyReplicatedAttestation { attestation }
++        | DirectoryOp::PutAttestationSynced { attestation, .. }
++        | DirectoryOp::ApplyReplicatedAttestationSynced { attestation, .. } => {
++            refuse_earlier_form_row("attestation", &attestation.attestation)
++        }
++        other => match earlier_form_op_plane(other) {
++            Some(plane) => refuse_earlier_form(plane),
++            None => Ok(()),
++        },
++    }
++}
++
++/// v62.0.0 (JSON-cut slice D) — the door plane of each [`DirectoryOp`] that
++/// carries an earlier-form signed object, `None` for the rest. Exhaustive, so
++/// an appended op must be classified here before it compiles.
++#[must_use]
++pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
++    match op {
++        // ── inbound earlier-form signed objects ──
++        DirectoryOp::PutPublicKey { .. } | DirectoryOp::ApplyReplicatedKeyRecord { .. } => {
++            Some("key_record")
++        }
++        DirectoryOp::PutRevocation { .. } => Some("revocation"),
++        DirectoryOp::PutLocationProof { .. } => Some("location_proof"),
++        DirectoryOp::PutIdentityOccurrence { .. } => Some("identity_occurrence"),
++        DirectoryOp::PutIdentityOccurrenceRevocation { .. } => {
++            Some("identity_occurrence_revocation")
++        }
++        DirectoryOp::PutFamily { .. } => Some("family"),
++        DirectoryOp::PutCommunity { .. } => Some("community"),
++        DirectoryOp::PutTransportDestination { .. }
++        | DirectoryOp::PutSignedTransportDestination { .. } => Some("transport_destination"),
++        DirectoryOp::ApplyReplicatedAccordEvidence { .. } => Some("accord_evidence"),
++        DirectoryOp::PutLineageHeadCosign { .. } => Some("lineage_head_cosign"),
++        DirectoryOp::PutAttestation { .. }
++        | DirectoryOp::PutAttestationAuthored { .. }
++        | DirectoryOp::PutAttestationSynced { .. }
++        | DirectoryOp::ApplyReplicatedAttestation { .. }
++        | DirectoryOp::ApplyReplicatedAttestationSynced { .. } => Some("attestation"),
++        // ── reads, folds and node-local writes: no signed object in ──
++        DirectoryOp::LookupPublicKey { .. }
++        | DirectoryOp::ListTransportDestinationsFor { .. }
++        | DirectoryOp::LookupSharedInstanceLease { .. }
++        | DirectoryOp::AcquireSharedInstanceLease { .. }
++        | DirectoryOp::HeartbeatSharedInstance { .. }
++        | DirectoryOp::ReleaseSharedInstanceLease { .. }
++        | DirectoryOp::ListAccordHolders { .. }
++        | DirectoryOp::PeerMetadataFor { .. }
++        | DirectoryOp::ListHeldFountainContent { .. }
++        | DirectoryOp::EvictFountainContentToTier { .. }
++        | DirectoryOp::EvictFountainContentHardDelete { .. }
++        | DirectoryOp::ReachableUnderScope { .. }
++        | DirectoryOp::BuildDelegationGraph { .. }
++        | DirectoryOp::AddPeerRecord { .. }
++        | DirectoryOp::RemovePeerRecord { .. }
++        | DirectoryOp::UpdatePeerAlias { .. }
++        | DirectoryOp::UpdatePeerTrust { .. }
++        | DirectoryOp::UpdatePeerNotes { .. }
++        | DirectoryOp::UpdatePeerPolicy { .. }
++        | DirectoryOp::LookupIdentityForOccurrence { .. }
++        | DirectoryOp::ListAllTransportDestinations { .. }
++        | DirectoryOp::ListTransportDestinationsByDestination { .. }
++        | DirectoryOp::ListSignedIdentityOccurrencesFor { .. }
++        | DirectoryOp::ListSignedRecords { .. }
++        | DirectoryOp::ListSignedTransportDestinationsFor { .. }
++        | DirectoryOp::ResolveEncryptionKeys { .. }
++        | DirectoryOp::ListIdentityOccurrenceRevocationsFor { .. }
++        | DirectoryOp::ListScores { .. }
++        | DirectoryOp::ResolveScores { .. }
++        | DirectoryOp::ListAttestationLog { .. }
++        | DirectoryOp::RecordAnnouncedPeer { .. }
++        | DirectoryOp::ListAnnouncedPeers
++        | DirectoryOp::TrustRootValid { .. }
++        | DirectoryOp::CapabilityRootsToTrustedRoot { .. }
++        | DirectoryOp::ListConsentPeers { .. }
++        | DirectoryOp::ListSignedLocationProofsSince { .. }
++        | DirectoryOp::ListSignedTransportDestinationsSince { .. }
++        | DirectoryOp::ListAttestationsSince { .. }
++        | DirectoryOp::LookupSignedRecordByContentHash { .. }
++        | DirectoryOp::RebuildSignedWireIndex
++        | DirectoryOp::ResolveTransitEligibility { .. }
++        | DirectoryOp::RevocationsFor { .. }
++        | DirectoryOp::ListSignedAccordQuorumEvidenceSince { .. }
++        | DirectoryOp::ListWireHashesSince { .. }
++        | DirectoryOp::InsertKnownWireHash { .. }
++        | DirectoryOp::KnownWireHashContains { .. }
++        | DirectoryOp::ListKnownWireHashesSince { .. }
++        | DirectoryOp::EvictKnownWireHashes { .. }
++        | DirectoryOp::WithdrawsAdmissionDepth { .. }
++        | DirectoryOp::RevocationsForSubject { .. }
++        | DirectoryOp::TrustDirectionHeldAmong { .. }
++        | DirectoryOp::ListKeyPlaneWireHashesSince { .. }
++        | DirectoryOp::ExecuteAttestationQuery { .. }
++        | DirectoryOp::ListComposersReferencingAny { .. }
++        | DirectoryOp::ListIdentityOccurrenceHistoryByOccurrence { .. }
++        | DirectoryOp::ListIdentityOccurrencesByOccurrenceKey { .. }
++        | DirectoryOp::ListAttestationsNamingByDimension { .. }
++        | DirectoryOp::ListAttestationsSinceByPrefixes { .. }
++        | DirectoryOp::ListOwnerBindingsSince { .. }
++        | DirectoryOp::ListKeysByIdentityType { .. }
++        | DirectoryOp::ListAllTransportDestinationsUnfolded { .. }
++        | DirectoryOp::ListTransportDestinationsByDestinationUnfolded { .. }
++        | DirectoryOp::BlackholeList { .. }
++        | DirectoryOp::BlackholeUpsert { .. }
++        | DirectoryOp::BlackholeRemove { .. }
++        | DirectoryOp::BlackholeRecordHit { .. }
++        | DirectoryOp::BlackholePruneExpired { .. }
++        | DirectoryOp::ListAttestationsReferencing { .. }
++        | DirectoryOp::GetAttestation { .. }
++        | DirectoryOp::ListSettledSelfRosterProposals { .. }
++        | DirectoryOp::ListIdentityOccurrencesFor { .. }
++        | DirectoryOp::GetActiveHalt { .. }
++        | DirectoryOp::LookupRoleWithdrawal { .. }
++        | DirectoryOp::LookupFamily { .. }
++        | DirectoryOp::LookupCommunity { .. }
++        | DirectoryOp::ListFamiliesForMember { .. }
++        | DirectoryOp::FamilyRosterSigners { .. }
++        | DirectoryOp::CommunityRosterSigners { .. }
++        | DirectoryOp::ListFamilyMembershipRevocationsFor { .. }
++        | DirectoryOp::ListFamilyMembershipWideningsFor { .. }
++        | DirectoryOp::ListLineageHeadCosignsFor { .. }
++        | DirectoryOp::LookupSignedCommunity { .. }
++        | DirectoryOp::LookupCanonicalWithdrawal { .. }
++        | DirectoryOp::ListCanonicalWithdrawals { .. }
++        | DirectoryOp::VoteWindowFirstHeld { .. }
++        | DirectoryOp::ListCosignAliases { .. }
++        | DirectoryOp::CosignAlias { .. }
++        | DirectoryOp::GetAccordDecision { .. }
++        | DirectoryOp::ListAccordProposalsByAnchor { .. }
++        | DirectoryOp::PurgeTombstoned { .. }
++        | DirectoryOp::PurgeTombstoneNotices { .. }
++        | DirectoryOp::ListTargetedByDimensionPrefix { .. }
++        | DirectoryOp::KeyGrantHeldOwner { .. }
++        | DirectoryOp::NodeKeyId { .. }
++        | DirectoryOp::WithdrawsDelegationDepth { .. }
++        | DirectoryOp::HardwareAttestationPolicy { .. } => None,
++        // ── the edition-2 doors and reads ──
++        DirectoryOp::PutEdition2Statement { .. }
++        | DirectoryOp::ApplyReplicatedStatement { .. }
++        | DirectoryOp::Edition2StatementsSince { .. }
++        | DirectoryOp::BundlesInForce { .. } => None,
++        // TODO(json-cut): detection events are MESH (RULINGS "Planes"), but
++        // no edition-2 detection door exists yet and the Rust door
++        // (`derived::put_edge_detection_event`) is not wired to the
++        // switch; the capsule follows the Rust door rather than diverge.
++        DirectoryOp::PutEdgeDetectionEvent { .. } => None,
++        // TODO(json-cut): an earlier-form signature check, not a door; its
++        // fate is the "composite components as standalone keys" ruling
++        // (JSON_CUT_PLAN §8.6).
++        DirectoryOp::VerifyHybridViaDirectory { .. } => None,
++    }
+ }
+ 
+ /// v61.4.0 (CIRISPersist#1244) — the refusal a blackhole op gets from a
+@@ -1716,6 +2145,12 @@ pub async fn dispatch_directory_op(
+     op: DirectoryOp,
+ ) -> DirectoryOpResult {
+     use crate::federation::types::identity_type;
++    // v62.0.0 (JSON-cut slice D) — an op that carries an earlier-form signed
++    // object is refused by name once the doors are shut, before any parse,
++    // with the same reading as the Rust and Python doors.
++    if let Err(e) = refuse_earlier_form_op(&op) {
++        return DirectoryOpResult::Err(typed_error_string(&e));
++    }
+     match op {
+         DirectoryOp::LookupPublicKey { key_id } => match dir.lookup_public_key(&key_id).await {
+             Ok(v) => DirectoryOpResult::PublicKey(v),
+@@ -2727,6 +3162,55 @@ pub async fn dispatch_directory_op(
+                 Err(e) => DirectoryOpResult::Err(e.to_string()),
+             }
+         }
++        // v62.0.0 (JSON-cut slice D) — the edition-2 doors run inside
++        // persist's `.so` over persist's own directory; their errors keep
++        // their reading (`typed_error_string`).
++        DirectoryOp::PutEdition2Statement {
++            statement,
++            offered_row_id,
++        } => match Box::pin(crate::federation::edition2::ingest::put_statement(
++            dir,
++            &statement,
++            offered_row_id.as_ref(),
++            crate::federation::edition2::ingest::INGEST_TIER,
++        ))
++        .await
++        {
++            Ok(o) => DirectoryOpResult::Edition2StatementOutcome(o.into()),
++            Err(e) => DirectoryOpResult::Err(typed_error_string(&e)),
++        },
++        DirectoryOp::ApplyReplicatedStatement {
++            statement,
++            offered_row_id,
++        } => match Box::pin(
++            crate::federation::edition2::ingest::apply_replicated_statement(
++                dir,
++                &statement,
++                &offered_row_id,
++            ),
++        )
++        .await
++        {
++            Ok(o) => DirectoryOpResult::ReplicatedStatementOutcome(o.into()),
++            Err(e) => DirectoryOpResult::Err(typed_error_string(&e)),
++        },
++        DirectoryOp::Edition2StatementsSince { cursor, limit } => {
++            let cursor = cursor.map(crate::federation::edition2::store::StatementCursor::from);
++            match dir.edition2_statements_since(cursor.as_ref(), limit).await {
++                Ok(v) => DirectoryOpResult::Edition2StatementPage(
++                    v.into_iter().map(Edition2ServedStatement::from).collect(),
++                ),
++                Err(e) => DirectoryOpResult::Err(typed_error_string(&e)),
++            }
++        }
++        DirectoryOp::BundlesInForce {} => {
++            match Box::pin(crate::federation::edition2::genesis::bundles_in_force(dir)).await {
++                Ok(v) => DirectoryOpResult::BundlesInForce(
++                    v.iter().map(Edition2BundleInForce::from).collect(),
++                ),
++                Err(e) => DirectoryOpResult::Err(typed_error_string(&e)),
++            }
++        }
+     }
+ }
+ 
+@@ -4972,6 +5456,35 @@ impl FederationDirectory for OpsDirectory {
+         }
+     }
+ 
++    /// v62.0.0 (JSON-cut slice D) — the edition-2 serve listing, proxied.
++    /// The trait default answers EMPTY, which a serving consumer would read
++    /// as "nothing held" (the #1244 fail-open class), so the read crosses.
++    async fn edition2_statements_since(
++        &self,
++        cursor: Option<&crate::federation::edition2::store::StatementCursor>,
++        limit: u32,
++    ) -> Result<Vec<crate::federation::edition2::store::ServedStatement>, Error> {
++        match self
++            .run_op(&DirectoryOp::Edition2StatementsSince {
++                cursor: cursor.copied().map(Edition2Cursor::from),
++                limit,
++            })
++            .await?
++        {
++            DirectoryOpResult::Edition2StatementPage(v) => Ok(v
++                .into_iter()
++                .map(|s| crate::federation::edition2::store::ServedStatement {
++                    cursor: s.cursor.into(),
++                    bytes: s.bytes,
++                })
++                .collect()),
++            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
++            _ => Err(Error::Backend(
++                "directory ops proxy: unexpected result variant".into(),
++            )),
++        }
++    }
++
+     /// v61.1.0 (CIRISPersist#1163) — the owner-binding feed, proxied.
+     async fn list_owner_bindings_since(
+         &self,
+@@ -6495,9 +7008,12 @@ mod tests {
+         // DIRECTORY_ABI_VERSION stays 13.
+         // v61.4.0 round 2 (CIRISPersist#1244) — GROWTH: the rooting reads and
+         // the fail-open trust reads APPENDED (29 ops); ABI stays 13.
++        // v62.0.0 (JSON-cut slice D) — GROWTH: `PutEdition2Statement`,
++        // `ApplyReplicatedStatement`, `Edition2StatementsSince` and
++        // `BundlesInForce` APPENDED, nothing existing touched; ABI stays 13.
+         assert_eq!(
+             structural_digest("DirectoryOp"),
+-            "10f494612b504776fad61ddd55b88d70ffcdf6dd6c6ba1387d9e3db5b4ca9f8e",
++            "72341051723f44a4549be63fd77144eb7ef532cd2ba7d8e9a4c7113ae39d1c4f",
+             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
+              touched nothing existing) → re-pin this digest only. BREAK \
+              (changed/renamed/removed/reordered an existing variant) → re-pin \
+@@ -6556,9 +7072,12 @@ mod tests {
+         // v61.4.0 (CIRISPersist#1244) — GROWTH: `BlackholeRecords` APPENDED.
+         // v61.4.0 round 2 (CIRISPersist#1244) — GROWTH: 21 result variants
+         // APPENDED for the rooting and trust reads.
++        // v62.0.0 (JSON-cut slice D) — GROWTH: `Edition2StatementOutcome`,
++        // `ReplicatedStatementOutcome`, `Edition2StatementPage` and
++        // `BundlesInForce` APPENDED.
+         assert_eq!(
+             structural_digest("DirectoryOpResult"),
+-            "e3041d8473605d82d0aad59d6f99920013a38968d4ca66a938a67b4053ed553c",
++            "cdc2ba77d8c0538ec3fef933dca28b5a883764ce320227a0083e664da11360a0",
+             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
+              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
+         );
+@@ -9999,6 +10518,23 @@ mod proxy_gate {
+             "`trust_root::resolve_transit_eligibility` is a free, fail-closed function over \
+              the directory, not a trait method",
+         ),
++        // v62.0.0 (JSON-cut slice D) — the edition-2 doors are free functions
++        // over the directory; the consumer sends the op.
++        (
++            "PutEdition2Statement",
++            "`edition2::ingest::put_statement` is a free door persist runs over its own \
++             directory, so every gate runs on the host's store; no trait method to proxy",
++        ),
++        (
++            "ApplyReplicatedStatement",
++            "`edition2::ingest::apply_replicated_statement` is a free door persist runs over \
++             its own directory; no trait method to proxy",
++        ),
++        (
++            "BundlesInForce",
++            "`edition2::genesis::bundles_in_force` is a free fold over the held genesis \
++             lineage, not a trait method",
++        ),
+     ];
+ 
+     /// The body of the first `{ … }` block opening at or after `at`.
+@@ -10100,3 +10636,513 @@ mod proxy_gate {
+         assert!(missing.is_empty(), "I1322 (#787):\n{}", missing.join("\n"));
+     }
+ }
++
++/// v62.0.0 (JSON-cut slice D) — the edition-2 ops and the earlier-form
++/// refusal across the capsule, on sqlite and postgres.
++///
++/// - **I2480 (the statement door crosses).** `PutEdition2Statement` admits a
++///   `key:record` through the C-ABI as the key plane, under the row id this
++///   node computes from the bytes; the same bytes again are `new: false`.
++/// - **I2481 (an earlier-form object at the edition-2 op).** JSON bytes are
++///   refused by the door itself, and the flattened error carries the
++///   reading `federation_malformed_row: {plane}: earlier_form_object`.
++/// - **I2482 (the offered id).** An offered row id the bytes do not name is
++///   `row_id_mismatch`; the store is untouched.
++/// - **I2483 (the replicated door).** `ApplyReplicatedStatement` under the
++///   computed id is `Admitted`, then `Unchanged`, with the plane carried.
++/// - **I2484 (the serve listing crosses, and the proxy reads it).**
++///   `Edition2StatementsSince` pages every held statement once, as received,
++///   in strictly increasing positions; the answer equals the directory's
++///   own, and the consumer proxy (`OpsDirectory`) answers the same instead
++///   of the trait default's empty set.
++/// - **I2485 (bundles in force cross).** `BundlesInForce` answers what
++///   `edition2::genesis::bundles_in_force` answers (none held: empty).
++/// - **I2486 (the earlier-form ops refuse once shut).** With the switch
++///   forced on, `PutAttestation` (a JSON row with no statement) and
++///   `PutIdentityOccurrenceRevocation` answer
++///   `federation_malformed_row: {plane}: earlier_form_object` before any
++///   parse, nothing is stored; with the switch off neither is refused by
++///   that name.
++/// - **I2487 (every inbound op is classified).** Every `Put*` /
++///   `ApplyReplicated*` op is classified earlier-form by
++///   [`earlier_form_op_plane`], or is named here with why.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod edition2_ops {
++    use super::*;
++    use ciris_crypto::composite::CompositeSigningKey;
++    use ciris_verify_core::cde::{self, Value};
++    use ciris_verify_core::edition2::{cose_key, identity_ref, sign_row_statement, thumbprint};
++    use std::sync::mpsc;
++
++    use crate::federation::edition2::names::RowId;
++
++    // ── fixtures (signed before any await: no signing key crosses one) ──
++
++    fn key(n: u8) -> CompositeSigningKey {
++        CompositeSigningKey::from_seeds(&[n; 32], &[n.wrapping_add(100); 32])
++    }
++
++    fn iref(k: &CompositeSigningKey) -> String {
++        identity_ref(&thumbprint(k.public_key()))
++    }
++
++    fn map(mut m: Vec<(&str, Value)>) -> Value {
++        let t = |s: &str| Value::Text(s.into());
++        m.sort_by_key(|(k, _)| cde::encode(&t(k)));
++        Value::Map(m.into_iter().map(|(k, v)| (t(k), v)).collect())
++    }
++
++    /// A self-signed `key:record` of the key seeded `n`.
++    fn key_record(n: u8, at: u64) -> Vec<u8> {
++        let k = key(n);
++        let roles = Value::Array(vec![Value::Text("user".into())]);
++        let payload = map(vec![
++            ("key", cose_key(k.public_key())),
++            ("identity_type", roles),
++            ("asserted_at", Value::Uint(at)),
++            ("author", Value::Text(iref(&k))),
++        ]);
++        sign_row_statement(
++            &k,
++            &iref(&k),
++            &iref(&k),
++            "scores",
++            "key:record",
++            &payload,
++            vec![],
++        )
++        .expect("sign a key:record")
++    }
++
++    fn rid(statement: &[u8]) -> [u8; 32] {
++        RowId::of_statement(statement).expect("a row statement").0
++    }
++
++    fn runtime() -> Arc<tokio::runtime::Runtime> {
++        Arc::new(
++            tokio::runtime::Builder::new_multi_thread()
++                .worker_threads(2)
++                .thread_stack_size(16 * 1024 * 1024)
++                .enable_all()
++                .build()
++                .expect("build tokio runtime"),
++        )
++    }
++
++    /// Drive one op through the C-ABI (the shape a consumer wheel uses).
++    fn run_op(
++        rt: &Arc<tokio::runtime::Runtime>,
++        directory: &Directory,
++        op: &DirectoryOp,
++    ) -> DirectoryOpResult {
++        let op_bytes = serde_json::to_vec(op).expect("serialize op");
++        let (tx, rx) = mpsc::channel::<Vec<u8>>();
++        let ctx: *mut c_void = Box::into_raw(Box::new(tx)) as *mut c_void;
++
++        unsafe extern "C" fn cb(ctx: *mut c_void, ptr: *const u8, len: usize) {
++            // SAFETY: single-fire boxed Sender; readable (ptr,len) for the call.
++            let tx: Box<mpsc::Sender<Vec<u8>>> =
++                unsafe { Box::from_raw(ctx as *mut mpsc::Sender<Vec<u8>>) };
++            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
++            let _ = tx.send(bytes);
++        }
++
++        // SAFETY: matched data/vtable; readable op bytes; Send-valid ctx/cb.
++        let task_ptr = unsafe {
++            (directory.vtable.build_op)(directory.data, op_bytes.as_ptr(), op_bytes.len(), cb, ctx)
++        };
++        let executor = crate::ffi::executor_capsule::build_persist_executor(rt.clone());
++        // SAFETY: task from build_op; matched executor vtable; single spawn.
++        unsafe { (executor.vtable.spawn)(executor.data, task_ptr) };
++        let bytes = rx
++            .recv_timeout(std::time::Duration::from_secs(30))
++            .expect("op result must arrive");
++        // SAFETY: single-drop, matched vtable.
++        unsafe { (executor.vtable.drop)(executor.data) };
++        serde_json::from_slice(&bytes).expect("deserialize DirectoryOpResult")
++    }
++
++    fn err_of(r: DirectoryOpResult, what: &str) -> String {
++        match r {
++            DirectoryOpResult::Err(s) => s,
++            other => panic!("{what}: expected Err, got {other:?}"),
++        }
++    }
++
++    /// I2480–I2487 over one migrated, EMPTY store.
++    fn body(rt: &Arc<tokio::runtime::Runtime>, dir: Arc<dyn FederationDirectory>) {
++        let s1 = key_record(81, 1_000);
++        let s2 = key_record(82, 2_000);
++        let directory = build_persist_directory(dir.clone());
++
++        // ── I2480 ──
++        for want_new in [true, false] {
++            match run_op(
++                rt,
++                &directory,
++                &DirectoryOp::PutEdition2Statement {
++                    statement: s1.clone(),
++                    offered_row_id: None,
++                },
++            ) {
++                DirectoryOpResult::Edition2StatementOutcome(
++                    Edition2StatementOutcome::KeyPlane { row_id, new },
++                ) => {
++                    assert_eq!(row_id, rid(&s1), "I2480: the node-computed row id");
++                    assert_eq!(new, want_new, "I2480: new on first put only");
++                }
++                other => panic!("I2480: {other:?}"),
++            }
++        }
++
++        // ── I2481 ──
++        let json = br#"{"attestation":{"attestation_id":"a","attesting_key_id":"k"}}"#.to_vec();
++        let e = err_of(
++            run_op(
++                rt,
++                &directory,
++                &DirectoryOp::PutEdition2Statement {
++                    statement: json,
++                    offered_row_id: None,
++                },
++            ),
++            "I2481",
++        );
++        assert!(
++            e.starts_with("federation_malformed_row: ") && e.contains(": earlier_form_object: "),
++            "I2481: the reading crosses: {e}"
++        );
++
++        // ── I2482 ──
++        let e = err_of(
++            run_op(
++                rt,
++                &directory,
++                &DirectoryOp::PutEdition2Statement {
++                    statement: s2.clone(),
++                    offered_row_id: Some([0x5a; 32]),
++                },
++            ),
++            "I2482",
++        );
++        assert!(e.contains(": row_id_mismatch: "), "I2482: {e}");
++        let held = rt
++            .block_on(dir.edition2_statements_since(None, 100))
++            .expect("I2482: read");
++        assert!(
++            held.iter().all(|s| s.bytes != s2),
++            "I2482: a refused statement is not stored"
++        );
++
++        // ── I2483 ──
++        let first = run_op(
++            rt,
++            &directory,
++            &DirectoryOp::ApplyReplicatedStatement {
++                statement: s2.clone(),
++                offered_row_id: rid(&s2),
++            },
++        );
++        let again = run_op(
++            rt,
++            &directory,
++            &DirectoryOp::ApplyReplicatedStatement {
++                statement: s2.clone(),
++                offered_row_id: rid(&s2),
++            },
++        );
++        let kp = Edition2StatementOutcome::KeyPlane {
++            row_id: rid(&s2),
++            new: true,
++        };
++        match first {
++            DirectoryOpResult::ReplicatedStatementOutcome(Edition2ReplicatedOutcome::Admitted(
++                o,
++            )) => assert_eq!(o, kp, "I2483: admitted on the key plane"),
++            other => panic!("I2483 first: {other:?}"),
++        }
++        match again {
++            DirectoryOpResult::ReplicatedStatementOutcome(
++                Edition2ReplicatedOutcome::Unchanged(Edition2StatementOutcome::KeyPlane {
++                    row_id,
++                    new,
++                }),
++            ) => {
++                assert_eq!(row_id, rid(&s2), "I2483");
++                assert!(!new, "I2483: a re-offer is not new");
++            }
++            other => panic!("I2483 again: {other:?}"),
++        }
++
++        // ── I2484 ──
++        let mut served: Vec<Edition2ServedStatement> = Vec::new();
++        let mut cursor = None;
++        loop {
++            let page = match run_op(
++                rt,
++                &directory,
++                &DirectoryOp::Edition2StatementsSince { cursor, limit: 1 },
++            ) {
++                DirectoryOpResult::Edition2StatementPage(v) => v,
++                other => panic!("I2484: {other:?}"),
++            };
++            assert!(page.len() <= 1, "I2484: the limit");
++            let Some(last) = page.last() else { break };
++            cursor = Some(last.cursor);
++            served.extend(page);
++        }
++        assert!(
++            served.windows(2).all(|w| w[0].cursor < w[1].cursor),
++            "I2484: strictly increasing positions"
++        );
++        for s in [&s1, &s2] {
++            assert_eq!(
++                served.iter().filter(|x| &x.bytes == s).count(),
++                1,
++                "I2484: each held statement served once, as received"
++            );
++        }
++        let direct: Vec<Edition2ServedStatement> = rt
++            .block_on(dir.edition2_statements_since(None, 100))
++            .expect("I2484: direct read")
++            .into_iter()
++            .map(Edition2ServedStatement::from)
++            .collect();
++        assert_eq!(
++            served, direct,
++            "I2484: the op answers what the directory answers"
++        );
++        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
++            rt.clone(),
++        ));
++        let proxy =
++            build_ops_directory(build_persist_directory(dir.clone()), executor).expect("abi ok");
++        let via_proxy: Vec<Edition2ServedStatement> = rt
++            .block_on(proxy.edition2_statements_since(None, 100))
++            .expect("I2484: proxy read")
++            .into_iter()
++            .map(Edition2ServedStatement::from)
++            .collect();
++        assert_eq!(
++            via_proxy, direct,
++            "I2484: the consumer proxy reads the host's listing, not the empty default"
++        );
++
++        // ── I2485 ──
++        let direct: Vec<Edition2BundleInForce> = rt
++            .block_on(crate::federation::edition2::genesis::bundles_in_force(
++                dir.as_ref(),
++            ))
++            .expect("I2485: direct")
++            .iter()
++            .map(Edition2BundleInForce::from)
++            .collect();
++        match run_op(rt, &directory, &DirectoryOp::BundlesInForce {}) {
++            DirectoryOpResult::BundlesInForce(v) => {
++                assert_eq!(v, direct, "I2485: the op answers the fold");
++                assert!(v.is_empty(), "I2485: no genesis bundle held");
++            }
++            other => panic!("I2485: {other:?}"),
++        }
++
++        // ── I2486 ── (dispatched in THIS task: the forced switch is
++        // task-local, and the C-ABI spawns onto another task.)
++        use crate::federation::tier_ingest::test_support as ts;
++        let id = uuid::Uuid::new_v4().to_string();
++        let row =
++            ts::bare_attestation(&id, "i2486-signer", "i2486-subject", &serde_json::json!({}));
++        let put_row = || DirectoryOp::PutAttestation {
++            attestation: crate::federation::SignedAttestation {
++                attestation: row.clone(),
++            },
++        };
++        let put_occ_rev = || DirectoryOp::PutIdentityOccurrenceRevocation {
++            revocation: serde_json::json!({ "identity_occurrence_revocation": {} }),
++        };
++        let shut = rt.block_on(
++            crate::federation::edition2::door::with_earlier_form_doors_shut(async {
++                (
++                    dispatch_directory_op(dir.as_ref(), put_row()).await,
++                    dispatch_directory_op(dir.as_ref(), put_occ_rev()).await,
++                )
++            }),
++        );
++        for (r, plane) in [
++            (shut.0, "attestation"),
++            (shut.1, "identity_occurrence_revocation"),
++        ] {
++            let e = err_of(r, "I2486 shut");
++            assert!(
++                e.starts_with(&format!(
++                    "federation_malformed_row: {plane}: earlier_form_object: "
++                )),
++                "I2486: {plane} refused by name: {e}"
++            );
++        }
++        assert!(
++            rt.block_on(dir.get_attestation(&id))
++                .expect("I2486: read")
++                .is_none(),
++            "I2486: nothing stored behind the refusal"
++        );
++        for op in [put_row(), put_occ_rev()] {
++            if let DirectoryOpResult::Err(e) = rt.block_on(dispatch_directory_op(dir.as_ref(), op))
++            {
++                assert!(
++                    !e.contains("earlier_form_object"),
++                    "I2486: the switch is off, so no earlier-form refusal: {e}"
++                );
++            }
++        }
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[test]
++    fn i2480_to_i2486_edition2_ops_cross_the_capsule_sqlite() {
++        let rt = runtime();
++        let backend = rt.block_on(async {
++            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++                .await
++                .expect("open sqlite");
++            crate::store::backend::Backend::run_migrations(&b)
++                .await
++                .expect("migrate");
++            b
++        });
++        body(&rt, Arc::new(backend));
++    }
++
++    #[cfg(feature = "postgres")]
++    #[test]
++    fn i2480_to_i2486_edition2_ops_cross_the_capsule_pg() {
++        let Some(dsn) = crate::test_pg::empty_dsn() else {
++            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
++            return;
++        };
++        let rt = runtime();
++        let backend = rt.block_on(async {
++            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++                .await
++                .expect("connect");
++            crate::store::backend::Backend::run_migrations(&b)
++                .await
++                .expect("migrate");
++            b
++        });
++        body(&rt, Arc::new(backend));
++    }
++
++    /// The `Put*` / `ApplyReplicated*` ops that are NOT earlier-form doors,
++    /// each with why.
++    const NOT_EARLIER_FORM: &[(&str, &str)] = &[
++        (
++            "PutEdition2Statement",
++            "the edition-2 door itself; it refuses an earlier-form object by its own form check",
++        ),
++        (
++            "ApplyReplicatedStatement",
++            "the replicated edition-2 door; the same form check runs inside put_statement",
++        ),
++        (
++            "PutEdgeDetectionEvent",
++            "TODO(json-cut): MESH by ruling, but no edition-2 detection door exists and the Rust \
++             door is not on the switch; the capsule follows the Rust door",
++        ),
++    ];
++
++    /// I2487 — from this file's own text (comments stripped): every
++    /// `Put*` / `ApplyReplicated*` variant of [`DirectoryOp`] is named in
++    /// [`earlier_form_op_plane`]'s earlier-form arms (the arms before its
++    /// first `=> None`), or in [`NOT_EARLIER_FORM`] with why — never both.
++    #[test]
++    fn i2487_every_inbound_op_is_classified() {
++        let src: String = include_str!("directory_capsule.rs")
++            .lines()
++            .map(|l| l.split("//").next().unwrap_or(""))
++            .collect::<Vec<_>>()
++            .join("\n");
++        let enum_at = src.find("pub enum DirectoryOp {").expect("the op enum");
++        let enum_end = enum_at + src[enum_at..].find("\n}\n").expect("enum end");
++        let variants: Vec<&str> = src[enum_at..enum_end]
++            .lines()
++            .filter_map(|l| {
++                let name = l.strip_prefix("    ")?;
++                let end = name
++                    .find(|c: char| !c.is_ascii_alphanumeric())
++                    .unwrap_or(name.len());
++                let name = &name[..end];
++                name.starts_with(|c: char| c.is_ascii_uppercase())
++                    .then_some(name)
++            })
++            .collect();
++        assert!(
++            variants.len() >= 115,
++            "I2487: the scan found {} variants",
++            variants.len()
++        );
++        let fn_at = src
++            .find("pub fn earlier_form_op_plane(")
++            .expect("the classifier");
++        let earlier = &src[fn_at..fn_at + src[fn_at..].find("=> None").expect("a None arm")];
++        let classified = |v: &str| {
++            earlier
++                .match_indices(&format!("DirectoryOp::{v}"))
++                .any(|(i, m)| {
++                    !earlier[i + m.len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
++                })
++        };
++        let mut bad = Vec::new();
++        for v in variants
++            .iter()
++            .filter(|v| v.starts_with("Put") || v.starts_with("ApplyReplicated"))
++        {
++            let exempt = NOT_EARLIER_FORM.iter().any(|(n, _)| n == v);
++            match (classified(v), exempt) {
++                (true, true) => bad.push(format!("{v}: classified AND exempt")),
++                (false, false) => bad.push(format!("{v}: not classified earlier-form")),
++                _ => {}
++            }
++        }
++        for (n, why) in NOT_EARLIER_FORM {
++            assert!(variants.contains(n), "I2487: no op `{n}`");
++            assert!(
++                why.split_whitespace().count() >= 8,
++                "I2487: `{n}` needs a reason"
++            );
++        }
++        assert!(bad.is_empty(), "I2487:\n{}", bad.join("\n"));
++    }
++
++    /// I2486 (pure) — the classifier's refusal is inert while the switch is
++    /// off, and names the plane once it is on.
++    #[tokio::test]
++    async fn i2486_the_op_refusal_follows_the_switch() {
++        let op = DirectoryOp::PutIdentityOccurrenceRevocation {
++            revocation: serde_json::json!({}),
++        };
++        refuse_earlier_form_op(&op).expect("I2486: inert while off");
++        let e = crate::federation::edition2::door::with_earlier_form_doors_shut(async {
++            refuse_earlier_form_op(&op)
++        })
++        .await
++        .expect_err("I2486: refused once shut");
++        assert_eq!(
++            typed_error_string(&e)
++                .split(": ")
++                .take(3)
++                .collect::<Vec<_>>(),
++            vec![
++                "federation_malformed_row",
++                "identity_occurrence_revocation",
++                "earlier_form_object"
++            ],
++            "I2486: the reading"
++        );
++        let read = DirectoryOp::LookupPublicKey { key_id: "k".into() };
++        crate::federation::edition2::door::with_earlier_form_doors_shut(async {
++            refuse_earlier_form_op(&read)
++        })
++        .await
++        .expect("I2486: a read is never refused");
++    }
++}
+diff --git a/src/server/edition2.rs b/src/server/edition2.rs
+new file mode 100644
+index 00000000..9ed56b69
+--- /dev/null
++++ b/src/server/edition2.rs
+@@ -0,0 +1,890 @@
++//! v62.0.0 (JSON-cut slice D, CC 2.6.1, 2.6.1.12) — the edition-2 HTTP
++//! surface: statement ingest, the serve listing, and the bundles in force.
++//!
++//! # Composition (opt-in, like the secrets routes)
++//!
++//! These routes are NOT part of [`super::router`]. A deployment merges them
++//! explicitly, so no existing deployment grows a write surface on upgrade:
++//!
++//! ```ignore
++//! let app = ciris_persist::server::router(app_state)
++//!     .merge(ciris_persist::server::edition2::router(edition2_state.clone()))
++//!     // Only behind the deployment's peer authentication: see below.
++//!     .merge(ciris_persist::server::edition2::serve_router(edition2_state));
++//! ```
++//!
++//! **The serve listing is OFF** (ruling, 2026-11-18): it must not serve
++//! without an audience filter, and the serving path
++//! (`edition2_statements_since`, which cut B's replication reads too)
++//! filters nothing yet. [`Edition2State::new`] leaves it off and its `GET`
++//! answers 403 `serve_listing_disabled`. TODO(json-cut): wire the route
++//! through the audience-filtered serving path once one exists, then drop
++//! [`Edition2State::serve_listing_unfiltered`].
++//!
++//! - [`router`]: `POST` [`STATEMENTS_PATH`] (ingest) and `GET`
++//!   [`BUNDLES_IN_FORCE_PATH`]. A statement is self-authenticating: the
++//!   edition-2 door verifies its composite signature against the held key
++//!   plane and runs every gate the JSON door ran, so the route needs no
++//!   request authentication of its own (the same posture as
++//!   `POST /api/v1/accord/events`, whose persister verifies). The bundles in
++//!   force are the genesis roster, which the trust-root route already
++//!   serves publicly.
++//! - [`serve_router`]: `GET` [`STATEMENTS_PATH`], every held statement in
++//!   admission order (OFF by default, above). It applies NO audience or
++//!   withholding filter (the store listing does not), so it is a separate
++//!   router a deployment would mount only behind its own peer
++//!   authentication.
++//!
++//! # Limits
++//!
++//! A request body is capped at [`MAX_STATEMENT_BODY_BYTES`] (413 above it,
++//! before the door runs); one statement per request; a page is at most the
++//! store's [`crate::federation::edition2::store::MAX_PAGE`].
++//!
++//! # Status codes
++//!
++//! - 200: admitted, unchanged, or (replicated) refused as a policy outcome;
++//! - 400: a malformed query (`row_id`, `after`);
++//! - 403: the serve listing while it is off (`serve_listing_disabled`);
++//! - 413: body over the cap;
++//! - 422: a terminal refusal, with its stable `kind` (and `plane` / `reason`
++//!   for `federation_malformed_row`, e.g. `earlier_form_object`);
++//! - 424: the signer's key record is not held (`federation_attester_key_unknown`,
++//!   retryable: re-offer after the key plane catches up);
++//! - 500: a storage failure (detail logged, not served).
++
++use std::sync::Arc;
++
++use axum::body::Bytes;
++use axum::extract::{DefaultBodyLimit, Query, State};
++use axum::http::StatusCode;
++use axum::response::{IntoResponse, Response};
++use axum::routing::{get, post};
++use axum::{Json, Router};
++use serde::{Deserialize, Serialize};
++
++use crate::federation::attestation_apply::AttestationRefusalReason;
++use crate::federation::edition2::ingest::{
++    apply_replicated_statement, put_statement, ReplicatedStatementOutcome, StatementOutcome,
++    INGEST_TIER,
++};
++use crate::federation::edition2::store::StatementCursor;
++use crate::federation::{Error, FederationDirectory};
++
++/// `POST`: ingest one statement; `GET`: the serve listing ([`serve_router`]).
++pub const STATEMENTS_PATH: &str = "/v1/edition2/statements";
++/// `GET`: the bundles in force (CC 2.6.1.11, 2.7.8).
++pub const BUNDLES_IN_FORCE_PATH: &str = "/v1/edition2/bundles-in-force";
++/// The largest request body the edition-2 routes read: one statement. A
++/// composite signature is under 4 KiB and a row's payload is CDE text, so
++/// 1 MiB is generous; larger bodies are 413 before the door runs.
++pub const MAX_STATEMENT_BODY_BYTES: usize = 1024 * 1024;
++/// The page size when `limit` is absent.
++pub const DEFAULT_PAGE: u32 = 100;
++
++/// State shared by the edition-2 handlers: the directory the door runs over.
++///
++/// `F` may be unsized, so an `Arc<dyn FederationDirectory>` composes too.
++pub struct Edition2State<F>
++where
++    F: FederationDirectory + ?Sized + 'static,
++{
++    /// The directory every route reads and writes.
++    pub directory: Arc<F>,
++    /// The serve listing answers only when this is `true`. It serves with NO
++    /// audience filter, so it is off by default ([`Self::new`]) and is turned
++    /// on only by a test until the filtered serving path exists.
++    pub serve_listing_unfiltered: bool,
++}
++
++impl<F> Edition2State<F>
++where
++    F: FederationDirectory + ?Sized + 'static,
++{
++    /// The state over `directory`, with the serve listing OFF.
++    #[must_use]
++    pub fn new(directory: Arc<F>) -> Self {
++        Self {
++            directory,
++            serve_listing_unfiltered: false,
++        }
++    }
++}
++
++// Manual `Clone`: only the `Arc` clones.
++impl<F> Clone for Edition2State<F>
++where
++    F: FederationDirectory + ?Sized + 'static,
++{
++    fn clone(&self) -> Self {
++        Self {
++            directory: self.directory.clone(),
++            serve_listing_unfiltered: self.serve_listing_unfiltered,
++        }
++    }
++}
++
++/// The ingest route and the bundles-in-force read. See the module docs.
++pub fn router<F>(state: Edition2State<F>) -> Router
++where
++    F: FederationDirectory + ?Sized + 'static,
++{
++    Router::new()
++        .route(STATEMENTS_PATH, post(post_statement::<F>))
++        .route(BUNDLES_IN_FORCE_PATH, get(get_bundles_in_force::<F>))
++        .layer(DefaultBodyLimit::max(MAX_STATEMENT_BODY_BYTES))
++        .with_state(state)
++}
++
++/// The serve listing: OFF unless [`Edition2State::serve_listing_unfiltered`]
++/// (403 `serve_listing_disabled`). It serves every held statement with no
++/// audience filter.
++pub fn serve_router<F>(state: Edition2State<F>) -> Router
++where
++    F: FederationDirectory + ?Sized + 'static,
++{
++    Router::new()
++        .route(STATEMENTS_PATH, get(get_statements_since::<F>))
++        .layer(DefaultBodyLimit::max(MAX_STATEMENT_BODY_BYTES))
++        .with_state(state)
++}
++
++// ── wire bodies ──────────────────────────────────────────────────────
++
++/// What the ingest route did with a statement (200).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct StatementResponse {
++    /// `admitted`, `unchanged`, or `refused` (replicated only).
++    pub outcome: String,
++    /// `key_plane`, `voice`, `row` or `pending` (a counted row short of its
++    /// count: held, waiting for its voices); absent when refused.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub plane: Option<String>,
++    /// The row id THIS node computed, lowercase hex; absent when refused.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub row_id: Option<String>,
++    /// Was the statement new here (PyO3's `new`); absent when refused.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub new: Option<bool>,
++    /// Why a replicated statement was refused (a policy outcome).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub reason: Option<AttestationRefusalReason>,
++}
++
++/// A failure body (400 / 422 / 424 / 500).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Edition2ErrorBody {
++    /// The stable error kind (`federation_malformed_row`, ...), or
++    /// `bad_request` for a malformed query.
++    pub kind: String,
++    /// The door, for `federation_malformed_row`.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub plane: Option<String>,
++    /// The stable reason token, for `federation_malformed_row`
++    /// (`earlier_form_object`, `row_id_mismatch`, ...).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub reason: Option<String>,
++    /// Human-readable detail (generic for a 500).
++    pub detail: String,
++    /// May a later re-offer succeed?
++    pub retryable: bool,
++}
++
++/// One served statement.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PagedStatement {
++    /// Its position ([`encode_cursor`]); pass the last one back as `after`.
++    pub cursor: String,
++    /// The statement's bytes as received (CC 2.6.1.2), lowercase hex.
++    pub statement: String,
++}
++
++/// A page of the serve listing (200).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct StatementPage {
++    /// The statements, in this node's admission order.
++    pub statements: Vec<PagedStatement>,
++    /// The cursor to resume after; `None` when the page is empty.
++    pub next: Option<String>,
++}
++
++/// One bundle in force: the shape PyO3's `bundles_in_force_json` serves
++/// (one entry per tip; two are a fork).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct BundleInForceJson {
++    /// The bundle's object id, lowercase hex.
++    pub object_id: String,
++    /// `version`.
++    pub version: u32,
++    /// `refs.prev`, lowercase hex, on a later bundle.
++    pub prev: Option<String>,
++    /// `asserted_at`, POSIX ms.
++    pub asserted_at: u64,
++    /// The accord's name.
++    pub family_key_id: String,
++    /// The roster's identity-refs, in `holders` order.
++    pub holders: Vec<String>,
++    /// The seats' identity-refs, in `serve_nodes` order.
++    pub serve_nodes: Vec<String>,
++    /// The identity-refs whose statements counted, sorted.
++    pub counted: Vec<String>,
++}
++
++impl From<&crate::federation::edition2::genesis::GenesisPlacement> for BundleInForceJson {
++    fn from(t: &crate::federation::edition2::genesis::GenesisPlacement) -> Self {
++        Self {
++            object_id: hex::encode(t.object_id),
++            version: t.version,
++            prev: t.prev.as_ref().map(hex::encode),
++            asserted_at: t.asserted_at,
++            family_key_id: t.family_key_id.clone(),
++            holders: t.holders.iter().map(|h| h.identity_ref.clone()).collect(),
++            serve_nodes: t.seats.iter().map(|x| x.identity_ref.clone()).collect(),
++            counted: t.counted.clone(),
++        }
++    }
++}
++
++/// The edition-2 trust-root body (CC 5.3.4): every named row of every valid
++/// held bundle, then every held voice of those bundles, in lineage order, as
++/// received, lowercase hex. Fed to `put_genesis_bundle` on a fresh node with
++/// the right anchor, it reproduces the lineage.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct TrustRootStatements {
++    /// The statements.
++    pub statements: Vec<String>,
++}
++
++// ── queries ──────────────────────────────────────────────────────────
++
++/// `POST` [`STATEMENTS_PATH`] query.
++#[derive(Debug, Default, Deserialize)]
++pub struct IngestQuery {
++    /// The row id a peer offers the statement as (64 hex). Present: the
++    /// replicated door ([`apply_replicated_statement`]); absent: the local
++    /// door ([`put_statement`]).
++    pub row_id: Option<String>,
++}
++
++/// `GET` [`STATEMENTS_PATH`] query.
++#[derive(Debug, Default, Deserialize)]
++pub struct SinceQuery {
++    /// Resume after this cursor ([`encode_cursor`]); absent: from the first.
++    pub after: Option<String>,
++    /// At most this many (default [`DEFAULT_PAGE`]; the store clamps).
++    pub limit: Option<u32>,
++}
++
++// ── cursor / digest text ─────────────────────────────────────────────
++
++/// A cursor as text: `"{admitted_us}:{statement_id hex}"` (the form PyO3's
++/// `edition2_statements_since` hands out).
++#[must_use]
++pub fn encode_cursor(c: &StatementCursor) -> String {
++    format!("{}:{}", c.admitted_us, hex::encode(c.statement_id))
++}
++
++/// The inverse of [`encode_cursor`]; `None` for anything else.
++#[must_use]
++pub fn parse_cursor(s: &str) -> Option<StatementCursor> {
++    let (us, id) = s.split_once(':')?;
++    Some(StatementCursor {
++        admitted_us: us.parse().ok()?,
++        statement_id: parse_digest(id)?,
++    })
++}
++
++/// 64 hex characters as 32 bytes; `None` for anything else.
++#[must_use]
++pub fn parse_digest(s: &str) -> Option<[u8; 32]> {
++    if s.len() != 64 {
++        return None;
++    }
++    let v = hex::decode(s).ok()?;
++    <[u8; 32]>::try_from(v.as_slice()).ok()
++}
++
++// ── handlers ─────────────────────────────────────────────────────────
++
++fn bad_request(detail: &str) -> Response {
++    (
++        StatusCode::BAD_REQUEST,
++        Json(Edition2ErrorBody {
++            kind: "bad_request".to_owned(),
++            plane: None,
++            reason: None,
++            detail: detail.to_owned(),
++            retryable: false,
++        }),
++    )
++        .into_response()
++}
++
++/// An [`Error`] as its status and typed body. A storage failure's detail is
++/// logged, not served.
++fn error_response(e: &Error) -> Response {
++    match e {
++        Error::Backend(_) | Error::Unsupported { .. } => {
++            tracing::warn!(kind = e.kind(), error = %e, "edition-2 route failed");
++            (
++                StatusCode::INTERNAL_SERVER_ERROR,
++                Json(Edition2ErrorBody {
++                    kind: e.kind().to_owned(),
++                    plane: None,
++                    reason: None,
++                    detail: "edition-2 store unavailable".to_owned(),
++                    retryable: true,
++                }),
++            )
++                .into_response()
++        }
++        Error::AttesterKeyUnknown { .. } => (
++            StatusCode::FAILED_DEPENDENCY,
++            Json(Edition2ErrorBody {
++                kind: e.kind().to_owned(),
++                plane: None,
++                reason: None,
++                detail: e.to_string(),
++                retryable: true,
++            }),
++        )
++            .into_response(),
++        Error::MalformedRow {
++            plane,
++            reason,
++            message,
++        } => (
++            StatusCode::UNPROCESSABLE_ENTITY,
++            Json(Edition2ErrorBody {
++                kind: e.kind().to_owned(),
++                plane: Some((*plane).to_owned()),
++                reason: Some((*reason).to_owned()),
++                detail: message.clone(),
++                retryable: false,
++            }),
++        )
++            .into_response(),
++        other => (
++            StatusCode::UNPROCESSABLE_ENTITY,
++            Json(Edition2ErrorBody {
++                kind: other.kind().to_owned(),
++                plane: None,
++                reason: None,
++                detail: other.to_string(),
++                retryable: false,
++            }),
++        )
++            .into_response(),
++    }
++}
++
++fn kept(outcome: &str, o: &StatementOutcome) -> StatementResponse {
++    let (plane, row_id) = match o {
++        StatementOutcome::KeyPlane { row_id, .. } => ("key_plane", row_id),
++        StatementOutcome::Voice { row_id, .. } => ("voice", row_id),
++        StatementOutcome::Row { row_id, .. } => ("row", row_id),
++        StatementOutcome::Pending { row_id, .. } => ("pending", row_id),
++    };
++    StatementResponse {
++        outcome: outcome.to_owned(),
++        plane: Some(plane.to_owned()),
++        row_id: Some(row_id.hex()),
++        new: Some(is_new(o)),
++        reason: None,
++    }
++}
++
++fn is_new(o: &StatementOutcome) -> bool {
++    match o {
++        StatementOutcome::KeyPlane { new, .. }
++        | StatementOutcome::Voice { new, .. }
++        | StatementOutcome::Row { new, .. }
++        | StatementOutcome::Pending { new, .. } => *new,
++    }
++}
++
++/// `POST` [`STATEMENTS_PATH`]: one `COSE_Sign1` statement as the body.
++async fn post_statement<F>(
++    State(state): State<Edition2State<F>>,
++    Query(q): Query<IngestQuery>,
++    body: Bytes,
++) -> Response
++where
++    F: FederationDirectory + ?Sized + 'static,
++{
++    let dir: &F = &state.directory;
++    match q.row_id.as_deref() {
++        Some(text) => {
++            let Some(offered) = parse_digest(text) else {
++                return bad_request("row_id: 64 hex characters");
++            };
++            match Box::pin(apply_replicated_statement(dir, &body, &offered)).await {
++                Ok(ReplicatedStatementOutcome::Admitted(o)) => {
++                    (StatusCode::OK, Json(kept("admitted", &o))).into_response()
++                }
++                Ok(ReplicatedStatementOutcome::Unchanged(o)) => {
++                    (StatusCode::OK, Json(kept("unchanged", &o))).into_response()
++                }
++                Ok(ReplicatedStatementOutcome::Refused { reason }) => (
++                    StatusCode::OK,
++                    Json(StatementResponse {
++                        outcome: "refused".to_owned(),
++                        plane: None,
++                        row_id: None,
++                        new: None,
++                        reason: Some(reason),
++                    }),
++                )
++                    .into_response(),
++                Err(e) => error_response(&e),
++            }
++        }
++        None => match Box::pin(put_statement(dir, &body, None, INGEST_TIER)).await {
++            Ok(o) => {
++                let outcome = if is_new(&o) { "admitted" } else { "unchanged" };
++                (StatusCode::OK, Json(kept(outcome, &o))).into_response()
++            }
++            Err(e) => error_response(&e),
++        },
++    }
++}
++
++/// `GET` [`STATEMENTS_PATH`]: a page of the serve listing.
++async fn get_statements_since<F>(
++    State(state): State<Edition2State<F>>,
++    Query(q): Query<SinceQuery>,
++) -> Response
++where
++    F: FederationDirectory + ?Sized + 'static,
++{
++    if !state.serve_listing_unfiltered {
++        return (
++            StatusCode::FORBIDDEN,
++            Json(Edition2ErrorBody {
++                kind: "serve_listing_disabled".to_owned(),
++                plane: None,
++                reason: None,
++                detail: "the edition-2 serve listing is off: it needs an audience filter"
++                    .to_owned(),
++                retryable: false,
++            }),
++        )
++            .into_response();
++    }
++    let cursor = match q.after.as_deref() {
++        None => None,
++        Some(text) => match parse_cursor(text) {
++            Some(c) => Some(c),
++            None => return bad_request("after: {admitted_us}:{64 hex}"),
++        },
++    };
++    let limit = q.limit.unwrap_or(DEFAULT_PAGE);
++    match state
++        .directory
++        .edition2_statements_since(cursor.as_ref(), limit)
++        .await
++    {
++        Ok(served) => {
++            let next = served.last().map(|s| encode_cursor(&s.cursor));
++            let statements = served
++                .into_iter()
++                .map(|s| PagedStatement {
++                    cursor: encode_cursor(&s.cursor),
++                    statement: hex::encode(&s.bytes),
++                })
++                .collect();
++            (StatusCode::OK, Json(StatementPage { statements, next })).into_response()
++        }
++        Err(e) => error_response(&e),
++    }
++}
++
++/// `GET` [`BUNDLES_IN_FORCE_PATH`].
++async fn get_bundles_in_force<F>(State(state): State<Edition2State<F>>) -> Response
++where
++    F: FederationDirectory + ?Sized + 'static,
++{
++    let dir: &F = &state.directory;
++    match Box::pin(crate::federation::edition2::genesis::bundles_in_force(dir)).await {
++        Ok(tips) => {
++            let body: Vec<BundleInForceJson> = tips.iter().map(BundleInForceJson::from).collect();
++            (StatusCode::OK, Json(body)).into_response()
++        }
++        Err(e) => error_response(&e),
++    }
++}
++
++/// v62.0.0 (JSON-cut slice D, CC 5.3.4) — the trust-root body once the
++/// earlier-form doors are shut: what
++/// [`crate::federation::edition2::genesis::genesis_statements`] reads (every
++/// named row, then every voice, of each valid held bundle, as received). A
++/// node that holds no bundle serves an empty set, honestly.
++///
++/// # Errors
++/// Directory read failures.
++pub(crate) async fn trust_root_statements<F>(dir: &F) -> Result<TrustRootStatements, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let held = Box::pin(crate::federation::edition2::genesis::genesis_statements(
++        dir,
++    ))
++    .await?;
++    Ok(TrustRootStatements {
++        statements: held.iter().map(hex::encode).collect(),
++    })
++}
++
++/// v62.0.0 (JSON-cut slice D) — the edition-2 routes' witnesses.
++///
++/// - **I2490 (local ingest).** `POST` a `key:record` → 200 `admitted`,
++///   `key_plane`, the row id this node computes; the same bytes again →
++///   `unchanged`.
++/// - **I2491 (an earlier-form object at the edition-2 route).** A JSON body
++///   → 422 `federation_malformed_row` / `earlier_form_object`, not retryable.
++/// - **I2492 (replicated ingest).** `?row_id=` the bytes do not name → 422
++///   `row_id_mismatch`; the computed id → `admitted`, then `unchanged`; a
++///   malformed `row_id` → 400.
++/// - **I2493 (the cap).** A body over [`MAX_STATEMENT_BODY_BYTES`] → 413.
++/// - **I2494 (the serve listing).** Paging by `after` with `limit=1` serves
++///   each held statement once, as received (hex), in strictly increasing
++///   positions, and `next` is null after the last; a malformed `after` →
++///   400; the listing is not on [`router`] (405, so a deployment that merges
++///   only `router` serves nothing).
++/// - **I2495 (bundles in force).** 200 `[]` with none held.
++/// - **I2497 (the serve listing is off by default).** [`Edition2State::new`]
++///   leaves it off: `GET` answers 403 `serve_listing_disabled`, serving
++///   nothing, until an audience filter exists.
++/// - **I2496 (the trust-root route follows the switch).** With the
++///   earlier-form doors forced shut, `GET /v1/trust-root/bundle` serves the
++///   edition-2 body (`{"statements": [...]}`), never the earlier-form
++///   bundle; with the switch off it serves the earlier-form body as before.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod tests {
++    use super::*;
++    use axum::body::Body;
++    use axum::http::Request;
++    use ciris_crypto::composite::CompositeSigningKey;
++    use ciris_verify_core::cde::{self, Value};
++    use ciris_verify_core::edition2::{cose_key, identity_ref, sign_row_statement, thumbprint};
++    use http_body_util::BodyExt;
++    use tower::ServiceExt;
++
++    use crate::federation::edition2::names::RowId;
++
++    fn key(n: u8) -> CompositeSigningKey {
++        CompositeSigningKey::from_seeds(&[n; 32], &[n.wrapping_add(100); 32])
++    }
++
++    fn iref(k: &CompositeSigningKey) -> String {
++        identity_ref(&thumbprint(k.public_key()))
++    }
++
++    fn map(mut m: Vec<(&str, Value)>) -> Value {
++        let t = |s: &str| Value::Text(s.into());
++        m.sort_by_key(|(k, _)| cde::encode(&t(k)));
++        Value::Map(m.into_iter().map(|(k, v)| (t(k), v)).collect())
++    }
++
++    /// A self-signed `key:record` of the key seeded `n` (signed before any
++    /// await: no signing key crosses one).
++    fn key_record(n: u8, at: u64) -> Vec<u8> {
++        let k = key(n);
++        let payload = map(vec![
++            ("key", cose_key(k.public_key())),
++            (
++                "identity_type",
++                Value::Array(vec![Value::Text("user".into())]),
++            ),
++            ("asserted_at", Value::Uint(at)),
++            ("author", Value::Text(iref(&k))),
++        ]);
++        sign_row_statement(
++            &k,
++            &iref(&k),
++            &iref(&k),
++            "scores",
++            "key:record",
++            &payload,
++            vec![],
++        )
++        .expect("sign a key:record")
++    }
++
++    fn rid_hex(statement: &[u8]) -> String {
++        RowId::of_statement(statement)
++            .expect("a row statement")
++            .hex()
++    }
++
++    async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
++        let resp = app.clone().oneshot(req).await.expect("infallible");
++        let status = resp.status();
++        let body = resp
++            .into_body()
++            .collect()
++            .await
++            .expect("body")
++            .to_bytes()
++            .to_vec();
++        (status, body)
++    }
++
++    fn post(uri: &str, body: Vec<u8>) -> Request<Body> {
++        Request::post(uri)
++            .header("Content-Type", "application/cose")
++            .body(Body::from(body))
++            .expect("request")
++    }
++
++    fn get(uri: &str) -> Request<Body> {
++        Request::get(uri).body(Body::empty()).expect("request")
++    }
++
++    /// I2490–I2495 over one migrated, EMPTY store.
++    async fn body(dir: Arc<dyn FederationDirectory>) {
++        let s1 = key_record(91, 1_000);
++        let s2 = key_record(92, 2_000);
++        let state = Edition2State::new(dir.clone());
++        let app = router(state.clone());
++        // I2497: off by default, refused by name.
++        let (st, b) = send(&serve_router(state.clone()), get(STATEMENTS_PATH)).await;
++        assert_eq!(st, StatusCode::FORBIDDEN, "I2497: the listing is off");
++        let e: Edition2ErrorBody = serde_json::from_slice(&b).expect("I2497: body");
++        assert_eq!(e.kind, "serve_listing_disabled", "I2497");
++        let serve = serve_router(Edition2State {
++            serve_listing_unfiltered: true,
++            ..state
++        });
++
++        // ── I2490 ──
++        for want in ["admitted", "unchanged"] {
++            let (st, b) = send(&app, post(STATEMENTS_PATH, s1.clone())).await;
++            assert_eq!(st, StatusCode::OK, "I2490: {}", String::from_utf8_lossy(&b));
++            let r: StatementResponse = serde_json::from_slice(&b).expect("I2490: body");
++            assert_eq!(r.outcome, want, "I2490");
++            assert_eq!(r.plane.as_deref(), Some("key_plane"), "I2490");
++            assert_eq!(r.row_id, Some(rid_hex(&s1)), "I2490: the node-computed id");
++            assert_eq!(r.new, Some(want == "admitted"), "I2490: new");
++        }
++
++        // ── I2491 ──
++        let json = br#"{"attestation":{"attestation_id":"a","attesting_key_id":"k"}}"#.to_vec();
++        let (st, b) = send(&app, post(STATEMENTS_PATH, json)).await;
++        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "I2491");
++        let e: Edition2ErrorBody = serde_json::from_slice(&b).expect("I2491: body");
++        assert_eq!(e.kind, "federation_malformed_row", "I2491");
++        assert_eq!(e.reason.as_deref(), Some("earlier_form_object"), "I2491");
++        assert!(!e.retryable, "I2491: terminal");
++
++        // ── I2492 ──
++        let wrong = format!("{STATEMENTS_PATH}?row_id={}", "5a".repeat(32));
++        let (st, b) = send(&app, post(&wrong, s2.clone())).await;
++        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "I2492");
++        let e: Edition2ErrorBody = serde_json::from_slice(&b).expect("I2492: body");
++        assert_eq!(e.reason.as_deref(), Some("row_id_mismatch"), "I2492");
++        let (st, _) = send(
++            &app,
++            post(&format!("{STATEMENTS_PATH}?row_id=xyz"), s2.clone()),
++        )
++        .await;
++        assert_eq!(st, StatusCode::BAD_REQUEST, "I2492: a malformed row_id");
++        let right = format!("{STATEMENTS_PATH}?row_id={}", rid_hex(&s2));
++        for want in ["admitted", "unchanged"] {
++            let (st, b) = send(&app, post(&right, s2.clone())).await;
++            assert_eq!(st, StatusCode::OK, "I2492: {}", String::from_utf8_lossy(&b));
++            let r: StatementResponse = serde_json::from_slice(&b).expect("I2492: body");
++            assert_eq!(r.outcome, want, "I2492: the replicated door");
++            assert_eq!(r.row_id, Some(rid_hex(&s2)), "I2492");
++        }
++
++        // ── I2493 ──
++        let (st, _) = send(
++            &app,
++            post(STATEMENTS_PATH, vec![0u8; MAX_STATEMENT_BODY_BYTES + 1]),
++        )
++        .await;
++        assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "I2493");
++
++        // ── I2494 ──
++        let (st, _) = send(&app, get(STATEMENTS_PATH)).await;
++        assert_eq!(
++            st,
++            StatusCode::METHOD_NOT_ALLOWED,
++            "I2494: the listing is not on the ingest router"
++        );
++        let mut served: Vec<PagedStatement> = Vec::new();
++        let mut after: Option<String> = None;
++        loop {
++            let uri = match &after {
++                None => format!("{STATEMENTS_PATH}?limit=1"),
++                Some(c) => format!("{STATEMENTS_PATH}?limit=1&after={c}"),
++            };
++            let (st, b) = send(&serve, get(&uri)).await;
++            assert_eq!(st, StatusCode::OK, "I2494: {}", String::from_utf8_lossy(&b));
++            let page: StatementPage = serde_json::from_slice(&b).expect("I2494: body");
++            assert!(page.statements.len() <= 1, "I2494: the limit");
++            if page.statements.is_empty() {
++                assert_eq!(page.next, None, "I2494: no next after the last");
++                break;
++            }
++            assert_eq!(
++                page.next,
++                page.statements.last().map(|s| s.cursor.clone()),
++                "I2494: next is the last served"
++            );
++            after = page.next.clone();
++            served.extend(page.statements);
++        }
++        let positions: Vec<StatementCursor> = served
++            .iter()
++            .map(|s| parse_cursor(&s.cursor).expect("I2494: a cursor round-trips"))
++            .collect();
++        assert!(
++            positions.windows(2).all(|w| w[0] < w[1]),
++            "I2494: strictly increasing positions"
++        );
++        for s in [&s1, &s2] {
++            assert_eq!(
++                served
++                    .iter()
++                    .filter(|x| x.statement == hex::encode(s))
++                    .count(),
++                1,
++                "I2494: each held statement once, as received"
++            );
++        }
++        let (st, _) = send(&serve, get(&format!("{STATEMENTS_PATH}?after=nope"))).await;
++        assert_eq!(st, StatusCode::BAD_REQUEST, "I2494: a malformed cursor");
++
++        // ── I2495 ──
++        let (st, b) = send(&app, get(BUNDLES_IN_FORCE_PATH)).await;
++        assert_eq!(st, StatusCode::OK, "I2495");
++        let tips: Vec<BundleInForceJson> = serde_json::from_slice(&b).expect("I2495: body");
++        assert!(tips.is_empty(), "I2495: none held");
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i2490_to_i2495_edition2_routes_sqlite() {
++        use crate::store::Backend as _;
++        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++            .await
++            .expect("open sqlite");
++        b.run_migrations().await.expect("migrate");
++        Box::pin(body(Arc::new(b))).await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i2490_to_i2495_edition2_routes_pg() {
++        use crate::store::Backend as _;
++        let Some(dsn) = crate::test_pg::empty_dsn() else {
++            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
++            return;
++        };
++        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++            .await
++            .expect("connect");
++        b.run_migrations().await.expect("migrate");
++        Box::pin(body(Arc::new(b))).await;
++    }
++
++    /// The trust-root route over `b`, under the forced switch and not.
++    async fn trust_root_follows_the_switch<F>(b: Arc<F>)
++    where
++        F: FederationDirectory + crate::store::Backend + 'static,
++    {
++        use crate::queue::{spawn_persister, DEFAULT_QUEUE_DEPTH};
++        use crate::scrub::NullScrubber;
++        use crate::verify::PythonJsonDumpsCanonicalizer;
++        use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner};
++        let tmp = tempfile::tempdir().expect("tempdir");
++        let journal = Arc::new(crate::journal::Journal::open(tmp.path().join("j.redb")).unwrap());
++        std::mem::forget(tmp); // the detached persister outlives this fn
++        let mut signer = Ed25519SoftwareSigner::new("i2496-signer");
++        signer.import_key(&[0xA6u8; 32]).expect("import_key");
++        let signer: Arc<dyn HardwareSigner> = Arc::new(signer);
++        let (handle, persister) = spawn_persister(
++            DEFAULT_QUEUE_DEPTH,
++            b.clone(),
++            Arc::new(PythonJsonDumpsCanonicalizer),
++            Arc::new(NullScrubber),
++            journal.clone(),
++            signer,
++            "i2496-signer".to_owned(),
++        );
++        std::mem::forget(persister);
++        let app = crate::server::router(crate::server::AppState {
++            handle,
++            journal,
++            directory: b,
++        });
++        let shut = crate::federation::edition2::door::with_earlier_form_doors_shut(send(
++            &app,
++            get(crate::server::TRUST_ROOT_BUNDLE_PATH),
++        ))
++        .await;
++        assert_eq!(shut.0, StatusCode::OK, "I2496");
++        let v: serde_json::Value = serde_json::from_slice(&shut.1).expect("I2496: body");
++        assert_eq!(
++            v,
++            serde_json::json!({ "statements": [] }),
++            "I2496: the edition-2 body, nothing held"
++        );
++        let (st, b) = send(&app, get(crate::server::TRUST_ROOT_BUNDLE_PATH)).await;
++        assert_eq!(st, StatusCode::OK, "I2496: switch off");
++        let v: serde_json::Value = serde_json::from_slice(&b).expect("I2496: body");
++        assert!(
++            v.get("bundle").is_some() && v.get("statements").is_none(),
++            "I2496: the earlier-form body while the switch is off: {v}"
++        );
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test]
++    async fn i2496_trust_root_route_follows_the_switch_sqlite() {
++        Box::pin(trust_root_follows_the_switch(Arc::new(
++            crate::store::test_backend::test_backend(),
++        )))
++        .await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i2496_trust_root_route_follows_the_switch_pg() {
++        use crate::store::Backend as _;
++        let Some(dsn) = crate::test_pg::empty_dsn() else {
++            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
++            return;
++        };
++        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++            .await
++            .expect("connect");
++        b.run_migrations().await.expect("migrate");
++        Box::pin(trust_root_follows_the_switch(Arc::new(b))).await;
++    }
++
++    /// The cursor text round-trips and refuses other text.
++    #[test]
++    fn i2494_cursor_text_round_trips() {
++        let c = StatementCursor {
++            admitted_us: 1_700_000_000_000_001,
++            statement_id: [0xab; 32],
++        };
++        assert_eq!(parse_cursor(&encode_cursor(&c)), Some(c));
++        let short = format!("1:{}", "ab".repeat(31));
++        let dotted = format!("1.{}", "ab".repeat(32));
++        for bad in [
++            "",
++            "1",
++            "1:",
++            ":ab",
++            "x:abab",
++            short.as_str(),
++            dotted.as_str(),
++        ] {
++            assert_eq!(parse_cursor(bad), None, "I2494: {bad:?}");
++        }
++    }
++}
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index ffa88a01..e06af7ef 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -16,7 +16,10 @@
+ //!   - `GET /health` — liveness + queue depth + journal pending count.
+ //!   - `GET /v1/trust-root/bundle` (alias `GET /v1/steward-key`) — the CC 5.3.4
+ //!     GenesisBundle with the `ciris-canonical` community row beside it
+-//!     (v50.0.0, CIRISPersist#926).
++//!     (v50.0.0, CIRISPersist#926). Once the earlier-form doors are shut
++//!     (v62.0.0), the edition-2 body: the held voices of the bundles in force.
++//!   - [`edition2::router`] / [`edition2::serve_router`] (v62.0.0, opt-in) —
++//!     edition-2 statement ingest, the serve listing, the bundles in force.
+ //!
+ //! Status codes (TRACE_WIRE_FORMAT.md §1, §12 + FSD §3.4 #5):
+ //!   - 200 — accepted (queued for persistence).
+@@ -38,6 +41,8 @@ use crate::journal::Journal;
+ use crate::queue::{IngestHandle, QueueError};
+ use crate::store::Backend;
+ 
++// v62.0.0 (JSON-cut slice D) — the edition-2 routes, an opt-in router.
++pub mod edition2;
+ pub mod pipeline;
+ #[cfg(feature = "secrets-server")]
+ pub mod secrets;
+@@ -156,10 +161,31 @@ pub const STEWARD_KEY_ALIAS_PATH: &str = "/v1/steward-key";
+ /// re-verifies against its own pins
+ /// ([`crate::federation::canonical_community::pin_trust_from_bundle_response`]).
+ /// A node that holds no row serves `community: null` — honest, not an error.
++///
++/// v62.0.0 (JSON-cut slice D, CC 5.3.4) — once the earlier-form doors are
++/// shut ([`crate::federation::edition2::door::earlier_form_doors_shut`]) the
++/// bundle/1 JSON is an earlier-form object this node no longer serves: the
++/// same paths serve the edition-2 body ([`edition2::TrustRootStatements`],
++/// the held voices of each bundle in force).
+ async fn get_trust_root_bundle<F>(State(state): State<AppState<F>>) -> Response
+ where
+     F: FederationDirectory + Backend + 'static,
+ {
++    if crate::federation::edition2::door::earlier_form_doors_shut() {
++        return match edition2::trust_root_statements(&*state.directory).await {
++            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
++            Err(e) => {
++                tracing::warn!(kind = e.kind(), error = %e, "trust-root statements route failed");
++                (
++                    StatusCode::INTERNAL_SERVER_ERROR,
++                    Json(TrustRootErrorResponse {
++                        detail: "trust-root bundle unavailable",
++                    }),
++                )
++                    .into_response()
++            }
++        };
++    }
+     match crate::federation::canonical_community::trust_root_bundle_response(
+         &*state.directory,
+         crate::federation::genesis::canonical_genesis_bundle(),

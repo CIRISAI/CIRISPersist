@@ -1,0 +1,45 @@
+diff --git a/FSD/v62_docs/RULINGS.md b/FSD/v62_docs/RULINGS.md
+index 31cb14f..5f8fa60 100644
+--- a/FSD/v62_docs/RULINGS.md
++++ b/FSD/v62_docs/RULINGS.md
+@@ -43,15 +43,34 @@ These are the decisions v62 is built to, with who made each. "Eric" is the proje
+   - A roster change is a later bundle at the holders' count: a strict majority of the predecessor's holders, plus each added holder and each re-committed holder.
+   - A recovery is a later bundle signed by the recovery key alone, changing only that seat.
+   - A holder rotates only with its own statement under its current key.
+-- **Halt.**
+-  - One row with ONE composite statement from a SINGLE accord holder; no count.
+-  - The signer is judged against the holders of the bundle in force for `accord_root`.
+-  - With no bundle held, or an unknown kid, the halt WAITS. It is never refused while the roster is unknown.
+-  - `iss_not_holder` is refused.
+-  - The tokens are Verify's, as fixed in v23.3.0.
++- **Halt** (CC 4.2.1.1; Verify v23.3.0, tag ffd7af1).
++  - An invocation (`accord:invoke:{constitutional,notify,drill}:…`) is one row with ONE composite statement from a SINGLE accord holder; no count.
++  - The signer is judged against the holders of the bundle in force for the invocation's `accord_root`. That roster is also its whole key directory; the halt names no head.
++  - With no bundle held, or a kid the roster does not place, the halt WAITS. It is never refused while the roster is unknown.
++  - A signer that is not a holder is refused `iss_not_holder`.
++  - The reading and its tokens are Verify v23.3.0's `HaltReading`: `valid`; `waiting:{kid,bundle,kid+bundle}`; `refused:{token}`. Verify v23.2.0's `not_a_holder` reading is gone: a key the roster does not place reads `waiting:kid`.
++  - A valid constitutional invocation latches the accord's halt.
+ - **Lifecycle rows are counted,** with `refs {head, target}`.
+ - **Dedupe `invocation_id` and `nonce` within `valid_until`.** This is the store's duty; the token is `accord_invocation_replayed`.
+ 
++## The key of an issuer (CC 2.6.1.7, 2.4.1.1, 3.1.3; Verify v23.3.0 `KeyDirectory::key_of`; *next edition*)
++
++A statement names two keys: `iss`, the identity-ref of the signer's genesis key, and `kid`, the key that signed. The door asks whether `kid` is a key OF `iss` (the key-of-issuer check) after Verify's verdict. A key signs only for its own identity unless one of the rules below makes it a key of another. Otherwise the statement is refused `kid_not_of_iss`.
++
++- **The genesis key.** `kid` is a key of `iss` when it IS `iss`'s genesis key.
++- **A rotation chain.** `kid` is a key of `iss` when, for some held record of `kid`, all five hold:
++  1. the key's own statement over its `key:record` carries `iss`;
++  2. its `refs.target` names the predecessor key's record;
++  3. a valid statement by the predecessor key over the same row id carries the same `iss`, and the predecessor is itself a key of `iss`, recursively back to the genesis key;
++  4. the named record is a held record of the predecessor that covers the rotation's instant;
++  5. no rival rotation of the predecessor is held.
++
++  **A rival counts only as the rotation path would:** it is a rival only if it names the predecessor's valid record and that record covers the rival's own instant. A rotation that lacks the new key's own statement hands on nothing, so it is no rival either.
++- **The key the bundle in force seats.** A key that the genesis bundle in force places at a holder's seat is a key of that holder: a recovery replaces a holder's key with no rotation record. A seat binding verifies under the key the bundle places for that seat. With no bundle held, a key that signs as an accord holder's identity and that no chain reaches waits on the bundle.
++- **A missing link waits, never refuses**: the retryable `federation_attester_key_unknown`, naming the missing predecessor key or record.
++- **A record signed only by other keys** never makes its key a key of another identity. It may still make that key live to sign as itself.
++- **Where it applies:** every row and every counted voice, each genesis bundle voice (a voice counts only under a key of its `iss`), and each `key:revocation` (honoured only when its signer's key is of the identity whose standing is asked).
++
+ ## Families and payloads (*next edition* where marked)
+ 
+ - **Edition-2 payloads** for group:roster, membership, occurrence_revocation, cosign, revocation, takedown_notice, custody, key_grant and delivery_receipt carry the earlier record's members one to one as CDE, with no embedded signed object. The statements are the authority; a co-scrub is a counted voice. Persist's `edition2::payloads` is the source the CDDL will be written from. *next edition*

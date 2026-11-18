@@ -1,0 +1,881 @@
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index 35475526..65c84ea8 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -1713,7 +1713,54 @@ pub fn check_namespace_family_registered(namespace: &str) -> Result<(), Error> {
+     })
+ }
+ 
++/// v62.0.0 (P4, CC rc20 3.4.7) — **where the emitter's standing for a
++/// reserved family comes from**, for [`DimensionAdmissionPolicy`].
++///
++/// CC rc20 3.4.7: "No key declares itself into a duty. `identity_type` on a
++/// key record is the key's own statement about itself. No admission decision
++/// reads it to open a reserved family." An edition-2 `key:record` is
++/// self-signed and its `identity_type` vocabulary is open (Verify's
++/// `check_key_record` takes any sorted text set), so for a row carrying an
++/// edition-2 statement the type-keyed layers cannot decide standing.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum EmitterStanding {
++    /// The earlier form: the attester's `identity_type`, whose privileged
++    /// members were gated at the earlier-form key doors
++    /// (`check_privileged_identity_type_admission` and its siblings).
++    Declared,
++    /// Edition 2: standing is CONFERRED. The `accord:*` layer and every
++    /// reserved-prefix rule that names a delegation scope are not decided
++    /// here; [`check_reserved_prefix_admission`] decides them on the
++    /// conferral plane CC names (the genesis bundle in force for `accord:*`,
++    /// the scope's delegation from a root this node trusts for the rest).
++    Conferred,
++}
++
+ impl DimensionAdmissionPolicy {
++    /// v62.0.0 (P4, I3080) — [`Self::check`] for a row carrying an edition-2
++    /// statement ([`EmitterStanding::Conferred`]): every layer runs except
++    /// the ones that would read `attesting_identity_type` to open a reserved
++    /// family whose duty CC confers elsewhere. Those are re-asked, on their
++    /// conferral plane, by [`check_reserved_prefix_admission`] at tier 4 of
++    /// the same plan.
++    ///
++    /// # Errors
++    /// As [`Self::check`], less [`Error::AccordDimensionRequiresAccordHolder`]
++    /// and the scoped [`Error::ReservedPrefixEmitterMismatch`] arms.
++    pub fn check_conferred(
++        &self,
++        attn_type: &str,
++        dimension: Option<&str>,
++        attesting_identity_type: &str,
++    ) -> Result<(), Error> {
++        self.check_with(
++            attn_type,
++            dimension,
++            attesting_identity_type,
++            EmitterStanding::Conferred,
++        )
++    }
++
+     /// Run both layers (the `accord:*` × `accord_holder` rule and
+     /// the four-test gate) against an incoming attestation.
+     ///
+@@ -1738,6 +1785,23 @@ impl DimensionAdmissionPolicy {
+         attn_type: &str,
+         dimension: Option<&str>,
+         attesting_identity_type: &str,
++    ) -> Result<(), Error> {
++        self.check_with(
++            attn_type,
++            dimension,
++            attesting_identity_type,
++            EmitterStanding::Declared,
++        )
++    }
++
++    /// [`Self::check`] / [`Self::check_conferred`]: one body, the standing
++    /// source named.
++    fn check_with(
++        &self,
++        attn_type: &str,
++        dimension: Option<&str>,
++        attesting_identity_type: &str,
++        standing: EmitterStanding,
+     ) -> Result<(), Error> {
+         if attn_type != attestation_type::SCORES {
+             // v53.0.0 (CIRISPersist#975, CC 2.4 ask 3) — "the dimension gate
+@@ -1758,7 +1822,7 @@ impl DimensionAdmissionPolicy {
+             let Some(dim) = dimension.map(str::trim).filter(|d| !d.is_empty()) else {
+                 return Ok(());
+             };
+-            return match self.check_dimension(dim, attesting_identity_type) {
++            return match self.check_dimension(dim, attesting_identity_type, standing) {
+                 Ok(()) => Ok(()),
+                 Err(e) => match crate::federation::row_type::enforcement() {
+                     crate::federation::row_type::RowTypeEnforcement::Enforce => Err(e),
+@@ -1779,17 +1843,31 @@ impl DimensionAdmissionPolicy {
+                 reason: DimensionRejectionReason::EmptyOrMissingDimension.as_str(),
+             });
+         }
+-        self.check_dimension(dim, attesting_identity_type)
++        self.check_dimension(dim, attesting_identity_type, standing)
+     }
+ 
+     /// The dimension tests themselves, over a non-empty `dim` — shared by the
+     /// `scores` path and (CC 2.4 ask 3) a composer that carries a dimension.
+-    fn check_dimension(&self, dim: &str, attesting_identity_type: &str) -> Result<(), Error> {
++    fn check_dimension(
++        &self,
++        dim: &str,
++        attesting_identity_type: &str,
++        standing: EmitterStanding,
++    ) -> Result<(), Error> {
+         // Layer 1 — the `accord:*` × `accord_holder` constitutional
+         // rule. FSD-002 §4.1 + §7.1. Checked first because it
+         // produces a distinct error variant downstream consumers
+         // pattern-match on for the constitutional asymmetry case.
+-        if dim.starts_with("accord:") && attesting_identity_type != identity_type::ACCORD_HOLDER {
++        //
++        // v62.0.0 (P4, I3082) — under `EmitterStanding::Conferred` (an
++        // edition-2 row) this layer is not asked: the signer's `accord_holder`
++        // label is its own statement, and the standing is the genesis bundle
++        // in force for the row's `accord_root`, which
++        // `check_reserved_prefix_admission` reads (CC rc20 3.4.7, 3.4.1).
++        if standing == EmitterStanding::Declared
++            && dim.starts_with("accord:")
++            && attesting_identity_type != identity_type::ACCORD_HOLDER
++        {
+             return Err(Error::AccordDimensionRequiresAccordHolder {
+                 dimension: dim.to_string(),
+                 identity_type: attesting_identity_type.to_string(),
+@@ -1810,6 +1888,17 @@ impl DimensionAdmissionPolicy {
+         // operator owns.
+         for rule in &self.reserved_prefix_rules {
+             if dim.starts_with(rule.pattern_prefix.as_str()) {
++                // v62.0.0 (P4, I3080) — an edition-2 row's duty under a
++                // rule that names a delegation scope is CONFERRED (CC rc20
++                // 3.4.7: `infra:detect` for `detection:*`, ...), never read
++                // off the signer's own `identity_type`. The first matching
++                // rule governs, so stop here; tier 4's
++                // `check_reserved_prefix_admission` resolves the scope.
++                if standing == EmitterStanding::Conferred
++                    && rule.required_delegation_scope.is_some()
++                {
++                    break;
++                }
+                 // CC 3.4.7.1 — `identity_type` is a SET; the gate is
+                 // satisfied iff a required role is a MEMBER of the
+                 // attester's role-set (not scalar equality). For a
+@@ -19897,7 +19986,26 @@ pub async fn check_reserved_prefix_admission(
+     // `infra:attest:assurance` scope — not only the role layer 1b of
+     // `DimensionAdmissionPolicy::check` asks. No emitter in any repo writes the
+     // dimension shape yet, so nothing held is newly refused.
+-    let is_accord = at.starts_with("accord:");
++    //
++    // v62.0.0 (P4, I3080–I3082) — a row carrying an edition-2 statement is
++    // judged on the CONFERRAL plane (CC rc20 3.4.7: "No key declares itself
++    // into a duty"). Tier 2 ran `DimensionAdmissionPolicy::check_conferred`,
++    // which skips the type-keyed `accord:*` layer and every scoped
++    // reserved-prefix rule, so THIS function is where they are asked, for the
++    // dimension shape as well as the type slot:
++    // - `accord:*` in either slot → the signer is a holder of the genesis
++    //   bundle in force for the row's `accord_root`
++    //   (`edition2::standing::holds_accord_standing`);
++    // - a `scores` row's rule is matched on its DIMENSION, whatever it is
++    //   (the earlier form matched only the two assurance ladders there);
++    // - a rule naming a delegation scope is satisfied by the delegation from a
++    //   root this node trusts ALONE; the signer's `identity_type` is not read
++    //   for it.
++    let edition2 = super::edition2::standing::carries_statement(row);
++    let is_accord = at.starts_with("accord:")
++        || (edition2
++            && envelope_dimension(&row.attestation_envelope)
++                .is_some_and(|d| d.starts_with("accord:")));
+     // v61.1.0 (CIRISPersist#1174 item 2) — the `hard_case:` family in EITHER
+     // form. Persist's own hard_case door writes `scores` + `hard_case:{kind}:v1`
+     // (v57), so keying on the type slot alone left that form — the one
+@@ -19909,7 +20017,8 @@ pub async fn check_reserved_prefix_admission(
+         .then(|| envelope_dimension(&row.attestation_envelope))
+         .flatten()
+         .filter(|d| {
+-            d.starts_with("age_assurance:")
++            edition2
++                || d.starts_with("age_assurance:")
+                 || d.starts_with(crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX)
+         })
+         .unwrap_or(at);
+@@ -19928,11 +20037,38 @@ pub async fn check_reserved_prefix_admission(
+         .map(|k| k.identity_type)
+         .unwrap_or_default();
+ 
+-    if is_accord && got != identity_type::ACCORD_HOLDER {
+-        return Err(Error::AccordDimensionRequiresAccordHolder {
+-            dimension: at.to_owned(),
+-            identity_type: got,
+-        });
++    if is_accord {
++        let namespace = if at.starts_with("accord:") {
++            at.to_owned()
++        } else {
++            envelope_dimension(&row.attestation_envelope)
++                .unwrap_or(at)
++                .to_owned()
++        };
++        let holds = if edition2 {
++            // `check_accord_root_binding` above refused an unnamed or
++            // disagreeing root, so a Named root is the only arm left; any
++            // other reading confers nothing (fail closed).
++            match super::trust_root::accord_root_claim(row) {
++                super::trust_root::AccordRootClaim::Named { root_ref, .. } => {
++                    super::edition2::standing::holds_accord_standing(
++                        directory,
++                        &row.attesting_key_id,
++                        &root_ref,
++                    )
++                    .await?
++                }
++                _ => false,
++            }
++        } else {
++            got == identity_type::ACCORD_HOLDER
++        };
++        if !holds {
++            return Err(Error::AccordDimensionRequiresAccordHolder {
++                dimension: namespace,
++                identity_type: got,
++            });
++        }
+     }
+     if let Some(hard_case_family) = hard_case_family {
+         // v61.1.0 (CIRISPersist#1174) — set membership over the family's two
+@@ -20069,10 +20205,17 @@ pub async fn check_reserved_prefix_admission(
+                 });
+             }
+         }
+-        if !rule
+-            .required_identity_types
+-            .iter()
+-            .any(|t| identity_type::set_contains(&got, t))
++        // v62.0.0 (P4, I3080/I3081) — for an edition-2 row a scoped rule is
++        // decided by the delegation above ALONE: the type is the signer's own
++        // statement and "no admission decision reads it to open a reserved
++        // family" (CC rc20 3.4.7). A rule with no scope (the substrate
++        // self-report families) keeps its label test.
++        let conferred_only = edition2 && rule.required_delegation_scope.is_some();
++        if !conferred_only
++            && !rule
++                .required_identity_types
++                .iter()
++                .any(|t| identity_type::set_contains(&got, t))
+         {
+             let mut required = rule.required_identity_types.clone();
+             required.sort();
+diff --git a/src/federation/attestation_admit.rs b/src/federation/attestation_admit.rs
+index 9a72c73e..6c8c8934 100644
+--- a/src/federation/attestation_admit.rs
++++ b/src/federation/attestation_admit.rs
+@@ -883,33 +883,51 @@ where
+     // statement reads its signer's identity set from the signer's live
+     // edition-2 `key:record`, never from the earlier store's
+     // `federation_keys` (CC 2.6.1.12). The same gates follow.
+-    let attesting_identity_type = match crate::federation::edition2::ingest::carried_identity_type(
+-        dir.as_dyn_directory(),
+-        &row,
+-    )
+-    .await?
+-    {
+-        Some(t) => t,
+-        None => dir
+-            .attesting_identity_type(&row.attesting_key_id)
+-            .await?
+-            // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart from a
+-            // bad signature (retryable once the Key row lands).
+-            .ok_or_else(|| {
+-                crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation")
+-            })?,
+-    };
++    //
++    // v62.0.0 (P4, I3080/I3082) — and its standing for a reserved family is
++    // CONFERRED, not read off that set (CC rc20 3.4.7): the policy below runs
++    // `check_conferred` for such a row, and `check_reserved_prefix_admission`
++    // (tier 4) asks the conferral plane.
++    let (attesting_identity_type, standing) =
++        match crate::federation::edition2::ingest::carried_identity_type(
++            dir.as_dyn_directory(),
++            &row,
++        )
++        .await?
++        {
++            Some(t) => (t, crate::federation::admission::EmitterStanding::Conferred),
++            None => (
++                dir.attesting_identity_type(&row.attesting_key_id)
++                    .await?
++                    // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart from a
++                    // bad signature (retryable once the Key row lands).
++                    .ok_or_else(|| {
++                        crate::federation::Error::unknown_signer(
++                            &row.attesting_key_id,
++                            "attestation",
++                        )
++                    })?,
++                crate::federation::admission::EmitterStanding::Declared,
++            ),
++        };
+     // AV-76 D2 — the lookup above is a hard DATA dependency of the
+     // dimension policy here (`attesting_identity_type`); the pair moves
+     // as a unit and its internal order is fixed. The default policy
+     // enforces the `accord:*` × `accord_holder` rule and the four-test
+     // operational-language gate on `scores` attestations; structural
+     // primitives are exempt. See `src/federation/admission.rs`.
+-    crate::federation::admission::DimensionAdmissionPolicy::default().check(
+-        &row.attestation_type,
+-        crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+-        &attesting_identity_type,
+-    )?;
++    {
++        let policy = crate::federation::admission::DimensionAdmissionPolicy::default();
++        let dim = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
++        match standing {
++            crate::federation::admission::EmitterStanding::Conferred => {
++                policy.check_conferred(&row.attestation_type, dim, &attesting_identity_type)?;
++            }
++            crate::federation::admission::EmitterStanding::Declared => {
++                policy.check(&row.attestation_type, dim, &attesting_identity_type)?;
++            }
++        }
++    }
+ 
+     // v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a `revoked`
+     // consent_record at local tier MAY *transit* the local write path
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 96060d48..10b9a44c 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -39,6 +39,7 @@ pub mod names;
+ pub mod payloads;
+ pub mod produce;
+ pub mod projection;
++pub mod standing;
+ pub mod store;
+ 
+ #[cfg(test)]
+@@ -67,6 +68,8 @@ mod payloads_invariants;
+ mod produce_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod projection_invariants;
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod standing_invariants;
+ #[cfg(test)]
+ mod verify_vectors_replay;
+ 
+diff --git a/src/federation/edition2/standing.rs b/src/federation/edition2/standing.rs
+new file mode 100644
+index 00000000..37d97170
+--- /dev/null
++++ b/src/federation/edition2/standing.rs
+@@ -0,0 +1,77 @@
++//! v62.0.0 (P4, CC rc20 3.4.7 / 3.4.7.1) — **standing is conferred, never
++//! declared.**
++//!
++//! An edition-2 key becomes live through its OWN self-signed `key:record`, and
++//! that record's `identity_type` is an open vocabulary (Verify's
++//! `check_key_record` admits any sorted, non-empty text set). So the set is the
++//! key's statement about itself, and CC rc20 3.4.7 rules: "No key declares
++//! itself into a duty. `identity_type` on a key record is the key's own
++//! statement about itself. No admission decision reads it to open a reserved
++//! family." 3.4.7.1: "A conferral is not a label."
++//!
++//! Where CC names the conferral, persist reads it there:
++//! - **accord-holder standing**: a holder of the genesis bundle in force for
++//!   the accord ([`holds_accord_standing`]; CC 3.4.1, CC 4.2.1);
++//! - **canonical standing**: a seat in `serve_nodes` of the bundle in force
++//!   (`genesis::is_canonical_by_bundle`, ruling C);
++//! - **a reserved duty** (`infra:detect` for `detection:*`, ...): the
++//!   `delegates_to` chain from a root this node trusts
++//!   (`trust_root::capability_roots_to_trusted_root`, CC 4.4.3.34's delegation
++//!   plane);
++//! - the halt: the holders the bundle in force places (`halt::HaltRoster`).
++//!
++//! The admission gates branch on [`carries_statement`]: a row carrying an
++//! edition-2 statement is judged on the conferral plane
++//! (`admission::EmitterStanding::Conferred`), an earlier-form row as before.
++
++use crate::federation::types::Attestation;
++use crate::federation::{Error, FederationDirectory};
++
++/// Does `row` carry an edition-2 statement (the envelope member
++/// [`super::ingest::STATEMENT_MEMBER`])? Tier 2 of the attestation plan
++/// (`ingest::verify_carried`) has already checked that such a row is exactly
++/// the projection of the statement it carries, so a peer cannot attach a
++/// statement to an earlier-form row to change which plane judges it.
++#[must_use]
++pub fn carries_statement(row: &Attestation) -> bool {
++    row.attestation_envelope
++        .get(super::ingest::STATEMENT_MEMBER)
++        .is_some()
++}
++
++/// Is `signer` (an identity-ref) a standing holder of the accord named
++/// `accord_root`, in `in_force`: the accord's name is `accord_root` and every
++/// tip of the bundle in force seats `signer` as a holder? Pure.
++///
++/// The identity-ref names the holder's genesis key and survives a rotation
++/// (CC 4.2.1); the door's key-of-issuer check (`kid_not_of_iss`) has already
++/// bound the signing key to `signer`.
++#[must_use]
++pub fn accord_standing_in(
++    in_force: &super::genesis::GenesisInForce,
++    signer: &str,
++    accord_root: &str,
++) -> bool {
++    in_force.family_key_id() == Some(accord_root)
++        && in_force.holders().iter().any(|h| h.identity_ref == signer)
++}
++
++/// v62.0.0 (P4, I3082) — **accord-holder standing, from the bundle in force.**
++/// `false` with no bundle held, on a genesis fork, for another accord, or for
++/// a signer the bundle does not seat. The signer's own `accord_holder` label is
++/// never read (CC rc20 3.4.7: "The accord's holders are fixed by the accord's
++/// charter, and no delegation confers that standing").
++///
++/// # Errors
++/// Directory read failures.
++pub async fn holds_accord_standing<F>(
++    dir: &F,
++    signer: &str,
++    accord_root: &str,
++) -> Result<bool, Error>
++where
++    F: FederationDirectory + ?Sized,
++{
++    let in_force = super::genesis::genesis_in_force(dir).await?;
++    Ok(accord_standing_in(&in_force, signer, accord_root))
++}
+diff --git a/src/federation/edition2/standing_invariants.rs b/src/federation/edition2/standing_invariants.rs
+new file mode 100644
+index 00000000..7379ab28
+--- /dev/null
++++ b/src/federation/edition2/standing_invariants.rs
+@@ -0,0 +1,430 @@
++//! v62.0.0 (P4, CC rc20 3.4.7 / 3.4.7.1) — **standing is conferred, never
++//! declared**: an edition-2 key's self-signed `key:record` may state any
++//! `identity_type` (Verify's `check_key_record` takes an open vocabulary), and
++//! no gate reads that statement to open a reserved family. On sqlite and
++//! postgres.
++//!
++//! - **I3080** — a live self-signed `key:record` declaring `lenscore_detector`
++//!   cannot emit a reserved `detection:*` row: the row is refused
++//!   `ReservedPrefixEmitterMismatch`, naming the `infra:detect` delegation from
++//!   a root this node trusts (the clause that decides, not the missing node
++//!   identity before it), and nothing is stored. The projection still carries
++//!   the label, so the refusal is not about the label's absence.
++//! - **I3081** — a properly conferred detector is admitted: an `agent` key
++//!   that declares NO `lenscore_detector` but holds `infra:detect` on a
++//!   `delegates_to` chain from a root this node trusts emits the same row.
++//!   (Uses E0's `fixture_switch` builders; see P4.md "assumed APIs".)
++//! - **I3082** — a live self-signed `key:record` declaring `accord_holder`
++//!   cannot emit an `accord:*` row: with no genesis bundle in force seating it,
++//!   the row is refused `AccordDimensionRequiresAccordHolder`, and nothing is
++//!   stored.
++//! - **I3083** — a self-declared `accord_holder` is not a halt signer: its
++//!   constitutional halt never reads Valid against the roster of the bundle in
++//!   force (its kid is not placed: it waits), and the accord's active halt is
++//!   not latched.
++//! - **I3084** — a holder the bundle in force places (conferred by the
++//!   accord's charter) IS a halt signer: its constitutional halt latches.
++//! - **I3085** (pure) — accord standing is read from the bundle in force:
++//!   nothing held seats nobody, whatever the signer states.
++
++use ciris_crypto::composite::CompositeSigningKey;
++use ciris_verify_core::cde::Value;
++use ciris_verify_core::edition2::sign_row_statement;
++
++use super::door_invariants::fixture::{iref, key, key_record, map};
++use super::halt::{put_invocation, HaltRoster, FAMILY_CONSTITUTIONAL};
++use super::ingest::{put_statement, INGEST_TIER};
++use super::names::RowId;
++use crate::federation::{Error, FederationDirectory};
++
++const ACCORD: &str = "humanity-accord";
++
++/// The node identity the detector runners set: a key this node is, holding no
++/// trust edge, so the delegation walk runs and finds nothing.
++fn node_key() -> CompositeSigningKey {
++    key(90)
++}
++
++/// A `detection:hash_chain_integrity:v1` score by `k` about itself.
++fn detection_row(k: &CompositeSigningKey, at: u64) -> Vec<u8> {
++    let payload = map(vec![
++        ("asserted_at", Value::Uint(at)),
++        ("author", Value::Text(iref(k))),
++        ("score", Value::Uint(750_000)),
++        ("confidence", Value::Uint(900_000)),
++        (
++            "dimension",
++            Value::Text("detection:hash_chain_integrity:v1".into()),
++        ),
++    ]);
++    sign_row_statement(
++        k,
++        &iref(k),
++        &iref(k),
++        "scores",
++        "detection:hash_chain_integrity",
++        &payload,
++        vec![],
++    )
++    .unwrap()
++}
++
++/// An `accord:human_dignity:v1` verdict by `k` about itself, naming
++/// [`ACCORD`] as its `accord_root` (so `check_accord_root_binding` passes and
++/// the standing clause is the one that decides).
++fn accord_row(k: &CompositeSigningKey, at: u64) -> Vec<u8> {
++    let payload = map(vec![
++        ("accord_root", Value::Text(ACCORD.into())),
++        ("asserted_at", Value::Uint(at)),
++        ("author", Value::Text(iref(k))),
++        ("score", Value::Uint(750_000)),
++        ("confidence", Value::Uint(900_000)),
++        ("dimension", Value::Text("accord:human_dignity:v1".into())),
++    ]);
++    sign_row_statement(
++        k,
++        &iref(k),
++        &iref(k),
++        "scores",
++        "accord:human_dignity",
++        &payload,
++        vec![],
++    )
++    .unwrap()
++}
++
++/// A constitutional halt by `k`.
++fn halt(k: &CompositeSigningKey, id: &str, nonce: u8, at: u64, until: u64) -> Vec<u8> {
++    let m = map(vec![
++        ("accord_root", Value::Text(ACCORD.into())),
++        ("asserted_at", Value::Uint(at)),
++        ("author", Value::Text(iref(k))),
++        ("invocation_id", Value::Text(id.into())),
++        ("nonce", Value::Bytes(vec![nonce; 32])),
++        ("valid_until", Value::Uint(until)),
++    ]);
++    sign_row_statement(
++        k,
++        &iref(k),
++        ACCORD,
++        "scores",
++        FAMILY_CONSTITUTIONAL,
++        &m,
++        vec![],
++    )
++    .unwrap()
++}
++
++async fn stored(d: &dyn FederationDirectory, statement: &[u8]) -> bool {
++    let id = RowId::of_statement(statement).expect("a row id").hex();
++    d.get_attestation(&id).await.unwrap().is_some()
++}
++
++/// I3080: the self-declared detector. The caller has set this node's identity
++/// to [`node_key`].
++pub(crate) async fn self_declared_detector_body(d: &dyn FederationDirectory) {
++    let det = key(80);
++    put_statement(
++        d,
++        &key_record(&det, &["lenscore_detector"], 0, None),
++        None,
++        INGEST_TIER,
++    )
++    .await
++    .expect("I3080: the detector's own record is live");
++    let projected = d
++        .lookup_public_key(&iref(&det))
++        .await
++        .unwrap()
++        .expect("I3080: the key is projected");
++    assert!(
++        projected.claims_role(crate::federation::types::identity_type::LENSCORE_DETECTOR),
++        "I3080: the label is present ({}), so the refusal below is not about its absence",
++        projected.identity_type
++    );
++    let row = detection_row(&det, 5_000);
++    let e = put_statement(d, &row, None, INGEST_TIER)
++        .await
++        .expect_err("I3080: a self-declared detector must not emit detection:*");
++    match &e {
++        Error::ReservedPrefixEmitterMismatch {
++            prefix, required, ..
++        } => {
++            assert!(
++                prefix.starts_with("detection:"),
++                "I3080: the detection rule decides; prefix {prefix}"
++            );
++            assert!(
++                required.iter().any(|r| r
++                    .contains(crate::federation::types::delegation_scope::INFRA_DETECT)
++                    && r.contains("from a root this node trusts")),
++                "I3080: the refusal names the missing conferral, not the node identity: \
++                 {required:?}"
++            );
++        }
++        other => panic!("I3080: expected ReservedPrefixEmitterMismatch, got {other:?}"),
++    }
++    assert!(!stored(d, &row).await, "I3080: nothing stored");
++}
++
++/// I3081: the conferred detector (E0's builders). The caller has set this
++/// node's identity to `e2::kid("p4-node")`.
++pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
++    use super::fixture_switch as e2;
++    use crate::federation::trust_root::{
++        TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
++    };
++    use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
++    let lit = |from: &str, to: &str, at: &str, envelope: serde_json::Value| {
++        let now = crate::host::clock::now();
++        crate::federation::Attestation {
++            attestation_id: String::new(),
++            attesting_key_id: e2::kid(from),
++            attested_key_id: e2::kid(to),
++            attestation_type: at.to_owned(),
++            weight: Some(1.0),
++            asserted_at: now,
++            expires_at: None,
++            attestation_envelope: envelope,
++            original_content_hash: String::new(),
++            scrub_signature_classical: String::new(),
++            scrub_signature_pqc: None,
++            scrub_key_id: e2::kid(from),
++            scrub_timestamp: now,
++            pqc_completed_at: None,
++            persist_row_hash: String::new(),
++            subject_key_ids: Vec::new(),
++            withdraws_admission_rule: None,
++            cohort_scope: cohort_scope::FEDERATION.to_owned(),
++            tier: attestation_tier::FEDERATION.to_owned(),
++            promoted_at: None,
++            additional_scrubs: Vec::new(),
++        }
++    };
++    let (node, root, det) = ("p4-node", "p4-root", "p4-detector");
++    e2::put_key(d, node, &["node"]).await;
++    e2::put_key(d, root, &["node"]).await;
++    // The detector states only `agent`: the duty is the delegation's.
++    e2::put_key(d, det, &["agent"]).await;
++    // The root charters itself (a key root carries infra:serve AND
++    // infra:attest, and a pre-rotation commitment); this node accepts it; it
++    // confers infra:detect on the detector.
++    let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[
++        "p4-root-successor".to_owned(),
++    ])
++    .expect("commitment");
++    for (from, to, envelope) in [
++        (
++            root,
++            root,
++            serde_json::json!({
++                "dimension": TRUST_CHARTER_DIMENSION,
++                "scope": ["infra:serve", "infra:attest"],
++                "pre_rotation_commitment": commitment,
++            }),
++        ),
++        (
++            node,
++            root,
++            serde_json::json!({"dimension": TRUST_ACCEPTS_DIMENSION, "scope": ["infra:serve"]}),
++        ),
++        (
++            root,
++            det,
++            serde_json::json!({
++                "dimension": TRUST_CONFERS_DIMENSION,
++                "scope": [crate::federation::types::delegation_scope::INFRA_DETECT],
++            }),
++        ),
++    ] {
++        e2::try_put_row(
++            d,
++            &lit(from, to, attestation_type::DELEGATES_TO, envelope),
++            from,
++        )
++        .await
++        .unwrap_or_else(|e| panic!("I3081: the trust edge {from} -> {to} is admitted: {e:?}"));
++    }
++    let detection = lit(
++        det,
++        det,
++        attestation_type::SCORES,
++        serde_json::json!({
++            "dimension": "detection:hash_chain_integrity:v1",
++            "score": 0.75,
++            "confidence": 0.9,
++        }),
++    );
++    let stored_row = e2::try_put_row(d, &detection, det)
++        .await
++        .unwrap_or_else(|e| panic!("I3081: a conferred detector emits detection:*: {e:?}"));
++    assert!(
++        d.get_attestation(&e2::rid(&stored_row))
++            .await
++            .unwrap()
++            .is_some(),
++        "I3081: stored under its row id"
++    );
++}
++
++/// I3082: the self-declared accord holder on the attestation door.
++pub(crate) async fn self_declared_accord_holder_row_body(d: &dyn FederationDirectory) {
++    let pretender = key(82);
++    put_statement(
++        d,
++        &key_record(&pretender, &["accord_holder"], 0, None),
++        None,
++        INGEST_TIER,
++    )
++    .await
++    .expect("I3082: the pretender's own record is live");
++    let row = accord_row(&pretender, 5_000);
++    let e = put_statement(d, &row, None, INGEST_TIER)
++        .await
++        .expect_err("I3082: a self-declared accord holder must not emit accord:*");
++    assert!(
++        matches!(e, Error::AccordDimensionRequiresAccordHolder { .. }),
++        "I3082: expected AccordDimensionRequiresAccordHolder, got {e:?}"
++    );
++    assert!(!stored(d, &row).await, "I3082: nothing stored");
++}
++
++/// I3083 + I3084: the halt door judges the signer against the bundle in force,
++/// never its label.
++pub(crate) async fn halt_signer_body(d: &dyn FederationDirectory) {
++    let holder = key(83);
++    let pretender = key(84);
++    for k in [&holder, &pretender] {
++        put_statement(
++            d,
++            &key_record(k, &["accord_holder"], 0, None),
++            None,
++            INGEST_TIER,
++        )
++        .await
++        .expect("I3083: both records are live");
++    }
++    let projected = d
++        .lookup_public_key(&iref(&pretender))
++        .await
++        .unwrap()
++        .expect("I3083: the pretender is projected");
++    assert!(
++        projected.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER),
++        "I3083: the pretender states accord_holder ({})",
++        projected.identity_type
++    );
++    // The bundle in force places ONE holder.
++    let roster = HaltRoster::new(
++        ACCORD,
++        [0x5a; 32],
++        [(iref(&holder), holder.public_key().clone())],
++        None,
++    );
++    let e = put_invocation(
++        d,
++        &halt(&pretender, "p4-pretend", 0x41, 2_000_000, 3_000_000),
++        Some(&roster),
++    )
++    .await
++    .expect_err("I3083: a self-declared accord holder is not a halt signer");
++    assert_eq!(
++        e.kind(),
++        "federation_attester_key_unknown",
++        "I3083: a key the bundle does not place waits; it is never admitted"
++    );
++    assert!(
++        d.get_active_halt(ACCORD).await.unwrap().is_none(),
++        "I3083: no halt latched"
++    );
++    // I3084: the placed holder's halt latches.
++    let out = put_invocation(
++        d,
++        &halt(&holder, "p4-holder", 0x42, 2_000_000, 3_000_000),
++        Some(&roster),
++    )
++    .await
++    .expect("I3084: the placed holder's halt is admitted");
++    assert!(out.new && out.latched, "I3084: latched");
++    let active = d
++        .get_active_halt(ACCORD)
++        .await
++        .unwrap()
++        .expect("I3084: the active halt");
++    assert_eq!(
++        active.active_halt_id,
++        hex::encode(out.invocation.row_id),
++        "I3084: the holder's invocation is the active halt"
++    );
++}
++
++/// I3085: nothing held seats nobody.
++#[test]
++fn i3085_no_bundle_in_force_seats_no_accord_holder() {
++    let none = super::genesis::GenesisInForce::default();
++    assert!(
++        !super::standing::accord_standing_in(&none, &iref(&key(85)), ACCORD),
++        "I3085"
++    );
++}
++
++/// I3080–I3084, one backend.
++async fn all(d: &dyn FederationDirectory) {
++    self_declared_detector_body(d).await;
++    self_declared_accord_holder_row_body(d).await;
++    halt_signer_body(d).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3080_i3082_i3083_i3084_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    b.set_node_key_id(iref(&node_key()));
++    Box::pin(all(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3080_i3082_i3083_i3084_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    b.set_node_key_id(iref(&node_key()));
++    Box::pin(all(&b)).await;
++}
++
++#[cfg(feature = "sqlite")]
++#[tokio::test]
++async fn i3081_sqlite() {
++    use crate::store::Backend as _;
++    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    b.set_node_key_id(super::fixture_switch::kid("p4-node"));
++    Box::pin(conferred_detector_body(&b)).await;
++}
++
++#[cfg(feature = "postgres")]
++#[tokio::test]
++async fn i3081_postgres() {
++    use crate::store::Backend as _;
++    let Some(dsn) = crate::test_pg::empty_dsn() else {
++        return;
++    };
++    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++        .await
++        .unwrap();
++    b.run_migrations().await.unwrap();
++    b.set_node_key_id(super::fixture_switch::kid("p4-node"));
++    Box::pin(conferred_detector_body(&b)).await;
++}
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index 4db4606b..b0be018f 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -697,6 +697,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     ("caller_scope_from_directory", Class::Gate),
+     ("canonicalize_in_place", Class::Gate),
+     ("check", Class::Gate),
++    // v62.0.0 (P4) — the dimension policy for a row carrying an edition-2
++    // statement (`DimensionAdmissionPolicy::check_conferred`): a refusal of
++    // the caller's row, so a Gate like `check`.
++    ("check_conferred", Class::Gate),
+     ("check_admissible", Class::Gate),
+     ("check_admission_via_envelope", Class::Gate),
+     ("check_attested_subject_admission", Class::Gate),

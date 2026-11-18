@@ -1,0 +1,1411 @@
+diff --git a/src/federation/doors_takedown_invariants.rs b/src/federation/doors_takedown_invariants.rs
+index 65b1a4fc..dd09f5b7 100644
+--- a/src/federation/doors_takedown_invariants.rs
++++ b/src/federation/doors_takedown_invariants.rs
+@@ -61,8 +61,9 @@
+ //! - **I796** (memory, sqlite, postgres) — the content's community is the
+ //!   HELD binding's: with no row binding the content held here the takedown
+ //!   is `takedown_content_unbound` (retryable); bound under community Y, a
+-//!   moderator of X naming X in the notice is refused, and Y's moderator
+-//!   naming X is judged under Y and admitted.
++//!   moderator of X is refused, and Y's moderator is judged under Y and
++//!   admitted. (v62: a notice names no room at all; its member list is
++//!   closed.)
+ //! - **I797** (two nodes, sqlite and postgres; and from disk) — bytes a
+ //!   tombstone took down never come back: after the takedown, the same bytes
+ //!   re-pushed at either node through `put_blob_signing`,
+@@ -119,6 +120,17 @@
+ //!   peer's raw-pubkey `takedown_notice` Contribution is refused as retired
+ //!   on the local AND the replicated door, and nothing is recorded (v60.x
+ //!   applied it replicated, one release of compat).
++//!
++//! v62.0.0 (JSON cut, E12) — every fixture here is edition 2: a notice is
++//! the claimant's `takedown_notice:{basis}` STATEMENT (the family's closed
++//! member list, T2's writer), handed to the doors as the row it maps to
++//! (`notice_of`), whose carried statement the doors re-verify on their own
++//! key plane; claimants, subjects and producers are `e2` keys named by
++//! identity-ref; rooms are founded by their members' `group:roster` voices
++//! (T1); binding rows, delegations, withdraws and owner bindings are
++//! statements put through the one entry; occurrences are
++//! `identity:occurrence` binds (O1). The Engine witnesses run on two engines
++//! that state their own `key:record` (cut B).
+ //! - **I1517** (sqlite, postgres; v61, CIRISPersist#1160) — the CC 4.5.5
+ //!   duty gate resolves the signer to its identity first: a room's named
+ //!   moderator (a federation identity) takes content down through a live
+@@ -157,72 +169,142 @@
+ 
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ pub(crate) mod bodies {
++    use crate::federation::edition2::fixture_switch as e2;
++    use crate::federation::edition2::ingest::{StatementOutcome, INGEST_TIER};
++    use crate::federation::edition2::typed::{takedown_payload, NoticeText, TAKEDOWN_PREFIX};
++    use crate::federation::edition2::typed_fixtures::typed_statement;
+     use crate::federation::steward_purge::{self as sp, PurgePlane};
+     use crate::federation::takedown_tombstone::{
+         self as td, token, TakedownDisposition, TakedownNotice,
+     };
+     use crate::federation::tier_ingest::test_support as ts;
+-    use crate::federation::types::{attestation_type, Attestation, SignedAttestation};
++    use crate::federation::types::identity_type::{AGENT, NODE as NODE_TYPE, USER};
++    use crate::federation::types::{attestation_type, cohort_scope as cs};
+     use crate::federation::FederationDirectory;
+-
+-    /// A takedown claimant: a federation key id (lowercase, CC 2.3.2.1), whose
+-    /// deterministic hybrid key the test signer derives from the id.
+-    /// v60.0.0 (CIRISPersist#803, #854) — the notice is a row the claimant
+-    /// signs, so the claimant is a federation key, not a raw base64 pubkey.
++    use ciris_verify_core::cde::{self, Value};
++
++    /// A takedown claimant: an edition-2 identity-ref (CC 2.3.2.1).
++    ///
++    /// v62.0.0 (JSON cut, E12) — `id` is `e2::kid` of the claimant's seed
++    /// name; every fixture that signs takes the kid back to its seed through
++    /// `fixture_switch`'s map, so the struct keeps its one field (other
++    /// modules build `Claimant { id }` from a kid). The key is made live on a
++    /// directory by [`key_as`] (or a fixture that calls it), never here.
+     pub(crate) struct Claimant {
+         pub(crate) id: String,
+     }
+ 
+     pub(crate) fn claimant(seed: u8) -> Claimant {
+         Claimant {
+-            id: format!("td-claimant-{seed:02x}"),
++            id: e2::kid(&format!("td-claimant-{seed:02x}")),
+         }
+     }
+ 
+-    /// A `takedown_notice:{basis}:v1` ROW (CC 3.1.1 / CC 3.3.2), signed by
+-    /// the claimant: the CC 3.3.2 members at the envelope's top level,
+-    /// score `-1`, `claimant_key_id` = the signer, the notice's `expires_at`
+-    /// the row's. v60.0.0 (CIRISPersist#803).
+-    pub(crate) fn notice_at(
++    /// v62.0.0 (JSON cut, E12) — `k` (a seed, or a kid this process minted)
++    /// live on `dir` as an edition-2 key of `identity_type`, unless a key is
++    /// already live under its identity-ref (whatever its type: the first
++    /// registration stands). Returns the identity-ref.
++    pub(crate) async fn key_as(
++        dir: &dyn FederationDirectory,
++        k: &str,
++        identity_type: &str,
++    ) -> String {
++        let id = e2::kid(k);
++        if dir.lookup_public_key(&id).await.unwrap().is_none() {
++            e2::put_key(dir, k, &e2::identity_types_of(identity_type)).await;
++        }
++        id
++    }
++
++    /// `payload` (a CBOR map) with `key` set to `v`, in the deterministic
++    /// order (each key's encoding, CC 2.6.1.2).
++    fn with_member(payload: Value, key: &str, v: Value) -> Value {
++        let Value::Map(mut m) = payload else {
++            panic!("a statement payload is a map");
++        };
++        m.retain(|(k, _)| k.as_text() != Some(key));
++        m.push((Value::Text(key.to_owned()), v));
++        m.sort_by_key(|(k, _)| cde::encode(k));
++        Value::Map(m)
++    }
++
++    /// v62.0.0 (JSON cut, E12; CC 3.3.2, T2's `takedown_notice:{basis}`) —
++    /// the claimant's `takedown_notice:{basis}` STATEMENT over `sha_hex`:
++    /// the family's closed member list (`edition2::payloads`, P1e) through
++    /// T2's writer, `claimant` = `author` = the signer, at `-1`, its
++    /// `expires_at` and `asserted_at` at ms. `evidence` (64-hex digests)
++    /// rides as `evidence_refs`. The basis is not checked here: a basis
++    /// outside the closed set signs, and the door refuses it.
++    pub(crate) fn notice_statement(
+         c: &Claimant,
+         sha_hex: &str,
+         basis: &str,
+         asserted_at: chrono::DateTime<chrono::Utc>,
+         expires_at: chrono::DateTime<chrono::Utc>,
+-    ) -> TakedownNotice {
+-        notice_row_with(c, sha_hex, basis, asserted_at, expires_at, |_| {})
++        evidence: &[&str],
++    ) -> Vec<u8> {
++        let digest = |h: &str| -> [u8; 32] {
++            let mut d = [0u8; 32];
++            hex::decode_to_slice(h, &mut d).expect("a 64-hex digest");
++            d
++        };
++        let claimant = e2::kid(&c.id);
++        let text = NoticeText {
++            claim_text: "claim".to_owned(),
++            good_faith_statement: "good faith".to_owned(),
++            jurisdiction: "US".to_owned(),
++        };
++        let mut payload = takedown_payload(
++            basis,
++            &claimant,
++            &digest(sha_hex),
++            &[],
++            &text,
++            e2::ms(expires_at),
++            e2::ms(asserted_at),
++        )
++        .expect("the notice payload");
++        if !evidence.is_empty() {
++            payload = with_member(
++                payload,
++                "evidence_refs",
++                Value::Array(
++                    evidence
++                        .iter()
++                        .map(|h| ciris_verify_core::edition2::hash_digest_value(&digest(h)))
++                        .collect(),
++                ),
++            );
++        }
++        typed_statement(&c.id, None, &claimant, TAKEDOWN_PREFIX, &payload)
++    }
++
++    /// The notice the takedown doors take: the row a `takedown_notice`
++    /// statement maps to (`scores`, the envelope projected to the names
++    /// `notice_row_shape` reads, carrying the statement), serialized. The
++    /// doors re-verify the carried statement against their own key plane.
++    pub(crate) fn notice_of(statement: &[u8]) -> TakedownNotice {
++        TakedownNotice::of_row(&e2::row_of_statement(statement, INGEST_TIER))
++            .expect("a notice row serializes")
+     }
+ 
+-    /// [`notice_at`] with `edit` applied to the envelope BEFORE the seal.
+-    pub(crate) fn notice_row_with(
++    /// A `takedown_notice:{basis}:v1` notice (CC 3.1.1 / CC 3.3.2), signed by
++    /// the claimant, asserted at `asserted_at`, expiring at `expires_at`.
++    pub(crate) fn notice_at(
+         c: &Claimant,
+         sha_hex: &str,
+         basis: &str,
+         asserted_at: chrono::DateTime<chrono::Utc>,
+         expires_at: chrono::DateTime<chrono::Utc>,
+-        edit: impl FnOnce(&mut serde_json::Value),
+     ) -> TakedownNotice {
+-        let mut env = serde_json::json!({
+-            "dimension": td::notice_dimension(basis),
+-            "score": -1.0,
+-            "confidence": 1.0,
+-            "subject_kind": "takedown_notice",
+-            "content_sha256": sha_hex,
+-            "claimant_key_id": c.id,
+-            "legal_basis": basis,
+-            "jurisdiction": "US",
+-            "good_faith_statement": "good faith",
+-            "claim_text": "claim",
+-        });
+-        edit(&mut env);
+-        let mut row = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), &c.id, &c.id, &env);
+-        row.attestation_type = attestation_type::SCORES.into();
+-        row.weight = None;
+-        row.asserted_at = asserted_at;
+-        row.scrub_timestamp = asserted_at;
+-        row.expires_at = Some(expires_at);
+-        let row = ts::seal_row(&c.id, row);
+-        TakedownNotice::of_row(&row).expect("a notice row serializes")
++        notice_of(&notice_statement(
++            c,
++            sha_hex,
++            basis,
++            asserted_at,
++            expires_at,
++            &[],
++        ))
+     }
+ 
+     pub(crate) fn notice(c: &Claimant, sha_hex: &str, basis: &str) -> TakedownNotice {
+@@ -230,20 +312,6 @@ pub(crate) mod bodies {
+         notice_at(c, sha_hex, basis, t, t + chrono::Duration::days(30))
+     }
+ 
+-    /// [`notice`] whose envelope NAMES `community` (a claim the door never
+-    /// reads), sealed with it.
+-    pub(crate) fn notice_naming(
+-        c: &Claimant,
+-        sha_hex: &str,
+-        basis: &str,
+-        community: &str,
+-    ) -> TakedownNotice {
+-        let t = chrono::Utc::now();
+-        notice_row_with(c, sha_hex, basis, t, t + chrono::Duration::days(30), |e| {
+-            e["community_id"] = serde_json::json!(community);
+-        })
+-    }
+-
+     /// A v59 peer's retired `takedown_notice` CONTRIBUTION (refused since v61),
+     /// shaped as `ContributionEnvelope` serialized and self-signed Ed25519 by
+     /// the raw key whose base64 pubkey is `author_id`, in the pre-v60 basis
+@@ -252,17 +320,6 @@ pub(crate) mod bodies {
+         seed: u8,
+         sha_hex: &str,
+         legacy_basis: &str,
+-    ) -> (TakedownNotice, String) {
+-        legacy_contribution_notice_with(seed, sha_hex, legacy_basis, |_| {})
+-    }
+-
+-    /// [`legacy_contribution_notice`] with `edit` applied to the payload
+-    /// BEFORE the self-signature.
+-    pub(crate) fn legacy_contribution_notice_with(
+-        seed: u8,
+-        sha_hex: &str,
+-        legacy_basis: &str,
+-        edit: impl FnOnce(&mut serde_json::Value),
+     ) -> (TakedownNotice, String) {
+         use base64::engine::general_purpose::STANDARD as B64;
+         use base64::Engine as _;
+@@ -290,19 +347,29 @@ pub(crate) mod bodies {
+             "signature": {"ed25519": "", "ml_dsa_65": null, "signed_at": ts_of(t)},
+             "submitted_at": ts_of(t),
+         });
+-        edit(&mut env["payload"]);
+         let canonical = crate::verify::canonical::canonicalize_envelope_for_signing(&env).unwrap();
+         env["signature"]["ed25519"] =
+             serde_json::json!(B64.encode(key.sign(&canonical).to_bytes()));
+         (TakedownNotice { envelope: env }, author)
+     }
+ 
++    /// v62.0.0 (JSON cut, E12) — a registered dimension for the content's
++    /// binding rows: `evidence:{suite}:{kind}:{cell}:{prefix}` (Verify
++    /// v23.3.0 `family_authorship.json`; the earlier fixtures'
++    /// `content:established:v1` is not registered, so no statement of it can
++    /// be signed). It is an open family: `evidence_refs` and the cohort
++    /// target ride as they did.
++    pub(crate) const BINDING_DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
++
+     // ── I1170 (binding) ───────────────────────────────────────────────────
+     /// v60.0.0 (#803) — a takedown notice ROW is about the content, never a
+     /// binding of it: a named moderator's admitted notice row, whose
+     /// `evidence_refs` name the digest and whose attested key is its signer,
+     /// adds no subject to the content's binding (`content_binding` skips the
+-    /// `takedown_notice:` family).
++    /// `takedown_notice:` family). v62.0.0 (E12): the notice is the
++    /// moderator's `takedown_notice:dmca512` statement, admitted at the
++    /// statement door (T2: it lands in `federation_attestations` through the
++    /// notice row's own gate).
+     pub(crate) async fn i1170_a_notice_row_never_binds_its_content<D>(d: &D)
+     where
+         D: FederationDirectory + Sync,
+@@ -321,25 +388,22 @@ pub(crate) mod bodies {
+             &binder.id,
+             &[],
+             &sha,
+-            crate::federation::types::cohort_scope::COMMUNITY,
++            cs::COMMUNITY,
+             Some(comm),
+             None,
+         )
+         .await
+         .expect("I1170: the binding row");
+         let t = chrono::Utc::now();
+-        let n = notice_row_with(
++        let st = notice_statement(
+             &moderator,
+             &sha,
+             "dmca512",
+             t,
+             t + chrono::Duration::days(1),
+-            |e| {
+-                e["evidence_refs"] = serde_json::json!([sha.clone()]);
+-            },
++            &[&sha],
+         );
+-        let row: Attestation = serde_json::from_value(n.envelope.clone()).unwrap();
+-        dir.put_attestation(SignedAttestation { attestation: row })
++        e2::put_statement(dir, &st)
+             .await
+             .expect("I1170: the named moderator's notice row is admitted");
+         let binding = td::content_binding(dir, &sha).await.unwrap().unwrap();
+@@ -352,26 +416,28 @@ pub(crate) mod bodies {
+     // ── I1171 ─────────────────────────────────────────────────────────────
+     /// v61 S2 (CIRISPersist#803 "remove in v61", #1160) — a v59 peer's
+     /// raw-pubkey `takedown_notice` Contribution is refused on BOTH doors,
+-    /// named as retired, even where its author moderates the content's room;
+-    /// nothing is recorded. (v60.x applied it on the replicated door.)
++    /// named as retired; nothing is recorded. (v60.x applied it on the
++    /// replicated door.) v62.0.0 (E12): the content is bound into a room; the
++    /// earlier arm that seated the raw-pubkey author as the room's moderator
++    /// is gone (a raw base64 pubkey is no edition-2 key, so it cannot be a
++    /// roster member), and the doors refuse the shape before any duty read.
+     pub(crate) async fn i1171_a_v59_peers_contribution_notice_is_refused<D>(d: &D)
+     where
+         D: FederationDirectory + Sync,
+     {
+         let dir = d.as_dyn_directory();
+         let sha = sha_of("i1171");
+-        let (n, author) = legacy_contribution_notice(0x6b, &sha, "dmca_512");
+-        // The legacy author moderates the room the content is bound into.
++        let (n, _author) = legacy_contribution_notice(0x6b, &sha, "dmca_512");
+         let comm = "i1171-comm";
+         let binder = claimant(0x6c);
+-        group_of(dir, comm, &[&author, &binder.id], None).await;
++        group_of(dir, comm, &[&binder.id], None).await;
+         bind_row(
+             dir,
+             &binder.id,
+             &binder.id,
+             &[],
+             &sha,
+-            crate::federation::types::cohort_scope::COMMUNITY,
++            cs::COMMUNITY,
+             Some(comm),
+             None,
+         )
+@@ -401,69 +467,77 @@ pub(crate) mod bodies {
+         );
+     }
+ 
++    /// `owner` binds `node` as its owner (`delegates_to` at the owner-binding
++    /// dimension): the owner's statement, then the node's own voice over it.
++    async fn bind_owner(dir: &dyn FederationDirectory, owner: &str, node: &str) {
++        use crate::federation::types::{delegation_scope as ds, owner_binding};
++        let mut row = ts::bare_attestation(
++            "",
++            owner,
++            node,
++            &serde_json::json!({
++                "id": uuid::Uuid::new_v4().to_string(),
++                "kind": "delegates_to",
++                "dimension": owner_binding::DIMENSION,
++                "delegation_purpose": owner_binding::PURPOSE,
++                "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
++            }),
++        );
++        row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
++        let row = ts::seal_row(owner, row);
++        e2::put_signed(dir, &row)
++            .await
++            .expect("the owner's binding of its node");
++        let voice = e2::voice_of(
++            &e2::carried_statement(&row).expect("the binding carries its statement"),
++            node,
++        );
++        e2::put_statement(dir, &voice)
++            .await
++            .expect("the node's voice on its owner binding");
++    }
++
+     // ── I1517 (#1160) ─────────────────────────────────────────────────────
+     /// v61 S2 (CIRISPersist#1160; CC 4.5.5) — the duty gate asks about the
+     /// signer's IDENTITY: a room's named moderator (a federation identity)
+     /// files a takedown notice through one of its live occurrence keys, and it
+-    /// is admitted. An unbound key with the same notice is not.
++    /// is admitted. An unbound key with the same notice is not. v62.0.0
++    /// (E12): the occurrence is an `identity:occurrence` bind (O1: the
++    /// device's own statement, then the moderator's).
+     pub(crate) async fn i1517_a_moderators_occurrence_files_the_takedown<D>(d: &D)
+     where
+         D: FederationDirectory + Sync,
+     {
++        use crate::federation::edition2::fixture_occurrence::{put_bind, BindOptions};
+         let dir = d.as_dyn_directory();
+         let (moderator, occurrence, stranger) = (claimant(0xa1), claimant(0xa2), claimant(0xa3));
+         let comm = "i1517-comm";
+         community_of(dir, comm, &moderator.id).await;
+         for k in [&occurrence.id, &stranger.id] {
+-            ts::register_hybrid_key_as(dir, k, k, crate::federation::types::identity_type::USER)
+-                .await;
+-        }
+-        let at = |secs: i64| {
+-            let t = chrono::Utc::now() - chrono::Duration::seconds(secs);
+-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
+-                .expect("ms instant")
+-        };
+-        // Both halves of the binding: the identity claims the device, and the
+-        // device agrees.
+-        for (signer, t) in [(&moderator.id, at(3)), (&occurrence.id, at(1))] {
+-            dir.put_identity_occurrence(
+-                ts::signed_content_only_occurrence(signer, &moderator.id, &occurrence.id, t).await,
+-            )
+-            .await
+-            .expect("I1517: the occurrence binding");
++            key_as(dir, k, USER).await;
+         }
++        // The identity binds the device; the device's own statement agrees.
++        put_bind(
++            dir,
++            &moderator.id,
++            &moderator.id,
++            &occurrence.id,
++            crate::federation::types::device_class::LAPTOP,
++            &BindOptions::default(),
++        )
++        .await
++        .expect("I1517: the occurrence binding");
+         let sha = sha_of("i1517");
+-        let now = chrono::Utc::now();
+-        let row = Attestation {
+-            attestation_id: uuid::Uuid::new_v4().to_string(),
+-            attesting_key_id: moderator.id.clone(),
+-            attested_key_id: moderator.id.clone(),
+-            attestation_type: attestation_type::SCORES.into(),
+-            weight: None,
+-            asserted_at: now,
+-            expires_at: None,
+-            attestation_envelope: serde_json::json!({
+-                "dimension": "content:established:v1",
+-                "evidence_refs": [sha],
+-                "community_id": comm,
+-            }),
+-            original_content_hash: String::new(),
+-            scrub_signature_classical: String::new(),
+-            scrub_signature_pqc: None,
+-            scrub_key_id: moderator.id.clone(),
+-            scrub_timestamp: now,
+-            pqc_completed_at: Some(now),
+-            persist_row_hash: String::new(),
+-            subject_key_ids: Vec::new(),
+-            withdraws_admission_rule: None,
+-            cohort_scope: crate::federation::types::cohort_scope::COMMUNITY.to_string(),
+-            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+-            promoted_at: None,
+-            additional_scrubs: Vec::new(),
+-        };
+-        dir.put_attestation(SignedAttestation {
+-            attestation: ts::seal_row(&moderator.id, row),
+-        })
++        bind_row(
++            dir,
++            &moderator.id,
++            &moderator.id,
++            &[],
++            &sha,
++            cs::COMMUNITY,
++            Some(comm),
++            None,
++        )
+         .await
+         .expect("I1517: the binding row in the moderator's room");
+         let e = td::takedown_tombstone(dir, &notice(&stranger, &sha, "dmca512"), NODE)
+@@ -474,8 +548,8 @@ pub(crate) mod bodies {
+         // holds no duty: a node has no agency, so it never acts as the
+         // moderator whose machine it is.
+         let node = claimant(0xa4);
+-        ts::register_hybrid_key(dir, &node.id).await;
+-        ts::put_owner_binding(dir, &moderator.id, &node.id).await;
++        key_as(dir, &node.id, NODE_TYPE).await;
++        bind_owner(dir, &moderator.id, &node.id).await;
+         assert_eq!(
+             crate::federation::admission::owner_of(dir, &node.id)
+                 .await
+@@ -496,31 +570,32 @@ pub(crate) mod bodies {
+ 
+     /// A community whose only member is `member`, its founder (a person, so
+     /// a steward-bound duty root: a named moderator).
++    ///
++    /// v62.0.0 (JSON cut, E12) — the room is founded by its members'
++    /// `group:roster` voices (T1); its id is `e2::kid(comm)` (keyless: the
++    /// room needs no key of its own), and `member` (a seed or a kid) is made
++    /// a live `user` key first unless it already is a key. A row that binds
++    /// content into the room names it by `e2::kid(comm)` ([`bind_row`] maps a
++    /// plain name itself).
+     pub(crate) async fn community_of(dir: &dyn FederationDirectory, comm: &str, member: &str) {
+         group_of(dir, comm, &[member], None).await
+     }
+ 
+     /// [`community_of`] with a `policy_blob` (an `affiliations` group). The
+-    /// first of `members` is the founder.
++    /// first of `members` is the founder and signs the record; every listed
++    /// member voices it.
+     async fn group_of(
+         dir: &dyn FederationDirectory,
+         comm: &str,
+         members: &[&str],
+         policy_blob: Option<serde_json::Value>,
+     ) {
+-        for k in std::iter::once(&comm).chain(members) {
+-            if dir.lookup_public_key(k).await.unwrap().is_none() {
+-                ts::register_hybrid_key_as(
+-                    dir,
+-                    k,
+-                    k,
+-                    crate::federation::types::identity_type::USER,
+-                )
+-                .await;
+-            }
++        for m in members {
++            key_as(dir, m, USER).await;
+         }
+-        dir.put_community(ts::sign_community(
+-            comm,
++        let now = chrono::Utc::now();
++        let signed = ts::sign_community(
++            members[0],
+             crate::federation::types::Community {
+                 prev_head_digest: String::new(),
+                 charter_digest: String::new(),
+@@ -531,24 +606,28 @@ pub(crate) mod bodies {
+                     .enumerate()
+                     .map(|(i, m)| crate::federation::types::CommunityMember {
+                         key_id: (*m).to_owned(),
+-                        joined_at: chrono::Utc::now(),
++                        joined_at: now,
+                         role: (i == 0)
+                             .then(|| crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
+                     })
+                     .collect(),
+-                founded_at: chrono::Utc::now(),
++                founded_at: now,
+                 consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                     .to_owned(),
+                 policy_blob,
+                 persist_row_hash: String::new(),
+             },
+-        ))
+-        .await
+-        .unwrap_or_else(|e| panic!("community {comm}: {e}"));
++        );
++        let out = e2::put_voices(dir, &e2::community_voices(&signed, 1, None, e2::ms(now)))
++            .await
++            .unwrap_or_else(|e| panic!("community {comm}: {e}"));
++        assert!(
++            matches!(out, StatementOutcome::Row { .. }),
++            "community {comm}: the founding roster lands: {out:?}"
++        );
+     }
+ 
+-    // ── I796 ──────────────────────────────────────────────────────────────
+-    /// The content's community is the HELD binding's, never the notice's.
++    // ── I1523 ─────────────────────────────────────────────────────────────
+     /// I1523: a chat row names its room by `community_key_id`, the canonical
+     /// cohort-target alias, beside a sealed-content pointer. The room's
+     /// founder and a key it delegates `takedown` to hold the duty over that
+@@ -567,51 +646,35 @@ pub(crate) mod bodies {
+         let (room, elsewhere) = ("i1523-room", "i1523-elsewhere");
+         group_of(dir, room, &[&founder.id, &author.id], None).await;
+         community_of(dir, elsewhere, &other.id).await;
+-        ts::register_hybrid_key(dir, &deputy.id).await;
++        key_as(dir, &deputy.id, AGENT).await;
+         delegate(dir, &founder.id, &deputy.id, &["takedown"]).await;
+ 
+-        let now = chrono::Utc::now();
+         let shas: Vec<String> = ["founder", "delegate"].map(sha_of).to_vec();
+         for sha in &shas {
+-            let row = Attestation {
+-                attestation_id: uuid::Uuid::new_v4().to_string(),
+-                attesting_key_id: author.id.clone(),
+-                attested_key_id: author.id.clone(),
+-                attestation_type: attestation_type::SCORES.into(),
+-                weight: None,
+-                asserted_at: now,
+-                expires_at: None,
+-                attestation_envelope: serde_json::json!({
++            let mut row = ts::bare_attestation(
++                "",
++                &author.id,
++                &author.id,
++                &serde_json::json!({
+                     "dimension": "chat:message:v1",
+                     "evidence_refs": [sha],
+-                    "community_key_id": room,
++                    "community_key_id": e2::kid(room),
+                     "content": {"sha256": sha, "tier": "community"},
+                     "content_type": "text/plain",
+                 }),
+-                original_content_hash: String::new(),
+-                scrub_signature_classical: String::new(),
+-                scrub_signature_pqc: None,
+-                scrub_key_id: author.id.clone(),
+-                scrub_timestamp: now,
+-                pqc_completed_at: Some(now),
+-                persist_row_hash: String::new(),
+-                subject_key_ids: vec![author.id.clone()],
+-                withdraws_admission_rule: None,
+-                cohort_scope: crate::federation::types::cohort_scope::COMMUNITY.to_string(),
+-                tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+-                promoted_at: None,
+-                additional_scrubs: Vec::new(),
+-            };
+-            dir.put_attestation(SignedAttestation {
+-                attestation: ts::seal_row(&author.id, row),
+-            })
+-            .await
+-            .expect("I1523: the chat row");
++            );
++            row.attestation_type = attestation_type::SCORES.into();
++            row.weight = None;
++            row.subject_key_ids = vec![author.id.clone()];
++            row.cohort_scope = cs::COMMUNITY.to_string();
++            e2::put_signed(dir, &ts::seal_row(&author.id, row))
++                .await
++                .expect("I1523: the chat row");
+         }
+ 
+         let binding = td::content_binding(dir, &shas[0]).await.unwrap().unwrap();
+         assert!(
+-            binding.communities.contains(room),
++            binding.communities.contains(&e2::kid(room)),
+             "I1523: the chat row binds its room: {binding:?}"
+         );
+         let e = td::takedown_tombstone(dir, &notice(&other, &shas[0], "dmca512"), NODE)
+@@ -628,6 +691,13 @@ pub(crate) mod bodies {
+         assert!(ok.tombstoned);
+     }
+ 
++    // ── I796 ──────────────────────────────────────────────────────────────
++    /// The content's community is the HELD binding's. v62.0.0 (E12): a
++    /// `takedown_notice` statement has a closed member list with no
++    /// community member (P1e), so a notice can no longer NAME a room at all;
++    /// the arm that named the other room is gone, and the rest stands: no
++    /// binding is retryable, X's moderator is refused over content bound
++    /// under Y, and Y's moderator is admitted.
+     pub(crate) async fn i796_the_contents_own_community_judges<D>(d: &D)
+     where
+         D: FederationDirectory + Sync,
+@@ -640,110 +710,72 @@ pub(crate) mod bodies {
+         let sha = sha_of("i796");
+ 
+         // Not bound here yet: retryable, nothing written.
+-        let e = td::takedown_tombstone(dir, &notice_naming(&mod_y, &sha, "dmca512", comm_y), NODE)
++        let e = td::takedown_tombstone(dir, &notice(&mod_y, &sha, "dmca512"), NODE)
+             .await
+             .expect_err("I796: no binding row held");
+         assert_eq!(e.kind(), token::CONTENT_UNBOUND, "I796: {e}");
+ 
+         // Bound under Y, by a row at community scope.
+-        let now = chrono::Utc::now();
+-        let row = Attestation {
+-            attestation_id: uuid::Uuid::new_v4().to_string(),
+-            attesting_key_id: mod_y.id.clone(),
+-            attested_key_id: mod_y.id.clone(),
+-            attestation_type: attestation_type::SCORES.into(),
+-            weight: None,
+-            asserted_at: now,
+-            expires_at: None,
+-            attestation_envelope: serde_json::json!({
+-                "dimension": "content:established:v1",
+-                "evidence_refs": [sha],
+-                "community_id": comm_y,
+-            }),
+-            original_content_hash: String::new(),
+-            scrub_signature_classical: String::new(),
+-            scrub_signature_pqc: None,
+-            scrub_key_id: mod_y.id.clone(),
+-            scrub_timestamp: now,
+-            pqc_completed_at: Some(now),
+-            persist_row_hash: String::new(),
+-            subject_key_ids: Vec::new(),
+-            withdraws_admission_rule: None,
+-            cohort_scope: crate::federation::types::cohort_scope::COMMUNITY.to_string(),
+-            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+-            promoted_at: None,
+-            additional_scrubs: Vec::new(),
+-        };
+-        dir.put_attestation(SignedAttestation {
+-            attestation: ts::seal_row(&mod_y.id, row),
+-        })
++        bind_row(
++            dir,
++            &mod_y.id,
++            &mod_y.id,
++            &[],
++            &sha,
++            cs::COMMUNITY,
++            Some(comm_y),
++            None,
++        )
+         .await
+         .expect("I796: the binding row under Y");
+ 
+-        // X's moderator names X: judged under Y, refused.
+-        let e = td::takedown_tombstone(dir, &notice_naming(&mod_x, &sha, "dmca512", comm_x), NODE)
++        // X's moderator: judged under Y, refused.
++        let e = td::takedown_tombstone(dir, &notice(&mod_x, &sha, "dmca512"), NODE)
+             .await
+             .expect_err("I796: X's moderator over Y's content");
+         assert_eq!(e.kind(), token::UNAUTHORISED, "I796: {e}");
+         assert_eq!(dir.purge_tombstoned("blob", &sha).await.unwrap(), None);
+-        // Y's moderator, whatever community the notice names, is Y's.
+-        let ok = td::takedown_tombstone(dir, &notice_naming(&mod_y, &sha, "dmca512", comm_x), NODE)
++        // Y's moderator is Y's.
++        let ok = td::takedown_tombstone(dir, &notice(&mod_y, &sha, "dmca512"), NODE)
+             .await
+             .expect("I796: Y's named moderator over Y's content");
+         assert!(ok.tombstoned);
+     }
+ 
+-    /// Register `subject` and make it the SIGNED subject of `sha_hex`: the
+-    /// content's establishing `scores` row (CC 4.5.5 subject_of), produced by
++    /// Make `subject` the SIGNED subject of `sha_hex`: the content's
++    /// establishing `scores` row (CC 4.5.5 subject_of), produced by
+     /// `producer`. Returns the row's id — a score over the content.
++    ///
++    /// v62.0.0 (JSON cut, E12) — the row is `producer`'s edition-2 statement
++    /// (dimension [`BINDING_DIMENSION`]); `producer` and `subject` (seeds or
++    /// kids) are made live `agent` keys unless they are keys already; the id
++    /// returned is the computed row id.
+     pub(crate) async fn establish(
+         dir: &dyn FederationDirectory,
+         producer: &str,
+         subject: &str,
+         sha_hex: &str,
+     ) -> String {
+-        for k in [producer, subject] {
+-            if dir.lookup_public_key(k).await.unwrap().is_none() {
+-                ts::register_hybrid_key(dir, k).await;
+-            }
+-        }
+-        let now = chrono::Utc::now();
+-        let id = uuid::Uuid::new_v4().to_string();
+-        let row = Attestation {
+-            attestation_id: id.clone(),
+-            attesting_key_id: producer.into(),
+-            attested_key_id: producer.into(),
+-            attestation_type: attestation_type::SCORES.into(),
+-            weight: None,
+-            asserted_at: now,
+-            expires_at: None,
+-            attestation_envelope: serde_json::json!({
+-                "dimension": "content:established:v1",
+-                "evidence_refs": [sha_hex],
+-            }),
+-            original_content_hash: String::new(),
+-            scrub_signature_classical: String::new(),
+-            scrub_signature_pqc: None,
+-            scrub_key_id: producer.into(),
+-            scrub_timestamp: now,
+-            pqc_completed_at: Some(now),
+-            persist_row_hash: String::new(),
+-            subject_key_ids: vec![subject.to_owned()],
+-            withdraws_admission_rule: None,
+-            cohort_scope: "federation".to_string(),
+-            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+-            promoted_at: None,
+-            additional_scrubs: Vec::new(),
+-        };
+-        let row = ts::seal_row(producer, row);
+-        dir.put_attestation(SignedAttestation { attestation: row })
+-            .await
+-            .expect("the establishing row");
+-        id
++        bind_row(
++            dir,
++            producer,
++            producer,
++            &[subject],
++            sha_hex,
++            cs::FEDERATION,
++            None,
++            None,
++        )
++        .await
++        .expect("the establishing row")
+     }
+ 
+     /// A content-binding `scores` row over `sha_hex` by `producer`, attested
+     /// to `attested`, with `subjects`, at `scope` naming `community`.
++    /// v62.0.0 (E12): every key is made live (`agent`) unless it is a key
++    /// already; the row is put through the statement door; the community is
++    /// named by its identity-ref (`e2::kid_or_keep`); the id returned is the
++    /// computed row id.
+     #[allow(clippy::too_many_arguments)]
+     async fn bind_row(
+         dir: &dyn FederationDirectory,
+@@ -756,47 +788,23 @@ pub(crate) mod bodies {
+         expires_at: Option<chrono::DateTime<chrono::Utc>>,
+     ) -> Result<String, crate::federation::Error> {
+         for k in [producer, attested].iter().chain(subjects) {
+-            if dir.lookup_public_key(k).await.unwrap().is_none() {
+-                ts::register_hybrid_key(dir, k).await;
+-            }
++            key_as(dir, k, AGENT).await;
+         }
+-        let now = chrono::Utc::now();
+-        let id = uuid::Uuid::new_v4().to_string();
+         let mut env = serde_json::json!({
+-            "dimension": "content:established:v1",
++            "dimension": BINDING_DIMENSION,
+             "evidence_refs": [sha_hex],
+         });
+         if let Some(c) = community {
+-            env["community_id"] = serde_json::json!(c);
++            env["community_id"] = serde_json::json!(e2::kid_or_keep(c));
+         }
+-        let row = Attestation {
+-            attestation_id: id.clone(),
+-            attesting_key_id: producer.into(),
+-            attested_key_id: attested.into(),
+-            attestation_type: attestation_type::SCORES.into(),
+-            weight: None,
+-            asserted_at: now,
+-            expires_at,
+-            attestation_envelope: env,
+-            original_content_hash: String::new(),
+-            scrub_signature_classical: String::new(),
+-            scrub_signature_pqc: None,
+-            scrub_key_id: producer.into(),
+-            scrub_timestamp: now,
+-            pqc_completed_at: Some(now),
+-            persist_row_hash: String::new(),
+-            subject_key_ids: subjects.iter().map(|s| (*s).to_owned()).collect(),
+-            withdraws_admission_rule: None,
+-            cohort_scope: scope.to_string(),
+-            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+-            promoted_at: None,
+-            additional_scrubs: Vec::new(),
+-        };
+-        dir.put_attestation(SignedAttestation {
+-            attestation: ts::seal_row(producer, row),
+-        })
+-        .await
+-        .map(|_| id)
++        let mut row = ts::bare_attestation("", producer, attested, &env);
++        row.attestation_type = attestation_type::SCORES.into();
++        row.weight = None;
++        row.expires_at = expires_at;
++        row.subject_key_ids = subjects.iter().map(|s| e2::kid_or_keep(s)).collect();
++        row.cohort_scope = scope.to_string();
++        let row = ts::seal_row(producer, row);
++        e2::put_signed(dir, &row).await.map(|_| e2::rid(&row))
+     }
+ 
+     // ── I772 ──────────────────────────────────────────────────────────────
+@@ -804,7 +812,6 @@ pub(crate) mod bodies {
+     where
+         D: FederationDirectory + Sync,
+     {
+-        use crate::federation::types::cohort_scope as cs;
+         let dir = d.as_dyn_directory();
+         let producer = "i772-producer";
+         let auth = |signer: String, sha: String| async move {
+@@ -844,16 +851,9 @@ pub(crate) mod bodies {
+             auth(old.id.clone(), sha.clone()).await.is_ok(),
+             "I772 precondition"
+         );
+-        let env = serde_json::json!({
+-            "references_attestation_id": r_old,
+-            "withdrawal_reason": "I772",
+-        });
+-        let mut w =
+-            ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), producer, producer, &env);
+-        w.attestation_type = attestation_type::WITHDRAWS.into();
+-        w.cohort_scope = "federation".into();
+-        ts::seal_row_in_place(producer, &mut w);
+-        dir.put_attestation(SignedAttestation { attestation: w })
++        // v62.0.0 (E12) — the attester's `withdraws` names the binding by its
++        // computed id (`refs.target`), through the statement door.
++        ts::put_retraction(dir, producer, producer, &r_old, attestation_type::WITHDRAWS)
+             .await
+             .expect("I772: the attester withdraws its binding");
+         assert!(
+@@ -966,8 +966,8 @@ pub(crate) mod bodies {
+         let dir = d.as_dyn_directory();
+         let owner = claimant(0x71);
+         let stranger = claimant(0x72);
+-        // A keyed stranger: its notice row verifies, and it holds no duty.
+-        ts::register_hybrid_key(dir, &stranger.id).await;
++        // A keyed stranger: its notice verifies, and it holds no duty.
++        key_as(dir, &stranger.id, AGENT).await;
+         let sha = sha_of("i786");
+         establish(dir, "i786-producer", &owner.id, &sha).await;
+         let unauth = |r: Result<td::TakedownReport, crate::federation::Error>, why: &str| {
+@@ -979,6 +979,8 @@ pub(crate) mod bodies {
+             td::takedown_tombstone(dir, &notice(&stranger, &sha, "dmca512"), NODE).await,
+             "a signer with no duty over the content",
+         );
++        // v62.0.0 (E12) — an edit to the mapped row after signing: the row is
++        // no longer the projection of the statement it carries.
+         let mut edited = notice(&owner, &sha, "dmca512");
+         edited.envelope["attestation_envelope"]["claim_text"] =
+             serde_json::json!("edited after signing");
+@@ -1002,10 +1004,24 @@ pub(crate) mod bodies {
+             .await,
+             "an expired notice",
+         );
+-        unauth(
+-            td::takedown_tombstone(dir, &notice(&owner, &sha, "not_a_basis"), NODE).await,
+-            "a basis outside the closed set",
++        // v62.0.0 (E12) — a basis outside the closed set is no admissible
++        // statement (the family's `{basis}` leaves are CC 3.3.2's eleven):
++        // it maps to no row, and the statement door refuses it.
++        let outside = notice_statement(
++            &owner,
++            &sha,
++            "not_a_basis",
++            t,
++            t + chrono::Duration::days(30),
++            &[],
++        );
++        assert!(
++            e2::try_row_of_statement(&outside, INGEST_TIER).is_err(),
++            "I786: a basis outside the closed set maps to no notice row"
+         );
++        e2::put_statement(dir, &outside)
++            .await
++            .expect_err("I786: a basis outside the closed set is refused at the door");
+         unauth(
+             td::takedown_tombstone(dir, &notice(&owner, &sha, sp::STEWARD_PURGE_BASIS), NODE).await,
+             "steward_purge is the trust root's cosigned purge, not a takedown",
+@@ -1137,23 +1153,29 @@ pub(crate) mod bodies {
+     }
+ 
+     /// A `delegates_to(granter → grantee)` bearing `scope`, really signed.
++    ///
++    /// v62.0.0 (JSON cut, E12) — the granter's `self:delegates_to` statement
++    /// through the statement door. The earlier form echoed the row's own
++    /// chosen id as `references_attestation_id`; an edition-2 row cannot name
++    /// its own (computed) id, so the label rides as an `id` member. Returns
++    /// the computed row id.
+     pub(crate) async fn delegate(
+         dir: &dyn FederationDirectory,
+         granter: &str,
+         grantee: &str,
+         scope: &[&str],
+     ) -> String {
+-        let id = uuid::Uuid::new_v4().to_string();
+-        let mut envelope = serde_json::json!({"references_attestation_id": id, "scope": scope});
++        let mut envelope = serde_json::json!({
++            "id": uuid::Uuid::new_v4().to_string(),
++            "scope": scope,
++        });
+         // v60.0.0 (#1048) — a duty edge carries a term (CC 2.4).
+         crate::federation::admission::with_test_term(&mut envelope, chrono::Utc::now());
+-        let mut row = ts::bare_attestation(&id, granter, grantee, &envelope);
++        let mut row = ts::bare_attestation("", granter, grantee, &envelope);
+         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+         ts::seal_row_in_place(granter, &mut row);
+-        dir.put_attestation(SignedAttestation { attestation: row })
+-            .await
+-            .expect("the delegation");
+-        id
++        e2::put_signed(dir, &row).await.expect("the delegation");
++        e2::rid(&row)
+     }
+ 
+     // ── I798 ──────────────────────────────────────────────────────────────
+@@ -1165,7 +1187,6 @@ pub(crate) mod bodies {
+     where
+         D: FederationDirectory + Sync,
+     {
+-        use crate::federation::types::identity_type::{AGENT, USER};
+         let dir = d.as_dyn_directory();
+         let (owner, delegate_ok, delegate_cr, machine, machine_delegate, nobody) = (
+             claimant(0x81),
+@@ -1183,7 +1204,7 @@ pub(crate) mod bodies {
+             (&machine_delegate, AGENT),
+             (&nobody, AGENT),
+         ] {
+-            ts::register_hybrid_key_as(dir, &c.id, &c.id, kind).await;
++            key_as(dir, &c.id, kind).await;
+         }
+         let sha = sha_of("i798");
+         establish(dir, "i798-producer", &owner.id, &sha).await;
+@@ -1225,21 +1246,20 @@ pub(crate) mod bodies {
+         // A missing principal never admits: content bound with no subject and
+         // no community has no duty-holder at all, not even its producer.
+         let sha3 = sha_of("i798-orphan");
+-        let now = chrono::Utc::now();
+-        let mut row = ts::bare_attestation(
+-            &uuid::Uuid::new_v4().to_string(),
++        bind_row(
++            dir,
+             "i798-producer",
+             "i798-producer",
+-            &serde_json::json!({"dimension": "content:established:v1", "evidence_refs": [sha3]}),
+-        );
+-        row.attestation_type = attestation_type::SCORES.to_owned();
+-        row.asserted_at = now;
+-        ts::seal_row_in_place("i798-producer", &mut row);
+-        dir.put_attestation(SignedAttestation { attestation: row })
+-            .await
+-            .expect("a binding row with no subject");
++            &[],
++            &sha3,
++            cs::FEDERATION,
++            None,
++            None,
++        )
++        .await
++        .expect("a binding row with no subject");
+         let producer = claimant(0x87);
+-        ts::register_hybrid_key_as(dir, &producer.id, &producer.id, USER).await;
++        key_as(dir, &producer.id, USER).await;
+         refused(
+             td::takedown_tombstone(dir, &notice(&producer, &sha3, "court_order"), NODE).await,
+             "no principal: no subject, no community",
+@@ -1314,7 +1334,9 @@ pub(crate) mod bodies {
+         };
+         // v60.0.0 (#803) — the notice is a row: on a receiver that does not
+         // hold its signer's key yet the refusal is that ordering gap,
+-        // retryable, never a verdict on the notice.
++        // retryable, never a verdict on the notice. v62.0.0 (E12): the
++        // carried statement waits on the signer's `key:record` (the edition-2
++        // door's `AttesterKeyUnknown`), which `takedown_terms` passes through.
+         let e = td::apply_replicated_takedown(b, &n, &bundle.record_ids, "receiver")
+             .await
+             .expect_err("I789: the receiver does not hold the signer's key yet");
+@@ -1323,7 +1345,7 @@ pub(crate) mod bodies {
+             "federation_attester_key_unknown",
+             "I789: retryable: {e}"
+         );
+-        ts::register_hybrid_key(b, &owner.id).await;
++        key_as(b, &owner.id, AGENT).await;
+         let e = td::apply_replicated_takedown(b, &n, &bundle.record_ids, "receiver")
+             .await
+             .expect_err("I789: the receiver holds no row binding the content");
+@@ -1450,7 +1472,8 @@ pub(crate) mod bodies {
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ pub(crate) mod engine_bodies {
+     use super::bodies::{claimant, establish, notice, notice_at};
+-    use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
++    use crate::federation::edition2::fixture_switch as e2;
++    use crate::federation::epoch_minter_invariants::bodies::Pick;
+     use crate::federation::steward_purge::{self as sp, test_clock};
+     use crate::federation::takedown_tombstone::TakedownDisposition;
+     use crate::federation::takedown_tombstone::{self as td, token};
+@@ -1459,6 +1482,55 @@ pub(crate) mod engine_bodies {
+     use crate::federation::FederationDirectory;
+     use crate::federation::{BlobBody, BlobError, BlobStorage, ChunkManifest, ChunkRef};
+     use sha2::Digest as _;
++    use std::sync::Arc;
++
++    /// v62.0.0 (JSON cut, E12) — the two engines these witnesses run on. Each
++    /// states its own `key:record` (cut B's `register_self_federation_key`:
++    /// the engine's key is its composite's identity-ref, `e2::kid(alias)`),
++    /// and each node's key is live on the other directory. The epoch-minter
++    /// ladder these bodies ran on before also seeded a room through the
++    /// earlier typed plane; no takedown witness reads it, so it is not built.
++    pub(crate) struct Pair<B> {
++        pub engine_a: crate::Engine,
++        pub engine_b: crate::Engine,
++        /// A's backend, and B's — typed, so one body runs on both stores.
++        pub ba: Arc<B>,
++        pub bb: Arc<B>,
++        pub node_a: String,
++        pub node_b: String,
++    }
++
++    pub(crate) async fn pair<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>) -> Pair<B>
++    where
++        B: BlobStorage + FederationDirectory + Sync,
++    {
++        let (alias_a, alias_b) = (format!("em-a-{run}"), format!("em-b-{run}"));
++        let engine_a = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_a), dsn_a)
++            .await
++            .unwrap();
++        let engine_b = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_b), dsn_b)
++            .await
++            .unwrap();
++        for e in [&engine_a, &engine_b] {
++            e.register_self_federation_key(USER, None, None)
++                .await
++                .expect("register the engine's own key");
++        }
++        let (ba, bb) = (pick(&engine_a), pick(&engine_b));
++        // Each node's key on the other (the earlier ladder's `introduce`).
++        e2::put_key(ba.as_ref(), &alias_b, &[USER]).await;
++        e2::put_key(bb.as_ref(), &alias_a, &[USER]).await;
++        let node_a = engine_a.local_derived_key_id().await.unwrap();
++        let node_b = engine_b.local_derived_key_id().await.unwrap();
++        Pair {
++            engine_a,
++            engine_b,
++            ba,
++            bb,
++            node_a,
++            node_b,
++        }
++    }
+ 
+     pub(crate) fn plaintext_manifest(segs: &[Vec<u8>]) -> ChunkManifest {
+         ChunkManifest {
+@@ -1487,8 +1559,8 @@ pub(crate) mod engine_bodies {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i780-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i780-author-{run}"));
+         for b in [l.ba.as_ref(), l.bb.as_ref()] {
+             ts::register_hybrid_key_as(b, &author, &author, USER).await;
+         }
+@@ -1651,8 +1723,8 @@ pub(crate) mod engine_bodies {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i1400-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i1400-author-{run}"));
+         ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+         let e = &l.engine_a;
+         let nothing_at = |sha: [u8; 32], why: &'static str| {
+@@ -1797,8 +1869,8 @@ pub(crate) mod engine_bodies {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i773-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i773-author-{run}"));
+         ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+         let owner = claimant(0x97);
+         let dir = l.ba.as_dyn_directory();
+@@ -1877,17 +1949,11 @@ pub(crate) mod engine_bodies {
+             .await
+             .unwrap();
+         engine
+-            .register_self_federation_key(
+-                crate::federation::types::identity_type::NODE,
+-                &alias,
+-                None,
+-                serde_json::json!({}),
+-                vec![],
+-            )
++            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
+             .await
+             .unwrap();
+         let b = pick(&engine);
+-        let stranger = format!("i774-stranger-{run}");
++        let stranger = e2::kid(&format!("i774-stranger-{run}"));
+         ts::register_hybrid_key_as(b.as_ref(), &stranger, &stranger, USER).await;
+         let cfg = std::sync::Arc::new(DiskPressureConfig {
+             monitor_path: std::path::PathBuf::from("/x"),
+@@ -1988,8 +2054,8 @@ pub(crate) mod engine_bodies {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i790-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i790-author-{run}"));
+         ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+         let owner = claimant(0x77);
+         let dir = l.ba.as_dyn_directory();
+@@ -2069,8 +2135,8 @@ pub(crate) mod engine_bodies {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i1402-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i1402-author-{run}"));
+         ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+         let owner = claimant(0x14);
+         let dir = l.ba.as_dyn_directory();
+@@ -2110,8 +2176,8 @@ pub(crate) mod engine_bodies {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i1403-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i1403-author-{run}"));
+         let owner = claimant(0x15);
+         let bytes = format!("i1403-{run}");
+         let late = format!("i1403-late-{run}");
+@@ -2243,8 +2309,8 @@ pub(crate) mod engine_bodies {
+             + Sync
+             + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i1404-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i1404-author-{run}"));
+         ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+         let owner = claimant(0x17);
+         let dir = l.ba.as_dyn_directory();
+@@ -2399,8 +2465,8 @@ pub(crate) mod engine_bodies {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i1408-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i1408-author-{run}"));
+         ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+         let owner = claimant(0x19);
+         let e = &l.engine_a;
+@@ -2457,8 +2523,8 @@ pub(crate) mod engine_bodies {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i1405-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i1405-author-{run}"));
+         ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+         let owner = claimant(0x16);
+         let dir = l.ba.as_dyn_directory();
+@@ -2529,8 +2595,8 @@ pub(crate) mod engine_bodies {
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+         use crate::federation::attestation_query::test_support::AllAttestations as _;
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i791-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i791-author-{run}"));
+         ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+         let dir = l.ba.as_dyn_directory();
+         let stranger_alias = format!("i791-stranger-{run}");
+@@ -2592,8 +2658,8 @@ pub(crate) mod engine_bodies {
+     ) where
+         B: BlobStorage + FederationDirectory + Sync + 'static,
+     {
+-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+-        let author = format!("i795-author-{run}");
++        let l = pair(dsn_a, dsn_b, run, pick).await;
++        let author = e2::kid(&format!("i795-author-{run}"));
+         let owner = claimant(0x78);
+         let bytes = format!("i795-{run}");
+         let mut sha = [0u8; 32];
+diff --git a/src/federation/room_takedown_invariants.rs b/src/federation/room_takedown_invariants.rs
+index a03dc428..e175d094 100644
+--- a/src/federation/room_takedown_invariants.rs
++++ b/src/federation/room_takedown_invariants.rs
+@@ -12,8 +12,8 @@
+ //!
+ //! - **I1746** (two nodes; sqlite and postgres) — the takedown delivered
+ //!   through the planes. A is the author's node (it holds the `self` row and
+-//!   the widening); B is a member's node and receives the widening through
+-//!   `apply_replicated_attestation`. On B the room's founder takes the
++//!   the widening); B is a member's node and receives the widening's
++//!   statement through its statement door (v62). On B the room's founder takes the
+ //!   message down and the founder's `takedown` deputy the file
+ //!   (`community_standards`); both tombstones apply and withhold, and the
+ //!   same notices apply on A. A plain member of the room and a founder of
+@@ -32,10 +32,20 @@
+ //!   not a widening to `federation` scope. `attestations_binding_content`
+ //!   (the bytes plane, `subject_of_content`) is unchanged: it returns no
+ //!   `supersedes` row.
++//!
++//! v62.0.0 (JSON cut, E12) — the rooms are founded by their members'
++//! `group:roster` voices (`make_group`, T1) and every key is an edition-2
++//! key named by identity-ref; a notice is the signer's `takedown_notice`
++//! statement (`doors_takedown_invariants::bodies::notice`); a row reaches the
++//! other node by its statement through the one entry (`e2::put_signed`, the
++//! door local and replicated rows share), never the JSON replicated door.
+ 
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ pub(crate) mod bodies {
+-    use crate::federation::doors_takedown_invariants::bodies::{delegate, notice, Claimant};
++    use crate::federation::doors_takedown_invariants::bodies::{
++        delegate, key_as, notice, Claimant,
++    };
++    use crate::federation::edition2::fixture_switch as e2;
+     use crate::federation::room_roster_authority_invariants::bodies::make_group;
+     use crate::federation::steward_purge::purge_withheld;
+     use crate::federation::takedown_reversal_invariants::bodies::{ruling, sha_bytes, sha_hex};
+@@ -154,11 +164,11 @@ pub(crate) mod bodies {
+         w
+     }
+ 
++    /// v62.0.0 (E12) — `row` delivered to `to`: its carried statement
++    /// through the receiver's statement door (one entry for local and
++    /// replicated rows), re-verified on the receiver's key plane.
+     async fn deliver(to: &dyn FederationDirectory, row: &Attestation) {
+-        let out = to
+-            .apply_replicated_attestation(SignedAttestation {
+-                attestation: row.clone(),
+-            })
++        let out = e2::put_signed(to, row)
+             .await
+             .unwrap_or_else(|e| panic!("delivery of {}: {e}", row.attestation_id));
+         assert!(
+@@ -203,19 +213,14 @@ pub(crate) mod bodies {
+         node_b: &str,
+         s: &str,
+     ) {
++        // v62.0.0 (E12) — each node key live on both directories, named by
++        // its identity-ref.
+         for d in [a, b] {
+             for n in [node_a, node_b] {
+-                if d.lookup_public_key(n).await.unwrap().is_none() {
+-                    ts::register_hybrid_key_as(
+-                        d,
+-                        n,
+-                        n,
+-                        crate::federation::types::identity_type::NODE,
+-                    )
+-                    .await;
+-                }
++                key_as(d, n, crate::federation::types::identity_type::NODE).await;
+             }
+         }
++        let (node_a, node_b) = (&e2::kid(node_a), &e2::kid(node_b));
+         let tag = format!("i1746-{s}");
+         let other_tag = format!("i1746x-{s}");
+         let mut room = String::new();
+@@ -355,28 +360,29 @@ pub(crate) mod bodies {
+             .notice_attestation_id
+             .clone()
+             .expect("a notice row");
+-        let e = b
+-            .put_attestation(SignedAttestation {
+-                attestation: ruling(
+-                    plain,
+-                    &notice_row,
+-                    "reversed",
+-                    cohort_scope::COMMUNITY,
+-                    &room,
+-                ),
+-            })
+-            .await
+-            .expect_err("I1746: a plain member does not rule");
++        let e = e2::put_signed(
++            b,
++            &ruling(
++                plain,
++                &notice_row,
++                "reversed",
++                cohort_scope::COMMUNITY,
++                &room,
++            ),
++        )
++        .await
++        .expect_err("I1746: a plain member does not rule");
+         assert_eq!(e.kind(), "federation_delegated_scope_unauthorized", "{e}");
+-        b.put_attestation(SignedAttestation {
+-            attestation: ruling(
++        e2::put_signed(
++            b,
++            &ruling(
+                 deputy,
+                 &notice_row,
+                 "reversed",
+                 cohort_scope::COMMUNITY,
+                 &room,
+             ),
+-        })
++        )
+         .await
+         .expect("I1746: the review deputy's reversal");
+         assert!(
+@@ -404,11 +410,9 @@ pub(crate) mod bodies {
+         // A withdrawn placement binds nothing: the author withdraws the third
+         // placement on A, and the withdraws reaches B.
+         let w = withdraws(author, &gone, &room);
+-        a.put_attestation(SignedAttestation {
+-            attestation: w.clone(),
+-        })
+-        .await
+-        .expect("I1746: the author withdraws the placement");
++        e2::put_signed(a, &w)
++            .await
++            .expect("I1746: the author withdraws the placement");
+         deliver(
+             b,
+             &a.get_attestation(&w.attestation_id).await.unwrap().unwrap(),
+@@ -441,19 +445,14 @@ pub(crate) mod bodies {
+         node_b: &str,
+         s: &str,
+     ) {
++        // v62.0.0 (E12) — each node key live on both directories, named by
++        // its identity-ref.
+         for d in [a, b] {
+             for n in [node_a, node_b] {
+-                if d.lookup_public_key(n).await.unwrap().is_none() {
+-                    ts::register_hybrid_key_as(
+-                        d,
+-                        n,
+-                        n,
+-                        crate::federation::types::identity_type::NODE,
+-                    )
+-                    .await;
+-                }
++                key_as(d, n, crate::federation::types::identity_type::NODE).await;
+             }
+         }
++        let (node_a, node_b) = (&e2::kid(node_a), &e2::kid(node_b));
+         let tag = format!("i1750-{s}");
+         let mut room = String::new();
+         let mut keys = Vec::new();

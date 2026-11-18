@@ -1,0 +1,601 @@
+diff --git a/src/federation/amendment_digest_invariants.rs b/src/federation/amendment_digest_invariants.rs
+new file mode 100644
+index 00000000..a7938eb7
+--- /dev/null
++++ b/src/federation/amendment_digest_invariants.rs
+@@ -0,0 +1,243 @@
++//! v62 (CC 3.1.5 rc21; CIRISServer#1365/#1366, CIRISServer 0.5.250) —
++//! **an identity amendment is the exact text the Wise Authority approved**,
++//! witnessed on every backend through every door a row enters by.
++//!
++//! - **I2931** — a `deferral:response:approved:v1` carrying `amendment_digest`
++//!   is admitted (no envelope-member gate refuses the member), at the direct
++//!   door and at the replicated door; an amendment whose `amendment_digest`
++//!   equals the approval's is admitted, at both doors.
++//! - **I2932** — an amendment whose `amendment_digest` differs from the
++//!   approval's is refused `amendment_digest_mismatch`
++//!   (`amendment_digest_differs_from_approved`), and nothing is stored.
++//! - **I2933** — an amendment citing an approval that carries no
++//!   `amendment_digest` (the earlier server's shape) is refused
++//!   `amendment_digest_mismatch` (`response_carries_no_amendment_digest`);
++//!   an approval whose digest is present but not hex64 is refused the same
++//!   token (`response_amendment_digest_not_hex64`).
++//! - **I2934** — the replicated door (`apply_replicated_attestation`) refuses
++//!   the differing and the absent cases with the same typed error: the gate
++//!   is in the write path every door shares, not in one door.
++//!
++//! The pure-function witness is I2930 (`identity_amendment::tests`).
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++pub(crate) mod bodies {
++    use crate::federation::identity_amendment as ia;
++    use crate::federation::tier_ingest::test_support as ts;
++    use crate::federation::types::{attestation_type, cohort_scope, Attestation};
++    use crate::federation::{Error, FederationDirectory, SignedAttestation};
++
++    /// The refused row is `amendment_digest_mismatch` with `reason`.
++    fn mismatch(e: Error, reason: &str, what: &str) {
++        let text = e.to_string();
++        assert!(
++            matches!(e, Error::InvalidArgument(_))
++                && text.contains(&format!("{}: {reason}", ia::AMENDMENT_DIGEST_MISMATCH)),
++            "{what}: expected {} ({reason}), got {text}",
++            ia::AMENDMENT_DIGEST_MISMATCH
++        );
++    }
++
++    /// **I2931–I2934** — see the module doc.
++    pub(crate) async fn i2931_the_amendment_is_the_text_the_wa_approved(
++        d: &dyn FederationDirectory,
++        tag: &str,
++    ) {
++        let owner = format!("i2931-owner-{tag}");
++        let agent = format!("i2931-agent-{tag}");
++        ts::register_user_role_key(d, &owner).await;
++        ts::register_hybrid_key(d, &agent).await;
++        ts::put_owner_binding(d, &owner, &agent).await;
++
++        let put = |r: Attestation| async move {
++            d.put_attestation(SignedAttestation { attestation: r })
++                .await
++                .map(|_| ())
++        };
++        let replicate = |r: Attestation| async move {
++            d.apply_replicated_attestation(SignedAttestation { attestation: r })
++                .await
++        };
++        let row = |by: &str, about: &str, dimension: &str, extra: serde_json::Value| {
++            let id = uuid::Uuid::new_v4().to_string();
++            let mut env = serde_json::json!({ "id": id, "dimension": dimension });
++            for (k, v) in extra.as_object().unwrap() {
++                env[k] = v.clone();
++            }
++            let mut r = ts::bare_attestation(&id, by, about, &env);
++            r.attestation_type = attestation_type::SCORES.to_owned();
++            r.cohort_scope = cohort_scope::SELF.to_owned();
++            if by == about {
++                r.subject_key_ids = vec![about.to_owned()];
++            }
++            ts::seal_row_in_place(by, &mut r);
++            r
++        };
++
++        let request = row(
++            &agent,
++            &agent,
++            ia::DEFERRAL_REQUEST_DIMENSION,
++            serde_json::json!({ "deferral_id": "d-1", "reason_digest": "ab".repeat(32) }),
++        );
++        let request_id = request.attestation_id.clone();
++        put(request).await.expect("I2931: the deferral request");
++
++        // The owner's approval; `digest` is what it names (None: no member).
++        let approval = |digest: Option<serde_json::Value>| {
++            let mut extra = serde_json::json!({ "references_attestation_id": request_id });
++            if let Some(value) = digest {
++                extra[ia::AMENDMENT_DIGEST_MEMBER] = value;
++            }
++            row(&owner, &agent, ia::DEFERRAL_APPROVED_DIMENSION, extra)
++        };
++        let amendment = |digest: &str, authorized_by: &str| {
++            row(
++                &agent,
++                &agent,
++                ia::IDENTITY_AMENDMENT_DIMENSION,
++                serde_json::json!({
++                    "amendment_digest": digest,
++                    "authorized_by": authorized_by,
++                    "evidence_refs": [authorized_by],
++                }),
++            )
++        };
++        let approved_text = "cd".repeat(32);
++        let other_text = "ef".repeat(32);
++
++        // I2931 — the approval carrying the member admits, at both doors.
++        let direct = approval(Some(serde_json::json!(approved_text)));
++        let direct_id = direct.attestation_id.clone();
++        put(direct)
++            .await
++            .unwrap_or_else(|e| panic!("I2931: an approval carrying amendment_digest admits: {e}"));
++        let wired = approval(Some(serde_json::json!(approved_text)));
++        let wired_id = wired.attestation_id.clone();
++        let outcome = replicate(wired).await.unwrap_or_else(|e| {
++            panic!("I2931: a replicated approval carrying amendment_digest admits: {e}")
++        });
++        assert!(
++            matches!(
++                outcome,
++                crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted
++            ),
++            "I2931: the replicated approval is inserted, got {outcome:?}"
++        );
++        for id in [&direct_id, &wired_id] {
++            let held = d.get_attestation(id).await.unwrap().expect("I2931: held");
++            assert_eq!(
++                held.attestation_envelope[ia::AMENDMENT_DIGEST_MEMBER],
++                serde_json::json!(approved_text),
++                "I2931: the member is stored as signed"
++            );
++        }
++
++        // I2932 — another text is refused, at the direct door; nothing stored.
++        let differs = amendment(&other_text, &direct_id);
++        let differs_id = differs.attestation_id.clone();
++        mismatch(
++            put(differs.clone()).await.unwrap_err(),
++            ia::digest_mismatch_reason::DIGESTS_DIFFER,
++            "I2932 (direct)",
++        );
++        assert!(d.get_attestation(&differs_id).await.unwrap().is_none());
++
++        // I2933 — an approval naming no text authorises none.
++        let silent = approval(None);
++        let silent_id = silent.attestation_id.clone();
++        put(silent)
++            .await
++            .expect("I2933: the earlier shape of approval still stores");
++        let unnamed = amendment(&approved_text, &silent_id);
++        let unnamed_id = unnamed.attestation_id.clone();
++        mismatch(
++            put(unnamed.clone()).await.unwrap_err(),
++            ia::digest_mismatch_reason::RESPONSE_NAMES_NO_TEXT,
++            "I2933 (direct, absent)",
++        );
++        assert!(d.get_attestation(&unnamed_id).await.unwrap().is_none());
++        // An ill-shaped digest on the (admitted) approval is the same token.
++        let ill = approval(Some(serde_json::json!(approved_text.to_uppercase())));
++        let ill_id = ill.attestation_id.clone();
++        put(ill)
++            .await
++            .expect("I2933: the approval is admitted; its digest is read by the gate");
++        mismatch(
++            put(amendment(&approved_text, &ill_id)).await.unwrap_err(),
++            ia::digest_mismatch_reason::RESPONSE_DIGEST_ILL_SHAPED,
++            "I2933 (direct, ill-shaped)",
++        );
++
++        // I2934 — the replicated door refuses both, with the same typed error.
++        mismatch(
++            replicate(differs).await.unwrap_err(),
++            ia::digest_mismatch_reason::DIGESTS_DIFFER,
++            "I2934 (replicated, differs)",
++        );
++        assert!(d.get_attestation(&differs_id).await.unwrap().is_none());
++        mismatch(
++            replicate(unnamed).await.unwrap_err(),
++            ia::digest_mismatch_reason::RESPONSE_NAMES_NO_TEXT,
++            "I2934 (replicated, absent)",
++        );
++        assert!(d.get_attestation(&unnamed_id).await.unwrap().is_none());
++
++        // I2931 — the approved text admits, at both doors.
++        let ok = amendment(&approved_text, &direct_id);
++        let ok_id = ok.attestation_id.clone();
++        put(ok)
++            .await
++            .unwrap_or_else(|e| panic!("I2931: the approved text admits: {e}"));
++        assert!(d.get_attestation(&ok_id).await.unwrap().is_some());
++        let ok_wired = amendment(&approved_text, &wired_id);
++        let ok_wired_id = ok_wired.attestation_id.clone();
++        let outcome = replicate(ok_wired)
++            .await
++            .unwrap_or_else(|e| panic!("I2931: the replicated approved text admits: {e}"));
++        assert!(
++            matches!(
++                outcome,
++                crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted
++            ),
++            "I2931: the replicated amendment is inserted, got {outcome:?}"
++        );
++        assert!(d.get_attestation(&ok_wired_id).await.unwrap().is_some());
++    }
++}
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod tests {
++    use super::bodies;
++
++    fn tag(n: &str) -> String {
++        format!("{n}{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i2931_sqlite() {
++        use crate::store::Backend as _;
++        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        bodies::i2931_the_amendment_is_the_text_the_wa_approved(&b, &tag("s")).await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i2931_postgres() {
++        use crate::store::Backend as _;
++        let Some(dsn) = crate::test_pg::empty_dsn() else {
++            eprintln!("I2931 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
++            return;
++        };
++        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        bodies::i2931_the_amendment_is_the_text_the_wa_approved(&b, &tag("p")).await;
++        eprintln!("i2931_postgres: RAN");
++    }
++}
+diff --git a/src/federation/family_rules.rs b/src/federation/family_rules.rs
+index 88f7e886..b5dbbb1d 100644
+--- a/src/federation/family_rules.rs
++++ b/src/federation/family_rules.rs
+@@ -216,6 +216,9 @@ pub struct PersistFamilyRule {
+ /// Ordered by gap kind then prefix, so the three populations read as the three
+ /// different asks they are.
+ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
++    // v62 (CC 3.1.5 rc21; CIRISServer#1365/#1366) — the rule gains the
++    // approved-text clause: the cited approval's `amendment_digest` must equal
++    // the amendment's.
+     // v60.1.0 (CIRISPersist#1120) — CC rc10 (`cadd5a9`, untagged) makes the
+     // rule normative and registers `identity_amendment:v1` with it; persist
+     // vendors rc9, which has no row, so the gate's rule is pinned here until
+@@ -229,7 +232,10 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
+                about the same agent, and its signer held a WA seat at its asserted_at (the \
+                agent node's owner, self to self; on a split home, whose owner binds only the \
+                node, the user the signing agent key is an occurrence of); \
+-               identity_amendment_unauthorized otherwise",
++               identity_amendment_unauthorized otherwise; and (CC 3.1.5 rc21) only when the \
++               cited response's amendment_digest equals the amendment's, the exact text the \
++               WA approved; amendment_digest_mismatch when the response carries none, an \
++               ill-shaped one, or another",
+         enforced_at: &["federation::identity_amendment::check_identity_amendment_admission"],
+         gap: RowRuleGap::NoRuleOnTheRow,
+         minted_by_persist: false,
+diff --git a/src/federation/identity_amendment.rs b/src/federation/identity_amendment.rs
+index 89454a6c..3ed5e6a5 100644
+--- a/src/federation/identity_amendment.rs
++++ b/src/federation/identity_amendment.rs
+@@ -12,6 +12,30 @@
+ //! agent, and its attester held a Wise Authority seat at the response's
+ //! `asserted_at`. Otherwise it is refused **`identity_amendment_unauthorized`**.
+ //!
++//! # The approved text (CC 3.1.5, rc21)
++//!
++//! An approval authorises ONE text, not "an amendment". CIRISServer 0.5.250
++//! (CIRISServer#1365/#1366, Eric's ruling) puts the `amendment_digest` of the
++//! text the Wise Authority approved into the WA-signed
++//! `deferral:response:approved:v1` row, and CC rc21 adds the clause: the
++//! amendment's `amendment_digest` must EQUAL the cited response's. Otherwise
++//! the amendment is refused **`amendment_digest_mismatch`** (its own token,
++//! [`AMENDMENT_DIGEST_MISMATCH`]), one token for every case, with the case in
++//! the message ([`digest_mismatch_reason`]):
++//!
++//! - the response carries no `amendment_digest` (an approval that names no
++//!   text authorises none — the earlier server's rows, too);
++//! - the response's `amendment_digest` is present but not 64 lowercase hex
++//!   digits. The response row is already admitted, so this is not the
++//!   amendment's malformation: the approval names no text this amendment can
++//!   be;
++//! - the two digests differ.
++//!
++//! The check runs after the outcome check (2) and before the subject (3) and
++//! seat (4) checks. In the edition-2 forward form the member is a hash
++//! digest (`[-16, bstr .size 32]`); the edition-2 ingest hands the gates its
++//! bytes as lowercase hex, so this gate compares the hex form either way.
++//!
+ //! CIRISServer (0.5.234, `agent_deferral.rs`) enforces the rule at its own
+ //! authoring door, which is the only way a server node MAKES an amendment.
+ //! A replicated amendment from another producer reached no gate at all; this
+@@ -41,6 +65,8 @@
+ //! precedent; a new `Error` arm would be a break in a minor). The ill-shaped
+ //! members (`amendment_digest`, `authorized_by`) are
+ //! [`Error::MalformedRow`]: those bytes can never be an amendment.
++//! `amendment_digest_mismatch` rides [`Error::InvalidArgument`] the same way
++//! (token first, then the [`digest_mismatch_reason`], then the detail).
+ 
+ use super::admission::envelope_dimension;
+ use super::types::{attestation_type, Attestation};
+@@ -69,6 +95,22 @@ pub const EVIDENCE_REFS_MEMBER: &str = "evidence_refs";
+ /// CC 3.1.5 (rc10) — the refusal token.
+ pub const IDENTITY_AMENDMENT_UNAUTHORIZED: &str = "identity_amendment_unauthorized";
+ 
++/// CC 3.1.5 (rc21; CIRISServer#1365/#1366) — the refusal token when the
++/// amendment is not the exact text the Wise Authority approved: the cited
++/// approval's `amendment_digest` is absent, ill-shaped, or another digest.
++pub const AMENDMENT_DIGEST_MISMATCH: &str = "amendment_digest_mismatch";
++
++/// Which case an [`AMENDMENT_DIGEST_MISMATCH`] refusal is. Carried in the
++/// message after the token; persist-local.
++pub mod digest_mismatch_reason {
++    /// The approval carries no `amendment_digest`: it names no text.
++    pub const RESPONSE_NAMES_NO_TEXT: &str = "response_carries_no_amendment_digest";
++    /// The approval's `amendment_digest` is not 64 lowercase hex digits.
++    pub const RESPONSE_DIGEST_ILL_SHAPED: &str = "response_amendment_digest_not_hex64";
++    /// The approval names another text.
++    pub const DIGESTS_DIFFER: &str = "amendment_digest_differs_from_approved";
++}
++
+ /// Which CC 3.1.5 condition an unauthorized amendment failed. Carried in the
+ /// refusal's message after the token; persist-local.
+ pub mod unauthorized_reason {
+@@ -95,6 +137,61 @@ fn unauthorized(row: &Attestation, reason: &'static str, detail: String) -> Erro
+     ))
+ }
+ 
++fn digest_mismatch(row: &Attestation, reason: &'static str, detail: String) -> Error {
++    Error::InvalidArgument(format!(
++        "{AMENDMENT_DIGEST_MISMATCH}: {reason}: amendment {} — {detail} (CC 3.1.5 rc21, \
++         CIRISServer#1366)",
++        row.attestation_id
++    ))
++}
++
++/// CC 3.1.5 (rc21) — **the amendment is the text the WA approved.** `digest`
++/// is the amendment's own (already checked hex64); `response` is the cited
++/// `deferral:response:approved:v1`. A pure function of the two rows, so the
++/// same at every door.
++///
++/// # Errors
++///
++/// [`Error::InvalidArgument`] led by [`AMENDMENT_DIGEST_MISMATCH`] when the
++/// response names no digest, an ill-shaped one, or another one.
++fn check_approved_digest(
++    row: &Attestation,
++    digest: &str,
++    response: &Attestation,
++) -> Result<(), Error> {
++    use digest_mismatch_reason as why;
++    let (reason, detail) = match response.attestation_envelope.get(AMENDMENT_DIGEST_MEMBER) {
++        None => (
++            why::RESPONSE_NAMES_NO_TEXT,
++            format!(
++                "the approval {} carries no `{AMENDMENT_DIGEST_MEMBER}`, so it authorises no text",
++                response.attestation_id
++            ),
++        ),
++        Some(serde_json::Value::String(approved)) if is_hex64(approved) => {
++            if approved == digest {
++                return Ok(());
++            }
++            (
++                why::DIGESTS_DIFFER,
++                format!(
++                    "the approval {} names {approved}, the amendment carries {digest}",
++                    response.attestation_id
++                ),
++            )
++        }
++        Some(_) => (
++            why::RESPONSE_DIGEST_ILL_SHAPED,
++            format!(
++                "the approval {}'s `{AMENDMENT_DIGEST_MEMBER}` is not 64 lowercase hex digits, \
++                 so it names no text this amendment can be",
++                response.attestation_id
++            ),
++        ),
++    };
++    Err(digest_mismatch(row, reason, detail))
++}
++
+ fn malformed(reason: &'static str, detail: String) -> Error {
+     Error::malformed_row(
+         "attestation",
+@@ -140,7 +237,9 @@ async fn person_of_occurrence(
+ ///
+ /// [`Error::MalformedRow`] for an ill-shaped member;
+ /// [`Error::InvalidArgument`] led by [`IDENTITY_AMENDMENT_UNAUTHORIZED`] when
+-/// a CC 3.1.5 condition fails; directory reads.
++/// a CC 3.1.5 condition fails, or by [`AMENDMENT_DIGEST_MISMATCH`] when the
++/// cited approval does not name this amendment's `amendment_digest` (CC 3.1.5
++/// rc21); directory reads.
+ pub async fn check_identity_amendment_admission(
+     directory: &dyn FederationDirectory,
+     row: &Attestation,
+@@ -152,22 +251,21 @@ pub async fn check_identity_amendment_admission(
+     let env = &row.attestation_envelope;
+ 
+     // The members' shapes.
+-    let digest = env.get(AMENDMENT_DIGEST_MEMBER);
+-    match digest.map(|v| v.as_str()) {
++    let digest = match env.get(AMENDMENT_DIGEST_MEMBER).map(|v| v.as_str()) {
+         None => {
+             return Err(malformed(
+                 malformed_row::ENVELOPE_MEMBER_MISSING,
+                 format!("`{AMENDMENT_DIGEST_MEMBER}` is required"),
+             ))
+         }
+-        Some(Some(d)) if is_hex64(d) => {}
++        Some(Some(d)) if is_hex64(d) => d,
+         Some(_) => {
+             return Err(malformed(
+                 malformed_row::ENVELOPE_MEMBER_INVALID,
+                 format!("`{AMENDMENT_DIGEST_MEMBER}` is not 64 lowercase hex digits"),
+             ))
+         }
+-    }
++    };
+     let authorized_by = match env.get(AUTHORIZED_BY_MEMBER).map(|v| v.as_str()) {
+         None => {
+             return Err(malformed(
+@@ -230,6 +328,9 @@ pub async fn check_identity_amendment_admission(
+             format!("{authorized_by} is not a {DEFERRAL_APPROVED_DIMENSION}"),
+         ));
+     }
++    // (2a) CC 3.1.5 rc21 — the amendment is the exact text the response
++    // approved: the two `amendment_digest`s are equal (module doc).
++    check_approved_digest(row, digest, &response)?;
+     // (3) Its subject is this agent.
+     if response.attested_key_id != agent {
+         return Err(unauthorized(
+@@ -272,3 +373,85 @@ pub async fn check_identity_amendment_admission(
+     }
+     Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::federation::tier_ingest::test_support as ts;
++
++    fn approval(digest: Option<serde_json::Value>) -> Attestation {
++        let id = uuid::Uuid::new_v4().to_string();
++        let mut env = serde_json::json!({ "id": id, "dimension": DEFERRAL_APPROVED_DIMENSION });
++        if let Some(d) = digest {
++            env[AMENDMENT_DIGEST_MEMBER] = d;
++        }
++        let mut r = ts::bare_attestation(&id, "i2930-wa", "i2930-agent", &env);
++        r.attestation_type = attestation_type::SCORES.to_owned();
++        r
++    }
++
++    fn amendment() -> Attestation {
++        let id = uuid::Uuid::new_v4().to_string();
++        let mut r = ts::bare_attestation(
++            &id,
++            "i2930-agent",
++            "i2930-agent",
++            &serde_json::json!({ "id": id, "dimension": IDENTITY_AMENDMENT_DIMENSION }),
++        );
++        r.attestation_type = attestation_type::SCORES.to_owned();
++        r
++    }
++
++    fn refused_with(r: Result<(), Error>, reason: &str, what: &str) {
++        match r {
++            Err(Error::InvalidArgument(m)) => assert!(
++                m.starts_with(&format!("{AMENDMENT_DIGEST_MISMATCH}: {reason}: ")),
++                "I2930 ({what}): expected {reason}, got {m}"
++            ),
++            other => panic!("I2930 ({what}): expected {AMENDMENT_DIGEST_MISMATCH}, got {other:?}"),
++        }
++    }
++
++    /// **I2930 (CC 3.1.5 rc21; CIRISServer#1365/#1366)** — the approved-text
++    /// check, as a pure function of the two rows: an equal digest passes; an
++    /// absent, ill-shaped (uppercase, short, non-string, null) or different
++    /// one is refused `amendment_digest_mismatch`, each case named in the
++    /// message. Mutation targets: the equality and the absent arm.
++    #[test]
++    fn i2930_the_amendment_is_the_text_the_wa_approved() {
++        let digest = "cd".repeat(32);
++        let row = amendment();
++        check_approved_digest(&row, &digest, &approval(Some(serde_json::json!(digest))))
++            .expect("I2930: the approved text admits");
++
++        use digest_mismatch_reason as why;
++        refused_with(
++            check_approved_digest(&row, &digest, &approval(None)),
++            why::RESPONSE_NAMES_NO_TEXT,
++            "absent",
++        );
++        refused_with(
++            check_approved_digest(
++                &row,
++                &digest,
++                &approval(Some(serde_json::json!("ef".repeat(32)))),
++            ),
++            why::DIGESTS_DIFFER,
++            "another text",
++        );
++        for (bad, what) in [
++            (serde_json::json!("CD".repeat(32)), "uppercase"),
++            (serde_json::json!("cd".repeat(31)), "short"),
++            (serde_json::json!(7), "a number"),
++            (serde_json::Value::Null, "null"),
++        ] {
++            refused_with(
++                check_approved_digest(&row, &digest, &approval(Some(bad))),
++                why::RESPONSE_DIGEST_ILL_SHAPED,
++                what,
++            );
++        }
++        // The token is its own, not the authority token: a consumer keys on it.
++        assert_ne!(AMENDMENT_DIGEST_MISMATCH, IDENTITY_AMENDMENT_UNAUTHORIZED);
++    }
++}
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index 7d19bfe2..f397d684 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -830,6 +830,10 @@ mod signed_object_1098_invariants;
+ // v60.1.0 (docs/V61_TASK_PLAN.md §2 slice B) — the consumer asks, I1360+.
+ #[cfg(test)]
+ mod v601_asks_invariants;
++// v62 (CC 3.1.5 rc21; CIRISServer#1365/#1366) — I2931–I2934: an identity
++// amendment is the exact text the Wise Authority approved, at every door.
++#[cfg(test)]
++mod amendment_digest_invariants;
+ // v61.0.5 (CIRISPersist#1225) — I1544–I1547: the read of rows naming a key,
+ // one dimension, on every backend.
+ #[cfg(test)]
+diff --git a/src/federation/v601_asks_invariants.rs b/src/federation/v601_asks_invariants.rs
+index 2c6687eb..0f2cc5f1 100644
+--- a/src/federation/v601_asks_invariants.rs
++++ b/src/federation/v601_asks_invariants.rs
+@@ -423,7 +423,12 @@ pub(crate) mod bodies {
+                 by,
+                 about,
+                 dimension,
+-                serde_json::json!({ "references_attestation_id": request_id }),
++                // v62 (CC 3.1.5 rc21) — the approval names the text it
++                // approves; every amendment below carries this digest.
++                serde_json::json!({
++                    "references_attestation_id": request_id,
++                    "amendment_digest": "cd".repeat(32),
++                }),
+             )
+         };
+         let amendment = |by: &str, about: &str, authorized_by: &str, cite: bool| {
+@@ -534,7 +539,7 @@ pub(crate) mod bodies {
+             &stranger,
+             &unowned,
+             ia::DEFERRAL_APPROVED_DIMENSION,
+-            serde_json::json!({}),
++            serde_json::json!({ "amendment_digest": "cd".repeat(32) }),
+         );
+         let for_unowned_id = for_unowned.attestation_id.clone();
+         put(for_unowned).await.expect("I1365: stores");
+@@ -573,7 +578,7 @@ pub(crate) mod bodies {
+                 &serde_json::json!({
+                     "id": id,
+                     "dimension": ia::IDENTITY_AMENDMENT_DIMENSION,
+-                    "amendment_digest": "ef".repeat(32),
++                    "amendment_digest": "cd".repeat(32),
+                     "authorized_by": authorized_by,
+                     "evidence_refs": [authorized_by],
+                 }),
+@@ -717,7 +722,11 @@ pub(crate) mod bodies {
+                 &approver,
+                 &agent,
+                 ia::DEFERRAL_APPROVED_DIMENSION,
+-                serde_json::json!({ "references_attestation_id": request_id }),
++                // v62 (CC 3.1.5 rc21) — the approval names the amended text.
++                serde_json::json!({
++                    "references_attestation_id": request_id,
++                    "amendment_digest": "cd".repeat(32),
++                }),
+             );
+             let approved_id = approved.attestation_id.clone();
+             put(approved).await.expect("I1368: the approval stores");

@@ -1,0 +1,1021 @@
+diff --git a/src/federation/admission.rs b/src/federation/admission.rs
+index 35475526..a717b802 100644
+--- a/src/federation/admission.rs
++++ b/src/federation/admission.rs
+@@ -7358,12 +7358,30 @@ pub fn verify_touch_claim_admission(
+     now: chrono::DateTime<chrono::Utc>,
+     max_skew: chrono::Duration,
+ ) -> Result<(), Error> {
+-    let skew = claim.fresh_as_of - now;
++    check_touch_fresh_as_of_skew(claim.fresh_as_of, now, max_skew)
++}
++
++/// v62.0.0 (v62 P5b) — the freshness-floor skew guard over the instant
++/// alone: **reject `fresh_as_of > now + max_skew`**. The one rule both
++/// writes enforce: the earlier-form signed door
++/// ([`verify_touch_claim_admission`]) and the node-local write
++/// (`FederationDirectory::put_touch_claim_local`), so a node's own clock
++/// cannot jump its floor into the future either.
++///
++/// # Errors
++///
++/// [`Error::InvalidArgument`] beyond the tolerance.
++pub fn check_touch_fresh_as_of_skew(
++    fresh_as_of: chrono::DateTime<chrono::Utc>,
++    now: chrono::DateTime<chrono::Utc>,
++    max_skew: chrono::Duration,
++) -> Result<(), Error> {
++    let skew = fresh_as_of - now;
+     if skew > max_skew {
+         return Err(Error::InvalidArgument(format!(
+-            "signed touch_claim: fresh_as_of {} is {}s ahead of now ({}), beyond the {}s skew \
++            "touch_claim: fresh_as_of {} is {}s ahead of now ({}), beyond the {}s skew \
+              tolerance — a lying clock cannot jump the freshness floor into the future",
+-            claim.fresh_as_of.to_rfc3339(),
++            fresh_as_of.to_rfc3339(),
+             skew.num_seconds(),
+             now.to_rfc3339(),
+             max_skew.num_seconds(),
+diff --git a/src/federation/directory_double.rs b/src/federation/directory_double.rs
+index f3b0c6f3..0180c5e0 100644
+--- a/src/federation/directory_double.rs
++++ b/src/federation/directory_double.rs
+@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
+     }
+ }
+ 
+-// 141 delegations, generated. Every one: fault first, then delegate.
++// 143 delegations, generated. Every one: fault first, then delegate.
+ #[async_trait::async_trait]
+ impl FederationDirectory for FaultInjectingDirectory {
+     async fn adopt_genesis_reanchor(
+@@ -338,6 +338,16 @@ impl FederationDirectory for FaultInjectingDirectory {
+         }
+         self.inner.family_roster_signers(family_key_id).await
+     }
++    async fn freshness_floor(
++        &self,
++        target_key_id: &str,
++        target_kind: &str,
++    ) -> Result<Option<types::FreshnessFloor>, Error> {
++        if let Some(e) = self.faulted("freshness_floor") {
++            return Err(e);
++        }
++        self.inner.freshness_floor(target_key_id, target_kind).await
++    }
+     async fn get_accord_decision(
+         &self,
+         proposal_digest: &str,
+@@ -1346,6 +1356,20 @@ impl FederationDirectory for FaultInjectingDirectory {
+         }
+         self.inner.put_revocation(revocation).await
+     }
++    async fn put_touch_claim_local(
++        &self,
++        target_key_id: &str,
++        target_kind: &str,
++        fresh_as_of: chrono::DateTime<chrono::Utc>,
++        cohort_scope: &str,
++    ) -> Result<freshness::TouchApplyOutcome, Error> {
++        if let Some(e) = self.faulted("put_touch_claim_local") {
++            return Err(e);
++        }
++        self.inner
++            .put_touch_claim_local(target_key_id, target_kind, fresh_as_of, cohort_scope)
++            .await
++    }
+     async fn read_group_plane_object(
+         &self,
+         link: &group_plane::GroupRowLink,
+diff --git a/src/federation/evidence_admit.rs b/src/federation/evidence_admit.rs
+index ddc4b82e..592db80f 100644
+--- a/src/federation/evidence_admit.rs
++++ b/src/federation/evidence_admit.rs
+@@ -43,6 +43,24 @@ pub(crate) struct PlannedTouchClaim<'a> {
+     pub(crate) signature_json: String,
+ }
+ 
++/// v62.0.0 (v62 P5b) — a NODE-LOCAL touch the plan admitted: the floor's
++/// fields, and nothing signed (the node is the only author; the row never
++/// crosses the mesh).
++#[derive(Debug, Clone)]
++pub(crate) struct PlannedLocalTouch<'a> {
++    /// What is being kept alive.
++    pub(crate) target_key_id: &'a str,
++    /// The kind of thing `target_key_id` names.
++    pub(crate) target_kind: &'a str,
++    /// The lower bound to merge (monotonic max).
++    pub(crate) fresh_as_of: DateTime<Utc>,
++    /// The mandatory privacy row, checked.
++    pub(crate) cohort_scope: &'a str,
++    /// The writing node's own key id (`node_key_id`), or empty when the
++    /// store has none: provenance only, never a signer.
++    pub(crate) node_key_id: String,
++}
++
+ /// A wholeness witness the plan admitted, its integer columns checked into
+ /// the stored widths.
+ #[derive(Debug, Clone)]
+@@ -98,6 +116,17 @@ pub(crate) trait EvidenceStore: FederationDirectory + Sized {
+         planned: PlannedTouchClaim<'_>,
+     ) -> Result<bool, Error>;
+ 
++    /// v62.0.0 (v62 P5b) — the same monotonic-max merge for a node-local
++    /// touch: `true` when the floor advanced. The row is stored under
++    /// [`NODE_LOCAL_TOUCH_FORM`](super::types::NODE_LOCAL_TOUCH_FORM), with an
++    /// empty `signature` and `{}` as `signed_envelope` (an advanced
++    /// earlier-form row loses its signature: the floor it now holds is the
++    /// node's own).
++    async fn store_planned_touch_claim_local(
++        &self,
++        planned: PlannedLocalTouch<'_>,
++    ) -> Result<bool, Error>;
++
+     /// In ONE transaction: insert the witness (idempotent on
+     /// `(peer_id, epoch_id, observed_at_unix_ms)`), then prune the peer's
+     /// corpus to its newest [`PlannedWitness::keep`].
+@@ -243,6 +272,53 @@ pub(crate) async fn put_touch_claim_planned<D: EvidenceStore>(
+     })
+ }
+ 
++/// v62.0.0 (v62 P5b; RULINGS "a touch claim is node-local";
++/// CC_FAMILYMAP_ANSWER: a node-local fold) — **the door: every backend's
++/// `put_touch_claim_local`.** The node's own write of its freshness floor:
++/// no object, no signature (the node is the only author, and the floor never
++/// crosses the mesh), so no earlier-form refusal applies. The rules the
++/// signed door enforced on the floor itself stand, verify-before-mutation:
++/// a non-empty target, a closed-set `cohort_scope`
++/// ([`check_cohort_scope`](super::admission::check_cohort_scope), the
++/// mandatory privacy row), the future-skew guard at the door's one clock
++/// read ([`check_touch_fresh_as_of_skew`](super::admission::check_touch_fresh_as_of_skew),
++/// [`DEFAULT_MAX_TOUCH_SKEW`](super::admission::DEFAULT_MAX_TOUCH_SKEW)),
++/// then the monotonic-max merge.
++pub(crate) async fn put_touch_claim_local_planned<D: EvidenceStore>(
++    dir: &D,
++    target_key_id: &str,
++    target_kind: &str,
++    fresh_as_of: DateTime<Utc>,
++    cohort_scope: &str,
++) -> Result<TouchApplyOutcome, Error> {
++    if target_key_id.is_empty() || target_kind.is_empty() {
++        return Err(Error::InvalidArgument(
++            "touch_claim: target_key_id and target_kind must be non-empty".into(),
++        ));
++    }
++    super::admission::check_cohort_scope(cohort_scope)?;
++    let received_at = crate::host::clock::now();
++    super::admission::check_touch_fresh_as_of_skew(
++        fresh_as_of,
++        received_at,
++        super::admission::DEFAULT_MAX_TOUCH_SKEW,
++    )?;
++    let advanced = dir
++        .store_planned_touch_claim_local(PlannedLocalTouch {
++            target_key_id,
++            target_kind,
++            fresh_as_of,
++            cohort_scope,
++            node_key_id: dir.node_key_id().unwrap_or_default(),
++        })
++        .await?;
++    Ok(if advanced {
++        TouchApplyOutcome::Advanced
++    } else {
++        TouchApplyOutcome::NotFresher
++    })
++}
++
+ /// The door: every backend's `put_wholeness_witness`. Verify BEFORE persist
+ /// (N3 / RC8 / AV-9): on any failure nothing is written.
+ #[allow(clippy::too_many_arguments)]
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index 7d19bfe2..6035e936 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -408,6 +408,10 @@ pub mod scope_classifier_invariants;
+ pub(crate) mod sealed_dag_adopt_invariants;
+ #[cfg(any(test, feature = "test-anchor"))]
+ pub mod self_collective_invariants;
++/// v62.0.0 (v62 P5b) — I3114–I3117, the node-local touch write keeps the
++/// freshness floor's rules.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod touch_local_invariants;
+ // v62.0.0 (P13) — every item inside is test-gated; so is the module.
+ #[cfg(test)]
+ pub(crate) mod silo_projection_invariants;
+@@ -9921,6 +9925,11 @@ pub trait FederationDirectory: Send + Sync {
+     /// floor for `(target_key_id, target_kind)`; `None` if it was never
+     /// touched. Default impl errors; the three backends override.
+     ///
++    /// v62.0.0 (v62 P5b) — the earlier form's read: it returns the floor
++    /// only while a SIGNED claim set it, and `None` once a node-local touch
++    /// ([`Self::put_touch_claim_local`]) holds it. The floor itself is
++    /// [`Self::freshness_floor`]; this read goes with the signed door.
++    ///
+     /// **Privacy note (mandatory — see [`freshness`]'s module docs):** the
+     /// returned claim carries a `cohort_scope`. A consumer MUST apply the
+     /// same cohort/consent gating persist applies to any other
+@@ -9941,6 +9950,54 @@ pub trait FederationDirectory: Send + Sync {
+         ))
+     }
+ 
++    /// v62.0.0 (v62 P5b; RULINGS "a touch claim is node-local";
++    /// CC_FAMILYMAP_ANSWER: the floor is a NODE-LOCAL fold, and the
++    /// `witness_touch` / `n_of_m` forms are gone) — **this node records a
++    /// touch on `(target_key_id, target_kind)`'s freshness floor.** Unsigned:
++    /// the node is the only author of its own floor, and the floor never
++    /// crosses the mesh. The rules the signed [`Self::put_touch_claim`]
++    /// enforced on the floor stand: **monotonic max** (an equal or older
++    /// `fresh_as_of` is [`freshness::TouchApplyOutcome::NotFresher`] and
++    /// writes nothing; a strictly newer one is
++    /// [`freshness::TouchApplyOutcome::Advanced`]), the **future-skew guard**
++    /// ([`admission::check_touch_fresh_as_of_skew`] at
++    /// [`admission::DEFAULT_MAX_TOUCH_SKEW`], refused
++    /// [`Error::InvalidArgument`]), and the **mandatory `cohort_scope`**
++    /// ([`admission::check_cohort_scope`], refused
++    /// [`Error::CohortScopeRejected`]). Both writes merge into the one floor
++    /// per target. Read it back with [`Self::freshness_floor`]. Default impl
++    /// refuses `Unsupported`; both backends override.
++    async fn put_touch_claim_local(
++        &self,
++        target_key_id: &str,
++        target_kind: &str,
++        fresh_as_of: chrono::DateTime<chrono::Utc>,
++        cohort_scope: &str,
++    ) -> Result<freshness::TouchApplyOutcome, Error> {
++        let _ = (target_key_id, target_kind, fresh_as_of, cohort_scope);
++        Err(Error::Unsupported {
++            method: "put_touch_claim_local",
++        })
++    }
++
++    /// v62.0.0 (v62 P5b) — **the freshness floor this node holds** for
++    /// `(target_key_id, target_kind)`, whichever write set it (the node-local
++    /// [`Self::put_touch_claim_local`] or the earlier-form signed
++    /// [`Self::put_touch_claim`]); `None` if never touched. The fields the
++    /// floor's fold reads ([`types::FreshnessFloor`]). The privacy note on
++    /// [`Self::lookup_freshness_floor`] applies unchanged. Default impl
++    /// refuses `Unsupported`; both backends override.
++    async fn freshness_floor(
++        &self,
++        target_key_id: &str,
++        target_kind: &str,
++    ) -> Result<Option<types::FreshnessFloor>, Error> {
++        let _ = (target_key_id, target_kind);
++        Err(Error::Unsupported {
++            method: "freshness_floor",
++        })
++    }
++
+     // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
+ 
+     /// Record a `hard_case:*` observability event (CEG §8.1.11.3 /
+diff --git a/src/federation/ownership_reclaim.rs b/src/federation/ownership_reclaim.rs
+index 4fd04e2e..0421bb87 100644
+--- a/src/federation/ownership_reclaim.rs
++++ b/src/federation/ownership_reclaim.rs
+@@ -1181,12 +1181,14 @@ pub async fn check_ownership_reclaim_admission(
+     //     permanent, which is the failure this clause exists to prevent.
+     if finding == WaFinding::Abandonment {
+         let incumbent = target.attesting_key_id.as_str();
++        // v62.0.0 (P5b) — the floor as this node holds it, whichever write
++        // set it (a touch claim is node-local).
+         let incumbent_floor = directory
+-            .lookup_freshness_floor(incumbent, OWNERSHIP_FRESHNESS_TARGET_KIND)
++            .freshness_floor(incumbent, OWNERSHIP_FRESHNESS_TARGET_KIND)
+             .await?
+             .map(|f| f.fresh_as_of);
+         let node_floor = directory
+-            .lookup_freshness_floor(node, OWNERSHIP_FRESHNESS_TARGET_KIND)
++            .freshness_floor(node, OWNERSHIP_FRESHNESS_TARGET_KIND)
+             .await?
+             .map(|f| f.fresh_as_of);
+         let floor = initial_freshness_floor(&target, [incumbent_floor, node_floor]);
+@@ -1420,10 +1422,8 @@ mod tests {
+ pub(crate) mod test_support {
+     use super::*;
+     use crate::federation::tier_ingest::test_support as ts;
+-    use crate::federation::types::{
+-        attestation_tier, cohort_scope, identity_type, FamilyMember, SignerForm,
+-    };
+-    use crate::federation::{Family, SignedAttestation, SignedTouchClaim};
++    use crate::federation::types::{attestation_tier, cohort_scope, identity_type, FamilyMember};
++    use crate::federation::{Family, SignedAttestation};
+ 
+     /// An UNSIGNED owner-binding row (used by pure unit tests that never
+     /// store it).
+@@ -1526,35 +1526,6 @@ pub(crate) mod test_support {
+         .map(|_| ())
+     }
+ 
+-    /// A hybrid-signed `self_touch` freshness claim.
+-    fn self_touch(target_key_id: &str, fresh_as_of: DateTime<Utc>) -> SignedTouchClaim {
+-        let fresh_as_of =
+-            crate::federation::admission::truncate_to_substrate_resolution(fresh_as_of);
+-        let unsigned = SignedTouchClaim {
+-            target_key_id: target_key_id.to_owned(),
+-            target_kind: OWNERSHIP_FRESHNESS_TARGET_KIND.to_owned(),
+-            fresh_as_of,
+-            signer_form: SignerForm::SelfTouch,
+-            attesting_key_id: target_key_id.to_owned(),
+-            signed_envelope: serde_json::Value::Null,
+-            signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+-                ed25519_signature_base64: String::new(),
+-                mldsa65_signature_base64: None,
+-            },
+-            cohort_scope: cohort_scope::SELF.to_owned(),
+-        };
+-        let env = unsigned.signing_envelope();
+-        let (_hash, classical, pqc) = ts::sign_envelope(target_key_id, &env);
+-        SignedTouchClaim {
+-            signed_envelope: env,
+-            signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+-                ed25519_signature_base64: classical,
+-                mldsa65_signature_base64: pqc,
+-            },
+-            ..unsigned
+-        }
+-    }
+-
+     /// **The whole ceremony, both directions.** Run against every backend.
+     #[allow(clippy::too_many_lines)]
+     pub(crate) async fn exercise_reclaim_ceremony(dir: &dyn FederationDirectory, suffix: &str) {
+@@ -2074,9 +2045,19 @@ pub(crate) mod test_support {
+         store(dir, &ts::owner_binding_attestation(&b2_id, &owner2, &node2))
+             .await
+             .expect("live binding");
+-        dir.put_touch_claim(&self_touch(&owner2, now - Duration::minutes(5)))
+-            .await
+-            .expect("fresh self-touch");
++        // v62.0.0 (P5b) — a touch claim is node-local: this node records the
++        // incumbent alive five minutes ago (no signature: the node is the
++        // only author of its own floor).
++        dir.put_touch_claim_local(
++            &owner2,
++            OWNERSHIP_FRESHNESS_TARGET_KIND,
++            crate::federation::admission::truncate_to_substrate_resolution(
++                now - Duration::minutes(5),
++            ),
++            cohort_scope::SELF,
++        )
++        .await
++        .expect("fresh node-local touch");
+         let p2 = signed_row(
+             &filer,
+             &node2,
+diff --git a/src/federation/touch_local_invariants.rs b/src/federation/touch_local_invariants.rs
+new file mode 100644
+index 00000000..6b386824
+--- /dev/null
++++ b/src/federation/touch_local_invariants.rs
+@@ -0,0 +1,245 @@
++//! v62.0.0 (v62 P5b; RULINGS "a touch claim is node-local";
++//! CC_FAMILYMAP_ANSWER: the freshness floor is a NODE-LOCAL fold, and the
++//! `witness_touch` / `n_of_m` forms are gone) — **I3114–I3117: the node's
++//! own, unsigned touch write keeps the floor's rules.** sqlite and postgres.
++//!
++//! - **I3114** — monotonic max: the first touch advances, an older or equal
++//!   one is `NotFresher` and changes nothing, a newer one advances.
++//! - **I3115** — the future-skew guard: a `fresh_as_of` beyond
++//!   `DEFAULT_MAX_TOUCH_SKEW` ahead of the door's clock is refused
++//!   `InvalidArgument` and writes nothing; one inside the tolerance admits.
++//! - **I3116** — the mandatory `cohort_scope`: a value outside the closed
++//!   set is refused `CohortScopeRejected` and writes nothing; every closed
++//!   value is stored and read back.
++//! - **I3117** — the node-local row is the floor (`freshness_floor` reads
++//!   it, with no signer), the earlier form's signed read
++//!   (`lookup_freshness_floor`) does not present it as a signed claim, and an
++//!   empty target is refused.
++//!
++//! Mutations: flip the SQL guard's `>` to `>=` or drop it and I3114 reds;
++//! drop `check_touch_fresh_as_of_skew` from the plan and I3115 reds; drop
++//! `check_cohort_scope` and I3116 reds; drop the `signer_form <>
++//! 'node_local'` filter from the signed read and I3117 reds (the row's empty
++//! signature fails to decode).
++
++/// The backend-agnostic witness bodies; `run` instantiates them per backend.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++pub(crate) mod bodies {
++    use crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW;
++    use crate::federation::types::{cohort_scope, FreshnessFloor};
++    use crate::federation::{Error, FederationDirectory, TouchApplyOutcome};
++
++    const KIND: &str = "ownership_binding";
++
++    /// Now, whole seconds, so every backend stores and returns it exactly
++    /// (sqlite's RFC 3339 text and postgres' microsecond `timestamptz`).
++    fn now_s() -> chrono::DateTime<chrono::Utc> {
++        chrono::DateTime::<chrono::Utc>::from_timestamp(chrono::Utc::now().timestamp(), 0)
++            .expect("seconds")
++    }
++
++    async fn floor(d: &dyn FederationDirectory, target: &str) -> Option<FreshnessFloor> {
++        d.freshness_floor(target, KIND)
++            .await
++            .expect("freshness_floor")
++    }
++
++    async fn touch(
++        d: &dyn FederationDirectory,
++        target: &str,
++        at: chrono::DateTime<chrono::Utc>,
++    ) -> Result<TouchApplyOutcome, Error> {
++        d.put_touch_claim_local(target, KIND, at, cohort_scope::SELF)
++            .await
++    }
++
++    /// **I3114** — the floor only ever advances.
++    pub async fn i3114_monotonic_max(d: &dyn FederationDirectory) {
++        let target = "i3114-target";
++        let t1 = now_s() - chrono::Duration::hours(1);
++        assert_eq!(floor(d, target).await, None, "I3114: never touched");
++        assert_eq!(
++            touch(d, target, t1).await.unwrap(),
++            TouchApplyOutcome::Advanced,
++            "I3114: the first touch advances"
++        );
++        assert_eq!(floor(d, target).await.unwrap().fresh_as_of, t1);
++        assert_eq!(
++            touch(d, target, t1 - chrono::Duration::minutes(10))
++                .await
++                .unwrap(),
++            TouchApplyOutcome::NotFresher,
++            "I3114: an older touch is a no-op"
++        );
++        assert_eq!(
++            touch(d, target, t1).await.unwrap(),
++            TouchApplyOutcome::NotFresher,
++            "I3114: an equal touch is a no-op (strict >)"
++        );
++        assert_eq!(
++            floor(d, target).await.unwrap().fresh_as_of,
++            t1,
++            "I3114: never rolled back"
++        );
++        let t2 = t1 + chrono::Duration::minutes(30);
++        assert_eq!(
++            touch(d, target, t2).await.unwrap(),
++            TouchApplyOutcome::Advanced,
++            "I3114: a newer touch advances"
++        );
++        assert_eq!(floor(d, target).await.unwrap().fresh_as_of, t2);
++    }
++
++    /// **I3115** — a lying clock cannot jump the floor into the future.
++    pub async fn i3115_future_skew_is_refused(d: &dyn FederationDirectory) {
++        let target = "i3115-target";
++        let far = now_s() + DEFAULT_MAX_TOUCH_SKEW + chrono::Duration::minutes(5);
++        match touch(d, target, far).await {
++            Err(Error::InvalidArgument(m)) => {
++                assert!(m.contains("ahead of now"), "I3115: {m}");
++            }
++            other => panic!("I3115: a touch beyond the skew tolerance is refused, got {other:?}"),
++        }
++        assert_eq!(
++            floor(d, target).await,
++            None,
++            "I3115: verify-before-mutation: nothing written"
++        );
++        let near = now_s() + chrono::Duration::minutes(1);
++        assert_eq!(
++            touch(d, target, near).await.unwrap(),
++            TouchApplyOutcome::Advanced,
++            "I3115: inside the tolerance admits"
++        );
++        assert_eq!(floor(d, target).await.unwrap().fresh_as_of, near);
++    }
++
++    /// **I3116** — the privacy row is mandatory and closed.
++    pub async fn i3116_cohort_scope_is_the_closed_set(d: &dyn FederationDirectory) {
++        let at = now_s() - chrono::Duration::hours(2);
++        for bad in ["", "public", "everyone", "SELF"] {
++            let target = format!("i3116-bad-{bad}");
++            match d.put_touch_claim_local(&target, KIND, at, bad).await {
++                Err(Error::CohortScopeRejected { cohort_scope }) => {
++                    assert_eq!(cohort_scope, bad, "I3116");
++                }
++                other => panic!("I3116: {bad:?} is refused CohortScopeRejected, got {other:?}"),
++            }
++            assert_eq!(floor(d, &target).await, None, "I3116: nothing written");
++        }
++        for (i, scope) in [
++            cohort_scope::SELF,
++            cohort_scope::FAMILY,
++            cohort_scope::COMMUNITY,
++            cohort_scope::AFFILIATIONS,
++            cohort_scope::SPECIES,
++            cohort_scope::BIOSPHERE,
++            cohort_scope::FEDERATION,
++        ]
++        .into_iter()
++        .enumerate()
++        {
++            let target = format!("i3116-ok-{i}");
++            assert_eq!(
++                d.put_touch_claim_local(&target, KIND, at, scope)
++                    .await
++                    .unwrap(),
++                TouchApplyOutcome::Advanced,
++                "I3116: {scope}"
++            );
++            assert_eq!(
++                floor(d, &target).await,
++                Some(FreshnessFloor {
++                    target_key_id: target.clone(),
++                    target_kind: KIND.to_owned(),
++                    fresh_as_of: at,
++                    cohort_scope: scope.to_owned(),
++                }),
++                "I3116: stored with its scope"
++            );
++        }
++    }
++
++    /// **I3117** — the node-local row is the floor, and never a signed claim.
++    pub async fn i3117_the_local_row_is_the_floor_not_a_signed_claim(d: &dyn FederationDirectory) {
++        let target = "i3117-target";
++        let at = now_s() - chrono::Duration::minutes(3);
++        touch(d, target, at).await.unwrap();
++        assert_eq!(
++            floor(d, target).await.map(|f| f.fresh_as_of),
++            Some(at),
++            "I3117: the floor"
++        );
++        assert_eq!(
++            d.lookup_freshness_floor(target, KIND)
++                .await
++                .expect("I3117: the signed read skips the row, it does not fail on it"),
++            None,
++            "I3117: a node-local floor is not presented as a signed claim"
++        );
++        for (t, k) in [("", KIND), (target, "")] {
++            assert!(
++                matches!(
++                    d.put_touch_claim_local(t, k, at, cohort_scope::SELF).await,
++                    Err(Error::InvalidArgument(_))
++                ),
++                "I3117: an empty target ({t:?}, {k:?}) is refused"
++            );
++        }
++    }
++}
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod run {
++    macro_rules! runners {
++        ($modname:ident, $fresh:expr) => {
++            mod $modname {
++                use super::super::bodies;
++                use crate::federation::FederationDirectory;
++                #[tokio::test]
++                async fn i3114() {
++                    let Some(d) = $fresh.await else { return };
++                    bodies::i3114_monotonic_max(&d as &dyn FederationDirectory).await
++                }
++                #[tokio::test]
++                async fn i3115() {
++                    let Some(d) = $fresh.await else { return };
++                    bodies::i3115_future_skew_is_refused(&d as &dyn FederationDirectory).await
++                }
++                #[tokio::test]
++                async fn i3116() {
++                    let Some(d) = $fresh.await else { return };
++                    bodies::i3116_cohort_scope_is_the_closed_set(&d as &dyn FederationDirectory)
++                        .await
++                }
++                #[tokio::test]
++                async fn i3117() {
++                    let Some(d) = $fresh.await else { return };
++                    bodies::i3117_the_local_row_is_the_floor_not_a_signed_claim(
++                        &d as &dyn FederationDirectory,
++                    )
++                    .await
++                }
++            }
++        };
++    }
++    #[cfg(feature = "sqlite")]
++    runners!(sqlite, async {
++        use crate::store::Backend as _;
++        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        Some(b)
++    });
++    #[cfg(feature = "postgres")]
++    runners!(postgres, async {
++        use crate::store::Backend as _;
++        let dsn = crate::test_pg::empty_dsn()?;
++        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        Some(b)
++    });
++}
+diff --git a/src/federation/types.rs b/src/federation/types.rs
+index 87a7f417..3f7974d0 100644
+--- a/src/federation/types.rs
++++ b/src/federation/types.rs
+@@ -4625,6 +4625,40 @@ impl SignedTouchClaim {
+     }
+ }
+ 
++/// v62.0.0 (v62 P5b; RULINGS "a touch claim is node-local";
++/// CC_FAMILYMAP_ANSWER: a NODE-LOCAL fold, CC 2.4.1 "node-local derived
++/// state") — **a freshness floor as this node holds it**: the fields the
++/// floor's fold reads, whichever write set them (the node-local
++/// [`crate::federation::FederationDirectory::put_touch_claim_local`] or the
++/// earlier-form signed `put_touch_claim`). Read with
++/// [`crate::federation::FederationDirectory::freshness_floor`].
++///
++/// It carries no signer and no signature: the node is the only author of a
++/// node-local floor, and the floor never crosses the mesh. The privacy note
++/// on [`SignedTouchClaim`] holds unchanged: `cohort_scope` is mandatory, and
++/// a consumer exposing a floor to a peer applies the same cohort/consent
++/// gating as for any other cohort-scoped read.
++/// v62.0.0 (v62 P5b) — the `freshness_floor.signer_form` token a node-local
++/// touch is stored under. The table keeps the earlier form's NOT NULL signed
++/// columns (V300 reproduces edition 1's DDL byte for byte, I1950), so a
++/// node-local row marks itself here, with an empty `signature` and an
++/// empty-object `signed_envelope`: it carries no signature and claims none.
++/// Never a [`SignerForm`] token, so the earlier form's read
++/// (`lookup_freshness_floor`) skips such a row by it.
++pub const NODE_LOCAL_TOUCH_FORM: &str = "node_local";
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct FreshnessFloor {
++    /// What is being kept alive (see [`SignedTouchClaim::target_key_id`]).
++    pub target_key_id: String,
++    /// The kind of thing `target_key_id` names (open vocabulary).
++    pub target_kind: String,
++    /// The lower bound: "alive no earlier than this instant". Monotonic max.
++    pub fresh_as_of: DateTime<Utc>,
++    /// The mandatory privacy row (one of the closed `cohort_scope` values).
++    pub cohort_scope: String,
++}
++
+ // ─── Trust hierarchy (v1.3.0, CIRISPersist#46 + #47) ───────────────
+ //
+ // Persist absorbs NodeCore's `crate::trust` module surface at the
+diff --git a/src/store/parity.rs b/src/store/parity.rs
+index 4db4606b..89e7c34a 100644
+--- a/src/store/parity.rs
++++ b/src/store/parity.rs
+@@ -295,6 +295,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     ("put_location_proof_planned", Class::Plan),
+     ("withdraw_location_proof_planned", Class::Plan),
+     ("put_touch_claim_planned", Class::Plan),
++    // v62.0.0 (v62 P5b) — the node-local touch write (no object, unsigned).
++    ("put_touch_claim_local_planned", Class::Plan),
+     ("put_wholeness_witness_planned", Class::Plan),
+     // The executors (storage only; compared across backends as the `AccordStore` / `EvidenceStore` traits): each fails only on the store's terms, and reports what it found for the plan to judge (`HeldRow`, a held proof, an advanced floor).
+     ("last_accord_proposal_created_at", Class::Plumbing),
+@@ -306,6 +308,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     ("store_planned_location_proof_withdrawal", Class::Plumbing),
+     ("rival_location_proof_withdrawal", Class::Plumbing),
+     ("store_planned_touch_claim", Class::Plumbing),
++    ("store_planned_touch_claim_local", Class::Plumbing),
+     // v58.0.0 (CIRISPersist#991) — the key plane. The revocation door is one
+     // shared plan; every key-plane write keeps its row with it in the same
+     // transaction (storage, Plumbing: the row is a pure function of the record
+@@ -1447,6 +1450,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+     ("verify_stream_sth_signature", Class::Gate),
+     ("verify_stream_sth_witnesses", Class::Gate),
+     ("verify_touch_claim_admission", Class::Gate),
++    // v62.0.0 (v62 P5b) — Gate: refuses the caller's `fresh_as_of` beyond
++    // the future-skew tolerance (the node-local touch write's guard).
++    ("check_touch_fresh_as_of_skew", Class::Gate),
+     // ── v55.0.0 (CIRISPersist#989, #1053) — the one holding claim; public rooms ──
+     // v55.0.0 (CIRISPersist#1053, CC 3.2) — Gate: refuses a `community:listing:v1`
+     // row off `federation`, malformed, for a non-public room, or by a signer that
+@@ -1606,7 +1612,7 @@ mod tests {
+     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
+     /// partition as a backend door, and its sequence is what a door's
+     /// `plan:NAME` token stands for.
+-    const SHARED_PLANS: [(&str, &str); 74] = [
++    const SHARED_PLANS: [(&str, &str); 75] = [
+         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
+         (
+             "src/federation/transport_admit.rs",
+@@ -1761,6 +1767,10 @@ mod tests {
+             "src/federation/evidence_admit.rs",
+             "put_touch_claim_planned",
+         ),
++        (
++            "src/federation/evidence_admit.rs",
++            "put_touch_claim_local_planned",
++        ),
+         (
+             "src/federation/evidence_admit.rs",
+             "put_wholeness_witness_planned",
+@@ -1877,7 +1887,7 @@ mod tests {
+     /// this list on the commit that moves its decision into a plan, and
+     /// cannot drift back: a gate added to one backend's copy fails
+     /// [`shared_doors_decide_nothing_in_a_backend`].
+-    const SHARED_DOORS: [(&str, &str, &str); 81] = [
++    const SHARED_DOORS: [(&str, &str, &str); 82] = [
+         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
+         // decoded by the row mapper both doors read through.
+         (
+@@ -2109,6 +2119,11 @@ mod tests {
+             "put_touch_claim",
+             "put_touch_claim_planned",
+         ),
++        (
++            "FederationDirectory",
++            "put_touch_claim_local",
++            "put_touch_claim_local_planned",
++        ),
+         (
+             "FederationDirectory",
+             "put_wholeness_witness",
+diff --git a/src/store/postgres.rs b/src/store/postgres.rs
+index ecf6cf56..5dc0eba0 100644
+--- a/src/store/postgres.rs
++++ b/src/store/postgres.rs
+@@ -3798,6 +3798,46 @@ impl crate::federation::evidence_admit::EvidenceStore for PostgresBackend {
+         Ok(n > 0)
+     }
+ 
++    async fn store_planned_touch_claim_local(
++        &self,
++        planned: crate::federation::evidence_admit::PlannedLocalTouch<'_>,
++    ) -> Result<bool, crate::federation::Error> {
++        let client = self
++            .get_client()
++            .await
++            .map_err(crate::store::Error::into_federation)?;
++        // The signed door's monotonic-max merge; the row marks itself
++        // node-local.
++        let n = client
++            .execute(
++                "INSERT INTO cirislens.freshness_floor \
++                    (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
++                     signed_envelope, signature, cohort_scope) \
++                 VALUES ($1, $2, $3, $4, $5, '{}', '', $6) \
++                 ON CONFLICT (target_key_id, target_kind) \
++                 DO UPDATE SET fresh_as_of = EXCLUDED.fresh_as_of, \
++                    signer_form = EXCLUDED.signer_form, \
++                    attesting_key_id = EXCLUDED.attesting_key_id, \
++                    signed_envelope = EXCLUDED.signed_envelope, \
++                    signature = EXCLUDED.signature, \
++                    cohort_scope = EXCLUDED.cohort_scope \
++                 WHERE EXCLUDED.fresh_as_of > cirislens.freshness_floor.fresh_as_of",
++                &[
++                    &planned.target_key_id,
++                    &planned.target_kind,
++                    &planned.fresh_as_of,
++                    &crate::federation::types::NODE_LOCAL_TOUCH_FORM,
++                    &planned.node_key_id,
++                    &planned.cohort_scope,
++                ],
++            )
++            .await
++            .map_err(|e| {
++                crate::federation::Error::Backend(format!("put_touch_claim_local: {e}"))
++            })?;
++        Ok(n > 0)
++    }
++
+     async fn store_planned_witness(
+         &self,
+         planned: crate::federation::evidence_admit::PlannedWitness,
+@@ -8699,6 +8739,19 @@ fn pg_row_to_signed_touch_claim(
+     })
+ }
+ 
++/// v62.0.0 (v62 P5b) — a `freshness_floor` row as the floor's fold reads it.
++fn pg_row_to_freshness_floor(
++    row: &tokio_postgres::Row,
++) -> Result<crate::federation::types::FreshnessFloor, crate::federation::Error> {
++    use crate::federation::Error as FErr;
++    Ok(crate::federation::types::FreshnessFloor {
++        target_key_id: row.safe_get_with("target_key_id", FErr::Backend)?,
++        target_kind: row.safe_get_with("target_kind", FErr::Backend)?,
++        fresh_as_of: row.safe_get_with("fresh_as_of", FErr::Backend)?,
++        cohort_scope: row.safe_get_with("cohort_scope", FErr::Backend)?,
++    })
++}
++
+ fn pg_row_to_installed_storage_budget(
+     row: tokio_postgres::Row,
+ ) -> Result<crate::fountain::storage_contention::InstalledStorageBudget, Error> {
+@@ -13457,7 +13510,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+                 "SELECT target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
+                     signed_envelope, signature, cohort_scope \
+                  FROM cirislens.freshness_floor \
+-                 WHERE target_key_id = $1 AND target_kind = $2",
++                 WHERE target_key_id = $1 AND target_kind = $2 \
++                    AND signer_form <> 'node_local'",
+                 &[&target_key_id, &target_kind],
+             )
+             .await
+@@ -13467,6 +13521,44 @@ impl crate::federation::FederationDirectory for PostgresBackend {
+         row.map(|r| pg_row_to_signed_touch_claim(&r)).transpose()
+     }
+ 
++    async fn put_touch_claim_local(
++        &self,
++        target_key_id: &str,
++        target_kind: &str,
++        fresh_as_of: chrono::DateTime<chrono::Utc>,
++        cohort_scope: &str,
++    ) -> Result<crate::federation::TouchApplyOutcome, crate::federation::Error> {
++        crate::federation::evidence_admit::put_touch_claim_local_planned(
++            self,
++            target_key_id,
++            target_kind,
++            fresh_as_of,
++            cohort_scope,
++        )
++        .await
++    }
++
++    async fn freshness_floor(
++        &self,
++        target_key_id: &str,
++        target_kind: &str,
++    ) -> Result<Option<crate::federation::types::FreshnessFloor>, crate::federation::Error> {
++        let client = self
++            .get_client()
++            .await
++            .map_err(crate::store::Error::into_federation)?;
++        let row = client
++            .query_opt(
++                "SELECT target_key_id, target_kind, fresh_as_of, cohort_scope \
++                 FROM cirislens.freshness_floor \
++                 WHERE target_key_id = $1 AND target_kind = $2",
++                &[&target_key_id, &target_kind],
++            )
++            .await
++            .map_err(|e| crate::federation::Error::Backend(format!("freshness_floor: {e}")))?;
++        row.map(|r| pg_row_to_freshness_floor(&r)).transpose()
++    }
++
+     // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
+ 
+     async fn record_hard_case(
+diff --git a/src/store/sqlite.rs b/src/store/sqlite.rs
+index ae68f51a..144a31ae 100644
+--- a/src/store/sqlite.rs
++++ b/src/store/sqlite.rs
+@@ -6876,7 +6876,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+                 conn.query_row(
+                 "SELECT target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
+                     signed_envelope, signature, cohort_scope \
+-                 FROM freshness_floor WHERE target_key_id = ?1 AND target_kind = ?2",
++                 FROM freshness_floor WHERE target_key_id = ?1 AND target_kind = ?2 \
++                    AND signer_form <> 'node_local'",
+                 rusqlite::params![target_key_id, target_kind],
+                 sqlite_row_to_signed_touch_claim,
+             )
+@@ -6887,6 +6888,50 @@ impl crate::federation::FederationDirectory for SqliteBackend {
+         .map_err(|e| crate::federation::Error::Backend(format!("lookup_freshness_floor: {e}")))
+     }
+ 
++    async fn put_touch_claim_local(
++        &self,
++        target_key_id: &str,
++        target_kind: &str,
++        fresh_as_of: chrono::DateTime<chrono::Utc>,
++        cohort_scope: &str,
++    ) -> Result<crate::federation::TouchApplyOutcome, crate::federation::Error> {
++        crate::federation::evidence_admit::put_touch_claim_local_planned(
++            self,
++            target_key_id,
++            target_kind,
++            fresh_as_of,
++            cohort_scope,
++        )
++        .await
++    }
++
++    async fn freshness_floor(
++        &self,
++        target_key_id: &str,
++        target_kind: &str,
++    ) -> Result<Option<crate::federation::types::FreshnessFloor>, crate::federation::Error> {
++        let target_key_id = target_key_id.to_owned();
++        let target_kind = target_kind.to_owned();
++        self
++            .read(
++                move |conn| -> Result<
++                    Option<crate::federation::types::FreshnessFloor>,
++                    rusqlite::Error,
++                > {
++                    use rusqlite::OptionalExtension;
++                    conn.query_row(
++                        "SELECT target_key_id, target_kind, fresh_as_of, cohort_scope \
++                     FROM freshness_floor WHERE target_key_id = ?1 AND target_kind = ?2",
++                        rusqlite::params![target_key_id, target_kind],
++                        sqlite_row_to_freshness_floor,
++                    )
++                    .optional()
++                },
++            )
++            .await
++            .map_err(|e| crate::federation::Error::Backend(format!("freshness_floor: {e}")))
++    }
++
+     // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
+ 
+     async fn record_hard_case(
+@@ -17495,6 +17540,25 @@ fn sqlite_row_to_signed_touch_claim(
+     })
+ }
+ 
++/// v62.0.0 (v62 P5b) — a `freshness_floor` row as the floor's fold reads it:
++/// the `freshness_floor` SELECT's columns (0..=3).
++fn sqlite_row_to_freshness_floor(
++    row: &rusqlite::Row<'_>,
++) -> rusqlite::Result<crate::federation::types::FreshnessFloor> {
++    let fresh_as_of_str: String = row.get(2)?;
++    let fresh_as_of = chrono::DateTime::parse_from_rfc3339(&fresh_as_of_str)
++        .map(|t| t.with_timezone(&chrono::Utc))
++        .map_err(|e| {
++            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
++        })?;
++    Ok(crate::federation::types::FreshnessFloor {
++        target_key_id: row.get(0)?,
++        target_kind: row.get(1)?,
++        fresh_as_of,
++        cohort_scope: row.get(3)?,
++    })
++}
++
+ fn sqlite_row_to_identity_occurrence(
+     row: &rusqlite::Row<'_>,
+ ) -> rusqlite::Result<crate::federation::IdentityOccurrence> {
+@@ -26844,6 +26908,49 @@ impl crate::federation::evidence_admit::EvidenceStore for SqliteBackend {
+         Ok(changed > 0)
+     }
+ 
++    async fn store_planned_touch_claim_local(
++        &self,
++        planned: crate::federation::evidence_admit::PlannedLocalTouch<'_>,
++    ) -> Result<bool, crate::federation::Error> {
++        let target_key_id = planned.target_key_id.to_owned();
++        let target_kind = planned.target_kind.to_owned();
++        let fresh_as_of = planned.fresh_as_of.to_rfc3339();
++        let cohort_scope = planned.cohort_scope.to_owned();
++        let node_key_id = planned.node_key_id;
++        let changed = self
++            .write(move |conn| -> Result<usize, rusqlite::Error> {
++                // The signed door's monotonic-max merge, over the same text
++                // spelling of the instant; the row marks itself node-local.
++                conn.execute(
++                    "INSERT INTO freshness_floor \
++                        (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
++                         signed_envelope, signature, cohort_scope) \
++                     VALUES (?1, ?2, ?3, ?4, ?5, '{}', '', ?6) \
++                     ON CONFLICT(target_key_id, target_kind) \
++                     DO UPDATE SET fresh_as_of = excluded.fresh_as_of, \
++                        signer_form = excluded.signer_form, \
++                        attesting_key_id = excluded.attesting_key_id, \
++                        signed_envelope = excluded.signed_envelope, \
++                        signature = excluded.signature, \
++                        cohort_scope = excluded.cohort_scope \
++                     WHERE excluded.fresh_as_of > freshness_floor.fresh_as_of",
++                    rusqlite::params![
++                        target_key_id,
++                        target_kind,
++                        fresh_as_of,
++                        crate::federation::types::NODE_LOCAL_TOUCH_FORM,
++                        node_key_id,
++                        cohort_scope
++                    ],
++                )
++            })
++            .await
++            .map_err(|e| {
++                crate::federation::Error::Backend(format!("put_touch_claim_local: {e}"))
++            })?;
++        Ok(changed > 0)
++    }
++
+     async fn store_planned_witness(
+         &self,
+         planned: crate::federation::evidence_admit::PlannedWitness,
+diff --git a/src/store/sqlite_conn_model.rs b/src/store/sqlite_conn_model.rs
+index 559a85e6..0b247b4c 100644
+--- a/src/store/sqlite_conn_model.rs
++++ b/src/store/sqlite_conn_model.rs
+@@ -497,6 +497,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+     ("store_planned_location_proof", ConnClass::Write),
+     ("store_planned_location_proof_withdrawal", ConnClass::Write),
+     ("store_planned_touch_claim", ConnClass::Write),
++    ("store_planned_touch_claim_local", ConnClass::Write),
+     ("store_planned_witness", ConnClass::Write),
+     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
+     // one transaction.
+@@ -727,6 +728,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+     ("lookup_community", ConnClass::Read),
+     ("lookup_family", ConnClass::Read),
+     ("lookup_freshness_floor", ConnClass::Read),
++    // v62.0.0 (v62 P5b) — the floor as the node holds it.
++    ("freshness_floor", ConnClass::Read),
+     ("lookup_identity_for_occurrence", ConnClass::Read),
+     (
+         "list_identity_occurrences_by_occurrence_key",

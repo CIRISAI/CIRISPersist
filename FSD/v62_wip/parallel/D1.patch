@@ -1,0 +1,994 @@
+diff --git a/python/ciris_persist/__init__.py b/python/ciris_persist/__init__.py
+index 68a2c9e0..012dfd91 100644
+--- a/python/ciris_persist/__init__.py
++++ b/python/ciris_persist/__init__.py
+@@ -47,6 +47,7 @@ from .ciris_persist import (
+     __version__,
+     accord_threshold_for,
+     dimension_rejection_is_retryable,
++    earlier_form_doors_shut,
+     engine_teardown_wait,
+     engine_teardowns_in_flight,
+     key_grant_refusal_is_retryable,
+@@ -104,6 +105,8 @@ __all__ = [
+     "accord_threshold_for",
+     "dimension_rejection_is_retryable",
+     "key_grant_refusal_is_retryable",
++    # v62.0.0 (JSON-cut slice D) — the earlier-form switch, read-only.
++    "earlier_form_doors_shut",
+     # v61.1.0 (CIRISPersist#1235) — read attribution: the caller label this
+     # thread's reads are credited to, and its context manager.
+     "set_caller_scope",
+diff --git a/python/ciris_persist/ciris_persist.pyi b/python/ciris_persist/ciris_persist.pyi
+index 568fc8ad..6e7c1a52 100644
+--- a/python/ciris_persist/ciris_persist.pyi
++++ b/python/ciris_persist/ciris_persist.pyi
+@@ -674,6 +674,70 @@ class Engine:
+     def apply_replicated_key_grant(self, signed_key_grant_json: str) -> str:
+         """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13), v55.0.0 (#989, CC 3.3.2 rc7) — admit one replicated key-grant row and project its wrap. FFI mirror..."""
+ 
++    def apply_replicated_statement(self, statement: bytes, offered_row_id: str) -> str:
++        """v62.0.0 — the replicated edition-2 statement door: one ``COSE_Sign1``
++        statement as a peer delivered it, under the 64-hex id the peer offered
++        it as, at tier ``federation``, through every gate
++        ``put_edition2_statement`` runs. The edition-2 twin of
++        ``apply_replicated_attestation``.
++
++        Returns JSON; every outcome advances the sender's cursor:
++        ``{"outcome": "admitted"|"unchanged", "plane", "row_id", "new",
++        "advances_cursor": true}`` or ``{"outcome": "refused", "reason":
++        "store_conflict", "advances_cursor": true}``.
++
++        Raises:
++            ValueError: ``federation_attester_key_unknown`` (retryable: the
++                signer's key record is not held; do NOT advance the cursor);
++                ``federation_malformed_row: edition2: <token>`` and every
++                attestation-gate refusal, as ``put_edition2_statement``; a
++                malformed ``offered_row_id``.
++        """
++
++    def amendment_standings_json(self, agent: str) -> str:
++        """v62.0.0 (CC 2.7, CC 3.1.5) — the standing of every identity
++        amendment about ``agent``, read now. An amendment is admitted and HELD
++        while the approval it cites does not authorise it; a later approval
++        makes it count with nothing re-written. Ask this, never the bare row's
++        presence. Retraction is not applied (the reader's usual fold).
++
++        Returns a JSON list: ``[{"row_id": str, "standing": "in_force" | "held",
++        "token": str | null, "reason": str | null, "detail": str | null}]``;
++        ``token`` is ``identity_amendment_unauthorized`` or
++        ``amendment_digest_mismatch``.
++        """
++
++    def bundles_in_force_json(self) -> str:
++        """v62.0.0 (CC 2.6.1.11, CC 2.7.8) — the genesis bundles in force on
++        this node: the tips of the held genesis lineage as CIRISVerify places
++        them. The bundle/2 accessor that replaces reading bundle/1
++        ``serve_nodes[].record.key_id``.
++
++        Returns a JSON list, empty when no bundle is held, one entry per tip:
++        ``{"object_id": hex, "version": int, "prev": hex | null,
++        "asserted_at": ms, "family_key_id": str, "holders": [identity-ref, ...],
++        "serve_nodes": [identity-ref, ...], "counted": [identity-ref, ...]}``.
++        Two entries are a fork: a reader takes only what both name.
++        """
++
++    def put_edition2_statement(self, statement: bytes, offered_row_id: str | None = None) -> str:
++        """v62.0.0 (CC 2.6.1, 2.6.1.12) — the edition-2 statement door, local
++        or replicated: one ``COSE_Sign1`` (tag 18) statement as received.
++        ``offered_row_id`` is the 64-hex id the carrier names it by, if any;
++        it must be the id the bytes compute.
++
++        Returns JSON ``{"plane": "key_plane"|"voice"|"row"|"pending", "row_id": hex,
++        "new": bool}``.
++
++        Raises:
++            ValueError: ``federation_malformed_row: edition2: <token>``
++                (``earlier_form_object`` for a JSON object or bytes in no form,
++                ``row_id_mismatch``, ``row_ref_edition_1``, ...); the retryable
++                ``federation_attester_key_unknown``; every attestation-gate
++                refusal exactly as ``put_attestation`` raises it; a malformed
++                ``offered_row_id``.
++        """
++
+     def apply_replicated_key_record(
+         self,
+         signed_key_record_json: str,
+@@ -2597,6 +2661,17 @@ class Engine:
+     def blob_provenance_from_attestation_json(self, attestation_json: str, sha256_hex: str, epoch: int | None = None, minter_key_id: str | None = None) -> str:
+         """(derived) empirical — v46.0.0 (CIRISPersist#876, FSD/EPOCH_MINTER.md) — the provenance of a blob, read off the attestation it flowed from."""
+ 
++    def edition2_statements_since(self, cursor: str | None = None, limit: int = 1000) -> list[tuple[str, bytes]]:
++        """v62.0.0 — serve the held edition-2 statements after ``cursor``, in
++        this node's admission order, at most ``limit`` (clamped to 1000). Each
++        item is ``(cursor, statement)``: the statement's bytes as received and
++        the opaque cursor (``"<admitted_us>:<statement_id hex>"``) to pass
++        back to resume after it. None starts from the first.
++
++        Raises:
++            ValueError: a malformed cursor.
++        """
++
+     def cache_stats(self) -> dict[str, Any]:
+         """(derived) empirical — v53.1.8 (CIRISPersist#1014) — [crate::Engine::cache_stats] as a dict keyed by cache (repository_statistics, scoring_factors), each {hits, misses, e..."""
+ 
+@@ -4498,6 +4573,12 @@ def set_caller_scope(label: str | None = None) -> str | None:
+ def dimension_rejection_is_retryable(reason: str) -> bool:
+     """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_dimension_rejected refusal named succeed? reason is the refus..."""
+ 
++def earlier_form_doors_shut() -> bool:
++    """v62.0.0 (CC 2.6.1.12) — are the earlier-form doors shut on this build?
++    False until the switch flips; then every earlier-form JSON door raises
++    ``ValueError("federation_malformed_row: <plane>: earlier_form_object ...")``
++    before it decodes its object."""
++
+ def key_grant_refusal_is_retryable(reason: str) -> bool:
+     """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_key_grant_refused refusal named succeed? reason is the refusa..."""
+ 
+diff --git a/scripts/ffi_taxonomy.tsv b/scripts/ffi_taxonomy.tsv
+index 529ea40a..5b544529 100644
+--- a/scripts/ffi_taxonomy.tsv
++++ b/scripts/ffi_taxonomy.tsv
+@@ -165,6 +165,8 @@ Engine	apply_replicated_accord_evidence	deontic
+ Engine	apply_replicated_attestation	deontic
+ Engine	apply_replicated_key_grant	deontic
+ Engine	apply_replicated_key_record	deontic
++Engine	apply_replicated_statement	deontic	
++Engine	put_edition2_statement	deontic	
+ Engine	attestation_insert_local	empirical	
+ Engine	attestation_insert_local_many	empirical	
+ Engine	attestation_upsert_local	empirical	
+@@ -193,6 +195,8 @@ Engine	blackhole_remove	deontic
+ Engine	blackhole_upsert	deontic	
+ Engine	blob_storage_capsule	structural	
+ Engine	body_sha256	pragmatic	
++Engine	bundles_in_force_json	deontic	
++Engine	amendment_standings_json	deontic	
+ Engine	build_corpus_want_v1	deontic	
+ Engine	build_storage_budget_v1	deontic	
+ Engine	cache_budget_bytes	epistemic	
+@@ -303,6 +307,7 @@ Engine	emit_attestation	deontic
+ Engine	emit_attestation_self	deontic	
+ Engine	emit_key_grant	deontic
+ Engine	emit_pending_key_grants	deontic
++Engine	edition2_statements_since	empirical	
+ Engine	licences_issued_under_json	deontic	
+ Engine	licensure_status_set	deontic	
+ Engine	list_key_registration_history	empirical	
+@@ -714,6 +719,7 @@ MODULE	engine_teardown_wait	structural
+ MODULE	engine_teardowns_in_flight	structural	
+ MODULE	install_panic_logger	structural	
+ MODULE	key_grant_refusal_is_retryable	procedural	
++MODULE	earlier_form_doors_shut	procedural	
+ MODULE	namespace_manifest_version	axiomatic	
+ MODULE	panic_count	structural	
+ MODULE	persist_field_conformance	axiomatic	
+diff --git a/src/ffi/pyo3.rs b/src/ffi/pyo3.rs
+index 1237d484..ccc7d030 100644
+--- a/src/ffi/pyo3.rs
++++ b/src/ffi/pyo3.rs
+@@ -59,33 +59,32 @@ use crate::verify::PythonJsonDumpsCanonicalizer;
+ const POSTGRES_ONLY_MSG: &str = "this build has no postgres backend — build \
+ ciris-persist with feature `pyo3` (not `pyo3-sqlite`) for postgres";
+ 
+-/// v31.0.0 (CIRISPersist#648) — the wheel's half of
+-/// [`classify_genesis_seed`](crate::engine::classify_genesis_seed): an ABSENT
+-/// or UNREADABLE constitutional seed leaves a pre-genesis node that boots and
+-/// refuses every root-requiring gate; a DIVERGENT one still refuses to boot.
+-///
+-/// Shaped as an `.or_else` over the seeder's own `Result` so the wheel and
+-/// `Engine::with_signer` share one rule. Two boot paths that disagree about
+-/// which faults are survivable is precisely the drift #392 collapsed
+-/// `seed_family_and_canonical` to prevent.
++/// v62.0.0 (JSON-cut slice D, with C2's boot) — the wheel boots
++/// **pre-genesis**, as `Engine::with_signer` does: no baked JSON genesis is
++/// seeded and nothing is rooted until a `ceg-genesis-bundle/2` arrives at the
++/// import door. At boot it only reports the posture: when no bundle Verify
++/// reads Valid is held (or the held bundles cannot be read), it logs the
++/// `pre_genesis` banner. Never fatal.
+ #[cfg(any(feature = "postgres", feature = "sqlite"))]
+-fn pre_genesis_or_refuse(
+-    fault: crate::federation::genesis::GenesisFault,
+-) -> Result<(), crate::federation::genesis::GenesisFault> {
+-    if fault.refuses_boot() {
+-        return Err(fault);
++async fn report_genesis_at_boot<F>(dir: &F)
++where
++    F: crate::federation::FederationDirectory + ?Sized,
++{
++    match crate::federation::edition2::genesis::genesis_in_force(dir).await {
++        Ok(state) if state.is_held() => {}
++        Ok(_) => tracing::warn!(
++            posture = "pre_genesis",
++            "PRE-GENESIS BOOT: this node holds no ceg-genesis-bundle/2. It roots nothing until \
++             a bundle arrives at the import door under its anchor; every operation that \
++             resolves authority to the accord root is refused until then."
++        ),
++        Err(e) => tracing::warn!(
++            posture = "pre_genesis",
++            error = %e,
++            "PRE-GENESIS BOOT: the held genesis bundles could not be read; this node treats \
++             itself as holding no root."
++        ),
+     }
+-    tracing::warn!(
+-        posture = "pre_genesis",
+-        leg = fault.leg().as_str(),
+-        fault = fault.as_str(),
+-        detail = fault.detail(),
+-        "PRE-GENESIS BOOT: this node holds no constitutional trust root. It can host a \
+-         genesis ceremony; until one completes, every operation that resolves authority to \
+-         the accord root is REFUSED (federation_no_constitutional_root_yet). Node mode only \
+-         — do not run an agent against this node."
+-    );
+-    Ok(())
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -1129,6 +1128,18 @@ impl PyEngine {
+         }
+     }
+ 
++    /// v62.0.0 (JSON-cut slice D) — this handle's backend as the object-safe
++    /// directory, for the edition-2 doors that take any
++    /// `F: FederationDirectory + ?Sized` (one code path for both backends).
++    fn federation_directory_arc(&self) -> Arc<dyn crate::federation::FederationDirectory> {
++        match &self.backend {
++            #[cfg(feature = "postgres")]
++            BackendDispatch::Postgres(b) => b.clone(),
++            #[cfg(feature = "sqlite")]
++            BackendDispatch::Sqlite(b) => b.clone(),
++        }
++    }
++
+     /// v2.0.1 (CIRISPersist#95) — Rust-level accessor for the
+     /// outbound-queue substrate. Returns the public
+     /// [`BackendDispatch`](crate::engine::BackendDispatch) the
+@@ -1812,37 +1823,17 @@ impl PyEngine {
+                 {
+                     let pg = py.detach(|| {
+                         runtime.block_on(async {
+-                        let pg = PostgresBackend::connect(dsn)
+-                            .await
+-                            .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
+-                        pg.run_migrations()
+-                            .await
+-                            .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
+-                        // v12.0.2 (CIRISPersist#347) — first-boot-seed the
+-                        // HUMANITY_ACCORD holder rooting-anchor rows, then
+-                        // fail-secure verify.
+-                        if let Err(e) = pg
+-                            .seed_genesis_accord_holders(
+-                                &crate::federation::genesis::effective_accord_holder_records(),
+-                            )
+-                            .await
+-                        {
+-                            tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+-                        }
+-                        // v13.4.1 (CIRISPersist#392) — run the SAME shared seed
+-                        // routine `Engine::with_signer` does (verify anchor →
+-                        // family #386 → canonical #390). Previously this pyo3 ctor
+-                        // stopped at the holder seed, so wheel consumers got no
+-                        // family + no canonical row — the seed paths had drifted.
+-                        // v31.0.0 (CIRISPersist#648) — and the SAME survivability
+-                        // classification, so the wheel and the Rust ctor cannot
+-                        // disagree about which faults a node may boot through.
+-                        crate::federation::genesis::seed_family_and_canonical(&pg)
+-                            .await
+-                            .or_else(pre_genesis_or_refuse)
+-                            .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
+-                        Ok::<_, PyErr>(Arc::new(pg))
+-                    })
++                            let pg = PostgresBackend::connect(dsn)
++                                .await
++                                .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
++                            pg.run_migrations()
++                                .await
++                                .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
++                            // v62.0.0 (JSON-cut slice D, with C2's boot) — boot
++                            // pre-genesis: no bundle/1 seed; report the posture.
++                            report_genesis_at_boot(&pg).await;
++                            Ok::<_, PyErr>(Arc::new(pg))
++                        })
+                     })?;
+                     BackendDispatch::Postgres(pg)
+                 }
+@@ -1873,48 +1864,31 @@ impl PyEngine {
+                         || dsn == "sqlite://:memory:";
+                     let sq = py.detach(|| {
+                         runtime.block_on(async {
+-                        let sq = if in_memory {
+-                            SqliteBackend::open_in_memory()
+-                                .await
+-                                .map_err(|e| PyRuntimeError::new_err(format!("sqlite open: {e}")))?
+-                        } else {
+-                            // Strip the `sqlite:///` (3-slash) or
+-                            // `sqlite://` (2-slash) prefix to recover
+-                            // the on-disk path. rusqlite::open takes a
+-                            // path verbatim.
+-                            let path = dsn
+-                                .strip_prefix("sqlite:///")
+-                                .or_else(|| dsn.strip_prefix("sqlite://"))
+-                                .unwrap_or(dsn);
+-                            SqliteBackend::open(path)
++                            let sq = if in_memory {
++                                SqliteBackend::open_in_memory().await.map_err(|e| {
++                                    PyRuntimeError::new_err(format!("sqlite open: {e}"))
++                                })?
++                            } else {
++                                // Strip the `sqlite:///` (3-slash) or
++                                // `sqlite://` (2-slash) prefix to recover
++                                // the on-disk path. rusqlite::open takes a
++                                // path verbatim.
++                                let path = dsn
++                                    .strip_prefix("sqlite:///")
++                                    .or_else(|| dsn.strip_prefix("sqlite://"))
++                                    .unwrap_or(dsn);
++                                SqliteBackend::open(path).await.map_err(|e| {
++                                    PyRuntimeError::new_err(format!("sqlite open: {e}"))
++                                })?
++                            };
++                            sq.run_migrations()
+                                 .await
+-                                .map_err(|e| PyRuntimeError::new_err(format!("sqlite open: {e}")))?
+-                        };
+-                        sq.run_migrations()
+-                            .await
+-                            .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
+-                        // v12.0.2 (CIRISPersist#347) — first-boot-seed the
+-                        // HUMANITY_ACCORD holder rooting-anchor rows, then
+-                        // fail-secure verify.
+-                        if let Err(e) = sq
+-                            .seed_genesis_accord_holders(
+-                                &crate::federation::genesis::effective_accord_holder_records(),
+-                            )
+-                            .await
+-                        {
+-                            tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+-                        }
+-                        // v13.4.1 (CIRISPersist#392) — same shared seed routine as
+-                        // Engine::with_signer (verify anchor → family #386 →
+-                        // canonical #390); this pyo3 ctor previously stopped at the
+-                        // holder seed, so wheel consumers got no family + canonical.
+-                        // v31.0.0 (CIRISPersist#648) — same survivability rule too.
+-                        crate::federation::genesis::seed_family_and_canonical(&sq)
+-                            .await
+-                            .or_else(pre_genesis_or_refuse)
+-                            .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
+-                        Ok::<_, PyErr>(Arc::new(sq))
+-                    })
++                                .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
++                            // v62.0.0 (JSON-cut slice D, with C2's boot) — boot
++                            // pre-genesis: no bundle/1 seed; report the posture.
++                            report_genesis_at_boot(&sq).await;
++                            Ok::<_, PyErr>(Arc::new(sq))
++                        })
+                     })?;
+                     BackendDispatch::Sqlite(sq)
+                 }
+@@ -6098,6 +6072,10 @@ impl PyEngine {
+     /// v62.0.0 deleted the cold-path attach. `algorithm` MUST be `"hybrid"`.
+     fn put_public_key(&self, py: Python<'_>, signed_key_record_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("key_record")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let record: crate::federation::SignedKeyRecord =
+@@ -6185,6 +6163,10 @@ impl PyEngine {
+         signed_key_record_json: &str,
+     ) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("key_record")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let record: crate::federation::SignedKeyRecord =
+@@ -6349,6 +6331,10 @@ impl PyEngine {
+     ) -> PyResult<String> {
+         let _ = (py, signed_key_record_json);
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("key_record")
++            .map_err(federation_err_to_py)?;
+         Err(federation_err_to_py(
+             crate::federation::Error::EnvelopeKindRetired {
+                 kind: crate::federation::replication_policy::EnvelopeKind::Key,
+@@ -6369,6 +6355,10 @@ impl PyEngine {
+     /// outcomes, not exceptions.
+     fn rebind_key_record(&self, py: Python<'_>, signed_key_record_json: &str) -> PyResult<String> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("key_record")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let record: crate::federation::SignedKeyRecord =
+                 serde_json::from_str(signed_key_record_json).map_err(|e| {
+@@ -6504,6 +6494,13 @@ impl PyEngine {
+                 serde_json::from_str(signed_attestation_json).map_err(|e| {
+                     PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
+                 })?;
++            // v62.0.0 (JSON-cut slice D) — an earlier-form row is refused by name
++            // once the switch is on; a row that carries its edition-2 statement passes.
++            crate::federation::edition2::door::refuse_earlier_form_row(
++                "attestation",
++                &att.attestation,
++            )
++            .map_err(federation_err_to_py)?;
+             let outcome = py.detach(|| match &self.backend {
+                 #[cfg(feature = "postgres")]
+                 BackendDispatch::Postgres(pg) => {
+@@ -6538,6 +6535,242 @@ impl PyEngine {
+         })
+     }
+ 
++    /// v62.0.0 (JSON-cut slice D; CC 2.6.1, 2.6.1.12) — **the edition-2
++    /// statement door**, the Python twin of
++    /// [`Engine::put_edition2_statement`](crate::engine::Engine::put_edition2_statement).
++    /// `statement` is one `COSE_Sign1` (tag 18) as received;
++    /// `offered_row_id` the 64-hex id the carrier names it by, if any (it
++    /// must be the id the bytes compute).
++    ///
++    /// Returns JSON `{"plane": "key_plane"|"voice"|"row"|"pending", "row_id": hex,
++    /// "new": bool}`. A refusal raises `ValueError`, the type of the JSON
++    /// door it replaces: `federation_malformed_row: edition2: <token>`
++    /// (`earlier_form_object` for a JSON object or bytes in no form,
++    /// `row_id_mismatch`, `row_ref_edition_1`, `kid_not_of_iss`, ...), the
++    /// retryable `federation_attester_key_unknown`, and every refusal of the
++    /// attestation gates exactly as `put_attestation` raises it.
++    #[pyo3(signature = (statement, offered_row_id = None))]
++    fn put_edition2_statement(
++        &self,
++        py: Python<'_>,
++        statement: &[u8],
++        offered_row_id: Option<&str>,
++    ) -> PyResult<String> {
++        self.ensure_usable()?;
++        catch_panic(|| {
++            let offered = match offered_row_id {
++                None => None,
++                Some(s) => Some(parse_digest32_hex("offered_row_id", s)?),
++            };
++            let backend = match &self.backend {
++                #[cfg(feature = "postgres")]
++                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
++                #[cfg(feature = "sqlite")]
++                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
++            };
++            let signer = self.signer.clone();
++            let local_signer = self.local_signer.clone();
++            let runtime = self.runtime.clone();
++            let statement = statement.to_vec();
++            let outcome = py.detach(move || {
++                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
++                runtime.block_on(async move {
++                    engine
++                        .put_edition2_statement(&statement, offered)
++                        .await
++                        .map_err(federation_err_to_py)
++                })
++            })?;
++            Ok(edition2_statement_outcome_json(&outcome).to_string())
++        })
++    }
++
++    /// v62.0.0 (JSON-cut slice D) — **the replicated statement door**: one
++    /// edition-2 statement as a peer delivered it, under the id the peer
++    /// offered it as, at tier `federation`, through every gate
++    /// [`put_edition2_statement`](Self::put_edition2_statement) runs. FFI
++    /// mirror of
++    /// [`apply_replicated_statement`](crate::federation::edition2::ingest::apply_replicated_statement);
++    /// the edition-2 twin of `apply_replicated_attestation`.
++    ///
++    /// Returns JSON, every outcome advancing the sender's cursor:
++    /// `{"outcome": "admitted"|"unchanged", "plane", "row_id", "new",
++    /// "advances_cursor": true}` or `{"outcome": "refused", "reason":
++    /// "store_conflict", "advances_cursor": true}` (a lost race: fail closed,
++    /// held rows untouched, safe to re-offer). A statement whose signer's key
++    /// record is not held raises the retryable
++    /// `ValueError(federation_attester_key_unknown)`: the cursor must NOT
++    /// advance past it. Every other refusal raises as
++    /// [`put_edition2_statement`](Self::put_edition2_statement) does.
++    fn apply_replicated_statement(
++        &self,
++        py: Python<'_>,
++        statement: &[u8],
++        offered_row_id: &str,
++    ) -> PyResult<String> {
++        self.ensure_usable()?;
++        catch_panic(|| {
++            let offered = parse_digest32_hex("offered_row_id", offered_row_id)?;
++            let dir = self.federation_directory_arc();
++            let runtime = self.runtime.clone();
++            let statement = statement.to_vec();
++            let outcome = py.detach(move || {
++                runtime.block_on(async move {
++                    crate::federation::edition2::ingest::apply_replicated_statement(
++                        dir.as_ref(),
++                        &statement,
++                        &offered,
++                    )
++                    .await
++                    .map_err(federation_err_to_py)
++                })
++            })?;
++            Ok(replicated_statement_outcome_json(&outcome).to_string())
++        })
++    }
++
++    /// v62.0.0 (JSON-cut slice D; CC 2.6.1.11, CC 2.7.8) — **the genesis
++    /// bundles in force** on this node: the tips of the held genesis lineage
++    /// as CIRISVerify places them
++    /// ([`bundles_in_force`](crate::federation::edition2::genesis::bundles_in_force)),
++    /// the bundle/2 accessor that replaces reading bundle/1
++    /// `serve_nodes[].record.key_id`.
++    ///
++    /// Returns a JSON list, empty when no bundle is held, one entry per tip:
++    /// `{"object_id": hex, "version": int, "prev": hex|null, "asserted_at":
++    /// ms, "family_key_id": str, "holders": [identity-ref…], "serve_nodes":
++    /// [identity-ref…], "counted": [identity-ref…]}` (`holders` in roster
++    /// order, `serve_nodes` in seat order). Two entries are a fork; a reader
++    /// takes only what both name. Directory read failures raise as the other
++    /// federation reads.
++    fn bundles_in_force_json(&self, py: Python<'_>) -> PyResult<String> {
++        self.ensure_usable()?;
++        catch_panic(|| {
++            let dir = self.federation_directory_arc();
++            let runtime = self.runtime.clone();
++            let tips = py.detach(move || {
++                runtime.block_on(async move {
++                    crate::federation::edition2::genesis::bundles_in_force(dir.as_ref())
++                        .await
++                        .map_err(federation_err_to_py)
++                })
++            })?;
++            let out: Vec<serde_json::Value> = tips
++                .iter()
++                .map(|t| {
++                    serde_json::json!({
++                        "object_id": hex::encode(t.object_id),
++                        "version": t.version,
++                        "prev": t.prev.as_ref().map(hex::encode),
++                        "asserted_at": t.asserted_at,
++                        "family_key_id": t.family_key_id,
++                        "holders": t.holders.iter().map(|h| h.identity_ref.as_str()).collect::<Vec<_>>(),
++                        "serve_nodes": t.seats.iter().map(|x| x.identity_ref.as_str()).collect::<Vec<_>>(),
++                        "counted": t.counted,
++                    })
++                })
++                .collect();
++            Ok(serde_json::Value::Array(out).to_string())
++        })
++    }
++
++    /// v62.0.0 (P2c; CC 2.7, CC 3.1.5) — **the standing of every identity
++    /// amendment about `agent`**, read now: FFI mirror of
++    /// [`amendment_standings_for`](crate::federation::identity_amendment::amendment_standings_for).
++    /// An amendment is admitted and HELD when the approval it cites does not
++    /// authorise it (not held, not approved, a different `amendment_digest`,
++    /// about another agent, signed by an unseated WA); nothing is stored, so
++    /// a later read sees a later approval. Consumers ask THIS, never the bare
++    /// row's presence. Retraction is the reader's usual fold, not applied.
++    ///
++    /// Returns a JSON list: `[{"row_id": str, "standing": "in_force"|"held",
++    /// "token": str|null, "reason": str|null, "detail": str|null}]`
++    /// (`token` is `identity_amendment_unauthorized` or
++    /// `amendment_digest_mismatch`). Directory read failures raise as the
++    /// other federation reads.
++    fn amendment_standings_json(&self, py: Python<'_>, agent: &str) -> PyResult<String> {
++        self.ensure_usable()?;
++        catch_panic(|| {
++            let dir = self.federation_directory_arc();
++            let runtime = self.runtime.clone();
++            let agent = agent.to_owned();
++            let standings = py.detach(move || {
++                runtime.block_on(async move {
++                    crate::federation::identity_amendment::amendment_standings_for(
++                        dir.as_ref(),
++                        &agent,
++                    )
++                    .await
++                    .map_err(federation_err_to_py)
++                })
++            })?;
++            let out: Vec<serde_json::Value> = standings
++                .iter()
++                .map(|(row, standing)| {
++                    use crate::federation::identity_amendment::AmendmentStanding;
++                    let detail = match standing {
++                        AmendmentStanding::InForce => None,
++                        AmendmentStanding::Held { detail, .. } => Some(detail.as_str()),
++                    };
++                    serde_json::json!({
++                        "row_id": row.attestation_id,
++                        "standing": if standing.is_in_force() { "in_force" } else { "held" },
++                        "token": standing.token(),
++                        "reason": standing.reason(),
++                        "detail": detail,
++                    })
++                })
++                .collect();
++            Ok(serde_json::Value::Array(out).to_string())
++        })
++    }
++
++    /// v62.0.0 (JSON-cut slice D) — **serve the held edition-2 statements**
++    /// after `cursor`, in THIS node's admission order, at most `limit`
++    /// (clamped to 1000 by the store): FFI mirror of
++    /// [`FederationDirectory::edition2_statements_since`](crate::federation::FederationDirectory::edition2_statements_since).
++    /// Each item is `(cursor, statement)`: the statement's bytes as received
++    /// (CC 2.6.1.2) and the opaque cursor (`"<admitted_us>:<statement_id
++    /// hex>"`) to pass back to resume after it. `None` starts from the
++    /// first. Raises `ValueError` for a malformed cursor.
++    #[pyo3(signature = (cursor = None, limit = 1000))]
++    fn edition2_statements_since(
++        &self,
++        py: Python<'_>,
++        cursor: Option<&str>,
++        limit: u32,
++    ) -> PyResult<Vec<(String, Py<PyBytes>)>> {
++        self.ensure_usable()?;
++        catch_panic(|| {
++            let cursor = match cursor {
++                None => None,
++                Some(s) => Some(parse_statement_cursor(s)?),
++            };
++            let dir = self.federation_directory_arc();
++            let runtime = self.runtime.clone();
++            let served = py.detach(move || {
++                runtime.block_on(async move {
++                    crate::federation::FederationDirectory::edition2_statements_since(
++                        dir.as_ref(),
++                        cursor.as_ref(),
++                        limit,
++                    )
++                    .await
++                    .map_err(federation_err_to_py)
++                })
++            })?;
++            Ok(served
++                .iter()
++                .map(|s| {
++                    (
++                        format_statement_cursor(&s.cursor),
++                        PyBytes::new(py, &s.bytes).unbind(),
++                    )
++                })
++                .collect())
++        })
++    }
++
+     /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13), v55.0.0 (#989, CC
+     /// 3.3.2 rc7) — **admit one replicated key-grant row and project its
+     /// wrap.** FFI mirror of
+@@ -6566,6 +6799,10 @@ impl PyEngine {
+         signed_key_grant_json: &str,
+     ) -> PyResult<String> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("key_grant")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let set: crate::federation::key_grant::SignedKeyGrantRow =
+@@ -7553,6 +7790,13 @@ impl PyEngine {
+                 serde_json::from_str(signed_attestation_json).map_err(|e| {
+                     PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
+                 })?;
++            // v62.0.0 (JSON-cut slice D) — an earlier-form row is refused by name
++            // once the switch is on; a row that carries its edition-2 statement passes.
++            crate::federation::edition2::door::refuse_earlier_form_row(
++                "attestation",
++                &att.attestation,
++            )
++            .map_err(federation_err_to_py)?;
+ 
+             py.detach(|| match &self.backend {
+                 #[cfg(feature = "postgres")]
+@@ -8309,6 +8553,10 @@ impl PyEngine {
+     /// signs a missing ML-DSA-65 half (the PQC cold path is deleted).
+     fn put_revocation(&self, py: Python<'_>, signed_revocation_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("revocation")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let rev: crate::federation::SignedRevocation =
+@@ -8466,6 +8714,10 @@ impl PyEngine {
+         evidence_json: &str,
+     ) -> PyResult<String> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("accord_evidence")
++            .map_err(federation_err_to_py)?;
+         let evidence: crate::federation::accord_carriage::AccordQuorumEvidence =
+             serde_json::from_str(evidence_json)
+                 .map_err(|e| PyValueError::new_err(format!("accord evidence JSON decode: {e}")))?;
+@@ -9975,6 +10227,10 @@ impl PyEngine {
+     /// `ValueError`; an identical re-PUT is idempotent.
+     fn put_delivery_receipt(&self, py: Python<'_>, receipt_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("delivery_receipt")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let receipt: crate::federation::stream_receipt::DeliveryReceipt =
+                 serde_json::from_str(receipt_json).map_err(|e| {
+@@ -10165,6 +10421,10 @@ impl PyEngine {
+     /// ```
+     fn put_identity_occurrence_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("identity_occurrence")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             // v14.0.0 (CIRISPersist#418) — this endpoint takes a RAW (unsigned)
+@@ -10415,6 +10675,10 @@ impl PyEngine {
+         leaves_b64_json: Option<&str>,
+     ) -> PyResult<String> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("wholeness_witness")
++            .map_err(federation_err_to_py)?;
+         if !legacy_positional.is_empty() {
+             return Err(pyo3::exceptions::PyTypeError::new_err(
+                 PUT_WHOLENESS_WITNESS_LEGACY_SHAPE,
+@@ -10768,6 +11032,10 @@ impl PyEngine {
+     /// authority signature is rejected fail-closed.
+     fn put_family_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("family")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let value: serde_json::Value = serde_json::from_str(payload_json)
+@@ -10836,6 +11104,10 @@ impl PyEngine {
+     /// `put_community` hybrid-Strict-verifies them before any write.
+     fn put_community_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("community")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let value: serde_json::Value = serde_json::from_str(payload_json)
+@@ -10917,6 +11189,10 @@ impl PyEngine {
+     /// "refused", "reason"?: <rule>}`. Nothing is ever deleted.
+     fn put_lineage_head_cosign_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("lineage_head_cosign")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let cosign: crate::federation::lineage_witness::LineageHeadCosign =
+@@ -11010,6 +11286,10 @@ impl PyEngine {
+     /// (`federation_conflict`, ValueError).
+     fn put_accord_proposal_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("accord_quorum")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let v: serde_json::Value = serde_json::from_str(payload_json)
+@@ -11094,6 +11374,10 @@ impl PyEngine {
+     /// [<ThresholdMember>...] }`. Verify-before-mutation + M6 dedup.
+     fn put_accord_participation_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("accord_quorum")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let v: serde_json::Value = serde_json::from_str(payload_json)
+@@ -11155,6 +11439,10 @@ impl PyEngine {
+     /// it carried is removed, and dropping it silently would hide that.
+     fn put_accord_decision_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("accord_quorum")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let v: serde_json::Value = serde_json::from_str(payload_json)
+@@ -11528,6 +11816,10 @@ impl PyEngine {
+         response_json: &str,
+     ) -> PyResult<String> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("genesis_bundle")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let response: crate::federation::canonical_community::TrustRootBundleResponse =
+@@ -13065,6 +13357,10 @@ impl PyEngine {
+         notice_json: &str,
+     ) -> PyResult<String> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("purge")
++            .map_err(federation_err_to_py)?;
+         let selection: crate::federation::steward_purge::PurgeSelection =
+             serde_json::from_str(selection_json)
+                 .map_err(|e| PyValueError::new_err(format!("purge selection_json: {e}")))?;
+@@ -13162,6 +13458,10 @@ impl PyEngine {
+     /// re-derived from the ids before any tombstone lands. Deletes nothing.
+     fn apply_replicated_purge_json(&self, py: Python<'_>, bundle_json: &str) -> PyResult<String> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("purge")
++            .map_err(federation_err_to_py)?;
+         let bundle: crate::federation::steward_purge::PurgeBundle =
+             serde_json::from_str(bundle_json)
+                 .map_err(|e| PyValueError::new_err(format!("purge bundle_json: {e}")))?;
+@@ -15702,6 +16002,10 @@ impl PyEngine {
+     /// Registry, or unknown key_id.
+     fn federation_grant_trust(&self, py: Python<'_>, signed_grant_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("trust_grant")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let grant: crate::federation::SignedTrustGrant =
+@@ -15746,6 +16050,10 @@ impl PyEngine {
+     /// granter — only the granter withdraws its own grant.
+     fn federation_revoke_trust(&self, py: Python<'_>, revocation_json: &str) -> PyResult<()> {
+         self.ensure_usable()?;
++        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
++        // before it is decoded once the switch is on (inert until slice F).
++        crate::federation::edition2::door::refuse_earlier_form("trust_grant")
++            .map_err(federation_err_to_py)?;
+         catch_panic(|| {
+             let runtime = self.runtime.clone();
+             let revocation: crate::federation::SignedTrustRevocation =
+@@ -32965,6 +33273,95 @@ fn erasure_err_to_py(e: crate::store::Error) -> PyErr {
+     }
+ }
+ 
++/// v62.0.0 (JSON-cut slice D) — a 32-byte id the caller passes as 64 hex
++/// (an offered row id, a pinned genesis object id). `what` names the
++/// argument in the `ValueError`.
++fn parse_digest32_hex(what: &str, s: &str) -> PyResult<crate::federation::edition2::Digest32> {
++    let bytes = hex::decode(s)
++        .map_err(|e| PyValueError::new_err(format!("{what}: 64 hex characters expected: {e}")))?;
++    <crate::federation::edition2::Digest32>::try_from(bytes.as_slice()).map_err(|_| {
++        PyValueError::new_err(format!(
++            "{what}: 64 hex characters expected (32 bytes), got {} bytes",
++            bytes.len()
++        ))
++    })
++}
++
++/// v62.0.0 (JSON-cut slice D) — the opaque Python spelling of a
++/// [`StatementCursor`](crate::federation::edition2::store::StatementCursor):
++/// `"<admitted_us>:<statement_id hex>"`.
++fn format_statement_cursor(c: &crate::federation::edition2::store::StatementCursor) -> String {
++    format!("{}:{}", c.admitted_us, hex::encode(c.statement_id))
++}
++
++/// The inverse of [`format_statement_cursor`].
++fn parse_statement_cursor(
++    s: &str,
++) -> PyResult<crate::federation::edition2::store::StatementCursor> {
++    let (us, id) = s.split_once(':').ok_or_else(|| {
++        PyValueError::new_err("cursor: \"<admitted_us>:<statement_id hex>\" expected")
++    })?;
++    let admitted_us: i64 = us
++        .parse()
++        .map_err(|e| PyValueError::new_err(format!("cursor: admitted_us: {e}")))?;
++    Ok(crate::federation::edition2::store::StatementCursor {
++        admitted_us,
++        statement_id: parse_digest32_hex("cursor", id)?,
++    })
++}
++
++/// v62.0.0 (JSON-cut slice D) — a
++/// [`StatementOutcome`](crate::federation::edition2::ingest::StatementOutcome)
++/// as the JSON the Python doors return: `{"plane", "row_id", "new"}`;
++/// `plane` is `key_plane`, `voice`, `row` or `pending` (the voice is kept,
++/// no typed row yet: the group protocol is short).
++fn edition2_statement_outcome_json(
++    outcome: &crate::federation::edition2::ingest::StatementOutcome,
++) -> serde_json::Value {
++    use crate::federation::edition2::ingest::StatementOutcome;
++    let (plane, row_id, new) = match outcome {
++        StatementOutcome::KeyPlane { row_id, new } => ("key_plane", row_id, *new),
++        StatementOutcome::Voice { row_id, new } => ("voice", row_id, *new),
++        StatementOutcome::Row { row_id, new } => ("row", row_id, *new),
++        StatementOutcome::Pending { row_id, new } => ("pending", row_id, *new),
++    };
++    serde_json::json!({ "plane": plane, "row_id": row_id.hex(), "new": new })
++}
++
++/// v62.0.0 (JSON-cut slice D) — a
++/// [`ReplicatedStatementOutcome`](crate::federation::edition2::ingest::ReplicatedStatementOutcome)
++/// as JSON: `outcome` (`admitted` / `unchanged` / `refused`),
++/// `advances_cursor`, and the placement or the refusal reason.
++fn replicated_statement_outcome_json(
++    outcome: &crate::federation::edition2::ingest::ReplicatedStatementOutcome,
++) -> serde_json::Value {
++    use crate::federation::edition2::ingest::ReplicatedStatementOutcome;
++    let advances = outcome.advances_cursor();
++    match outcome {
++        ReplicatedStatementOutcome::Admitted(o) | ReplicatedStatementOutcome::Unchanged(o) => {
++            let mut v = edition2_statement_outcome_json(o);
++            if let serde_json::Value::Object(m) = &mut v {
++                let tag = if matches!(outcome, ReplicatedStatementOutcome::Admitted(_)) {
++                    "admitted"
++                } else {
++                    "unchanged"
++                };
++                m.insert("outcome".to_owned(), serde_json::Value::from(tag));
++                m.insert(
++                    "advances_cursor".to_owned(),
++                    serde_json::Value::from(advances),
++                );
++            }
++            v
++        }
++        ReplicatedStatementOutcome::Refused { reason } => serde_json::json!({
++            "outcome": "refused",
++            "reason": reason.as_str(),
++            "advances_cursor": advances,
++        }),
++    }
++}
++
+ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
+     let kind = e.kind();
+     tracing::warn!(error = %e, kind = kind, "federation error");
+@@ -37935,6 +38332,18 @@ fn accord_threshold_for(roster_size: usize) -> usize {
+ /// refusal's stable token (the segment after the kind in the `ValueError`
+ /// text). Persist's own answer, so a bridge keeps no table of its own.
+ /// Raises `ValueError` for a token outside the set — never a guess.
++/// v62.0.0 (JSON-cut slice D; CC 2.6.1.12) — are the earlier-form doors shut
++/// on this build? `False` until slice F flips
++/// `edition2::door::EARLIER_FORM_DOORS_SHUT`; then every earlier-form door
++/// (the JSON `put_*` / `apply_replicated_*` methods) raises
++/// `ValueError(federation_malformed_row: <plane>: earlier_form_object)`
++/// before it decodes its object. A host reads it to know which form its
++/// peers' doors take; a Python witness of the refusal gates on it.
++#[pyfunction]
++fn earlier_form_doors_shut() -> bool {
++    crate::federation::edition2::door::earlier_form_doors_shut()
++}
++
+ #[pyfunction]
+ fn key_grant_refusal_is_retryable(reason: &str) -> PyResult<bool> {
+     crate::federation::key_grant::KeyGrantRefusalReason::from_token(reason)
+@@ -38043,6 +38452,8 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+     m.add_function(pyo3::wrap_pyfunction!(accord_threshold_for, m)?)?;
+     // v60.1.0 (CIRISPersist#1064) — persist's own retryability answers.
+     m.add_function(pyo3::wrap_pyfunction!(key_grant_refusal_is_retryable, m)?)?;
++    // v62.0.0 (JSON-cut slice D) — the earlier-form switch, read-only.
++    m.add_function(pyo3::wrap_pyfunction!(earlier_form_doors_shut, m)?)?;
+     m.add_function(pyo3::wrap_pyfunction!(dimension_rejection_is_retryable, m)?)?;
+     // v61.3.0 (CIRISPersist#1252) — the one ref rule.
+     m.add_function(pyo3::wrap_pyfunction!(attestation_wire_hash, m)?)?;

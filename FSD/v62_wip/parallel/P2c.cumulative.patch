@@ -1,0 +1,1267 @@
+diff --git a/src/federation/amendment_digest_invariants.rs b/src/federation/amendment_digest_invariants.rs
+new file mode 100644
+index 00000000..739a9660
+--- /dev/null
++++ b/src/federation/amendment_digest_invariants.rs
+@@ -0,0 +1,378 @@
++//! v62 (CC 3.1.5 rc21; CIRISServer#1365/#1366, CIRISServer 0.5.250) —
++//! **an identity amendment is the exact text the Wise Authority approved**,
++//! witnessed on every backend through every door a row enters by.
++//!
++//! v62 (CC 2.7, "a row is never refused for what another row says") —
++//! what the CITED APPROVAL decides never refuses the amendment: it is
++//! admitted and HELD, and its force is `identity_amendment::amendment_standing`,
++//! read now.
++//!
++//! - **I2931** — a `deferral:response:approved:v1` carrying `amendment_digest`
++//!   is admitted (no envelope-member gate refuses the member), at the direct
++//!   door and at the replicated door; an amendment whose `amendment_digest`
++//!   equals the approval's is admitted and IN FORCE, at both doors.
++//! - **I2932** — an amendment whose `amendment_digest` differs from the
++//!   approval's is ADMITTED at both doors, held, NOT in force, reporting
++//!   `amendment_digest_mismatch` (`amendment_digest_differs_from_approved`).
++//! - **I2933** — an amendment citing an approval that carries no
++//!   `amendment_digest` (the earlier server's shape), or an ill-shaped one,
++//!   is admitted, held, not in force, reporting `amendment_digest_mismatch`
++//!   (`response_carries_no_amendment_digest` /
++//!   `response_amendment_digest_not_hex64`).
++//! - **I2934** — an amendment that arrives AHEAD of its approval is admitted
++//!   and held (`identity_amendment_unauthorized`, `response_not_held`); the
++//!   matching approval arriving makes it count, with nothing re-written.
++//!   `amendment_standings_for(agent)` lists every admitted amendment, and
++//!   exactly the authorised ones are in force. The door still refuses what
++//!   the amendment's OWN bytes decide (`evidence_does_not_cite_response`).
++//! - **I2935** — the WA WITHDRAWS its approval: the amendment that was in
++//!   force reads held (`identity_amendment_unauthorized`,
++//!   `response_withdrawn`) and stays stored; an amendment under another
++//!   approval stays in force. A `supersedes` is not followed.
++//!
++//! The pure-function witness is I2930 (`identity_amendment::tests`).
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++pub(crate) mod bodies {
++    use crate::federation::identity_amendment as ia;
++    use crate::federation::tier_ingest::test_support as ts;
++    use crate::federation::types::{attestation_type, cohort_scope, Attestation};
++    use crate::federation::{Error, FederationDirectory, SignedAttestation};
++
++    /// **I2931–I2935** — see the module doc.
++    pub(crate) async fn i2931_the_amendment_is_the_text_the_wa_approved(
++        d: &dyn FederationDirectory,
++        tag: &str,
++    ) {
++        let owner = format!("i2931-owner-{tag}");
++        let agent = format!("i2931-agent-{tag}");
++        ts::register_user_role_key(d, &owner).await;
++        ts::register_hybrid_key(d, &agent).await;
++        ts::put_owner_binding(d, &owner, &agent).await;
++
++        let put = |r: Attestation| async move {
++            d.put_attestation(SignedAttestation { attestation: r })
++                .await
++                .map(|_| ())
++        };
++        let replicate = |r: Attestation| async move {
++            d.apply_replicated_attestation(SignedAttestation { attestation: r })
++                .await
++        };
++        let row = |by: &str, about: &str, dimension: &str, extra: serde_json::Value| {
++            let id = uuid::Uuid::new_v4().to_string();
++            let mut env = serde_json::json!({ "id": id, "dimension": dimension });
++            for (k, v) in extra.as_object().unwrap() {
++                env[k] = v.clone();
++            }
++            let mut r = ts::bare_attestation(&id, by, about, &env);
++            r.attestation_type = attestation_type::SCORES.to_owned();
++            r.cohort_scope = cohort_scope::SELF.to_owned();
++            if by == about {
++                r.subject_key_ids = vec![about.to_owned()];
++            }
++            ts::seal_row_in_place(by, &mut r);
++            r
++        };
++
++        let request = row(
++            &agent,
++            &agent,
++            ia::DEFERRAL_REQUEST_DIMENSION,
++            serde_json::json!({ "deferral_id": "d-1", "reason_digest": "ab".repeat(32) }),
++        );
++        let request_id = request.attestation_id.clone();
++        put(request).await.expect("I2931: the deferral request");
++
++        // The owner's approval; `digest` is what it names (None: no member).
++        let approval = |digest: Option<serde_json::Value>| {
++            let mut extra = serde_json::json!({ "references_attestation_id": request_id });
++            if let Some(value) = digest {
++                extra[ia::AMENDMENT_DIGEST_MEMBER] = value;
++            }
++            row(&owner, &agent, ia::DEFERRAL_APPROVED_DIMENSION, extra)
++        };
++        let amendment = |digest: &str, authorized_by: &str| {
++            row(
++                &agent,
++                &agent,
++                ia::IDENTITY_AMENDMENT_DIMENSION,
++                serde_json::json!({
++                    "amendment_digest": digest,
++                    "authorized_by": authorized_by,
++                    "evidence_refs": [authorized_by],
++                }),
++            )
++        };
++        let approved_text = "cd".repeat(32);
++        let other_text = "ef".repeat(32);
++        let standing = |r: Attestation| async move {
++            ia::amendment_standing(d, &r)
++                .await
++                .unwrap()
++                .expect("an identity amendment")
++        };
++        let inserted = |o: crate::federation::attestation_apply::ReplicatedAttestationOutcome,
++                        what: &str| {
++            assert!(
++                matches!(
++                    o,
++                    crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted
++                ),
++                "{what}: inserted, got {o:?}"
++            );
++        };
++
++        // I2931 — the approval carrying the member admits, at both doors.
++        let direct = approval(Some(serde_json::json!(approved_text)));
++        let direct_id = direct.attestation_id.clone();
++        put(direct)
++            .await
++            .unwrap_or_else(|e| panic!("I2931: an approval carrying amendment_digest admits: {e}"));
++        let wired = approval(Some(serde_json::json!(approved_text)));
++        let wired_id = wired.attestation_id.clone();
++        inserted(
++            replicate(wired).await.unwrap_or_else(|e| {
++                panic!("I2931: a replicated approval carrying amendment_digest admits: {e}")
++            }),
++            "I2931 (replicated approval)",
++        );
++        for id in [&direct_id, &wired_id] {
++            let held = d.get_attestation(id).await.unwrap().expect("I2931: held");
++            assert_eq!(
++                held.attestation_envelope[ia::AMENDMENT_DIGEST_MEMBER],
++                serde_json::json!(approved_text),
++                "I2931: the member is stored as signed"
++            );
++        }
++
++        // I2932 — another text: ADMITTED and HELD (CC 2.7), at both doors,
++        // not in force, reporting `amendment_digest_mismatch`.
++        let differs = amendment(&other_text, &direct_id);
++        put(differs.clone())
++            .await
++            .unwrap_or_else(|e| panic!("I2932: a mismatched amendment is admitted: {e}"));
++        let differs_wired = amendment(&other_text, &wired_id);
++        inserted(
++            replicate(differs_wired.clone()).await.unwrap_or_else(|e| {
++                panic!("I2932: a replicated mismatched amendment is admitted: {e}")
++            }),
++            "I2932 (replicated)",
++        );
++        for row in [&differs, &differs_wired] {
++            assert!(d
++                .get_attestation(&row.attestation_id)
++                .await
++                .unwrap()
++                .is_some());
++            let s = standing(row.clone()).await;
++            assert!(!s.is_in_force(), "I2932: not in force");
++            assert_eq!(
++                s.token(),
++                Some(ia::AMENDMENT_DIGEST_MISMATCH),
++                "I2932: {s:?}"
++            );
++            assert_eq!(
++                s.reason(),
++                Some(ia::digest_mismatch_reason::DIGESTS_DIFFER),
++                "I2932: {s:?}"
++            );
++        }
++
++        // I2933 — an approval naming no text (the earlier server's shape), or
++        // an ill-shaped one: the amendment is admitted, held, not in force.
++        let silent = approval(None);
++        let silent_id = silent.attestation_id.clone();
++        put(silent)
++            .await
++            .expect("I2933: the earlier shape of approval stores");
++        let ill = approval(Some(serde_json::json!(approved_text.to_uppercase())));
++        let ill_id = ill.attestation_id.clone();
++        put(ill)
++            .await
++            .expect("I2933: the ill-shaped approval stores");
++        for (cited, reason) in [
++            (
++                &silent_id,
++                ia::digest_mismatch_reason::RESPONSE_NAMES_NO_TEXT,
++            ),
++            (
++                &ill_id,
++                ia::digest_mismatch_reason::RESPONSE_DIGEST_ILL_SHAPED,
++            ),
++        ] {
++            let a = amendment(&approved_text, cited);
++            put(a.clone())
++                .await
++                .unwrap_or_else(|e| panic!("I2933 ({reason}): admitted and held: {e}"));
++            let s = standing(a).await;
++            assert!(!s.is_in_force(), "I2933 ({reason})");
++            assert_eq!(
++                s.token(),
++                Some(ia::AMENDMENT_DIGEST_MISMATCH),
++                "I2933: {s:?}"
++            );
++            assert_eq!(s.reason(), Some(reason), "I2933: {s:?}");
++        }
++
++        // I2934 — the approval arrives AFTER the amendment: the amendment is
++        // admitted and held (`response_not_held`), then the matching approval
++        // makes it count. Nothing is re-written; the standing is re-read.
++        let later = approval(Some(serde_json::json!(approved_text)));
++        let later_id = later.attestation_id.clone();
++        let early = amendment(&approved_text, &later_id);
++        replicate(early.clone()).await.unwrap_or_else(|e| {
++            panic!("I2934: an amendment ahead of its approval is admitted: {e}")
++        });
++        let s = standing(early.clone()).await;
++        assert!(!s.is_in_force(), "I2934: absent approval, not in force");
++        assert_eq!(
++            s.token(),
++            Some(ia::IDENTITY_AMENDMENT_UNAUTHORIZED),
++            "I2934: {s:?}"
++        );
++        assert_eq!(
++            s.reason(),
++            Some(ia::unauthorized_reason::RESPONSE_NOT_HELD),
++            "I2934: {s:?}"
++        );
++        put(later).await.expect("I2934: the approval arrives");
++        assert_eq!(
++            standing(early.clone()).await,
++            ia::AmendmentStanding::InForce,
++            "I2934: the matching approval makes the held amendment count"
++        );
++
++        // I2931 — the approved text is in force, at both doors.
++        let ok = amendment(&approved_text, &direct_id);
++        put(ok.clone())
++            .await
++            .unwrap_or_else(|e| panic!("I2931: the approved text admits: {e}"));
++        assert_eq!(standing(ok.clone()).await, ia::AmendmentStanding::InForce);
++        let ok_wired = amendment(&approved_text, &wired_id);
++        inserted(
++            replicate(ok_wired.clone())
++                .await
++                .unwrap_or_else(|e| panic!("I2931: the replicated approved text admits: {e}")),
++            "I2931 (replicated)",
++        );
++        assert_eq!(
++            standing(ok_wired.clone()).await,
++            ia::AmendmentStanding::InForce
++        );
++
++        // The reader: every amendment about the agent, each with its standing.
++        let all = ia::amendment_standings_for(d, &agent).await.unwrap();
++        let in_force: std::collections::BTreeSet<String> = all
++            .iter()
++            .filter(|(_, s)| s.is_in_force())
++            .map(|(r, _)| r.attestation_id.clone())
++            .collect();
++        assert_eq!(
++            in_force,
++            [&early, &ok, &ok_wired]
++                .iter()
++                .map(|r| r.attestation_id.clone())
++                .collect(),
++            "I2934: exactly the authorised amendments are in force"
++        );
++        assert_eq!(
++            all.len(),
++            7,
++            "I2934: every admitted amendment is listed, held or not"
++        );
++
++        // The door still refuses what the amendment's OWN bytes decide.
++        let mut uncited = amendment(&approved_text, &direct_id);
++        uncited.attestation_envelope["evidence_refs"] = serde_json::json!([]);
++        ts::seal_row_in_place(&agent, &mut uncited);
++        let e = put(uncited).await.unwrap_err();
++        assert!(
++            matches!(e, Error::InvalidArgument(_))
++                && e.to_string().contains(&format!(
++                    "{}: {}",
++                    ia::IDENTITY_AMENDMENT_UNAUTHORIZED,
++                    ia::unauthorized_reason::EVIDENCE_DOES_NOT_CITE
++                )),
++            "the door refuses an amendment that does not cite its approval: {e}"
++        );
++
++        // I2935 — the WA WITHDRAWS its approval: the amendment that was in
++        // force reads held (`response_withdrawn`); the other approval's
++        // amendment is untouched. A withdrawal is followed, a supersession
++        // is not (the amendment names its approval row).
++        assert_eq!(standing(ok.clone()).await, ia::AmendmentStanding::InForce);
++        ts::put_retraction(
++            d,
++            &owner,
++            &agent,
++            &direct_id,
++            crate::federation::types::attestation_type::WITHDRAWS,
++        )
++        .await
++        .unwrap_or_else(|e| panic!("I2935: the WA withdraws its approval: {e}"));
++        let s = standing(ok.clone()).await;
++        assert!(
++            !s.is_in_force(),
++            "I2935: a withdrawn approval authorises nothing"
++        );
++        assert_eq!(
++            s.token(),
++            Some(ia::IDENTITY_AMENDMENT_UNAUTHORIZED),
++            "I2935: {s:?}"
++        );
++        assert_eq!(
++            s.reason(),
++            Some(ia::unauthorized_reason::RESPONSE_WITHDRAWN),
++            "I2935: {s:?}"
++        );
++        assert!(
++            d.get_attestation(&ok.attestation_id)
++                .await
++                .unwrap()
++                .is_some(),
++            "I2935: the amendment stays stored, held"
++        );
++        assert_eq!(
++            standing(ok_wired.clone()).await,
++            ia::AmendmentStanding::InForce,
++            "I2935: the other approval's amendment stays in force"
++        );
++    }
++}
++
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod tests {
++    use super::bodies;
++
++    fn tag(n: &str) -> String {
++        format!("{n}{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i2931_sqlite() {
++        use crate::store::Backend as _;
++        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        bodies::i2931_the_amendment_is_the_text_the_wa_approved(&b, &tag("s")).await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i2931_postgres() {
++        use crate::store::Backend as _;
++        let Some(dsn) = crate::test_pg::empty_dsn() else {
++            eprintln!("I2931 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
++            return;
++        };
++        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
++            .await
++            .unwrap();
++        b.run_migrations().await.unwrap();
++        bodies::i2931_the_amendment_is_the_text_the_wa_approved(&b, &tag("p")).await;
++        eprintln!("i2931_postgres: RAN");
++    }
++}
+diff --git a/src/federation/family_rules.rs b/src/federation/family_rules.rs
+index 88f7e886..07aad32b 100644
+--- a/src/federation/family_rules.rs
++++ b/src/federation/family_rules.rs
+@@ -216,6 +216,9 @@ pub struct PersistFamilyRule {
+ /// Ordered by gap kind then prefix, so the three populations read as the three
+ /// different asks they are.
+ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
++    // v62 (CC 3.1.5 rc21; CIRISServer#1365/#1366) — the rule gains the
++    // approved-text clause: the cited approval's `amendment_digest` must equal
++    // the amendment's.
+     // v60.1.0 (CIRISPersist#1120) — CC rc10 (`cadd5a9`, untagged) makes the
+     // rule normative and registers `identity_amendment:v1` with it; persist
+     // vendors rc9, which has no row, so the gate's rule is pinned here until
+@@ -225,12 +228,21 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
+         prefix: "identity_amendment:",
+         rule: "an identity_amendment:v1 (attester an occurrence of the agent, subject the \
+                agent, amendment_digest hex64, authorized_by a uuid cited in evidence_refs) \
+-               admits only when the cited deferral:response:approved:v1 is admitted here, is \
++               is in force only when the cited deferral:response:approved:v1 is admitted here, is \
+                about the same agent, and its signer held a WA seat at its asserted_at (the \
+                agent node's owner, self to self; on a split home, whose owner binds only the \
+                node, the user the signing agent key is an occurrence of); \
+-               identity_amendment_unauthorized otherwise",
+-        enforced_at: &["federation::identity_amendment::check_identity_amendment_admission"],
++               identity_amendment_unauthorized otherwise; and (CC 3.1.5 rc21) only when the \
++               cited response's amendment_digest equals the amendment's, the exact text the \
++               WA approved; amendment_digest_mismatch when the response carries none, an \
++               ill-shaped one, or another. v62 (CC 2.7): the response-decided conditions \
++               never refuse; the amendment is admitted and held, in force only while they \
++               hold (identity_amendment::amendment_standing); the door refuses only the \
++               shape, the citation and the signer",
++        enforced_at: &[
++            "federation::identity_amendment::check_identity_amendment_admission",
++            "federation::identity_amendment::amendment_standing",
++        ],
+         gap: RowRuleGap::NoRuleOnTheRow,
+         minted_by_persist: false,
+         cc_ask: "none outstanding: CC rc12 registers the row with this rule \
+diff --git a/src/federation/identity_amendment.rs b/src/federation/identity_amendment.rs
+index 89454a6c..b1af3b08 100644
+--- a/src/federation/identity_amendment.rs
++++ b/src/federation/identity_amendment.rs
+@@ -10,12 +10,51 @@
+ //! uuid; `evidence_refs[]` → the response) is admitted **only** when the
+ //! cited response is admitted, its outcome is approved, its subject is this
+ //! agent, and its attester held a Wise Authority seat at the response's
+-//! `asserted_at`. Otherwise it is refused **`identity_amendment_unauthorized`**.
++//! `asserted_at`. Otherwise it is **`identity_amendment_unauthorized`**.
++//!
++//! # Held, not refused (v62, CC 2.7)
++//!
++//! "A row is never refused for what another row says." Every condition the
++//! CITED RESPONSE decides (held, approved, naming this text, about this
++//! agent, by a seated WA) is the amendment's [`AmendmentStanding`], read by
++//! [`amendment_standing`] (one row) or [`amendment_standings_for`] (an
++//! agent's) at the time of the read. The amendment is ADMITTED at every door
++//! and HELD: it does not count while a condition fails, and it reports the
++//! token and the condition. A matching approval held later makes it count;
++//! nothing is re-written. The door ([`check_identity_amendment_admission`])
++//! refuses only what the amendment's own bytes and its signer decide: the
++//! member shapes ([`Error::MalformedRow`]), `evidence_refs[]` citing
++//! `authorized_by`, and the signer being an occurrence of the agent
++//! (`identity_amendment_unauthorized`).
++//!
++//! # The approved text (CC 3.1.5, rc21)
++//!
++//! An approval authorises ONE text, not "an amendment". CIRISServer 0.5.250
++//! (CIRISServer#1365/#1366, Eric's ruling) puts the `amendment_digest` of the
++//! text the Wise Authority approved into the WA-signed
++//! `deferral:response:approved:v1` row, and CC rc21 adds the clause: the
++//! amendment's `amendment_digest` must EQUAL the cited response's. Otherwise
++//! the amendment is held under **`amendment_digest_mismatch`** (its own token,
++//! [`AMENDMENT_DIGEST_MISMATCH`]), one token for every case, with the case in
++//! the message ([`digest_mismatch_reason`]):
++//!
++//! - the response carries no `amendment_digest` (an approval that names no
++//!   text authorises none — the earlier server's rows, too);
++//! - the response's `amendment_digest` is present but not 64 lowercase hex
++//!   digits. The response row is already admitted, so this is not the
++//!   amendment's malformation: the approval names no text this amendment can
++//!   be;
++//! - the two digests differ.
++//!
++//! The condition is read after the outcome (2) and before the subject and
++//! seat conditions. In the edition-2 forward form the member is a hash
++//! digest (`[-16, bstr .size 32]`); the edition-2 ingest hands the gates its
++//! bytes as lowercase hex, so this gate compares the hex form either way.
+ //!
+ //! CIRISServer (0.5.234, `agent_deferral.rs`) enforces the rule at its own
+ //! authoring door, which is the only way a server node MAKES an amendment.
+ //! A replicated amendment from another producer reached no gate at all; this
+-//! is that gate, at every door a row enters by.
++//! module is that rule, at every door a row enters by and at every read.
+ //!
+ //! # Who holds a WA seat
+ //!
+@@ -34,13 +73,15 @@
+ //! the login anchor), that person is the owner. An unowned agent has no
+ //! seated WA, so nothing authorises its amendment.
+ //!
+-//! # The refusal's shape
++//! # The refusal's shape (the door's two self-contained refusals)
+ //!
+ //! `identity_amendment_unauthorized` rides [`Error::InvalidArgument`] with the
+ //! token leading its message (the `reconsideration_community_mismatch`
+ //! precedent; a new `Error` arm would be a break in a minor). The ill-shaped
+ //! members (`amendment_digest`, `authorized_by`) are
+ //! [`Error::MalformedRow`]: those bytes can never be an amendment.
++//! A held amendment reports its token and case through
++//! [`AmendmentStanding::Held`], never as an error.
+ 
+ use super::admission::envelope_dimension;
+ use super::types::{attestation_type, Attestation};
+@@ -66,16 +107,32 @@ pub const AUTHORIZED_BY_MEMBER: &str = "authorized_by";
+ /// The member that cites the response as evidence.
+ pub const EVIDENCE_REFS_MEMBER: &str = "evidence_refs";
+ 
+-/// CC 3.1.5 (rc10) — the refusal token.
++/// CC 3.1.5 (rc10) — the token: a door refusal for the two self-contained
++/// conditions, a held amendment's reason for the response-decided ones.
+ pub const IDENTITY_AMENDMENT_UNAUTHORIZED: &str = "identity_amendment_unauthorized";
+ 
+-/// Which CC 3.1.5 condition an unauthorized amendment failed. Carried in the
+-/// refusal's message after the token; persist-local.
++/// CC 3.1.5 (rc21; CIRISServer#1365/#1366) — the held amendment's token when
++/// it is not the exact text the Wise Authority approved: the cited
++/// approval's `amendment_digest` is absent, ill-shaped, or another digest.
++pub const AMENDMENT_DIGEST_MISMATCH: &str = "amendment_digest_mismatch";
++
++/// Which case an [`AMENDMENT_DIGEST_MISMATCH`] standing is; persist-local.
++pub mod digest_mismatch_reason {
++    /// The approval carries no `amendment_digest`: it names no text.
++    pub const RESPONSE_NAMES_NO_TEXT: &str = "response_carries_no_amendment_digest";
++    /// The approval's `amendment_digest` is not 64 lowercase hex digits.
++    pub const RESPONSE_DIGEST_ILL_SHAPED: &str = "response_amendment_digest_not_hex64";
++    /// The approval names another text.
++    pub const DIGESTS_DIFFER: &str = "amendment_digest_differs_from_approved";
++}
++
++/// Which CC 3.1.5 condition an unauthorized amendment failed: in a door
++/// refusal's message after the token, or in a held standing; persist-local.
+ pub mod unauthorized_reason {
+     /// `evidence_refs[]` does not cite the `authorized_by` response.
+     pub const EVIDENCE_DOES_NOT_CITE: &str = "evidence_does_not_cite_response";
+-    /// The cited response is not admitted on this node. The one ordering
+-    /// gap: it may still arrive, and a re-offer after it lands admits.
++    /// The cited response is not held on this node. The ordering gap: it
++    /// may still arrive, and the amendment counts once it does.
+     pub const RESPONSE_NOT_HELD: &str = "response_not_held";
+     /// The cited row is not a `deferral:response:approved:v1`.
+     pub const NOT_APPROVED: &str = "response_not_approved";
+@@ -85,6 +142,65 @@ pub mod unauthorized_reason {
+     pub const NOT_THE_AGENTS_OCCURRENCE: &str = "attester_not_the_agents_occurrence";
+     /// The response's signer held no WA seat at its `asserted_at`.
+     pub const NOT_A_SEATED_WA: &str = "response_signer_not_a_seated_wa";
++    /// v62 (CC 2.7) — the approval is withdrawn (or recanted) by a key
++    /// entitled to retract it: it authorises nothing any more. A held
++    /// standing only, never a door refusal.
++    pub const RESPONSE_WITHDRAWN: &str = "response_withdrawn";
++}
++
++/// v62 (CC 2.7) — **an amendment's standing**: whether the approval it
++/// cites authorises it NOW. A row is never refused for what another row says,
++/// so the door admits an amendment whatever its cited response says, and
++/// every reader of "the amendment in force" asks this.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum AmendmentStanding {
++    /// The cited approval authorises the amendment: it counts.
++    InForce,
++    /// Admitted and held: it does NOT count while `token` / `reason` holds.
++    /// A later matching approval (or the response arriving) makes it count;
++    /// nothing is re-written, the standing is re-read.
++    Held {
++        /// [`IDENTITY_AMENDMENT_UNAUTHORIZED`] or [`AMENDMENT_DIGEST_MISMATCH`].
++        token: &'static str,
++        /// The case: an [`unauthorized_reason`] or a [`digest_mismatch_reason`].
++        reason: &'static str,
++        /// Human detail.
++        detail: String,
++    },
++}
++
++impl AmendmentStanding {
++    /// Does the amendment count?
++    #[must_use]
++    pub fn is_in_force(&self) -> bool {
++        matches!(self, Self::InForce)
++    }
++
++    /// The reason token a held amendment reports (`None` in force).
++    #[must_use]
++    pub fn token(&self) -> Option<&'static str> {
++        match self {
++            Self::InForce => None,
++            Self::Held { token, .. } => Some(token),
++        }
++    }
++
++    /// The case a held amendment reports (`None` in force).
++    #[must_use]
++    pub fn reason(&self) -> Option<&'static str> {
++        match self {
++            Self::InForce => None,
++            Self::Held { reason, .. } => Some(reason),
++        }
++    }
++}
++
++fn held(token: &'static str, reason: &'static str, detail: String) -> AmendmentStanding {
++    AmendmentStanding::Held {
++        token,
++        reason,
++        detail,
++    }
+ }
+ 
+ fn unauthorized(row: &Attestation, reason: &'static str, detail: String) -> Error {
+@@ -95,6 +211,45 @@ fn unauthorized(row: &Attestation, reason: &'static str, detail: String) -> Erro
+     ))
+ }
+ 
++/// CC 3.1.5 (rc21) — **the amendment is the text the WA approved.** `digest`
++/// is the amendment's own (already checked hex64); `response` is the cited
++/// `deferral:response:approved:v1`. A pure function of the two rows. `None`
++/// when the digests are equal; otherwise the held standing, led by
++/// [`AMENDMENT_DIGEST_MISMATCH`].
++fn approved_digest_standing(digest: &str, response: &Attestation) -> Option<AmendmentStanding> {
++    use digest_mismatch_reason as why;
++    let (reason, detail) = match response.attestation_envelope.get(AMENDMENT_DIGEST_MEMBER) {
++        None => (
++            why::RESPONSE_NAMES_NO_TEXT,
++            format!(
++                "the approval {} carries no `{AMENDMENT_DIGEST_MEMBER}`, so it authorises no text",
++                response.attestation_id
++            ),
++        ),
++        Some(serde_json::Value::String(approved)) if is_hex64(approved) => {
++            if approved == digest {
++                return None;
++            }
++            (
++                why::DIGESTS_DIFFER,
++                format!(
++                    "the approval {} names {approved}, the amendment carries {digest}",
++                    response.attestation_id
++                ),
++            )
++        }
++        Some(_) => (
++            why::RESPONSE_DIGEST_ILL_SHAPED,
++            format!(
++                "the approval {}'s `{AMENDMENT_DIGEST_MEMBER}` is not 64 lowercase hex digits, \
++                 so it names no text this amendment can be",
++                response.attestation_id
++            ),
++        ),
++    };
++    Some(held(AMENDMENT_DIGEST_MISMATCH, reason, detail))
++}
++
+ fn malformed(reason: &'static str, detail: String) -> Error {
+     Error::malformed_row(
+         "attestation",
+@@ -133,41 +288,29 @@ async fn person_of_occurrence(
+     Ok(None)
+ }
+ 
+-/// v60.1.0 (CIRISPersist#1120; CC 3.1.5) — the gate. A no-op for every row
+-/// that is not an `identity_amendment:v1`; see the module doc.
++/// The members a well-formed amendment carries: `(amendment_digest,
++/// authorized_by)`. The row's own bytes only.
+ ///
+ /// # Errors
+ ///
+-/// [`Error::MalformedRow`] for an ill-shaped member;
+-/// [`Error::InvalidArgument`] led by [`IDENTITY_AMENDMENT_UNAUTHORIZED`] when
+-/// a CC 3.1.5 condition fails; directory reads.
+-pub async fn check_identity_amendment_admission(
+-    directory: &dyn FederationDirectory,
+-    row: &Attestation,
+-) -> Result<(), Error> {
+-    use unauthorized_reason as why;
+-    if !is_identity_amendment(row) {
+-        return Ok(());
+-    }
++/// [`Error::MalformedRow`] for an absent or ill-shaped member.
++fn amendment_members(row: &Attestation) -> Result<(&str, &str), Error> {
+     let env = &row.attestation_envelope;
+-
+-    // The members' shapes.
+-    let digest = env.get(AMENDMENT_DIGEST_MEMBER);
+-    match digest.map(|v| v.as_str()) {
++    let digest = match env.get(AMENDMENT_DIGEST_MEMBER).map(|v| v.as_str()) {
+         None => {
+             return Err(malformed(
+                 malformed_row::ENVELOPE_MEMBER_MISSING,
+                 format!("`{AMENDMENT_DIGEST_MEMBER}` is required"),
+             ))
+         }
+-        Some(Some(d)) if is_hex64(d) => {}
++        Some(Some(d)) if is_hex64(d) => d,
+         Some(_) => {
+             return Err(malformed(
+                 malformed_row::ENVELOPE_MEMBER_INVALID,
+                 format!("`{AMENDMENT_DIGEST_MEMBER}` is not 64 lowercase hex digits"),
+             ))
+         }
+-    }
++    };
+     let authorized_by = match env.get(AUTHORIZED_BY_MEMBER).map(|v| v.as_str()) {
+         None => {
+             return Err(malformed(
+@@ -183,7 +326,38 @@ pub async fn check_identity_amendment_admission(
+             ))
+         }
+     };
+-    let cites = env
++    Ok((digest, authorized_by))
++}
++
++/// v60.1.0 (CIRISPersist#1120; CC 3.1.5) — **the door.** A no-op for every
++/// row that is not an `identity_amendment:v1`.
++///
++/// v62 (CC 2.7, "a row is never refused for what another row says") — the
++/// door refuses only what the amendment's OWN bytes and its signer decide:
++/// the member shapes, `evidence_refs[]` citing `authorized_by`, and the
++/// signer being an occurrence of the agent the row is about. Everything the
++/// CITED RESPONSE decides (held here, approved, about this agent, by a seated
++/// WA, naming this text) is the amendment's [`AmendmentStanding`], read by
++/// [`amendment_standing`] whenever the amendment's force is asked: the row
++/// is admitted and held, and counts once a matching approval is held.
++///
++/// # Errors
++///
++/// [`Error::MalformedRow`] for an ill-shaped member;
++/// [`Error::InvalidArgument`] led by [`IDENTITY_AMENDMENT_UNAUTHORIZED`] for
++/// [`unauthorized_reason::EVIDENCE_DOES_NOT_CITE`] and
++/// [`unauthorized_reason::NOT_THE_AGENTS_OCCURRENCE`]; directory reads.
++pub async fn check_identity_amendment_admission(
++    directory: &dyn FederationDirectory,
++    row: &Attestation,
++) -> Result<(), Error> {
++    use unauthorized_reason as why;
++    if !is_identity_amendment(row) {
++        return Ok(());
++    }
++    let (_, authorized_by) = amendment_members(row)?;
++    let cites = row
++        .attestation_envelope
+         .get(EVIDENCE_REFS_MEMBER)
+         .and_then(serde_json::Value::as_array)
+         .is_some_and(|refs| refs.iter().any(|r| r.as_str() == Some(authorized_by)));
+@@ -195,7 +369,8 @@ pub async fn check_identity_amendment_admission(
+         ));
+     }
+ 
+-    // Attester = an occurrence of the agent, subject = the agent.
++    // Attester = an occurrence of the agent, subject = the agent: a question
++    // about the SIGNER, not about the cited response.
+     let agent = row.attested_key_id.as_str();
+     let signer = row.attesting_key_id.as_str();
+     if signer != agent
+@@ -211,37 +386,95 @@ pub async fn check_identity_amendment_admission(
+             format!("{signer} is not an active occurrence of {agent}"),
+         ));
+     }
++    Ok(())
++}
++
++/// v62 (CC 2.7; CC 3.1.5 rc10 + rc21) — **the amendment's standing, read
++/// now.** `None` for a row that is not an `identity_amendment:v1`. The
++/// conditions, in order, each over the cited `deferral:response:*` as this
++/// node holds it at the time of the read:
++///
++/// 1. the response is held ([`unauthorized_reason::RESPONSE_NOT_HELD`]);
++/// 2. it is a `deferral:response:approved:v1`
++///    ([`unauthorized_reason::NOT_APPROVED`]), not withdrawn or recanted by a
++///    key entitled to retract it ([`unauthorized_reason::RESPONSE_WITHDRAWN`];
++///    a `supersedes` is not followed);
++/// 3. it names this amendment's text ([`AMENDMENT_DIGEST_MISMATCH`], the
++///    [`digest_mismatch_reason`] cases);
++/// 4. it is about this agent ([`unauthorized_reason::ABOUT_ANOTHER_AGENT`]);
++/// 5. its signer held a WA seat at its `asserted_at` (module doc,
++///    [`unauthorized_reason::NOT_A_SEATED_WA`]).
++///
++/// All hold: [`AmendmentStanding::InForce`]. A held amendment reports the
++/// first failing condition. Nothing is stored: a later approval changes the
++/// answer the next read gives.
++///
++/// # Errors
++///
++/// [`Error::MalformedRow`] for an ill-shaped member (an admitted row never
++/// is); directory reads.
++pub async fn amendment_standing(
++    directory: &dyn FederationDirectory,
++    row: &Attestation,
++) -> Result<Option<AmendmentStanding>, Error> {
++    use unauthorized_reason as why;
++    if !is_identity_amendment(row) {
++        return Ok(None);
++    }
++    let (digest, authorized_by) = amendment_members(row)?;
++    let agent = row.attested_key_id.as_str();
++    let signer = row.attesting_key_id.as_str();
++    let unauth = |reason, detail| Ok(Some(held(IDENTITY_AMENDMENT_UNAUTHORIZED, reason, detail)));
+ 
+-    // (1) The cited response is admitted here.
++    // (1) The cited response is held here.
+     let Some(response) = directory.get_attestation(authorized_by).await? else {
+-        return Err(unauthorized(
+-            row,
++        return unauth(
+             why::RESPONSE_NOT_HELD,
+             format!("no admitted row {authorized_by} on this node"),
+-        ));
++        );
+     };
+     // (2) Its outcome is approved.
+     let approved = response.attestation_type == attestation_type::SCORES
+         && envelope_dimension(&response.attestation_envelope) == Some(DEFERRAL_APPROVED_DIMENSION);
+     if !approved {
+-        return Err(unauthorized(
+-            row,
++        return unauth(
+             why::NOT_APPROVED,
+             format!("{authorized_by} is not a {DEFERRAL_APPROVED_DIMENSION}"),
+-        ));
++        );
++    }
++    // (2a) v62 (CC 2.7) — it is not withdrawn: a `withdraws` / `recants` of
++    // it by a key entitled to retract it (the one retraction rule,
++    // `precedence::retraction_entitled`) leaves the amendment held. A
++    // `supersedes` is NOT followed: the amendment names this row, and a
++    // different approval is answered by an amendment citing it.
++    for r in directory
++        .list_attestations_referencing(&response.attestation_id)
++        .await?
++    {
++        let retracts = r.attestation_type == attestation_type::WITHDRAWS
++            || r.attestation_type == attestation_type::RECANTS;
++        if retracts && super::precedence::retraction_entitled(&r, &response) {
++            return unauth(
++                why::RESPONSE_WITHDRAWN,
++                format!("{authorized_by} is retracted by {}", r.attestation_id),
++            );
++        }
+     }
+-    // (3) Its subject is this agent.
++    // (3) CC 3.1.5 rc21 — it approved exactly this text.
++    if let Some(mismatch) = approved_digest_standing(digest, &response) {
++        return Ok(Some(mismatch));
++    }
++    // (4) Its subject is this agent.
+     if response.attested_key_id != agent {
+-        return Err(unauthorized(
+-            row,
++        return unauth(
+             why::ABOUT_ANOTHER_AGENT,
+             format!(
+                 "the response is about {}, the amendment about {agent}",
+                 response.attested_key_id
+             ),
+-        ));
++        );
+     }
+-    // (4) Its signer held a WA seat at its `asserted_at`: the self of the
++    // (5) Its signer held a WA seat at its `asserted_at`: the self of the
+     // owner of the agent's node (module doc).
+     let at = response.asserted_at;
+     let owner = match super::admission::owner_of(directory, signer).await? {
+@@ -261,14 +494,111 @@ pub async fn check_identity_amendment_admission(
+         None => false,
+     };
+     if !seated {
+-        return Err(unauthorized(
+-            row,
++        return unauth(
+             why::NOT_A_SEATED_WA,
+             format!(
+                 "{} held no Wise Authority seat over {agent} at {at}",
+                 response.attesting_key_id
+             ),
+-        ));
++        );
++    }
++    Ok(Some(AmendmentStanding::InForce))
++}
++
++/// v62 (CC 2.7) — **every `identity_amendment:v1` about `agent` this node
++/// holds, each with its standing read now**, oldest first. A reader of "the
++/// amendments in force" keeps those whose standing
++/// [`is_in_force`](AmendmentStanding::is_in_force); a held one reports its
++/// token. Retraction (`withdraws` / `recants` / `supersedes`) is the
++/// reader's usual fold and is not applied here.
++///
++/// # Errors
++///
++/// Directory reads; [`Error::MalformedRow`] for a held row that does not
++/// parse (an admitted row never is).
++pub async fn amendment_standings_for(
++    directory: &dyn FederationDirectory,
++    agent: &str,
++) -> Result<Vec<(Attestation, AmendmentStanding)>, Error> {
++    use super::attestation_query::{AttestationQuery, FOLD_PAGE};
++    let mut rows = Vec::new();
++    let mut pages = AttestationQuery::to(agent, FOLD_PAGE)
++        .dimension_prefix(IDENTITY_AMENDMENT_FAMILY_STEM)
++        .pages();
++    while let Some(page) = pages.next(directory).await? {
++        rows.extend(page);
++    }
++    let mut out = Vec::new();
++    for row in rows {
++        if let Some(standing) = amendment_standing(directory, &row).await? {
++            out.push((row, standing));
++        }
++    }
++    Ok(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::federation::tier_ingest::test_support as ts;
++
++    fn approval(digest: Option<serde_json::Value>) -> Attestation {
++        let id = uuid::Uuid::new_v4().to_string();
++        let mut env = serde_json::json!({ "id": id, "dimension": DEFERRAL_APPROVED_DIMENSION });
++        if let Some(d) = digest {
++            env[AMENDMENT_DIGEST_MEMBER] = d;
++        }
++        let mut r = ts::bare_attestation(&id, "i2930-wa", "i2930-agent", &env);
++        r.attestation_type = attestation_type::SCORES.to_owned();
++        r
++    }
++
++    fn mismatch_with(s: Option<AmendmentStanding>, reason: &str, what: &str) {
++        let s = s.unwrap_or_else(|| panic!("I2930 ({what}): expected held, got in force"));
++        assert!(!s.is_in_force(), "I2930 ({what})");
++        assert_eq!(s.token(), Some(AMENDMENT_DIGEST_MISMATCH), "I2930 ({what})");
++        assert_eq!(s.reason(), Some(reason), "I2930 ({what})");
++    }
++
++    /// **I2930 (CC 3.1.5 rc21; CIRISServer#1365/#1366; CC 2.7)** — the
++    /// approved-text condition, as a pure function of the two rows: an equal
++    /// digest raises nothing; an absent, ill-shaped (uppercase, short,
++    /// non-string, null) or different one HOLDS the amendment under
++    /// `amendment_digest_mismatch`, each case named. Mutation targets: the
++    /// equality and the absent arm.
++    #[test]
++    fn i2930_the_amendment_is_the_text_the_wa_approved() {
++        let digest = "cd".repeat(32);
++        assert_eq!(
++            approved_digest_standing(&digest, &approval(Some(serde_json::json!(digest)))),
++            None,
++            "I2930: the approved text raises nothing"
++        );
++        use digest_mismatch_reason as why;
++        mismatch_with(
++            approved_digest_standing(&digest, &approval(None)),
++            why::RESPONSE_NAMES_NO_TEXT,
++            "absent",
++        );
++        mismatch_with(
++            approved_digest_standing(&digest, &approval(Some(serde_json::json!("ef".repeat(32))))),
++            why::DIGESTS_DIFFER,
++            "another text",
++        );
++        for (bad, what) in [
++            (serde_json::json!("CD".repeat(32)), "uppercase"),
++            (serde_json::json!("cd".repeat(31)), "short"),
++            (serde_json::json!(7), "a number"),
++            (serde_json::Value::Null, "null"),
++        ] {
++            mismatch_with(
++                approved_digest_standing(&digest, &approval(Some(bad))),
++                why::RESPONSE_DIGEST_ILL_SHAPED,
++                what,
++            );
++        }
++        assert_ne!(AMENDMENT_DIGEST_MISMATCH, IDENTITY_AMENDMENT_UNAUTHORIZED);
++        assert!(AmendmentStanding::InForce.is_in_force());
++        assert_eq!(AmendmentStanding::InForce.token(), None);
+     }
+-    Ok(())
+ }
+diff --git a/src/federation/mod.rs b/src/federation/mod.rs
+index 7d19bfe2..f397d684 100644
+--- a/src/federation/mod.rs
++++ b/src/federation/mod.rs
+@@ -830,6 +830,10 @@ mod signed_object_1098_invariants;
+ // v60.1.0 (docs/V61_TASK_PLAN.md §2 slice B) — the consumer asks, I1360+.
+ #[cfg(test)]
+ mod v601_asks_invariants;
++// v62 (CC 3.1.5 rc21; CIRISServer#1365/#1366) — I2931–I2934: an identity
++// amendment is the exact text the Wise Authority approved, at every door.
++#[cfg(test)]
++mod amendment_digest_invariants;
+ // v61.0.5 (CIRISPersist#1225) — I1544–I1547: the read of rows naming a key,
+ // one dimension, on every backend.
+ #[cfg(test)]
+diff --git a/src/federation/v601_asks_invariants.rs b/src/federation/v601_asks_invariants.rs
+index 2c6687eb..3e33c1a0 100644
+--- a/src/federation/v601_asks_invariants.rs
++++ b/src/federation/v601_asks_invariants.rs
+@@ -31,12 +31,15 @@
+ //! - **I1365 (CIRISPersist#1120; CC 3.1.5 rc10)** — `identity_amendment:v1`
+ //!   admits only citing an admitted `deferral:response:approved:v1` about the
+ //!   same agent, signed by a seated WA (the agent node's owner, compared self
+-//!   to self at the response's instant). Refused
+-//!   `identity_amendment_unauthorized`, each with its condition: a response
+-//!   not held, a rejected response, a response by a stranger, a response about
+-//!   another agent, evidence that does not cite the response, an amendment
+-//!   signed by a key that is not the agent's; an unowned agent has no seated
+-//!   WA. Ill-shaped `amendment_digest` / `authorized_by` are malformed rows.
++//!   to self at the response's instant). v62 (CC 2.7): what the CITED
++//!   RESPONSE decides never refuses the amendment. A response not held, a
++//!   rejected response, a response by a stranger, a response about another
++//!   agent, and an unowned agent (no seated WA) each leave the amendment
++//!   ADMITTED and HELD (`amendment_standing` is not in force, reporting
++//!   `identity_amendment_unauthorized` with its condition). Still refused
++//!   `identity_amendment_unauthorized` at the door: evidence that does not
++//!   cite the response, an amendment signed by a key that is not the agent's.
++//!   Ill-shaped `amendment_digest` / `authorized_by` are malformed rows.
+ //! - **I1368 (CIRISPersist#1120, CIRISServer#601)** — the split home: the
+ //!   owner (a `user`) binds the NODE (`responsible_for`), the agent key is
+ //!   the owner's occurrence (the `self:delegates_to:agent_occurrence:v1`
+@@ -44,7 +47,8 @@
+ //!   approval authorises the agent's self-subject amendment: the person the
+ //!   signing key is an occurrence of is its owner. The same shape whose
+ //!   principal is not a `user`, and an agent key with no anchor, are still
+-//!   refused `response_signer_not_a_seated_wa`.
++//!   not in force: admitted and held, `response_signer_not_a_seated_wa`
++//!   (v62, CC 2.7).
+ 
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ pub(crate) mod bodies {
+@@ -423,7 +427,12 @@ pub(crate) mod bodies {
+                 by,
+                 about,
+                 dimension,
+-                serde_json::json!({ "references_attestation_id": request_id }),
++                // v62 (CC 3.1.5 rc21) — the approval names the text it
++                // approves; every amendment below carries this digest.
++                serde_json::json!({
++                    "references_attestation_id": request_id,
++                    "amendment_digest": "cd".repeat(32),
++                }),
+             )
+         };
+         let amendment = |by: &str, about: &str, authorized_by: &str, cite: bool| {
+@@ -454,6 +463,33 @@ pub(crate) mod bodies {
+                 "I1365 ({what}): expected {reason}, got {text}"
+             );
+         };
++        // v62 (CC 2.7) — a condition the CITED RESPONSE decides never refuses
++        // the amendment: it is admitted and held, not in force, reporting
++        // the token.
++        let held = |s: Option<ia::AmendmentStanding>, reason: &str, what: &str| {
++            let s = s.unwrap_or_else(|| panic!("I1365 ({what}): not an amendment"));
++            assert!(!s.is_in_force(), "I1365 ({what}): held, not in force");
++            assert_eq!(
++                s.token(),
++                Some(ia::IDENTITY_AMENDMENT_UNAUTHORIZED),
++                "I1365 ({what}): {s:?}"
++            );
++            assert_eq!(s.reason(), Some(reason), "I1365 ({what}): {s:?}");
++        };
++        // Admitted (CC 2.7), then its standing read now.
++        let admitted_standing = |r: Attestation, what: &'static str| async move {
++            put(r.clone())
++                .await
++                .unwrap_or_else(|e| panic!("I1365 ({what}): admitted and held: {e}"));
++            assert!(d
++                .get_attestation(&r.attestation_id)
++                .await
++                .unwrap()
++                .is_some());
++            crate::federation::identity_amendment::amendment_standing(d, &r)
++                .await
++                .unwrap()
++        };
+ 
+         // The owner (the seated WA) approves: the amendment admits.
+         let approved = response(&owner, &agent, ia::DEFERRAL_APPROVED_DIMENSION);
+@@ -461,17 +497,20 @@ pub(crate) mod bodies {
+         put(approved).await.expect("I1365: the owner's approval");
+         let ok = amendment(&agent, &agent, &approved_id, true);
+         let ok_id = ok.attestation_id.clone();
+-        put(ok)
++        put(ok.clone())
+             .await
+             .unwrap_or_else(|e| panic!("I1365: the authorised amendment admits: {e}"));
+         assert!(d.get_attestation(&ok_id).await.unwrap().is_some());
++        assert_eq!(
++            ia::amendment_standing(d, &ok).await.unwrap(),
++            Some(ia::AmendmentStanding::InForce),
++            "I1365: the authorised amendment is in force"
++        );
+ 
+         // A response this node does not hold.
+         let missing = uuid::Uuid::new_v4().to_string();
+-        refused(
+-            put(amendment(&agent, &agent, &missing, true))
+-                .await
+-                .unwrap_err(),
++        held(
++            admitted_standing(amendment(&agent, &agent, &missing, true), "not held").await,
+             ia::unauthorized_reason::RESPONSE_NOT_HELD,
+             "not held",
+         );
+@@ -479,10 +518,8 @@ pub(crate) mod bodies {
+         let rejected = response(&owner, &agent, ia::DEFERRAL_REJECTED_DIMENSION);
+         let rejected_id = rejected.attestation_id.clone();
+         put(rejected).await.expect("I1365: the owner's rejection");
+-        refused(
+-            put(amendment(&agent, &agent, &rejected_id, true))
+-                .await
+-                .unwrap_err(),
++        held(
++            admitted_standing(amendment(&agent, &agent, &rejected_id, true), "rejected").await,
+             ia::unauthorized_reason::NOT_APPROVED,
+             "rejected",
+         );
+@@ -492,10 +529,8 @@ pub(crate) mod bodies {
+         put(by_stranger)
+             .await
+             .expect("I1365: a stranger's row stores");
+-        refused(
+-            put(amendment(&agent, &agent, &by_stranger_id, true))
+-                .await
+-                .unwrap_err(),
++        held(
++            admitted_standing(amendment(&agent, &agent, &by_stranger_id, true), "stranger").await,
+             ia::unauthorized_reason::NOT_A_SEATED_WA,
+             "stranger",
+         );
+@@ -505,10 +540,12 @@ pub(crate) mod bodies {
+         put(elsewhere)
+             .await
+             .expect("I1365: the other agent's approval");
+-        refused(
+-            put(amendment(&agent, &agent, &elsewhere_id, true))
+-                .await
+-                .unwrap_err(),
++        held(
++            admitted_standing(
++                amendment(&agent, &agent, &elsewhere_id, true),
++                "another agent",
++            )
++            .await,
+             ia::unauthorized_reason::ABOUT_ANOTHER_AGENT,
+             "another agent",
+         );
+@@ -534,14 +571,16 @@ pub(crate) mod bodies {
+             &stranger,
+             &unowned,
+             ia::DEFERRAL_APPROVED_DIMENSION,
+-            serde_json::json!({}),
++            serde_json::json!({ "amendment_digest": "cd".repeat(32) }),
+         );
+         let for_unowned_id = for_unowned.attestation_id.clone();
+         put(for_unowned).await.expect("I1365: stores");
+-        refused(
+-            put(amendment(&unowned, &unowned, &for_unowned_id, true))
+-                .await
+-                .unwrap_err(),
++        held(
++            admitted_standing(
++                amendment(&unowned, &unowned, &for_unowned_id, true),
++                "unowned",
++            )
++            .await,
+             ia::unauthorized_reason::NOT_A_SEATED_WA,
+             "unowned",
+         );
+@@ -573,7 +612,7 @@ pub(crate) mod bodies {
+                 &serde_json::json!({
+                     "id": id,
+                     "dimension": ia::IDENTITY_AMENDMENT_DIMENSION,
+-                    "amendment_digest": "ef".repeat(32),
++                    "amendment_digest": "cd".repeat(32),
+                     "authorized_by": authorized_by,
+                     "evidence_refs": [authorized_by],
+                 }),
+@@ -601,7 +640,13 @@ pub(crate) mod bodies {
+             put(ok)
+                 .await
+                 .expect("I1365: the owner approves for the agent");
+-            put(about(&occ, &multi, &ok_id)).await.unwrap_or_else(|e| {
++            let amended = about(&occ, &multi, &ok_id);
++            assert_eq!(
++                ia::amendment_standing(d, &amended).await.unwrap(),
++                Some(ia::AmendmentStanding::InForce),
++                "I1365: an occurrence's amendment under the owner's approval is in force"
++            );
++            put(amended).await.unwrap_or_else(|e| {
+                 panic!(
+                     "I1365: an occurrence of the agent amends it (owner on the {}): {e}",
+                     if owner_on_occurrence {
+@@ -717,11 +762,15 @@ pub(crate) mod bodies {
+                 &approver,
+                 &agent,
+                 ia::DEFERRAL_APPROVED_DIMENSION,
+-                serde_json::json!({ "references_attestation_id": request_id }),
++                // v62 (CC 3.1.5 rc21) — the approval names the amended text.
++                serde_json::json!({
++                    "references_attestation_id": request_id,
++                    "amendment_digest": "cd".repeat(32),
++                }),
+             );
+             let approved_id = approved.attestation_id.clone();
+             put(approved).await.expect("I1368: the approval stores");
+-            put(row(
++            let amendment = row(
+                 &agent,
+                 &agent,
+                 ia::IDENTITY_AMENDMENT_DIMENSION,
+@@ -730,20 +779,33 @@ pub(crate) mod bodies {
+                     "authorized_by": approved_id,
+                     "evidence_refs": [approved_id],
+                 }),
+-            ))
+-            .await
++            );
++            let admitted = put(amendment.clone()).await;
++            // v62 (CC 2.7) — admitted whatever the approval says; its force
++            // is its standing, read now.
++            let standing = match &admitted {
++                Ok(()) => ia::amendment_standing(d, &amendment).await,
++                Err(_) => Ok(None),
++            };
++            (admitted, standing)
+         };
+-        let refused = |r: Result<(), Error>, what: &str| {
+-            let e = r.expect_err(what);
+-            let text = e.to_string();
+-            assert!(
+-                matches!(e, Error::InvalidArgument(_))
+-                    && text.contains(&format!(
+-                        "{}: {}",
+-                        ia::IDENTITY_AMENDMENT_UNAUTHORIZED,
+-                        ia::unauthorized_reason::NOT_A_SEATED_WA
+-                    )),
+-                "I1368 ({what}): expected not-a-seated-WA, got {text}"
++        let refused = |(admitted, standing): (
++            Result<(), Error>,
++            Result<Option<ia::AmendmentStanding>, Error>,
++        ),
++                       what: &str| {
++            admitted.unwrap_or_else(|e| panic!("I1368 ({what}): admitted and held: {e}"));
++            let s = standing.unwrap().expect("an amendment");
++            assert!(!s.is_in_force(), "I1368 ({what}): held, not in force");
++            assert_eq!(
++                s.token(),
++                Some(ia::IDENTITY_AMENDMENT_UNAUTHORIZED),
++                "I1368 ({what})"
++            );
++            assert_eq!(
++                s.reason(),
++                Some(ia::unauthorized_reason::NOT_A_SEATED_WA),
++                "I1368 ({what}): expected not-a-seated-WA, got {s:?}"
+             );
+         };
+ 
+@@ -763,9 +825,13 @@ pub(crate) mod bodies {
+             None,
+             "I1368: the agent key carries no owner binding"
+         );
+-        amend(agent.clone(), owner.clone())
+-            .await
+-            .unwrap_or_else(|e| panic!("I1368: the split home's amendment admits: {e}"));
++        let (admitted, standing) = amend(agent.clone(), owner.clone()).await;
++        admitted.unwrap_or_else(|e| panic!("I1368: the split home's amendment admits: {e}"));
++        assert_eq!(
++            standing.unwrap(),
++            Some(ia::AmendmentStanding::InForce),
++            "I1368: the split home's amendment is in force"
++        );
+         // A stranger's approval on the same home still holds no seat.
+         let stranger = format!("i1368-stranger-{tag}");
+         ts::register_user_role_key(d, &stranger).await;

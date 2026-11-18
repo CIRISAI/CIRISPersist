@@ -1,0 +1,784 @@
+diff --git a/src/engine.rs b/src/engine.rs
+index a780865f..12bd044f 100644
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -3431,6 +3431,36 @@ impl Engine {
+                 attestation_id: row.attestation_id,
+             });
+         }
++        // v62.0.0 (v62 P3, as ruled: "restate at the crossing") — this node's
++        // own local hard_case row is never signed in the earlier form: its
++        // event is restated as an edition-2 statement at `federation`
++        // (`hard_case::restate_held_hard_case`), admitted through the
++        // statement door. The local row stays local, as the node-local
++        // record; `Crossed` names the STATED row (a different id).
++        let node = self.local_derived_key_id().await.map_err(|e| {
++            crate::federation::Error::Backend(format!("enter_mesh derive key_id: {e}"))
++        })?;
++        if row.attesting_key_id == node
++            && crate::federation::hard_case::project_hard_case_row(&row).is_some()
++        {
++            let signer = self.composite_signer("enter_mesh")?;
++            if let Some(rid) =
++                crate::federation::hard_case::restate_held_hard_case(&*dir, signer, &row).await?
++            {
++                let stated = dir.get_attestation(&rid).await?.ok_or_else(|| {
++                    crate::federation::Error::Backend(format!(
++                        "enter_mesh: the restated hard_case row {rid} is not held"
++                    ))
++                })?;
++                return Ok(MeshCrossingOutcome::Crossed(
++                    crate::federation::crossing::report(
++                        &stated,
++                        crate::federation::crossing::Custody::ActorSigned,
++                        crate::host::clock::now(),
++                    ),
++                ));
++            }
++        }
+         let Some(custody) = self.custody_for(&row, actor).await? else {
+             return Ok(MeshCrossingOutcome::AwaitingActor {
+                 age_ms: (crate::host::clock::now() - row.asserted_at).num_milliseconds(),
+@@ -3737,9 +3767,12 @@ impl Engine {
+             }
+         };
+         match self.enter_mesh(&row.attestation_id, &ci, None).await {
+-            Ok(MeshCrossingOutcome::Crossed(_)) => {
++            // v62.0.0 (v62 P3) — a crossing that STATED a new row (a local
++            // hard_case restated at `federation`) leaves the local row
++            // local: there is nothing of it to widen.
++            Ok(MeshCrossingOutcome::Crossed(crossed)) => {
+                 report.promoted += 1;
+-                true
++                crossed.attestation_id == row.attestation_id
+             }
+             Ok(MeshCrossingOutcome::AlreadyInMesh { .. })
+             | Ok(MeshCrossingOutcome::AlreadyWidened { .. }) => true,
+@@ -4023,6 +4056,30 @@ impl Engine {
+         self.emit_attestation(signer, input).await
+     }
+ 
++    /// v62.0.0 (v62 P3, JSON-cut slice B) — **record a `hard_case:*` event
++    /// on the clean mesh**: the event stated as an edition-2 statement signed
++    /// by THIS engine's composite key and admitted through the statement door
++    /// ([`crate::federation::hard_case::state_hard_case`]). Returns the row id
++    /// (hex). The statement's `asserted_at` is the event's `emitted_at`, so a
++    /// re-record of one observation is the same row.
++    ///
++    /// The backend's `record_hard_case` door is unchanged: it writes the
++    /// node-local, in-transaction record an act commits with (it holds no
++    /// signer).
++    ///
++    /// # Errors
++    /// `composite_signing_unavailable` for a classical-only engine; the
++    /// attribution refusal; the door's and the gates' refusals.
++    #[cfg(any(feature = "postgres", feature = "sqlite"))]
++    pub async fn record_hard_case(
++        &self,
++        event: crate::federation::hard_case::HardCaseEvent,
++    ) -> Result<String, crate::federation::Error> {
++        let signer = self.composite_signer("record_hard_case")?;
++        crate::federation::hard_case::state_hard_case(&*self.federation_directory(), signer, event)
++            .await
++    }
++
+     /// v30.0.0 (CIRISPersist#601 item 3 / #596 item 3) — **canonicalize, sign
+     /// and assemble a federation-tier row, and do NOT store it.**
+     ///
+diff --git a/src/federation/edition2/hard_case_producer_invariants.rs b/src/federation/edition2/hard_case_producer_invariants.rs
+new file mode 100644
+index 00000000..98aff0a4
+--- /dev/null
++++ b/src/federation/edition2/hard_case_producer_invariants.rs
+@@ -0,0 +1,433 @@
++//! v62.0.0 (v62 P3, JSON-cut slice B) — **I3055–I3056: the hard_case
++//! producer states an edition-2 statement a SECOND node admits.** sqlite and
++//! postgres.
++//!
++//! - **I3055** — node A records a `hard_case:lineage_equivocation` event
++//!   (`Engine::record_hard_case`, through `edition2::produce::sign_row`). The
++//!   statement is `scores` in family `hard_case:.kind`, signed by A's own key,
++//!   about A. A serves it (`edition2_statements_since`), and node B admits it
++//!   through the statement door (`put_edition2_statement`) under the same row
++//!   id, attested by A. B's `hard_case_events` lists the event with A as its
++//!   emitter: this leg needs P3.patch's edition-2 projection fence.
++//! - **I3056** — re-recording the same event on A is the same statement and
++//!   the same row id, with nothing new admitted (idempotence). A
++//!   non-attributed `admin_action` is refused before anything is signed.
++//!
++//! - **I3058** — restate at the crossing: `enter_mesh` on a local hard_case
++//!   row (the in-transaction door's) states its event at `federation`; the
++//!   local row stays local; B admits and projects it.
++//!
++//! - **I3059** — an event older than the signing key's current record is
++//!   asserted at the record's start and admitted; `emitted_at` keeps the
++//!   original instant; a re-record is the same row.
++//!
++//! Mutation: stamp `asserted_at` from the clock in `hard_case_emit_input`,
++//! and I3056 reds on the second row id.
++
++pub(crate) mod bodies {
++    use super::super::producer_invariants::bodies::{deliver, node};
++    use crate::federation::edition2::emit::{carried_statement, family_of_statement};
++    use crate::federation::edition2::ingest::{kid_of_identity_ref, statement_kid};
++    use crate::federation::hard_case::{self, HardCaseEvent, HardCaseFilter};
++    use crate::federation::types::identity_type;
++
++    fn event(event_id: &str) -> HardCaseEvent {
++        HardCaseEvent {
++            event_id: event_id.to_owned(),
++            kind: hard_case::kind::LINEAGE_EQUIVOCATION.to_owned(),
++            target_key_id: None,
++            subject_key_id: None,
++            detail: serde_json::json!({"heads": 2}),
++            emitted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
++                chrono::Utc::now().timestamp_millis(),
++            )
++            .expect("ms"),
++            emitter_key_id: String::new(),
++        }
++    }
++
++    /// I3055 / I3056.
++    pub(crate) async fn i3055_a_hard_case_reaches_a_second_node(
++        a_dsn: &str,
++        b_dsn: &str,
++        tag: &str,
++    ) {
++        let a = node(a_dsn, &format!("{tag}-3055-a")).await;
++        let b = node(b_dsn, &format!("{tag}-3055-b")).await;
++        let a_id = a
++            .register_self_federation_key(identity_type::NODE, None, None)
++            .await
++            .expect("I3055: A registers");
++        // B holds A's key record before A's rows reach it.
++        let mut cursor = None;
++        deliver(&a, &b, &mut cursor).await;
++
++        let ev = event(&format!("{tag}-3055-ev"));
++        let rid = a
++            .record_hard_case(ev.clone())
++            .await
++            .expect("I3055: A records the hard_case");
++        let row = a
++            .federation_directory()
++            .get_attestation(&rid)
++            .await
++            .unwrap()
++            .expect("I3055: A holds its row");
++        let st = carried_statement(&row).expect("I3055: the row carries its statement");
++        assert_eq!(
++            family_of_statement(&st),
++            Some(("hard_case:.kind".to_owned(), "scores".to_owned())),
++            "I3055: the family the dimension resolves to"
++        );
++        assert_eq!(
++            statement_kid(&st),
++            kid_of_identity_ref(&a_id),
++            "I3055: signed by A's own key"
++        );
++        assert_eq!(row.attested_key_id, a_id, "I3055: about A");
++
++        // I3056 — a re-record is the same statement, the same row.
++        let again = a
++            .record_hard_case(ev.clone())
++            .await
++            .expect("I3056: a re-record is admitted");
++        assert_eq!(again, rid, "I3056: a re-record names the same row");
++
++        // Delivered through the planes to B.
++        let delivered = deliver(&a, &b, &mut cursor).await;
++        assert!(delivered.contains(&st), "I3055: A serves the statement");
++        assert_eq!(
++            delivered.iter().filter(|s| **s == st).count(),
++            1,
++            "I3056: one statement for one observation"
++        );
++        let at_b = b
++            .federation_directory()
++            .get_attestation(&rid)
++            .await
++            .unwrap()
++            .expect("I3055: B admits the row under the same row id");
++        assert_eq!(at_b.attesting_key_id, a_id, "I3055: attested by A");
++        let listed: Vec<HardCaseEvent> = b
++            .federation_directory()
++            .list_hard_case_events(HardCaseFilter {
++                kind: Some(hard_case::kind::LINEAGE_EQUIVOCATION.to_owned()),
++                ..HardCaseFilter::default()
++            })
++            .await
++            .expect("list")
++            .into_iter()
++            .filter(|e| e.event_id == ev.event_id)
++            .collect();
++        assert_eq!(listed.len(), 1, "I3055: B projects the event: {listed:?}");
++        assert_eq!(listed[0].emitter_key_id, a_id, "I3055: A is the emitter");
++
++        // I3056 — an unattributed admin action signs nothing.
++        let mut unattributed = event(&format!("{tag}-3056-admin"));
++        unattributed.kind = hard_case::kind::ADMIN_ACTION.to_owned();
++        unattributed.detail = serde_json::json!({});
++        assert!(
++            a.record_hard_case(unattributed).await.is_err(),
++            "I3056: the attribution gate refuses before signing"
++        );
++        assert!(
++            deliver(&a, &b, &mut cursor).await.is_empty(),
++            "I3056: nothing was stated"
++        );
++    }
++
++    /// **I3058** — "restate at the crossing": A records an event through
++    /// the backend's in-transaction door (a local, unsigned row under its
++    /// derived id), then `enter_mesh` on that row restates the event as an
++    /// edition-2 statement at `federation`. `Crossed` names the STATED row
++    /// (not the local id); the local row stays local; B admits the statement
++    /// under the same row id and projects one event. A second crossing is the
++    /// same statement (idempotent).
++    pub(crate) async fn i3058_the_crossing_restates_a_local_hard_case(
++        a_dsn: &str,
++        b_dsn: &str,
++        tag: &str,
++    ) {
++        use crate::federation::crossing::{self, Audience, CrossingBasis};
++        use crate::federation::types::{attestation_tier, cohort_scope};
++        use crate::federation::{FederationDirectory as _, MeshCrossingOutcome};
++
++        let a = node(a_dsn, &format!("{tag}-3058-a")).await;
++        let b = node(b_dsn, &format!("{tag}-3058-b")).await;
++        let a_id = a
++            .register_self_federation_key(identity_type::NODE, None, None)
++            .await
++            .expect("I3058: A registers");
++        let mut cursor = None;
++        deliver(&a, &b, &mut cursor).await;
++
++        let ev = event(&format!("{tag}-3058-ev"));
++        a.federation_directory()
++            .record_hard_case(ev.clone())
++            .await
++            .expect("I3058: the in-transaction door records");
++        let local_id = hard_case::hard_case_attestation_id(&ev.event_id);
++        let local = a
++            .federation_directory()
++            .get_attestation(&local_id)
++            .await
++            .unwrap()
++            .expect("I3058: the local row is held");
++        assert_eq!(local.tier, attestation_tier::LOCAL, "I3058: a local row");
++        let ci = crossing::describe(
++            &local,
++            Audience::of_row(&local).expect("audience"),
++            CrossingBasis::ProducerAuthority,
++        )
++        .expect("I3058: describable");
++
++        let crossed = match a.enter_mesh(&local_id, &ci, None).await {
++            Ok(MeshCrossingOutcome::Crossed(c)) => c,
++            other => panic!("I3058: the crossing restates: {other:?}"),
++        };
++        assert_ne!(
++            crossed.attestation_id, local_id,
++            "I3058: Crossed names the stated row"
++        );
++        assert_eq!(
++            crossed.audience,
++            Audience::Federation,
++            "I3058: stated at federation"
++        );
++        let stated = a
++            .federation_directory()
++            .get_attestation(&crossed.attestation_id)
++            .await
++            .unwrap()
++            .expect("I3058: A holds the stated row");
++        assert_eq!(stated.cohort_scope, cohort_scope::FEDERATION, "I3058");
++        assert!(
++            carried_statement(&stated).is_some(),
++            "I3058: the stated row is an edition-2 statement"
++        );
++        assert_eq!(
++            a.federation_directory()
++                .get_attestation(&local_id)
++                .await
++                .unwrap()
++                .expect("I3058: the local row stays")
++                .tier,
++            attestation_tier::LOCAL,
++            "I3058: the local row is not signed in the earlier form"
++        );
++
++        // A second crossing is the same statement.
++        match a.enter_mesh(&local_id, &ci, None).await {
++            Ok(MeshCrossingOutcome::Crossed(c)) => assert_eq!(
++                c.attestation_id, crossed.attestation_id,
++                "I3058: a re-crossing is the same row"
++            ),
++            other => panic!("I3058: a re-crossing restates idempotently: {other:?}"),
++        }
++
++        deliver(&a, &b, &mut cursor).await;
++        let at_b = b
++            .federation_directory()
++            .get_attestation(&crossed.attestation_id)
++            .await
++            .unwrap()
++            .expect("I3058: B admits the stated row");
++        assert_eq!(at_b.attesting_key_id, a_id, "I3058: attested by A");
++        let listed: Vec<HardCaseEvent> = b
++            .federation_directory()
++            .list_hard_case_events(HardCaseFilter {
++                kind: Some(hard_case::kind::LINEAGE_EQUIVOCATION.to_owned()),
++                ..HardCaseFilter::default()
++            })
++            .await
++            .expect("list")
++            .into_iter()
++            .filter(|e| e.event_id == ev.event_id)
++            .collect();
++        assert_eq!(listed.len(), 1, "I3058: B projects one event: {listed:?}");
++    }
++
++    /// **I3059** — an event observed before the signing key's current record
++    /// is asserted at the record's start (`statement_instant`), so it is
++    /// covered and admitted; the body keeps the event's own `emitted_at`; a
++    /// re-record is the same row (deterministic per signing key).
++    pub(crate) async fn i3059_an_event_older_than_the_key_is_covered(dsn: &str, tag: &str) {
++        let a = node(dsn, &format!("{tag}-3059-a")).await;
++        a.register_self_federation_key(identity_type::NODE, None, None)
++            .await
++            .expect("I3059: A registers");
++        let mut ev = event(&format!("{tag}-3059-ev"));
++        ev.emitted_at -= chrono::Duration::days(1);
++        let rid = a
++            .record_hard_case(ev.clone())
++            .await
++            .expect("I3059: an event older than the key is stated");
++        let row = a
++            .federation_directory()
++            .get_attestation(&rid)
++            .await
++            .unwrap()
++            .expect("I3059: held");
++        assert!(
++            row.asserted_at > ev.emitted_at && row.asserted_at <= chrono::Utc::now(),
++            "I3059: asserted at the key record's start, not the event's instant"
++        );
++        let body_at: chrono::DateTime<chrono::Utc> = serde_json::from_value(
++            row.attestation_envelope[hard_case::BODY_MEMBER]["emitted_at"].clone(),
++        )
++        .expect("I3059: the body carries emitted_at");
++        assert_eq!(
++            body_at, ev.emitted_at,
++            "I3059: the original instant rides in the body"
++        );
++        assert_eq!(
++            a.record_hard_case(ev).await.expect("I3059: re-record"),
++            rid,
++            "I3059: deterministic per signing key"
++        );
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::bodies as b;
++
++    fn tag() -> String {
++        uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i3055_sqlite() {
++        let d = tempfile::tempdir().unwrap();
++        let dsn = |name: &str| {
++            format!(
++                "sqlite:///{}",
++                d.path().join(format!("{name}.db")).display()
++            )
++        };
++        b::i3055_a_hard_case_reaches_a_second_node(&dsn("a"), &dsn("b"), &tag()).await;
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i3058_sqlite() {
++        let d = tempfile::tempdir().unwrap();
++        let dsn = |name: &str| {
++            format!(
++                "sqlite:///{}",
++                d.path().join(format!("{name}.db")).display()
++            )
++        };
++        b::i3058_the_crossing_restates_a_local_hard_case(&dsn("a"), &dsn("b"), &tag()).await;
++    }
++
++    #[cfg(feature = "sqlite")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i3059_sqlite() {
++        let d = tempfile::tempdir().unwrap();
++        let dsn = format!("sqlite:///{}", d.path().join("a.db").display());
++        b::i3059_an_event_older_than_the_key_is_covered(&dsn, &tag()).await;
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i3059_postgres() {
++        let Some(a) = crate::test_pg::isolated_dsn() else {
++            eprintln!("i3059 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
++            return;
++        };
++        b::i3059_an_event_older_than_the_key_is_covered(&a, &tag()).await;
++        eprintln!("i3059 postgres: RAN");
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i3058_postgres() {
++        let (Some(a), Some(bb)) = (
++            crate::test_pg::isolated_dsn(),
++            crate::test_pg::isolated_dsn(),
++        ) else {
++            eprintln!("i3058 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
++            return;
++        };
++        b::i3058_the_crossing_restates_a_local_hard_case(&a, &bb, &tag()).await;
++        eprintln!("i3058 postgres: RAN");
++    }
++
++    #[cfg(feature = "postgres")]
++    #[tokio::test(flavor = "multi_thread")]
++    async fn i3055_postgres() {
++        let (Some(a), Some(bb)) = (
++            crate::test_pg::isolated_dsn(),
++            crate::test_pg::isolated_dsn(),
++        ) else {
++            eprintln!("i3055 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
++            return;
++        };
++        b::i3055_a_hard_case_reaches_a_second_node(&a, &bb, &tag()).await;
++        eprintln!("i3055 postgres: RAN");
++    }
++}
++
++#[cfg(test)]
++mod unit {
++    use crate::federation::edition2::emit::payload_from_envelope;
++    use crate::federation::hard_case::{self, edition2_reals, HardCaseEvent};
++
++    /// **I3057** — a hard_case body carries no floats on the clean mesh: a
++    /// real under `score` / `confidence` / `weight` (or an array under one)
++    /// is fixed6, any other real a decimal string; integers are unchanged.
++    /// An event whose `detail` holds reals then states as a payload (the
++    /// payload builder refuses any float).
++    #[test]
++    fn i3057_a_real_in_detail_is_fixed6_or_a_decimal_string() {
++        assert_eq!(
++            edition2_reals(
++                serde_json::json!({
++                    "score": 0.75,
++                    "ratio": 0.25,
++                    "count": 3,
++                    "nested": {"confidence": [0.5, 1], "label": "x"},
++                }),
++                None,
++            ),
++            serde_json::json!({
++                "score": 750_000,
++                "ratio": "0.25",
++                "count": 3,
++                "nested": {"confidence": [500_000, 1], "label": "x"},
++            }),
++            "I3057"
++        );
++        let event = HardCaseEvent {
++            event_id: "i3057-ev".to_owned(),
++            kind: hard_case::kind::LINEAGE_EQUIVOCATION.to_owned(),
++            target_key_id: None,
++            subject_key_id: None,
++            detail: serde_json::json!({"score": 0.5, "drift": 1.5}),
++            emitted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_790_000_000_000)
++                .expect("ms"),
++            emitter_key_id: String::new(),
++        };
++        let input = hard_case::hard_case_emit_input(&event, event.emitted_at)
++            .expect("I3057: the input builds");
++        let envelope = input.attestation_envelope.to_value();
++        assert_eq!(
++            envelope[hard_case::BODY_MEMBER]["detail"],
++            serde_json::json!({"score": 500_000, "drift": "1.5"}),
++            "I3057: the stated detail"
++        );
++        assert!(
++            payload_from_envelope(&envelope, 0, None, &[]).is_ok(),
++            "I3057: a detail with reals states as a payload"
++        );
++        // Without the restatement the payload builder refuses the float.
++        let mut raw = envelope.clone();
++        raw[hard_case::BODY_MEMBER]["detail"]["drift"] = serde_json::json!(1.5);
++        assert!(
++            payload_from_envelope(&raw, 0, None, &[]).is_err(),
++            "I3057: a float in a payload is refused"
++        );
++    }
++}
+diff --git a/src/federation/edition2/mod.rs b/src/federation/edition2/mod.rs
+index 76fb33a9..bcb5c0d8 100644
+--- a/src/federation/edition2/mod.rs
++++ b/src/federation/edition2/mod.rs
+@@ -54,6 +54,9 @@ mod liveness_invariants;
+ mod produce_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod producer_invariants;
++// v62.0.0 (v62 P3) — I3055/I3056: the hard_case producer, two nodes.
++#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
++mod hard_case_producer_invariants;
+ #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+ mod projection_invariants;
+ #[cfg(test)]
+diff --git a/src/federation/hard_case.rs b/src/federation/hard_case.rs
+index 12c5421a..1dbea2d0 100644
+--- a/src/federation/hard_case.rs
++++ b/src/federation/hard_case.rs
+@@ -964,6 +964,239 @@ pub fn project_hard_case_row(row: &super::types::Attestation) -> Option<HardCase
+     Some(event)
+ }
+ 
++/// v62.0.0 (v62 P3, JSON-cut slice B) — **the row an event is stated as on
++/// the clean mesh**, as the emit recipe's input: `scores`, dimension
++/// `hard_case:{kind}:v1` (family `hard_case:.kind`, authored), the event
++/// whole under the `hard_case` member ([`hard_case_envelope`]), about the
++/// signer itself (`sub` = `iss`), at `cohort_scope = federation`: this is
++/// the MESH-bound statement, an accountability record meant for peers. The
++/// node-local in-transaction row (`attestation_admit::plan_hard_case_row`)
++/// keeps `self`.
++///
++/// `asserted_at` is the caller's: [`statement_instant`] (the event's
++/// `emitted_at`, or the signing key's current record start when that is
++/// later), never the clock at the call. The statement is then a function of
++/// the event and the signing key, so re-recording one observation signs the
++/// same bytes and names the same row id (the idempotence the earlier form's
++/// derived id gave; the author in the id gives what its emitter-bound id
++/// gave: no other key can occupy it). The event's own instant always rides
++/// in the body as `emitted_at`.
++///
++/// # Errors
++/// An envelope that does not serialize or does not read as an
++/// [`EnvelopeCore`](super::envelope::EnvelopeCore).
++pub fn hard_case_emit_input(
++    event: &HardCaseEvent,
++    asserted_at: DateTime<Utc>,
++) -> Result<super::EmitAttestationInput, super::Error> {
++    let mut envelope = hard_case_envelope(event)
++        .map_err(|e| super::Error::Backend(format!("hard_case envelope: {e}")))?;
++    if let Some(members) = envelope.as_object_mut() {
++        members.insert(
++            "asserted_at".to_owned(),
++            serde_json::Value::String(super::admission::render_signed_instant(asserted_at)),
++        );
++        // An edition-2 payload carries no floats (CC 2.6.1.5): a real in the
++        // body (its `detail`) is stated as fixed6 or as a decimal string.
++        if let Some(body) = members.get_mut(BODY_MEMBER) {
++            *body = edition2_reals(std::mem::take(body), None);
++        }
++    }
++    Ok(super::EmitAttestationInput::with_envelope(
++        super::types::attestation_type::SCORES,
++        super::envelope::EnvelopeCore::from_value(envelope)?,
++        super::types::cohort_scope::FEDERATION,
++    ))
++}
++
++/// v62.0.0 (v62 P3) — **the reals of a hard_case body, stated without
++/// floats** (CC 2.6.1.5: an edition-2 payload carries integers; a score,
++/// confidence or weight is an integer at the fixed scale of 10^6). `detail` is
++/// open vocabulary, so a real can appear anywhere in it:
++///
++/// - under a member named in
++///   [`SCALED_MEMBERS`](super::edition2::ingest::SCALED_MEMBERS) (`score`,
++///   `confidence`, `weight`; an array under one inherits its name): the
++///   integer `round(x × 10^6)`, the fixed6 form every payload's scaled
++///   members take;
++/// - anywhere else: its shortest decimal string (`0.25` → `"0.25"`), never
++///   rounded, so nothing the emitter observed is lost.
++///
++/// Integers, text, booleans and nulls are unchanged. Applied on the
++/// edition-2 producer only; the node-local row keeps the event as built.
++#[must_use]
++pub fn edition2_reals(value: serde_json::Value, member: Option<&str>) -> serde_json::Value {
++    use serde_json::Value as J;
++    match value {
++        J::Number(n) if n.as_u64().is_none() && n.as_i64().is_none() => {
++            let scaled =
++                member.is_some_and(|m| super::edition2::ingest::SCALED_MEMBERS.contains(&m));
++            match n.as_f64() {
++                Some(x) if scaled => {
++                    #[allow(clippy::cast_possible_truncation)]
++                    let fixed = (x * 1_000_000.0).round() as i64;
++                    J::from(fixed)
++                }
++                _ => J::String(n.to_string()),
++            }
++        }
++        J::Array(items) => J::Array(
++            items
++                .into_iter()
++                .map(|item| edition2_reals(item, member))
++                .collect(),
++        ),
++        J::Object(members) => J::Object(
++            members
++                .into_iter()
++                .map(|(k, v)| {
++                    let v = edition2_reals(v, Some(&k));
++                    (k, v)
++                })
++                .collect(),
++        ),
++        other => other,
++    }
++}
++
++/// v62.0.0 (v62 P3, JSON-cut slice B) — **the hard_case producer on the
++/// clean mesh**: the #570 attribution gate, then the event stated as an
++/// edition-2 statement signed by `signer`'s composite key
++/// ([`edition2::produce::sign_row`](super::edition2::produce::sign_row),
++/// through [`emit_statement`](super::attestation_emit::emit_statement)) and
++/// admitted through the one statement door as this node's authorship, the
++/// door a peer's copy meets. Returns the row id (hex). A re-record of the
++/// same event is the same statement: admitted idempotently, the same id.
++///
++/// The `hard_case:` emitter rule is the door's (`node` or
++/// `substrate_persist`, about itself; a row about another party needs the
++/// `infra:record_hard_case` conferral).
++///
++/// # Errors
++/// The attribution refusal (`AdminActionUnattributed`);
++/// `composite_signing_unavailable`; every refusal of the edition-2 door and
++/// the attestation gates.
++pub async fn state_hard_case<D>(
++    dir: &D,
++    signer: &crate::signing::LocalSigner,
++    event: HardCaseEvent,
++) -> Result<String, super::Error>
++where
++    D: super::FederationDirectory + Sync + ?Sized,
++{
++    check_admin_action_attribution(&event)?;
++    stated_hard_case(dir, signer, &event).await
++}
++
++/// The statement step both producers share: [`hard_case_emit_input`], then
++/// the emit recipe. No attribution gate here: [`state_hard_case`] runs it on
++/// a new event; [`restate_held_hard_case`] restates an event this node's own
++/// door already recorded.
++async fn stated_hard_case<D>(
++    dir: &D,
++    signer: &crate::signing::LocalSigner,
++    event: &HardCaseEvent,
++) -> Result<String, super::Error>
++where
++    D: super::FederationDirectory + Sync + ?Sized,
++{
++    let asserted_at = statement_instant(dir, signer, event.emitted_at).await?;
++    let input = hard_case_emit_input(event, asserted_at)?;
++    let emitted = super::attestation_emit::emit_statement(dir, signer, input, None).await?;
++    Ok(emitted.attestation_id)
++}
++
++/// v62.0.0 (v62 P3, as ruled) — **the instant a hard_case statement is
++/// asserted at**: `max(emitted_at, start)`, where `start` is the earliest
++/// `asserted_at` among the signing key's valid edition-2 records that cover
++/// NOW (its current record; a renewal that also covers now does not move
++/// it). A statement must be covered by its signer's record at its own
++/// instant (CC 2.4.1.1), so an event observed before the current record
++/// (recorded locally before registration, or under an earlier record) is
++/// asserted at the record's start instead of waiting forever; the original
++/// instant stays in the body as `emitted_at`. Deterministic per signing key:
++/// re-restating one event signs the same bytes. With no current record,
++/// `emitted_at` (the door then judges the signer as it would any).
++///
++/// # Errors
++/// `composite_signing_unavailable` for a signer without its PQC half; the
++/// directory's.
++pub async fn statement_instant<D>(
++    dir: &D,
++    signer: &crate::signing::LocalSigner,
++    emitted_at: DateTime<Utc>,
++) -> Result<DateTime<Utc>, super::Error>
++where
++    D: super::FederationDirectory + Sync + ?Sized,
++{
++    let (kid, _iss) = super::edition2::produce::signer_identity(signer)
++        .await
++        .map_err(|e| {
++            super::edition2::emit::composite_signing_unavailable("record_hard_case", &e.to_string())
++        })?;
++    let keys = super::edition2::ingest::held_keys_for_kid(dir, &kid).await?;
++    let now_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
++    let start = keys.valid_records(&kid).ok().and_then(|valid| {
++        valid
++            .into_iter()
++            .map(|v| v.record)
++            .filter(|r| r.asserted_at <= now_ms && r.valid_until.is_none_or(|u| now_ms <= u))
++            .map(|r| r.asserted_at)
++            .min()
++    });
++    let emitted_ms = u64::try_from(emitted_at.timestamp_millis()).unwrap_or(0);
++    Ok(match start {
++        Some(s) if s > emitted_ms => i64::try_from(s)
++            .ok()
++            .and_then(DateTime::<Utc>::from_timestamp_millis)
++            .unwrap_or(emitted_at),
++        _ => emitted_at,
++    })
++}
++
++/// v62.0.0 (v62 P3, as ruled: "restate at the crossing") — **a held
++/// node-local hard_case row, restated on the clean mesh.** The in-transaction
++/// door writes a local-tier, unsigned row under its derived id (it holds no
++/// signer, and the row commits with its act). It reaches the mesh only here:
++/// `Engine::enter_mesh` restates its event as an edition-2 statement signed
++/// by `signer` ([`hard_case_emit_input`], `cohort_scope = federation`) and
++/// admits it through the statement door; it never signs the local row in
++/// the earlier form. The local row stays where it is, as the node-local
++/// record; `hard_case_events` holds one event per `event_id`
++/// ([`projection_outranks`] ranks the stated row over the local v1 row).
++///
++/// `Ok(None)` for a row that is not a local hard_case row (it carries a
++/// statement already, or does not project): the caller crosses it as any
++/// other row. The #570 attribution gate is not re-run: the event was
++/// recorded by this node's own door, whose in-transaction emitters carry
++/// their own required members (`admin_action:peer_removal`).
++///
++/// A re-restatement is the same statement (its `asserted_at` is the event's
++/// `emitted_at`), admitted idempotently.
++///
++/// # Errors
++/// As [`state_hard_case`], less the attribution refusal.
++pub async fn restate_held_hard_case<D>(
++    dir: &D,
++    signer: &crate::signing::LocalSigner,
++    row: &super::types::Attestation,
++) -> Result<Option<String>, super::Error>
++where
++    D: super::FederationDirectory + Sync + ?Sized,
++{
++    if row
++        .attestation_envelope
++        .get(super::edition2::ingest::STATEMENT_MEMBER)
++        .is_some()
++    {
++        return Ok(None);
++    }
++    let Some(event) = project_hard_case_row(row) else {
++        return Ok(None);
++    };
++    stated_hard_case(dir, signer, &event).await.map(Some)
++}
++
+ /// v57.0.0 (CIRISPersist#988 item 2) — record an OBSERVATION riding on
+ /// another row's admission or on a cascade (a membership change, a liveness
+ /// transition, a recipient excluded, a takedown applied): through

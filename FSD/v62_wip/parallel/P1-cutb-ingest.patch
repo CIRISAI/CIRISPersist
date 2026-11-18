@@ -1,0 +1,22 @@
+--- a/src/federation/edition2/ingest.rs	2026-11-18 11:40:32.360163178 -0600
++++ b/src/federation/edition2/ingest.rs	2026-11-18 11:40:32.425923433 -0600
+@@ -63,11 +63,14 @@
+ /// The payload's fixed-scale members (CC 2.6.1.5), projected as reals.
+ pub const SCALED_MEMBERS: &[&str] = &["score", "confidence", "weight"];
+ 
+-/// v62.0.0 (JSON-cut slice B) — the payload's hash-digest members (CC 2.6.1:
+-/// `[-16, bstr .size 32]`, SHA-256), projected as the 64-lowercase-hex text
+-/// the earlier gates read: `evidence_refs` is a set of them, the others one.
+-// cut-B: moves into edition2::payloads (slice A owns member typing) at the merge.
+-pub const HASH_DIGEST_MEMBERS: &[&str] = &["evidence_refs", "carried", "seat_commitment"];
++/// v62.0.0 (JSON-cut slice B; wave P1) — the payload's hash-digest members
++/// (CC 2.6.1: `[-16, bstr .size 32]`, SHA-256), projected as the
++/// 64-lowercase-hex text the earlier gates read: `evidence_refs` is a
++/// sequence of them, the others one. The list is
++/// [`super::payloads::HASH_DIGEST_MEMBERS`] (slice A owns member typing); it
++/// carries `amendment_digest` (`deferral:response:approved`,
++/// `identity_amendment`), whose hex the identity-amendment gate compares.
++pub use super::payloads::HASH_DIGEST_MEMBERS;
+ 
+ /// A `[-16, bstr32]` hash digest as lowercase hex.
+ fn digest_hex(v: &Value) -> Option<String> {
