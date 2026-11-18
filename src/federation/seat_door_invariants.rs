@@ -600,7 +600,7 @@ runners!(postgres, async {
 async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
     use crate::federation::types::cohort_scope::COMMUNITY;
     engine
-        .register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
+        .register_self_federation_key(USER, None, None)
         .await
         .expect("register the engine's own key");
     let key = engine.local_derived_key_id().await.unwrap();

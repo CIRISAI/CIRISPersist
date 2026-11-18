@@ -2184,13 +2184,7 @@ mod runners {
         .await
         .unwrap();
         engine
-            .register_self_federation_key(
-                crate::federation::types::identity_type::NODE,
-                &alias,
-                None,
-                serde_json::json!({}),
-                vec![],
-            )
+            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
             .await
             .unwrap();
         let b = engine.sqlite_backend().unwrap().clone();
@@ -2216,13 +2210,7 @@ mod runners {
         .await
         .unwrap();
         engine
-            .register_self_federation_key(
-                crate::federation::types::identity_type::NODE,
-                &alias,
-                None,
-                serde_json::json!({}),
-                vec![],
-            )
+            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
             .await
             .unwrap();
         let b = engine.postgres_backend().unwrap().clone();

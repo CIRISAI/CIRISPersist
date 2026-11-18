@@ -109,9 +109,8 @@ use serde::{Deserialize, Serialize};
 use crate::federation::admission::{reachable_under_scope_with_reasons, ReachabilityVerdict};
 use crate::federation::types::{
     Attestation, Community, CommunityMembershipRevocation, Family, FamilyMembershipRevocation,
-    HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
-    PeerMetadataRow, Revocation, SignedCommunityMembershipRevocation,
-    SignedFamilyMembershipRevocation,
+    IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof, PeerMetadataRow,
+    Revocation, SignedCommunityMembershipRevocation, SignedFamilyMembershipRevocation,
 };
 use crate::federation::{accord_quorum, cohort, self_at_login, shared_instance, types, Error};
 use crate::federation::{
@@ -5488,25 +5487,6 @@ impl FederationDirectory for OpsDirectory {
             method: "list_group_versions",
         })
     }
-    async fn attach_key_pqc_signature(
-        &self,
-        key_id: &str,
-        pubkey_ml_dsa_65_base64: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "attach_key_pqc_signature",
-        })
-    }
-    async fn attach_attestation_pqc_signature(
-        &self,
-        attestation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "attach_attestation_pqc_signature",
-        })
-    }
     async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error> {
         // v61.4.0 (CIRISPersist#1244 round 2, the rooting view).
         match self
@@ -5530,19 +5510,6 @@ impl FederationDirectory for OpsDirectory {
     ) -> Result<crate::federation::MeshCrossingOutcome, Error> {
         Err(Error::Unsupported {
             method: "enter_mesh",
-        })
-    }
-    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error> {
-        Err(Error::Unsupported {
-            method: "list_hybrid_pending_keys",
-        })
-    }
-    async fn list_hybrid_pending_attestations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error> {
-        Err(Error::Unsupported {
-            method: "list_hybrid_pending_attestations",
         })
     }
     async fn put_accord_proposal(
@@ -9822,11 +9789,7 @@ mod tests {
         ("add_community_member", PRE_1162),
         ("supersede_group_row", PRE_1162),
         ("list_group_versions", PRE_1162),
-        ("attach_key_pqc_signature", PRE_1162),
-        ("attach_attestation_pqc_signature", PRE_1162),
         ("enter_mesh", PRE_1162),
-        ("list_hybrid_pending_keys", PRE_1162),
-        ("list_hybrid_pending_attestations", PRE_1162),
         ("put_accord_proposal", PRE_1162),
         ("get_accord_proposal", PRE_1162),
         ("put_accord_participation", PRE_1162),

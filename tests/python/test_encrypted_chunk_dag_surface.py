@@ -66,7 +66,7 @@ def test_encrypted_chunk_dag_round_trips_through_the_wheel_832(tmp_path) -> None
     eng = _engine(tmp_path)
     try:
         # The identity and ONE occurrence of it, keyed for content delivery.
-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
+        kid = eng.register_self_federation_key("agent")
         enc = eng.self_enc_pubkeys()
         eng.put_identity_occurrence_json(
             json.dumps(
@@ -181,7 +181,7 @@ def test_commons_seal_stream_refuses_a_sealed_chunk_row_832(tmp_path) -> None:
     row cannot be sealed by the commons `seal_stream`."""
     eng = _engine(tmp_path)
     try:
-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
+        kid = eng.register_self_federation_key("agent")
         stream = "py-832-mixed-" + secrets.token_hex(4)
         eng.put_blob_chunk_scoped("self", stream, 0, _b64(b"sealed"), 0, community_key_id=kid)
         with pytest.raises(ValueError, match="blob_invalid_argument"):
@@ -201,7 +201,7 @@ def test_a_stream_belongs_to_its_first_append_and_a_chunk_to_its_position_837_83
     is `blob_not_granted`; an unknown position is `blob_invalid_argument`."""
     eng = _engine(tmp_path)
     try:
-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
+        kid = eng.register_self_federation_key("agent")
         enc = eng.self_enc_pubkeys()
         eng.put_identity_occurrence_json(
             json.dumps(

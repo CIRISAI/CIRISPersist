@@ -370,6 +370,19 @@ mod tests {
                     if rel == "src/federation/blobs.rs" && !line.contains(".store_blob_local(") {
                         continue;
                     }
+                    // v62.0.0 (JSON-cut slice B) — the same hop now stores
+                    // through `store_blob_local` and announces the claim as a
+                    // statement after; it is still the default
+                    // `put_blob_signing_at`, and only there.
+                    if rel == "src/federation/blobs.rs"
+                        && lines[..n]
+                            .iter()
+                            .rev()
+                            .find(|l| l.trim_start().starts_with("fn "))
+                            .is_some_and(|l| l.contains("fn put_blob_signing_at<"))
+                    {
+                        continue;
+                    }
                     // A COMMONS door may reach the floor, but only by naming a
                     // commons scope as a LITERAL CONSTANT in the call itself —
                     // never a variable, which could carry an encrypted cohort.

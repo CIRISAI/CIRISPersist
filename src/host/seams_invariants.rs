@@ -73,7 +73,7 @@ async fn i1790_engine_stamps_the_installed_clock(dsn: &str, backend: &str) {
     // trust root's windows are not this witness's subject.
     clock::install(Arc::new(FixedClock::new(at)));
     let kid = engine
-        .register_self_federation_key("agent", "i1790", None, serde_json::json!({}), vec![])
+        .register_self_federation_key("agent", None, None)
         .await
         .unwrap_or_else(|e| panic!("I1790 {backend}: register_self: {e}"));
     let rec = match engine.backend() {

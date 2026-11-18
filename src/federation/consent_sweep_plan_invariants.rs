@@ -24,9 +24,7 @@
 //! - **I1195 (the consent-revocation fold)** — a `consent:state:revoked`
 //!   stance is a revocation and a producer's own `withdraws` (rule 1) is
 //!   not; newest first; `since` bounds the scan.
-//! - **I1196 (the PQC sweep's selection)** — a zero or negative page reads
-//!   nothing on every backend (sqlite read EVERY row for `-1`, postgres
-//!   refused it); pages come oldest first, ties by id, cut at the limit.
+//! - **I1196** — retired in v62 with the PQC cold path (a composite is atomic).
 //! - **I1197 (the reaper's selection)** — the never-offered types are never
 //!   offered; ids come oldest expiry first, ties by id; walking the pages by
 //!   OFFSET yields every row exactly once; an empty page reads nothing.
@@ -428,96 +426,6 @@ pub(crate) mod bodies {
         );
     }
 
-    /// I1196 — the PQC sweep's selection.
-    pub(crate) async fn i1196_hybrid_pending(d: &dyn FederationDirectory, s: &str) {
-        let (a, b) = (format!("i1196-a-{s}"), format!("i1196-b-{s}"));
-        // Inserted b first; both carry the fixture's one `valid_from`, so the
-        // id decides their order.
-        for k in [&b, &a] {
-            let (rec, _, _) =
-                crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
-                    k,
-                    crate::federation::types::identity_type::PRIMITIVE,
-                );
-            d.put_public_key(crate::federation::SignedKeyRecord { record: rec })
-                .await
-                .expect("I1196: a hybrid-pending key");
-        }
-        for limit in [0, -1, i64::MIN] {
-            assert!(
-                d.list_hybrid_pending_keys(limit).await.unwrap().is_empty(),
-                "I1196: a page of {limit} reads nothing"
-            );
-            assert!(d
-                .list_hybrid_pending_attestations(limit)
-                .await
-                .unwrap()
-                .is_empty());
-        }
-        let full: Vec<String> = d
-            .list_hybrid_pending_keys(10_000)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.id)
-            .collect();
-        let pa = full
-            .iter()
-            .position(|x| *x == a)
-            .expect("I1196: a is pending");
-        let pb = full
-            .iter()
-            .position(|x| *x == b)
-            .expect("I1196: b is pending");
-        assert_eq!(pb, pa + 1, "I1196: ties on valid_from by id: {full:?}");
-        let cut: Vec<String> = d
-            .list_hybrid_pending_keys(i64::try_from(pa + 1).unwrap())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.id)
-            .collect();
-        assert_eq!(
-            cut,
-            full[..=pa].to_vec(),
-            "I1196: the page is the order's prefix"
-        );
-        // The attestation plane: a row is on the PQC sweep's page exactly
-        // when its hybrid half is still pending.
-        let k = format!("i1196-k-{s}");
-        ts::register_identity_key(d, &k, NODE).await;
-        let x = format!("i1196-x-{s}");
-        put(
-            d,
-            row(
-                &x,
-                &k,
-                &k,
-                serde_json::json!({"dimension": "x:v1"}),
-                vec![k.clone()],
-                Utc::now(),
-            ),
-        )
-        .await;
-        let pending: Vec<String> = d
-            .list_hybrid_pending_attestations(10_000)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.id)
-            .collect();
-        let stored = d.get_attestation(&x).await.unwrap().unwrap();
-        assert_eq!(
-            pending.contains(&x),
-            stored.pqc_completed_at.is_none(),
-            "I1196: on the page iff pending: {pending:?}"
-        );
-        assert!(
-            !pending.is_empty(),
-            "I1196: the fixture holds a hybrid-pending attestation"
-        );
-    }
-
     /// I1197 — the reaper's selection.
     pub(crate) async fn i1197_expired(d: &dyn FederationDirectory, s: &str) {
         let k = format!("i1197-k-{s}");
@@ -834,19 +742,11 @@ mod units {
         assert!(ObservationTable::AnnouncedPeers.keep_predicate().is_none());
     }
 
-    /// I1196 / I1197 (unit) — the selections' bounds plan nothing for an
+    /// I1197 (unit) — the selection's bounds plan nothing for an
     /// empty or unreachable page.
     #[test]
-    fn i1196_i1197_selection_bounds() {
-        use crate::federation::sweep_plan::{plan_expired, plan_hybrid_pending, HybridPlane};
-        assert!(plan_hybrid_pending(HybridPlane::Keys, 0).is_none());
-        assert!(plan_hybrid_pending(HybridPlane::Keys, -5).is_none());
-        assert_eq!(
-            plan_hybrid_pending(HybridPlane::Attestations, 3)
-                .unwrap()
-                .limit,
-            3
-        );
+    fn i1197_selection_bounds() {
+        use crate::federation::sweep_plan::plan_expired;
         let now = chrono::Utc::now();
         assert!(plan_expired(now, 0, 0).is_none());
         assert!(plan_expired(now, 1, usize::MAX).is_none());
@@ -1004,11 +904,6 @@ mod run {
                     let Some(d) = $fresh.await else { return };
                     b::i1195_consent_revocations(&d as &dyn FederationDirectory, &super::suffix())
                         .await
-                }
-                #[tokio::test(flavor = "multi_thread")]
-                async fn i1196_hybrid_pending() {
-                    let Some(d) = $fresh.await else { return };
-                    b::i1196_hybrid_pending(&d as &dyn FederationDirectory, &super::suffix()).await
                 }
                 #[tokio::test(flavor = "multi_thread")]
                 async fn i1197_expired() {

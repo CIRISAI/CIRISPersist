@@ -333,7 +333,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("plan_key_supersede", Class::Delegates),
     ("plan_key_replace", Class::Delegates),
     ("plan_key_reanchor", Class::Delegates),
-    ("plan_key_attach_pqc", Class::Delegates),
     // Gates: the stored-column shapes (hex content hash, hybrid algorithm),
     // the consent-role token.
     ("check_key_record_columns", Class::Gate),
@@ -368,7 +367,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("list_consent_peers_for_planned", Class::Plan),
     ("live_consent_grants_planned", Class::Plan),
     ("consent_revocations_planned", Class::Plan),
-    ("list_hybrid_pending_planned", Class::Plan),
     ("list_expired_attestation_ids_planned", Class::Plan),
     ("evict_known_wire_hashes_planned", Class::Plan),
     ("evict_room_chunks_planned", Class::Plan),
@@ -573,10 +571,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("repair_withdraws_depth", Class::Plumbing),
     ("attesting_identity_type", Class::Plumbing),
     ("composer_replay_held", Class::Plumbing),
-    // The hybrid-completion door (`attach_attestation_pqc_signature`): the
-    // shared door, its decision (a refusal of an unknown or already-complete
-    // row, so a Gate), and the executor's guarded write.
-    ("attach_attestation_pqc_planned", Class::Plan),
     // The local-tier doors (`attestation_upsert_local` /
     // `attestation_insert_local`), door 2: until v56.0.0 each delegated its
     // body to a per-backend helper the scan could not see past (both doors read
@@ -652,8 +646,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // must carry a dimension string", which every backend writes identically
     // and which I951's local-door rows exercise.
     ("map", Class::Plumbing),
-    ("plan_attach_attestation_pqc_signature", Class::Gate),
-    ("store_pqc_completion", Class::Plumbing),
     // v55.0.0 (CIRISPersist#952) — Gate: the finalize refuses a chunk not held whole.
     ("check_held_dag_chunk", Class::Gate),
     // v46.3.0 (#884) — `minter_of_blob`'s community arm IS the #876 read
@@ -861,7 +853,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_geographic_community_admission", Class::Gate),
     ("check_infra_attest_role_admission", Class::Gate),
     ("check_instant_binding", Class::Gate),
-    ("check_key_pqc_attachment", Class::Gate),
     ("check_no_moderator_federate_apply", Class::Gate),
     ("check_node_agency_admission", Class::Gate),
     ("check_observed_region", Class::Gate),
@@ -1615,7 +1606,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 75] = [
+    const SHARED_PLANS: [(&str, &str); 74] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
         (
             "src/federation/transport_admit.rs",
@@ -1811,10 +1802,6 @@ mod tests {
         ),
         (
             "src/federation/attestation_admit.rs",
-            "attach_attestation_pqc_planned",
-        ),
-        (
-            "src/federation/attestation_admit.rs",
             "write_local_attestation_planned",
         ),
         (
@@ -1855,7 +1842,7 @@ mod tests {
     /// a selection runs NO gate (a selection that starts refusing is a door
     /// in disguise, and belongs in [`SHARED_PLANS`]), and every selection is
     /// named by at least one door (a selection no door runs is dead code).
-    const SHARED_SELECTIONS: [(&str, &str); 8] = [
+    const SHARED_SELECTIONS: [(&str, &str); 7] = [
         (
             "src/federation/consent_admit.rs",
             "list_consent_peers_planned",
@@ -1871,10 +1858,6 @@ mod tests {
         (
             "src/federation/consent_admit.rs",
             "consent_revocations_planned",
-        ),
-        (
-            "src/federation/sweep_plan.rs",
-            "list_hybrid_pending_planned",
         ),
         (
             "src/federation/sweep_plan.rs",
@@ -1894,7 +1877,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 85] = [
+    const SHARED_DOORS: [(&str, &str, &str); 81] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
         // decoded by the row mapper both doors read through.
         (
@@ -2167,16 +2150,6 @@ mod tests {
         // The sweeps' selections.
         (
             "FederationDirectory",
-            "list_hybrid_pending_keys",
-            "list_hybrid_pending_planned",
-        ),
-        (
-            "FederationDirectory",
-            "list_hybrid_pending_attestations",
-            "list_hybrid_pending_planned",
-        ),
-        (
-            "FederationDirectory",
             "list_expired_attestation_ids",
             "list_expired_attestation_ids_planned",
         ),
@@ -2231,11 +2204,6 @@ mod tests {
         ),
         (
             "FederationDirectory",
-            "attach_key_pqc_signature",
-            "key_record_write_planned",
-        ),
-        (
-            "FederationDirectory",
             "apply_replicated_key_record",
             "apply_replicated_key_record_planned",
         ),
@@ -2255,11 +2223,6 @@ mod tests {
             "AttestationStore",
             "store_planned_attestation",
             "recheck_cycle_under_lock",
-        ),
-        (
-            "FederationDirectory",
-            "attach_attestation_pqc_signature",
-            "attach_attestation_pqc_planned",
         ),
         (
             "FederationDirectory",
@@ -3474,7 +3437,6 @@ mod tests {
             Reads::ReceivedAt,
         ),
         ("plan_key_supersede", "admit_key_record", Reads::ReceivedAt),
-        ("plan_key_attach_pqc", "Some", Reads::ReceivedAt),
         // Receipt bounds (CC 2.6.7 W; the future-skew sanity bound).
         (
             "plan_put_attestation",
@@ -3532,12 +3494,6 @@ mod tests {
         (
             "recheck_cycle_under_lock",
             "check_delegation_cycle_admission",
-            Reads::ReceivedAt,
-        ),
-        // The hybrid completion stamps the receipt instant into the row.
-        (
-            "plan_attach_attestation_pqc_signature",
-            "Some",
             Reads::ReceivedAt,
         ),
         // The local door mints the row's instant from the receipt clock (or the
@@ -3659,7 +3615,7 @@ mod tests {
     ];
 
     /// The plan fns [`PLAN_INSTANTS`] covers: `(file, fn)`.
-    const INSTANT_PLANS: [(&str, &str); 18] = [
+    const INSTANT_PLANS: [(&str, &str); 16] = [
         // v60.0.0 (CIRISPersist#934 step 4) — the consent planners and the
         // reaper's selection: none reads the clock (the trust grant's
         // `trusted_at` is the door's one `received_at`).
@@ -3671,7 +3627,6 @@ mod tests {
         ("src/federation/key_plane.rs", "plan_key_put"),
         ("src/federation/key_plane.rs", "plan_key_scrub_upgrade"),
         ("src/federation/key_plane.rs", "plan_key_supersede"),
-        ("src/federation/key_plane.rs", "plan_key_attach_pqc"),
         // v57.0.0 (CIRISPersist#988 items 2, 3).
         ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
         ("src/federation/attestation_admit.rs", "plan_detection_row"),
@@ -3682,10 +3637,6 @@ mod tests {
         (
             "src/federation/attestation_admit.rs",
             "recheck_cycle_under_lock",
-        ),
-        (
-            "src/federation/attestation_admit.rs",
-            "plan_attach_attestation_pqc_signature",
         ),
         (
             "src/federation/attestation_admit.rs",

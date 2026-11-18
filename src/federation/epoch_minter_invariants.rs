@@ -56,8 +56,8 @@ pub(crate) mod bodies {
         let engine_b = Engine::with_signer_pre_genesis(ts::local_signer(&alias_b), dsn_b)
             .await
             .unwrap();
-        for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
-            e.register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
+        for (e, _alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+            e.register_self_federation_key(USER, None, None)
                 .await
                 .expect("register the engine's own key");
         }
@@ -1287,7 +1287,7 @@ pub(crate) mod room_1271 {
             let e = Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
                 .await
                 .unwrap();
-            e.register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
+            e.register_self_federation_key(USER, None, None)
                 .await
                 .expect("register the engine's own key");
             engines.push(e);

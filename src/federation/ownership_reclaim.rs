@@ -786,6 +786,94 @@ pub fn build_reclaim_withdraws_envelope(
     .to_value()
 }
 
+// ── v62.0.0 (JSON-cut slice B) — the three steps as edition-2 drafts ──────
+//
+// The builders above return the earlier JSON envelope a holder signed by its
+// JCS bytes. On the clean mesh each step is a row its signer states with its
+// own composite key: these return the [`Draft`](super::edition2::emit::Draft)
+// (the CBOR payload and the `Sig_structure` bytes to sign) for the signer
+// whose kid is `kid` and identity-ref `iss`. The members are the builders',
+// so the gates read the same row; the withdraws names the binding by
+// (`(kid, iss)` is the signer the draft is for.)
+// `refs.target` and carries the binding's family.
+
+/// **Step 1 draft**: the petition (a `scores` row about `node`).
+///
+/// # Errors
+/// `edition2_payload_invalid`.
+pub fn draft_reclaim_petition(
+    (kid, iss): (&super::edition2::Digest32, &str),
+    node: &str,
+    target_owner_binding_id: &str,
+    grounds: &str,
+    asserted_at_ms: u64,
+) -> Result<super::edition2::emit::Draft, Error> {
+    super::edition2::emit::draft_from_envelope(
+        kid,
+        iss,
+        node,
+        super::types::attestation_type::SCORES,
+        &build_reclaim_petition_envelope(target_owner_binding_id, grounds),
+        asserted_at_ms,
+        None,
+    )
+}
+
+/// **Step 2 draft**: the WA finding; each WA member drafts and signs its own
+/// voice over the same payload.
+///
+/// # Errors
+/// `edition2_payload_invalid`.
+pub fn draft_wa_finding(
+    (kid, iss): (&super::edition2::Digest32, &str),
+    node: &str,
+    finding: WaFinding,
+    target_owner_binding_id: &str,
+    petition_ref: &str,
+    grounds: &str,
+    asserted_at_ms: u64,
+) -> Result<super::edition2::emit::Draft, Error> {
+    super::edition2::emit::draft_from_envelope(
+        kid,
+        iss,
+        node,
+        super::types::attestation_type::SCORES,
+        &build_wa_finding_envelope(finding, target_owner_binding_id, petition_ref, grounds),
+        asserted_at_ms,
+        None,
+    )
+}
+
+/// **Step 3 draft**: the gated `withdraws` of the owner binding
+/// `target_owner_binding_id` (an edition-2 row id), carrying the binding's
+/// family `target_family` (`CC-READING(next-edition)`).
+///
+/// # Errors
+/// `edition2_payload_invalid` (a target that is not a row id included).
+pub fn draft_reclaim_withdraws(
+    (kid, iss): (&super::edition2::Digest32, &str),
+    node: &str,
+    target_owner_binding_id: &str,
+    target_family: &str,
+    wa_adjudication_ref: &str,
+    asserted_at_ms: u64,
+) -> Result<super::edition2::emit::Draft, Error> {
+    let target = super::edition2::store::id_of_hex(target_owner_binding_id).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "edition2_payload_invalid: {target_owner_binding_id:?} is not an edition-2 row id"
+        ))
+    })?;
+    super::edition2::emit::draft_from_envelope(
+        kid,
+        iss,
+        node,
+        super::types::attestation_type::WITHDRAWS,
+        &build_reclaim_withdraws_envelope(target_owner_binding_id, wa_adjudication_ref),
+        asserted_at_ms,
+        Some((&target, target_family)),
+    )
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  The re-derived WA quorum
 // ─────────────────────────────────────────────────────────────────────────

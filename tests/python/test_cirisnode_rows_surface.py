@@ -73,7 +73,7 @@ def _contribution(kind: str, payload: dict) -> str:
 def test_the_classes_are_rows_from_python(tmp_path) -> None:
     eng = _engine(tmp_path)
     try:
-        me = eng.register_self_federation_key("user", "ref-node", None, None, None)
+        me = eng.register_self_federation_key("user")
 
         cid = eng.cirisnode_put_contribution(_contribution("arc_question", {"q": 1}))
         page = json.loads(eng.cirisnode_list_contributions(me))
@@ -112,7 +112,7 @@ def test_the_classes_are_rows_from_python(tmp_path) -> None:
 def test_a_takedown_notice_is_a_row_from_python(tmp_path) -> None:
     eng = _engine(tmp_path)
     try:
-        me = eng.register_self_federation_key("user", "ref-node", None, None, None)
+        me = eng.register_self_federation_key("user")
         sha = hashlib.sha256(b"cirisnode-rows-takedown").hexdigest()
         # The content's establishing row names this node as its signed subject
         # (CC 4.5.5 `subject_of`): this node holds the takedown duty over it.

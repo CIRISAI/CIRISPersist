@@ -1310,7 +1310,7 @@ pub mod orchestrate {
     where
         B: BlobStorage + Sync,
     {
-        let minter = signer.derived_key_id();
+        let minter = signer.federation_id().await;
         let current = backend
             .community_dek_current_epoch(community_key_id, &minter)
             .await?;

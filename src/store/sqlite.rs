@@ -3133,6 +3133,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
     }
 
+    async fn edition2_statement(
+        &self,
+        statement_id: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, crate::federation::Error> {
+        let id = *statement_id;
+        self.read(move |conn| crate::federation::edition2::store::statement_by_id_sqlite(conn, &id))
+            .await
+    }
+
+    async fn edition2_statement_ids_since(
+        &self,
+        after: Option<&[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let after = after.copied();
+        self.read(move |conn| {
+            crate::federation::edition2::store::statement_ids_since_sqlite(
+                conn,
+                after.as_ref(),
+                limit,
+            )
+        })
+        .await
+    }
+
     // v61.4.0 (CIRISPersist#1244) — the directory capsule reaches the
     // blackhole and edge-detection surfaces through these, so those calls
     // run inside persist's `.so`.
@@ -4635,6 +4660,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         after_content_hash: Option<&str>,
         limit: u32,
     ) -> Result<Vec<String>, crate::federation::Error> {
+        // v62.0.0 (JSON-cut slice B) — the statement-id wire index.
+        if kind == crate::federation::edition2::store::STATEMENT_KIND {
+            let after = after_content_hash.and_then(crate::federation::edition2::store::id_of_hex);
+            return crate::federation::edition2::store::served_statement_ids_since(
+                self,
+                after.as_ref(),
+                limit,
+            )
+            .await;
+        }
         let kind = kind.to_owned();
         let after = after_content_hash.unwrap_or("").to_owned();
         let lim = i64::from(limit);
@@ -7623,6 +7658,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         kind: &str,
         content_hash: &str,
     ) -> Result<Option<Vec<u8>>, crate::federation::Error> {
+        // v62.0.0 (JSON-cut slice B) — a statement by its statement id, a row
+        // by its row id: the bytes as received.
+        if let Some(served) =
+            crate::federation::edition2::store::lookup_by_id(self, kind, content_hash).await?
+        {
+            return Ok(served);
+        }
         let kind_owned = kind.to_owned();
         let hash_owned = content_hash.to_owned();
         let record_key = self
@@ -7674,41 +7716,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             crate::federation::Error::Backend(format!("rebuild_signed_wire_index: {e}"))
         })?;
         Ok(count)
-    }
-
-    async fn attach_key_pqc_signature(
-        &self,
-        key_id: &str,
-        pubkey_ml_dsa_65_base64: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), crate::federation::Error> {
-        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
-        crate::federation::key_plane::key_record_write_planned(
-            self,
-            crate::federation::key_plane::KeyRecordWrite::AttachPqc {
-                key_id,
-                pubkey_ml_dsa_65_base64,
-                scrub_signature_pqc,
-            },
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// v56.0.0 (CIRISPersist#934 step 1) — the decision is
-    /// [`plan_attach_attestation_pqc_signature`](crate::federation::attestation_admit::plan_attach_attestation_pqc_signature),
-    /// shared by all three backends; this backend stores it.
-    async fn attach_attestation_pqc_signature(
-        &self,
-        attestation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), crate::federation::Error> {
-        crate::federation::attestation_admit::attach_attestation_pqc_planned(
-            self,
-            attestation_id,
-            scrub_signature_pqc,
-        )
-        .await
     }
 
     async fn get_attestation(
@@ -8068,34 +8075,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             trace,
         )
         .await
-    }
-
-    async fn list_hybrid_pending_keys(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
-        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
-            self,
-            crate::federation::sweep_plan::HybridPlane::Keys,
-            limit,
-        )
-        .await?;
-        Ok(rows)
-    }
-
-    async fn list_hybrid_pending_attestations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
-        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
-            self,
-            crate::federation::sweep_plan::HybridPlane::Attestations,
-            limit,
-        )
-        .await?;
-        Ok(rows)
     }
 
     // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
@@ -10659,7 +10638,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         //    I18 — a retraction that cannot be admitted ABORTS the eviction:
         //    the bytes stay, the error surfaces, the next sweep retries; a
         //    claim already retracted is not retracted twice.
-        let node = signer.derived_key_id();
+        let node = signer.federation_id().await;
         for sha_hex in &sha_hexes {
             let Ok(sha) = <[u8; 32]>::try_from(hex::decode(sha_hex).unwrap_or_default()) else {
                 continue;
@@ -15463,59 +15442,6 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         .await
         .map(|_| ())
         .map_err(|e| crate::federation::Error::Backend(format!("withdraws depth repair: {e}")))
-    }
-
-    async fn store_pqc_completion(
-        &self,
-        completion: crate::federation::attestation_admit::PqcCompletion,
-    ) -> Result<(), crate::federation::Error> {
-        let attestation_id = completion.attestation_id.clone();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
-                // THREE served columns; the serve position moves with them.
-                let admitted_at =
-                    sqlite_next_plane_position(conn, "federation_attestations", POS_ATTESTATION)?;
-                conn.execute(
-                    "UPDATE federation_attestations \
-                 SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3, \
-                     admitted_at = ?5 \
-                 WHERE attestation_id = ?4 AND pqc_completed_at IS NULL",
-                    rusqlite::params![
-                        completion.scrub_signature_pqc,
-                        completion.pqc_completed_at.to_rfc3339(),
-                        completion.persist_row_hash,
-                        completion.attestation_id,
-                        admitted_at.to_rfc3339()
-                    ],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(
-                "federation_attestations row was concurrently completed".to_string(),
-            ));
-        }
-        // v31.0.0 (CIRISPersist#657) — the hybrid-completion write moves THREE
-        // serialized columns of the attestation (`scrub_signature_pqc`,
-        // `pqc_completed_at`, `persist_row_hash`), so it moves the wire content
-        // hash exactly as the key-plane twin above does. #547 fixed the key
-        // site and #640 made that remedy shared; this site was never redirected
-        // through it, so a federation-tier attestation that completed its PQC
-        // leg kept serving the PRE-completion hash out of `signed_wire_index` —
-        // the point-read advertises one digest and the read surface returns
-        // another. Indexed from the row AS STORED (the shared helper re-reads),
-        // which is what makes the index agree with the read surface on a
-        // backend that rounds `pqc_completed_at`.
-        self.index_stored_record(
-            "Attestation",
-            &crate::federation::wire_index::record_key(&[("attestation_id", &attestation_id)]),
-        )
-        .await?;
-        Ok(())
     }
 
     async fn store_planned_local_attestation(
@@ -23914,41 +23840,6 @@ fn sqlite_binds(binds: Vec<crate::federation::attestation_query::Bind>) -> Vec<S
 /// Storage only: the selections are `federation::sweep_plan`'s.
 #[async_trait::async_trait]
 impl crate::federation::sweep_plan::SweepStore for SqliteBackend {
-    async fn read_hybrid_pending(
-        &self,
-        selection: crate::federation::sweep_plan::HybridPendingSelection,
-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        let stmt = selection.render(crate::federation::attestation_query::Dialect::Sqlite);
-        let binds = sqlite_binds(stmt.binds);
-        let sql = stmt.sql;
-        let rows = self
-            .read(
-                move |conn| -> Result<Vec<(String, String, String)>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows = stmt.query_map(params_from_iter(binds.iter()), |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                    })?;
-                    rows.collect()
-                },
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("read_hybrid_pending: {e}")))?;
-        rows.into_iter()
-            .map(|(id, envelope_text, classical_sig_b64)| {
-                let envelope = serde_json::from_str(&envelope_text).map_err(|e| {
-                    crate::federation::Error::Backend(format!(
-                        "hybrid-pending envelope decode: {e}"
-                    ))
-                })?;
-                Ok(crate::federation::HybridPendingRow {
-                    id,
-                    envelope,
-                    classical_sig_b64,
-                })
-            })
-            .collect()
-    }
-
     async fn read_expired_attestation_ids(
         &self,
         selection: crate::federation::sweep_plan::ExpiredSelection,
@@ -27387,7 +27278,6 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
             | P::Rewrite { record, .. }
             | P::Replace { record, .. }
             | P::RehydrateScrubs { record } => Some(sqlite_key_columns(record)?),
-            P::CompletePqc { .. } => None,
         };
         self.rehome_legacy_key_plane().await?;
         let kid = key_id.clone();
@@ -27566,29 +27456,6 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
                         )?
                     }
                 }
-                (
-                    P::CompletePqc {
-                        key_id,
-                        pubkey_ml_dsa_65_base64,
-                        scrub_signature_pqc,
-                        completed_at,
-                        persist_row_hash,
-                    },
-                    _,
-                ) => tx.execute(
-                    "UPDATE federation_keys \
-                     SET pubkey_ml_dsa_65_base64 = ?1, scrub_signature_pqc = ?2, \
-                         pqc_completed_at = ?3, persist_row_hash = ?4, mutated_at = ?6 \
-                     WHERE key_id = ?5 AND pqc_completed_at IS NULL",
-                    rusqlite::params![
-                        pubkey_ml_dsa_65_base64,
-                        scrub_signature_pqc,
-                        completed_at.to_rfc3339(),
-                        persist_row_hash,
-                        key_id,
-                        position,
-                    ],
-                )?,
                 (P::RehydrateScrubs { record: r }, Some(c)) => tx.execute(
                     "UPDATE federation_keys SET additional_scrubs = ?3, mutated_at = ?4 \
                      WHERE key_id = ?1 AND persist_row_hash = ?2 AND additional_scrubs = '[]'",
@@ -52013,35 +51880,6 @@ mod tests {
         .await;
     }
 
-    /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
-    /// the STORED envelope. No production door can do this (both v31 gates
-    /// refuse the shape), so the seam reaches the connection directly.
-    #[async_trait::async_trait]
-    impl crate::federation::migration::test_support::LegacyRowInstaller for SqliteBackend {
-        async fn downgrade_to_v30(&self, attestation_id: &str) {
-            let row = crate::federation::FederationDirectory::get_attestation(self, attestation_id)
-                .await
-                .expect("read")
-                .expect("downgrade_to_v30: row must exist");
-            let envelope =
-                serde_json::to_string(&crate::federation::migration::test_support::v30_envelope(
-                    &row.attestation_envelope,
-                ))
-                .expect("serialize");
-            let conn = self.conn.clone();
-            let id = attestation_id.to_owned();
-            (move || -> Result<usize, rusqlite::Error> {
-                let conn = conn.lock();
-                conn.execute(
-                    "UPDATE federation_attestations SET attestation_envelope = ?2 \
-                     WHERE attestation_id = ?1",
-                    rusqlite::params![id, envelope],
-                )
-            })()
-            .expect("downgrade_to_v30 update");
-        }
-    }
-
     impl SqliteBackend {
         pub(crate) fn rewrite_dimension_for_test(&self, attestation_id: &str, dimension: &str) {
             let conn = self.conn.lock();
@@ -52072,34 +51910,6 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::load_bearing::test_support::exercise_load_bearing_closure(
             &backend, "sq650c",
-        )
-        .await;
-    }
-
-    /// v31.0.0 (CIRISPersist#650) — THE PINNED GAP: a v30-shaped row can STILL
-    /// land after the migration, through the transit-revocation door. Sqlite
-    /// arm; shared body with memory + postgres.
-    #[tokio::test]
-    async fn a_v30_row_cannot_land_after_migration_sqlite_650() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::migration::test_support::exercise_a_v30_row_cannot_land_after_migration(
-            &backend, "sq650g",
-        )
-        .await;
-    }
-
-    /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration, sqlite arm.
-    /// Shared exercise body with memory + postgres; two independent in-memory
-    /// databases are two genuinely separate corpora.
-    #[tokio::test]
-    async fn v31_migration_sqlite_650() {
-        let origin = SqliteBackend::open_in_memory().await.unwrap();
-        origin.run_migrations().await.unwrap();
-        let peer = SqliteBackend::open_in_memory().await.unwrap();
-        peer.run_migrations().await.unwrap();
-        crate::federation::migration::test_support::exercise_v31_migration(
-            &origin, &origin, &peer, "sq650",
         )
         .await;
     }
@@ -52486,32 +52296,5 @@ mod tests {
         crate::federation::admission::ungated_doors_test_support::assert_role_launder_refused(
             "sqlite", a, b,
         );
-    }
-
-    /// v31.0.0 (CIRISPersist#657) — the cold-path PQC fill-in is GATED, on
-    /// sqlite. One shared body across memory / sqlite / postgres; see
-    /// [`crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated`].
-    #[tokio::test]
-    async fn attach_key_pqc_is_gated_sqlite_657() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated(
-            &backend, "sq657",
-        )
-        .await
-        .expect("657 attach-gate exercise");
-    }
-
-    /// v31.0.0 (CIRISPersist#657) — the ATTESTATION plane's instance of the
-    /// #547/#640 stale-index class, on sqlite.
-    #[tokio::test]
-    async fn attestation_wire_index_follows_pqc_attach_sqlite_657() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::operational::test_support::exercise_attestation_wire_index_follows_pqc_attach(
-            &backend, "sq657",
-        )
-        .await
-        .expect("657 attestation wire-index exercise");
     }
 }

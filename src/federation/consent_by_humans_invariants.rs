@@ -680,10 +680,8 @@ mod run {
                     .unwrap();
             e.register_self_federation_key(
                 crate::federation::types::identity_type::NODE,
-                &alias,
                 None,
-                serde_json::json!({}),
-                vec![],
+                None,
             )
             .await
             .unwrap();

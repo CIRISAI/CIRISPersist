@@ -589,3 +589,220 @@ where
         })
         .collect()
 }
+
+// ─── v62.0.0 (JSON-cut slice B) — serving by statement id / row id ─────────
+
+/// The wire-index kind of an edition-2 statement: its hash is the
+/// statement id (lowercase hex). `lookup_signed_record_by_content_hash` and
+/// `list_wire_hashes_since` serve this kind from `ceg_statements`, the bytes
+/// as received (CC 2.6.1.2).
+pub const STATEMENT_KIND: &str = "Statement";
+/// The lookup kind of an edition-2 row: its hash is the row id (lowercase
+/// hex), and the bytes served are the statement that admitted the row.
+pub const ROW_KIND: &str = "Row";
+
+/// A 64-hex id as 32 bytes.
+#[must_use]
+pub fn id_of_hex(hex_id: &str) -> Option<[u8; 32]> {
+    if hex_id.len() != 64 || hex_id.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    <[u8; 32]>::try_from(hex::decode(hex_id).ok()?).ok()
+}
+
+/// **The edition-2 point read** behind `lookup_signed_record_by_content_hash`:
+/// `None` when `kind` is not an edition-2 kind (the caller reads its earlier
+/// index), `Some(None)` for an id that is malformed or not held, else the
+/// statement's bytes as received.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn lookup_by_id<F>(
+    dir: &F,
+    kind: &str,
+    id_hex: &str,
+) -> Result<Option<Option<Vec<u8>>>, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    match kind {
+        STATEMENT_KIND => {
+            let Some(id) = id_of_hex(id_hex) else {
+                return Ok(Some(None));
+            };
+            let held = dir.edition2_statement(&id).await?;
+            Ok(Some(served_anonymously(dir, held).await?))
+        }
+        ROW_KIND => {
+            let Some(id) = id_of_hex(id_hex) else {
+                return Ok(Some(None));
+            };
+            // The statement that admitted the row (its mapped row carries
+            // it); a key-plane row, which maps to no typed row, is served by
+            // its first voice.
+            let held = match dir.get_attestation(id_hex).await? {
+                Some(row) => super::emit::carried_statement(&row),
+                None => None,
+            };
+            let held = match held {
+                Some(st) => Some(st),
+                None => dir
+                    .edition2_voices(&super::names::RowId(id))
+                    .await?
+                    .into_iter()
+                    .next(),
+            };
+            Ok(Some(served_anonymously(dir, held).await?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The point read and the wire index are anonymous (no requester is named
+/// at this surface): a statement is served only when an anonymous read may
+/// be served it ([`super::serve::servable_to`] with no requester: the
+/// commons, the key plane and signed objects).
+async fn served_anonymously<F>(
+    dir: &F,
+    held: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    match held {
+        Some(st) if super::serve::servable_to(dir, &st, None).await? => Ok(Some(st)),
+        _ => Ok(None),
+    }
+}
+
+/// **The statement-id wire index, filtered**: [`FederationDirectory::edition2_statement_ids_since`]
+/// with each id kept only when an anonymous read may be served its statement.
+///
+/// [`FederationDirectory::edition2_statement_ids_since`]: crate::federation::FederationDirectory::edition2_statement_ids_since
+///
+/// # Errors
+/// Directory reads.
+pub async fn served_statement_ids_since<F>(
+    dir: &F,
+    after: Option<&[u8; 32]>,
+    limit: u32,
+) -> Result<Vec<String>, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    let mut out = Vec::new();
+    for id in dir.edition2_statement_ids_since(after, limit).await? {
+        let Some(raw) = id_of_hex(&id) else { continue };
+        if served_anonymously(dir, dir.edition2_statement(&raw).await?)
+            .await?
+            .is_some()
+        {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// sqlite: one held statement by its statement id.
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn statement_by_id_sqlite(
+    conn: &rusqlite::Connection,
+    statement_id: &[u8; 32],
+) -> Result<Option<Vec<u8>>, crate::federation::Error> {
+    use rusqlite::OptionalExtension as _;
+    conn.query_row(
+        "SELECT bytes FROM ceg_statements WHERE statement_id = ?1",
+        rusqlite::params![&statement_id[..]],
+        |r| r.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))
+}
+
+/// postgres: one held statement by its statement id.
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn statement_by_id_postgres<C>(
+    client: &C,
+    statement_id: &[u8; 32],
+) -> Result<Option<Vec<u8>>, crate::federation::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    let be = |e: tokio_postgres::Error| {
+        crate::federation::Error::Backend(format!("ceg_statements: {e}"))
+    };
+    let row = client
+        .query_opt(
+            "SELECT bytes FROM cirislens.ceg_statements WHERE statement_id = $1",
+            &[&&statement_id[..]],
+        )
+        .await
+        .map_err(be)?;
+    row.map(|r| r.try_get::<_, Vec<u8>>(0).map_err(be))
+        .transpose()
+}
+
+/// sqlite: the held statement ids after `after` (lowercase hex, in id
+/// order), at most `limit` (clamped to [`MAX_PAGE`]): the statement-id wire
+/// index.
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn statement_ids_since_sqlite(
+    conn: &rusqlite::Connection,
+    after: Option<&[u8; 32]>,
+    limit: u32,
+) -> Result<Vec<String>, crate::federation::Error> {
+    let be = |e: rusqlite::Error| crate::federation::Error::Backend(format!("ceg_statements: {e}"));
+    let after = after.map_or_else(Vec::new, |a| a.to_vec());
+    let mut st = conn
+        .prepare(
+            "SELECT statement_id FROM ceg_statements WHERE statement_id > ?1 \
+             ORDER BY statement_id LIMIT ?2",
+        )
+        .map_err(be)?;
+    let rows = st
+        .query_map(
+            rusqlite::params![after, i64::from(limit.min(MAX_PAGE))],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .map_err(be)?;
+    rows.map(|r| r.map(hex::encode).map_err(be)).collect()
+}
+
+/// postgres: [`statement_ids_since_sqlite`].
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn statement_ids_since_postgres<C>(
+    client: &C,
+    after: Option<&[u8; 32]>,
+    limit: u32,
+) -> Result<Vec<String>, crate::federation::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    let be = |e: tokio_postgres::Error| {
+        crate::federation::Error::Backend(format!("ceg_statements: {e}"))
+    };
+    let after = after.map_or_else(Vec::new, |a| a.to_vec());
+    let rows = client
+        .query(
+            "SELECT statement_id FROM cirislens.ceg_statements WHERE statement_id > $1 \
+             ORDER BY statement_id LIMIT $2",
+            &[&after, &i64::from(limit.min(MAX_PAGE))],
+        )
+        .await
+        .map_err(be)?;
+    rows.iter()
+        .map(|r| r.try_get::<_, Vec<u8>>(0).map(hex::encode).map_err(be))
+        .collect()
+}

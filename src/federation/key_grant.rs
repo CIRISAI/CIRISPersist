@@ -2009,7 +2009,7 @@ pub async fn emit_key_grant_axis_with_local_signer<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let me = signer.derived_key_id();
+    let me = signer.federation_id().await;
     emit_planned(backend, &me, axis, |input| async move {
         crate::federation::attestation_emit::emit_with_local_signer(backend, signer, input)
             .await
@@ -2030,7 +2030,7 @@ pub async fn emit_dirty_with_local_signer<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let me = signer.derived_key_id();
+    let me = signer.federation_id().await;
     let axes = dirty_axes(backend, &me).await?;
     Ok(emit_dirty_axes(&me, axes, |axis| async move {
         emit_key_grant_axis_with_local_signer(backend, signer, &axis).await
@@ -2197,7 +2197,7 @@ where
 {
     let axis = KeyGrantAxis::Epoch {
         community_key_id: community_key_id.to_owned(),
-        minter_key_id: signer.derived_key_id(),
+        minter_key_id: signer.federation_id().await,
         epoch,
     };
     emit_key_grant_axis_with_local_signer(backend, signer, &axis).await
@@ -2259,7 +2259,7 @@ pub async fn publish_self_occurrence_with_local_signer<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let me = signer.derived_key_id();
+    let me = signer.federation_id().await;
     let kem = backend
         .load_or_init_content_kem_identity()
         .await
@@ -2304,7 +2304,7 @@ pub async fn publish_signed_content_only_occurrence<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let me = signer.derived_key_id();
+    let me = signer.federation_id().await;
     // Millisecond-exact: the envelope carries the millisecond rendering and
     // the gate requires the typed instant to carry nothing below it.
     let asserted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(

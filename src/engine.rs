@@ -531,12 +531,6 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
-        // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
-        // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
-        // `Backend` has no signer; this is the first point at which the backend
-        // and the signing key exist together. Idempotent, resumable, and never
-        // boot-fatal — see `federation::migration`.
-        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
         Ok(engine)
     }
 
@@ -618,13 +612,6 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
-        // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
-        // pre-genesis node usually has nothing to migrate (no identity ⇒ no
-        // authorship), and the routine returns early in that case; but a node
-        // that HAS an identity and no trust root still owns rows, and
-        // withholding the migration from this constructor would make the
-        // corpus's shape depend on which constructor the host happened to use.
-        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
         Ok(engine)
     }
 
@@ -2567,7 +2554,7 @@ impl Engine {
         let directory = self.federation_directory();
         crate::federation::blobs::emit_withdraws_attestation_helper(
             prior,
-            &signer.derived_key_id(),
+            &signer.federation_id().await,
             signer,
             &*directory,
             crate::host::clock::now(),
@@ -2674,334 +2661,184 @@ impl Engine {
     /// uniformly for software ([`Self::with_signer`]) and hardware
     /// ([`Self::with_hardware_signer_hybrid`]) engines alike — the alias
     /// is [`HardwareSigner::current_alias`].
+    ///
+    /// v62.0.0 (JSON-cut slice B) — on an engine that holds a composite
+    /// signer ([`Self::composite_signer`]) this is the composite key's
+    /// **identity-ref** (`urn:ietf:params:oauth:ckt:sha-256:…`, RFC 9679):
+    /// the `iss` every edition-2 statement this node produces carries, and the
+    /// key id its `key:record` projects under. A classical-only engine keeps
+    /// the earlier derived id; it produces nothing on the mesh.
     pub async fn local_derived_key_id(&self) -> Result<String, SignError> {
+        if let Some(local) = self.composite_local_signer() {
+            // Reads (and memoizes on the signer) its identity-ref.
+            return Ok(local.federation_id().await);
+        }
         crate::signing::federation_key_id_of(&*self.signer).await
     }
 
-    /// v10.0.1 (CIRISPersist#275) — register THIS engine's **own
-    /// federation identity** — the composed `self.signer`, the key every
-    /// emit/scrub path derives its key_id from — as a self-signed
-    /// `federation_keys` row of `identity_type`.
+    /// The local signer when it can sign a composite (its PQC half is
+    /// configured).
+    fn composite_local_signer(&self) -> Option<&crate::signing::LocalSigner> {
+        self.local_signer
+            .as_deref()
+            .filter(|l| l.pqc_signer().is_some())
+    }
+
+    /// v62.0.0 (JSON-cut slice B) — **this engine's composite signer**, the
+    /// one key every edition-2 statement it produces is signed with (CC
+    /// 2.6.1.7: composite signatures only).
     ///
-    /// The row is keyed by the **derived** federation key_id
-    /// ([`Self::local_derived_key_id`] = `derive_key_id(<alias>, <ed25519
-    /// pubkey>)` = `<label>-<fp>`), carries `self.signer`'s Ed25519 pubkey,
-    /// and a classical self-signature over the canonical
-    /// `registration_envelope`. This is the row the holding-claim / withdraws
-    /// / emit `scrub_key_id` FK resolves against (the #247 floor).
+    /// # Errors
+    /// `composite_signing_unavailable` (`InvalidArgument`, Python
+    /// `ValueError`) for an engine with no local signer, or one without its
+    /// ML-DSA-65 half: a classical-only engine refuses to produce.
+    pub fn composite_signer(
+        &self,
+        producer: &str,
+    ) -> Result<&crate::signing::LocalSigner, crate::federation::Error> {
+        use crate::federation::edition2::emit::composite_signing_unavailable;
+        match self.local_signer.as_deref() {
+            None => Err(composite_signing_unavailable(producer, "no local signer")),
+            Some(l) if l.pqc_signer().is_none() => Err(composite_signing_unavailable(
+                producer,
+                "the local signer has no ML-DSA-65 half",
+            )),
+            Some(l) => Ok(l),
+        }
+    }
+
+    /// v62.0.0 (JSON-cut slice B) — **register THIS engine's own key on the
+    /// clean mesh**: a self-signed `key:record` statement (CC 2.4.1.1) of the
+    /// engine's composite key, admitted through the statement door. Returns
+    /// the key's **identity-ref** (= [`Self::local_derived_key_id`]), which
+    /// the caller threads back as the attester of its emits.
     ///
-    /// # Why `self.signer`, not a `LocalSigner`
+    /// - `identity_type` is the identity SET, comma-separated (`"node"`,
+    ///   `"steward,witness"`); CC 2.4.1.1's set rules are the door's.
+    /// - `valid_until`: a `node` / `agent` record ends at most 365 days out;
+    ///   with none, persist writes that end. A `user` / `accord_holder`
+    ///   record carries none.
+    /// - `attestation_evidence`: the optional `{hardware_class, pq_custody,
+    ///   chain}` the record carries (the chain as hex DER, leaf first).
     ///
-    /// Pre-#275 the FFI bootstrap registered the **`LocalSigner`** seed's
-    /// identity (and historically the bare keystore alias). But every
-    /// federation-tier emit — [`Self::put_blob_signing`]'s holding-claim
-    /// scrub, [`Self::emit_attestation_self`], [`Self::attestation_promote`],
-    /// the eviction `withdraws` — derives its key_id from `self.signer`
-    /// ([`Self::local_derived_key_id`]). When the composed signer and the
-    /// local seed are distinct identities (different Ed25519 pubkeys ⇒
-    /// different derived ids — the real-node shape), the registered row and
-    /// the scrub FK target diverged, so `put_blob_signing` FK-failed on the
-    /// canonical "register self, then hold bytes" flow for every persist
-    /// ≥ 9.3.0. Registering `self.signer`'s identity (and returning its
-    /// derived id, which the caller threads back as `attesting_key_id`)
-    /// closes that gap structurally.
+    /// There are no `roles`, no caller `identity_ref` and no
+    /// `registration_envelope`: the record's identity is its key, and `act`
+    /// is derived by the reader, never a payload member.
     ///
-    /// The ML-DSA half is left to the cold-path PQC fill (matches the
-    /// pre-#275 shape). Returns the registered (derived) key_id.
+    /// A RESTART re-registers the same key (CIRISPersist#1146): when a held
+    /// self-signed record of this key already states this identity set and
+    /// evidence, and (with no `valid_until` asked) still has more than 30
+    /// days to run, nothing is signed and the held record stands.
     ///
-    /// # v31.0.0 (CIRISPersist#659) — BREAKING: the caller's envelope is
-    /// subject-BOUND before it is signed
-    ///
-    /// `registration_envelope` is stamped with the derived `key_id`, the
-    /// `identity_type` argument and BOTH of this engine's pubkeys through
-    /// [`admission::bind_subject_into_envelope`](crate::federation::admission::bind_subject_into_envelope)
-    /// — the one shared projection — before it is canonicalized and signed.
-    /// Every other field the caller passed survives untouched; the bound keys
-    /// are overwritten if present.
-    ///
-    /// This is a **preimage change** for the node's own bootstrap row, and it
-    /// is not cosmetic: that row replicates, and at every peer it lands on the
-    /// `Insert` branch of `apply_replicated_key_record`, which runs
-    /// [`verify_key_registration`](crate::federation::verify_key_registration)
-    /// — now REQUIRING the binding. Minting the row unbound would succeed
-    /// locally and be refused by the entire mesh.
+    /// # Errors
+    /// `composite_signing_unavailable` on a classical-only engine; the
+    /// door's refusals (`key_record_out_of_window`, a mixed identity set).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn register_self_federation_key(
         &self,
         identity_type: &str,
-        identity_ref: &str,
         valid_until: Option<chrono::DateTime<chrono::Utc>>,
-        registration_envelope: serde_json::Value,
-        roles: Vec<String>,
+        attestation_evidence: Option<serde_json::Value>,
     ) -> Result<String, crate::federation::Error> {
-        use crate::federation::FederationDirectory;
-        use crate::verify::canonical::ceg_produce_canonicalize;
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use sha2::{Digest, Sha256};
-
-        // The federation identity is the engine's composed signer — the
-        // SAME key every emit/scrub path derives its key_id from (#247/#275).
-        let key_id = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("register_self derive key_id: {e}"))
-        })?;
-        // v30.2.0 (CIRISPersist#607) — tell the backend WHO THIS NODE IS.
-        //
-        // Reserved-prefix rules carrying a `required_delegation_scope` resolve
-        // "does THIS NODE trust the root that conferred the emitter's role",
-        // and that question needs an identity to ask on behalf of. Registering
-        // itself is precisely the act in which a node states that identity, so
-        // it is where the backend learns it — not a separate call a host can
-        // forget, which is how a gate ends up unreachable from every real
-        // caller while its tests pass (AV-77's shape).
-        self.set_backend_node_key_id(&key_id);
-
-        let pubkey = self.signer.public_key().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("register_self signer public_key: {e}"))
-        })?;
-        let pubkey_ed25519_base64 = B64.encode(&pubkey);
-
-        // v10.1.0 (CIRISPersist#275 — withdraws/eviction surface) — populate
-        // the ML-DSA-65 PUBLIC KEY and a complete hybrid scrub signature when
-        // the engine has a PQC identity. Pre-#275 the row left
-        // `pubkey_ml_dsa_65_base64 = None` (deferred to a "cold-path fill"
-        // that never runs in a standalone / SQLite wheel). A registered key
-        // with NO ML-DSA pubkey makes the federation-tier ingest gate REJECT
-        // every hybrid-signed emission verified against it
-        // (`verify_hybrid_pqc_fields_mismatch`: "PQC signature without
-        // pubkey") — e.g. the eviction `withdraws` and any `emit_attestation`.
-        // So a node that registered itself could not emit. The classical half
-        // of `sign_hybrid` is the engine's composed signer (== the Ed25519
-        // identity in `pubkey_ed25519_base64`), so the row is internally
-        // consistent.
-        //
-        // v31.0.0 (CIRISPersist#659) — resolved BEFORE the envelope is
-        // canonicalized, because the subject binding below names it. The row's
-        // PQC leg and the leg the signature covers are now the same statement.
-        let pqc_pubkey_b64 = match self.local_signer.as_ref() {
-            Some(ls) => ls.pqc_public_key_b64().await.map_err(|e| {
-                crate::federation::Error::Backend(format!("register_self pqc public_key: {e}"))
-            })?,
-            None => None,
+        use crate::federation::edition2::emit::{
+            key_record_payload, produce_error, KEY_RECORD_FAMILY,
         };
+        use ciris_verify_core::edition2::keys::KEY_RECORD_MAX_SECS;
+        use ciris_verify_core::edition2::{identity_ref, thumbprint};
 
-        // v61 (CC 2.6.2) — the expiry is a signed instant: `.sssZ`, at the
-        // millisecond, and the record carries the same truncated instant.
-        let valid_until =
-            valid_until.map(crate::federation::admission::truncate_to_substrate_resolution);
-
-        // v61 (CIRISPersist#1146) — a RESTART re-registers the same key.
-        // When the held row already states this registration (same pubkeys,
-        // identity, roles and expiry), the call is a no-op success and the held
-        // row is kept byte for byte: re-signing a fresh envelope would move its
-        // `persist_row_hash` and everything that cites it. Any difference is a
-        // real change and still goes to the put, which refuses it `Conflict`
-        // (a key change goes through the rebind door, #864). The replicated
-        // put keeps its exact-hash rule; this applies to self-registration only.
-        if let Some(held) = self
-            .federation_directory()
-            .lookup_public_key(&key_id)
-            .await?
-        {
-            if crate::federation::register::self_registration_unchanged(
-                &held,
-                &crate::federation::register::SelfRegistration {
-                    pubkey_ed25519_base64: &pubkey_ed25519_base64,
-                    pubkey_ml_dsa_65_base64: pqc_pubkey_b64.as_deref(),
-                    identity_type,
-                    identity_ref,
-                    roles: &roles,
-                    valid_until,
-                },
-            ) {
-                return Ok(key_id);
-            }
-        }
-
-        // v31.0.0 (CIRISPersist#659, one plane wider) — **BIND THE SUBJECT
-        // BEFORE THE BYTES ARE FORMED.** This row is not verified here (the
-        // §5.6.8.15 gate is for PEER registration, see below) but it is
-        // verified at every PEER it replicates to: a fresh `key_id` arriving
-        // through `apply_replicated_key_record` takes the `Insert` branch and
-        // meets `verify_key_registration`, which now REQUIRES the binding. A
-        // node minting a subject-blind bootstrap row would register fine
-        // locally and be refused by the whole mesh — fail-closed, but
-        // fail-closed on the wrong side of the wire, and invisible until
-        // peering. The caller's envelope is otherwise untouched.
-        //
-        // v31.0.0 (CIRISVerify 13.1.0) — `identity_type` is bound to the
-        // PARAMETER, which is exactly the value the row is stored with a few
-        // lines below (`identity_type: identity_type.to_owned()`), unmodified
-        // and with nothing in between that could rewrite it. That equality is
-        // the whole requirement: this row replicates, every peer re-checks the
-        // binding against the COLUMN it arrives carrying, and binding anything
-        // other than the stored standing would make the node's own bootstrap
-        // row unreplicatable.
-        let mut registration_envelope = registration_envelope;
-        crate::federation::admission::bind_subject_into_envelope(
-            &mut registration_envelope,
-            &key_id,
-            identity_type,
-            &pubkey_ed25519_base64,
-            pqc_pubkey_b64.as_deref(),
-            // v38.7.0 (verify v14.0.0) — the expiry is BOUND. v61: the
-            // caller's `valid_until` (stored on the record below) is bound
-            // here in the CC 2.6.2 form; binding `None` beside a stored expiry
-            // made the row fail its own subject binding at every peer.
-            valid_until
-                .map(crate::federation::admission::render_signed_instant)
-                .as_deref(),
-        )
-        .map_err(crate::federation::Error::InvalidArgument)?;
-
-        // v61 (CC 2.6.2; the key record's preimage table puts `valid_from`
-        // beside `valid_until`) — the signed `valid_from` is `.sssZ`. A
-        // caller's `valid_from` in that form is kept; any other form is
-        // refused, naming the member, because persist signs these bytes and a
-        // producer MUST emit the canonical form. With none, persist writes the
-        // registration instant at the millisecond. The record carries the
-        // signed instant either way.
-        let valid_from = {
-            use crate::federation::admission::{
-                render_signed_instant, truncate_to_substrate_resolution,
-            };
-            let env = registration_envelope.as_object_mut().ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(
-                    "registration_envelope must be a JSON object".into(),
+        const PRODUCER: &str = "register_self_federation_key";
+        const RENEW_BEFORE_MS: u64 = 30 * 24 * 3600 * 1000;
+        let signer = self.composite_signer(PRODUCER)?;
+        let key = crate::federation::edition2::produce::composite_public_key(signer)
+            .await
+            .map_err(|e| {
+                crate::federation::edition2::emit::composite_signing_unavailable(
+                    PRODUCER,
+                    &e.to_string(),
                 )
             })?;
-            match env.get("valid_from") {
-                None => {
-                    let t = truncate_to_substrate_resolution(crate::host::clock::now());
-                    env.insert(
-                        "valid_from".into(),
-                        serde_json::Value::String(render_signed_instant(t)),
-                    );
-                    t
-                }
-                Some(serde_json::Value::String(s))
-                    if crate::verify::canonical_validation::validate_canonical_datetime(s)
-                        .is_ok() =>
-                {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .map_err(|e| {
-                            crate::federation::Error::InvalidArgument(format!(
-                                "registration_envelope valid_from {s:?}: {e}"
-                            ))
-                        })?
-                        .with_timezone(&chrono::Utc)
-                }
-                Some(other) => {
-                    return Err(crate::federation::Error::InvalidArgument(format!(
-                        "registration_envelope valid_from = {other} is not in the CC 2.6.2 form \
-                         YYYY-MM-DDTHH:MM:SS.sssZ; a signed instant in any other form does not \
-                         verify"
-                    )));
-                }
-            }
-        };
+        let kid = thumbprint(&key);
+        let iref = identity_ref(&kid);
+        // v30.2.0 (CIRISPersist#607) — tell the backend WHO THIS NODE IS.
+        self.set_backend_node_key_id(&iref);
 
-        // Canonicalize the registration envelope **through the CEG produce
-        // gate**, SHA-256 it, and self-sign with the composed signer.
-        //
-        // v37.0.0 — THE FOURTH INSTANCE of the #714 / #716 / #735
-        // canonicalization-parity class, and the one that mints a node's own
-        // bootstrap identity. From the v4.15.0 JCS produce flip to v36.x this
-        // hand-built `PythonJsonDumpsCanonicalizer` for BOTH halves of the row
-        // — the signing preimage and `original_content_hash` — while
-        // `register::verify_key_registration` (the gate every PEER runs on the
-        // `Insert` branch of `apply_replicated_key_record`) rebuilds both with
-        // `ceg_produce_canonicalize`, and `put_public_key` stores the envelope
-        // in its `canonical_at_rest` (JCS) form. The two rules agree
-        // byte-for-byte on the structured-ASCII shape
-        // `bind_subject_into_envelope` stamps, which is why it survived; a
-        // caller-supplied envelope carrying one non-ASCII character or one
-        // non-ES float token (`1e-05`) diverges, and then:
-        //
-        //   * the STORED envelope is JCS while both signatures and the
-        //     content hash are over V1 — the row is self-inconsistent at rest,
-        //     `sha256sum(registration_envelope) != original_content_hash`;
-        //   * every peer refuses it (`registration original_content_hash
-        //     mismatch`), so the node's own bootstrap row is unreplicatable;
-        //   * and it is UNREPAIRABLE. This path writes `pqc_completed_at =
-        //     Some(now)` whenever the engine has a PQC identity, so the row is
-        //     invisible to `list_hybrid_pending_keys` (`WHERE pqc_completed_at
-        //     IS NULL`) and `attach_key_pqc_signature` refuses it as "already
-        //     PQC-complete". There is no re-mint path and no detection path.
-        //
-        // Routed through the gate, the row `put_public_key` stores and the
-        // bytes it was signed over are the same byte sequence by construction.
-        // Witnessed by `register_self_canonicalizer_parity`.
-        let canonical = ceg_produce_canonicalize(&registration_envelope).map_err(|e| {
-            crate::federation::Error::Backend(format!("register_self canonicalize: {e}"))
+        let roles: Vec<&str> = identity_type
+            .split(',')
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .collect();
+        let now_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).map_err(|_| {
+            crate::federation::Error::InvalidArgument(
+                "register_self: the clock is before 1970".into(),
+            )
         })?;
-        let original_content_hash = hex::encode(Sha256::digest(&canonical));
-
-        // Microsecond truncation (Postgres TIMESTAMPTZ precision) — inlined
-        // to avoid a cirisaudit-feature dep on this path (mirrors the FFI).
-        let now = {
-            use chrono::Timelike as _;
-            let dt = crate::host::clock::now();
-            let micros = dt.nanosecond() / 1000;
-            dt.with_nanosecond(micros * 1000).unwrap_or(dt)
+        let must_end = roles.iter().any(|r| matches!(*r, "node" | "agent"));
+        let asked_end = valid_until
+            .map(|t| {
+                u64::try_from(t.timestamp_millis()).map_err(|_| {
+                    crate::federation::Error::InvalidArgument(
+                        "register_self: valid_until is before 1970".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        let end = match asked_end {
+            Some(u) => Some(u),
+            None if must_end => Some(now_ms.saturating_add(KEY_RECORD_MAX_SECS * 1000)),
+            None => None,
         };
+        let payload = key_record_payload(
+            &key,
+            &roles,
+            &iref,
+            now_ms,
+            end,
+            attestation_evidence.as_ref(),
+        )
+        .map_err(|e| produce_error(PRODUCER, e))?;
 
-        let (scrub_signature_classical, scrub_signature_pqc, pqc_completed_at) =
-            if pqc_pubkey_b64.is_some() {
-                let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
-                    crate::federation::Error::Backend(format!("register_self hybrid sign: {e}"))
-                })?;
-                (
-                    B64.encode(&sig.classical.signature),
-                    Some(B64.encode(&sig.pqc.signature)),
-                    Some(now),
-                )
-            } else {
-                // Ed25519-only identity — classical-only self-signature. A
-                // non-PQC node cannot emit federation-tier rows (enforced at
-                // those emit sites); the row stays Ed25519-only.
-                let classical_sig = self.signer.sign(&canonical).await.map_err(|e| {
-                    crate::federation::Error::Backend(format!("register_self classical sign: {e}"))
-                })?;
-                (B64.encode(&classical_sig), None, None)
+        // v61 (CIRISPersist#1146) — a restart is not a new registration.
+        let dir = self.federation_directory();
+        let held =
+            crate::federation::edition2::ingest::held_keys_for_kid(dir.as_ref(), &kid).await?;
+        if let Ok(valid) = held.valid_records(&kid) {
+            let same = |member: &str, statement: &[u8]| {
+                crate::federation::edition2::liveness::statement_parts(statement)
+                    .is_some_and(|(_, p)| p.get_text(member) == payload.get_text(member))
             };
-
-        let record = crate::federation::KeyRecord {
-            key_id: key_id.clone(),
-            pubkey_ed25519_base64,
-            pubkey_ml_dsa_65_base64: pqc_pubkey_b64,
-            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-            identity_type: identity_type.to_owned(),
-            identity_ref: identity_ref.to_owned(),
-            valid_from,
-            valid_until,
-            registration_envelope,
-            original_content_hash,
-            scrub_signature_classical,
-            scrub_signature_pqc,
-            scrub_key_id: key_id.clone(),
-            scrub_timestamp: now,
-            pqc_completed_at,
-            persist_row_hash: String::new(),
-            capability_roles: roles,
-            attestation_evidence: None,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        let signed = crate::federation::SignedKeyRecord { record };
-
-        // Self-bootstrap write — the same path the FFI `put_public_key`
-        // takes (NO `verify_key_registration`: that hybrid-mandatory
-        // §5.6.8.15 gate is for PEER registration via
-        // [`Self::register_federation_key`], not a node minting its own
-        // bootstrap row; the PQC half is filled by the cold path). The
-        // `put_public_key` writer is idempotent on the `key_id` PK.
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => b.put_public_key(signed).await?,
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => b.put_public_key(signed).await?,
+            let standing = valid.iter().any(|v| {
+                crate::federation::edition2::ingest::statement_kid(&v.statement) == Some(kid)
+                    && same("identity_type", &v.statement)
+                    && same("attestation_evidence", &v.statement)
+                    && match (asked_end, v.record.valid_until) {
+                        (Some(a), held_end) => held_end == Some(a),
+                        (None, None) => !must_end,
+                        (None, Some(u)) => u > now_ms.saturating_add(RENEW_BEFORE_MS),
+                    }
+            });
+            if standing {
+                return Ok(iref);
+            }
         }
-        Ok(key_id)
+
+        let statement = crate::federation::edition2::produce::sign_row(
+            signer,
+            &iref,
+            crate::federation::types::attestation_type::SCORES,
+            KEY_RECORD_FAMILY,
+            &payload,
+        )
+        .await
+        .map_err(|e| produce_error(PRODUCER, e))?;
+        crate::federation::edition2::ingest::put_statement_with_origin(
+            dir.as_ref(),
+            &statement,
+            None,
+            crate::federation::types::attestation_tier::FEDERATION,
+            crate::federation::replication::admission::WriteOrigin::Authored,
+        )
+        .await?;
+        Ok(iref)
     }
 
     /// v44.7.0 (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md` §4) — the local
@@ -3657,12 +3494,12 @@ impl Engine {
             None
         } else {
             match actor {
-                Some(a) if a.derived_key_id() == prior.attesting_key_id => Some(a),
+                Some(a) if a.federation_id().await == prior.attesting_key_id => Some(a),
                 Some(a) => {
                     return Err(Error::CustodyIsNotTheActor {
                         attestation_id: prior.attestation_id,
                         attesting_key_id: prior.attesting_key_id,
-                        scrub_key_id: a.derived_key_id(),
+                        scrub_key_id: a.federation_id().await,
                     })
                 }
                 None => {
@@ -4138,29 +3975,18 @@ impl Engine {
     pub async fn emit_attestation(
         &self,
         signer: &crate::signing::LocalSigner,
-        mut input: crate::federation::EmitAttestationInput,
+        input: crate::federation::EmitAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        // Derive the registered federation key_id from the signer itself
-        // (#247 floor) — never a caller-supplied alias.
-        let key_id = signer.derived_key_id();
-
-        // Canonicalize once here so the same bytes are both hashed and
-        // signed; hybrid-sign over the EXTERNAL signer. A non-PQC signer
-        // cannot emit a conformant federation-tier attestation — surface
-        // honestly with the same message the self-emit path uses.
-        // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
-        // envelope before the bytes are signed; `assemble` reads them back out
-        // instead of sampling a second clock after the signature exists.
-        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
-        let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \
-                 hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
-            ))
-        })?;
-
-        self.emit_attestation_assemble(key_id, &canonical, sig, input)
-            .await
+        // v62.0.0 (JSON-cut slice B) — an edition-2 statement signed by the
+        // signer's composite key, admitted through the statement door.
+        let emitted = crate::federation::attestation_emit::emit_statement(
+            &*self.federation_directory(),
+            signer,
+            input,
+            None,
+        )
+        .await?;
+        self.after_emit(emitted).await
     }
 
     /// v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN
@@ -4189,29 +4015,12 @@ impl Engine {
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn emit_attestation_self(
         &self,
-        mut input: crate::federation::EmitAttestationInput,
+        input: crate::federation::EmitAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        // #247-correct derived federation key_id of the engine's own
-        // composed signer (works for software + hardware-hybrid alike).
-        let key_id = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("emit_attestation_self derive key_id: {e}"))
-        })?;
-
-        // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
-        // envelope before the bytes are signed; `assemble` reads them back out
-        // instead of sampling a second clock after the signature exists.
-        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
-        // Hybrid-sign over the COMPOSED signer. No `LocalSigner` is needed,
-        // so a hardware-hybrid engine can emit here.
-        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "emit_attestation_self sign_hybrid: {e} — a conformant federation-tier emit \
-                 requires a composed hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
-            ))
-        })?;
-
-        self.emit_attestation_assemble(key_id, &canonical, sig, input)
-            .await
+        // v62.0.0 (JSON-cut slice B) — signed by THIS engine's composite key;
+        // a classical-only engine refuses `composite_signing_unavailable`.
+        let signer = self.composite_signer("emit_attestation_self")?;
+        self.emit_attestation(signer, input).await
     }
 
     /// v30.0.0 (CIRISPersist#601 item 3 / #596 item 3) — **canonicalize, sign
@@ -4241,92 +4050,27 @@ impl Engine {
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn assemble_attestation_self(
         &self,
-        mut input: crate::federation::EmitAttestationInput,
+        input: crate::federation::EmitAttestationInput,
     ) -> Result<crate::federation::SignedAttestation, crate::federation::Error> {
-        let key_id = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "assemble_attestation_self derive key_id: {e}"
-            ))
-        })?;
-        // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
-        // envelope before the bytes are signed; `assemble` reads them back out
-        // instead of sampling a second clock after the signature exists.
-        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
-        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "assemble_attestation_self sign_hybrid: {e} — a conformant federation-tier row \
-                 requires a composed hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
-            ))
-        })?;
-        let (row, _emitted) =
-            crate::federation::attestation_emit::assemble(key_id, &canonical, sig, input)?;
+        // v62.0.0 (JSON-cut slice B) — the statement is produced and read as
+        // the typed row it maps to, carrying the statement (`ceg_statement`),
+        // so whichever door stores it re-verifies the statement itself.
+        let signer = self.composite_signer("assemble_attestation_self")?;
+        let dir = self.federation_directory();
+        let produced =
+            crate::federation::attestation_emit::produce_row(&*dir, signer, input, None).await?;
+        let row =
+            crate::federation::attestation_emit::mapped_row(&*dir, &produced.statement).await?;
         Ok(crate::federation::SignedAttestation { attestation: row })
     }
 
-    /// Shared body of [`Self::emit_attestation`] / [`Self::emit_attestation_self`]:
-    /// canonicalize the envelope (produce gate → JCS post-cut, §0.9). The
-    /// canonical bytes are both SHA-256'd (`original_content_hash`) and
-    /// hybrid-signed by the caller, so the two paths sign byte-identical
-    /// content.
-    ///
-    /// v25.1.0 (CIRISPersist#582) — delegates to
-    /// [`attestation_emit::stamp_and_canonicalize`](crate::federation::attestation_emit::stamp_and_canonicalize),
-    /// the backend-generic half of the recipe.
-    ///
-    /// v31.0.0 (CIRISPersist#598) — takes `&mut input` rather than a bare
-    /// envelope `Value`: the row instants are stamped into the envelope HERE,
-    /// before the bytes exist, so the signature covers them and
-    /// [`assemble`](crate::federation::attestation_emit::assemble) can read
-    /// them back out instead of sampling its own clock afterwards.
-    ///
-    /// v31.0.0 (CIRISPersist#643) — takes the signer's DERIVED `key_id` too:
-    /// the typed-column mirror stamped here must carry the EFFECTIVE
-    /// `attested_key_id`, which for a self-attestation is that key_id.
+    /// The Engine-only step after an emit (CIRISPersist#509): a SELF-authored
+    /// `consent:replication:v1` grant fires the promote-on-consent sweep.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    fn emit_canonicalize(
-        input: &mut crate::federation::EmitAttestationInput,
-        attesting_key_id: &str,
-    ) -> Result<Vec<u8>, crate::federation::Error> {
-        crate::federation::attestation_emit::stamp_and_canonicalize(
-            input,
-            attesting_key_id,
-            crate::host::clock::now(),
-        )
-    }
-
-    /// Shared body of [`Self::emit_attestation`] / [`Self::emit_attestation_self`]:
-    /// assemble the 20-field [`Attestation`] from the already-derived
-    /// `key_id` (the attester/scrub — #247 derived federation key_id, never
-    /// a caller alias), the `canonical` bytes (for the
-    /// `original_content_hash`), the computed hybrid `sig`, and `input`, then
-    /// [`put_attestation`](crate::federation::FederationDirectory::put_attestation).
-    /// The two public entry points differ ONLY in where the signer / key_id
-    /// come from — this keeps the canonicalize→hash→assemble→put recipe
-    /// single-sourced (no duplication).
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    async fn emit_attestation_assemble(
+    async fn after_emit(
         &self,
-        key_id: String,
-        canonical: &[u8],
-        sig: ciris_crypto::HybridSignature,
-        input: crate::federation::EmitAttestationInput,
+        emitted: crate::federation::attestation_emit::EmittedAttestation,
     ) -> Result<String, crate::federation::Error> {
-        // v25.1.0 (CIRISPersist#582) — the assemble+put half is the
-        // backend-generic `attestation_emit::assemble_and_put`, so a sweep
-        // holding only a `FederationDirectory` (and the in-memory backend,
-        // which has no Engine at all) emits through THIS recipe rather than a
-        // hand-rolled copy of it. Both admission gates this chokepoint owns —
-        // #293 subject-id canonicality and #527 cohort_scope validate-never-
-        // default — moved WITH the body, so they still cover both entry
-        // points and both backends.
-        let emitted = crate::federation::attestation_emit::assemble_and_put(
-            &*self.federation_directory(),
-            key_id,
-            canonical,
-            sig,
-            input,
-        )
-        .await?;
         let attestation_id = emitted.attestation_id;
         // v21.2.0 (CIRISPersist#509 FLOOR) — chokepoint (c): what the
         // promote-on-consent sweep needs to know about the row just written.
@@ -4362,7 +4106,7 @@ impl Engine {
                     if let Err(e) = self.promote_consented_backlog().await {
                         tracing::warn!(
                             error = %e,
-                            "emit_attestation_assemble: consent-sweep chokepoint (c) failed; \
+                            "after_emit: consent-sweep chokepoint (c) failed; \
                              backlog self-heals at the next chokepoint"
                         );
                     }
@@ -4483,48 +4227,33 @@ impl Engine {
         self.emit_attestation(signer, input).await
     }
 
-    /// v62.0.0 (slice C) — [`Self::emit_attestation`] with this node's
-    /// co-scrub ([`ScrubSig`](crate::federation::types::ScrubSig)) appended to
-    /// `additional_scrubs`: the actor signs the canonical bytes, this engine's
-    /// composed signer signs the SAME bytes, and the row is stored through the
-    /// authored door, which verifies every scrub. The node's cosignature on an
-    /// owner binding of itself (CC 3.2, the first binding).
+    /// v62.0.0 — an owner binding of THIS node (CC 3.2, the first binding):
+    /// the actor's `ownership:{relation}:{target_kind}:{version}` statement,
+    /// then this node's own statement over the SAME payload as the second
+    /// voice (role `bound_node`, the row's `sub`; CC 2.6.1.9). Both are
+    /// admitted through the statement door; the voice joins the row's fold.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn emit_attestation_node_cosigned(
         &self,
         signer: &crate::signing::LocalSigner,
-        mut input: crate::federation::EmitAttestationInput,
+        input: crate::federation::EmitAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        let key_id = signer.derived_key_id();
-        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
-        let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \
-                 hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
-            ))
-        })?;
-        let node = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("node co-scrub derive key_id: {e}"))
-        })?;
-        let co = self.sign_hybrid(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!("node co-scrub sign_hybrid: {e}"))
-        })?;
-        let (mut row, emitted) =
-            crate::federation::attestation_emit::assemble(key_id, &canonical, sig, input)?;
-        row.additional_scrubs
-            .push(crate::federation::types::ScrubSig {
-                scrub_key_id: node,
-                scrub_signature_classical: B64.encode(&co.classical.signature),
-                scrub_signature_pqc: Some(B64.encode(&co.pqc.signature)),
-                cosigned_at: Some(crate::federation::admission::render_signed_instant(
-                    crate::host::clock::now(),
-                )),
-            });
-        self.federation_directory()
-            .put_attestation_authored(crate::federation::SignedAttestation { attestation: row })
-            .await?;
-        Ok(emitted.attestation_id)
+        use crate::federation::attestation_emit::{admit_produced, produce_row};
+        let node = self.composite_signer("owner binding (the node's voice)")?;
+        let dir = self.federation_directory();
+        let produced = produce_row(&*dir, signer, input, None).await?;
+        let emitted = admit_produced(&*dir, &produced, &produced.statement).await?;
+        let voice = crate::federation::edition2::produce::sign_row(
+            node,
+            &produced.sub,
+            &produced.row_type,
+            &produced.family,
+            &produced.payload,
+        )
+        .await
+        .map_err(|e| crate::federation::edition2::emit::produce_error("owner binding", e))?;
+        admit_produced(&*dir, &produced, &voice).await?;
+        self.after_emit(emitted).await
     }
 
     /// v9.3.0 (CIRISPersist#249, CC 4.4.3.4.3 steward-binding) — bind a node /
@@ -6480,11 +6209,11 @@ impl Engine {
         let me = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::Error::Backend(format!("publish_self_occurrence: node key: {e}"))
         })?;
-        if local.derived_key_id() != me {
+        let local_id = local.federation_id().await;
+        if local_id != me {
             return Err(crate::federation::Error::InvalidArgument(format!(
-                "publish_self_occurrence: the LocalSigner ({}) is not this node's identity ({me}); \
-                 a node publishes only its own occurrence (BLOB_REPLICATION.md §20.3)",
-                local.derived_key_id()
+                "publish_self_occurrence: the LocalSigner ({local_id}) is not this node's identity \
+                 ({me}); a node publishes only its own occurrence (BLOB_REPLICATION.md §20.3)",
             )));
         }
         match &self.backend {
@@ -6617,9 +6346,7 @@ impl Engine {
 
     /// CIRISPersist#848 (`BLOB_REPLICATION.md` §16, I66) — **resolve
     /// the V145 minter sentinel to this node's own key**, at construction,
-    /// the first moment the backend and the signer exist together — beside
-    /// `run_v31_migration_at_boot`, which needs the signer for the same
-    /// reason. Runs before any read; a sentinel that survives aborts the
+    /// the first moment the backend and the signer exist together. Runs before any read; a sentinel that survives aborts the
     /// boot. Idempotent: a no-op on every boot but the first after V145.
     /// #848 (I66) — **resolve V145's minter sentinel before the first door
     /// that reads or writes the community-DEK plane.** The DSN constructors
@@ -8256,11 +7983,12 @@ impl Engine {
         // same signer, so the check moves ahead of it: a foreign signer
         // refuses BEFORE any occurrence is written, not after two are.
         if let Some(signer) = &input.identity_signer {
-            if signer.derived_key_id() != input.identity_key_id {
+            let signer_id = signer.federation_id().await;
+            if signer_id != input.identity_key_id {
                 return Err(crate::federation::Error::CustodyIsNotTheActor {
                     attestation_id: String::new(),
                     attesting_key_id: input.identity_key_id.clone(),
-                    scrub_key_id: signer.derived_key_id(),
+                    scrub_key_id: signer_id,
                 });
             }
         }
@@ -8443,17 +8171,23 @@ impl Engine {
             weight: None,
         };
         let node_key = self.local_derived_key_id().await.ok();
+        let identity_signer_id = match &input.identity_signer {
+            Some(s) => Some(s.federation_id().await),
+            None => None,
+        };
         let (delegation_id, delegation_promoted) = match &input.identity_signer {
-            Some(signer) if signer.derived_key_id() == input.identity_key_id => {
+            Some(signer)
+                if identity_signer_id.as_deref() == Some(input.identity_key_id.as_str()) =>
+            {
                 (self.emit_attestation(signer, delegation_input).await?, true)
             }
-            Some(signer) => {
+            Some(_) => {
                 // Unreachable since v44.5.0 moved the check ahead of step 1
                 // (I93); kept as the defensive arm so this match stays total.
                 return Err(crate::federation::Error::CustodyIsNotTheActor {
                     attestation_id: String::new(),
                     attesting_key_id: input.identity_key_id.clone(),
-                    scrub_key_id: signer.derived_key_id(),
+                    scrub_key_id: identity_signer_id.unwrap_or_default(),
                 });
             }
             None if node_key.as_deref() == Some(input.identity_key_id.as_str()) => {
@@ -10029,6 +9763,30 @@ impl Engine {
         Err(crate::federation::Error::EnvelopeKindRetired {
             kind: crate::federation::replication_policy::EnvelopeKind::Key,
         })
+    }
+
+    /// v62.0.0 (JSON-cut slice B) — the edition-2 serve listing a REQUESTER
+    /// may be handed: [`statements_served_to`], the JSON listing's serve rule
+    /// (tier, row type, purge plane) plus the requester's audience
+    /// ("never serve what the requester is not party to"). `requester` is
+    /// the identity the transport authenticated; `None` serves the commons
+    /// only. Hosts serve through this, never the raw store listing.
+    ///
+    /// [`statements_served_to`]: crate::federation::edition2::serve::statements_served_to
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn edition2_statements_served_to(
+        &self,
+        cursor: Option<&crate::federation::edition2::store::StatementCursor>,
+        limit: u32,
+        requester: Option<&str>,
+    ) -> Result<crate::federation::edition2::serve::ServedPage, crate::federation::Error> {
+        crate::federation::edition2::serve::statements_served_to(
+            self.federation_directory().as_ref(),
+            cursor,
+            limit,
+            requester,
+        )
+        .await
     }
 
     /// v62.0.0 (slice E2a, CIRISPersist#1274; CC 2.6.1, 2.6.1.12) — **the
@@ -11662,13 +11420,7 @@ mod tests {
             .expect("construct engine");
         // Register the node's self key — the authority the community roots at.
         let kid = engine
-            .register_self_federation_key(
-                "primitive",
-                "ref",
-                None,
-                serde_json::json!({}),
-                Vec::new(),
-            )
+            .register_self_federation_key("primitive", None, None)
             .await
             .expect("register self");
 
@@ -14575,7 +14327,7 @@ mod tests {
         // register_self registers the engine's federation identity, keyed
         // by the DERIVED id — not the bare alias.
         let kid = engine
-            .register_self_federation_key("agent", "ref", None, serde_json::json!({}), vec![])
+            .register_self_federation_key("agent", None, None)
             .await
             .expect("register_self_federation_key");
         let derived = engine.local_derived_key_id().await.expect("derived id");
@@ -14618,7 +14370,7 @@ mod tests {
             .await
             .expect("construct engine");
         let kid = engine
-            .register_self_federation_key("agent", "ref", None, serde_json::json!({}), vec![])
+            .register_self_federation_key("agent", None, None)
             .await
             .expect("register_self_federation_key");
 
@@ -16506,7 +16258,7 @@ mod tests {
             .await
             .expect("engine");
         let node = engine
-            .register_self_federation_key("primitive", "ref", None, serde_json::json!({}), vec![])
+            .register_self_federation_key("primitive", None, None)
             .await
             .expect("register self");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
@@ -17271,7 +17023,7 @@ mod tests {
             .await
             .expect("construct PG engine");
         let node = engine
-            .register_self_federation_key("primitive", "ref", None, serde_json::json!({}), vec![])
+            .register_self_federation_key("primitive", None, None)
             .await
             .expect("register self");
         let pg = engine.postgres_backend().expect("pg backend");
@@ -22444,7 +22196,7 @@ mod tests {
         use crate::federation::BlobStorage;
 
         let (signer, _alias) = self_login_signer();
-        let steward_derived = signer.derived_key_id();
+        let _steward_derived = signer.derived_key_id();
         let engine = Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("engine");
@@ -22455,13 +22207,7 @@ mod tests {
         // this row. The fake `'AAAA'` row the other self-login tests seed
         // can verify nothing.
         engine
-            .register_self_federation_key(
-                identity_type::STEWARD,
-                &steward_derived,
-                None,
-                serde_json::json!({}),
-                vec![],
-            )
+            .register_self_federation_key(identity_type::STEWARD, None, None)
             .await
             .expect("register the engine's own key");
 
@@ -23110,7 +22856,7 @@ mod register_self_canonicalizer_parity {
             .await
             .expect("construct engine");
         let key_id = engine
-            .register_self_federation_key("primitive", "ref", None, caller_envelope(), Vec::new())
+            .register_self_federation_key("primitive", None, None)
             .await
             .expect("register self over a non-ASCII bootstrap envelope");
         let dir = engine.federation_directory();

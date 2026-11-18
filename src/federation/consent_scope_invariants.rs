@@ -934,7 +934,7 @@ mod run {
                 .await
                 .unwrap();
         let node = engine
-            .register_self_federation_key("primitive", "ref", None, serde_json::json!({}), vec![])
+            .register_self_federation_key("primitive", None, None)
             .await
             .unwrap();
         let sq = engine.sqlite_backend().unwrap().clone();
@@ -1019,7 +1019,7 @@ mod run {
                 .await
                 .unwrap();
         let node = engine
-            .register_self_federation_key("primitive", "ref", None, serde_json::json!({}), vec![])
+            .register_self_federation_key("primitive", None, None)
             .await
             .unwrap();
         let sq = engine.sqlite_backend().unwrap().clone();
@@ -1105,7 +1105,7 @@ mod run {
                 .await
                 .unwrap();
         let node = engine
-            .register_self_federation_key("primitive", "ref", None, serde_json::json!({}), vec![])
+            .register_self_federation_key("primitive", None, None)
             .await
             .unwrap();
         let sq = engine.sqlite_backend().unwrap().clone();

@@ -214,7 +214,7 @@ pub(crate) mod bodies {
         l.ba.put_stream_sth(sth.clone(), &l.node_a).await.unwrap();
         let subscriber =
             crate::federation::tier_ingest::test_support::local_signer(&format!("em-b-{run}"));
-        assert_eq!(subscriber.derived_key_id(), l.node_b);
+        assert_eq!(subscriber.federation_id().await, l.node_b);
         let bytes = receipt_signing_bytes(&l.node_b, &sid, 0, &sth.root_hash, 1);
         let receipt = DeliveryReceipt {
             stream_id: sid.clone(),

@@ -1212,16 +1212,6 @@ pub(crate) enum KeyRecordWrite<'a> {
         /// The bundle whose quorum authorises it.
         bundle: &'a super::genesis::GenesisBundle,
     },
-    /// The hybrid completion: an Ed25519-only record gains its ML-DSA-65 key
-    /// and signature (CIRISPersist#657).
-    AttachPqc {
-        /// The held key.
-        key_id: &'a str,
-        /// Its ML-DSA-65 public key.
-        pubkey_ml_dsa_65_base64: &'a str,
-        /// The PQC scrub signature.
-        scrub_signature_pqc: &'a str,
-    },
     /// Write back the `additional_scrubs` a pre-v53.1.4 door dropped
     /// (CIRISPersist#995 row 2).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -1296,20 +1286,6 @@ pub(crate) enum PlannedKeyRecord {
         /// Which replacement.
         kind: super::types::KeyReplacementKind,
     },
-    /// The hybrid completion of a held Ed25519-only row (only while its
-    /// `pqc_completed_at` is still unset).
-    CompletePqc {
-        /// The held key.
-        key_id: String,
-        /// Its ML-DSA-65 public key.
-        pubkey_ml_dsa_65_base64: String,
-        /// The PQC scrub signature.
-        scrub_signature_pqc: String,
-        /// The completion instant (the receipt clock).
-        completed_at: chrono::DateTime<chrono::Utc>,
-        /// The completed record's `persist_row_hash`.
-        persist_row_hash: String,
-    },
     /// Write back `additional_scrubs` (only while the held row's hash is
     /// `record.persist_row_hash` and its scrub set is empty).
     RehydrateScrubs {
@@ -1327,7 +1303,6 @@ impl PlannedKeyRecord {
             | Self::Rewrite { record, .. }
             | Self::Replace { record, .. }
             | Self::RehydrateScrubs { record } => &record.key_id,
-            Self::CompletePqc { key_id, .. } => key_id,
         }
     }
 
@@ -1363,9 +1338,6 @@ impl PlannedKeyRecord {
             Self::Replace { kind, .. } => Some(Error::Conflict(format!(
                 "{} key registration {kid}: row changed concurrently",
                 kind.as_str()
-            ))),
-            Self::CompletePqc { .. } => Some(Error::Conflict(format!(
-                "federation_keys row {kid} was concurrently completed"
             ))),
             Self::RehydrateScrubs { .. } => Some(Error::Conflict(format!(
                 "rehydrate_dropped_key_scrubs {kid}: row changed concurrently"
@@ -1724,43 +1696,6 @@ async fn plan_key_reanchor(
     })))
 }
 
-/// The hybrid completion's decision (CIRISPersist#657): the held row exists
-/// and is not yet complete; verify-before-mutation over the row AS IT WOULD
-/// BE STORED (the envelope names THIS ML-DSA key, #659, and the row
-/// verifies hybrid-Strict with it); the completion instant is the receipt
-/// clock, and the hash is the completed record's.
-async fn plan_key_attach_pqc(
-    dir: &dyn super::FederationDirectory,
-    key_id: &str,
-    pubkey_ml_dsa_65_base64: &str,
-    scrub_signature_pqc: &str,
-    received_at: chrono::DateTime<chrono::Utc>,
-) -> Result<KeyRecordPlan, Error> {
-    let mut row = dir.lookup_public_key(key_id).await?.ok_or_else(|| {
-        Error::InvalidArgument(format!("federation_keys row {key_id} does not exist"))
-    })?;
-    if row.is_pqc_complete() {
-        return Err(Error::Conflict(format!(
-            "federation_keys row {key_id} is already PQC-complete"
-        )));
-    }
-    row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
-    row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-    super::admission::check_key_pqc_attachment(dir, &row).await?;
-    row.pqc_completed_at = Some(received_at);
-    row.persist_row_hash = String::new();
-    let persist_row_hash = super::types::compute_persist_row_hash(&row)?;
-    Ok(KeyRecordPlan::Write(Box::new(
-        PlannedKeyRecord::CompletePqc {
-            key_id: key_id.to_owned(),
-            pubkey_ml_dsa_65_base64: pubkey_ml_dsa_65_base64.to_owned(),
-            scrub_signature_pqc: scrub_signature_pqc.to_owned(),
-            completed_at: received_at,
-            persist_row_hash,
-        },
-    )))
-}
-
 /// v60.0.0 (CIRISPersist#934 step 3) — **the key-record write doors'
 /// decision**, once for every backend: each door's gates, in the order its
 /// three copies ran them, and the write they lead to. `received_at` is the
@@ -1800,20 +1735,6 @@ pub(crate) async fn plan_key_record_write(
         }
         KeyRecordWrite::Reanchor { record, bundle } => {
             plan_key_reanchor(dir, record, bundle).await?
-        }
-        KeyRecordWrite::AttachPqc {
-            key_id,
-            pubkey_ml_dsa_65_base64,
-            scrub_signature_pqc,
-        } => {
-            plan_key_attach_pqc(
-                dir,
-                key_id,
-                pubkey_ml_dsa_65_base64,
-                scrub_signature_pqc,
-                received_at,
-            )
-            .await?
         }
         #[cfg(any(feature = "postgres", feature = "sqlite"))]
         KeyRecordWrite::RehydrateScrubs { mut record } => {

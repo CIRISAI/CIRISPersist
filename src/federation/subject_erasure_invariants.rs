@@ -1058,13 +1058,7 @@ mod run {
             .await
             .expect("engine");
         engine
-            .register_self_federation_key(
-                crate::federation::types::identity_type::NODE,
-                "ref",
-                None,
-                serde_json::json!({}),
-                vec![],
-            )
+            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
             .await
             .expect("register the node key");
         let b = engine.sqlite_backend().expect("sqlite").clone();
@@ -1086,13 +1080,7 @@ mod run {
             .await
             .expect("engine");
         engine
-            .register_self_federation_key(
-                crate::federation::types::identity_type::NODE,
-                "ref",
-                None,
-                serde_json::json!({}),
-                vec![],
-            )
+            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
             .await
             .expect("register the node key");
         let b = engine.postgres_backend().expect("postgres").clone();

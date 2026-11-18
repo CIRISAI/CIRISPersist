@@ -723,20 +723,6 @@ pub(crate) mod bodies {
             conflict,
         )
         .await;
-        // The hybrid completion's guard: the row is already complete.
-        stale(
-            b,
-            "complete a completed row",
-            PlannedKeyRecord::CompletePqc {
-                key_id: k.clone(),
-                pubkey_ml_dsa_65_base64: "AAAA".to_owned(),
-                scrub_signature_pqc: "AAAA".to_owned(),
-                completed_at: chrono::Utc::now(),
-                persist_row_hash: "0".repeat(64),
-            },
-            conflict,
-        )
-        .await;
         // An insert over a differing held row is Conflict; over the same
         // record, or with Keep, it stands.
         let mut differing = pop_record(&s);
@@ -912,16 +898,6 @@ mod unit {
                     kind: KeyReplacementKind::Rebind,
                 },
                 "rebind key registration",
-            ),
-            (
-                PlannedKeyRecord::CompletePqc {
-                    key_id: r.key_id.clone(),
-                    pubkey_ml_dsa_65_base64: String::new(),
-                    scrub_signature_pqc: String::new(),
-                    completed_at: chrono::Utc::now(),
-                    persist_row_hash: String::new(),
-                },
-                "concurrently completed",
             ),
             (
                 PlannedKeyRecord::RehydrateScrubs { record: r.clone() },

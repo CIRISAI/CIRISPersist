@@ -1409,6 +1409,53 @@ pub mod test_support {
         dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await
             .expect("register hybrid key");
+        register_edition2_twin(dir, pubkey_source_key_id, identity_type).await;
+    }
+
+    /// v62.0.0 (JSON-cut slice B) — **the edition-2 twin of a fixture key**:
+    /// a self-signed `key:record` of the composite key
+    /// [`local_signer`]`(source)` signs with (its seed is
+    /// [`seed_for`]`(source)`), stating `identity_type` as its identity set.
+    /// Every fixture that registers a test key also holds it on the clean
+    /// mesh, so a producer that signs with that test signer states rows the
+    /// door admits (its kid is a key of its iss). Best effort: a directory
+    /// with no statement store, or a set the end rule refuses, holds no twin.
+    pub async fn register_edition2_twin<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        source: &str,
+        identity_type: &str,
+    ) {
+        use ciris_verify_core::edition2::{identity_ref, sign_row_statement, thumbprint};
+        let seed = seed_for(source);
+        let k = ciris_crypto::composite::CompositeSigningKey::from_seeds(&seed, &seed);
+        let iref = identity_ref(&thumbprint(k.public_key()));
+        let roles: Vec<&str> = identity_type.split(',').map(str::trim).collect();
+        let now_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+        let end = roles
+            .iter()
+            .any(|r| matches!(*r, "node" | "agent"))
+            .then(|| now_ms + ciris_verify_core::edition2::keys::KEY_RECORD_MAX_SECS * 1000);
+        let Ok(payload) = crate::federation::edition2::emit::key_record_payload(
+            k.public_key(),
+            &roles,
+            &iref,
+            now_ms,
+            end,
+            None,
+        ) else {
+            return;
+        };
+        let Ok(st) = sign_row_statement(&k, &iref, &iref, "scores", "key:record", &payload, vec![])
+        else {
+            return;
+        };
+        let _ = crate::federation::edition2::ingest::put_statement(
+            dir,
+            &st,
+            None,
+            crate::federation::edition2::ingest::INGEST_TIER,
+        )
+        .await;
     }
 
     /// Build a PQC-configured [`crate::signing::LocalSigner`] whose
@@ -3574,6 +3621,7 @@ pub mod test_support {
         dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await
             .expect("register user-role key");
+        register_edition2_twin(dir, key_id, crate::federation::types::identity_type::USER).await;
     }
 
     /// v38.2.0 — seed a community authored by its first member.
@@ -4416,6 +4464,7 @@ pub mod test_support {
         dir.put_public_key(crate::federation::SignedKeyRecord { record })
             .await
             .expect("register identity key");
+        register_edition2_twin(dir, key_id, identity_type).await;
     }
     /// CIRISPersist#788 — a record whose key validity window has CLOSED.
     ///
@@ -4999,6 +5048,7 @@ mod tests {
         dir.put_public_key(SignedKeyRecord { record: rec })
             .await
             .expect("register hybrid key");
+        super::test_support::register_edition2_twin(dir, key_id, identity_type::AGENT).await;
     }
 
     /// Build a `scores` Attestation by `attester` over a fresh envelope.

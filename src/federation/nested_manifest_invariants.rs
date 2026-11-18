@@ -87,8 +87,8 @@ pub(crate) mod bodies {
         let b = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_b), dsn_b)
             .await
             .unwrap();
-        for (e, alias) in [(&a, &alias_a), (&b, &alias_b)] {
-            e.register_self_federation_key(NODE, alias, None, serde_json::json!({}), vec![])
+        for (e, _alias) in [(&a, &alias_a), (&b, &alias_b)] {
+            e.register_self_federation_key(NODE, None, None)
                 .await
                 .unwrap();
         }

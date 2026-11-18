@@ -1,26 +1,37 @@
-//! v61 (CIRISPersist#1146) — **a restart that re-registers the same key is
-//! a no-op success.**
+//! v61 (CIRISPersist#1146), re-read for v62.0.0 (JSON-cut slice B) — **a
+//! restart that re-registers the same key is a no-op success.**
 //!
-//! An agent-embedded node calls `Engine::register_self_federation_key` on every
-//! boot. The key is the same, the envelope is freshly signed, so the row hash
-//! differs and the put refused it `Conflict`. The rule: when the held row for
-//! the node's own `key_id` states the same pubkeys (Ed25519 and PQC),
-//! `identity_type`, `identity_ref`, roles and expiry, the call returns the held
-//! `key_id` and writes nothing. Any difference is still `Conflict`, and the
-//! replicated put keeps its exact-hash rule.
+//! An agent-embedded node calls `Engine::register_self_federation_key` on
+//! every boot. Since v62 the registration is a self-signed `key:record`
+//! edition-2 statement of the engine's composite key, and the call returns
+//! the key's identity-ref.
+//!
+//! - **I1146** — a restart that states the same identity set and evidence
+//!   signs nothing: the held record is the only one, byte for byte. A
+//!   changed identity set, or an asked end, is a real change: a further
+//!   record of the same key, admitted (a key record is not a single-valued
+//!   row; CC 2.4.1.1). A different composite key is a different identity.
+//! - **I2202** — the identity-ref is `local_derived_key_id()`; a classical-only
+//!   engine refuses `composite_signing_unavailable` and stores nothing; a
+//!   `node` record with no asked end ends 365 days out (CC 2.4.1.1's window);
+//!   a `user` record carries none.
 //!
 //! One body, run on sqlite (a file both engines open) and postgres (one
 //! database both engines open).
 
 /// The witness body: two engines over one store, the second a "restart".
 pub(crate) mod bodies {
-    use crate::federation::types::identity_type::NODE;
-    use crate::federation::{Error, SignedKeyRecord};
+    use crate::federation::edition2::emit::COMPOSITE_SIGNING_UNAVAILABLE;
+    use crate::federation::edition2::ingest::{held_keys_for_kid, kid_of_identity_ref};
+    use crate::federation::types::identity_type::{NODE, USER};
+    use crate::federation::Error;
+    use ciris_verify_core::edition2::keys::KEY_RECORD_MAX_SECS;
 
-    /// A hybrid signer whose Ed25519 key is `alias`'s deterministic key and
-    /// whose ML-DSA-65 key is derived from `pqc_alias`: same `key_id`, a
-    /// different PQC leg when the two aliases differ.
-    fn signer(alias: &str, pqc_alias: &str) -> std::sync::Arc<crate::signing::LocalSigner> {
+    /// A composite signer: Ed25519 from `alias`, ML-DSA-65 from `pqc_alias`.
+    pub(crate) fn signer(
+        alias: &str,
+        pqc_alias: &str,
+    ) -> std::sync::Arc<crate::signing::LocalSigner> {
         let seed = |s: &str| {
             let mut seed = [0x11u8; 32];
             for (i, b) in s.bytes().take(32).enumerate() {
@@ -46,246 +57,159 @@ pub(crate) mod bodies {
             .expect("engine")
     }
 
-    /// I1146: restart Ok and byte-identical; a changed role, a changed PQC key
-    /// and a changed expiry are `Conflict`; the replicated put of a fresh
-    /// envelope is still `Conflict`.
+    /// The held `key:record` statements of `iref`.
+    async fn records(e: &crate::Engine, iref: &str) -> Vec<Vec<u8>> {
+        e.federation_directory()
+            .edition2_statements_about("key:record", iref)
+            .await
+            .unwrap()
+    }
+
+    /// I1146 under edition 2.
     pub(crate) async fn i1146_restart_is_a_no_op(dsn: &str, tag: &str) {
         let alias = format!("{tag}-1146-node");
         let first = engine(dsn, &alias, &alias).await;
-        let key_id = first
-            .register_self_federation_key(
-                NODE,
-                &alias,
-                None,
-                serde_json::json!({"boot": 1}),
-                vec!["serve".to_owned()],
-            )
+        let iref = first
+            .register_self_federation_key(NODE, None, None)
             .await
             .expect("I1146: first registration");
-        let dir = first.federation_directory();
-        let held = dir
-            .lookup_public_key(&key_id)
-            .await
-            .unwrap()
-            .expect("held row");
+        let held = records(&first, &iref).await;
+        assert_eq!(held.len(), 1, "I1146: one record");
         drop(first);
 
-        // A restart: a second engine, the same key, a FRESH envelope.
+        // A restart: a second engine, the same key.
         let restarted = engine(dsn, &alias, &alias).await;
         let again = restarted
-            .register_self_federation_key(
-                NODE,
-                &alias,
-                None,
-                serde_json::json!({"boot": 2}),
-                vec!["serve".to_owned()],
-            )
+            .register_self_federation_key(NODE, None, None)
             .await
             .expect("I1146: a restart that re-registers the same key is Ok");
-        assert_eq!(again, key_id);
-        let after = restarted
-            .federation_directory()
-            .lookup_public_key(&key_id)
-            .await
-            .unwrap()
-            .expect("held row");
+        assert_eq!(again, iref);
         assert_eq!(
-            (
-                &after.persist_row_hash,
-                &after.registration_envelope,
-                &after.original_content_hash,
-                &after.scrub_signature_classical,
-                &after.scrub_signature_pqc,
-            ),
-            (
-                &held.persist_row_hash,
-                &held.registration_envelope,
-                &held.original_content_hash,
-                &held.scrub_signature_classical,
-                &held.scrub_signature_pqc,
-            ),
-            "I1146: the held row is kept byte for byte"
+            records(&restarted, &iref).await,
+            held,
+            "I1146: nothing is signed; the held record is kept byte for byte"
         );
 
-        // A changed role is a real change.
-        let changed_role = restarted
-            .register_self_federation_key(
-                NODE,
-                &alias,
-                None,
-                serde_json::json!({"boot": 3}),
-                vec!["serve".to_owned(), "relay".to_owned()],
-            )
-            .await;
-        assert!(
-            matches!(
-                changed_role,
-                Err(Error::KeyRecordConflict {
-                    reason:
-                        crate::federation::register::KeyRecordConflictReason::SameKeyDifferentRecord,
-                    ..
-                })
-            ),
-            "I1146: a changed role is a same-key conflict (v62: typed): {changed_role:?}"
+        // A changed identity set is a further record of the same key.
+        restarted
+            .register_self_federation_key("node,witness", None, None)
+            .await
+            .expect("I1146: a changed set is a further record");
+        assert_eq!(
+            records(&restarted, &iref).await.len(),
+            2,
+            "I1146: two records"
         );
 
-        // A changed expiry is a real change.
-        let changed_expiry = restarted
-            .register_self_federation_key(
-                NODE,
-                &alias,
-                Some(chrono::Utc::now() + chrono::Duration::days(30)),
-                serde_json::json!({"boot": 4}),
-                vec!["serve".to_owned()],
-            )
-            .await;
-        assert!(
-            matches!(
-                changed_expiry,
-                Err(Error::KeyRecordConflict {
-                    reason:
-                        crate::federation::register::KeyRecordConflictReason::SameKeyDifferentRecord,
-                    ..
-                })
-            ),
-            "I1146: a changed expiry is Conflict: {changed_expiry:?}"
-        );
+        // An asked end is a real change too.
+        let asked = chrono::Utc::now() + chrono::Duration::days(30);
+        restarted
+            .register_self_federation_key(NODE, Some(asked), None)
+            .await
+            .expect("I1146: an asked end is a further record");
+        assert_eq!(records(&restarted, &iref).await.len(), 3);
         drop(restarted);
 
-        // The same Ed25519 key with a different PQC key: same key_id.
+        // A different ML-DSA half is a different composite key: a different
+        // identity, never a conflict over the first.
         let swapped = engine(dsn, &alias, &format!("{tag}-1146-other-pqc")).await;
-        let changed_pqc = swapped
-            .register_self_federation_key(
-                NODE,
-                &alias,
-                None,
-                serde_json::json!({"boot": 5}),
-                vec!["serve".to_owned()],
-            )
-            .await;
-        assert!(
-            matches!(
-                changed_pqc,
-                Err(Error::KeyRecordConflict {
-                    reason: crate::federation::register::KeyRecordConflictReason::PubkeyChange,
-                    ..
-                })
-            ),
-            "I1146: a changed PQC key is Conflict: {changed_pqc:?}"
-        );
-
-        // The replicated put keeps its exact-hash rule: the same key, a fresh
-        // envelope, is a Conflict there.
-        let mut fresh = held.clone();
-        fresh.registration_envelope["boot"] = serde_json::json!(6);
-        fresh.persist_row_hash = String::new();
-        let put = swapped
-            .federation_directory()
-            .put_public_key(SignedKeyRecord { record: fresh })
-            .await;
-        assert!(
-            matches!(
-                put,
-                Err(Error::KeyRecordConflict {
-                    reason:
-                        crate::federation::register::KeyRecordConflictReason::SameKeyDifferentRecord,
-                    ..
-                })
-            ),
-            "I1146: the replicated put of a fresh envelope is still Conflict: {put:?}"
-        );
-        let unchanged = swapped
-            .federation_directory()
-            .lookup_public_key(&key_id)
+        let other = swapped
+            .register_self_federation_key(NODE, None, None)
             .await
-            .unwrap()
-            .expect("held row");
-        assert_eq!(unchanged.persist_row_hash, held.persist_row_hash);
+            .expect("I1146: another key registers");
+        assert_ne!(
+            other, iref,
+            "I1146: another composite, another identity-ref"
+        );
+        assert_eq!(records(&swapped, &iref).await.len(), 3, "I1146: untouched");
     }
-    /// I-IFP-9 — **the key record's signed `valid_from` is a CC 2.6.2
-    /// instant** (CC 2.6.1.7's preimage table, beside `valid_until`). The
-    /// self-registration door refuses a caller envelope whose `valid_from` is
-    /// offset-form or carries nine fractional digits, admits `.sssZ` and keeps
-    /// it, and with no `valid_from` writes one `.sssZ`, the same instant the
-    /// record carries.
-    pub(crate) async fn i_ifp_9_self_registration_valid_from(dsn: &str, tag: &str) {
-        use crate::verify::canonical_validation::validate_canonical_datetime;
-        let alias = format!("{tag}-ifp9-node");
+
+    /// I2202 — the identity-ref, the classical-only refusal, the end rule.
+    pub(crate) async fn i2202_register_self_returns_the_identity_ref(dsn: &str, tag: &str) {
+        let alias = format!("{tag}-2202-node");
         let e = engine(dsn, &alias, &alias).await;
-        for bad in [
-            "2026-06-23T03:16:34.499535577+00:00",
-            "2026-06-23T03:16:34.499535577Z",
-            "2026-06-23T03:16:34.499+00:00",
-        ] {
-            let r = e
-                .register_self_federation_key(
-                    NODE,
-                    &alias,
-                    None,
-                    serde_json::json!({ "valid_from": bad }),
-                    vec![],
-                )
-                .await;
-            match r {
-                Err(Error::InvalidArgument(why)) => {
-                    assert!(
-                        why.contains("valid_from"),
-                        "I-IFP-9: names the member: {why}"
-                    )
-                }
-                other => panic!("I-IFP-9: {bad:?} is refused InvalidArgument: {other:?}"),
-            }
-        }
-        let good = "2026-06-23T03:16:34.499Z";
-        let key_id = e
-            .register_self_federation_key(
-                NODE,
-                &alias,
-                None,
-                serde_json::json!({ "valid_from": good }),
-                vec![],
-            )
+        let iref = e
+            .register_self_federation_key(NODE, None, None)
             .await
-            .expect("I-IFP-9: a .sssZ valid_from is admitted");
-        let held = e
+            .expect("I2202: registration");
+        assert!(
+            iref.starts_with(ciris_verify_core::edition2::IDENTITY_REF_PREFIX),
+            "I2202: an identity-ref: {iref}"
+        );
+        assert_eq!(
+            e.local_derived_key_id().await.unwrap(),
+            iref,
+            "I2202: local_derived_key_id is the identity-ref"
+        );
+        let kid = kid_of_identity_ref(&iref).expect("I2202: names a kid");
+        let keys = held_keys_for_kid(e.federation_directory().as_ref(), &kid)
+            .await
+            .unwrap();
+        let valid = keys.valid_records(&kid).expect("I2202: a valid record");
+        assert_eq!(valid.len(), 1);
+        let r = &valid[0].record;
+        assert_eq!(r.identity_type, vec!["node".to_owned()]);
+        assert_eq!(
+            r.valid_until,
+            Some(r.asserted_at + KEY_RECORD_MAX_SECS * 1000),
+            "I2202: a node record with no asked end ends at the window"
+        );
+        // The projection the earlier-form gates read.
+        let projected = e
             .federation_directory()
-            .lookup_public_key(&key_id)
+            .lookup_public_key(&iref)
             .await
             .unwrap()
-            .expect("held row");
-        assert_eq!(
-            held.registration_envelope["valid_from"], good,
-            "I-IFP-9: kept"
-        );
-        assert_eq!(
-            crate::federation::admission::render_signed_instant(held.valid_from),
-            good,
-            "I-IFP-9: the record carries the signed instant"
-        );
+            .expect("I2202: projected into federation_keys");
+        assert_eq!(projected.identity_type, "node");
         drop(e);
 
-        let alias = format!("{tag}-ifp9-fresh");
-        let e = engine(dsn, &alias, &alias).await;
-        let key_id = e
-            .register_self_federation_key(NODE, &alias, None, serde_json::json!({}), vec![])
+        // A user record carries no end.
+        let user_alias = format!("{tag}-2202-user");
+        let u = engine(dsn, &user_alias, &user_alias).await;
+        let uref = u
+            .register_self_federation_key(USER, None, None)
             .await
-            .expect("I-IFP-9: registration");
-        let held = e
-            .federation_directory()
-            .lookup_public_key(&key_id)
+            .expect("I2202: a user registers");
+        let ukid = kid_of_identity_ref(&uref).unwrap();
+        let keys = held_keys_for_kid(u.federation_directory().as_ref(), &ukid)
             .await
-            .unwrap()
-            .expect("held row");
-        let written = held.registration_envelope["valid_from"]
-            .as_str()
-            .expect("I-IFP-9: the emitter writes valid_from")
-            .to_owned();
-        validate_canonical_datetime(&written).expect("I-IFP-9: written .sssZ");
+            .unwrap();
         assert_eq!(
-            crate::federation::admission::render_signed_instant(held.valid_from),
-            written,
-            "I-IFP-9: the record carries the written instant"
+            keys.valid_records(&ukid).unwrap()[0].record.valid_until,
+            None
         );
+        drop(u);
+
+        // A classical-only engine produces nothing on the mesh.
+        let c_alias = format!("{tag}-2202-classical");
+        let classical = std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
+            ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]),
+            c_alias.clone(),
+            None,
+            None,
+        ));
+        let c = crate::Engine::with_signer_pre_genesis(classical, dsn)
+            .await
+            .expect("engine");
+        match c.register_self_federation_key(NODE, None, None).await {
+            Err(Error::InvalidArgument(m)) if m.starts_with(COMPOSITE_SIGNING_UNAVAILABLE) => {}
+            other => panic!("I2202: composite_signing_unavailable, got {other:?}"),
+        }
+        match c
+            .emit_attestation_self(crate::federation::EmitAttestationInput::with_envelope(
+                "scores",
+                crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({"dimension": "health:liveness:v1"}),
+                )
+                .unwrap(),
+                crate::federation::types::cohort_scope::FEDERATION,
+            ))
+            .await
+        {
+            Err(Error::InvalidArgument(m)) if m.starts_with(COMPOSITE_SIGNING_UNAVAILABLE) => {}
+            other => panic!("I2202: a classical-only engine emits nothing, got {other:?}"),
+        }
     }
 }
 
@@ -315,19 +239,19 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn i_ifp_9_self_registration_valid_from_sqlite() {
+    async fn i2202_register_self_returns_the_identity_ref_sqlite() {
         let dir = tempfile::tempdir().expect("tempdir");
         let dsn = format!("sqlite:///{}", dir.path().join("node.db").display());
-        super::bodies::i_ifp_9_self_registration_valid_from(&dsn, &tag()).await;
+        super::bodies::i2202_register_self_returns_the_identity_ref(&dsn, &tag()).await;
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    async fn i_ifp_9_self_registration_valid_from_postgres() {
+    async fn i2202_register_self_returns_the_identity_ref_postgres() {
         let Some(dsn) = crate::test_pg::isolated_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
-        super::bodies::i_ifp_9_self_registration_valid_from(&dsn, &tag()).await;
+        super::bodies::i2202_register_self_returns_the_identity_ref(&dsn, &tag()).await;
     }
 }

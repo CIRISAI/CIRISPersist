@@ -2708,7 +2708,7 @@ pub trait BlobStorage: Send + Sync {
         attestation_id: uuid::Uuid,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
     where
-        Self: Sync,
+        Self: Sized + Sync + crate::federation::FederationDirectory,
     {
         // The commons form: records `federation` / plaintext on the row (§11.1).
         // Hybrid-only like every announcing door (§20.5).
@@ -2836,7 +2836,7 @@ pub trait BlobStorage: Send + Sync {
         group_key_id: Option<&'s str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
     where
-        Self: Sync,
+        Self: Sized + Sync + crate::federation::FederationDirectory,
     {
         async move {
             // v43.0.0 (§11.2 (5) / I21) — the matcher screens PLAINTEXT, once.
@@ -2878,26 +2878,32 @@ pub trait BlobStorage: Send + Sync {
                         sha256_hex: hex::encode(sha256),
                     })?,
             };
-            let att = crate::federation::holding_claim::sign_holding_claim(
-                local,
-                sha256,
-                attestation_id,
-                now,
-                body.size_bytes(),
-                &scope,
-            )
-            .await?;
-            self.put_blob_with_scope(
-                Some(author_key_id),
+            // v62.0.0 (JSON-cut slice B) — the bytes are stored, then this
+            // node's claim is announced as an edition-2 `custody` statement
+            // through the statement door (`emit_holding_claim`), the floor the
+            // sealing cascades already end at. The claim scope above is the one
+            // the emit re-derives from the stored row.
+            let _ = (attestation_id, &scope);
+            if local.pqc_signer().is_none() {
+                return Err(BlobError::AttestationEmissionFailed(format!(
+                    "hybrid-only: {} has no ML-DSA-65 key, so it cannot sign a holding claim; a \
+                     classical-only producer does not announce (CIRISPersist#851 §20.5)",
+                    local.federation_id().await
+                )));
+            }
+            self.store_blob_local(
                 sha256,
                 body,
                 media_type,
-                att,
                 cohort_scope,
                 floor,
+                Some(author_key_id),
                 group_key_id,
             )
-            .await
+            .await?;
+            crate::federation::holding_claim::emit_holding_claim(self, local, sha256, now)
+                .await
+                .map(|_| ())
         }
     }
 
@@ -2935,7 +2941,7 @@ pub trait BlobStorage: Send + Sync {
         attestation_id: uuid::Uuid,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
     where
-        Self: crate::federation::FederationDirectory + Sync,
+        Self: Sized + Sync + crate::federation::FederationDirectory,
     {
         async move {
             // v43.0.0 (§11.2) — THE TIER IS RESOLVED FROM THE DIRECTORY,
@@ -4095,7 +4101,7 @@ pub fn check_announcing_signer(
     local: &crate::signing::LocalSigner,
     node_key_id: &str,
 ) -> Result<(), BlobError> {
-    let derived = local.derived_key_id();
+    let derived = local.federation_id_now();
     if derived != node_key_id {
         return Err(BlobError::AttestationEmissionFailed(format!(
             "hybrid-only: this engine's LocalSigner ({derived}) is not its node identity \
@@ -4937,18 +4943,12 @@ pub(crate) async fn emit_withdraws_attestation_helper(
     directory: &dyn crate::federation::FederationDirectory,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), BlobError> {
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-
-    // v9.3.0 (#247) — the withdraws' FK fields (attesting/attested/scrub)
-    // are the SIGNER's registered DERIVED federation key_id (`<label>-<fp>`),
-    // computed from the signer itself — NOT the caller-supplied alias
-    // (`_signer_key_id`), which FK-violated on every real node (alias ≠
-    // derived id). Same #247 floor as `Engine::emit_attestation`. The host
-    // attests it itself no longer holds the bytes (a self-revocation).
-    let signer_key_id = signer.derived_key_id();
-
+    // v62.0.0 (JSON-cut slice B) — the withdraws is an edition-2 statement,
+    // signed by the signer's composite key and admitted through the statement
+    // door: `refs.target` names the withdrawn row, and the statement carries
+    // the TARGET's family (`CC-READING(next-edition)`). `now` is no longer
+    // read: the producer stamps the instant it signs (CC 2.6.2).
+    let _ = now;
     let mut envelope = crate::federation::withdraws_attestation_envelope(
         &prior.attestation_id,
         &prior.attestation_type,
@@ -4973,98 +4973,20 @@ pub(crate) async fn emit_withdraws_attestation_helper(
     } else {
         crate::federation::types::cohort_scope::FEDERATION.to_owned()
     };
-    // v31.0.0 (#643/#598) — the row is ASSEMBLED FIRST, then stamped, then
-    // signed. This helper hand-rolls the emit recipe (it predates
-    // `attestation_emit`), and the two bindings are both over material the
-    // signature covers, so the order is forced: build → stamp → canonicalize →
-    // sign. Without it persist's own eviction sweeper emits rows its own
-    // put-gate refuses.
-    //
-    // `attestation_id` is minted here rather than at the literal because it is
-    // signed material — the mirror carries it.
-    let attestation_id = uuid::Uuid::new_v4().to_string();
-    let mut row = crate::federation::Attestation {
-        attestation_id,
-        attesting_key_id: signer_key_id.to_owned(),
-        // The withdraws row's FK target is `signer_key_id`: the host
-        // attests it itself no longer holds the bytes. Matches the
-        // v3.4.0 sweeper convention (`engine.rs::emit_withdraws_attestation`).
-        attested_key_id: signer_key_id.to_owned(),
-        attestation_type: crate::federation::types::attestation_type::WITHDRAWS.to_owned(),
-        weight: None,
-        asserted_at: now,
-        expires_at: None,
-        attestation_envelope: envelope,
-        // Filled in below, once there are bytes to sign.
-        original_content_hash: String::new(),
-        scrub_signature_classical: String::new(),
-        scrub_signature_pqc: None,
-        scrub_key_id: signer_key_id.to_owned(),
-        scrub_timestamp: now,
-        pqc_completed_at: Some(now),
-        persist_row_hash: String::new(),
-        // v3.7.0 (CIRISPersist#146, CEG 0.6) — evict_actor emits a
-        // producer-self-revocation withdraws; subject-side authority
-        // (rule 2/3) doesn't apply on this path.
-        subject_key_ids: Vec::new(),
-        withdraws_admission_rule: None,
-        cohort_scope: placement,
-        tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
-        promoted_at: None,
-        additional_scrubs: Vec::new(),
-    };
-
-    // v31.0.0 (CIRISPersist#598) — THE SIGNED INSTANTS, before the signature.
-    // Through the shared placement rather than a fourth hand-rolled copy; it
-    // also TRUNCATES `asserted_at` to the substrate resolution, which is why
-    // the two derived timestamps are re-read from the row afterwards instead of
-    // from `now` — a row whose three instants differ in their last nanoseconds
-    // is one the postgres arm stores differently from the sqlite arm.
-    crate::federation::envelope::stamp_signed_instants(&mut row)
-        .map_err(|e| BlobError::Backend(format!("withdraws instant stamp: {e}")))?;
-    row.scrub_timestamp = row.asserted_at;
-    row.pqc_completed_at = Some(row.asserted_at);
-    // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN MIRROR, from
-    // `RowMirror::of` and NOT a hand-written `json!` literal.
-    //
-    // The literal that stood here was correct only by coincidence.
-    // [`RowMirror`] is `deny_unknown_fields` over a CLOSED member set, so the
-    // next column bound into it would have left this one site silently
-    // stamping a mirror missing that field — #643 re-opened at exactly one
-    // door, and the door persist's own eviction sweeper writes through.
-    // `RowMirror::of` is the one projection the GATE compares against, so
-    // there is now nothing here that can drift from it.
-    crate::federation::envelope::RowMirror::stamp_row(&mut row)
-        .map_err(|e| BlobError::Backend(format!("withdraws row mirror stamp: {e}")))?;
-
-    // v9.0.0 (#237, CC 5.3.2.4.3.1) — canonicalize through the CEG
-    // PRODUCE gate (JCS post-cut, §0.9), the SAME canonical form the
-    // federation-tier ingest gate verifies (was PythonJsonDumpsCanonicalizer,
-    // which the gate's ceg_produce_canonicalize would not match).
-    let canonical_bytes =
-        crate::verify::canonical::ceg_produce_canonicalize(&row.attestation_envelope)
-            .map_err(|e| BlobError::Backend(format!("withdraws canonicalize: {e}")))?;
-    row.original_content_hash = hex::encode(Sha256::digest(&canonical_bytes));
-    // v9.0.0 — HYBRID-sign (Ed25519 + ML-DSA-65 bound half) so the
-    // federation-tier withdraws carries the PQC half the ingest gate
-    // mandates. Mirrors Engine::attestation_promote. A non-PQC signer
-    // CANNOT emit a conformant federation-tier withdraws — surface that
-    // honestly (no classical-only fallback / silent skip / local
-    // downgrade).
-    let sig = signer.sign_hybrid(&canonical_bytes).await.map_err(|e| {
-        BlobError::Backend(format!(
-            "withdraws hybrid-sign: {e} — cannot emit a conformant federation-tier withdraws \
-             without a hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
-        ))
-    })?;
-    row.scrub_signature_classical = B64.encode(&sig.classical.signature);
-    row.scrub_signature_pqc = Some(B64.encode(&sig.pqc.signature));
-
-    directory
-        .put_attestation(crate::federation::SignedAttestation { attestation: row })
+    let core = crate::federation::envelope::EnvelopeCore::from_value(envelope)
+        .map_err(|e| BlobError::Backend(format!("withdraws envelope: {e}")))?;
+    let mut input = crate::federation::EmitAttestationInput::with_envelope(
+        crate::federation::types::attestation_type::WITHDRAWS,
+        core,
+        placement,
+    );
+    // The host attests it itself no longer holds the bytes (a
+    // self-revocation): the withdraws is about its own key.
+    input.attested_key_id = None;
+    crate::federation::attestation_emit::emit_statement(directory, signer, input, None)
         .await
         .map(|_| ())
-        .map_err(|e| BlobError::Backend(format!("withdraws put_attestation: {e}")))
+        .map_err(|e| BlobError::Backend(format!("withdraws emit: {e}")))
 }
 
 /// v2.3 (CIRISPersist#103) — verify a `[u8; 32]` SHA-256 against an

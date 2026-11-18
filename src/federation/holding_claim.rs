@@ -265,7 +265,7 @@ pub async fn sign_holding_claim(
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
 
-    let holder = local.derived_key_id();
+    let holder = local.federation_id().await;
     let row = holding_claim_row(
         sha256,
         &holder,
@@ -607,7 +607,7 @@ where
         .await?
         .ok_or_else(not_held)?
         .size_bytes;
-    let holder = local.derived_key_id();
+    let holder = local.federation_id().await;
     if !scope.is_directory()
         && !super::custody_ack::holder_in_cohort(
             backend,
@@ -620,11 +620,43 @@ where
     {
         return Ok(HoldingClaimOutcome::NotInCohort { scope });
     }
-    let attestation_id = uuid::Uuid::new_v4();
-    let claim = sign_holding_claim(local, sha256, attestation_id, now, size, &scope).await?;
-    backend.put_holding_claim(sha256, claim, &scope).await?;
+    // v62.0.0 (JSON-cut slice B) — the claim is an edition-2 `custody`
+    // statement signed by this node's composite key and admitted through the
+    // statement door, the door a peer's copy meets (the custody gate and the
+    // holder index are the attestation door's). The scope and size were read
+    // from the held row above, so the claim states exactly what is held.
+    let row = holding_claim_row(
+        sha256,
+        &holder,
+        &uuid::Uuid::new_v4().to_string(),
+        now,
+        size,
+        &scope,
+    )?;
+    let mut envelope = row.attestation_envelope;
+    if let Some(o) = envelope.as_object_mut() {
+        o.remove("row");
+    }
+    let core = super::envelope::EnvelopeCore::from_value(envelope)
+        .map_err(|e| BlobError::Backend(format!("holding claim envelope: {e}")))?;
+    let mut input = super::EmitAttestationInput::with_envelope(
+        super::types::attestation_type::SCORES,
+        core,
+        scope.cohort_scope(),
+    );
+    input.expires_at = row.expires_at;
+    let emitted = super::attestation_emit::emit_statement(backend, local, input, None)
+        .await
+        .map_err(|e| match e {
+            super::Error::InvalidArgument(m)
+                if m.starts_with(super::edition2::emit::COMPOSITE_SIGNING_UNAVAILABLE) =>
+            {
+                BlobError::AttestationEmissionFailed(m)
+            }
+            other => BlobError::InvalidArgument(other.to_string()),
+        })?;
     Ok(HoldingClaimOutcome::Emitted {
-        attestation_id: attestation_id.to_string(),
+        attestation_id: emitted.attestation_id,
         scope,
     })
 }
@@ -731,7 +763,7 @@ pub async fn reack_own_claims<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let me = local.derived_key_id();
+    let me = local.federation_id().await;
     let mut report = ReackReport::default();
     // v56.0.0 (#1071) — every emission this pass may make.
     let mut budget = HOLDING_CLAIM_REACK_MAX_PER_PASS;
@@ -1232,7 +1264,7 @@ where
     let shas = held_by(backend, actor, now, false)
         .await
         .map_err(|e| BlobError::Backend(format!("evict_actor: {e}")))?;
-    let me = signer.derived_key_id();
+    let me = signer.federation_id().await;
     let mut report = super::EvictActorReport::default();
     for sha in shas {
         let own = own_here_claims(backend, &me, &sha)
