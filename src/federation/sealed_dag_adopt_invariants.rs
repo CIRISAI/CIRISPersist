@@ -52,13 +52,11 @@ pub(crate) mod bodies {
         let engine_b = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_b), dsn_b)
             .await
             .unwrap();
-        for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+        for (e, _alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
             e.register_self_federation_key(
                 crate::federation::types::identity_type::NODE,
-                alias,
                 None,
-                serde_json::json!({}),
-                vec![],
+                None,
             )
             .await
             .unwrap();

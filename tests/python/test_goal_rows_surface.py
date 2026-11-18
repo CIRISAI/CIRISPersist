@@ -53,7 +53,7 @@ def _body(text: str, scale: str = "self", **extra) -> str:
 def test_a_goal_is_a_row_from_python(tmp_path) -> None:
     eng = _engine(tmp_path)
     try:
-        me = eng.register_self_federation_key("user", "ref-goal-node", None, None, None)
+        me = eng.register_self_federation_key("user")
 
         gid = eng.cirisnode_put_goal_json(
             _body("publish the report", "cohort", cohort_id="stewards", score=-0.5)
@@ -97,7 +97,7 @@ def test_a_goal_is_a_row_from_python(tmp_path) -> None:
 def test_m1_and_the_retired_typed_goal_are_refused(tmp_path) -> None:
     eng = _engine(tmp_path)
     try:
-        eng.register_self_federation_key("user", "ref-goal-node", None, None, None)
+        eng.register_self_federation_key("user")
         no_m1 = json.dumps({"goal_text": "t", "scale": "self"})
         with pytest.raises(ValueError):
             eng.cirisnode_put_goal_json(no_m1)

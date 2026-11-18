@@ -369,13 +369,11 @@ pub(crate) mod bodies {
             .unwrap();
         // The engines are NODES (a user target would make the owner binding
         // below a custody claim, refused for an age-unverified user).
-        for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+        for (e, _alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
             e.register_self_federation_key(
                 crate::federation::types::identity_type::NODE,
-                alias,
                 None,
-                serde_json::json!({}),
-                vec![],
+                None,
             )
             .await
             .unwrap();

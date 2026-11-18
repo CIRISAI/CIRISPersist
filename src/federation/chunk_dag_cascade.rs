@@ -1449,7 +1449,7 @@ pub mod orchestrate {
         }
         // §11.2 (6) / I23 / §20.5 — the announcing identity IS the PQC
         // LocalSigner's derived id; hybrid-only, so there is no other.
-        let signer_key_id = local.derived_key_id();
+        let signer_key_id = local.federation_id().await;
         // #837 (§12.9 / I41) — the stream's ROW first: a seal by a signer
         // that is not the owner, or at a cohort / community that is not
         // the stream's, is refused before any chunk row is looked at.

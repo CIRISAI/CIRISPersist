@@ -2209,33 +2209,23 @@ class Engine:
     def register_self_federation_key(
         self,
         identity_type: str,
-        identity_ref: str,
         valid_until: str | None = None,
-        registration_envelope_json: str | None = None,
-        roles: list[str] | None = None,
+        attestation_evidence_json: str | None = None,
     ) -> str:
-        """v1.5.3 (renamed from `register_federation_key` in v8.8.0) —
-        One-call helper that registers THIS engine's local pubkey in the
-        **federation directory** (`federation_keys`).
+        """v62.0.0 — register THIS engine's own key on the clean mesh: a
+        self-signed ``key:record`` edition-2 statement of the engine's
+        composite (ML-DSA-65 + Ed25519) key. Returns its identity-ref
+        (``urn:ietf:params:oauth:ckt:sha-256:…``) = ``local_derived_key_id()``.
 
-        Composes the existing canonicalize + sign + put_public_key
-        primitives so callers don't re-implement persist's canonical-bytes
-        rule in Python. Returns the registered `key_id` (equals
-        `engine.local_key_id()`).
+        ``identity_type`` is the identity set, comma-separated. A ``node`` /
+        ``agent`` record ends at most 365 days out (that end is written when
+        ``valid_until`` is None); a ``user`` / ``accord_holder`` record takes
+        none. ``attestation_evidence_json``: optional
+        ``{hardware_class, pq_custody, chain}`` (chain as hex DER, leaf first).
 
-        Internally:
-        1. Canonicalizes `registration_envelope_json` (defaults to `{}`)
-           via persist's `PythonJsonDumpsCanonicalizer`.
-        2. Signs canonical bytes with the engine's local Ed25519 key.
-        3. Builds a self-signed `SignedKeyRecord` (scrub_key_id =
-           local_key_id).
-        4. Calls `put_public_key` — backend dispatch + cold-path
-           ML-DSA-65 PQC attach handled automatically.
-
-        Raises:
-            ValueError: no local signing identity, malformed valid_until,
-                or unparseable registration_envelope_json.
-            RuntimeError: backend / IO error.
+        BREAKING in v62.0.0: ``identity_ref``, ``registration_envelope_json``
+        and ``roles`` are gone. Raises ``ValueError(composite_signing_unavailable: …)``
+        on an engine without its ML-DSA-65 half.
         """
 
     def respond_classical_kex_b64(self, recipient_x25519_priv_b64: str, handshake_msg_json: str) -> str:

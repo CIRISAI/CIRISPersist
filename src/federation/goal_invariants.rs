@@ -589,7 +589,7 @@ pub(crate) mod engine_bodies {
         let e = Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
             .await
             .unwrap();
-        e.register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
+        e.register_self_federation_key(USER, None, None)
             .await
             .expect("register the engine's own key");
         e

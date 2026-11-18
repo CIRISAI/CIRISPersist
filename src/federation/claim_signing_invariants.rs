@@ -40,8 +40,8 @@ mod tests {
             crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_b), "sqlite::memory:")
                 .await
                 .unwrap();
-        for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
-            e.register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
+        for (e, _alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+            e.register_self_federation_key(USER, None, None)
                 .await
                 .expect("register the engine's own key");
         }
@@ -221,8 +221,9 @@ mod tests {
         use crate::federation::holding_claim::{sign_holding_claim, ClaimScope};
         let attester = crate::federation::tier_ingest::test_support::local_signer("i81-attester");
         let other = crate::federation::tier_ingest::test_support::local_signer("i81-other");
-        assert_ne!(attester.derived_key_id(), other.derived_key_id());
-        let key = attester.derived_key_id();
+        assert_ne!(attester.federation_id().await, other.federation_id().await);
+        // v62.0.0 — the signer's id is its composite identity-ref.
+        let key = attester.federation_id().await;
         let sha = [0x81u8; 32];
         let scope = ClaimScope::of_content(CryptoTier::Plaintext, "federation", None).unwrap();
         let (id, now) = (uuid::Uuid::new_v4(), chrono::Utc::now());
@@ -878,11 +879,8 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let run = uuid::Uuid::new_v4().simple().to_string();
         let local = ts::local_signer(&format!("i86-node-{run}"));
-        let node = local.derived_key_id();
         let peer = format!("i86-peer-{run}");
-        for k in [&node, &peer] {
-            ts::register_hybrid_key_as(backend.as_ref(), k, k, USER).await;
-        }
+        ts::register_hybrid_key_as(backend.as_ref(), &peer, &peer, USER).await;
         let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
             crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
         );
@@ -891,6 +889,12 @@ mod tests {
             signer,
             Some(local.clone()),
         );
+        // v62.0.0 — the node's key is an edition-2 `key:record`; its id is the
+        // identity-ref.
+        let node = engine
+            .register_self_federation_key(USER, None, None)
+            .await
+            .expect("I86: the node registers");
         let body = b"i86 proxy bytes".to_vec();
         let sha: [u8; 32] = {
             use sha2::Digest as _;

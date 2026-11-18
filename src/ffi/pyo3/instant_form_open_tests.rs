@@ -43,13 +43,7 @@ fn seed_then_open_from_python(
             .await
             .unwrap();
         engine
-            .register_self_federation_key(
-                crate::federation::types::identity_type::NODE,
-                alias,
-                None,
-                serde_json::json!({}),
-                vec![],
-            )
+            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
             .await
             .unwrap();
         #[cfg(feature = "sqlite")]

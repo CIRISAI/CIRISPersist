@@ -3364,7 +3364,7 @@ mod tests {
                     .await
                     .unwrap();
             engine
-                .register_self_federation_key(USER, &alias, None, serde_json::json!({}), vec![])
+                .register_self_federation_key(USER, None, None)
                 .await
                 .unwrap();
             let sq = engine.sqlite_backend().unwrap().clone();
@@ -3496,13 +3496,11 @@ mod tests {
             )
             .await
             .unwrap();
-            for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+            for (e, _alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
                 e.register_self_federation_key(
                     crate::federation::types::identity_type::NODE,
-                    alias,
                     None,
-                    serde_json::json!({}),
-                    vec![],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3806,10 +3804,8 @@ mod tests {
             engine
                 .register_self_federation_key(
                     crate::federation::types::identity_type::NODE,
-                    &alias,
                     None,
-                    serde_json::json!({}),
-                    vec![],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3933,13 +3929,11 @@ mod tests {
             )
             .await
             .unwrap();
-            for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+            for (e, _alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
                 e.register_self_federation_key(
                     crate::federation::types::identity_type::NODE,
-                    alias,
                     None,
-                    serde_json::json!({}),
-                    vec![],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4078,10 +4072,8 @@ mod tests {
             engine_c
                 .register_self_federation_key(
                     crate::federation::types::identity_type::NODE,
-                    &format!("i92-c-{run}"),
                     None,
-                    serde_json::json!({}),
-                    vec![],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4135,10 +4127,8 @@ mod tests {
             engine
                 .register_self_federation_key(
                     crate::federation::types::identity_type::NODE,
-                    &alias,
                     None,
-                    serde_json::json!({}),
-                    vec![],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4227,10 +4217,8 @@ mod tests {
             engine
                 .register_self_federation_key(
                     crate::federation::types::identity_type::NODE,
-                    &alias,
                     None,
-                    serde_json::json!({}),
-                    vec![],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4358,7 +4346,7 @@ mod tests {
                     .await
                     .unwrap();
             engine
-                .register_self_federation_key(USER, &alias, None, serde_json::json!({}), vec![])
+                .register_self_federation_key(USER, None, None)
                 .await
                 .unwrap();
             let sq = engine.sqlite_backend().unwrap().clone();
@@ -4554,8 +4542,8 @@ mod tests {
             )
             .await
             .unwrap();
-            for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
-                e.register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
+            for (e, _alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+                e.register_self_federation_key(USER, None, None)
                     .await
                     .expect("register the engine's own key");
             }

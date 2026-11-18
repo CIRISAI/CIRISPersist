@@ -387,22 +387,282 @@ fn assemble_any_row_type(
 pub async fn emit_with_local_signer<D>(
     dir: &D,
     signer: &crate::signing::LocalSigner,
-    mut input: EmitAttestationInput,
+    input: EmitAttestationInput,
 ) -> Result<EmittedAttestation, Error>
 where
     D: FederationDirectory + Sync + ?Sized,
 {
-    let key_id = signer.derived_key_id();
-    // v31.0.0 (CIRISPersist#598/#643) — stamp BEFORE signing (see
-    // [`stamp_and_canonicalize`]); `assemble` then reads the instants back out
-    // and `check_row_column_binding` re-checks the typed-column mirror at the
-    // door.
-    let canonical = stamp_and_canonicalize(&mut input, &key_id, crate::host::clock::now())?;
-    let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
-        Error::Backend(format!(
-            "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \
-             hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
-        ))
-    })?;
-    assemble_and_put(dir, key_id, &canonical, sig, input).await
+    // v62.0.0 (JSON-cut slice B) — the row is an edition-2 statement signed
+    // by the signer's composite key and admitted through the statement door.
+    emit_statement(dir, signer, input, None).await
+}
+
+// ─── v62.0.0 (JSON-cut slice B) — the edition-2 emit ───────────────────────
+
+/// v62.0.0 (JSON-cut slice B) — **one produced row, before it is admitted**:
+/// the statement this node signed and the facts its producer reports.
+#[derive(Debug, Clone)]
+pub struct ProducedRow {
+    /// The `COSE_Sign1` statement, as signed (CC 2.6.1).
+    pub statement: Vec<u8>,
+    /// Its family (header -70002).
+    pub family: String,
+    /// Its row type (header -70001).
+    pub row_type: String,
+    /// Its CWT `sub`.
+    pub sub: String,
+    /// Its payload: a further voice signs the same one (CC 2.6.1.9).
+    pub payload: ciris_verify_core::cde::Value,
+    /// The signer's identity-ref (`iss`).
+    pub iss: String,
+    /// The payload's `asserted_at` (POSIX ms).
+    pub asserted_at_ms: u64,
+    /// Was the row's dimension the `consent:replication:v1` grant dimension?
+    pub is_grant_dimension: bool,
+}
+
+/// v62.0.0 (JSON-cut slice B) — **state a row as an edition-2 statement**
+/// signed by `signer`'s composite key, and do NOT admit it.
+///
+/// The row is the [`EmitAttestationInput`] the earlier recipe signed, read as
+/// a payload ([`payload_from_envelope`](super::edition2::emit::payload_from_envelope)):
+///
+/// - `iss` and the header `kid` are the signer's own composite key and
+///   identity-ref ([`signer_identity`](super::edition2::produce::signer_identity)),
+///   so the statement's kid is a key of its iss (the door reads it so);
+/// - `sub` is `attested_key_id` (the signer when absent), the row type is
+///   `attestation_type`, and the family is [`family_for`](super::edition2::emit::family_for)'s;
+/// - the typed members (`subject_key_ids`, `cohort_scope`, `weight`,
+///   `expires_at`) are payload members, as the mapping reads them back;
+/// - a composer names its target by `refs.target` (a row-ref, CC 2.6.1.4),
+///   never `references_attestation_id`, and carries the target's family;
+/// - no `act` member: the reader derives it.
+///
+/// # Errors
+/// `composite_signing_unavailable` for a signer without its PQC half;
+/// `edition2_payload_invalid`; the subject-id and cohort-scope gates.
+pub async fn produce_row<D>(
+    dir: &D,
+    signer: &crate::signing::LocalSigner,
+    mut input: EmitAttestationInput,
+    family: Option<&str>,
+) -> Result<ProducedRow, Error>
+where
+    D: FederationDirectory + Sync + ?Sized,
+{
+    use super::edition2::emit::{
+        family_for, payload_from_envelope, produce_error, refs_target, with_member,
+    };
+    use super::types::attestation_type as t;
+
+    let producer = "emit_attestation";
+    let (_kid, iss) = super::edition2::produce::signer_identity(signer)
+        .await
+        .map_err(|e| {
+            super::edition2::emit::composite_signing_unavailable(producer, &e.to_string())
+        })?;
+    super::validate_subject_key_ids(&input.subject_key_ids)?;
+    super::admission::check_cohort_scope(&input.cohort_scope)?;
+    // The instants are stamped as the earlier recipe stamped them (CC 2.6.2,
+    // at the millisecond); the canonical JSON is not used.
+    let _ = stamp_and_canonicalize(&mut input, &iss, crate::host::clock::now())?;
+    let mut envelope = input.attestation_envelope.to_value();
+    if let Some(o) = envelope.as_object_mut() {
+        if !input.subject_key_ids.is_empty() {
+            o.insert(
+                "subject_key_ids".into(),
+                serde_json::json!(input.subject_key_ids),
+            );
+        }
+        o.insert(
+            "cohort_scope".into(),
+            serde_json::Value::String(input.cohort_scope.clone()),
+        );
+        if let Some(w) = input.weight {
+            o.insert("weight".into(), serde_json::json!(w));
+        }
+    }
+    let asserted_at_ms = envelope
+        .get("asserted_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .and_then(|t| u64::try_from(t.timestamp_millis()).ok())
+        .ok_or_else(|| Error::InvalidArgument("emit: asserted_at did not stamp".into()))?;
+
+    // An edition-2 row type is one of five (CC 2.6.1). An earlier
+    // `attestation_type` that names a dimension (`age_assurance:…:v1`) is a
+    // `scores` row on that dimension.
+    if !ciris_verify_core::edition2::ROW_TYPES.contains(&input.attestation_type.as_str()) {
+        if let Some(o) = envelope.as_object_mut() {
+            o.entry("dimension")
+                .or_insert_with(|| serde_json::Value::String(input.attestation_type.clone()));
+        }
+        input.attestation_type = t::SCORES.to_owned();
+    }
+    // A composer's target: its row id (refs.target) and its family.
+    let composer = matches!(
+        input.attestation_type.as_str(),
+        t::WITHDRAWS | t::RECANTS | t::SUPERSEDES
+    );
+    let mut target: Option<(ciris_verify_core::edition2::Digest32, Option<Vec<u8>>)> = None;
+    if composer {
+        if let Some(id) = envelope
+            .get("references_attestation_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            let held = dir.get_attestation(id).await?;
+            let statement = held
+                .as_ref()
+                .and_then(super::edition2::emit::carried_statement);
+            let digest = hex::decode(id)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "edition2_payload_invalid: a {} names its target by row id, and {id:?} \
+                         is not an edition-2 row id (64 lowercase hex)",
+                        input.attestation_type
+                    ))
+                })?;
+            target = Some((digest, statement));
+        }
+    }
+    let family = family_for(
+        &input.attestation_type,
+        family,
+        &envelope,
+        target.as_ref().and_then(|(_, s)| s.as_deref()),
+    )?;
+    // A `dimension` that does not resolve to the family would be refused at
+    // the door (`dimension_family`); a delegation's is advisory (routing)
+    // and is left out when it names no family of its own.
+    if let Some(d) = envelope
+        .get("dimension")
+        .and_then(serde_json::Value::as_str)
+    {
+        if super::edition2::emit::family_of_dimension(d).as_deref() != Some(family.as_str()) {
+            if let Some(o) = envelope.as_object_mut() {
+                o.remove("dimension");
+            }
+        }
+    }
+    let is_grant_dimension = super::admission::envelope_dimension(&envelope)
+        == Some(super::consent_grammar::GRANT_DIMENSION);
+    let author = super::edition2::emit::family_is_authored(
+        &family,
+        envelope
+            .get("dimension")
+            .and_then(serde_json::Value::as_str),
+    )
+    .then_some(iss.as_str());
+    let mut payload = payload_from_envelope(
+        &envelope,
+        asserted_at_ms,
+        author,
+        &["references_attestation_id"],
+    )
+    .map_err(|e| produce_error(producer, e))?;
+    if let Some((digest, _)) = &target {
+        payload = with_member(payload, "refs", refs_target(digest))
+            .map_err(|e| produce_error(producer, e))?;
+    }
+    let sub = input.attested_key_id.clone().unwrap_or_else(|| iss.clone());
+    let statement = super::edition2::produce::sign_row(
+        signer,
+        &sub,
+        &input.attestation_type,
+        &family,
+        &payload,
+    )
+    .await
+    .map_err(|e| produce_error(producer, e))?;
+    Ok(ProducedRow {
+        statement,
+        family,
+        row_type: input.attestation_type,
+        sub,
+        payload,
+        iss,
+        asserted_at_ms,
+        is_grant_dimension,
+    })
+}
+
+/// v62.0.0 (JSON-cut slice B) — **the emit recipe on the clean mesh**:
+/// [`produce_row`], then admit the statement through the one statement door
+/// ([`put_statement_with_origin`](super::edition2::ingest::put_statement_with_origin),
+/// `Authored`), the same door a peer's copy meets. Returns the row id (hex)
+/// as `attestation_id`.
+///
+/// # Errors
+/// [`produce_row`]'s; every refusal of the edition-2 door and the
+/// attestation gates.
+pub async fn emit_statement<D>(
+    dir: &D,
+    signer: &crate::signing::LocalSigner,
+    input: EmitAttestationInput,
+    family: Option<&str>,
+) -> Result<EmittedAttestation, Error>
+where
+    D: FederationDirectory + Sync + ?Sized,
+{
+    let produced = produce_row(dir, signer, input, family).await?;
+    admit_produced(dir, &produced, &produced.statement).await
+}
+
+/// Admit a produced statement (the row, or a further voice over the same
+/// payload) through the statement door as THIS node's authorship, and report
+/// the row it stated.
+///
+/// # Errors
+/// The door's and the attestation gates' refusals.
+pub async fn admit_produced<D>(
+    dir: &D,
+    produced: &ProducedRow,
+    statement: &[u8],
+) -> Result<EmittedAttestation, Error>
+where
+    D: FederationDirectory + Sync + ?Sized,
+{
+    let outcome = super::edition2::ingest::put_statement_with_origin(
+        dir,
+        statement,
+        None,
+        super::types::attestation_tier::FEDERATION,
+        super::replication::admission::WriteOrigin::Authored,
+    )
+    .await?;
+    let row_id = match outcome {
+        super::edition2::ingest::StatementOutcome::Row { row_id, .. }
+        | super::edition2::ingest::StatementOutcome::Voice { row_id, .. }
+        | super::edition2::ingest::StatementOutcome::KeyPlane { row_id, .. } => row_id,
+    };
+    Ok(EmittedAttestation {
+        attestation_id: row_id.hex(),
+        attesting_key_id: produced.iss.clone(),
+        is_grant_dimension: produced.is_grant_dimension,
+    })
+}
+
+/// v62.0.0 (JSON-cut slice B) — a produced statement read as the typed row
+/// the gates read, WITHOUT storing it: through the edition-2 door against the
+/// keys `dir` holds (the signer's own `key:record` among them), then the
+/// mapping. For a producer that hands its row to another door (the
+/// assemble-without-put shape, CIRISPersist#601).
+///
+/// # Errors
+/// The door's refusals (a signer whose key `dir` does not hold waits:
+/// `federation_attester_key_unknown`).
+pub async fn mapped_row<D>(dir: &D, statement: &[u8]) -> Result<Attestation, Error>
+where
+    D: FederationDirectory + Sync + ?Sized,
+{
+    let keys = super::edition2::ingest::held_keys_for(dir, statement).await?;
+    let admitted = super::edition2::door::admit_row(
+        statement,
+        &keys,
+        None,
+        ciris_verify_core::edition2::family::SelectContext::default(),
+    )?;
+    super::edition2::ingest::attestation_of(&admitted, super::types::attestation_tier::FEDERATION)
 }

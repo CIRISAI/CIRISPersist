@@ -35,7 +35,7 @@ async fn engine(alias: &str) -> (Engine, Arc<SqliteBackend>) {
     let e = Engine::with_signer_pre_genesis(ts::local_signer(alias), "sqlite::memory:")
         .await
         .expect("engine");
-    e.register_self_federation_key(NODE, alias, None, serde_json::json!({}), vec![])
+    e.register_self_federation_key(NODE, None, None)
         .await
         .expect("own key");
     let b = e.sqlite_backend().expect("sqlite").clone();

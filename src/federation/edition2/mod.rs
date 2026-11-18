@@ -27,6 +27,7 @@
 //! id a peer offers ([`token::ROW_ID_MISMATCH`]).
 
 pub mod door;
+pub mod emit;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_switch;
 pub mod genesis;
@@ -51,6 +52,8 @@ mod ingest_invariants;
 mod liveness_invariants;
 #[cfg(test)]
 mod produce_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod producer_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod projection_invariants;
 #[cfg(test)]

@@ -341,7 +341,7 @@ def test_register_self_then_put_blob_signing_275() -> None:
             pytest.skip("wheel built without the sqlite feature")
         raise
     try:
-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
+        kid = eng.register_self_federation_key("agent")
         # The registered + returned key_id is the DERIVED wire id, NOT the
         # bare alias — this is the heart of the #275 fix.
         assert kid != alias, "register_self must register the derived id, not the alias"
@@ -447,7 +447,7 @@ def test_local_derived_key_id_pyo3_295():
         # Stable across calls (pure derivation over the composed signer).
         assert eng.local_derived_key_id() == derived
         # It is exactly the id register_self registers + returns (the FK target).
-        assert eng.register_self_federation_key("agent", "ref", None, None, None) == derived
+        assert eng.register_self_federation_key("agent") == derived
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
@@ -500,7 +500,7 @@ def test_put_community_json_round_trip_290() -> None:
         # primitive identities; agent/node members would need a steward-
         # binding chain (which the conformance harness supplies in the real
         # moderation flow, but isn't needed to prove the FFI admits a row).
-        kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
+        kid = eng.register_self_federation_key("primitive")
         now = "2026-06-25T00:00:00.000Z"
         eng.put_community_json(
             json.dumps(
@@ -560,7 +560,7 @@ def test_emit_attestation_self_rejects_uppercase_subject_key_id_293():
             pytest.skip("wheel built without the sqlite feature")
         raise
     try:
-        eng.register_self_federation_key("agent", "ref", None, None, None)
+        eng.register_self_federation_key("agent")
         upper = "FF7C5632DAE6EF3AE7F6283BD35268BC7910332414AA8A1C35A1645CA0295F61"
 
         # Uppercase-hex subject id — must be refused (was admitted on 10.4.0).
@@ -626,7 +626,7 @@ def test_nodes_stewarded_by_json_pyo3_299():
             pytest.skip("wheel built without the sqlite feature")
         raise
     try:
-        kid = eng.register_self_federation_key("user", "ref", None, None, None)
+        kid = eng.register_self_federation_key("user")
         # A user-role key owns itself (exact inverse: kid ∈ nodes_stewarded_by(kid)
         # ⟺ kid ∈ steward_bindings_of(kid), the clause-1 self-binding).
         owned = json.loads(eng.nodes_stewarded_by_json(kid))
@@ -982,7 +982,7 @@ def test_put_blob_scoped_aad_b64_binds_the_seal_831() -> None:
             pytest.skip("wheel built without the sqlite feature")
         raise
     try:
-        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
+        kid = eng.register_self_federation_key("agent")
         # One keyed occurrence of the self identity — the grantee. The
         # occurrence key IS the identity key (the v3.12.0 binding shape; the
         # occurrence column carries an FK to `federation_keys`, and the self
@@ -1097,7 +1097,7 @@ def test_put_blob_scoped_reports_the_roster_partition_843() -> None:
     try:
         # The node's own key is the community's key AND its one member (a
         # primitive identity needs no steward binding at put_community).
-        kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
+        kid = eng.register_self_federation_key("primitive")
         now = "2026-09-09T00:00:00.000Z"
         eng.put_community_json(
             json.dumps(
@@ -1212,7 +1212,7 @@ def test_would_hold_adopt_and_hold_breadth_846() -> None:
             pytest.skip("wheel built without the sqlite feature")
         raise
     try:
-        eng.register_self_federation_key("agent", "ref", None, None, None)
+        eng.register_self_federation_key("agent")
         peer = "peer-" + secrets.token_hex(4)
 
         # Not party to a community we are not a member of: the answer, not an error.
@@ -1338,7 +1338,7 @@ def test_ciris_canonical_trust_root_surface_926() -> None:
         assert pinned["community"]["community_key_id"] == "ciris-canonical", pinned
         assert pinned["community"]["live"] is True, pinned
         now = "2026-06-25T00:00:00.000Z"
-        kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
+        kid = eng.register_self_federation_key("primitive")
         base = {
             "community_key_id": kid,
             "community_name": "T",
@@ -1408,7 +1408,7 @@ def test_reack_holding_claims_once_is_host_reachable_989() -> None:
             pytest.skip("wheel built without the sqlite feature")
         raise
     try:
-        eng.register_self_federation_key("agent", "ref", None, None, None)
+        eng.register_self_federation_key("agent")
         body = b"commons bytes " + secrets.token_bytes(8)
         put = json.loads(
             eng.put_blob_scoped("federation", base64.b64encode(body).decode(), None, None)

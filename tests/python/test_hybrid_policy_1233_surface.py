@@ -51,7 +51,7 @@ def _b64(b: bytes) -> str:
 def test_verify_hybrid_via_directory_accepts_only_strict_1233(tmp_path) -> None:
     eng = _engine(tmp_path)
     try:
-        kid = eng.register_self_federation_key("agent", "ref-1233", None, None, None)
+        kid = eng.register_self_federation_key("agent")
         msg = b"CIRISPersist#1233 I1563"
         out = eng.local_sign_hybrid(msg)
         ed_sig = _b64(out["classical_sig"])

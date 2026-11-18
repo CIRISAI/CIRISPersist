@@ -1444,9 +1444,18 @@ impl PyEngine {
         if let Some(cached) = self.derived_key_id_memo.get() {
             return Ok(cached.clone());
         }
-        let derived = crate::signing::federation_key_id_of(&*self.signer)
-            .await
-            .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))?;
+        // v62.0.0 (JSON-cut slice B) — with a composite LocalSigner the
+        // node's id is its identity-ref, as `Engine::local_derived_key_id`.
+        let derived = match self
+            .local_signer
+            .as_ref()
+            .filter(|l| l.pqc_signer().is_some())
+        {
+            Some(local) => local.federation_id().await,
+            None => crate::signing::federation_key_id_of(&*self.signer)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))?,
+        };
         // A racing caller may have filled it; either value is the same bytes.
         Ok(self
             .derived_key_id_memo
@@ -7237,93 +7246,52 @@ impl PyEngine {
         })
     }
 
-    /// v1.5.3 — One-call helper that registers THIS engine's local
-    /// pubkey as a `federation_keys` row of the specified
-    /// `identity_type`. Composes the existing primitives
-    /// (`canonicalize_envelope` + `local_sign` + `put_public_key`) so
-    /// callers don't have to re-implement persist's canonical-bytes
-    /// rule in their own language.
+    /// v62.0.0 (JSON-cut slice B) — register THIS engine's own key on the
+    /// clean mesh: a self-signed `key:record` edition-2 statement of the
+    /// engine's composite (ML-DSA-65 + Ed25519) key, admitted through the
+    /// statement door. Returns the key's identity-ref
+    /// (`urn:ietf:params:oauth:ckt:sha-256:…`) = `local_derived_key_id()`;
+    /// thread it back as the attester of the emit helpers.
     ///
-    /// What it does:
-    /// 1. Builds a `KeyRecord` with this engine's local Ed25519 pubkey
-    ///    + `key_id`, the supplied `identity_type` / `identity_ref` /
-    ///    `valid_until`, and `algorithm = "hybrid"`.
-    /// 2. Canonicalizes the supplied `registration_envelope` JSON
-    ///    through the CEG produce gate (`ceg_produce_canonicalize` —
-    ///    RFC 8785 JCS at the current produce epoch), the same rule the
-    ///    `canonicalize_envelope` PyO3 method uses and the same rule
-    ///    `register::verify_key_registration` rebuilds with. (This doc
-    ///    said `PythonJsonDumpsCanonicalizer` until v37.0.0, and so did
-    ///    the code — see `Engine::register_self_federation_key` for the
-    ///    defect that made a non-ASCII bootstrap row permanently
-    ///    unverifiable.)
-    /// 3. Signs those canonical bytes with the local Ed25519 key →
-    ///    `scrub_signature_classical`.
-    /// 4. `original_content_hash = hex(SHA-256(canonical_bytes))`.
-    /// 5. `scrub_key_id = key_id` (self-signed bootstrap row).
-    /// 6. ML-DSA-65 half signed in the same call when the engine carries
-    ///    a PQC identity (v10.1.0/#275), leaving `pqc_completed_at` set;
-    ///    an Ed25519-only engine stores the classical half alone.
-    /// 7. Calls `put_public_key` with the assembled `SignedKeyRecord`.
+    /// `identity_type` is the identity set, comma-separated. `valid_until`
+    /// (ISO-8601) ends the record: a `node` / `agent` record ends at most 365
+    /// days out and gets that end when none is passed; a `user` /
+    /// `accord_holder` record takes none. `attestation_evidence_json` is the
+    /// optional `{hardware_class, pq_custody, chain}` object (chain: hex DER,
+    /// leaf first).
     ///
-    /// Returns the registered `key_id` — the **derived** federation
-    /// key_id `derive_key_id(<alias>, <pubkey>)` (= `engine.local_derived_key_id()`),
-    /// NOT the bare keystore alias. Thread this returned value back as the
-    /// `attesting_key_id` to `put_blob_signing` / the emit helpers so the
-    /// holding-claim / withdraws `scrub_key_id` FK resolves (CIRISPersist#275;
-    /// the #247 floor).
-    ///
-    /// Idempotent on `(key_id)` PRIMARY KEY of `federation_keys` — the
-    /// underlying `put_public_key` writer rejects on key_id conflict
-    /// with differing content, no-ops on identical re-registration.
+    /// v62.0.0 BREAKING: `identity_ref`, `registration_envelope_json` and
+    /// `roles` are gone (the record's identity is its key; `act` is derived
+    /// by the reader).
     ///
     /// Raises:
-    /// - `ValueError` if no local signing identity is configured.
-    /// - `ValueError` if `valid_until` is malformed ISO-8601.
-    /// - `ValueError` if `registration_envelope_json` doesn't parse.
-    /// - `RuntimeError` for backend errors (pool, conflict, etc.).
-    #[pyo3(signature = (identity_type, identity_ref, valid_until = None,
-                        registration_envelope_json = None, roles = None))]
+    /// - `ValueError(composite_signing_unavailable: …)` on an engine whose
+    ///   local signer has no ML-DSA-65 half (a classical-only engine
+    ///   produces nothing on the mesh);
+    /// - `ValueError` for a malformed `valid_until` / evidence, or a record
+    ///   the door refuses (`key_record_out_of_window`, a mixed set).
+    #[pyo3(signature = (identity_type, valid_until = None, attestation_evidence_json = None))]
     fn register_self_federation_key(
         &self,
         py: Python<'_>,
         identity_type: &str,
-        identity_ref: &str,
         valid_until: Option<&str>,
-        registration_envelope_json: Option<&str>,
-        roles: Option<Vec<String>>,
+        attestation_evidence_json: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
-            // Parse valid_until.
             let valid_until_dt: Option<chrono::DateTime<chrono::Utc>> = match valid_until {
                 None => None,
                 Some(s) => Some(s.parse().map_err(|e| {
                     PyValueError::new_err(format!("valid_until must be ISO-8601 (got {s:?}): {e}"))
                 })?),
             };
-
-            // Parse registration_envelope (default to {}).
-            let envelope: serde_json::Value = match registration_envelope_json {
-                None => serde_json::json!({}),
-                Some(s) => serde_json::from_str(s).map_err(|e| {
-                    PyValueError::new_err(format!("registration_envelope JSON decode: {e}"))
-                })?,
+            let evidence: Option<serde_json::Value> = match attestation_evidence_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("attestation_evidence JSON decode: {e}"))
+                })?),
             };
-            let roles = roles.unwrap_or_default();
-
-            // v10.0.1 (CIRISPersist#275) — delegate to the crate-level
-            // `Engine::register_self_federation_key`, which registers the
-            // engine's **composed-signer** federation identity (the key
-            // every emit/scrub path derives its key_id from), keyed by the
-            // DERIVED federation key_id. Pre-#275 this FFI registered the
-            // `LocalSigner` seed's identity (or, earlier, the bare alias) —
-            // a row the holding-claim / withdraws scrub FK could never resolve
-            // against when the composed signer and the local seed are
-            // distinct identities, so `put_blob_signing` FK-failed on every
-            // persist ≥ 9.3.0. Reconstruct the hybrid-capable engine over
-            // the shared backend + signer (the `enter_mesh` /
-            // `emit_attestation` cohabitation pattern) and call it.
             let backend = match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
@@ -7334,18 +7302,11 @@ impl PyEngine {
             let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
             let identity_type = identity_type.to_owned();
-            let identity_ref = identity_ref.to_owned();
             py.detach(move || {
                 let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
-                        .register_self_federation_key(
-                            &identity_type,
-                            &identity_ref,
-                            valid_until_dt,
-                            envelope,
-                            roles,
-                        )
+                        .register_self_federation_key(&identity_type, valid_until_dt, evidence)
                         .await
                         .map_err(federation_err_to_py)
                 })
@@ -35984,7 +35945,7 @@ mod tests {
             // The node's REAL pubkeys: the crossing verifies the actor's
             // signature against the registered record.
             let registered = engine
-                .register_self_federation_key("steward", "ref", None, serde_json::json!({}), vec![])
+                .register_self_federation_key("steward", None, None)
                 .await
                 .expect("register self");
             assert_eq!(registered, derived);

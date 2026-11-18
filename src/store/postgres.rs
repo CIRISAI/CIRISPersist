@@ -9491,6 +9491,30 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::edition2::store::statements_since_postgres(&client, cursor, limit).await
     }
 
+    async fn edition2_statement(
+        &self,
+        statement_id: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::store::statement_by_id_postgres(&client, statement_id).await
+    }
+
+    async fn edition2_statement_ids_since(
+        &self,
+        after: Option<&[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::store::statement_ids_since_postgres(&client, after, limit)
+            .await
+    }
+
     // v61.4.0 (CIRISPersist#1244) — the directory capsule reaches the
     // blackhole and edge-detection surfaces through these, so those calls
     // run inside persist's `.so`.
@@ -11157,6 +11181,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         after_content_hash: Option<&str>,
         limit: u32,
     ) -> Result<Vec<String>, crate::federation::Error> {
+        // v62.0.0 (JSON-cut slice B) — the statement-id wire index.
+        if kind == crate::federation::edition2::store::STATEMENT_KIND {
+            let after = after_content_hash.and_then(crate::federation::edition2::store::id_of_hex);
+            return self
+                .edition2_statement_ids_since(after.as_ref(), limit)
+                .await;
+        }
         let after = after_content_hash.unwrap_or("");
         let lim = i64::from(limit);
         let client = self
@@ -14290,6 +14321,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         kind: &str,
         content_hash: &str,
     ) -> Result<Option<Vec<u8>>, crate::federation::Error> {
+        // v62.0.0 (JSON-cut slice B) — a statement by its statement id, a row
+        // by its row id: the bytes as received.
+        if let Some(served) =
+            crate::federation::edition2::store::lookup_by_id(self, kind, content_hash).await?
+        {
+            return Ok(served);
+        }
         let client = self
             .get_client()
             .await
@@ -17303,7 +17341,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // node's own holding claims (v55.0.0, CIRISPersist#989), each by its
         // signer; a refused retraction ABORTS (I18), a retracted one is not
         // retracted twice.
-        let node = signer.derived_key_id();
+        let node = signer.federation_id().await;
         for sha_hex in &sha_hexes {
             let Ok(sha) = <[u8; 32]>::try_from(hex::decode(sha_hex).unwrap_or_default()) else {
                 continue;

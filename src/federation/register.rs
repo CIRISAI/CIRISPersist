@@ -3843,13 +3843,7 @@ mod tests {
         // hybrid-pending refusal an engine without a PQC identity would earn.
         {
             let self_id = engine
-                .register_self_federation_key(
-                    identity_type::NODE,
-                    &format!("self-{run_tag}"),
-                    None,
-                    serde_json::json!({ "purpose": "self-bootstrap" }),
-                    Vec::new(),
-                )
+                .register_self_federation_key(identity_type::NODE, None, None)
                 .await
                 .expect("(h) register_self_federation_key must succeed");
             let row = directory

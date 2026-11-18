@@ -94,7 +94,7 @@ def test_key_grant_rows_round_trip_between_two_nodes_989(tmp_path) -> None:
     # ── Node A: a self stream under a caller-supplied epoch DEK ──────────
     a = _engine(tmp_path, "a", 0x5A)
     try:
-        ka = a.register_self_federation_key("agent", "ref-a", None, None, None)
+        ka = a.register_self_federation_key("agent")
         enc_a = a.self_enc_pubkeys()
         _occurrence(a, ka, ka, enc_a)
 
@@ -162,7 +162,7 @@ def test_key_grant_rows_round_trip_between_two_nodes_989(tmp_path) -> None:
     # ── Node B: admit A's rows ───────────────────────────────────────────
     b = _engine(tmp_path, "b", 0xB5)
     try:
-        b.register_self_federation_key("agent", "ref-b", None, None, None)
+        b.register_self_federation_key("agent")
         content_row = by_dim["key_grant:content:v1"]
         stream_row = by_dim["key_grant:stream:v1"]
 

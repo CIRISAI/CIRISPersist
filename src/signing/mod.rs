@@ -280,6 +280,9 @@ pub struct LocalSigner {
     key_id: String,
     pqc_signer: Option<Arc<dyn PqcSigner>>,
     pqc_key_id: Option<String>,
+    /// v62.0.0 — the composite identity-ref, once read
+    /// ([`Self::federation_id`]); the signer's keys are fixed for its life.
+    identity_ref: std::sync::OnceLock<String>,
 }
 
 impl std::fmt::Debug for LocalSigner {
@@ -369,6 +372,7 @@ impl LocalSigner {
             key_id: cfg.key_id.clone(),
             pqc_signer,
             pqc_key_id: pqc_key_id_out,
+            identity_ref: std::sync::OnceLock::new(),
         })
     }
 
@@ -387,6 +391,7 @@ impl LocalSigner {
             key_id,
             pqc_signer,
             pqc_key_id,
+            identity_ref: std::sync::OnceLock::new(),
         }
     }
 
@@ -430,6 +435,7 @@ impl LocalSigner {
             key_id,
             pqc_signer,
             pqc_key_id,
+            identity_ref: std::sync::OnceLock::new(),
         })
     }
 
@@ -662,6 +668,37 @@ impl LocalSigner {
     /// (CIRISPersist#247).
     pub fn derived_key_id(&self) -> String {
         ciris_verify_core::fedcode::derive_key_id(&self.key_id, &self.ed25519_public_key_bytes())
+    }
+
+    /// v62.0.0 (JSON-cut slice B) — **the id this signer states rows under**:
+    /// with its ML-DSA-65 half, its composite key's identity-ref (the `iss`
+    /// of every edition-2 statement it signs, RFC 9679); without one, the
+    /// earlier [`Self::derived_key_id`]. Every "is this signer that identity"
+    /// comparison asks this, so a composite signer is recognised by the id
+    /// its statements carry.
+    pub async fn federation_id(&self) -> String {
+        if let Some(iref) = self.identity_ref.get() {
+            return iref.clone();
+        }
+        if self.pqc_signer.is_some() {
+            if let Ok((_, iref)) = crate::federation::edition2::produce::signer_identity(self).await
+            {
+                return self.identity_ref.get_or_init(|| iref).clone();
+            }
+        }
+        self.derived_key_id()
+    }
+
+    /// [`Self::federation_id`] without awaiting: the identity-ref once
+    /// [`Self::federation_id`] has read it (every Engine constructor does, at
+    /// boot), else the earlier [`Self::derived_key_id`]. For a synchronous
+    /// preflight ([`check_announcing_signer`](crate::federation::blobs::check_announcing_signer)).
+    #[must_use]
+    pub fn federation_id_now(&self) -> String {
+        self.identity_ref
+            .get()
+            .cloned()
+            .unwrap_or_else(|| self.derived_key_id())
     }
 
     /// Local ML-DSA-65 public key, base64 standard alphabet

@@ -66,7 +66,7 @@ def test_producer_doors_sign_the_term(tmp_path) -> None:
     # Node A: a key the granter can name as its delegate.
     a = _engine(tmp_path, "a", 0xA6)
     try:
-        ka = a.register_self_federation_key("agent", "ref-aff-a", None, None, None)
+        ka = a.register_self_federation_key("agent")
         record_a = a.lookup_public_key(ka)
         assert record_a is not None
     finally:
@@ -74,7 +74,7 @@ def test_producer_doors_sign_the_term(tmp_path) -> None:
 
     b = _engine(tmp_path, "b", 0xB6)
     try:
-        b.register_self_federation_key("user", "ref-aff-b", None, None, None)
+        b.register_self_federation_key("user")
         # lookup_public_key returns the record; the put door takes it signed.
         b.put_public_key(json.dumps({"record": json.loads(record_a)}))
 

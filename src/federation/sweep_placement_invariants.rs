@@ -491,7 +491,7 @@ mod run {
         use crate::federation::EmitAttestationInput;
 
         let node = engine
-            .register_self_federation_key("node", "ref", None, serde_json::json!({}), vec![])
+            .register_self_federation_key("node", None, None)
             .await
             .expect("register self");
         let dir = engine.federation_directory();

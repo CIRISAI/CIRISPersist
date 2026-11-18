@@ -63,6 +63,22 @@ pub const INSTANT_MEMBERS: &[&str] = &[
 /// The payload's fixed-scale members (CC 2.6.1.5), projected as reals.
 pub const SCALED_MEMBERS: &[&str] = &["score", "confidence", "weight"];
 
+/// v62.0.0 (JSON-cut slice B) — the payload's hash-digest members (CC 2.6.1:
+/// `[-16, bstr .size 32]`, SHA-256), projected as the 64-lowercase-hex text
+/// the earlier gates read: `evidence_refs` is a set of them, the others one.
+// cut-B: moves into edition2::payloads (slice A owns member typing) at the merge.
+pub const HASH_DIGEST_MEMBERS: &[&str] = &["evidence_refs", "carried", "seat_commitment"];
+
+/// A `[-16, bstr32]` hash digest as lowercase hex.
+fn digest_hex(v: &Value) -> Option<String> {
+    match v.as_array()? {
+        [alg, d] if alg.as_i64() == Some(-16) => {
+            d.as_bytes().filter(|b| b.len() == 32).map(hex::encode)
+        }
+        _ => None,
+    }
+}
+
 /// How far a chain of key records is followed when loading a signer's keys.
 const MAX_KEY_HOPS: usize = 8;
 
@@ -229,6 +245,23 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
                 );
             }
         }
+        // Hash digests (`[-16, h'…']`) read back as the hex the gates read.
+        for member in HASH_DIGEST_MEMBERS {
+            match row.payload.get_text(member) {
+                Some(Value::Array(a)) if *member == "evidence_refs" => {
+                    let hexes: Option<Vec<String>> = a.iter().map(digest_hex).collect();
+                    if let Some(h) = hexes {
+                        o.insert((*member).to_owned(), serde_json::json!(h));
+                    }
+                }
+                Some(v) => {
+                    if let Some(h) = digest_hex(v) {
+                        o.insert((*member).to_owned(), serde_json::Value::String(h));
+                    }
+                }
+                None => {}
+            }
+        }
         // Scores, confidences and weights are integers at the fixed scale of
         // 10^6 (CC 2.6.1.5); the earlier form's gates read the real value.
         for member in SCALED_MEMBERS {
@@ -382,7 +415,7 @@ where
         && expected.attested_key_id == row.attested_key_id
         && expected.attestation_type == row.attestation_type
         && expected.asserted_at == row.asserted_at
-        && expected.attestation_envelope == row.attestation_envelope
+        && same_envelope(&expected.attestation_envelope, &row.attestation_envelope)
         && expected.subject_key_ids == row.subject_key_ids;
     if !same {
         return Err(Error::malformed_row(
@@ -416,6 +449,15 @@ where
         Liveness::Live(r) => Ok(Some(r.identity_type.join(","))),
         _ => Err(Error::unknown_signer(&admitted.iss, PLANE)),
     }
+}
+
+/// cut-B: two envelopes are the same projection when their canonical (JCS)
+/// images are equal. A stored envelope reads back through its at-rest JCS
+/// form, where an integral real (`score: 1.0`) is the integer `1`, so a
+/// `serde_json::Value` comparison would call one row two.
+fn same_envelope(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use crate::verify::canonical::ceg_produce_canonicalize as jcs;
+    a == b || matches!((jcs(a), jcs(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 /// What [`put_statement`] did.
@@ -460,6 +502,33 @@ pub async fn put_statement<F>(
     bytes: &[u8],
     offered_id: Option<&Digest32>,
     tier: &str,
+) -> Result<StatementOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    put_statement_with_origin(
+        dir,
+        bytes,
+        offered_id,
+        tier,
+        crate::federation::replication::admission::WriteOrigin::Wire,
+    )
+    .await
+}
+
+/// v62.0.0 (JSON-cut slice B) — [`put_statement`] with the mapped row's
+/// write origin: `Authored` for a statement THIS node produced and signed
+/// in-process (`edition2::emit`), so its own producers are metered as local
+/// authorship (CIRISPersist#804), never as a stranger's wire write.
+///
+/// # Errors
+/// As [`put_statement`].
+pub async fn put_statement_with_origin<F>(
+    dir: &F,
+    bytes: &[u8],
+    offered_id: Option<&Digest32>,
+    tier: &str,
+    origin: crate::federation::replication::admission::WriteOrigin,
 ) -> Result<StatementOutcome, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -515,7 +584,7 @@ where
         });
     }
     let row = attestation_of(&admitted, tier)?;
-    dir.put_attestation(SignedAttestation { attestation: row })
+    dir.put_attestation_with_origin(SignedAttestation { attestation: row }, origin)
         .await?;
     let new = dir.put_edition2_statement(&admitted).await?;
     Ok(StatementOutcome::Row {

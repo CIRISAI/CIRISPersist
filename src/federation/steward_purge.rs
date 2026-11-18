@@ -1733,6 +1733,35 @@ pub fn notice_signing_bytes(envelope: &serde_json::Value) -> Result<Vec<u8>, Err
     })
 }
 
+/// v62.0.0 (JSON-cut slice B) — **the purge notice as an edition-2 draft**:
+/// the `takedown_notice:{basis}` row each founder states with its own
+/// composite key (a counted row at `steward_purge`: no `author`; each
+/// cosigner's statement over the same payload is one voice, CC 2.6.1.9).
+/// Returns the [`Draft`](super::edition2::emit::Draft) for the founder whose
+/// kid is `kid` and identity-ref `iss`, in place of the JCS bytes
+/// ([`notice_signing_bytes`]). `sub` is the notice's subject.
+///
+/// # Errors
+/// `edition2_payload_invalid` (the envelope's members as a payload; its
+/// `dimension` must resolve to a `takedown_notice` family).
+pub fn draft_notice(
+    kid: &super::edition2::Digest32,
+    iss: &str,
+    sub: &str,
+    envelope: &serde_json::Value,
+    asserted_at_ms: u64,
+) -> Result<super::edition2::emit::Draft, Error> {
+    super::edition2::emit::draft_from_envelope(
+        kid,
+        iss,
+        sub,
+        super::types::attestation_type::SCORES,
+        envelope,
+        asserted_at_ms,
+        None,
+    )
+}
+
 /// Parse and shape-check the notice's signed members (CC 3.3.2 shape plus the
 /// `steward_purge` members). Every failure is [`token::UNAUTHORISED`].
 ///

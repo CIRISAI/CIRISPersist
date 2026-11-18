@@ -3496,7 +3496,7 @@ pub mod orchestrate {
         // value per signer; derive it, never accept it.
         // §11.2 (6) / I23 / §20.5 — the announcing identity IS the PQC
         // LocalSigner's derived id; hybrid-only, so there is no other.
-        let signer_key_id = local.derived_key_id();
+        let signer_key_id = local.federation_id().await;
         let signer_key_id = signer_key_id.as_str();
         let tier = super::resolve_write_tier(backend, cohort_scope, community_key_id).await?;
         match tier {

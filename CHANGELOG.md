@@ -7,6 +7,29 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
 ## [62.0.0] - UNRELEASED
 
+### Changed (v62 JSON-cut slice B: producers and serving, CIRISPersist#1274)
+
+A v62 node PRODUCES only edition-2 statements on the mesh: each producer signs a row with this node's composite key (`edition2::produce::sign_row`) and admits it through the one statement door (`put_statement`), the door a peer's copy meets.
+
+- **The PQC cold path is deleted** (a composite signature is atomic): `FederationDirectory::{attach_key_pqc_signature, attach_attestation_pqc_signature, list_hybrid_pending_keys, list_hybrid_pending_attestations}`, `KeyRecordWrite::AttachPqc`, `PlannedKeyRecord::CompletePqc`, `plan_key_attach_pqc`, `admission::check_key_pqc_attachment`, `HybridPendingRow`, PyO3 `cold_path_pqc_sign`, and the v31 re-stamp migration. A from-disk gate (I1147) keeps the names gone.
+- **`register_self_federation_key(identity_type, valid_until, attestation_evidence)`** writes a self-signed `key:record` and returns the key's **identity-ref**. `identity_type` is the identity set (comma-separated); a `node` / `agent` record with no asked end ends at the 365-day window; `act` is never a payload member. A restart that states the same set and evidence signs nothing (more than 30 days left). `Engine::local_derived_key_id()` is the identity-ref on an engine with a composite signer.
+- **`composite_signing_unavailable`** (`InvalidArgument`, Python `ValueError`): a classical-only engine produces nothing on the mesh (`Engine::composite_signer`).
+- **The emit recipe** (`attestation_emit::{produce_row, emit_statement, admit_produced, mapped_row}`): `emit_attestation`, `emit_attestation_self`, `assemble_attestation_self` (the statement read as its mapped row, carrying `ceg_statement`) and `emit_with_local_signer` (so the key-grant emission and the vocabulary sweep) state rows. The payload is the envelope's members (`edition2::emit::payload_from_envelope`): instants as POSIX ms, scores ×10⁶, hash digests as `[-16, h'…']`, `author` stated on an authored family (`family_is_authored`, read with the row's leaf).
+- **Families** (`edition2::emit::family_for`): a `scores` row's is its dimension's (an open-vocabulary dimension is refused); capability / moderator / steward / guardianship delegations are `self:delegates_to`; an agent occurrence is `self:delegates_to:agent_occurrence`; an owner binding is `ownership:.relation:.target_kind:.version`, and when it binds THIS node the node's own statement over the same payload is the second voice. A composer (`withdraws` / `recants` / `supersedes`) names its target by `refs.target` (never `references_attestation_id`) and carries the TARGET's family (`CC-READING(next-edition)`).
+- **The eviction `withdraws`** and **the node's own holding claim** (`emit_holding_claim`, and the plaintext write door `put_blob_signing_at`: bytes stored, then the claim announced) are statements. `LocalSigner::federation_id()` (the memoized identity-ref) is the signer's id at every producer's identity check.
+- **Serving.** `lookup_signed_record_by_content_hash` reads the `Statement` kind by statement id and the `Row` kind by row id (the statement that admitted the row), the bytes as received; `list_wire_hashes_since("Statement", …)` is the statement-id wire index. New `FederationDirectory::{edition2_statement, edition2_statement_ids_since}` (sqlite, postgres).
+- **Drafts** (`edition2::emit::{Draft, draft_row, draft_from_envelope}`): a payload plus its `Sig_structure` for an external signer, `Draft::assemble(signature)` the statement. `ownership_reclaim::{draft_reclaim_petition, draft_wa_finding, draft_reclaim_withdraws}` and `steward_purge::draft_notice`.
+- `put_statement_with_origin` (`Authored` for this node's own producers); the mapping reads hash-digest members back as hex (`HASH_DIGEST_MEMBERS`, `// cut-B`, moves into `edition2::payloads` at the merge); a carried row equals its projection by canonical image (an integral real reads back as an integer at rest).
+
+### Adoption notes (CIRISEdge, CIRISServer, CIRISAgent) for slice B
+
+- **Python:** `Engine(..., pqc_sweep_on_init=...)`, `Engine.run_pqc_sweep`, `Engine.attach_attestation_pqc_signature` and `Engine.attach_key_pqc_signature` are removed. `register_self_federation_key(identity_type, valid_until=None, attestation_evidence_json=None)`: `identity_ref`, `registration_envelope_json` and `roles` are gone, and it returns an identity-ref (`urn:ietf:params:oauth:ckt:sha-256:…`). The Agent stores it opaquely (`edge_runtime.py:610`).
+- An engine needs its ML-DSA-65 half to produce: `local_pqc_key_id` / `local_pqc_key_path`, or `identity_dir` + `keystore_alias`.
+- Rows this node emits are named by their **row id** (64 hex), not a UUID; `emit_attestation*` return it.
+- Edge's fetch by `(kind, content_hash)` gains `Statement` (statement id) and `Row` (row id); `list_wire_hashes_since("Statement")` pages the statement ids.
+- A `scores` emit with an open-vocabulary dimension (for example `identity_binding:v1`) is refused: an edition-2 row names a registered family.
+- Server's `emit_attestation(_self)` sites keep their `EmitAttestationInput`; a `withdraws` input names its target by `references_attestation_id`, which persist states as `refs.target`.
+
 ### Changed (v62 slice J0: E2a, E2b and C reconciled; the edition-2 key plane's read models, CIRISPersist#1274)
 
 Slices E2b (the V300 baseline), E2a (the edition-2 door) and C (the kernel adapter) are merged. The signer FKs on `federation_attestations` stay, so an edition-2 row inserts only once its signer has a `federation_keys` row. That row is now the edition-2 key's **projection**, a read model.

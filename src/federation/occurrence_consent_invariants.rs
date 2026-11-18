@@ -147,7 +147,7 @@ pub(crate) mod engine_bodies {
             .await
             .unwrap();
         engine
-            .register_self_federation_key(it::NODE, &alias_n, None, serde_json::json!({}), vec![])
+            .register_self_federation_key(it::NODE, None, None)
             .await
             .expect("register the engine key");
         let n = engine.local_derived_key_id().await.unwrap();

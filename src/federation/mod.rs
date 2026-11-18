@@ -3734,6 +3734,26 @@ pub trait FederationDirectory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// v62.0.0 (JSON-cut slice B) — one held statement by its statement id,
+    /// as received (CC 2.6.1.2): the point read behind the
+    /// [`edition2::store::STATEMENT_KIND`] wire kind.
+    async fn edition2_statement(&self, statement_id: &[u8; 32]) -> Result<Option<Vec<u8>>, Error> {
+        let _ = statement_id;
+        Ok(None)
+    }
+
+    /// v62.0.0 (JSON-cut slice B) — the statement-id wire index: the held
+    /// statement ids (lowercase hex) after `after`, in id order, at most
+    /// `limit`.
+    async fn edition2_statement_ids_since(
+        &self,
+        after: Option<&[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        let _ = (after, limit);
+        Ok(Vec::new())
+    }
+
     // ── Public keys ────────────────────────────────────────────────
 
     /// Insert a new pubkey row. Idempotent on `key_id` collision with

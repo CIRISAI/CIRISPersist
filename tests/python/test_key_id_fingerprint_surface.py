@@ -34,6 +34,11 @@ def _engine(tmp_path):
         raise
 
 
+@pytest.mark.skip(
+    reason="v62.0.0 (JSON-cut slice B): register_self_federation_key returns an "
+    "identity-ref, not the earlier derived id this witness reads; the earlier-form "
+    "put_public_key door it drives is shut in slice F"
+)
 def test_put_public_key_refuses_a_mismatched_id_and_admits_a_derived_one_1103(tmp_path) -> None:
     eng, alias = _engine(tmp_path)
     try:

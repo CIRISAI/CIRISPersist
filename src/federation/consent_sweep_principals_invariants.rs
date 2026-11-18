@@ -335,7 +335,7 @@ mod run {
         // The machine registers its own key (the row every attestation ABOUT
         // it resolves against) — the production boot shape.
         let registered = engine
-            .register_self_federation_key("node", "ref", None, serde_json::json!({}), Vec::new())
+            .register_self_federation_key("node", None, None)
             .await
             .expect("register self");
         let derived = engine.local_derived_key_id().await.expect("derived key");
