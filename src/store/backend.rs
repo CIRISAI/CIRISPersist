@@ -54,6 +54,29 @@ pub trait Backend: Send + Sync {
         rows: &[TraceLlmCallRow],
     ) -> impl Future<Output = Result<usize, Error>> + Send;
 
+    /// v62.0.0 (wave P7; CC 3.1.5, the manifest-only ruling) — **store a
+    /// trace blob** (a `trace:complete:v1` row's content) on the blob plane,
+    /// its bytes exactly as received, under their SHA-256 (the digest the
+    /// row's `evidence_refs` names). The sqlite and postgres backends store it
+    /// through `crate::ingest::store_trace_blob_on`; a backend with no blob
+    /// plane answers [`Error::NotImplemented`], so a statement-carrying trace
+    /// is refused there rather than admitted without its bytes.
+    fn store_trace_blob(
+        &self,
+        sha256: &[u8; 32],
+        blob: Vec<u8>,
+        cohort_scope: &str,
+        group_key_id: Option<&str>,
+        author_key_id: &str,
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        let _ = (sha256, blob, cohort_scope, group_key_id, author_key_id);
+        async {
+            Err(Error::NotImplemented(
+                "store_trace_blob: this backend has no blob plane",
+            ))
+        }
+    }
+
     /// ## Projection-pinned (v20.1.0, CIRISPersist#477 — recorded decision)
     ///
     /// This surface reads the `trace_events` PROJECTION by design, not the

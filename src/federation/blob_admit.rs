@@ -611,6 +611,27 @@ pub(crate) async fn put_delivery_receipt_planned<D: BlobFloorStore>(
         .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
     // Step 1: the subscriber's hybrid signature. Necessary, NOT sufficient.
     super::stream_receipt::verify_receipt_signature(dir, &receipt).await?;
+    store_receipt_checked(dir, receipt).await
+}
+
+/// v62.0.0 (wave T2) — **the receipt door for an edition-2
+/// `delivery_receipt:{stream_id}` statement** (`edition2::typed`). The
+/// edition-2 door verified the subscriber's composite statement (its step
+/// 1); the JOIN and equivocation steps are this door's own
+/// ([`store_receipt_checked`]), the same ones the earlier form meets.
+pub(crate) async fn put_delivery_receipt_edition2_planned<D: BlobFloorStore>(
+    dir: &D,
+    receipt: super::stream_receipt::DeliveryReceipt,
+) -> Result<(), BlobError> {
+    store_receipt_checked(dir, receipt).await
+}
+
+/// The receipt door's steps after the signature: the JOIN against a
+/// published STH and the equivocation check. Shared by both forms.
+async fn store_receipt_checked<D: BlobFloorStore>(
+    dir: &D,
+    receipt: super::stream_receipt::DeliveryReceipt,
+) -> Result<(), BlobError> {
     let k_i64 = i64::try_from(receipt.k)
         .map_err(|_| BlobError::InvalidArgument("put_delivery_receipt: k exceeds i64".into()))?;
     let epoch_i64 = i64::try_from(receipt.epoch).map_err(|_| {
@@ -706,6 +727,11 @@ pub(crate) trait BlobWriteStore: BlobFloorStore {
     /// one, and the holding claim when there is one; after the commit, index
     /// the claim.
     async fn store_planned_blob(&self, planned: PlannedBlob) -> Result<(), BlobError>;
+
+    /// v62.0.0 (wave T2) — delete the blob row (as `BlobStorage::delete_blob`)
+    /// UNLESS a `custody:ack:v1` `here` row cites it, judged in the same
+    /// transaction as the delete. `false`: kept (claimed, or absent).
+    async fn delete_blob_unless_claimed(&self, sha256: &[u8; 32]) -> Result<bool, BlobError>;
 
     /// §11.5 / I28 — an announcement never stores. In ONE transaction:
     /// re-ask that the row is held (and bound, for a community-DEK token),
@@ -1008,6 +1034,104 @@ pub(crate) async fn put_blob_planned<D: BlobWriteStore>(
         door: "put_blob",
     })
     .await
+}
+
+/// v62.0.0 (wave T2) — **the blob door with an edition-2 holding claim**:
+/// `put_blob`'s commons form (`federation`, plaintext) whose claim is a
+/// `custody:{kind}` statement (`here`) instead of a signed JCS row. The
+/// pure checks run first (the claim names THIS blob and THIS size, at
+/// `federation`; the hash-on-write and size cap; the admission gate on the
+/// holder), then the bytes are stored, then the claim goes through the one
+/// statement door (`edition2::ingest::put_statement`): the edition-2
+/// verdict, the custody gate, the holder index the holder directory reads.
+/// A claim refused after the bytes landed reaps the bytes THIS call stored
+/// (`delete_blob_unless_claimed`: kept when any `here` claim cites the blob
+/// at delete time), so a refused claim leaves no bytes; bytes held before
+/// the call stay as they were; an admitted claim finds its bytes held (it
+/// re-stores them after a concurrent reap). Never a claim without bytes.
+pub(crate) async fn put_blob_edition2_planned<D: BlobWriteStore>(
+    dir: &D,
+    sha256: &[u8; 32],
+    body: super::BlobBody,
+    media_type: Option<&str>,
+    claim: &[u8],
+) -> Result<(), BlobError> {
+    use super::types::cohort_scope::{CryptoTier, FEDERATION};
+    let read = super::edition2::typed::holding_claim_of(claim)
+        .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
+    if read.sha256 != *sha256 {
+        return Err(BlobError::InvalidArgument(format!(
+            "put_blob: the holding claim names blob {}, not {}",
+            hex::encode(read.sha256),
+            hex::encode(sha256)
+        )));
+    }
+    if read.cohort_scope != FEDERATION {
+        return Err(BlobError::InvalidArgument(format!(
+            "put_blob: the commons form's claim is placed at {FEDERATION}, not {:?}",
+            read.cohort_scope
+        )));
+    }
+    let floor = StorageFloor::resolved(CryptoTier::Plaintext);
+    floor.check_scope(FEDERATION)?;
+    let tombstones = tombstone_floor(dir, &[*sha256]).await?;
+    if let Some(gate) = dir.blob_admission_gate() {
+        gate.check_blob(&read.holder).await?;
+    }
+    let (storage_kind, bytes_inline, external_ref, size_bytes) =
+        plan_blob_body("put_blob", sha256, &body, dir.inline_bytes_cap())?;
+    check_claim_size(read.size, body.size_bytes(), "stored")?;
+    // Held before this call? Then a refused claim leaves the held row as it
+    // was; otherwise the bytes this call stored are reaped (below).
+    let held_before = dir.blob_head(sha256).await?.is_some();
+    let planned = PlannedBlob {
+        row: PlannedBlobRow {
+            sha256: *sha256,
+            storage_kind,
+            bytes_inline,
+            external_ref,
+            size_bytes,
+            media_type: media_type.map(str::to_owned),
+            cohort_scope: FEDERATION.to_owned(),
+            tier: floor.tier().as_str().to_owned(),
+            author_key_id: Some(read.holder.clone()),
+            group_key_id: None,
+        },
+        associate: true,
+        binding: None,
+        claim: None,
+        tombstones,
+        door: "put_blob",
+    };
+    dir.store_planned_blob(planned.clone()).await?;
+    let admitted = super::edition2::ingest::put_statement(
+        dir,
+        claim,
+        None,
+        super::edition2::ingest::INGEST_TIER,
+    )
+    .await;
+    if let Err(e) = admitted {
+        // The claim was refused: no holding stands for these bytes. Bytes
+        // this call stored are reaped here, in the same call (no sweep reaps
+        // unclaimed local bytes); bytes held before it are left as they were.
+        if !held_before {
+            // Conditional: a concurrent writer whose claim landed first keeps
+            // the bytes (the guard and the delete are one transaction).
+            dir.delete_blob_unless_claimed(sha256).await?;
+        }
+        return Err(match e {
+            super::Error::Backend(m) => BlobError::Backend(m),
+            other => BlobError::InvalidArgument(other.to_string()),
+        });
+    }
+    // The other side of the race: a concurrent refused writer's reap may
+    // have run between this call's store and its claim. The claim stands, so
+    // its bytes are put back (first write wins; idempotent when held).
+    if dir.blob_head(sha256).await?.is_none() {
+        dir.store_planned_blob(planned).await?;
+    }
+    Ok(())
 }
 
 /// The door: every backend's `store_blob_local`.

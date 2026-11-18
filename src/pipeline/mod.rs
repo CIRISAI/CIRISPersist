@@ -1120,6 +1120,7 @@ mod tests {
             events: vec![crate::schema::BatchEvent::CompleteTrace {
                 trace,
                 trace_level: level,
+                statement: None,
             }],
             batch_timestamp: chrono::Utc::now(),
             consent_timestamp: chrono::Utc::now(),

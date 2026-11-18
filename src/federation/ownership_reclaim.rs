@@ -6,11 +6,12 @@
 //! # The gap this closes
 //!
 //! Ownership is a `delegates_to(U → node)` on the owner-binding dimension
-//! ([`super::types::owner_binding::DIMENSION`]).
-//! [`super::admission::check_single_node_owner_admission`] enforces
-//! at-most-one live owner (CC 3.2): a node already owned rejects a
-//! DIFFERENT granter's binding — the incumbent must `withdraws`/`recants`
-//! it, or it must lapse. So if the owner dies, loses custody, or *front-ran
+//! ([`super::types::owner_binding::DIMENSION`]). Ownership is single-valued
+//! (CC 3.2): a binding counts only when the node cosigned it, and v62.0.0's
+//! kernel owner seat ([`super::admission::owner_of`]) reads two counted owners
+//! as none. Until v62.0.0 a single-owner gate refused a DIFFERENT granter's
+//! binding outright; either way the incumbent's live binding stands until it
+//! is withdrawn or lapses. So if the owner dies, loses custody, or *front-ran
 //! the legitimate owner*, the live binding never withdraws and the node is
 //! locked **forever**. That is CC 3.2's "no permanent ownerless lock"
 //! violated by omission.
@@ -66,12 +67,13 @@
 //!   [`ReclaimRefusal::SingleActTransferAttempted`] *before any authority is
 //!   even considered* — a producer that tries to express the collapse is
 //!   told exactly which rule it broke.
-//! - **Refused by the ownership gate.** Step 4 still runs through
-//!   [`super::admission::check_single_node_owner_admission`], which rejects a
-//!   different granter's binding while ANY live binding remains. The reclaim
-//!   `withdraws` must therefore have already landed and taken the incumbent
-//!   non-live — i.e. K really does pass through the unowned state — before a
-//!   claimant can bind.
+//! - **Not counted by the owner seat.** v62.0.0 (kernel pass 2): a
+//!   claimant's binding is held, but counts only with K's cosignature, and
+//!   while the incumbent's binding is live a second counted owner leaves the
+//!   node unowned, not transferred. Step 4's own refusal
+//!   ([`check_post_reclaim_rebinding_admission`]) still demands K's
+//!   co-signature on a rebinding after a reclaim, so K really does pass
+//!   through the unowned state.
 //!
 //! # Authority is re-derived from this node's own verified state (#377)
 //!
@@ -974,13 +976,14 @@ async fn wa_quorum_over_body(
             }
         }
     }
-    let counted = super::reverse_quorum::count_distinct_roster_scrubs(
-        directory,
-        &finding.attestation_envelope,
-        &finding.scrubs(),
-        &carded,
-    )
-    .await;
+    // v62.0.0 (wave V1, I3284) — an edition-2 finding's cosigners are its
+    // VOICES: each WA member's own statement over the finding's payload,
+    // held in `ceg_statements` under the finding's row id
+    // (`edition2::voices`), never an `additional_scrubs` set. Distinct `iss`,
+    // restricted to the carded roster exactly as before. An earlier-form
+    // finding keeps the scrub count behind the earlier-form switch.
+    let counted =
+        super::edition2::voices::counted_roster_signers(directory, finding, &carded).await?;
     Ok(Ok(WaQuorum {
         counted: counted.len(),
         required,
@@ -1269,12 +1272,14 @@ pub async fn check_ownership_reclaim_admission(
     //     permanent, which is the failure this clause exists to prevent.
     if finding == WaFinding::Abandonment {
         let incumbent = target.attesting_key_id.as_str();
+        // v62.0.0 (P5b) — the floor as this node holds it, whichever write
+        // set it (a touch claim is node-local).
         let incumbent_floor = directory
-            .lookup_freshness_floor(incumbent, OWNERSHIP_FRESHNESS_TARGET_KIND)
+            .freshness_floor(incumbent, OWNERSHIP_FRESHNESS_TARGET_KIND)
             .await?
             .map(|f| f.fresh_as_of);
         let node_floor = directory
-            .lookup_freshness_floor(node, OWNERSHIP_FRESHNESS_TARGET_KIND)
+            .freshness_floor(node, OWNERSHIP_FRESHNESS_TARGET_KIND)
             .await?
             .map(|f| f.fresh_as_of);
         let floor = initial_freshness_floor(&target, [incumbent_floor, node_floor]);
@@ -1298,8 +1303,10 @@ pub async fn check_ownership_reclaim_admission(
 /// **Ceremony step 4** — a fresh owner-binding on a node that has been
 /// through a reclaim MUST be co-signed by that node.
 ///
-/// Wired into [`super::admission::check_single_node_owner_admission`], so
-/// all three backends inherit it from one chokepoint.
+/// Asked by the shared attestation plan (`plan_put_attestation`) beside
+/// [`super::admission::check_owner_binding_roster_fresh`] (v62.0.0: the
+/// single-owner gate that called it is deleted), so every backend inherits it
+/// from one chokepoint.
 ///
 /// "Has been through a reclaim" is derived from this node's own stored
 /// rows and nothing else: a `withdraws` against K stamped with
@@ -1339,14 +1346,20 @@ pub async fn check_post_reclaim_rebinding_admission(
     if !reclaimed {
         return Ok(());
     }
+    // v62.0.0 (wave V1b, I3285) — an edition-2 binding is judged by the one
+    // owner-binding counted rule (`admission::check_owner_binding_counted`),
+    // which runs for EVERY owner binding, reclaimed node or not: without the
+    // bound key's own voice the door keeps the owner's voice and the binding
+    // waits (`Pending`, no typed row); the node's voice over the same row
+    // lands it. So this step-4 check has nothing left to add for it. An
+    // earlier-form binding keeps the admission check behind the earlier-form
+    // switch.
+    if super::edition2::voices::carried_row_id(row).is_some() {
+        return Ok(());
+    }
     let node_roster = [node.to_owned()];
-    let cosigned = super::reverse_quorum::count_distinct_roster_scrubs(
-        directory,
-        &row.attestation_envelope,
-        &row.scrubs(),
-        &node_roster,
-    )
-    .await;
+    let cosigned =
+        super::edition2::voices::counted_roster_signers(directory, row, &node_roster).await?;
     if cosigned.is_empty() {
         return Err(Error::OwnershipReclaimRefused {
             node_key_id: node.to_owned(),
@@ -1508,10 +1521,8 @@ mod tests {
 pub(crate) mod test_support {
     use super::*;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{
-        attestation_tier, cohort_scope, identity_type, FamilyMember, SignerForm,
-    };
-    use crate::federation::{Family, SignedAttestation, SignedTouchClaim};
+    use crate::federation::types::{attestation_tier, cohort_scope, identity_type, FamilyMember};
+    use crate::federation::{Family, SignedAttestation};
 
     /// An UNSIGNED owner-binding row (used by pure unit tests that never
     /// store it).
@@ -1612,35 +1623,6 @@ pub(crate) mod test_support {
         })
         .await
         .map(|_| ())
-    }
-
-    /// A hybrid-signed `self_touch` freshness claim.
-    fn self_touch(target_key_id: &str, fresh_as_of: DateTime<Utc>) -> SignedTouchClaim {
-        let fresh_as_of =
-            crate::federation::admission::truncate_to_substrate_resolution(fresh_as_of);
-        let unsigned = SignedTouchClaim {
-            target_key_id: target_key_id.to_owned(),
-            target_kind: OWNERSHIP_FRESHNESS_TARGET_KIND.to_owned(),
-            fresh_as_of,
-            signer_form: SignerForm::SelfTouch,
-            attesting_key_id: target_key_id.to_owned(),
-            signed_envelope: serde_json::Value::Null,
-            signature: ciris_verify_core::transport_binding::TransportBindingSignature {
-                ed25519_signature_base64: String::new(),
-                mldsa65_signature_base64: None,
-            },
-            cohort_scope: cohort_scope::SELF.to_owned(),
-        };
-        let env = unsigned.signing_envelope();
-        let (_hash, classical, pqc) = ts::sign_envelope(target_key_id, &env);
-        SignedTouchClaim {
-            signed_envelope: env,
-            signature: ciris_verify_core::transport_binding::TransportBindingSignature {
-                ed25519_signature_base64: classical,
-                mldsa65_signature_base64: pqc,
-            },
-            ..unsigned
-        }
     }
 
     /// **The whole ceremony, both directions.** Run against every backend.
@@ -2068,16 +2050,24 @@ pub(crate) mod test_support {
             "({suffix}) a quorum finding is not a warrant for an arbitrary third party"
         );
 
-        // ══ RED 7 — a fresh binding while the incumbent is still live is the
-        //    ordinary single-owner refusal (the claimant cannot skip step 3).
-        let premature =
+        // ══ I2842 (was RED 7) — a fresh binding while the incumbent is still
+        //    live. v62.0.0 (kernel pass 2, KERNEL_SEAMS B1 / C557): the
+        //    single-owner refusal is gone; the claimant's binding is HELD. One
+        //    K never cosigned names no owner (CC 3.2, the first binding), so
+        //    the claimant still cannot skip step 3: the incumbent stays the
+        //    owner, and after the reclaim the node is still unowned.
+        let mut premature =
             ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &claimant, &node);
-        assert!(
-            matches!(
-                store(dir, &premature).await,
-                Err(Error::NodeAlreadyOwned { .. })
-            ),
-            "({suffix}) the claimant cannot bind while the incumbent is live"
+        premature.additional_scrubs.clear();
+        store(dir, &premature)
+            .await
+            .expect("I2842: the claimant's uncosigned binding is held, not refused");
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &node)
+                .await
+                .expect("owner_of"),
+            Some(owner.clone()),
+            "({suffix}) I2842: a binding K never cosigned names no owner; the incumbent stays"
         );
 
         // ══ GREEN — step 3: the full ceremony admits, THROUGH THE REAL GATE.
@@ -2162,9 +2152,19 @@ pub(crate) mod test_support {
         store(dir, &ts::owner_binding_attestation(&b2_id, &owner2, &node2))
             .await
             .expect("live binding");
-        dir.put_touch_claim(&self_touch(&owner2, now - Duration::minutes(5)))
-            .await
-            .expect("fresh self-touch");
+        // v62.0.0 (P5b) — a touch claim is node-local: this node records the
+        // incumbent alive five minutes ago (no signature: the node is the
+        // only author of its own floor).
+        dir.put_touch_claim_local(
+            &owner2,
+            OWNERSHIP_FRESHNESS_TARGET_KIND,
+            crate::federation::admission::truncate_to_substrate_resolution(
+                now - Duration::minutes(5),
+            ),
+            cohort_scope::SELF,
+        )
+        .await
+        .expect("fresh node-local touch");
         let p2 = signed_row(
             &filer,
             &node2,
@@ -2318,5 +2318,145 @@ pub(crate) mod test_support {
             Some(owner3.clone()),
             "({suffix}) …and the node is still owned — the refusal wrote nothing"
         );
+    }
+}
+
+/// v62.0.0 (wave V1) — **I3284: the WA quorum counts the finding's VOICES**,
+/// on sqlite and postgres. A 2-of-3 WA body (every member wearing the
+/// `wise_authority` card): the finding with its author's voice alone is short;
+/// a second member's own statement over the finding's payload meets it; a
+/// carded key outside the roster is never counted.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod wa_quorum_voices_v1 {
+    use super::{wa_quorum_over_body, ReclaimPolicy, WaQuorum};
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::voices_invariants::{add_voice, counted_row, found_family};
+    use crate::federation::types::identity_type;
+    use crate::federation::FederationDirectory;
+
+    async fn quorum(
+        d: &dyn FederationDirectory,
+        policy: &ReclaimPolicy,
+        finding: &crate::federation::Attestation,
+    ) -> WaQuorum {
+        match wa_quorum_over_body(d, policy, finding).await.unwrap() {
+            Ok(q) => q,
+            Err((_, detail)) => panic!("I3284 the WA body resolves: {detail}"),
+        }
+    }
+
+    pub(crate) async fn body(d: &dyn FederationDirectory) {
+        let (w1, w2, w3, x) = ("v1-wa-1", "v1-wa-2", "v1-wa-3", "v1-wa-x");
+        for s in [w1, w2, w3, x] {
+            let _ = e2::put_key(d, s, &[identity_type::USER, identity_type::WISE_AUTHORITY]).await;
+        }
+        let body = found_family(d, "v1-wa-body", &[w1, w2, w3], "majority").await;
+        let policy = ReclaimPolicy {
+            abandonment_window: ReclaimPolicy::DEFAULT_ABANDONMENT_WINDOW,
+            wa_family_key_id: body.family_key_id.clone(),
+        };
+        let finding = counted_row(d, w1).await;
+        let q = quorum(d, &policy, &finding).await;
+        assert_eq!((q.counted, q.roster_size), (1, 3), "I3284 one voice: {q:?}");
+        assert!(q.counted < q.required, "I3284 one of three is short: {q:?}");
+
+        let _ = add_voice(d, &finding, x).await;
+        assert_eq!(
+            quorum(d, &policy, &finding).await.counted,
+            1,
+            "I3284 a carded key outside the roster is not counted"
+        );
+
+        add_voice(d, &finding, w2)
+            .await
+            .expect("I3284 the second WA member's voice");
+        let q = quorum(d, &policy, &finding).await;
+        assert_eq!(q.counted, 2, "I3284 two voices: {q:?}");
+        assert!(q.counted >= q.required, "I3284 2-of-3 met by voices: {q:?}");
+    }
+
+    /// I3288: the WA card filter applies AFTER voice counting. A 3-seat body
+    /// where one seated member does NOT wear the `wise_authority` card: the
+    /// author's voice plus that uncarded member's voice is still 1 counted,
+    /// short of 2 (the denominator stays the full roster of 3); a second
+    /// CARDED member's voice meets it.
+    pub(crate) async fn card_filter_body(d: &dyn FederationDirectory) {
+        let (w1, w2, u) = ("v1-wc-1", "v1-wc-2", "v1-wc-u");
+        for s in [w1, w2] {
+            let _ = e2::put_key(d, s, &[identity_type::USER, identity_type::WISE_AUTHORITY]).await;
+        }
+        let _ = e2::put_key(d, u, &[identity_type::USER]).await;
+        let body = found_family(d, "v1-wc-body", &[w1, w2, u], "majority").await;
+        let policy = ReclaimPolicy {
+            abandonment_window: ReclaimPolicy::DEFAULT_ABANDONMENT_WINDOW,
+            wa_family_key_id: body.family_key_id.clone(),
+        };
+        let finding = counted_row(d, w1).await;
+        add_voice(d, &finding, u)
+            .await
+            .expect("I3288 the uncarded member's voice is held");
+        let q = quorum(d, &policy, &finding).await;
+        assert_eq!(
+            (q.counted, q.roster_size),
+            (1, 3),
+            "I3288 a seated member without the card is not counted: {q:?}"
+        );
+        assert!(q.counted < q.required, "I3288 still short: {q:?}");
+        add_voice(d, &finding, w2)
+            .await
+            .expect("I3288 the second carded member's voice");
+        let q = quorum(d, &policy, &finding).await;
+        assert_eq!(q.counted, 2, "I3288 two carded voices: {q:?}");
+        assert!(q.counted >= q.required, "I3288 met: {q:?}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i3288_wa_card_filter_after_voices_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(card_filter_body(&b)).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i3288_wa_card_filter_after_voices_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(card_filter_body(&b)).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i3284_wa_quorum_by_voices_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(body(&b)).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i3284_wa_quorum_by_voices_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(body(&b)).await;
     }
 }

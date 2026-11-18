@@ -378,6 +378,19 @@ where
         .map_err(|e| reject(format!("attestation_envelope canonicalize: {e}")))?;
     let computed_hash = hex::encode(Sha256::digest(&canonical));
 
+    // v62.0.0 (wave T1) — an edition-2 group statement's typed record: the
+    // edition-2 door verified each voice's statement when it arrived, and
+    // vouches for exactly this envelope, this signer and this marker
+    // (`edition2::group::vouched_signature`). Any other signature, in the
+    // same task or not, is verified below as before.
+    if super::edition2::group::vouched_signature(
+        attesting_key_id,
+        &computed_hash,
+        scrub_signature_classical,
+    ) {
+        return Ok(computed_hash);
+    }
+
     // (2) Resolve the attester's REGISTERED pubkeys — never pubkeys carried
     // on the row alone. Unknown/unregistered attester ⇒ reject (fail-secure).
     // v54.1.0 (CIRISPersist#1042) — typed as the ORDERING gap it is
@@ -1181,6 +1194,24 @@ pub mod test_support {
         if let Some(alias) = alias {
             return seed_for(&alias);
         }
+        // v62.0.0 (E0) — every identity-ref shares its first 32 bytes, so
+        // seeding from one would give every key the same keypair, silently.
+        // A kid `fixture_switch` minted resolves to its seed through ITS map
+        // (never through the string), so every earlier-form helper here
+        // (`sign_envelope`, `hybrid_pubkeys`, `local_signer`, `actor_reseal`,
+        // `widen`, ...) signs with the same key the kid names; an unminted kid
+        // panics.
+        if key_id.starts_with("urn:") {
+            let seed = crate::federation::edition2::fixture_switch::seed_of(key_id);
+            if seed != key_id {
+                return seed_for(&seed);
+            }
+        }
+        assert!(
+            !key_id.starts_with("urn:"),
+            "seed a signer from the seed name, never from kid() ({key_id}); use \
+             edition2::fixture_switch::seed_of"
+        );
         let mut seed = [0x11u8; 32];
         for (i, b) in key_id.bytes().take(32).enumerate() {
             seed[i] = b;
@@ -1351,6 +1382,19 @@ pub mod test_support {
         pubkey_source_key_id: &str,
         identity_type: &str,
     ) {
+        // v62.0.0 (E0) — under the switch, the key goes live as an edition-2
+        // `key:record` of `pubkey_source_key_id`'s key: its id is
+        // `kid(pubkey_source_key_id)`; `key_id` names nothing in edition 2.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            use crate::federation::edition2::fixture_switch as e2;
+            e2::put_key(
+                dir,
+                pubkey_source_key_id,
+                &e2::identity_types_of(identity_type),
+            )
+            .await;
+            return;
+        }
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(pubkey_source_key_id);
         // v30.12.0 (CIRISPersist#634) — TRUNCATED TO MICROSECONDS. Postgres
         // `TIMESTAMPTZ` is microsecond precision while `Utc::now()` carries
@@ -1746,6 +1790,17 @@ pub mod test_support {
     /// mirror after mutating" are ONE step that cannot be half-done.
     pub fn seal_row_in_place(signing_key_id: &str, row: &mut Attestation) {
         use crate::federation::envelope::paths;
+        // v62.0.0 (E0, the fixture flip) — under the switch (default ON) the
+        // seal is an edition-2 statement signed by `signing_key_id`'s
+        // composite, through the door and the mapping
+        // (`edition2::fixture_switch::row_of`): the row's ids are the
+        // node-computed one and the signer's identity-ref. An owner binding's
+        // node voice is a further statement (`fixture_switch::voice_of`), never
+        // a co-scrub.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            *row = crate::federation::edition2::fixture_switch::row_of(row, signing_key_id);
+            return;
+        }
         // v31.0.0 (CIRISPersist#598) — the INSTANTS are part of the seal, not a
         // separate step a fixture can forget. `check_instant_binding` now runs
         // on every dimension, so a row sealed without them is one this
@@ -2773,10 +2828,9 @@ pub mod test_support {
         //     custody claim counts; an unmarked delegation is a capability
         //     conferral, giving them a job rather than custody of them.
         //
-        // Two marker-bearing claims on ONE key is not a way to build it:
-        // `check_single_node_owner_admission` fires on any marker-bearing
-        // `delegates_to` regardless of the recipient's identity_type, so the
-        // second is refused `NodeAlreadyOwned`. Hence occurrence + one
+        // Two marker-bearing claims on ONE key is not a way to build it: the
+        // owner seat reads two counted owners as unowned (v62.0.0; until then
+        // the single-owner gate refused the second). Hence occurrence + one
         // custody claim.
         dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
             identity_key_id: other.clone(),
@@ -4034,6 +4088,20 @@ pub mod test_support {
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<String, crate::federation::Error> {
         let id = uuid::Uuid::new_v4().to_string();
+        // v62.0.0 (E0) — under the switch the row is named by the id this
+        // node computes: no self-echo of a minted uuid (an edition-2 name is a
+        // row id), the statement put through the one entry, and the STORED
+        // id returned.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            let envelope = serde_json::json!({ "id": id, "scope": ["act_on_behalf"] });
+            let mut row = bare_attestation(&id, granter, grantee, &envelope);
+            row.attestation_type =
+                crate::federation::types::attestation_type::DELEGATES_TO.to_owned();
+            row.expires_at = expires_at;
+            seal_row_in_place(granter, &mut row);
+            crate::federation::edition2::fixture_switch::put_signed(dir, &row).await?;
+            return Ok(crate::federation::edition2::fixture_switch::rid(&row));
+        }
         let envelope = serde_json::json!({
             "references_attestation_id": id,
             "scope": ["act_on_behalf"],
@@ -4064,6 +4132,15 @@ pub mod test_support {
         let mut row = bare_attestation(&id, granter, grantee, &envelope);
         row.attestation_type = verb.to_owned();
         seal_row_in_place(granter, &mut row);
+        // v62.0.0 (E0) — under the switch the composer (refs.target =
+        // `target_id`, which must be a held row's rid; the codec gives it the
+        // target's family) goes through the one entry, which checks the
+        // target is held in the statement store.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            return crate::federation::edition2::fixture_switch::put_signed(dir, &row)
+                .await
+                .map(|_| ());
+        }
         dir.put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
             .map(|_| ())
@@ -4454,6 +4531,13 @@ pub mod test_support {
         key_id: &str,
         identity_type: &str,
     ) {
+        // v62.0.0 (E0) — under the switch, an edition-2 `key:record`
+        // (`fixture_switch::put_key`): the key's id is `kid(key_id)`.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            use crate::federation::edition2::fixture_switch as e2;
+            e2::put_key(dir, key_id, &e2::identity_types_of(identity_type)).await;
+            return;
+        }
         let record = replicated_key_record(
             key_id,
             identity_type,
@@ -4481,6 +4565,17 @@ pub mod test_support {
         nonce: &str,
         valid_until: chrono::DateTime<chrono::Utc>,
     ) -> crate::federation::KeyRecord {
+        // v62.0.0 (E0) — under the switch, a node / agent edition-2 record
+        // whose end is `valid_until` (a user / accord_holder key carries no
+        // end: `key_row_for_earlier` panics, revoke it instead).
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            return crate::federation::edition2::fixture_switch::key_row_for_earlier(
+                key_id,
+                identity_type,
+                None,
+                Some(valid_until),
+            );
+        }
         let mut rec = replicated_key_record_with_expiry(
             key_id,
             identity_type,
@@ -4502,6 +4597,17 @@ pub mod test_support {
         nonce: &str,
         valid_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> crate::federation::KeyRecord {
+        // v62.0.0 (E0) — under the switch, `key_id`'s own edition-2 record
+        // (its read model); `scrub_key_id` / `signer_key_id` / `nonce` are
+        // the earlier form's (a key's record is signed by the key itself).
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            return crate::federation::edition2::fixture_switch::key_row_for_earlier(
+                key_id,
+                identity_type,
+                None,
+                valid_until,
+            );
+        }
         let vu = valid_until.map(|t| t.to_rfc3339());
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         let mut envelope = serde_json::json!({
@@ -4590,6 +4696,17 @@ pub mod test_support {
         signer_key_id: &str,
         nonce: &str,
     ) -> crate::federation::KeyRecord {
+        // v62.0.0 (E0) — under the switch, `key_id`'s own edition-2 record
+        // (its read model): `key_id` is the SEED, the record's `key_id` its
+        // identity-ref (`fixture_switch::kid`).
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            return crate::federation::edition2::fixture_switch::key_row_for_earlier(
+                key_id,
+                identity_type,
+                None,
+                None,
+            );
+        }
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         let mut envelope = serde_json::json!({
             "key_id": key_id,
@@ -4680,7 +4797,9 @@ pub mod test_support {
 
     /// v49.0.0 (#908) — a widening signed by [`roster_consensus_signers`] at
     /// its `effective_at` (primary = the first, the rest co-sign).
-    pub async fn sign_widening_by_consensus<D>(
+    // v62.0.0 (E0) — private: its only caller is the admit-spec builder
+    // below (it was a zero-external-caller typed-row builder).
+    async fn sign_widening_by_consensus<D>(
         directory: &D,
         widening: crate::federation::types::CommunityMembershipWidening,
     ) -> crate::federation::SignedCommunityMembershipWidening
@@ -4805,7 +4924,9 @@ pub mod test_support {
     /// v49.0.0 (#910) — a family widening signed by
     /// [`family_roster_consensus_signers`] at its `effective_at` (primary =
     /// the first, the rest co-sign).
-    pub async fn sign_family_widening_by_consensus<D>(
+    // v62.0.0 (E0) — private: its only caller is the admit-spec builder
+    // below (it was a zero-external-caller typed-row builder).
+    async fn sign_family_widening_by_consensus<D>(
         directory: &D,
         widening: crate::federation::types::FamilyMembershipWidening,
     ) -> crate::federation::SignedFamilyMembershipWidening
@@ -4926,8 +5047,8 @@ pub mod test_support {
     }
 
     /// #371 — build a LIVE **owner-binding** `delegates_to(owner → node)`
-    /// (the CC 1.13.3.3 / CC 3.2 ownership dimension the v12.6.0
-    /// single-owner gate + `owner_of` key on), federation-tier
+    /// (the CC 1.13.3.3 / CC 3.2 ownership dimension `owner_of` keys on),
+    /// federation-tier
     /// hybrid-signed by `owner`'s deterministic keys so
     /// `verify_federation_tier_ingest` admits it. Register `owner` as a
     /// `user`-role key ([`register_identity_key`]) first.

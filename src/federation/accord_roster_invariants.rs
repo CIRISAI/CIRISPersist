@@ -14,8 +14,8 @@
 //!   still committing them is a stray at the version), then it is admitted.
 //! - **I450j** a seat goes only to an `accord_holder` key record (both the
 //!   roster change and the recovery door).
-//! - **I450i** from disk: the genesis bundle check runs the same coverage
-//!   rule and propagates its refusal.
+//! - **I450i** deleted in v62.0.0 (json-cut C5) with the bundle/1 ceremony
+//!   verifier it read from disk.
 //! - **I450h** the standing roster is the HELD head's: cosigns from the holder
 //!   being added do not count toward the majority.
 //! - **I509** (v53.1.2, CIRISPersist#984 row 3) a recovery's exception
@@ -766,37 +766,8 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
-mod pure {
-    /// **I450i** — from disk, comments stripped: the genesis bundle check runs
-    /// the same coverage rule as the version door and PROPAGATES its refusal.
-    /// A bundle whose charter misses a holder cannot be built here without also
-    /// breaking the record-equality leg that runs first, so the leg is pinned by
-    /// its code; `charter_commitments_cover` itself is witnessed by I432, I433,
-    /// I450e and I450g through the door.
-    #[test]
-    fn i450i_genesis_runs_the_coverage_rule() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/federation/genesis/ceremony_verify.rs");
-        let code: String = std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let start = code
-            .find("fn check_family_record(")
-            .expect("check_family_record");
-        let body = &code[start..];
-        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
-        let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            flat.contains("accord_roster::charter_commitments_cover(")
-                && flat.contains(".map_err(|(token, detail)| format!(\"{token}: {detail}\"))?;"),
-            "I450i: the genesis check propagates the coverage refusal"
-        );
-    }
-}
+// v62.0.0 (json-cut C5): I450i (a from-disk check over the bundle/1
+// ceremony verifier, `genesis/ceremony_verify.rs`) is deleted with that file.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {

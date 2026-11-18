@@ -1,0 +1,1606 @@
+//! v62.0.0 (wave T2) — **the typed planes at the edition-2 door**, on sqlite
+//! and postgres. Every statement goes through the one entry
+//! (`ingest::put_statement`); every typed row is read back through the
+//! directory's own readers.
+//!
+//! - **I3150** a user self's occurrence revocation is a roster change, run
+//!   by the self-roster's two-path decision (O1's `gate_edition2`): one roster
+//!   key's voice is `Pending` and nothing is in
+//!   `federation_identity_occurrence_revocations`; the voice that meets the
+//!   strict majority lands it; a re-put is `Row { new: false }`.
+//! - **I3151** an `occurrence_key_id` that is not the row's `sub` is
+//!   `edition2_payload_invalid`, and the voice is not kept.
+//! - **I3152** a stranger's voice is refused, and not kept.
+//! - Every bind and revocation names its head (REQUIRED); the chain starts
+//!   at the genesis key's own `key:record` row.
+//! - **I3185** (CC27 item 2) an occurrence revocation naming the self-roster
+//!   head H1 = {alice, phone} is counted over H1 after the roster grew to
+//!   {alice, phone, tablet}: alice + tablet (2 of 3 now) are `Pending`;
+//!   phone's voice makes 2 of 2 over H1 and lands it.
+//! - **I3186** a revocation naming a head this node does not hold WAITS: its
+//!   voices are kept `Pending`, never refused; delivering the head re-plans
+//!   it at write time (no manual executor call) and it lands.
+//! - **I3187** (CC: refs.head required) an evicted key's voice on a
+//!   revocation naming a head from BEFORE its eviction is admitted as a
+//!   statement but not counted once this node holds the later head.
+//! - **I3153** a revocation of a key by itself lands in
+//!   `federation_revocations` (`revocations_for_subject`), through
+//!   `put_revocation`.
+//! - **I3154** a revocation of another's key with no slash conferral is
+//!   refused by the revocation door's authority rule, and not kept.
+//! - **I3155** a revocation whose `revoked_at` is text is `edition2_payload_invalid`.
+//! - **I3156** a revocation of a key not held waits (the retryable
+//!   `federation_attester_key_unknown`).
+//! - **I3157** a custody report lands in `federation_attestations`, read by
+//!   `parse_custody_ack`.
+//! - **I3158** a custody report about another device is refused
+//!   (`custody_ack_not_self_report`).
+//! - **I3159** a custody report with `expires_at` is `edition2_payload_invalid`.
+//! - **I3160** a content key grant lands and is projected (the pending index
+//!   a grant admitted before its bytes waits in).
+//! - **I3161** a key grant with a text `wrapped_dek` is `edition2_payload_invalid`.
+//! - **I3162** a delivery receipt of an unpublished root is refused by the
+//!   receipt door's JOIN, and kept nowhere.
+//! - **I3163** against a published root it lands in
+//!   `federation_stream_delivery_receipts` and as its signed row.
+//! - **I3164** a second root at the same `k` is the receipt door's
+//!   equivocation refusal.
+//! - **I3165** a cosign statement is kept beside its event in
+//!   `ceg_statements` only (`Voice`), never in `federation_attestations`.
+//! - **I3166** a cosign of an event not held waits
+//!   (`federation_withdraws_target_unheld`).
+//! - **I3167** a `steward_purge` notice is kept, voice by voice, `Pending`,
+//!   never as an attestation row.
+//! - **I3168** a `dmca512` notice passes the notice shape on its projected
+//!   envelope and meets the takedown authority (unbound content:
+//!   `takedown_content_unbound`), and is not kept.
+//! - **I3169** the purge door's count reads the notice's voices: with none
+//!   held it is `no_cosignature`; with two founders' voices held, the fold
+//!   (`cosign::edition2_voices`) is exactly their issuers and the count
+//!   reaches the trust root (`root_not_held` here).
+//! - **I3170** `put_blob_edition2` stores the bytes and admits the edition-2
+//!   holding claim; the holder directory (`list_holders_of`) names the
+//!   holder.
+//! - **I3171** a claim naming another blob is refused before any byte is
+//!   stored.
+//! - **I3178** a claim the statement door refuses after the bytes landed
+//!   reaps the bytes that call stored: a refused claim leaves no bytes.
+//! - **I3181** the reap is conditional (one transaction): a blob a `here`
+//!   claim names is kept; unclaimed local bytes are reaped.
+//! - **I3172** a `trust:accepts:v1` edge projects into the v1.3 trust plane
+//!   (`lookup_trust`): `trusted_by` = its granter, `Direct`, `valid_until`
+//!   as `expires_at`, and `trust_type` DERIVED `temporary`.
+//! - **I3173** the reciprocal edge makes both rows `partnered`.
+//! - **I3174** the granter's `withdraws` expires the row, and the other end
+//!   is re-derived `temporary`.
+//! - **I3175** a `self`-scope edge is `anonymous`.
+//! - **I3176** the purge count over a trust root's head: one voice of three
+//!   is `quorum_not_met`; a voice holding no seat is `not_a_seat`.
+//! - **I3177** two voices of three meet the head's `majority`: the counted
+//!   signers are exactly the voices.
+//! - **I3179** an edition-2 purge bundle carries the notice's statements: a
+//!   second node admits them through its own door (it then holds both
+//!   voices) and counts them by the edition-2 count (`root_not_held` with no
+//!   root held: the end-to-end rooted replication waits on W1's root).
+//! - **I3180** a carried statement the receiver's door refuses refuses the
+//!   bundle (the tampered statement is not held); statements naming two rows
+//!   are `notice_malformed`.
+
+use chrono::{TimeZone, Utc};
+use ciris_crypto::composite::CompositeSigningKey;
+use ciris_verify_core::cde::Value;
+use ciris_verify_core::edition2::sign_row_statement;
+use ciris_verify_core::namespace_match::family_id;
+
+use super::door_invariants::fixture::{iref, key, key_record, map};
+use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
+use super::names::RowId;
+use super::typed::{
+    cosign_payload,
+    custody_payload,
+    delivery_receipt_payload,
+    key_grant_payload,
+    occurrence_revocation_payload,
+    revocation_payload,
+    takedown_payload,
+    // X2 build fix: the trust:accepts witnesses (T2, after the import list was cut).
+    trust_accepts_payload,
+    withdraws_payload,
+    NoticeText,
+    COSIGN_PREFIX,
+    CUSTODY_PREFIX,
+    DELIVERY_RECEIPT_PREFIX,
+    KEY_GRANT_PREFIX,
+    OCCURRENCE_REVOCATION_PREFIX,
+    REVOCATION_PREFIX,
+    TAKEDOWN_PREFIX,
+    TRUST_PREFIX,
+};
+use crate::federation::blobs::GrantWrap;
+use crate::federation::custody_ack::{parse_custody_ack, CustodyState};
+use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRow};
+use crate::federation::types::IdentityOccurrenceRevocation;
+use crate::federation::{malformed_row, BlobStorage, Error, FederationDirectory};
+
+type K = CompositeSigningKey;
+
+fn at(ms: u64) -> chrono::DateTime<Utc> {
+    Utc.timestamp_millis_opt(i64::try_from(ms).unwrap())
+        .single()
+        .unwrap()
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(Utc::now().timestamp_millis()).unwrap()
+}
+
+fn sign_as(k: &K, iss: &str, sub: &str, prefix: &str, p: &Value) -> Vec<u8> {
+    sign_row_statement(k, iss, sub, "scores", &family_id(prefix), p, vec![]).unwrap()
+}
+
+fn sign(k: &K, sub: &str, prefix: &str, p: &Value) -> Vec<u8> {
+    sign_as(k, &iref(k), sub, prefix, p)
+}
+
+fn rid(st: &[u8]) -> RowId {
+    RowId::of_statement(st).unwrap()
+}
+
+/// `p` with `member` set to `v` (the map re-sorted).
+fn with_member(p: &Value, member: &str, v: Value) -> Value {
+    let mut m: Vec<(String, Value)> = p
+        .as_map()
+        .unwrap()
+        .iter()
+        .filter_map(|(k, v)| k.as_text().map(|k| (k.to_owned(), v.clone())))
+        .filter(|(k, _)| k != member)
+        .collect();
+    m.push((member.to_owned(), v));
+    map(m.iter().map(|(k, v)| (k.as_str(), v.clone())).collect())
+}
+
+async fn register<D: FederationDirectory + ?Sized>(d: &D, keys: &[&K]) {
+    for k in keys {
+        put_statement(d, &key_record(k, &["user"], 0, None), None, INGEST_TIER)
+            .await
+            .unwrap();
+    }
+}
+
+async fn put<D: FederationDirectory + ?Sized>(d: &D, st: &[u8]) -> Result<StatementOutcome, Error> {
+    put_statement(d, st, None, INGEST_TIER).await
+}
+
+fn reason(e: &Error) -> String {
+    match e {
+        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
+        other => other.kind().to_owned(),
+    }
+}
+
+async fn kept<D: FederationDirectory + ?Sized>(d: &D, st: &[u8]) -> bool {
+    !d.edition2_voices(&rid(st)).await.unwrap().is_empty()
+}
+
+/// The self-roster chain's first link for `k` (CC27 item 2): its own
+/// `key:record` row (the statement [`register`] put).
+fn genesis_head(k: &K) -> RowId {
+    rid(&key_record(k, &["user"], 0, None))
+}
+
+/// Bind `occ` as an occurrence of `identity` with a roster of one (O1's
+/// door: the occurrence key's own statement, then the identity's), naming
+/// the genesis head. Returns the bind's row id (the next head).
+async fn bind<D: FederationDirectory + ?Sized>(d: &D, identity: &K, occ: &K) -> RowId {
+    bind_at(d, identity, occ, &genesis_head(identity), &[identity]).await
+}
+
+async fn is_revoked<D: FederationDirectory + ?Sized>(d: &D, identity: &str, occ: &str) -> bool {
+    d.list_identity_occurrence_revocations_for(identity)
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.occurrence_key_id == occ)
+}
+
+async fn occurrence_revocation_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (alice, phone, mallory) = (key(110), key(111), key(112));
+    register(d, &[&alice, &phone, &mallory]).await;
+    let h1 = bind(d, &alice, &phone).await;
+    let (a, ph) = (iref(&alice), iref(&phone));
+    let t = now_ms();
+    let rev = IdentityOccurrenceRevocation {
+        identity_key_id: a.clone(),
+        occurrence_key_id: ph.clone(),
+        revoked_at: at(t),
+        effective_at: at(t),
+        reason: None,
+        witness_set: vec![],
+        persist_row_hash: String::new(),
+    };
+    let p = occurrence_revocation_payload(&rev, &a, None, &h1, &[], t).unwrap();
+
+    // I3152 — a stranger's voice.
+    let stranger = sign_as(&mallory, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p);
+    assert!(put(d, &stranger).await.is_err(), "I3152 refused");
+    assert!(!kept(d, &stranger).await, "I3152 not kept");
+
+    // I3151 — the occurrence is the row's sub.
+    let bad = occurrence_revocation_payload(
+        &IdentityOccurrenceRevocation {
+            occurrence_key_id: iref(&mallory),
+            ..rev.clone()
+        },
+        &a,
+        None,
+        &h1,
+        &[],
+        t,
+    )
+    .unwrap();
+    let bad = sign(&alice, &ph, OCCURRENCE_REVOCATION_PREFIX, &bad);
+    let e = put(d, &bad).await.unwrap_err();
+    assert_eq!(reason(&e), malformed_row::EDITION2_PAYLOAD_INVALID, "I3151");
+    assert!(!kept(d, &bad).await, "I3151 not kept");
+
+    // I3150 — counted at the roster's strict majority ({alice, phone}: 2).
+    let v1 = sign(&alice, &ph, OCCURRENCE_REVOCATION_PREFIX, &p);
+    let out = put(d, &v1).await.unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Pending { new: true, .. }),
+        "I3150 one of two is short: {out:?}"
+    );
+    assert!(!is_revoked(d, &a, &ph).await, "I3150 nothing lands short");
+    let v2 = sign_as(&phone, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p);
+    assert_eq!(rid(&v1), rid(&v2), "I3150 one row, two voices");
+    let out = put(d, &v2).await.unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { new: true, .. }),
+        "I3150 the majority lands it: {out:?}"
+    );
+    assert!(is_revoked(d, &a, &ph).await, "I3150 in the typed table");
+    let out = put(d, &v2).await.unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { new: false, .. }),
+        "I3150 a re-put: {out:?}"
+    );
+}
+
+/// Bind `occ` under `identity` naming the self-roster head `head`; the
+/// author statements are one per key of `voices`, each signed AS the
+/// identity. Returns the bind's row id (the next head).
+async fn bind_at<D: FederationDirectory + ?Sized>(
+    d: &D,
+    identity: &K,
+    occ: &K,
+    head: &RowId,
+    voices: &[&K],
+) -> RowId {
+    // A minute back: a later statement asserted before a later eviction
+    // still finds the occurrence live (I3187).
+    let mut m = vec![
+        ("asserted_at", Value::Uint(now_ms() - 60_000)),
+        ("author", Value::Text(iref(identity))),
+        ("identity_key_id", Value::Text(iref(identity))),
+        ("occurrence_key_id", Value::Text(iref(occ))),
+        ("device_class", Value::Text("phone".into())),
+    ];
+    m.push((
+        "refs",
+        map(vec![(
+            "head",
+            ciris_verify_core::edition2::row_ref(&head.0),
+        )]),
+    ));
+    let p = map(m);
+    let own = sign(occ, &iref(occ), "identity:occurrence", &p);
+    put(d, &own).await.expect("the occurrence key's own voice");
+    let mut last = None;
+    for v in voices {
+        last = Some(
+            put(
+                d,
+                &sign_as(v, &iref(identity), &iref(occ), "identity:occurrence", &p),
+            )
+            .await
+            .expect("an author voice"),
+        );
+    }
+    assert!(
+        matches!(last, Some(StatementOutcome::Row { .. })),
+        "bound: {last:?}"
+    );
+    rid(&own)
+}
+
+/// I3185 (CC27 item 2): an occurrence revocation is counted over the
+/// self-roster head it NAMES, not the roster now.
+async fn named_head_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (alice, phone, tablet) = (key(210), key(211), key(212));
+    register(d, &[&alice, &phone, &tablet]).await;
+    let (a, ph) = (iref(&alice), iref(&phone));
+    // H1: {alice, phone}. H2 (naming H1, counted over it): {alice, phone, tablet}.
+    let h1 = bind_at(d, &alice, &phone, &genesis_head(&alice), &[&alice]).await;
+    bind_at(d, &alice, &tablet, &h1, &[&alice, &phone]).await;
+    let t = now_ms();
+    let rev = |occ: &str| IdentityOccurrenceRevocation {
+        identity_key_id: a.clone(),
+        occurrence_key_id: occ.to_owned(),
+        revoked_at: at(t),
+        effective_at: at(t),
+        reason: None,
+        witness_set: vec![],
+        persist_row_hash: String::new(),
+    };
+
+    // I3185 — phone's revocation names H1. alice + tablet (both signing as
+    // alice) are 2 of 3 of the roster NOW, which would land it; over H1 only
+    // alice counts (1 of 2): it is held.
+    let p = occurrence_revocation_payload(&rev(ph.as_str()), &a, None, &h1, &[], t).unwrap();
+    for v in [&alice, &tablet] {
+        let out = put(d, &sign_as(v, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "I3185 counted over the named head, not the roster now: {out:?}"
+        );
+    }
+    assert!(
+        !is_revoked(d, &a, &ph).await,
+        "I3185 nothing lands short of H1's majority"
+    );
+    // phone's own voice as alice makes 2 of 2 over H1.
+    let out = put(
+        d,
+        &sign_as(&phone, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { .. }),
+        "I3185 the named head's majority lands it: {out:?}"
+    );
+    assert!(is_revoked(d, &a, &ph).await, "I3185 revoked");
+
+    // I3186 has its own body (`waiting_head_body`).
+}
+
+/// The two statements of a bind of `occ` under `identity` naming `head`,
+/// voiced by `voices` (each AS the identity), NOT put: [own, authors..].
+fn bind_statements(identity: &K, occ: &K, head: &RowId, voices: &[&K]) -> Vec<Vec<u8>> {
+    let p = map(vec![
+        ("asserted_at", Value::Uint(now_ms() - 60_000)),
+        ("author", Value::Text(iref(identity))),
+        ("identity_key_id", Value::Text(iref(identity))),
+        ("occurrence_key_id", Value::Text(iref(occ))),
+        ("device_class", Value::Text("phone".into())),
+        (
+            "refs",
+            map(vec![(
+                "head",
+                ciris_verify_core::edition2::row_ref(&head.0),
+            )]),
+        ),
+    ]);
+    let mut out = vec![sign(occ, &iref(occ), "identity:occurrence", &p)];
+    out.extend(
+        voices
+            .iter()
+            .map(|v| sign_as(v, &iref(identity), &iref(occ), "identity:occurrence", &p)),
+    );
+    out
+}
+
+/// I3186 (the lead's correction): a revocation naming a head this node does
+/// not hold WAITS (kept, `Pending`, never refused), and lands once the head
+/// arrives.
+async fn waiting_head_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (carol, phone, tablet) = (key(230), key(231), key(232));
+    register(d, &[&carol, &phone, &tablet]).await;
+    let (c, ph) = (iref(&carol), iref(&phone));
+    let h1 = bind_at(d, &carol, &phone, &genesis_head(&carol), &[&carol]).await;
+    // H2: tablet's bind (naming H1, voiced by carol and phone), signed but
+    // NOT yet delivered here.
+    let h2_statements = bind_statements(&carol, &tablet, &h1, &[&carol, &phone]);
+    let h2 = rid(&h2_statements[0]);
+    let t = now_ms();
+    let rev = IdentityOccurrenceRevocation {
+        identity_key_id: c.clone(),
+        occurrence_key_id: ph.clone(),
+        revoked_at: at(t),
+        effective_at: at(t),
+        reason: None,
+        witness_set: vec![],
+        persist_row_hash: String::new(),
+    };
+    let p = occurrence_revocation_payload(&rev, &c, None, &h2, &[], t).unwrap();
+    let voices = [
+        sign(&carol, &ph, OCCURRENCE_REVOCATION_PREFIX, &p),
+        sign_as(&phone, &c, &ph, OCCURRENCE_REVOCATION_PREFIX, &p),
+    ];
+    for v in &voices {
+        let out = put(d, v)
+            .await
+            .expect("I3186 a row naming an unheld head is never refused");
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "I3186 it waits on its head: {out:?}"
+        );
+        assert!(kept(d, v).await, "I3186 the voice is kept");
+    }
+    assert!(
+        !is_revoked(d, &c, &ph).await,
+        "I3186 nothing lands while H2 is absent"
+    );
+    // The head arrives (tablet's bind lands over H1: carol + phone, 2 of 2).
+    let mut last = None;
+    for st in &h2_statements {
+        last = Some(put(d, st).await.expect("H2 is delivered"));
+    }
+    assert!(
+        matches!(last, Some(StatementOutcome::Row { .. })),
+        "H2 landed: {last:?}"
+    );
+    // No manual step: the head's arrival re-plans the waiting proposal at
+    // write time (O1 declares the head read, `fold::reads(row:<head>)`, and
+    // G0's write-time re-fold re-runs it). carol + phone are 2 of 3 over H2.
+    assert!(
+        is_revoked(d, &c, &ph).await,
+        "I3186 the row lands as soon as its head is delivered, with no manual re-plan"
+    );
+}
+
+/// I3187 (CC's ruling on refs.head): an evicted key's voice on a revocation
+/// naming a head from BEFORE its eviction is not counted once this node
+/// holds the later head.
+async fn evicted_voice_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (bob, phone, tablet) = (key(220), key(221), key(222));
+    register(d, &[&bob, &phone, &tablet]).await;
+    let (b, ph, tb) = (iref(&bob), iref(&phone), iref(&tablet));
+    let h1 = bind_at(d, &bob, &phone, &genesis_head(&bob), &[&bob]).await;
+    let h2 = bind_at(d, &bob, &tablet, &h1, &[&bob, &phone]).await;
+    let t1 = now_ms();
+    let rev = |occ: &str, at_ms: u64| IdentityOccurrenceRevocation {
+        identity_key_id: b.clone(),
+        occurrence_key_id: occ.to_owned(),
+        revoked_at: at(at_ms),
+        effective_at: at(at_ms),
+        reason: None,
+        witness_set: vec![],
+        persist_row_hash: String::new(),
+    };
+    // H3: phone evicted (named H2; bob + tablet are 2 of 3).
+    let evict =
+        occurrence_revocation_payload(&rev(ph.as_str(), t1), &b, None, &h2, &[], t1).unwrap();
+    put(d, &sign(&bob, &ph, OCCURRENCE_REVOCATION_PREFIX, &evict))
+        .await
+        .unwrap();
+    let out = put(
+        d,
+        &sign_as(&tablet, &b, &ph, OCCURRENCE_REVOCATION_PREFIX, &evict),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { .. }),
+        "I3187 phone evicted: {out:?}"
+    );
+    // The tablet's revocation names H2 and was signed BEFORE the eviction
+    // took effect, so phone's voice passes the door (its seat was live then).
+    let t0 = t1 - 5_000;
+    let p = occurrence_revocation_payload(&rev(tb.as_str(), t0), &b, None, &h2, &[], t0).unwrap();
+    let out = put(
+        d,
+        &sign_as(&phone, &b, &tb, OCCURRENCE_REVOCATION_PREFIX, &p),
+    )
+    .await
+    .expect("I3187 the evicted key's voice is admitted as a statement");
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I3187 {out:?}"
+    );
+    // Over H2 alone phone + bob would be 2 of 3; this node holds H3, so
+    // phone is not counted: bob alone is short.
+    let out = put(d, &sign(&bob, &tb, OCCURRENCE_REVOCATION_PREFIX, &p))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I3187 the evicted key is not counted once the later head is held: {out:?}"
+    );
+    assert!(!is_revoked(d, &b, &tb).await, "I3187 nothing lands");
+    let out = put(
+        d,
+        &sign_as(&tablet, &b, &tb, OCCURRENCE_REVOCATION_PREFIX, &p),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { .. }),
+        "I3187 bob + tablet, both live, are 2 of 3: {out:?}"
+    );
+}
+
+async fn revocation_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (subj, other) = (key(120), key(121));
+    register(d, &[&subj, &other]).await;
+    let (s, o) = (iref(&subj), iref(&other));
+    let t = now_ms();
+    let payload = |author: &str| {
+        revocation_payload(
+            author,
+            "agent",
+            "compromise",
+            at(t),
+            at(t),
+            None,
+            None,
+            None,
+            t,
+        )
+        .unwrap()
+    };
+
+    // I3154 — another's key, no slash conferral.
+    let st = sign(&other, &s, REVOCATION_PREFIX, &payload(&o));
+    let e = put(d, &st).await.unwrap_err();
+    assert!(
+        [
+            "federation_delegated_scope_unauthorized",
+            "federation_node_identity_unset"
+        ]
+        .contains(&e.kind()),
+        "I3154 the revocation door's authority rule: {e:?}"
+    );
+    assert!(!kept(d, &st).await, "I3154 not kept");
+
+    // I3155 — a missing member.
+    let bad = sign(
+        &subj,
+        &s,
+        REVOCATION_PREFIX,
+        &with_member(&payload(&s), "revoked_at", Value::Text("x".into())),
+    );
+    assert_eq!(
+        reason(&put(d, &bad).await.unwrap_err()),
+        malformed_row::EDITION2_PAYLOAD_INVALID,
+        "I3155"
+    );
+
+    // I3156 — a subject not held waits.
+    let unheld = iref(&key(122));
+    let st = sign(&subj, &unheld, REVOCATION_PREFIX, &payload(&s));
+    assert_eq!(
+        put(d, &st).await.unwrap_err().kind(),
+        "federation_attester_key_unknown",
+        "I3156"
+    );
+
+    // I3153 — the key revokes itself.
+    let st = sign(&subj, &s, REVOCATION_PREFIX, &payload(&s));
+    let out = put(d, &st).await.unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { new: true, .. }),
+        "I3153 {out:?}"
+    );
+    let key_row = d.lookup_public_key(&s).await.unwrap().unwrap();
+    let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
+        &key_row.pubkey_ed25519_base64,
+    )
+    .unwrap()
+    .to_hex();
+    let held = d.revocations_for_subject(&digest).await.unwrap();
+    assert!(
+        held.iter()
+            .any(|r| r.revocation_id == rid(&st).hex() && r.revoking_key_id == s),
+        "I3153 in federation_revocations: {held:?}"
+    );
+}
+
+async fn custody_cosign_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (dev, other) = (key(130), key(131));
+    register(d, &[&dev, &other]).await;
+    let di = iref(&dev);
+    let t = now_ms();
+    let blob = [0x5c; 32];
+    let p = custody_payload(
+        &di,
+        &blob,
+        CustodyState::Here,
+        Some(4096),
+        "federation",
+        None,
+        t,
+    )
+    .unwrap();
+
+    // I3159 — the custody map is closed.
+    let bad = sign(
+        &dev,
+        &di,
+        CUSTODY_PREFIX,
+        &with_member(&p, "expires_at", Value::Uint(t + 1)),
+    );
+    assert_eq!(
+        reason(&put(d, &bad).await.unwrap_err()),
+        malformed_row::EDITION2_PAYLOAD_INVALID,
+        "I3159"
+    );
+
+    // I3158 — about another device.
+    let st = sign(&dev, &iref(&other), CUSTODY_PREFIX, &p);
+    let e = put(d, &st).await.unwrap_err();
+    assert!(
+        e.to_string().contains("custody_ack_not_self_report"),
+        "I3158 {e:?}"
+    );
+    assert!(
+        d.get_attestation(&rid(&st).hex()).await.unwrap().is_none(),
+        "I3158 not held"
+    );
+
+    // I3157 — lands, read by the gate's own parse.
+    let st = sign(&dev, &di, CUSTODY_PREFIX, &p);
+    let out = put(d, &st).await.unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { new: true, .. }),
+        "I3157 {out:?}"
+    );
+    let a = d
+        .get_attestation(&rid(&st).hex())
+        .await
+        .unwrap()
+        .expect("I3157 in federation_attestations");
+    let ack = parse_custody_ack(&a)
+        .unwrap()
+        .expect("I3157 a custody report");
+    assert_eq!(ack.blob_sha256_hex, hex::encode(blob), "I3157");
+    assert_eq!(ack.size, Some(4096), "I3157");
+
+    // I3166 — a cosign of an event not held waits.
+    let ghost = RowId([7; 32]);
+    let c = sign(
+        &other,
+        &di,
+        COSIGN_PREFIX,
+        &cosign_payload("signature", &ghost, t),
+    );
+    assert_eq!(
+        put(d, &c).await.unwrap_err().kind(),
+        "federation_withdraws_target_unheld",
+        "I3166"
+    );
+    assert!(!kept(d, &c).await, "I3166 not kept");
+
+    // I3165 — a cosign is kept beside its event only.
+    let c = sign(
+        &other,
+        &di,
+        COSIGN_PREFIX,
+        &cosign_payload("signature", &rid(&st), t),
+    );
+    let out = put(d, &c).await.unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Voice { new: true, .. }),
+        "I3165 {out:?}"
+    );
+    assert!(kept(d, &c).await, "I3165 in ceg_statements");
+    assert!(
+        d.get_attestation(&rid(&c).hex()).await.unwrap().is_none(),
+        "I3165 never an attestation row"
+    );
+}
+
+async fn takedown_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (root, f1, f2, claimant) = (key(140), key(141), key(142), key(143));
+    register(d, &[&root, &f1, &f2, &claimant]).await;
+    let t = now_ms();
+    let exp = t + 7 * 24 * 3_600_000;
+    let notice = NoticeText {
+        claim_text: "a claim".into(),
+        good_faith_statement: "in good faith".into(),
+        jurisdiction: "US".into(),
+    };
+    let holders = vec![iref(&f1)];
+
+    // I3167 — a steward purge is counted by the purge door: kept, Pending.
+    let p = takedown_payload(
+        "steward_purge",
+        &iref(&root),
+        &[0x44; 32],
+        &holders,
+        &notice,
+        exp,
+        t,
+    )
+    .unwrap();
+    let v1 = sign(&f1, &iref(&root), TAKEDOWN_PREFIX, &p);
+    let v2 = sign(&f2, &iref(&root), TAKEDOWN_PREFIX, &p);
+    let purge_reason = |e: Error| match e {
+        Error::PurgeRefused { body, .. } => body["reason"].as_str().unwrap_or_default().to_owned(),
+        other => panic!("I3169 a purge refusal, not {other:?}"),
+    };
+    assert_eq!(
+        purge_reason(
+            crate::federation::steward_purge::verify_purge_authorisation_edition2(d, &rid(&v1))
+                .await
+                .unwrap_err()
+        ),
+        crate::federation::steward_purge::unauthorised_reason::NO_COSIGNATURE,
+        "I3169 no voice held, nothing to count"
+    );
+    for v in [&v1, &v2] {
+        let out = put(d, v).await.unwrap();
+        assert!(
+            matches!(out, StatementOutcome::Pending { new: true, .. }),
+            "I3167 {out:?}"
+        );
+    }
+    assert_eq!(rid(&v1), rid(&v2), "I3167 one notice");
+    assert_eq!(
+        d.edition2_voices(&rid(&v1)).await.unwrap().len(),
+        2,
+        "I3167 both voices kept"
+    );
+    assert!(
+        d.get_attestation(&rid(&v1).hex()).await.unwrap().is_none(),
+        "I3167 never an attestation row (its row door is held shut)"
+    );
+    assert_eq!(
+        crate::federation::cosign::edition2_voices(d, &rid(&v1))
+            .await
+            .unwrap(),
+        [iref(&f1), iref(&f2)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "I3169 the purge count's input is the notice's voices"
+    );
+    assert_eq!(
+        purge_reason(
+            crate::federation::steward_purge::verify_purge_authorisation_edition2(d, &rid(&v1))
+                .await
+                .unwrap_err()
+        ),
+        crate::federation::steward_purge::unauthorised_reason::ROOT_NOT_HELD,
+        "I3169 the voices reach the trust root's count (no root is held here)"
+    );
+    assert_eq!(
+        purge_reason(
+            crate::federation::steward_purge::purge_rows_edition2(
+                d,
+                &crate::federation::steward_purge::PurgeSelection::mock_llm_traces(),
+                &rid(&v1),
+                "t2-node",
+            )
+            .await
+            .unwrap_err()
+        ),
+        crate::federation::steward_purge::unauthorised_reason::ROOT_NOT_HELD,
+        "I3169 purge_rows_edition2 runs the voice count before any selection"
+    );
+
+    // I3168 — a legal basis meets the takedown authority on its projection.
+    let ci = iref(&claimant);
+    let p = takedown_payload("dmca512", &ci, &[0x45; 32], &holders, &notice, exp, t).unwrap();
+    let st = sign(&claimant, &ci, TAKEDOWN_PREFIX, &p);
+    let e = put(d, &st).await.unwrap_err();
+    assert!(
+        matches!(e, Error::PurgeRefused { token, .. } if token == "takedown_content_unbound"),
+        "I3168 the shape passed; the authority refused: {e:?}"
+    );
+    assert!(!kept(d, &st).await, "I3168 not kept");
+}
+
+async fn key_grant_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) {
+    let (alice, phone) = (key(150), key(151));
+    register(d, &[&alice, &phone]).await;
+    let _h1 = bind(d, &alice, &phone).await;
+    let (a, ph) = (iref(&alice), iref(&phone));
+    let sha = [0x62; 32];
+    let row = KeyGrantRow {
+        axis: KeyGrantAxis::Content {
+            at_rest_sha256: hex::encode(sha),
+            cohort_scope: "self".into(),
+            owner_key_id: a.clone(),
+        },
+        wrap: GrantWrap {
+            recipient_key_id: ph.clone(),
+            wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.to_owned(),
+            wrapped_dek: "{\"v\":2,\"ct\":\"AAAA\"}".to_owned(),
+        },
+    };
+    let p = key_grant_payload(&a, &row, now_ms()).unwrap();
+
+    // I3161 — the wrap is bytes.
+    let bad = sign(
+        &alice,
+        &ph,
+        KEY_GRANT_PREFIX,
+        &with_member(&p, "wrapped_dek", Value::Text("not bytes".into())),
+    );
+    assert_eq!(
+        reason(&put(d, &bad).await.unwrap_err()),
+        malformed_row::EDITION2_PAYLOAD_INVALID,
+        "I3161"
+    );
+
+    // I3160 — lands, and the grant projection ran.
+    let st = sign(&alice, &ph, KEY_GRANT_PREFIX, &p);
+    let out = put(d, &st).await.unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { new: true, .. }),
+        "I3160 {out:?}"
+    );
+    let held = d
+        .get_attestation(&rid(&st).hex())
+        .await
+        .unwrap()
+        .expect("I3160 in federation_attestations");
+    assert_eq!(KeyGrantRow::from_attestation(&held).unwrap(), row, "I3160");
+    let pending = d.key_grant_pending_list(&sha, "self").await.unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|(id, signer)| *id == rid(&st).hex() && *signer == a),
+        "I3160 projected (pending its bytes): {pending:?}"
+    );
+}
+
+async fn blob_body<B>(d: &B)
+where
+    B: FederationDirectory + BlobStorage + crate::federation::blob_admit::BlobWriteStore + Sync,
+{
+    use sha2::Digest as _;
+    let h = key(170);
+    register(d, &[&h]).await;
+    let hi = iref(&h);
+    let bytes = b"t2 edition-2 blob".to_vec();
+    let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+    let size = bytes.len() as u64;
+    let claim = |sha: &[u8; 32]| {
+        sign(
+            &h,
+            &hi,
+            CUSTODY_PREFIX,
+            &custody_payload(
+                &hi,
+                sha,
+                CustodyState::Here,
+                Some(size),
+                "federation",
+                None,
+                now_ms(),
+            )
+            .unwrap(),
+        )
+    };
+
+    // I3171 — a claim naming another blob stores nothing.
+    let e = d
+        .put_blob_edition2(
+            &sha,
+            crate::federation::BlobBody::Inline(bytes.clone()),
+            None,
+            &claim(&[0x01; 32]),
+        )
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("names blob"), "I3171 {e:?}");
+    assert!(d.blob_head(&sha).await.unwrap().is_none(), "I3171 no bytes");
+
+    // I3178 — a claim the statement door refuses (its signer's key is not
+    // held) after the bytes landed: the bytes this call stored are reaped.
+    let stranger = key(171);
+    let si = iref(&stranger);
+    let other = b"t2 bytes of a refused claim".to_vec();
+    let other_sha: [u8; 32] = sha2::Sha256::digest(&other).into();
+    let refused = sign(
+        &stranger,
+        &si,
+        CUSTODY_PREFIX,
+        &custody_payload(
+            &si,
+            &other_sha,
+            CustodyState::Here,
+            Some(other.len() as u64),
+            "federation",
+            None,
+            now_ms(),
+        )
+        .unwrap(),
+    );
+    assert!(
+        d.put_blob_edition2(
+            &other_sha,
+            crate::federation::BlobBody::Inline(other),
+            None,
+            &refused
+        )
+        .await
+        .is_err(),
+        "I3178 the claim is refused"
+    );
+    assert!(
+        d.blob_head(&other_sha).await.unwrap().is_none(),
+        "I3178 a refused claim leaves no bytes"
+    );
+    assert!(!kept(d, &refused).await, "I3178 nor its statement");
+
+    // I3170 — the bytes and the claim; the holder directory reads it.
+    let st = claim(&sha);
+    d.put_blob_edition2(
+        &sha,
+        crate::federation::BlobBody::Inline(bytes.clone()),
+        Some("text/plain"),
+        &st,
+    )
+    .await
+    .expect("I3170 the edition-2 blob door");
+    assert!(
+        matches!(
+            d.get_blob(&sha).await.unwrap(),
+            Some(crate::federation::BlobBody::Inline(ref b)) if *b == bytes
+        ),
+        "I3170 the bytes"
+    );
+    assert!(kept(d, &st).await, "I3170 the claim statement");
+    let holders = crate::federation::holding_claim::list_holders_of(d, &sha)
+        .await
+        .unwrap();
+    assert!(
+        holders.contains(&hi),
+        "I3170 the holder directory: {holders:?}"
+    );
+
+    // I3181 — the reap is conditional, in one transaction: bytes a `here`
+    // claim names are kept (a concurrent writer whose claim landed keeps
+    // them); unclaimed bytes are reaped.
+    assert!(
+        !d.delete_blob_unless_claimed(&sha).await.unwrap(),
+        "I3181 a claimed blob is not reaped"
+    );
+    assert!(
+        d.blob_head(&sha).await.unwrap().is_some(),
+        "I3181 its bytes stay"
+    );
+    let loose = b"t2 unclaimed local bytes".to_vec();
+    let loose_sha: [u8; 32] = sha2::Sha256::digest(&loose).into();
+    d.store_blob_local(
+        &loose_sha,
+        crate::federation::BlobBody::Inline(loose),
+        None,
+        "federation",
+        crate::federation::StorageFloor::resolved(
+            crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+        ),
+        None,
+        None,
+    )
+    .await
+    .expect("local bytes");
+    assert!(
+        d.delete_blob_unless_claimed(&loose_sha).await.unwrap(),
+        "I3181 unclaimed bytes are reaped"
+    );
+    assert!(
+        d.blob_head(&loose_sha).await.unwrap().is_none(),
+        "I3181 gone"
+    );
+}
+
+fn sign_typed(k: &K, row_type: &str, sub: &str, prefix: &str, p: &Value) -> Vec<u8> {
+    sign_row_statement(k, &iref(k), sub, row_type, &family_id(prefix), p, vec![]).unwrap()
+}
+
+fn accepts(granter: &K, key: &str, scope: &str, until: Option<u64>, t: u64) -> Vec<u8> {
+    let p = trust_accepts_payload(
+        &iref(granter),
+        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
+        &[],
+        until,
+        scope,
+        t,
+    );
+    sign_typed(granter, "delegates_to", key, TRUST_PREFIX, &p)
+}
+
+async fn trust_body<D: FederationDirectory + ?Sized>(d: &D) {
+    use crate::federation::types::{TrustRelationship, TrustType};
+    let (a, b, c) = (key(180), key(181), key(182));
+    register(d, &[&a, &b, &c]).await;
+    let (ai, bi, ci) = (iref(&a), iref(&b), iref(&c));
+    let t = now_ms();
+    let until = t + 24 * 3_600_000;
+
+    // I3172 — temporary: one edge, A accepts B.
+    let ab = accepts(&a, &bi, "federation", Some(until), t);
+    assert!(
+        matches!(put(d, &ab).await.unwrap(), StatementOutcome::Row { .. }),
+        "I3172"
+    );
+    let row = d
+        .lookup_trust(&bi)
+        .await
+        .unwrap()
+        .expect("I3172 B's trust row");
+    assert_eq!(row.trusted_by, ai, "I3172 the granter is the edge's iss");
+    assert_eq!(
+        row.trust_type,
+        TrustType::Temporary,
+        "I3172 derived: temporary"
+    );
+    assert_eq!(row.trust_relationship, TrustRelationship::Direct, "I3172");
+    assert_eq!(row.trust_domains, None, "I3172");
+    assert_eq!(row.expires_at, Some(at(until)), "I3172 valid_until");
+
+    // I3173 — partnered: the reciprocal edge, B accepts A.
+    let ba = accepts(&b, &ai, "federation", Some(until), t + 1);
+    put(d, &ba).await.unwrap();
+    assert_eq!(
+        d.lookup_trust(&ai)
+            .await
+            .unwrap()
+            .expect("I3173")
+            .trust_type,
+        TrustType::Partnered,
+        "I3173 A is partnered"
+    );
+    assert_eq!(
+        d.lookup_trust(&bi)
+            .await
+            .unwrap()
+            .expect("I3173")
+            .trust_type,
+        TrustType::Partnered,
+        "I3173 B is re-derived partnered when the reciprocal arrives"
+    );
+
+    // I3174 — B withdraws its edge: A's row expires; B is temporary again.
+    let w = sign_typed(
+        &b,
+        "withdraws",
+        &ai,
+        TRUST_PREFIX,
+        &withdraws_payload(&bi, &rid(&ba), t + 2),
+    );
+    put(d, &w).await.expect("I3174 the granter's withdraws");
+    let row = d
+        .lookup_trust(&ai)
+        .await
+        .unwrap()
+        .expect("I3174 the row stays");
+    assert!(
+        row.expires_at.is_some_and(|e| e <= Utc::now()),
+        "I3174 expired by the withdraws: {row:?}"
+    );
+    assert_eq!(
+        d.lookup_trust(&bi)
+            .await
+            .unwrap()
+            .expect("I3174")
+            .trust_type,
+        TrustType::Temporary,
+        "I3174 B re-derived temporary when the reciprocal is withdrawn"
+    );
+
+    // I3175 — anonymous: a self-scope edge.
+    let ac = accepts(&a, &ci, "self", None, t + 3);
+    put(d, &ac).await.expect("I3175 a self-scope edge");
+    assert_eq!(
+        d.lookup_trust(&ci)
+            .await
+            .unwrap()
+            .expect("I3175")
+            .trust_type,
+        TrustType::Anonymous,
+        "I3175 derived: anonymous"
+    );
+}
+
+/// I3176–I3177: the purge door's count over voices against a trust root's
+/// head (handed in: no edition-2 path seats a ROOTED trust root yet).
+async fn purge_quorum_body<D: FederationDirectory + ?Sized>(d: &D) {
+    use crate::federation::canonical_community::counts_voices_over_head;
+    use crate::federation::steward_purge::unauthorised_reason as why;
+    use crate::federation::types::{Community, CommunityMember, SignedCommunity};
+    let (f1, f2, f3, x) = (key(190), key(191), key(192), key(193));
+    register(d, &[&f1, &f2, &f3, &x]).await;
+    let head = SignedCommunity {
+        community: Community {
+            community_key_id: iref(&key(194)),
+            community_name: "t2 root".into(),
+            members: [&f1, &f2, &f3]
+                .iter()
+                .map(|k| CommunityMember {
+                    key_id: iref(k),
+                    joined_at: at(1_000),
+                    role: Some("founder".into()),
+                })
+                .collect(),
+            founded_at: at(1_000),
+            consensus_protocol: "majority".into(),
+            policy_blob: None,
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            persist_row_hash: String::new(),
+        },
+        authority_key_id: String::new(),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
+        supersede_proof: None,
+        cosignatures: vec![],
+        lineage: vec![],
+    };
+    fn set(ks: &[&K]) -> std::collections::BTreeSet<String> {
+        ks.iter().map(|k| iref(k)).collect()
+    }
+    let now = Utc::now();
+    let one = counts_voices_over_head(d, &head, &set(&[&f1]), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        one.map_err(|(r, _)| r),
+        Err(why::QUORUM_NOT_MET),
+        "I3176 one voice of three is short of the root's majority"
+    );
+    let stranger = counts_voices_over_head(d, &head, &set(&[&f1, &x]), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        stranger.map_err(|(r, _)| r),
+        Err(why::NOT_A_SEAT),
+        "I3176 a voice that holds no seat is a refusal, not a discount"
+    );
+    let two = counts_voices_over_head(d, &head, &set(&[&f1, &f2]), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        two.map_err(|(r, _)| r),
+        Ok(set(&[&f1, &f2])),
+        "I3177 two voices of three meet the root's majority"
+    );
+}
+
+/// I3179–I3180: an edition-2 purge bundle replicated to a second node.
+async fn purge_replication_body<D: FederationDirectory + ?Sized>(a: &D, b: &D) {
+    use crate::federation::steward_purge::{
+        self as sp, unauthorised_reason as why, PurgeBundle, StewardPurgeNotice,
+    };
+    let (root, f1, f2) = (key(200), key(201), key(202));
+    for n in [a, b] {
+        register(n, &[&root, &f1, &f2]).await;
+    }
+    let t = now_ms();
+    let notice = NoticeText {
+        claim_text: "a claim".into(),
+        good_faith_statement: "in good faith".into(),
+        jurisdiction: "US".into(),
+    };
+    let p = takedown_payload(
+        "steward_purge",
+        &iref(&root),
+        &[0x46; 32],
+        &[iref(&f1)],
+        &notice,
+        t + 7 * 24 * 3_600_000,
+        t,
+    )
+    .unwrap();
+    let v1 = sign(&f1, &iref(&root), TAKEDOWN_PREFIX, &p);
+    let v2 = sign(&f2, &iref(&root), TAKEDOWN_PREFIX, &p);
+    for v in [&v1, &v2] {
+        put(a, v).await.unwrap();
+    }
+    fn bundle(statements: &[Vec<u8>]) -> PurgeBundle {
+        PurgeBundle {
+            notice: StewardPurgeNotice {
+                envelope: sp::edition2_notice_envelope(statements),
+                cosignatures: vec![],
+            },
+            record_ids: vec![],
+            derived_from: vec![],
+            admitted_at: Utc::now(),
+        }
+    }
+    let reason_of = |e: Error| match e {
+        Error::PurgeRefused { body, .. } => body["reason"].as_str().unwrap_or_default().to_owned(),
+        other => other.kind().to_owned(),
+    };
+
+    // I3180 — a carried statement the receiver's door refuses refuses the
+    // bundle, and the tampered statement is not held there.
+    let mut tampered = v2.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    let e = sp::apply_replicated_purge(b, &bundle(&[v1.clone(), tampered.clone()]), "node-b")
+        .await
+        .unwrap_err();
+    assert_ne!(
+        reason_of(e),
+        why::ROOT_NOT_HELD,
+        "I3180 refused before the count"
+    );
+    assert_eq!(
+        crate::federation::cosign::edition2_voices(b, &rid(&v1))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "I3180 only the untampered voice is held on the receiver"
+    );
+    // Statements naming two rows are no one notice.
+    let other_row = sign(
+        &f2,
+        &iref(&root),
+        TAKEDOWN_PREFIX,
+        &takedown_payload(
+            "steward_purge",
+            &iref(&root),
+            &[0x47; 32],
+            &[],
+            &notice,
+            t + 1_000_000,
+            t,
+        )
+        .unwrap(),
+    );
+    let e = sp::apply_replicated_purge(b, &bundle(&[v1.clone(), other_row]), "node-b")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reason_of(e),
+        why::NOTICE_MALFORMED,
+        "I3180 one notice per bundle"
+    );
+
+    // I3179 — the bundle carries the notice's statements; the receiver admits
+    // them through its own door and counts them by the edition-2 count (no
+    // root is held here, so the count reaches the root and stops).
+    let e = sp::apply_replicated_purge(b, &bundle(&[v1.clone(), v2.clone()]), "node-b")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reason_of(e),
+        why::ROOT_NOT_HELD,
+        "I3179 the edition-2 count ran"
+    );
+    assert_eq!(
+        crate::federation::cosign::edition2_voices(b, &rid(&v1))
+            .await
+            .unwrap(),
+        [iref(&f1), iref(&f2)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "I3179 the receiver holds and re-verified both voices"
+    );
+    assert!(
+        b.purge_execution(&rid(&v1).hex()).await.unwrap().is_none(),
+        "I3179 nothing recorded without the root's quorum"
+    );
+}
+
+const STREAM: &str = "t2-receipt-stream";
+const ROOT: [u8; 32] = [0x3a; 32];
+const ROOT_B: [u8; 32] = [0x3b; 32];
+
+/// I3162, before any STH is published.
+async fn receipt_refused_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) {
+    let s = key(160);
+    register(d, &[&s]).await;
+    let si = iref(&s);
+    let st = sign(
+        &s,
+        &si,
+        DELIVERY_RECEIPT_PREFIX,
+        &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
+    );
+    let e = put(d, &st).await.unwrap_err();
+    assert!(
+        matches!(e, Error::InvalidArgument(ref m) if m.contains("unpublished root")),
+        "I3162 the JOIN: {e:?}"
+    );
+    assert!(!kept(d, &st).await, "I3162 not kept");
+    assert!(
+        d.list_delivery_receipts_for(STREAM, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "I3162 no receipt"
+    );
+}
+
+/// I3163–I3164, with `ROOT` published at tree size 3 and `ROOT_B` at 4.
+async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) {
+    let s = key(160);
+    let si = iref(&s);
+    let st = sign(
+        &s,
+        &si,
+        DELIVERY_RECEIPT_PREFIX,
+        &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
+    );
+    let out = put(d, &st).await.unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { new: true, .. }),
+        "I3163 {out:?}"
+    );
+    let listed = d.list_delivery_receipts_for(STREAM, 10).await.unwrap();
+    assert_eq!(listed.len(), 1, "I3163");
+    assert_eq!(listed[0].chunk_root, ROOT, "I3163");
+    assert_eq!(listed[0].subscriber_key_id, si, "I3163");
+    assert_eq!(listed[0].k, 2, "I3163");
+    assert!(
+        d.get_attestation(&rid(&st).hex()).await.unwrap().is_some(),
+        "I3163 the signed receipt row"
+    );
+    let equivocal = sign(
+        &s,
+        &si,
+        DELIVERY_RECEIPT_PREFIX,
+        &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT_B, now_ms()),
+    );
+    let e = put(d, &equivocal).await.unwrap_err();
+    assert!(
+        matches!(e, Error::InvalidArgument(ref m) if m.contains("equivocation")),
+        "I3164 {e:?}"
+    );
+    assert!(!kept(d, &equivocal).await, "I3164 not kept");
+}
+
+#[cfg(feature = "sqlite")]
+async fn sqlite() -> crate::store::sqlite::SqliteBackend {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    b
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres() -> Option<crate::store::postgres::PostgresBackend> {
+    use crate::store::Backend as _;
+    let dsn = crate::test_pg::empty_dsn()?;
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Some(b)
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_publish(b: &crate::store::sqlite::SqliteBackend, tree_size: i64, root: [u8; 32]) {
+    let conn = b.conn_handle();
+    let conn = conn.lock();
+    conn.execute(
+        "INSERT INTO federation_stream_sth (\
+            stream_id, tree_size, epoch, root_hash, signed_at, \
+            producer_key_id, signature_blob, witness_signatures\
+         ) VALUES (?1, ?2, 0, ?3, '2026-01-01T00:00:00Z', \
+                  'producer-key', x'00', '[]')",
+        rusqlite::params![STREAM, tree_size, root.to_vec()],
+    )
+    .expect("seed federation_stream_sth");
+}
+
+#[cfg(feature = "postgres")]
+async fn pg_publish(b: &crate::store::postgres::PostgresBackend, tree_size: i64, root: [u8; 32]) {
+    let client = b.get_client().await.unwrap();
+    let root = root.to_vec();
+    client
+        .execute(
+            "INSERT INTO cirislens.federation_stream_sth (\
+                stream_id, tree_size, epoch, root_hash, signed_at, \
+                producer_key_id, signature_blob, witness_signatures\
+             ) VALUES ($1, $2, 0, $3, '2026-01-01T00:00:00Z', \
+                      'producer-key', '\\x00', '[]'::jsonb) \
+             ON CONFLICT (stream_id, tree_size) DO NOTHING",
+            &[&STREAM, &tree_size, &root],
+        )
+        .await
+        .expect("seed federation_stream_sth");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3150_i3152_occurrence_revocation_sqlite() {
+    Box::pin(occurrence_revocation_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3150_i3152_occurrence_revocation_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(occurrence_revocation_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3153_i3156_revocation_sqlite() {
+    Box::pin(revocation_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3153_i3156_revocation_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(revocation_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3157_i3159_i3165_i3166_custody_cosign_sqlite() {
+    Box::pin(custody_cosign_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3157_i3159_i3165_i3166_custody_cosign_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(custody_cosign_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3167_i3168_takedown_sqlite() {
+    Box::pin(takedown_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3167_i3168_takedown_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(takedown_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3160_i3161_key_grant_sqlite() {
+    Box::pin(key_grant_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3160_i3161_key_grant_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(key_grant_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3162_i3164_delivery_receipt_sqlite() {
+    let b = sqlite().await;
+    Box::pin(receipt_refused_body(&b)).await;
+    sqlite_publish(&b, 3, ROOT);
+    sqlite_publish(&b, 4, ROOT_B);
+    Box::pin(receipt_lands_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3162_i3164_delivery_receipt_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(receipt_refused_body(&b)).await;
+    pg_publish(&b, 3, ROOT).await;
+    pg_publish(&b, 4, ROOT_B).await;
+    Box::pin(receipt_lands_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3170_i3171_blob_sqlite() {
+    Box::pin(blob_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3170_i3171_blob_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(blob_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3172_i3175_trust_sqlite() {
+    Box::pin(trust_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3172_i3175_trust_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(trust_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3176_i3177_purge_quorum_sqlite() {
+    Box::pin(purge_quorum_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3176_i3177_purge_quorum_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(purge_quorum_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3179_i3180_purge_replication_sqlite() {
+    let (a, b) = (sqlite().await, sqlite().await);
+    Box::pin(purge_replication_body(&a, &b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3179_i3180_purge_replication_postgres() {
+    let (Some(a), Some(b)) = (postgres().await, postgres().await) else {
+        return;
+    };
+    Box::pin(purge_replication_body(&a, &b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3185_named_head_sqlite() {
+    Box::pin(named_head_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3185_named_head_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(named_head_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3187_evicted_voice_sqlite() {
+    Box::pin(evicted_voice_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3187_evicted_voice_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(evicted_voice_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3186_waiting_head_sqlite() {
+    Box::pin(waiting_head_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3186_waiting_head_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(waiting_head_body(&b)).await;
+}

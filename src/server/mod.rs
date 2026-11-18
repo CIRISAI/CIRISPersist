@@ -16,7 +16,10 @@
 //!   - `GET /health` — liveness + queue depth + journal pending count.
 //!   - `GET /v1/trust-root/bundle` (alias `GET /v1/steward-key`) — the CC 5.3.4
 //!     GenesisBundle with the `ciris-canonical` community row beside it
-//!     (v50.0.0, CIRISPersist#926).
+//!     (v50.0.0, CIRISPersist#926). Once the earlier-form doors are shut
+//!     (v62.0.0), the edition-2 body: the held voices of the bundles in force.
+//!   - [`edition2::router`] / [`edition2::serve_router`] (v62.0.0, opt-in) —
+//!     edition-2 statement ingest, the serve listing, the bundles in force.
 //!
 //! Status codes (TRACE_WIRE_FORMAT.md §1, §12 + FSD §3.4 #5):
 //!   - 200 — accepted (queued for persistence).
@@ -38,6 +41,8 @@ use crate::journal::Journal;
 use crate::queue::{IngestHandle, QueueError};
 use crate::store::Backend;
 
+// v62.0.0 (JSON-cut slice D) — the edition-2 routes, an opt-in router.
+pub mod edition2;
 pub mod pipeline;
 #[cfg(feature = "secrets-server")]
 pub mod secrets;
@@ -156,10 +161,31 @@ pub const STEWARD_KEY_ALIAS_PATH: &str = "/v1/steward-key";
 /// re-verifies against its own pins
 /// ([`crate::federation::canonical_community::pin_trust_from_bundle_response`]).
 /// A node that holds no row serves `community: null` — honest, not an error.
+///
+/// v62.0.0 (JSON-cut slice D, CC 5.3.4) — once the earlier-form doors are
+/// shut ([`crate::federation::edition2::door::earlier_form_doors_shut`]) the
+/// bundle/1 JSON is an earlier-form object this node no longer serves: the
+/// same paths serve the edition-2 body ([`edition2::TrustRootStatements`],
+/// the held voices of each bundle in force).
 async fn get_trust_root_bundle<F>(State(state): State<AppState<F>>) -> Response
 where
     F: FederationDirectory + Backend + 'static,
 {
+    if crate::federation::edition2::door::earlier_form_doors_shut() {
+        return match edition2::trust_root_statements(&*state.directory).await {
+            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+            Err(e) => {
+                tracing::warn!(kind = e.kind(), error = %e, "trust-root statements route failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(TrustRootErrorResponse {
+                        detail: "trust-root bundle unavailable",
+                    }),
+                )
+                    .into_response()
+            }
+        };
+    }
     match crate::federation::canonical_community::trust_root_bundle_response(
         &*state.directory,
         crate::federation::genesis::canonical_genesis_bundle(),

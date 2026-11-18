@@ -144,6 +144,7 @@ echo "evidence re-stamp agrees with the generator (#1052)"
 # bump's own Cargo.toml rewrite and re-stamp; the generator must agree, and
 # must not before the re-stamp.
 g="$t/gen"; mkdir -p "$g/evidence" "$g/src/federation/namespace"
+printf 'pub fn f() {}\n' > "$g/src/a.rs"  # the src/ row's span (v62.0.0, span_sha256)
 printf '[package]\nname = "ciris-persist"\nversion = "9.8.10"\n' > "$g/Cargo.toml"
 printf '{"evidence_export": {"CIRISPersist": [{"decimal_id": "1.1", "claim_id": "CLM-a", "repo": "CIRISPersist", "path#symbol": "src/a.rs#f", "tsv_target": "evidence/cc_impl.tsv"}, {"decimal_id": "1.2", "claim_id": "CLM-x", "repo": "CIRISPersist", "path#symbol": "ciris-verify-core/src/x.rs#g", "tsv_target": "evidence/cc_impl.tsv", "crate": "ciris-persist@31.0.0"}]}}' > "$g/src/federation/namespace/namespace_supersets.json"
 gen() { EVIDENCE_TSV_ROOT="$g" python3 scripts/evidence_tsv.py "$1" >/dev/null 2>&1; }

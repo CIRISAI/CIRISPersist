@@ -15,6 +15,9 @@
 //!   served. (Stricter than the JSON read: the tombstone's
 //!   accountability-record and person-subject voids are not granted here; a
 //!   withheld void is a row a peer re-fetches from a node that grants it.)
+//! - **about the requester** (v62.0.0, wave T1): a row whose subject
+//!   (`attested_key_id`) or a `subject_key_ids` entry is the requester, or a
+//!   principal of it, is served to it: an invitee its own invitation;
 //! - **audience** ("never serve what the requester is not party to"): a
 //!   commons row (`federation` / `species` / `biosphere`) is served to
 //!   anyone; a `self` / `family` / room (`community`, `affiliations`) row
@@ -25,8 +28,14 @@
 //!
 //! Key-plane statements (`key:record`, `key:revocation`) and signed objects
 //! (genesis bundle voices) are public and always served. A voice of a row
-//! follows its row. A statement whose row this node does not hold (a voice
-//! held alone) is withheld: fail closed.
+//! follows its row. v62.0.0 (wave T1) — a statement that maps to NO
+//! attestation row (a group voice, which lands in its typed table; a counted
+//! row still gathering voices; another statement-only family) is judged from
+//! the statement itself ([`super::group_serve::servable_without_row`]): a
+//! group voice by the group's members at the head it names, the member it
+//! names and the founders; any other by the scope its payload states, an
+//! absent scope reading as `federation` (the attestation default). The purge plane applies to it
+//! as to a row.
 //!
 //! The serve paths: [`statements_served_to`] (the listing, behind
 //! `Engine::edition2_statements_served_to`), [`super::store::lookup_by_id`]
@@ -100,7 +109,19 @@ where
     };
     let rid = rid.hex();
     let Some(row) = dir.get_attestation(&rid).await? else {
-        return Ok(false);
+        // v62.0.0 (wave T1) — no attestation row: judged from the statement.
+        if dir
+            .purge_tombstoned("attestation", &rid)
+            .await
+            .unwrap_or(None)
+            .is_some()
+        {
+            return Ok(false);
+        }
+        return Box::pin(super::group_serve::servable_without_row(
+            dir, statement, requester,
+        ))
+        .await;
     };
     if row.tier != crate::federation::types::attestation_tier::FEDERATION
         || !row_type_served(&row.attestation_type)
@@ -114,6 +135,17 @@ where
         .is_some()
     {
         return Ok(false);
+    }
+    // v62.0.0 (wave T1) — a row ABOUT the requester (its subject, or an
+    // invitee it names in `subject_key_ids`) is served to it: an invitee is
+    // not a member yet, but its invitation is about it, and its node must be
+    // able to answer it (CC 3.1.3.2).
+    if let Some(peer) = requester {
+        let named = std::iter::once(row.attested_key_id.as_str())
+            .chain(row.subject_key_ids.iter().map(String::as_str));
+        if super::group_serve::names_the_requester(dir, named, peer).await? {
+            return Ok(true);
+        }
     }
     let placement = cs::Scope::parse(&row.cohort_scope).map(cs::Scope::placement);
     match (placement, requester) {

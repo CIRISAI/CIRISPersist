@@ -988,6 +988,14 @@ where
 {
     match short {
         None => Ok(signed),
+        // v62.0.0 (wave T1) — an edition-2 group statement's typed record is
+        // never held as an earlier-form object: its voices are kept in
+        // `ceg_statements`, and the edition-2 door reads the shortfall
+        // (`edition2::group`).
+        Some(shortfall) if super::edition2::group::vouched() => {
+            super::edition2::group::note_short();
+            Err(shortfall)
+        }
         Some(shortfall) => Err(hold(dir, signed, shortfall).await),
     }
 }

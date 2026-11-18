@@ -9,12 +9,12 @@ given, refusing a term-bearing edge minted without one
 """
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 import ciris_persist
+from conftest import carry_statements, deliver
 
 RETIRED = (
     "put_organization",
@@ -67,16 +67,18 @@ def test_producer_doors_sign_the_term(tmp_path) -> None:
     a = _engine(tmp_path, "a", 0xA6)
     try:
         ka = a.register_self_federation_key("agent")
-        record_a = a.lookup_public_key(ka)
-        assert record_a is not None
+        assert a.lookup_public_key(ka) is not None
+        # v62.0.0 — A's key travels as its edition-2 `key:record` statement
+        # (the earlier `put_public_key` JSON door is shut).
+        carried = carry_statements(a)
     finally:
         ciris_persist.reset_engine()
 
     b = _engine(tmp_path, "b", 0xB6)
     try:
         b.register_self_federation_key("user")
-        # lookup_public_key returns the record; the put door takes it signed.
-        b.put_public_key(json.dumps({"record": json.loads(record_a)}))
+        deliver(b, carried)
+        assert b.lookup_public_key(ka) is not None
 
         # A term-bearing edge with no term is refused: CC supplies no default.
         with pytest.raises(ValueError, match="delegation_term_required"):

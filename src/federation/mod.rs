@@ -368,6 +368,10 @@ pub(crate) mod occurrence_consent_invariants;
 /// v52.0.0 (CIRISPersist#930) — the occurrence history witnesses, every backend.
 #[cfg(test)]
 pub(crate) mod occurrence_history_invariants;
+/// v62.0.0 (v62 P5c) — I3118–I3121, a node's (and an agent's) human is its
+/// owner, never an occurrence of the person.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod owner_audience_invariants;
 /// v62.0.0 slice E1 (CIRISPersist#1274) — the CC rc20 rules on today's wire,
 /// I1870 onward, every backend.
 #[cfg(test)]
@@ -408,6 +412,14 @@ pub mod scope_classifier_invariants;
 pub(crate) mod sealed_dag_adopt_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+/// v62.0.0 (v62 P5; CC rc20 5.4.6, 3.2) — I3110–I3113, a seat serves only
+/// with an announced owner; an agent is never exempt.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod serve_seat_owner_invariants;
+/// v62.0.0 (v62 P5b) — I3114–I3117, the node-local touch write keeps the
+/// freshness floor's rules.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod touch_local_invariants;
 // v62.0.0 (P13) — every item inside is test-gated; so is the module.
 #[cfg(test)]
 pub(crate) mod silo_projection_invariants;
@@ -830,6 +842,10 @@ mod signed_object_1098_invariants;
 // v60.1.0 (docs/V61_TASK_PLAN.md §2 slice B) — the consumer asks, I1360+.
 #[cfg(test)]
 mod v601_asks_invariants;
+// v62 (CC 3.1.5 rc21; CIRISServer#1365/#1366) — I2931–I2934: an identity
+// amendment is the exact text the Wise Authority approved, at every door.
+#[cfg(test)]
+mod amendment_digest_invariants;
 // v61.0.5 (CIRISPersist#1225) — I1544–I1547: the read of rows naming a key,
 // one dimension, on every backend.
 #[cfg(test)]
@@ -838,6 +854,11 @@ pub(crate) mod subject_read_1225_invariants;
 // reaches the backend's `list_attestations_naming_by_dimension`.
 #[cfg(test)]
 mod directory_double_1232_invariants;
+// v62 (CC rc21, CC 3.1) — I2965/I2966: a key in a family name is its bare
+// thumbprint segment; the licensure gate matches a v62 key through it, and a
+// URN in a dimension is a malformed row, on every backend.
+#[cfg(test)]
+mod key_segment_invariants;
 // v61.1.0 (CIRISPersist#1226) — I1610–I1615: the cohort revoke door carries
 // the one-voice countersign, verified, on every backend.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -854,6 +875,9 @@ mod withdraws_order_roster_receipt_invariants;
 // v62.0.0 (slice C) — I1840–I1843: the doors the kernel adapter switched.
 #[cfg(test)]
 mod kernel_adapter_invariants;
+// v62.0.0 (kernel pass 2, K1) — I2811–I2813: forks held as tips.
+#[cfg(test)]
+mod kernel_pass2_invariants;
 // v61.1.0 (CIRISPersist#1188) — I1621/I1622: the pure survivors of the
 // v61.0.0 mutation run (the consensus_protocol vocabulary, the supersede's
 // held-head verdict). I1620 and I1623–I1626 sit beside their helpers.
@@ -864,6 +888,10 @@ mod mutation_survivors_1188_invariants;
 // emitter-bound id.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod hard_case_occupant_invariants;
+// v62.0.0 (v62 P3) — I3050–I3054: an edition-2 hard_case row projects,
+// fenced by the id its statement computes.
+#[cfg(test)]
+mod hard_case_edition2_invariants;
 // v61.1.0 (CIRISPersist#1163, #1190) — I1570–I1579 and I1670–I1675: the
 // narrowed serve read and the owner-binding feed, on every backend.
 #[cfg(test)]
@@ -948,8 +976,13 @@ mod verify_v23_vectors;
 // v62.0.0 (slice D) — I1853–I1855, I1857: the composite cut, by form.
 #[cfg(test)]
 mod sth_form_invariants;
+// v62.0.0 (wave W1) — I3230–I3234: edition-2 witnesses for the properties the
+// deleted rc6 / 1106 tests carried (attach freshness, the liveness margin, the
+// seat's transit key).
 pub mod stream_receipt;
 pub mod stream_sth;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod v62_coverage_invariants;
 // v62.0.0 (P13) — every item inside is test-gated; so is the module.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod substrate_machine;
@@ -1314,6 +1347,10 @@ pub const DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER: &str = "device_rekey_authority_
 /// occurrence of the member: a node the member owns but does not speak through
 /// (infrastructure operated for others) is not their device and receives none
 /// of their history. RETRYABLE: the occurrence may not have replicated yet.
+/// v62.0.0 (v62 P5c) — the earlier form's rule, read only while its doors are
+/// open: once they are shut a node the member OWNS is their device (the
+/// `(person, node)` occurrence is forbidden, CC rc21 3.3.6), so this rule no
+/// longer refuses a node the owner-binding rules already admitted.
 pub const DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE: &str = "device_rekey_not_an_occurrence";
 /// v50.0.0 (CIRISPersist#916 review, N1) — the backend does not know this
 /// node's own key (`node_key_id()` unset: a host that never told it), so it
@@ -1551,6 +1588,11 @@ where
     let history = directory
         .list_identity_occurrence_history_by_occurrence(key_id)
         .await?;
+    // v62.0.0 (wave O1; E7) — the identity-set exclusion: in edition 2 a
+    // person's key is never an occurrence of a node (RULINGS; CC 3.3.6,
+    // rc21), so its edition-2 agreement is not read. The earlier form's
+    // reading stays behind the earlier-form switch.
+    let person = edition2::occurrence::is_person_key(directory, key_id).await?;
     let identities: std::collections::BTreeSet<&str> = history
         .iter()
         .map(|a| a.identity_key_id.as_str())
@@ -1565,7 +1607,9 @@ where
         if !node_identity {
             continue;
         }
-        let Some(agreed_from) = agreed_from_in(&history, identity, key_id) else {
+        let Some(agreed_from) =
+            agreed_from_either(directory, &history, identity, key_id, person).await?
+        else {
             continue;
         };
         let revocations: Vec<chrono::DateTime<chrono::Utc>> = directory
@@ -1593,6 +1637,39 @@ where
         }
     }
     Ok((false, intervals))
+}
+
+/// v62.0.0 (wave O1; E7) — the earliest agreement of `occurrence` to
+/// `identity` in either form: its own edition-2 voice over a bind
+/// ([`edition2::occurrence::own_voice_agreed_from`]; not read when
+/// `excluded`: a person's key under a machine identity, the identity-set
+/// exclusion), and, while the earlier-form doors are
+/// open ([`edition2::door::earlier_form_doors_shut`]), an earlier-form
+/// assertion it signed as attester ([`agreed_from_in`]).
+async fn agreed_from_either<F>(
+    directory: &F,
+    history: &[types::OccurrenceAssertion],
+    identity: &str,
+    occurrence: &str,
+    excluded: bool,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let earlier = if edition2::door::earlier_form_doors_shut() {
+        None
+    } else {
+        agreed_from_in(history, identity, occurrence)
+    };
+    let e2 = if excluded {
+        None
+    } else {
+        edition2::occurrence::own_voice_agreed_from(directory, identity, occurrence).await?
+    };
+    Ok(match (earlier, e2) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    })
 }
 
 /// The earliest instant `occurrence` itself signed an assertion binding it to
@@ -1633,7 +1710,12 @@ where
     let history = directory
         .list_identity_occurrence_history_by_occurrence(occurrence)
         .await?;
-    Ok(agreed_from_in(&history, identity, occurrence))
+    // v62.0.0 (wave O1; E7) — either form's agreement (the edition-2 own
+    // voice; the earlier form behind the switch), with the identity-set
+    // exclusion.
+    let excluded = edition2::occurrence::is_person_key(directory, occurrence).await?
+        && edition2::occurrence::is_machine_key(directory, identity).await?;
+    agreed_from_either(directory, &history, identity, occurrence, excluded).await
 }
 
 /// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself ever agree
@@ -2619,7 +2701,7 @@ where
         .iter()
         .map(family_member_as_roster_member)
         .collect();
-    Ok(authorized_roster_at(
+    let mut roster: Vec<types::FamilyMember> = authorized_roster_at(
         &record,
         RosterRules::of_family(family).with_persons(&persons),
         &events,
@@ -2627,7 +2709,20 @@ where
     )
     .into_iter()
     .map(roster_member_as_family_member)
-    .collect())
+    .collect();
+    // v62.0.0 (wave T1; CC 2.7.8) — while the head is forked, the roster is
+    // the members common to all tips.
+    if let Some(common) = Box::pin(edition2::group::forked_tip_members(
+        directory,
+        cohort::Cohort::Family,
+        &family.family_key_id,
+        &family.persist_row_hash,
+    ))
+    .await?
+    {
+        roster.retain(|m| common.contains(&m.key_id));
+    }
+    Ok(roster)
 }
 
 /// v49.0.0 (CIRISPersist#912) — the authorized roster of a STORED room at
@@ -2655,15 +2750,39 @@ where
     .await?;
     let rules = RosterRules::of_community(community, &nodes).with_persons(&persons);
     let spans = authorized_roster_spans_at(&community.members, rules, &events, as_of);
+    // v62.0.0 (wave T1; CC 2.7.8) — while the head is forked, the roster is
+    // the members common to all tips.
+    let common = Box::pin(community_forked_tip_members(directory, community)).await?;
     Ok(
         authorized_roster_at(&community.members, rules, &events, as_of)
             .into_iter()
+            .filter(|m| common.as_ref().is_none_or(|c| c.contains(&m.key_id)))
             .map(|m| {
                 let start = spans.get(&m.key_id).copied().flatten();
                 (m, start)
             })
             .collect(),
     )
+}
+
+/// v62.0.0 (wave T1; CC 2.7.8) — [`edition2::group::forked_tip_members`]
+/// for a stored room, under the cohort its record declares (an
+/// affiliation's versions are `affiliations`).
+async fn community_forked_tip_members<F>(
+    directory: &F,
+    community: &Community,
+) -> Result<Option<std::collections::BTreeSet<String>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let cohort = affiliation_config::declared_cohort(community)?;
+    edition2::group::forked_tip_members(
+        directory,
+        cohort,
+        &community.community_key_id,
+        &community.persist_row_hash,
+    )
+    .await
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD §3) — the authorized roster of a STORED room
@@ -2690,12 +2809,18 @@ where
     if reads.dissolved_at.is_some_and(|at| at <= as_of) {
         return Ok(Vec::new());
     }
-    Ok(authorized_roster_at(
+    let mut roster = authorized_roster_at(
         &community.members,
         RosterRules::of_community(community, &reads.nodes).with_persons(&reads.persons),
         &reads.events,
         as_of,
-    ))
+    );
+    // v62.0.0 (wave T1; CC 2.7.8) — while the head is forked, the roster is
+    // the members common to all tips.
+    if let Some(common) = Box::pin(community_forked_tip_members(directory, community)).await? {
+        roster.retain(|m| common.contains(&m.key_id));
+    }
+    Ok(roster)
 }
 
 /// v61.4.0 — the directory reads [`authorized_community_roster_at`] folds:
@@ -3568,6 +3693,18 @@ pub fn cohort_target_of_envelope(envelope: &serde_json::Value) -> Option<&str> {
     .find_map(|k| envelope.get(*k).and_then(serde_json::Value::as_str))
 }
 
+/// v62.0.0 (kernel pass 2, K1) — the prior a locally built
+/// `supersede_proof` names: the version the record's own `prev_head_digest`
+/// names, or (a record naming none) the held head. A proof and its record
+/// name one prior (`group_amendment::check_proof_names_versions_prior`).
+fn proof_prior(record_prev_head_digest: &str, held_head: String) -> String {
+    if record_prev_head_digest.is_empty() {
+        held_head
+    } else {
+        record_prev_head_digest.to_owned()
+    }
+}
+
 /// Federation directory trait — the registry/lens/agent's read+write
 /// surface over persist's three federation tables.
 ///
@@ -3681,6 +3818,27 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
+    /// v62.0.0 (slice C1; CC 2.6.1.11, CC ruling (a)) — store a placed
+    /// genesis offer in ONE transaction, all or nothing: each named row's
+    /// statement and names (`ceg_statements`, `ceg_row_names`), each placed
+    /// key's read model (`federation_keys` edition 2, `federation_revocations`,
+    /// as [`Self::upsert_edition2_key_projection`] writes them), each seat
+    /// binding's typed occurrence row and its history (wave O1's tx-level
+    /// write), then each bundle voice. Returns whether each planned
+    /// occurrence's upsert applied, in order. Storage only: every gate is
+    /// [`edition2::genesis::put_genesis_bundle`]'s. A directory with no
+    /// edition-2 store refuses (`Unsupported`, so the generated double
+    /// delegates it as a leaf).
+    async fn put_edition2_genesis(
+        &self,
+        write: &edition2::genesis::GenesisWrite,
+    ) -> Result<Vec<bool>, Error> {
+        let _ = write;
+        Err(Error::Unsupported {
+            method: "put_edition2_genesis",
+        })
+    }
+
     /// v62.0.0 (slice E2a) — store an admitted edition-2 statement and its
     /// names (`ceg_statements`, `ceg_row_names`), idempotently on the
     /// statement id. Returns whether it was new. A directory with no
@@ -3693,6 +3851,117 @@ pub trait FederationDirectory: Send + Sync {
         Err(Error::Backend(
             "this directory holds no edition-2 statement store".to_owned(),
         ))
+    }
+
+    /// v62.0.0 (wave G0; CC 2.7.3) — store what one fold evaluation found
+    /// for a held row ([`edition2::fold::FoldRecord`]), in ONE transaction:
+    /// its read keys replace the ones held (`ceg_fold_reads`), and its hold
+    /// is upserted (`ceg_fold_state`, `since_us` kept while the reason is
+    /// unchanged) or, for a concluded row, deleted. Storage only: the fold
+    /// is [`edition2::fold`]'s. A directory with no edition-2 store refuses
+    /// (`Unsupported`).
+    async fn put_fold_record(&self, rec: &edition2::fold::FoldRecord) -> Result<(), Error> {
+        let _ = rec;
+        Err(Error::Unsupported {
+            method: "put_fold_record",
+        })
+    }
+
+    /// v62.0.0 (wave G0) — why `row_id` concludes nothing
+    /// (`ceg_fold_state`); `None` when it is concluded or not held. `None`
+    /// by default (no fold store).
+    async fn fold_held(
+        &self,
+        row_id: &edition2::names::RowId,
+    ) -> Result<Option<edition2::fold::HeldReason>, Error> {
+        let _ = row_id;
+        Ok(None)
+    }
+
+    /// v62.0.0 (wave G0) — the held reasons in row-id order after `after`,
+    /// at most `limit`. Empty by default.
+    async fn fold_held_page(
+        &self,
+        after: Option<&edition2::names::RowId>,
+        limit: u32,
+    ) -> Result<Vec<edition2::fold::HeldReason>, Error> {
+        let _ = (after, limit);
+        Ok(Vec::new())
+    }
+
+    /// v62.0.0 (wave G0) — the rows (held or concluded) whose last fold
+    /// evaluation read any of `read_keys` (`ceg_fold_reads`), distinct, in
+    /// row-id order. Empty by default.
+    async fn fold_dependents(
+        &self,
+        read_keys: &[String],
+    ) -> Result<Vec<edition2::names::RowId>, Error> {
+        let _ = read_keys;
+        Ok(Vec::new())
+    }
+
+    /// v62.0.0 (wave G0 v4) — the fold's whole record of one row, held or
+    /// concluded (`ceg_fold_state`): its first arrival, plane, slot and,
+    /// when held, why. `None` by default (no fold store).
+    async fn fold_state(
+        &self,
+        row_id: &edition2::names::RowId,
+    ) -> Result<Option<edition2::fold::FoldState>, Error> {
+        let _ = row_id;
+        Ok(None)
+    }
+
+    /// v62.0.0 (wave G0 v4) — the CONCLUDED rows of one projection slot
+    /// (`ceg_fold_state.slot`), in row-id order. Empty by default.
+    async fn fold_slot_rows(&self, slot: &str) -> Result<Vec<edition2::names::RowId>, Error> {
+        let _ = slot;
+        Ok(Vec::new())
+    }
+
+    /// v62.0.0 (wave G0 v4) — is any row left `refolding` (an interrupted
+    /// re-fold, repaired at open)? `false` by default.
+    async fn fold_any_refolding(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// v62.0.0 (wave G0 v4) — take one occurrence pair's current-state row
+    /// out of `federation_identity_occurrences` (its history stays): the
+    /// occurrence plane's un-project hook (`edition2::fold::Plane`). `false`
+    /// when none was there. A directory with no edition-2 store refuses.
+    async fn clear_occurrence_projection(
+        &self,
+        identity_key_id: &str,
+        occurrence_key_id: &str,
+    ) -> Result<bool, Error> {
+        let _ = (identity_key_id, occurrence_key_id);
+        Err(Error::Unsupported {
+            method: "clear_occurrence_projection",
+        })
+    }
+
+    /// v62.0.0 (wave G0) — re-ask the attestation plane's gates about a
+    /// CONCLUDED row, writing nothing: the plan
+    /// (`attestation_admit::plan_put_attestation`) without its held-re-offer
+    /// short-cut. `Ok` when every gate still admits it. The fold runs it
+    /// inside an attempt, so a gate that marks a fold condition un-concludes
+    /// the row ([`edition2::fold`]).
+    async fn recheck_attestation(&self, row: &Attestation) -> Result<(), Error> {
+        let _ = row;
+        Err(Error::Unsupported {
+            method: "recheck_attestation",
+        })
+    }
+
+    /// v62.0.0 (wave G0) — take a row the fold no longer concludes out of
+    /// `federation_attestations`: its helper-removed projections
+    /// ([`Self::purge_attestation_projections`]), then the row (FK-cascaded
+    /// projections follow). Its statements stay held in `ceg_statements`.
+    /// `false` when no row was there.
+    async fn unconclude_attestation(&self, attestation_id: &str) -> Result<bool, Error> {
+        let _ = attestation_id;
+        Err(Error::Unsupported {
+            method: "unconclude_attestation",
+        })
     }
 
     /// v62.0.0 (slice J0) — write an edition-2 key's read models
@@ -4018,49 +4287,8 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
-    /// v13.4.2 (CIRISPersist#394) — the **self-signed → accord-scrubbed
-    /// upgrade** primitive, dyn-dispatchable (like #375's
-    /// [`apply_replicated_key_record`](Self::apply_replicated_key_record)).
-    /// Unlike that method it has **no `owner_of` gate** — the accord scrub set
-    /// IS the authority — so it is the correct primitive for the genesis
-    /// canonical seed on a node that already holds its OWN self-signed row
-    /// (`genesis::seed_canonical_servers`). Re-runs `check_canonical_role_admission`
-    /// (the ≥2-distinct-anchor-scrub gate), so a `canonical` role is still only
-    /// conferred on a valid 2-of-3. Requires the row to already EXIST (an absent
-    /// row ⇒ `InvalidArgument` — use `put_public_key` to insert). The
-    /// sqlite/postgres backends override this to delegate to their inherent
-    /// method; the default here is for backends without the upgrade path.
-    async fn adopt_scrub_upgrade(
-        &self,
-        _record: SignedKeyRecord,
-    ) -> Result<register::AdoptScrubOutcome, Error> {
-        Err(Error::InvalidArgument(
-            "adopt_scrub_upgrade is not supported on this backend".to_owned(),
-        ))
-    }
-
     /// Fetch a single pubkey row by `key_id`. Returns `None` if absent.
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<KeyRecord>, Error>;
-
-    /// v19.1.0 (CIRISPersist#490) — the **authenticated re-anchor**: replace
-    /// an ALREADY-ANCHORED key row with a re-blessed record carried by a
-    /// quorum-verified [`genesis::GenesisBundle`]. The ONLY path that may
-    /// replace an anchored canonical. Every impl MUST re-verify the bundle
-    /// quorum INTERNALLY against this node's own roster + pinned keys
-    /// (`genesis::verify_bundle_quorum`) before writing — authority is
-    /// re-derived from own verified state, never accepted from the caller
-    /// (the #377 lesson). Identity guard (pubkey-identical) + anti-rollback
-    /// (`valid_from` strictly newer) are re-asserted at the write.
-    async fn adopt_genesis_reanchor(
-        &self,
-        record: SignedKeyRecord,
-        bundle: &genesis::GenesisBundle,
-    ) -> Result<(), Error> {
-        let _ = (record, bundle);
-        Err(Error::Unsupported {
-            method: "adopt_genesis_reanchor",
-        })
-    }
 
     /// Fetch all pubkey rows for a given identity. Used by the
     /// "all keys for primitive X" lookup the v0.2.x verify subsumption
@@ -5707,6 +5935,75 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
+    /// v62.0.0 (wave O1; CC 3.3.6, CC 3.3.6.4) — write an admitted
+    /// edition-2 `identity:occurrence` bind to the occurrence table, in one
+    /// transaction: the last-signed-wins upsert (strictly newer
+    /// `asserted_at` only, at a fresh serve position) with `attesting_key_id`
+    /// the landing author key, `signed_envelope` the bind's row id
+    /// ([`edition2::occurrence::OccurrenceBind::envelope`]) and `signature`
+    /// NULL (the statements are held in `ceg_statements`), and the V161
+    /// history row; then the route its transport binding projects and the
+    /// owner's epoch re-wrap, as the JSON door does. Storage only: every gate
+    /// is [`edition2::occurrence::put_occurrence_voice`]'s. Returns whether
+    /// the upsert took the record.
+    async fn put_identity_occurrence_edition2(
+        &self,
+        bind: edition2::occurrence::OccurrenceBind,
+    ) -> Result<bool, Error> {
+        let _ = bind;
+        Err(Error::Unsupported {
+            method: "put_identity_occurrence_edition2",
+        })
+    }
+
+    /// v62.0.0 (wave T2) — **store an edition-2 `delivery_receipt:{stream_id}`
+    /// statement's receipt** in `federation_stream_delivery_receipts`, through
+    /// the receipt door's JOIN and equivocation steps
+    /// (`blob_admit::put_delivery_receipt_edition2_planned`, shared with
+    /// `put_delivery_receipt`). The subscriber's signature is the edition-2
+    /// door's: the receipt's `signature` is the statement's composite, in its
+    /// two halves (`edition2::typed::delivery_receipt_of`). Storage and the
+    /// receipt store's own checks only; every edition-2 gate is
+    /// `edition2::typed`'s. Default `Unsupported`; the sqlite and postgres
+    /// backends (the ones with a receipt store) override.
+    async fn put_delivery_receipt_edition2(
+        &self,
+        receipt: stream_receipt::DeliveryReceipt,
+    ) -> Result<(), Error> {
+        let _ = receipt;
+        Err(Error::Unsupported {
+            method: "put_delivery_receipt_edition2",
+        })
+    }
+
+    /// v62.0.0 (wave T2; CC 3.2 T3, CC 4.4.3.34) — **write the v1.3 trust
+    /// plane's row for a key from its admitted `trust:accepts` edge**
+    /// (`edition2::typed::project_trust_for`): the same store the
+    /// `grant_trust` door ends in (`federation_keys.trusted_by` / `trust_*`).
+    /// `false` when the key has no `federation_keys` row. Storage only; the
+    /// edge was judged by the edition-2 door and the attestation gates.
+    /// Default `Unsupported`; sqlite and postgres override.
+    async fn store_projected_trust(&self, row: TrustRow) -> Result<bool, Error> {
+        let _ = row;
+        Err(Error::Unsupported {
+            method: "store_projected_trust",
+        })
+    }
+
+    /// v62.0.0 (wave T2) — expire `key`'s projected trust row at `at` (the
+    /// granter's `withdraws` of its `trust:accepts` edge): the store the
+    /// `revoke_trust` door ends in. Idempotent. Default `Unsupported`.
+    async fn retract_projected_trust(
+        &self,
+        key: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        let _ = (key, at);
+        Err(Error::Unsupported {
+            method: "retract_projected_trust",
+        })
+    }
+
     /// v3.12.0 — list every currently-stored occurrence of
     /// `identity_key_id`. The DEK-cascade fan-out path
     /// (#152 v3.13+): when a `cohort_scope: self` Contribution
@@ -6509,6 +6806,79 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (proposal_id, outcome, settled_at);
         Err(Error::Unsupported {
             method: "settle_self_roster_proposal",
+        })
+    }
+
+    /// v62.0.0 (wave O1, S1; CC 3.3.6.4) — note that THIS node holds the
+    /// edition-2 self-roster proposal `row_id_hex` (an `identity:occurrence`
+    /// bind awaiting the two paths) for `identity_key_id`, first seen at
+    /// `received_at`: the lone path's window starts there. First-seen wins;
+    /// returns the stored receipt. The table is `ceg_roster_proposals` (no
+    /// attestation row backs an edition-2 proposal).
+    async fn note_edition2_roster_proposal(
+        &self,
+        row_id_hex: &str,
+        identity_key_id: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<self_roster::SelfRosterReceipt, Error> {
+        let _ = (row_id_hex, identity_key_id, received_at);
+        Err(Error::Unsupported {
+            method: "note_edition2_roster_proposal",
+        })
+    }
+
+    /// v62.0.0 (wave O1, S1) — this node's OPEN edition-2 self-roster
+    /// receipts (of `identity_key_id`, or of every self), ordered
+    /// `(received_at, row_id)`.
+    async fn list_open_edition2_roster_proposals(
+        &self,
+        identity_key_id: Option<&str>,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        let _ = identity_key_id;
+        Err(Error::Unsupported {
+            method: "list_open_edition2_roster_proposals",
+        })
+    }
+
+    /// v62.0.0 (wave O1; I3640) — this node's receipt of the edition-2
+    /// self-roster proposal `row_id_hex`, open or settled; `None` when it
+    /// never held it. The genesis key's edition-2 eviction is read from a
+    /// settled one (`self_roster::genesis_evicted_at`).
+    async fn edition2_roster_proposal(
+        &self,
+        row_id_hex: &str,
+    ) -> Result<Option<self_roster::SelfRosterReceipt>, Error> {
+        let _ = row_id_hex;
+        Err(Error::Unsupported {
+            method: "edition2_roster_proposal",
+        })
+    }
+
+    /// v62.0.0 (wave O1; the CC 2.7 ruling) — this node's SETTLED edition-2
+    /// self-roster receipts of `identity_key_id`, ordered
+    /// `(settled_at, row_id)`: the landed roster rows a producer names the
+    /// latest of as its `refs.head`.
+    async fn list_settled_edition2_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        let _ = identity_key_id;
+        Err(Error::Unsupported {
+            method: "list_settled_edition2_roster_proposals",
+        })
+    }
+
+    /// v62.0.0 (wave O1, S1) — settle an open edition-2 self-roster
+    /// proposal. Write-once, as [`Self::settle_self_roster_proposal`].
+    async fn settle_edition2_roster_proposal(
+        &self,
+        row_id_hex: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        let _ = (row_id_hex, outcome, settled_at);
+        Err(Error::Unsupported {
+            method: "settle_edition2_roster_proposal",
         })
     }
 
@@ -7489,6 +7859,21 @@ pub trait FederationDirectory: Send + Sync {
             if principals.iter().any(|(id, _)| *id == io.identity_key_id) {
                 continue;
             }
+            // v62.0.0 (v62 P5c; CC rc21 3.3.6, `occurrence_binds_machine_to_person`)
+            // — a machine key (`node` / `agent`) is never a device of a
+            // person. Once the earlier form is shut, a held row binding one
+            // under a person's identity (an upgraded store's) resolves
+            // nothing: that node's human is its OWNER
+            // ([`admission::owner_of`]), never an occurrence of the person.
+            if !replication_audience::occurrence_counts(
+                self,
+                &io.identity_key_id,
+                occurrence_key_id,
+            )
+            .await?
+            {
+                continue;
+            }
             // #932 — consent or local trust, never the identity's word alone.
             let signed_for_pair: Vec<SignedIdentityOccurrence> = self
                 .list_signed_identity_occurrences_for(&io.identity_key_id)
@@ -7755,12 +8140,13 @@ pub trait FederationDirectory: Send + Sync {
                     .map(cohort::RosterMember::from)
                     .collect()
             }
-            cohort::Cohort::SelfId => self
-                .list_identity_occurrences_active(group_key_id)
-                .await?
-                .into_iter()
-                .map(cohort::RosterMember::from)
-                .collect(),
+            cohort::Cohort::SelfId => {
+                crate::federation::replication_audience::devices_of(self, group_key_id)
+                    .await?
+                    .into_iter()
+                    .map(cohort::RosterMember::from)
+                    .collect()
+            }
         })
     }
 
@@ -7952,18 +8338,44 @@ pub trait FederationDirectory: Send + Sync {
                 }
                 out
             }
-            cohort::Cohort::SelfId => self
-                .lookup_identity_for_occurrence(member_key_id)
-                .await?
-                .into_iter()
-                .map(|o| cohort::GroupRef {
-                    cohort: cohort::Cohort::SelfId,
-                    group_key_id: o.identity_key_id,
-                    name: None,
-                    consensus_protocol: None,
-                    founded_at: None,
-                })
-                .collect(),
+            // v62.0.0 (v62 P5c; CC rc21 3.3.6) — the self a key is in: the
+            // identity its occurrence row binds it under, when that row
+            // counts (never a machine key under a person once the earlier
+            // form is shut), else its OWNER's (a node or agent is the
+            // owner's device by its owner binding).
+            cohort::Cohort::SelfId => {
+                let counted = match self.lookup_identity_for_occurrence(member_key_id).await? {
+                    Some(o)
+                        if replication_audience::occurrence_counts(
+                            self,
+                            &o.identity_key_id,
+                            member_key_id,
+                        )
+                        .await? =>
+                    {
+                        Some(o.identity_key_id)
+                    }
+                    _ => None,
+                };
+                let identity = match counted {
+                    Some(i) => Some(i),
+                    None => match admission::owner_of(self, member_key_id).await {
+                        Ok(owner) => owner,
+                        Err(Error::AmbiguousNodeOwner { .. }) => None,
+                        Err(e) => return Err(e),
+                    },
+                };
+                identity
+                    .into_iter()
+                    .map(|i| cohort::GroupRef {
+                        cohort: cohort::Cohort::SelfId,
+                        group_key_id: i,
+                        name: None,
+                        consensus_protocol: None,
+                        founded_at: None,
+                    })
+                    .collect()
+            }
         })
     }
 
@@ -8285,6 +8697,45 @@ pub trait FederationDirectory: Send + Sync {
         cohort: cohort::Cohort,
         group_key_id: &str,
     ) -> Result<Vec<cohort::GroupVersion>, Error>;
+
+    /// v62.0.0 (kernel pass 2, K1, I2812; CC 2.7.8 "Two versions of one head
+    /// wait as tips") — the versions of a `family` / `community` /
+    /// `affiliations` group this node holds as TIPS beside its head
+    /// (`federation_group_tips`): offered versions whose `prev_head_digest`
+    /// did not name the held head, held rather than refused. Ascending by
+    /// `held_at`, then `persist_row_hash`. Empty for an unknown group or one
+    /// with no tip. [`Error::InvalidArgument`] for the `self` cohort.
+    /// Default = `Unsupported`; the sqlite and postgres backends override.
+    async fn list_group_tips(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::GroupTip>, Error> {
+        let _ = (cohort, group_key_id);
+        Err(Error::Unsupported {
+            method: "list_group_tips",
+        })
+    }
+
+    /// v62.0.0 (wave T1; CC 2.7.8 "until a version naming the tips makes one
+    /// head again") — **the tips a merge made one head with leave the tip
+    /// store**: delete the `federation_group_tips` rows of `group_key_id`
+    /// under `cohort` whose `persist_row_hash` is in `persist_row_hashes`.
+    /// Idempotent; a hash held as no tip is no change. Called by the
+    /// edition-2 roster door ([`edition2::group`]) after a merge version
+    /// became the head. Storage only. Default = `Unsupported`; the sqlite and
+    /// postgres backends override.
+    async fn drop_group_tips(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        persist_row_hashes: &[String],
+    ) -> Result<(), Error> {
+        let _ = (cohort, group_key_id, persist_row_hashes);
+        Err(Error::Unsupported {
+            method: "drop_group_tips",
+        })
+    }
 
     /// #249 Cut G2 (§3) — supersede a family with new content (a re-baselined
     /// roster and/or a new `consensus_protocol`) as a new version. Validates
@@ -8610,6 +9061,18 @@ pub trait FederationDirectory: Send + Sync {
         let bytes = ag::accord_family_signing_bytes(change_envelope)
             .map_err(|e| refuse(format!("canonicalize: {e}")))?;
         let mut signers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // v62.0.0 (wave T1) — an edition-2 roster version's quorum is its
+        // voices: the edition-2 door vouches for exactly this change envelope
+        // (`edition2::group::vouched_quorum_signers`), and each voice's
+        // statement was verified when it arrived. Counted only where the
+        // signer holds a prior seat, as a verified signature is below.
+        if let Some(vouched) = edition2::group::vouched_quorum_signers(change_envelope) {
+            for m in &prior_roster {
+                if vouched.contains(&m.member_id) {
+                    signers.insert(m.member_id.clone());
+                }
+            }
+        }
         for sig in signatures {
             let Some(member) = prior_roster.iter().find(|m| m.member_id == sig.member_id) else {
                 continue;
@@ -8664,9 +9127,12 @@ pub trait FederationDirectory: Send + Sync {
             }) {
                 consensus::Verdict::Admit => {}
                 consensus::Verdict::Insufficient { detail, .. } => {
+                    // v62.0.0 (wave T1) — short, not refused, for an edition-2
+                    // roster version: its voices are kept until they meet it.
+                    edition2::group::note_short();
                     return Err(refuse(format!(
                         "consensus_protocol not met ({direction:?}): {detail}"
-                    )))
+                    )));
                 }
                 consensus::Verdict::Unevaluable { reason } => {
                     return Err(refuse(format!(
@@ -8823,10 +9289,16 @@ pub trait FederationDirectory: Send + Sync {
             .lookup_family(&new.family.family_key_id)
             .await?
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "supersede: unknown family group {:?} (nothing to supersede)",
-                    new.family.family_key_id
-                ))
+                // v62.0.0 (CC 2.7) — the group is not held (yet): the wait
+                // the executor's verdict answers for the same fact
+                // (`group_supersede_admit::unheld_group`).
+                Error::link_not_held(
+                    "family",
+                    format!(
+                        "supersede: family group {:?} is unheld here (nothing to supersede yet)",
+                        new.family.family_key_id
+                    ),
+                )
             })?;
         // v49.0.0 (#910.5) — the entrenchment the record stores is the one the
         // quorum signed, and an entrenched family stays entrenched (the same
@@ -8866,8 +9338,14 @@ pub trait FederationDirectory: Send + Sync {
         });
         // v49.0.0 (#910.5) — the record carries what authorized it, so a
         // peer can apply it against ITS OWN prior version and roster.
+        // v62.0.0 (kernel pass 2, K1) — the proof names the version the
+        // record names (`prev_head_digest`), so a version naming another than
+        // the held head is a tip, not a proof contradicting its own record.
         new.supersede_proof = Some(types::GroupSupersedeProof {
-            prior_persist_row_hash: prior.persist_row_hash,
+            prior_persist_row_hash: proof_prior(
+                &new.family.prev_head_digest,
+                prior.persist_row_hash,
+            ),
             change_envelope,
             quorum_signatures: signatures,
         });
@@ -8917,11 +9395,13 @@ pub trait FederationDirectory: Send + Sync {
         });
         // v49.0.0 (#910.5) — see [`Self::supersede_family_with_quorum`].
         new.supersede_proof = Some(types::GroupSupersedeProof {
-            prior_persist_row_hash: self
-                .lookup_community(&new.community.community_key_id)
-                .await?
-                .map(|c| c.persist_row_hash)
-                .unwrap_or_default(),
+            prior_persist_row_hash: proof_prior(
+                &new.community.prev_head_digest,
+                self.lookup_community(&new.community.community_key_id)
+                    .await?
+                    .map(|c| c.persist_row_hash)
+                    .unwrap_or_default(),
+            ),
             change_envelope,
             quorum_signatures: signatures,
         });
@@ -8970,11 +9450,13 @@ pub trait FederationDirectory: Send + Sync {
         });
         // v49.0.0 (#910.5) — see [`Self::supersede_family_with_quorum`].
         new.supersede_proof = Some(types::GroupSupersedeProof {
-            prior_persist_row_hash: self
-                .lookup_community(&new.community.community_key_id)
-                .await?
-                .map(|c| c.persist_row_hash)
-                .unwrap_or_default(),
+            prior_persist_row_hash: proof_prior(
+                &new.community.prev_head_digest,
+                self.lookup_community(&new.community.community_key_id)
+                    .await?
+                    .map(|c| c.persist_row_hash)
+                    .unwrap_or_default(),
+            ),
             change_envelope,
             quorum_signatures: signatures,
         });
@@ -9941,6 +10423,11 @@ pub trait FederationDirectory: Send + Sync {
     /// floor for `(target_key_id, target_kind)`; `None` if it was never
     /// touched. Default impl errors; the three backends override.
     ///
+    /// v62.0.0 (v62 P5b) — the earlier form's read: it returns the floor
+    /// only while a SIGNED claim set it, and `None` once a node-local touch
+    /// ([`Self::put_touch_claim_local`]) holds it. The floor itself is
+    /// [`Self::freshness_floor`]; this read goes with the signed door.
+    ///
     /// **Privacy note (mandatory — see [`freshness`]'s module docs):** the
     /// returned claim carries a `cohort_scope`. A consumer MUST apply the
     /// same cohort/consent gating persist applies to any other
@@ -9959,6 +10446,54 @@ pub trait FederationDirectory: Send + Sync {
         Err(Error::Backend(
             "lookup_freshness_floor not implemented for this backend".into(),
         ))
+    }
+
+    /// v62.0.0 (v62 P5b; RULINGS "a touch claim is node-local";
+    /// CC_FAMILYMAP_ANSWER: the floor is a NODE-LOCAL fold, and the
+    /// `witness_touch` / `n_of_m` forms are gone) — **this node records a
+    /// touch on `(target_key_id, target_kind)`'s freshness floor.** Unsigned:
+    /// the node is the only author of its own floor, and the floor never
+    /// crosses the mesh. The rules the signed [`Self::put_touch_claim`]
+    /// enforced on the floor stand: **monotonic max** (an equal or older
+    /// `fresh_as_of` is [`freshness::TouchApplyOutcome::NotFresher`] and
+    /// writes nothing; a strictly newer one is
+    /// [`freshness::TouchApplyOutcome::Advanced`]), the **future-skew guard**
+    /// ([`admission::check_touch_fresh_as_of_skew`] at
+    /// [`admission::DEFAULT_MAX_TOUCH_SKEW`], refused
+    /// [`Error::InvalidArgument`]), and the **mandatory `cohort_scope`**
+    /// ([`admission::check_cohort_scope`], refused
+    /// [`Error::CohortScopeRejected`]). Both writes merge into the one floor
+    /// per target. Read it back with [`Self::freshness_floor`]. Default impl
+    /// refuses `Unsupported`; both backends override.
+    async fn put_touch_claim_local(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+        fresh_as_of: chrono::DateTime<chrono::Utc>,
+        cohort_scope: &str,
+    ) -> Result<freshness::TouchApplyOutcome, Error> {
+        let _ = (target_key_id, target_kind, fresh_as_of, cohort_scope);
+        Err(Error::Unsupported {
+            method: "put_touch_claim_local",
+        })
+    }
+
+    /// v62.0.0 (v62 P5b) — **the freshness floor this node holds** for
+    /// `(target_key_id, target_kind)`, whichever write set it (the node-local
+    /// [`Self::put_touch_claim_local`] or the earlier-form signed
+    /// [`Self::put_touch_claim`]); `None` if never touched. The fields the
+    /// floor's fold reads ([`types::FreshnessFloor`]). The privacy note on
+    /// [`Self::lookup_freshness_floor`] applies unchanged. Default impl
+    /// refuses `Unsupported`; both backends override.
+    async fn freshness_floor(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+    ) -> Result<Option<types::FreshnessFloor>, Error> {
+        let _ = (target_key_id, target_kind);
+        Err(Error::Unsupported {
+            method: "freshness_floor",
+        })
     }
 
     // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
@@ -12570,31 +13105,6 @@ pub enum Error {
         detail: String,
     },
 
-    /// v54.0.0 (CIRISPersist#1031, CC 4.1.1 — the anti-pattern table's
-    /// "Cycles (A → B → A)" row: "Substrate MUST detect cycles on the
-    /// `delegates_to` graph and reject the cycle-closing emission"). A
-    /// `delegates_to(attesting → attested)` was REFUSED because `attested`
-    /// already reaches `attesting` through live `delegates_to` edges within the
-    /// absolute depth ceiling, so storing it would close a cycle between
-    /// distinct keys. A self-edge is the root charter's self-declaration and is
-    /// not refused. The row is not stored (verify-before-mutation, AV-9). Stable
-    /// `kind()` token `federation_delegation_cycle`. See
-    /// [`admission::check_delegation_cycle_admission`].
-    #[error(
-        "delegates_to {attesting_key_id:?} -> {attested_key_id:?} closes a delegation cycle: \
-         {attested_key_id:?} already reaches {attesting_key_id:?} through {hops} live \
-         delegates_to hop(s) (CC 4.1.1 — the cycle-closing emission is refused)"
-    )]
-    DelegationCycle {
-        /// The refused edge's granter (`attesting_key_id`).
-        attesting_key_id: String,
-        /// The refused edge's recipient (`attested_key_id`).
-        attested_key_id: String,
-        /// Length of the existing path `attested → … → attesting` that this
-        /// edge would close (at least 1).
-        hops: usize,
-    },
-
     /// v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C, CIRISConstitution#163)
     /// — a term-bearing `delegates_to` was REFUSED because its signed term is
     /// missing, unreadable, or longer than the bound that governs it. A
@@ -12623,34 +13133,12 @@ pub enum Error {
         detail: String,
     },
 
-    /// v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a **second,
-    /// distinct-owner** node owner-binding was REJECTED: the node already
-    /// carries a LIVE owner-binding from `incumbent_owner`, and a node has at
-    /// most ONE responsible steward (the `self` cohort boundary is undefined
-    /// otherwise). The incumbent must first `withdraws`/`recants` (or the
-    /// binding must lapse) before a different owner can bind. A refresh by the
-    /// SAME owner is idempotently admitted. The row is NOT stored (verify-
-    /// before-mutation, AV-9). Stable `kind()` token
-    /// `federation_node_already_owned`. See
-    /// [`admission::check_single_node_owner_admission`] / [`admission::owner_of`].
-    #[error(
-        "node {node_key_id:?} is already owner-bound by {incumbent_owner:?}; a node has \
-         at most one responsible steward (CC 1.13.3.3 / CC 3.2) — {attempted_owner:?} may \
-         not bind until the incumbent withdraws/recants or the binding lapses"
-    )]
-    NodeAlreadyOwned {
-        /// The node whose ownership is already claimed.
-        node_key_id: String,
-        /// The live incumbent owner (a different `user`-role granter).
-        incumbent_owner: String,
-        /// The rejected would-be owner (the incoming `attesting_key_id`).
-        attempted_owner: String,
-    },
-
     /// v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — [`admission::owner_of`]
-    /// found **more than one** distinct live owner for a node (a pre-gate
-    /// anomaly; [`admission::check_single_node_owner_admission`] prevents new
-    /// occurrences). This is a READ-path fail-closed signal: an ambiguous owner
+    /// found **more than one** distinct counted owner for a node. v62.0.0
+    /// (kernel pass 2, C557): no gate refuses a second owner's binding; two
+    /// bindings the node cosigned for two selves are both held and the
+    /// kernel's owner seat reads the node as unowned. This is a READ-path
+    /// fail-closed signal: an ambiguous owner
     /// is NOT a resolvable `self` boundary, so consumers MUST refuse rather than
     /// silently pick one. Stable `kind()` token `federation_ambiguous_node_owner`.
     #[error(
@@ -13446,6 +13934,58 @@ pub enum Error {
         /// The typed detail, a JSON object.
         body: serde_json::Value,
     },
+
+    /// v62.0.0 (CC 2.7) — **a row this one names is not held here yet.** A
+    /// store step found that a row the write references (the signer's or
+    /// subject's key record, the family or community a membership names, the
+    /// attestation a plane row points at) is not in this node's store: the
+    /// database's foreign key refused the insert. Under CC 2.7 a link that is
+    /// not held answers WAITING, never a refusal: nothing is stored, and the
+    /// same row is admitted when it is re-offered after the named row lands.
+    /// **Retryable** ([`Error::is_wait`]), the #858 ordering-gap class beside
+    /// [`Error::AttesterKeyUnknown`].
+    ///
+    /// Both backends answer it for the same fact: sqlite from its
+    /// `FOREIGN KEY constraint failed` error, postgres from SQLSTATE 23503
+    /// (`foreign_key_violation`) read off the database error, never from
+    /// `Display` text (tokio-postgres renders a database error as `db error`).
+    /// Before v62 the sqlite arm answered `federation_invalid_argument`
+    /// (terminal) and five postgres arms could never fire, so the same fact
+    /// reached a pg host as `federation_backend`. Stable `kind()` token
+    /// `federation_link_not_held`; Python `ciris_persist.Waiting`, a
+    /// `ValueError` subclass: the type of the sqlite arm it replaces.
+    #[error(
+        "{plane}: a row this write names is not held on this node yet — an ordering gap, not a \
+         refusal; re-offer the row after the row it names lands ({detail})"
+    )]
+    LinkNotHeld {
+        /// The store step whose foreign key refused: `attestation`,
+        /// `local_attestation`, `key_plane`, `identity_occurrence`, `family`,
+        /// `community`, `revocation`, or a revocation/widening plane name.
+        plane: &'static str,
+        /// The database's own account (constraint, table, detail).
+        detail: String,
+    },
+
+    /// v62.0.0 — **an error relayed across the directory capsule.** The host
+    /// side of [`crate::ffi::directory_capsule`] answers a failed op with the
+    /// error's stable `kind()` token, its [`Error::is_wait`] reading and its
+    /// text; the consumer's proxy rebuilds it as this variant, so the kind
+    /// and the wait survive the C-ABI (before v62 every failure crossing it
+    /// became [`Error::Backend`], a retryable ordering gap indistinguishable
+    /// from a database outage). A relayed `federation_backend` is rebuilt as
+    /// [`Error::Backend`] itself, so every predicate that reads that arm
+    /// ([`Error::is_duplicate_key`]) reads it as before. [`Error::kind`]
+    /// answers `kind`; [`Error::is_wait`] answers `wait`.
+    #[error("{message}")]
+    Relayed {
+        /// The host error's stable `kind()` token (interned: a closed set).
+        kind: &'static str,
+        /// The host's [`Error::is_wait`] reading.
+        wait: bool,
+        /// The host error's text.
+        message: String,
+    },
 }
 
 /// v59.0.0 (CIRISPersist#1099, CIRISEdge) — why a signer does not act for an
@@ -13611,30 +14151,37 @@ pub mod malformed_row {
     /// node's or agent's, or outside `[asserted_at, asserted_at +
     /// key_record_max_secs]`. CC's own token.
     pub const KEY_RECORD_OUT_OF_WINDOW: &str = "key_record_out_of_window";
-    /// v62.0.0 (slice E2a; CC 2.6.1.11, the settled bundle/2 rule) — the
-    /// bundle's own fault, with a reason in the message: `version_prev_mismatch`
-    /// (`version` 1 if and only if no prev; prev's plus one), `iat_mismatch`
-    /// (each statement's `iat` is ⌊asserted_at / 1000⌋, and required),
-    /// `holders_seats_overlap`, `members_missing`.
+    /// v62.0.0 (CC 2.6.1.11; CIRISVerify 23.3.0's bundle reader) — the
+    /// bundle's payload is malformed, which is final. The message leads with
+    /// Verify's reason (`Malformed::reason`): `genesis_bundle_schema`,
+    /// `version_prev_mismatch`, `holders_seats_overlap`,
+    /// `recovery_commitments_not_holders`, `scope_missing_infra`,
+    /// `family_key_id_changed`, the recovery reasons, ...; or `no_voice` when
+    /// no `ceg-genesis-bundle/2` voice is offered.
     pub const GENESIS_BUNDLE_MALFORMED: &str = "genesis_bundle_malformed";
-    /// v62.0.0 (slice E2a; CC 5.3.4) — the count is not met: the fresh genesis
-    /// needs every holder, a later bundle a strict majority of its
-    /// predecessor's holders and every holder it adds or re-commits. The
-    /// bundle concludes nothing yet; it is held, never a final refusal.
+    /// v62.0.0 (CC 2.6.1.11, CC 4.2.6) — the count is not met: the first
+    /// bundle needs every holder; a later bundle a strict majority of its
+    /// predecessor's holders and every holder it adds or re-commits; a
+    /// recovery its one statement under the committed recovery key. The
+    /// bundle concludes nothing; nothing of it is stored.
     pub const GENESIS_BUNDLE_COUNT_UNMET: &str = "genesis_bundle_count_unmet";
-    /// v62.0.0 (slice E2a; CC 5.3.4) — the bundle's object id is not this
-    /// reader's pin: it roots nothing here (another reader may pin it).
-    pub const GENESIS_BUNDLE_NOT_PINNED: &str = "genesis_bundle_not_pinned";
-    /// v62.0.0 (slice E2a; CC 3.3.6.2) — a seat's binding is not the seat's
-    /// own, or does not carry both X-Wing keys (`transit_xwing_pubkey`,
-    /// `onion_hop_xwing_pubkey`, 1216 bytes each) with distinct halves, or
-    /// carries the v1 `transit_kex_pubkeys` pair.
-    pub const GENESIS_BUNDLE_SEAT_BINDING: &str = "genesis_bundle_seat_binding";
-    /// v62.0.0 (slice E2a) — the genesis door's placement waits on
-    /// CIRISVerify's bundle reader (its verdict yields the placement: the
-    /// holders, each seat with its two X-Wing keys). Until it ships, the door
-    /// refuses by this name and stores nothing. Not a fault of the bundle.
-    pub const GENESIS_BUNDLE_READER_UNAVAILABLE: &str = "genesis_bundle_reader_unavailable";
+    /// v62.0.0 (CC 5.3.4) — a first bundle this node's anchor does not root
+    /// (or no anchor was given): it roots nothing here. Verify's token.
+    pub const GENESIS_BUNDLE_NOT_ANCHORED: &str = "genesis_bundle_not_anchored";
+    /// v62.0.0 (CC 2.6.1.11) — the bundle's predecessor is held and not
+    /// Valid. Verify's token.
+    pub const GENESIS_BUNDLE_PREV_NOT_VALID: &str = "genesis_bundle_prev_not_valid";
+    /// v62.0.0 (CC 2.6.1.11) — a named row with no place, two rows for one
+    /// place, or a party with no row. Verify's token.
+    pub const GENESIS_BUNDLE_ROW_UNPLACED: &str = "genesis_bundle_row_unplaced";
+    /// v62.0.0 (CC 2.6.1.11, CC 3.3.6.2) — a named row is Invalid or breaks
+    /// its place's rule (the message leads with Verify's detail: `row_signer`,
+    /// `seat_record_ended`, `binding_xwing_member`, ...). Verify's token.
+    pub const GENESIS_BUNDLE_ROW_INVALID: &str = "genesis_bundle_row_invalid";
+    /// v62.0.0 (CC 4.2.2.1) — a holder fails the custody gate (the message
+    /// leads with Verify's detail: `custody_chain_invalid`, ...). Verify's
+    /// token.
+    pub const GENESIS_HOLDER_CUSTODY: &str = "genesis_holder_custody";
     /// v62.0.0 (slice J0; CC 2.6.1.12) — an earlier-form verification (a
     /// JSON row, a JSON key registration, a plane object signed over its JCS
     /// image) whose signer is an edition-2 key: its `federation_keys` row is
@@ -13645,8 +14192,9 @@ pub mod malformed_row {
     /// v62.0.0 (JSON-cut slice A; CC 2.6.1.7, CC-READING(next-edition)) — the
     /// key a statement's `kid` resolves to is not a key of its `iss`: no
     /// held record of the key reaches `iss`'s genesis key through rotations
-    /// (`federation::edition2::liveness::KeyOwnership`). The same token
-    /// CIRISVerify's reader uses.
+    /// (`federation::edition2::liveness::HeldKeys::key_of`, which answers
+    /// CIRISVerify 23.3.0's `KeyDirectory::key_of`). The same token
+    /// CIRISVerify's reader uses (`Invalid::KidNotOfIss`).
     pub const KID_NOT_OF_ISS: &str = "kid_not_of_iss";
     /// v62.0.0 (JSON-cut slice A; CC 2.6.1, CC-READING(next-edition)) — an
     /// edition-2 payload of a mapped family breaks its member list
@@ -13671,6 +14219,79 @@ pub mod malformed_row {
     /// the family of the row its `refs.target` names: a composer carries
     /// its target's family.
     pub const COMPOSER_FAMILY_MISMATCH: &str = "composer_family_mismatch";
+    /// v62.0.0 (kernel pass 2, K1; CC ruling, half-open windows) — a row or
+    /// object that states `valid_until` at or before its own `asserted_at`:
+    /// its window `[asserted_at, valid_until)` covers no instant. Read from
+    /// the statement alone, at the edition-2 door
+    /// (`edition2::door::check_valid_until_after_asserted_at`).
+    pub const VALID_UNTIL_NOT_AFTER_ASSERTED_AT: &str = "valid_until_not_after_asserted_at";
+    /// v62.0.0 (wave P1e; CC rc21 CC 2.7.11, the verifier's token) — an
+    /// `admission:unit` row whose `author` and `refs.head` are both present
+    /// or both absent (authored XOR counted), or whose `sub` is not its
+    /// unit's digest (`canonical:sha256:{hex}`).
+    pub const ADMISSION_UNIT_MALFORMED: &str = "admission_unit_malformed";
+    /// v62.0.0 (wave P1e; CC 2.7.11) — empty `capabilities`, or one outside
+    /// the closed set.
+    pub const ADMISSION_CAPABILITY_UNKNOWN: &str = "admission_capability_unknown";
+    /// v62.0.0 (wave P1e; CC 2.7.11) — `valid_until <= asserted_at`, or
+    /// beyond `unit_lease_max_secs` after it.
+    pub const ADMISSION_LEASE_OUT_OF_WINDOW: &str = "admission_lease_out_of_window";
+    /// v62.0.0 (wave P1e; CC 2.7.11) — an authored row names an effect
+    /// capability: an effect needs a count.
+    pub const ADMISSION_EFFECT_NEEDS_COUNT: &str = "admission_effect_needs_count";
+    /// v62.0.0 (wave P1e; CC 2.7.11) — a signer whose key record's
+    /// `identity_type` holds neither `user` nor `accord_holder`.
+    pub const ADMISSION_ISSUER_NOT_PERSON: &str = "admission_issuer_not_person";
+    /// v62.0.0 (wave O1; CC 3.3.6, the rc21 second voice) — a statement over
+    /// an `identity:occurrence` row in the occurrence key's role (`iss` =
+    /// `sub` = `occurrence_key_id`) not signed by that key itself: it proves
+    /// no possession of the key the bind names.
+    pub const OCCURRENCE_VOICE_NOT_OWN_KEY: &str = "occurrence_voice_not_own_key";
+    /// v62.0.0 (wave O1; CC 4.2.6) — an edition-2 statement whose signing
+    /// key is a recovery key a held genesis bundle commits to (committed or
+    /// spent), matched by its public key material: a recovery key signs no
+    /// row, only its bundle's recovery voice
+    /// (`federation::edition2::recovery_signer`). Final, never a wait.
+    pub const RECOVERY_KEY_IS_NOT_A_SIGNER: &str = "recovery_key_is_not_a_signer";
+    /// v62.0.0 (wave O1; CC 3.3.6 as corrected for rc21) — an
+    /// `identity:occurrence` under a person's identity (`user` /
+    /// `accord_holder`) whose occurrence key is a `node` / `agent` key, or
+    /// whose `device_class` is `agent`: an occurrence never binds a machine
+    /// to a person; an agent's occurrence binds the agent's own identity.
+    pub const OCCURRENCE_BINDS_MACHINE_TO_PERSON: &str = "occurrence_binds_machine_to_person";
+    /// v62.0.0 (wave O1; CC 3.3.6, CC 3.2) — an `identity:occurrence` of an
+    /// agent identity with no live owner binding
+    /// (`ownership:{relation}:agent:{version}`,
+    /// `admission::agent_owner_of`): an agent's occurrence is authored by its
+    /// owner, and there is none.
+    pub const AGENT_OCCURRENCE_UNOWNED: &str = "agent_occurrence_unowned";
+    /// v62.0.0 (wave O1; CC 3.3.6) — an agent identity's `identity:occurrence`
+    /// whose `author` is not the agent's owner (the agent itself, or another
+    /// identity): "the author is the owner's roster key, plus the agent key's
+    /// own statement".
+    pub const AGENT_OCCURRENCE_NOT_OWNER_AUTHORED: &str = "agent_occurrence_not_owner_authored";
+    /// v62.0.0 (wave O1, S1b; CC 3.3.6.4) — a composer of the
+    /// `identity:occurrence` family that is not the proposer's own `withdraws`
+    /// of an open edition-2 self-roster proposal (another signer, a proposal
+    /// not open here, a `recants` / `supersedes`, or no `refs.target`).
+    pub const OCCURRENCE_WITHDRAWS_NOT_PROPOSER: &str = "occurrence_withdraws_not_proposer";
+    /// v62.0.0 (wave W1; CC 3.4.7, the enforcement row of
+    /// `transport:canonical_rebind`) — a voice of a reserved family signed
+    /// by a party the family's rule does not seat: a re-bind voice whose
+    /// signer is not a holder of the genesis bundle in force at its placed
+    /// key, or a re-bind about an identity that is not a seat of it
+    /// (`federation::edition2::transport_rebind`).
+    pub const RESERVED_FAMILY_UNSEATED: &str = "reserved_family_unseated";
+    /// v62.0.0 (wave V1b; CC 2.4.1.1, CLM-licence-contest) — the group's
+    /// counted withdrawal of a counted `licensure:{authority}` row whose
+    /// voices are short of the authority community's `consensus_protocol`
+    /// over the roster head it names. At the edition-2 door it is never seen:
+    /// the withdrawal waits (`Pending`).
+    pub const LICENCE_WITHDRAWAL_SHORT: &str = "licence_withdrawal_short";
+    /// v62.0.0 (wave V1b; CC 2.4.1.1) — a counted withdrawal of a counted
+    /// licence that names no `refs.head`: counted over no roster version, it
+    /// can never land. Terminal.
+    pub const LICENCE_WITHDRAWAL_NO_HEAD: &str = "licence_withdrawal_no_head";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -13709,9 +14330,11 @@ pub mod malformed_row {
         KEY_RECORD_OUT_OF_WINDOW,
         GENESIS_BUNDLE_MALFORMED,
         GENESIS_BUNDLE_COUNT_UNMET,
-        GENESIS_BUNDLE_NOT_PINNED,
-        GENESIS_BUNDLE_SEAT_BINDING,
-        GENESIS_BUNDLE_READER_UNAVAILABLE,
+        GENESIS_BUNDLE_NOT_ANCHORED,
+        GENESIS_BUNDLE_PREV_NOT_VALID,
+        GENESIS_BUNDLE_ROW_UNPLACED,
+        GENESIS_BUNDLE_ROW_INVALID,
+        GENESIS_HOLDER_CUSTODY,
         EARLIER_FORM_SIGNER_IS_EDITION2,
         KID_NOT_OF_ISS,
         EDITION2_PAYLOAD_INVALID,
@@ -13719,6 +14342,24 @@ pub mod malformed_row {
         ACCORD_INVOCATION_INVALID,
         ACCORD_INVOCATION_REPLAYED,
         COMPOSER_FAMILY_MISMATCH,
+        // v62.0.0 (kernel pass 2, K1) — appended.
+        VALID_UNTIL_NOT_AFTER_ASSERTED_AT,
+        ADMISSION_UNIT_MALFORMED,
+        ADMISSION_CAPABILITY_UNKNOWN,
+        ADMISSION_LEASE_OUT_OF_WINDOW,
+        ADMISSION_EFFECT_NEEDS_COUNT,
+        ADMISSION_ISSUER_NOT_PERSON,
+        OCCURRENCE_VOICE_NOT_OWN_KEY,
+        RECOVERY_KEY_IS_NOT_A_SIGNER,
+        OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+        AGENT_OCCURRENCE_UNOWNED,
+        AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
+        OCCURRENCE_WITHDRAWS_NOT_PROPOSER,
+        // v62.0.0 (wave W1) — appended.
+        RESERVED_FAMILY_UNSEATED,
+        // v62.0.0 (wave V1b) — appended.
+        LICENCE_WITHDRAWAL_SHORT,
+        LICENCE_WITHDRAWAL_NO_HEAD,
     ];
 }
 
@@ -13865,8 +14506,6 @@ impl Error {
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
-            Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
-            Error::DelegationCycle { .. } => "federation_delegation_cycle",
             Error::DelegationTermRequired { .. } => "federation_delegation_term_required",
             Error::AffiliationCohortMismatch { .. } => "federation_affiliation_cohort_mismatch",
             Error::AffiliationConfigInvalid { .. } => "federation_affiliation_config_invalid",
@@ -13916,6 +14555,84 @@ impl Error {
             Error::PoolExhausted { .. } => "federation_pool_exhausted",
             Error::Unsupported { .. } => "federation_ops_proxy_unsupported",
             Error::PurgeRefused { token, .. } => token,
+            Error::LinkNotHeld { .. } => "federation_link_not_held",
+            Error::Relayed { kind, .. } => kind,
+        }
+    }
+
+    /// v62.0.0 (CC 2.7) — **does this error say WAIT?** The ONE
+    /// classification of a refusal as an ordering gap: something the answer
+    /// depends on (a key record, a named row, a roster's protocol, a
+    /// delegation edge) is not held on this node yet, nothing was stored, and
+    /// the same row re-offered after it lands can be admitted. Every surface
+    /// reads it, never its own list: the directory capsule carries it across
+    /// the C-ABI ([`crate::ffi::directory_capsule::CapsuleError`]), the
+    /// edition-2 HTTP door answers `424` with `retryable: true` for it, and
+    /// the Python mapper raises `ciris_persist.Waiting` (a `ValueError`
+    /// subclass) with `retryable = True` and `kind` attributes.
+    ///
+    /// A `false` answer is a terminal refusal, a local resource or capability
+    /// fault, or a substrate failure; [`Error::Backend`] stays `false` here
+    /// (a host retries an outage on its own policy, not as an ordering gap).
+    /// [`Error::NoActorSignature`] is `false`: the row waits for its actor,
+    /// but re-offering the same call cannot change the answer (the caller
+    /// must come back WITH the actor), and its Python type is `RuntimeError`.
+    /// [`Error::NoConstitutionalRootYet`] is `false`: the remedy is a local
+    /// genesis ceremony, not a row that replication delivers.
+    #[must_use]
+    pub fn is_wait(&self) -> bool {
+        match self {
+            Error::AttesterKeyUnknown { .. }
+            | Error::WithdrawsTargetUnheld { .. }
+            | Error::RosterChangeNotLanded { .. }
+            | Error::LicensureShortOfAuthorityQuorum { .. }
+            | Error::LinkNotHeld { .. } => true,
+            Error::SignerDoesNotActFor { reason, .. } => reason.is_retryable(),
+            // A HELD proposal (`pending`) lands by itself; any other decision
+            // is a two-path refusal token.
+            Error::SelfRosterNotLanded { decision, .. } => *decision == "pending",
+            Error::WriteScopeRefused(reason) => {
+                matches!(
+                    reason,
+                    crate::scope::ScopeRefusalReason::MembershipUnresolved
+                )
+            }
+            Error::LocationAuthorityUnauthorized { rule, .. } => {
+                *rule == tier_ingest::LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE
+            }
+            Error::RosterAuthorityUnauthorized { rule, .. } => {
+                *rule == ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED
+            }
+            Error::MembershipAcceptanceRefused { rule, .. } => {
+                membership_acceptance::is_retryable_rule(rule)
+            }
+            Error::KeyGrantRefused { reason, .. } => {
+                key_grant::KeyGrantRefusalReason::from_token(reason)
+                    .is_some_and(key_grant::KeyGrantRefusalReason::is_retryable)
+            }
+            Error::DimensionRejected { reason, .. } => {
+                admission::dimension_rejected_reason::is_retryable(reason) == Some(true)
+            }
+            Error::PurgeRefused { token, body } => {
+                *token == steward_purge::token::UNAUTHORISED
+                    && body
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(steward_purge::unauthorised_reason::is_retryable)
+            }
+            Error::Relayed { wait, .. } => *wait,
+            _ => false,
+        }
+    }
+
+    /// v62.0.0 (CC 2.7) — the one constructor of [`Error::LinkNotHeld`]:
+    /// a store step's foreign key refused, so a row this write names is not
+    /// held yet. Both backends call it with the same `plane` for the same
+    /// store step.
+    pub(crate) fn link_not_held(plane: &'static str, detail: impl Into<String>) -> Self {
+        Error::LinkNotHeld {
+            plane,
+            detail: detail.into(),
         }
     }
 

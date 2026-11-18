@@ -7,24 +7,34 @@
 //! 1. **Form** ([`input_form`]). Bytes that are not a tag-18 `COSE_Sign1` are
 //!    refused [`token::EARLIER_FORM_OBJECT`]. That covers a JSON object of the
 //!    earlier form, and bytes in no form. Nothing is parsed for standing.
+//!    v62.0.0 (wave P1c) — then **the size**: a statement over
+//!    [`MAX_STATEMENT_BYTES`] is refused `federation_envelope_too_large`.
+//!    Steps 1 and 2 are [`pure_statement_gates`]: a pure function of the
+//!    bytes, which every door runs BEFORE its first directory read (the
+//!    signer's key plane, a roster), as the JSON doors run their pure tier
+//!    (AV-76). A statement that can never be admitted buys no read.
 //! 2. **Edition-1 row-refs.** A `row-ref` of edition 1 anywhere in `refs` is
 //!    refused [`token::ROW_REF_EDITION_1`]. This is structural, so the
-//!    answer does not depend on which keys are held. Verify's reader admits
-//!    both editions of a row-ref; the refusal is persist's (CC 2.6.1.3).
+//!    answer does not depend on which keys are held. Since CIRISVerify 23.3.0
+//!    Verify's reader refuses one too (as a malformed member); persist
+//!    names it first, by its own token (CC 2.6.1.3).
 //! 3. **Statement and family.** CIRISVerify's `verify_row_in_family_with` runs
 //!    under CC's vendored family model. Invalid is
 //!    [`token::STATEMENT_INVALID`] or [`token::FAMILY_INVALID`], and final.
 //!    Waiting is the retryable `federation_attester_key_unknown`, naming the
 //!    deepest missing key.
-//!    Then **the key is of the identity** (v62.0.0, JSON-cut slice A, I2101;
-//!    CC 2.6.1.7, CC-READING(next-edition)). `iss` names the signer's
-//!    identity, the identity-ref of its genesis key; `kid` names the key
-//!    that signed. The key `kid` resolves to must be a key OF `iss`: `iss`
-//!    is `kid`'s own identity-ref, or a held record of `kid` reaches `iss`'s
-//!    genesis record through rotations
-//!    ([`super::liveness::KeyOwnership`]). A key whose records are of
-//!    another identity is refused [`token::KID_NOT_OF_ISS`]; a missing link
-//!    waits (the retryable `federation_attester_key_unknown`, naming it).
+//!    **The key is of the identity** (v62.0.0, JSON-cut slice A, I2101;
+//!    CC 2.6.1.7). `iss` names the signer's identity, the identity-ref of
+//!    its genesis key; `kid` names the key that signed. The key `kid`
+//!    resolves to must be a key OF `iss`: `iss` is `kid`'s own identity-ref,
+//!    or a held record of `kid` reaches `iss`'s genesis record through
+//!    rotations. Since CIRISVerify 23.3.0 (slice C3) Verify's reader asks
+//!    this itself, through the directory's `KeyDirectory::key_of`
+//!    (persist's [`super::liveness::HeldKeys::key_of`]): its
+//!    `Invalid::KidNotOfIss` is refused [`token::KID_NOT_OF_ISS`], and a
+//!    missing link waits (the retryable `federation_attester_key_unknown`,
+//!    naming it). [`require_key_of_iss`] asks the same directory again
+//!    after the verdict (one answer; the objects' readers call it too).
 //! 4. **The row id, computed here.** SHA-256 over
 //!    `CDE(["CEG-row/2", type, family, sub, author, payload])`, taken over the
 //!    payload bytes as received. It must equal the reader's own id for the
@@ -45,9 +55,11 @@ use ciris_verify_core::edition2::family::{
     VendoredFamilyModel,
 };
 use ciris_verify_core::edition2::keys::{check_key_record, KeyRecordError, KEY_RECORD_FAMILY};
-use ciris_verify_core::edition2::{identity_ref, Digest32, Invalid, MissingKey};
+use ciris_verify_core::edition2::{
+    identity_ref, verify_row_statement, Digest32, Invalid, KeyDirectory, KeyOf, MissingKey, Verdict,
+};
 
-use super::liveness::{statement_parts, ChainMissing, KeyOf, KeyOwnership};
+use super::liveness::statement_parts;
 use super::names::{names_of, Name, NameError, RowId};
 use super::token;
 use crate::federation::Error;
@@ -134,11 +146,14 @@ pub fn invalid_label(i: &Invalid) -> String {
         Invalid::DimensionFamily => "dimension_family".into(),
         Invalid::DimensionRefused { token } => format!("dimension_refused:{token}"),
         Invalid::DimensionUnregistered => "dimension_unregistered".into(),
+        Invalid::KidNotOfIss => "kid_not_of_iss".into(),
         other => format!("{other:?}"),
     }
 }
 
-fn fault_label(f: &FamilyFault) -> &'static str {
+/// Verify's family fault as a stable label for the refusal's message.
+#[must_use]
+pub fn fault_label(f: &FamilyFault) -> &'static str {
     match f {
         FamilyFault::UnregisteredFamily => "unregistered_family",
         FamilyFault::AuthorColumn => "author_column",
@@ -151,17 +166,30 @@ fn fault_label(f: &FamilyFault) -> &'static str {
 }
 
 /// The waiting refusal: the retryable unknown-signer error naming the
-/// deepest missing key by its identity reference.
+/// first missing link: a key by its identity reference (also a key held
+/// with no record covering the instant), a record by `row:<hex>`.
 fn waiting(missing: &[MissingKey]) -> Error {
     let named = missing
         .first()
         .map(|m| match m {
-            MissingKey::Kid(k) => identity_ref(k),
-            MissingKey::MlDsaHalf { kid, .. } => identity_ref(kid),
+            MissingKey::Kid(k) | MissingKey::CoveringRecord { kid: k, .. } => identity_ref(k),
+            MissingKey::Record(r) => format!("row:{}", hex::encode(r)),
             other => format!("{other:?}"),
         })
         .unwrap_or_else(|| "<unnamed key>".to_owned());
     Error::unknown_signer(&named, PLANE)
+}
+
+/// The refusal of a key that is not a key of the statement's `iss`.
+fn kid_not_of_iss(kid: Option<&Digest32>, iss: &str) -> Error {
+    refuse(
+        token::KID_NOT_OF_ISS,
+        format!(
+            "the signing key {} is not a key of the statement's iss {iss}: no held record of \
+             the key reaches that identity's genesis key (CC 2.6.1.7)",
+            kid.map_or_else(|| "<unread kid>".to_owned(), identity_ref),
+        ),
+    )
 }
 
 /// Refuse an object that is not an edition-2 statement (step 1), naming
@@ -218,21 +246,45 @@ fn door_context(bytes: &[u8], mut ctx: SelectContext) -> SelectContext {
     ctx
 }
 
-/// Judge one edition-2 row statement at a door (steps 1 to 5).
+/// v62.0.0 (wave P1c) — the largest edition-2 statement a door reads, in
+/// bytes: [`MAX_ATTESTATION_ENVELOPE_BYTES`](crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES),
+/// the attestation plane's one size cap. The signed thing is the sized
+/// thing (CC#38's rule): the bytes as received, which the store keeps and
+/// forwards as they are.
+pub const MAX_STATEMENT_BYTES: usize = crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES;
+
+/// v62.0.0 (wave P1c) — **the door's pure gates** (steps 1 and 2), a function
+/// of the bytes alone: no directory read and no signature check. In order:
 ///
-/// `offered_id` is an id the carrier names the row by, if any. It is
-/// compared with the computed one, and never used.
+/// 1. the form ([`require_statement_form`]);
+/// 2. the size: over [`MAX_STATEMENT_BYTES`] is `federation_envelope_too_large`;
+/// 3. the decode: bytes that are no `COSE_Sign1` are
+///    [`token::STATEMENT_INVALID`], named by Verify's reader over `keys` (the
+///    decode fault does not depend on which keys are held);
+/// 4. a signed object that is not a row is [`token::NOT_A_ROW`];
+/// 5. an edition-1 row-ref is [`token::ROW_REF_EDITION_1`];
+/// 6. v62.0.0 (wave P1d) — the payload of a family with a member list
+///    ([`super::payloads`], by the header's family id) keeps that list:
+///    `edition2_payload_invalid` otherwise;
+/// 7. v62.0.0 (wave P1e) — an `admission:unit` payload keeps the verifier's
+///    pure rules ([`super::payloads::check_admission_unit`], their own
+///    tokens).
+///
+/// [`super::ingest::put_statement`] runs these before it reads the signer's
+/// key plane or a roster (AV-76: a statement that can never be admitted
+/// buys no directory read); [`admit_row`] runs them again at its head.
+/// Verify's verdict (step 3) and everything after it are unchanged.
 ///
 /// # Errors
-/// The door's named refusals (module docs). A statement that waits on a key
-/// is `Error::AttesterKeyUnknown` (retryable).
-pub fn admit_row(
-    bytes: &[u8],
-    keys: &dyn KeyOwnership,
-    offered_id: Option<&Digest32>,
-    ctx: SelectContext,
-) -> Result<AdmittedRow, Error> {
+/// The refusals above.
+pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(), Error> {
     require_statement_form(bytes)?;
+    if bytes.len() > MAX_STATEMENT_BYTES {
+        return Err(Error::EnvelopeTooLarge {
+            bytes: bytes.len(),
+            cap: MAX_STATEMENT_BYTES,
+        });
+    }
     let Some((protected, payload)) = statement_parts(bytes) else {
         // Not even a decodable COSE_Sign1: Verify's reader names the fault.
         let why = match ciris_verify_core::edition2::verify_row_statement(bytes, keys) {
@@ -253,19 +305,136 @@ pub fn admit_row(
         ));
     }
     refuse_edition_one(&payload)?;
+    // v62.0.0 (kernel pass 2, K1; CC ruling) — a stated window must cover
+    // some instant: read from the statement alone, before any key is asked.
+    check_valid_until_after_asserted_at(&payload)?;
+    // v62.0.0 (wave P1d) — the family's closed payload map
+    // (`edition2::payloads`), for a family that has one: an unknown member, a
+    // missing required one, a wrong type, a closed value or leaf broken is
+    // `edition2_payload_invalid`. A family with no list passes as before.
+    let Some(family) = protected.get_int(-70002).and_then(Value::as_text) else {
+        // No family in the header: Verify's verdict names that fault.
+        return Ok(());
+    };
+    // v62.0.0 (wave P1e) — a composer carries its target's family but its
+    // own payload shape: the row type (-70001) selects the composer rule.
+    let row_type = protected
+        .get_int(-70001)
+        .and_then(Value::as_text)
+        .unwrap_or_default();
+    super::payloads::check_by_id(family, row_type, &payload)?;
+    // v62.0.0 (wave P1e; CC rc21 CC 2.7.11) — the verifier's pure rules over
+    // an `admission:unit` payload, each with its own token.
+    // (A composer of an admission row carries the family, not the payload.)
+    if family == super::payloads::ADMISSION_UNIT_FAMILY
+        && !super::payloads::COMPOSER_ROW_TYPES.contains(&row_type)
+    {
+        let sub = protected
+            .get_int(15)
+            .and_then(|c| c.get_int(2))
+            .and_then(Value::as_text)
+            .unwrap_or_default();
+        super::payloads::check_admission_unit(sub, &payload)?;
+    }
+    Ok(())
+}
+
+/// Judge one edition-2 row statement at a door (steps 1 to 5).
+///
+/// `offered_id` is an id the carrier names the row by, if any. It is
+/// compared with the computed one, and never used.
+///
+/// # Errors
+/// The door's named refusals (module docs). A statement that waits on a key
+/// is `Error::AttesterKeyUnknown` (retryable).
+pub fn admit_row(
+    bytes: &[u8],
+    keys: &dyn KeyDirectory,
+    offered_id: Option<&Digest32>,
+    ctx: SelectContext,
+) -> Result<AdmittedRow, Error> {
+    // Steps 1 and 2: the pure gates. A door that reads the directory runs
+    // them first itself; repeated here, they cost a decode, and keep this
+    // function whole for every caller.
+    pure_statement_gates(bytes, keys)?;
+    // The header, for the key-of-issuer refusal's names (the pure gates have
+    // decoded it already, so this cannot fail; it is not unwrapped).
+    let Some((protected, _)) = statement_parts(bytes) else {
+        return Err(refuse(token::STATEMENT_INVALID, "not_cose_sign1"));
+    };
 
     let ctx = door_context(bytes, ctx);
-    let (row, role) = match verify_row_in_family_with(bytes, keys, &VendoredFamilyModel, &ctx) {
+    // v62.0.0 (wave O1; CC 3.3.6, the rc21 reading) — CC's vendored model,
+    // with the occurrence key's own voice on `identity:occurrence`.
+    let model = super::occurrence::WithOccurrenceRole(&VendoredFamilyModel);
+    let (row, role) = match verify_row_in_family_with(bytes, keys, &model, &ctx) {
         FamilyVerdict::Valid { row, role } => (row, role),
+        // Verify's own key-of-issuer check (23.3.0), through `keys.key_of`.
+        FamilyVerdict::Invalid(Invalid::KidNotOfIss) => {
+            let kid = protected
+                .get_int(4)
+                .and_then(Value::as_bytes)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok());
+            let iss = protected
+                .get_int(15)
+                .and_then(|c| c.get_int(1))
+                .and_then(Value::as_text)
+                .unwrap_or("<unread iss>")
+                .to_owned();
+            return Err(kid_not_of_iss(kid.as_ref(), &iss));
+        }
         FamilyVerdict::Invalid(i) => {
             return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
+        }
+        // v62.0.0 (wave V1b; CC 3.2 "An organisation's agent", ruling (a),
+        // CLM-org-on-the-bond) — an owner binding that names an affiliation
+        // is COUNTED over the affiliation's roster (CC 2.4.1.3): a member's
+        // voice over it is a counted voice, which rc21's family model admits
+        // and Verify 23.3.0 still refuses `iss_not_in_role`. Persist must not
+        // refuse what the ruled model admits: the statement itself must be
+        // Valid, and persist's counted rule
+        // (`admission::check_owner_binding_counted`) counts only the roster at
+        // the head the binding names. TODO(verify-rc21): drop this arm when
+        // Verify vendors the ownership arm.
+        FamilyVerdict::FamilyInvalid(FamilyFault::IssNotInRole)
+            if names_an_affiliation_on_the_bond(bytes) =>
+        {
+            match verify_row_statement(bytes, keys) {
+                Verdict::Valid(row) => (row, Some(AFFILIATION_MEMBER_ROLE.to_owned())),
+                Verdict::Invalid(i) => {
+                    return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
+                }
+                Verdict::Waiting { missing } => return Err(waiting(&missing)),
+            }
+        }
+        // v62.0.0 (wave V1b; CC 4.4.3.12 "two consents", the second ruling)
+        // — an affiliation's officer appointment is a `self:delegates_to`
+        // COUNTED over the affiliation's roster (act=group, no `author`,
+        // `refs.head`). rc21's family model gains the act=group arm, as
+        // `licensure` has; Verify 23.3.0 still reads `self:delegates_to` as
+        // authored and refuses an author-less one `author_column`. Persist
+        // must not refuse what the ruled model admits: the statement itself
+        // must be Valid, and the counted rule
+        // (`admission::check_officer_appointment_counted`) counts it.
+        // TODO(verify-rc21): drop this arm when Verify vendors it.
+        FamilyVerdict::FamilyInvalid(FamilyFault::AuthorColumn)
+            if is_counted_officer_appointment(bytes) =>
+        {
+            match verify_row_statement(bytes, keys) {
+                Verdict::Valid(row) => (row, None),
+                Verdict::Invalid(i) => {
+                    return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
+                }
+                Verdict::Waiting { missing } => return Err(waiting(&missing)),
+            }
         }
         FamilyVerdict::FamilyInvalid(f) => {
             return Err(refuse(token::FAMILY_INVALID, fault_label(&f)));
         }
         FamilyVerdict::Waiting(missing) => return Err(waiting(&missing)),
     };
-    // Step 3b: the key is of the identity it signs as.
+    // Step 3b: the key is of the identity it signs as. Verify's reader has
+    // asked the same directory already (23.3.0); this is the same answer.
     require_key_of_iss(keys, &row.kid, &row.iss)?;
 
     // Step 4: the row id, from the bytes as received.
@@ -325,49 +494,90 @@ pub fn admit_row(
     })
 }
 
+/// v62.0.0 (wave V1b) — the role a member of the affiliation an owner
+/// binding names fills when it voices the binding (CC 3.2 ruling (a)).
+/// TODO(verify-rc21): Verify's own role name when it vendors the arm.
+pub const AFFILIATION_MEMBER_ROLE: &str = "affiliation_member";
+
+/// v62.0.0 (wave V1b) — is `bytes` an owner binding (`ownership:*`) whose
+/// payload names a community (`community_id` or one of its aliases): the
+/// binding counted over the affiliation's roster (CC 3.2 ruling (a))? Read
+/// from the bytes only; whether the community is an affiliation, and who is
+/// on its roster, is the counted rule's (`admission::check_owner_binding_counted`).
+#[must_use]
+pub fn names_an_affiliation_on_the_bond(bytes: &[u8]) -> bool {
+    let Some((protected, payload)) = statement_parts(bytes) else {
+        return false;
+    };
+    let ownership = protected
+        .get_int(-70002)
+        .and_then(Value::as_text)
+        .and_then(ciris_verify_core::namespace_match::prefix_of_family_id)
+        .is_some_and(|p| p.starts_with("ownership:"));
+    ownership
+        && crate::federation::admission::COHORT_TARGET_ENVELOPE_FIELDS
+            .iter()
+            .any(|f| payload.get_text(f).and_then(Value::as_text).is_some())
+}
+
+/// The family of a `delegates_to` that is not an owner binding or another
+/// purpose-specific family (RULINGS, *delegates_to families*).
+pub const SELF_DELEGATES_TO_FAMILY_PREFIX: &str = "self:delegates_to";
+
+/// v62.0.0 (wave V1b; CC 4.4.3.12) — is `bytes` an affiliation's officer
+/// appointment as a COUNTED row: a `self:delegates_to` statement (exactly
+/// that family, not `self:delegates_to:agent_occurrence`) whose payload has
+/// no `author` and names a community (`community_id` or an alias), or the
+/// group's counted `withdraws` of one (no `author`)? Read from
+/// the bytes only; whether the community is an affiliation, its roster and
+/// the quorum are the counted rule's
+/// (`admission::check_officer_appointment_counted`).
+#[must_use]
+pub fn is_counted_officer_appointment(bytes: &[u8]) -> bool {
+    let Some((protected, payload)) = statement_parts(bytes) else {
+        return false;
+    };
+    let family = protected
+        .get_int(-70002)
+        .and_then(Value::as_text)
+        .and_then(ciris_verify_core::namespace_match::prefix_of_family_id);
+    // v62.0.0 (wave V1b; CC 2.4.1.1) — the group's counted withdrawal of
+    // one carries the appointment's family and names it by `refs.target`,
+    // not the community: the counted rule finds the community on the
+    // target (`admission::check_counted_withdrawal`).
+    let counted_withdrawal = protected.get_int(-70001).and_then(Value::as_text)
+        == Some(crate::federation::types::attestation_type::WITHDRAWS);
+    family == Some(SELF_DELEGATES_TO_FAMILY_PREFIX)
+        && payload.get_text("author").is_none()
+        && (counted_withdrawal
+            || crate::federation::admission::COHORT_TARGET_ENVELOPE_FIELDS
+                .iter()
+                .any(|f| payload.get_text(f).and_then(Value::as_text).is_some()))
+}
+
 /// Step 3b of the door: `kid` must be a key of `iss` (module docs). Every
 /// place the door resolves a signer calls this after Verify's verdict: rows,
-/// each counted voice, objects, the halt.
+/// each counted voice, objects, the halt. It asks the directory's
+/// `KeyDirectory::key_of`, the question Verify's row reader asks itself
+/// (CIRISVerify 23.3.0), so the two give one answer; an object statement is
+/// not asked by Verify, and is asked here.
 ///
 /// # Errors
 /// [`token::KID_NOT_OF_ISS`]; the retryable unknown-signer error naming a
 /// missing link.
-pub fn require_key_of_iss(keys: &dyn KeyOwnership, kid: &Digest32, iss: &str) -> Result<(), Error> {
-    let not_of = || {
-        refuse(
-            token::KID_NOT_OF_ISS,
-            format!(
-                "the signing key {} is not a key of the statement's iss {iss}: no held record of \
-                 the key reaches that identity's genesis key (CC 2.6.1.7)",
-                identity_ref(kid),
-            ),
-        )
-    };
+pub fn require_key_of_iss(keys: &dyn KeyDirectory, kid: &Digest32, iss: &str) -> Result<(), Error> {
     let Some(genesis) = super::ingest::kid_of_identity_ref(iss) else {
-        return Err(not_of());
+        return Err(kid_not_of_iss(Some(kid), iss));
     };
     if genesis == *kid {
         return Ok(());
     }
     match keys.key_of(kid, &genesis) {
         KeyOf::Yes => Ok(()),
-        KeyOf::No => Err(not_of()),
-        KeyOf::Waiting(missing) => Err(chain_waiting(&missing)),
+        KeyOf::Waiting(missing) => Err(waiting(&missing)),
+        // `No`, and any answer a later Verify adds: fail closed.
+        _ => Err(kid_not_of_iss(Some(kid), iss)),
     }
-}
-
-/// The waiting refusal for a missing key-chain link, naming it: a key by
-/// its identity-ref, a record by `row:<hex>`.
-fn chain_waiting(missing: &[ChainMissing]) -> Error {
-    let named = missing.first().map_or_else(
-        || "<unnamed link>".to_owned(),
-        |m| match m {
-            ChainMissing::Kid(k) => identity_ref(k),
-            ChainMissing::Record(r) => format!("row:{}", hex::encode(r)),
-            ChainMissing::Bundle => "ceg-genesis-bundle/2".to_owned(),
-        },
-    );
-    Error::unknown_signer(&named, PLANE)
 }
 
 /// The roles of a `key:record` payload's `identity_type` (text members).
@@ -412,6 +622,33 @@ pub fn check_identity_set_exclusive(sub: &str, payload: &Value) -> Result<(), Er
         });
     }
     Ok(())
+}
+
+/// v62.0.0 (kernel pass 2, K1; CC ruling: a record covers `t` when
+/// `asserted_at <= t < valid_until`, half-open everywhere) — **a stated
+/// window covers some instant.** A payload of any family (`key:record` and
+/// every family carrying a `valid_until` member) that states `valid_until`
+/// at or before its own `asserted_at` is refused
+/// `valid_until_not_after_asserted_at`
+/// ([`crate::federation::malformed_row::VALID_UNTIL_NOT_AFTER_ASSERTED_AT`]).
+/// A payload that states no `valid_until`, or no readable `asserted_at`,
+/// is not judged here (its family's own member rules are).
+///
+/// # Errors
+/// The malformed-row refusal above.
+pub fn check_valid_until_after_asserted_at(payload: &Value) -> Result<(), Error> {
+    let at = payload.get_text("asserted_at").and_then(Value::as_u64);
+    let until = payload.get_text("valid_until").and_then(Value::as_u64);
+    match (at, until) {
+        (Some(at), Some(until)) if until <= at => Err(refuse(
+            crate::federation::malformed_row::VALID_UNTIL_NOT_AFTER_ASSERTED_AT,
+            format!(
+                "valid_until {until} is not after asserted_at {at}: the window \
+                 [asserted_at, valid_until) covers no instant"
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The refusal for a `key:record` payload that breaks its rule.
@@ -491,7 +728,10 @@ pub(crate) async fn with_earlier_form_doors_shut<T>(
 /// # Errors
 /// [`token::EARLIER_FORM_OBJECT`] once the doors are shut.
 pub fn refuse_earlier_form(plane: &'static str) -> Result<(), Error> {
-    if earlier_form_doors_shut() {
+    // v62.0.0 (wave T1) — a group statement's typed record running the typed
+    // door under the edition-2 door's vouch is no earlier-form object: its
+    // proof is its statements (`edition2::group`).
+    if earlier_form_doors_shut() && !super::group::vouched() {
         return Err(Error::malformed_row(
             plane,
             token::EARLIER_FORM_OBJECT,

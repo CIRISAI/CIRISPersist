@@ -14,6 +14,23 @@
 //!
 //! None: the supersede is judged on the offered head's proof and
 //! `prev_head_digest` against the held head's `persist_row_hash`.
+//!
+//! # A fork is held as a tip (v62.0.0, kernel pass 2)
+//!
+//! CC 2.7.8: "Two versions of one head wait as tips." A version whose
+//! `prev_head_digest` does not name the held head (a sibling of it, a
+//! successor of a version not yet held, a second founding version) is no
+//! longer refused: the kernel reads it as a tip
+//! ([`crate::kernel::head::head_answer`]) and the executor holds it in
+//! `federation_group_tips` beside the head, which stays where it is
+//! ([`HeadVerdict::Tip`]). A version naming the held head becomes the head
+//! ([`HeadVerdict::Extends`]) and leaves the tips: re-offered once the head
+//! it names is held, a held tip runs the whole door again and extends.
+//! An unheld group (nothing to supersede yet) WAITS (v62.0.0, CC 2.7:
+//! [`unheld_group`], `federation_link_not_held`). What stays refused is a
+//! `supersede_proof` that contradicts the version it rides on (a
+//! matter of one row's shape, before the kernel; CIRISKernel
+//! `DIFFERENCES.md` row 8).
 
 use super::cohort::Cohort;
 use super::group_plane::{self, GroupKind, GroupRowLink, GroupSigned};
@@ -67,27 +84,77 @@ pub(crate) struct PlannedSupersede {
     pub(crate) authorization: Option<serde_json::Value>,
 }
 
+/// v62.0.0 (kernel pass 2, I2811) — **what the held-head verdict decided**
+/// for an offered version of a held group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadVerdict {
+    /// The version names the held head (or is an accord birth recorded as
+    /// replacing exactly the held row): it becomes the head.
+    Extends,
+    /// The version names another version, or none: held as a tip beside
+    /// the head, which does not move (CC 2.7.8, "Two versions of one head
+    /// wait as tips").
+    Tip,
+}
+
+/// What the executor wrote for a supersede.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SupersedeWritten {
+    /// The head's version after the write: the new version for
+    /// [`HeadVerdict::Extends`], the held head's unchanged version for
+    /// [`HeadVerdict::Tip`].
+    pub(crate) version: u32,
+    /// What the verdict decided.
+    pub(crate) verdict: HeadVerdict,
+}
+
+/// v62.0.0 (CC 2.7) — the supersede names a group this node does not hold
+/// (yet, or no longer: a plan/commit race on postgres): a link not held, the
+/// WAIT [`Error::LinkNotHeld`] under the cohort as its plane, never a
+/// terminal refusal or a substrate error. Before v62 the verdict answered
+/// `federation_invalid_argument`, and postgres's executor carried a
+/// `federation_backend` arm for the row vanishing under the write. Both
+/// backends answer this one value: the verdict and both executors call it.
+pub(crate) fn unheld_group(planned: &PlannedSupersede) -> Error {
+    Error::link_not_held(
+        planned.cohort_str,
+        format!(
+            "supersede: {} group {:?} is unheld here (nothing to supersede yet)",
+            planned.cohort_str,
+            planned.head.group_key_id()
+        ),
+    )
+}
+
 /// **The supersede's verdict against the held head**, asked by the executor
 /// inside the transaction that replaces it. `held_row_hash` is the held live
 /// row's `persist_row_hash`, `None` when no row is held.
 ///
-/// - an unheld group has nothing to supersede;
-/// - v49.0.0 (#910.5) — a proof names the version it replaces;
-/// - v53.0.0 (CC 3.2 T6) — the version names the head it succeeds.
+/// - an unheld group has nothing to supersede yet: the WAIT
+///   [`unheld_group`] (v62.0.0, CC 2.7; `InvalidArgument` before);
+/// - v49.0.0 (#910.5) — a proof names the version it replaces; v62.0.0
+///   (kernel pass 2): the version's own `prev_head_digest` is that version,
+///   so a proof naming another is a contradiction inside one row;
+/// - v53.0.0 (CC 3.2 T6) — the version names the head it succeeds, and
+///   becomes the head; v62.0.0 (kernel pass 2, I2811): a version that names
+///   another is held as a tip ([`HeadVerdict::Tip`]), never refused.
 pub(crate) fn held_head_verdict(
     planned: &PlannedSupersede,
     held_row_hash: Option<&str>,
-) -> Result<(), Error> {
+) -> Result<HeadVerdict, Error> {
     let key = planned.head.group_key_id();
     let Some(held) = held_row_hash else {
-        return Err(Error::InvalidArgument(format!(
-            "supersede: unknown {} group {key:?} (nothing to supersede)",
-            planned.cohort_str
-        )));
+        return Err(unheld_group(planned));
     };
     let proof = planned.head.supersede_proof();
     if let Some(p) = proof {
-        super::group_amendment::check_proof_names_prior(planned.cohort_str, key, p, held)?;
+        super::group_amendment::check_proof_names_versions_prior(
+            planned.cohort_str,
+            key,
+            p,
+            planned.head.prev_head_digest(),
+            held,
+        )?;
     }
     super::group_amendment::check_prev_head_names_held(
         planned.cohort_str,
@@ -142,11 +209,29 @@ pub(crate) fn decode_planned_head(
 pub(crate) trait GroupSupersedeStore:
     FederationDirectory + group_plane::GroupPlaneStore + super::community_admit::CommunityStore + Sized
 {
-    /// In ONE transaction: read the held head, ask [`held_head_verdict`],
-    /// snapshot the prior into `federation_group_versions`, rewrite the live
-    /// row (the signature with the record it authorizes, #651) at a fresh
-    /// serve position, bump `version`. Returns the new version.
-    async fn store_planned_supersede(&self, planned: PlannedSupersede) -> Result<u32, Error>;
+    /// In ONE transaction: read the held head, ask [`held_head_verdict`];
+    /// on [`HeadVerdict::Extends`], snapshot the prior into
+    /// `federation_group_versions`, rewrite the live row (the signature with
+    /// the record it authorizes, #651) at a fresh serve position, bump
+    /// `version`, and drop the new head from `federation_group_tips`; on
+    /// [`HeadVerdict::Tip`] (v62.0.0, kernel pass 2), hold the offered
+    /// signed version in `federation_group_tips` (idempotent on its
+    /// `persist_row_hash`) and leave the live row as it is.
+    async fn store_planned_supersede(
+        &self,
+        planned: PlannedSupersede,
+    ) -> Result<SupersedeWritten, Error>;
+}
+
+impl PlannedHead {
+    /// v62.0.0 (kernel pass 2, K1) — the signed wrapper as JSON, for the tip row.
+    pub(crate) fn signed_json(&self) -> Result<serde_json::Value, Error> {
+        match self {
+            Self::Family(f) => serde_json::to_value(f),
+            Self::Community(c) => serde_json::to_value(c),
+        }
+        .map_err(|e| Error::Backend(format!("tip snapshot serialize: {e}")))
+    }
 }
 
 /// The door: every backend's `supersede_group_row`.
@@ -179,13 +264,19 @@ pub(crate) async fn supersede_group_row_planned<D: GroupSupersedeStore>(
     let cohort_str = check_supersede_cohort(cohort)?;
     let group_key_id = super::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
     let head = decode_planned_head(cohort, new_snapshot)?;
-    let version = dir
+    let written = dir
         .store_planned_supersede(PlannedSupersede {
             cohort_str,
             head,
             authorization,
         })
         .await?;
+    let version = written.version;
+    // v62.0.0 (kernel pass 2, I2811) — a tip is held beside the head: the
+    // head's `group:roster:v1` row stays the head's.
+    if written.verdict == HeadVerdict::Tip {
+        return Ok(version);
+    }
     // v61 (CIRISPersist#991) — the new head's `group:roster:v1` row replaces
     // the prior head's.
     group_plane::sync_group_row_offered(

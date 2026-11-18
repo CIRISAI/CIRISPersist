@@ -1,47 +1,59 @@
-//! **I1901** — CIRISVerify 23.1.3's edition-2 row-statement known answers,
+//! **I1901** — CIRISVerify's edition-2 row-statement known answers,
 //! replayed through persist's door (`tests/vectors/verify_v23/edition2/
-//! row_statements_v1.json`, re-pinned from Verify's `23.1.3` tag).
+//! row_statements_v3.json`, re-pinned from Verify's `v23.3.0` tag, slice C3;
+//! v1 retired). **I2365**–**I2367** (slice C3) add the key-of-issuer check's
+//! known answers (`edition2/key_of_iss_v1.json`).
 //!
 //! What persist asserts, case set by case set:
 //! - `valid`: each statement passes [`admit_row`], with the vector's row id,
-//!   kid and iss. There are two exceptions:
-//!   - `second_voice` fills a role only the vector's stated TEST family model
-//!     names. Under CC's vendored model, which the door reads, it is
-//!     `edition2_family_invalid` (`iss_not_in_role`). Verify's statement
-//!     reader still calls it Valid.
-//!   - `counted_with_refs` is author-less in a family the vendored model
-//!     names authored: `edition2_family_invalid` (`author_column`).
-//!   - `names_earlier_form`, which persist refuses `row_ref_edition_1`.
-//!     Verify's reader admits an edition-1 `row-ref`. CC rc20 `0c9e17c` (CC
-//!     2.6.1.3, 2.6.1.12) says no row of this form names an object of the
-//!     earlier form, and the door holds that.
+//!   kid and iss (CC's v1.0-rc20 vendored model reads every one valid, the
+//!   vector's `family_vendored_expect`).
 //! - `refusals`: each Invalid case is refused `edition2_statement_invalid`
 //!   with Verify's own reason. The Waiting case is the retryable
-//!   unknown-signer error, naming the vector's key.
+//!   unknown-signer error, naming the vector's key. Two exceptions:
+//!   - `untagged` bytes are in no form at persist's door
+//!     (`edition2_earlier_form_object`);
+//!   - `names_earlier_form` and `row_ref_edition_1` (an edition-1
+//!     `row-ref`): persist's door names them first, `row_ref_edition_1`
+//!     (CC 2.6.1.3); Verify's reader alone gives the vector's reason.
 //! - `key_records`: each payload's end rule, Verify's token, equals the
 //!   door's refusal: `key_record_out_of_window`, the typed mixed-set error,
 //!   or `edition2_statement_invalid`.
-//! - `key_directory`, through persist's [`HeldKeys`]:
-//!   - `held_through_chain` and `deep_waiting` agree with Verify, and so
-//!     does `record_breaks_end_rule` (Invalid);
-//!   - `held_in_part` waits on the key itself: persist never holds a key in
-//!     part by an earlier-form commitment (CC 2.6.1.12);
-//!   - `after_valid_until` is retryable (waits on the key), not Invalid.
-//!     CC 2.4.1.1 says "A row whose signed instant no held record of its key
-//!     covers is retryable", and a renewal may revive the key.
+//! - `key_directory`, through persist's [`HeldKeys`] (I2365): Verify's
+//!   reader over persist's directory gives the vector's exact verdict, and
+//!   the door the matching refusal. `after_valid_until` waits on a record of
+//!   the key covering the instant (`MissingKey::CoveringRecord`, CC 2.4.1.1).
 //! - `objects`: the header verdicts agree, and persist's object id equals
 //!   the vector's.
+//! - `key_of_iss_v1.json` (I2366): every case through Verify's reader with
+//!   persist's directory (a raw key map, or [`HeldKeys`] holding the
+//!   vector's records in order), whose `KeyDirectory::key_of` is
+//!   [`HeldKeys::key_of`], gives the vector's verdict. Three stated
+//!   divergences, each kept by A's I2101 witnesses:
+//!   - `rotation_without_predecessor_statement` waits on the predecessor key
+//!     here (a door receives a rotation's voices one at a time; "a missing
+//!     link waits"), where Verify's directory answers `kid_not_of_iss`;
+//!   - `rotation_genesis_not_held` and `rotation_two_hops_middle_missing`
+//!     wait in both, but persist names the record `target` names where
+//!     Verify names the predecessor key its statement waits on.
+//! - (I2367) the same cases at persist's door: `kid_not_of_iss` is refused
+//!   by that token, a wait is the retryable unknown-signer error.
 
 use std::collections::BTreeMap;
 
 use ciris_crypto::composite::{CompositePublicKey, CompositeSigningKey};
 use ciris_verify_core::cde;
 use ciris_verify_core::edition2::family::SelectContext;
+use ciris_verify_core::edition2::family::{
+    verify_row_in_family, FamilyVerdict, VendoredFamilyModel,
+};
 use ciris_verify_core::edition2::keys::check_key_record;
-use ciris_verify_core::edition2::{identity_ref, thumbprint, Digest32, KeyDirectory};
+use ciris_verify_core::edition2::{
+    identity_ref, thumbprint, verify_row_statement, Digest32, KeyDirectory, MissingKey, Verdict,
+};
 use serde_json::Value as J;
 
-use super::door::{admit_row, key_record_refusal};
+use super::door::{admit_row, fault_label, invalid_label, key_record_refusal};
 use super::liveness::HeldKeys;
 use crate::federation::{malformed_row, Error};
 
@@ -51,7 +63,9 @@ const WAITING_KID: &str = concat!("waiting", ":kid:");
 const COLON: char = ':';
 
 const FILE: &str =
-    include_str!("../../../tests/vectors/verify_v23/edition2/row_statements_v1.json");
+    include_str!("../../../tests/vectors/verify_v23/edition2/row_statements_v3.json");
+const KEY_OF_ISS: &str =
+    include_str!("../../../tests/vectors/verify_v23/edition2/key_of_iss_v1.json");
 
 fn key(n: u8) -> CompositeSigningKey {
     CompositeSigningKey::from_seeds(&[n; 32], &[n.wrapping_add(100); 32])
@@ -103,9 +117,13 @@ fn file() -> J {
 fn i1901_valid_statements_pass_the_door() {
     let f = file();
     let cases = f["valid"].as_array().unwrap();
-    assert_eq!(cases.len(), 5);
+    assert_eq!(cases.len(), 4);
     for c in cases {
         let id = c["id"].as_str().unwrap();
+        assert_eq!(
+            c["family_vendored_expect"], "valid",
+            "I1901 {id}: CC's vendored model reads it valid"
+        );
         let n = u8::try_from(c["key_seed"].as_u64().unwrap()).unwrap();
         let got = admit_row(
             &hx(&c["statement_hex"]),
@@ -113,43 +131,6 @@ fn i1901_valid_statements_pass_the_door() {
             None,
             SelectContext::default(),
         );
-        if id == "counted_with_refs" {
-            // A counted (author-less) row in a family CC's vendored model
-            // names authored: the author column (the vector's test model
-            // calls the family counted).
-            assert_eq!(
-                label(&got),
-                format!("refused:{}", malformed_row::EDITION2_FAMILY_INVALID),
-                "I1901 {id}: CC's vendored model, not the vector's test model"
-            );
-            continue;
-        }
-        if id == "second_voice" {
-            // The vector's second voice fills a role of its stated TEST
-            // family model; under CC's vendored model (the door's) the
-            // family names no such role.
-            assert_eq!(
-                label(&got),
-                format!("refused:{}", malformed_row::EDITION2_FAMILY_INVALID),
-                "I1901 {id}: CC's vendored model, not the vector's test model"
-            );
-            assert!(matches!(
-                ciris_verify_core::edition2::verify_row_statement(
-                    &hx(&c["statement_hex"]),
-                    &dir([n])
-                ),
-                ciris_verify_core::edition2::Verdict::Valid(_)
-            ));
-            continue;
-        }
-        if id == "names_earlier_form" {
-            assert_eq!(
-                label(&got),
-                format!("refused:{}", malformed_row::EDITION2_ROW_REF_EDITION_1),
-                "I1901 {id}: Verify admits it; CC rc20 refuses a row naming the earlier form"
-            );
-            continue;
-        }
         let row = got.unwrap_or_else(|e| panic!("I1901 {id}: {e:?}"));
         assert_eq!(
             row.row_id.hex(),
@@ -178,7 +159,7 @@ fn i1901_valid_statements_pass_the_door() {
 fn i1901_refusals_give_verifys_reasons() {
     let f = file();
     let cases = f["refusals"].as_array().unwrap();
-    assert_eq!(cases.len(), 40);
+    assert_eq!(cases.len(), 42);
     for c in cases {
         let id = c["id"].as_str().unwrap();
         let expect = c["expect"].as_str().unwrap();
@@ -197,10 +178,22 @@ fn i1901_refusals_give_verifys_reasons() {
         };
         // `edition_1` names the CWT edition claim, not a row-ref: Verify's
         // reason stands. `untagged` bytes are in no form at persist's door.
-        let want = if id == "untagged" {
-            format!("refused:{}", malformed_row::EDITION2_EARLIER_FORM_OBJECT)
-        } else {
-            want
+        // An edition-1 row-ref is named by persist's door first; Verify's
+        // reader alone gives the vector's reason.
+        let want = match id {
+            "untagged" => format!("refused:{}", malformed_row::EDITION2_EARLIER_FORM_OBJECT),
+            "names_earlier_form" | "row_ref_edition_1" => {
+                assert_eq!(
+                    reader_label(&verify_row_statement(
+                        &hx(&c["statement_hex"]),
+                        &dir(seeds(c))
+                    )),
+                    expect,
+                    "I1901 {id}: Verify's reader"
+                );
+                format!("refused:{}", malformed_row::EDITION2_ROW_REF_EDITION_1)
+            }
+            _ => want,
         };
         assert_eq!(got, want, "I1901 {id}");
     }
@@ -235,42 +228,33 @@ fn i1901_key_record_end_rule_is_the_doors() {
     }
 }
 
+/// I1901 / I2365 — the key-directory cases through persist's [`HeldKeys`]:
+/// Verify's reader over it gives the vector's exact verdict, and the door
+/// the matching refusal (a wait names the key, also for a covering record).
 #[test]
-fn i1901_key_directory_through_persists_reading() {
+fn i1901_i2365_key_directory_through_persists_reading() {
     let f = file();
     let cases = f["key_directory"].as_array().unwrap();
-    assert_eq!(cases.len(), 5);
+    assert_eq!(cases.len(), 4);
     for c in cases {
         let id = c["id"].as_str().unwrap();
         let mut held = HeldKeys::new();
         for r in c["records_hex"].as_array().unwrap() {
             held.insert_record(hx(r)).unwrap();
         }
-        // Persist never holds a key in part: `partial` is not inserted.
         let st = hx(&c["statement_hex"]);
-        let got = label(&admit_row(&st, &held, None, SelectContext::default()));
         let expect = c["expect"].as_str().unwrap();
-        let want = match id {
-            "held_in_part" | "after_valid_until" => {
-                // Waits on the statement's own signing key.
-                let (protected, _) = super::liveness::statement_parts(&st).unwrap();
-                let kid: Digest32 = protected
-                    .get_int(4)
-                    .and_then(cde::Value::as_bytes)
-                    .unwrap()
-                    .try_into()
-                    .unwrap();
-                format!("waiting{COLON}{}", identity_ref(&kid))
-            }
-            _ => match expect.strip_prefix(WAITING_KID) {
-                Some(k) => {
-                    let kid: Digest32 = hex::decode(k).unwrap().try_into().unwrap();
-                    format!("waiting{COLON}{}", identity_ref(&kid))
-                }
-                None => expect.to_owned(),
-            },
+        assert_eq!(
+            reader_label(&verify_row_statement(&st, &held)),
+            expect,
+            "I2365 {id}: Verify's reader over persist's directory"
+        );
+        let got = label(&admit_row(&st, &held, None, SelectContext::default()));
+        let want = match waiting_kid(expect) {
+            Some(kid) => format!("waiting{COLON}{}", identity_ref(&kid)),
+            None => expect.to_owned(),
         };
-        assert_eq!(got, want, "I1901 {id} (Verify: {expect})");
+        assert_eq!(got, want, "I1901 {id} at the door");
     }
 }
 
@@ -311,4 +295,181 @@ fn i1901_an_empty_reader_waits() {
         HeldKeys::new().lookup(&k, 0),
         ciris_verify_core::edition2::KeyLookup::Waiting(_)
     ));
+}
+
+/// Verify's verdict, spelled like the vectors' `expect`.
+fn reader_label(v: &Verdict) -> String {
+    match v {
+        Verdict::Valid(_) => "valid".into(),
+        Verdict::Invalid(i) => format!("invalid{COLON}{}", invalid_label(i)),
+        Verdict::Waiting { missing } => missing_label(missing),
+    }
+}
+
+/// The first missing link, spelled like the vectors' `expect`.
+fn missing_label(missing: &[MissingKey]) -> String {
+    match missing.first() {
+        Some(MissingKey::Kid(k)) => format!("{WAITING_KID}{}", hex::encode(k)),
+        Some(MissingKey::CoveringRecord { kid, at_ms }) => format!(
+            "waiting{COLON}covering_record{COLON}{}{COLON}{at_ms}",
+            hex::encode(kid)
+        ),
+        Some(MissingKey::Record(r)) => format!("waiting{COLON}record{COLON}{}", hex::encode(r)),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The key a `waiting:kid:<hex>` or `waiting:covering_record:<hex>:<at>`
+/// expectation names: the door names it by its identity reference.
+fn waiting_kid(expect: &str) -> Option<Digest32> {
+    let mut parts = expect.split(COLON);
+    if parts.next() != Some("waiting") {
+        return None;
+    }
+    match (parts.next(), parts.next()) {
+        (Some("kid" | "covering_record"), Some(k)) => hex::decode(k).ok()?.try_into().ok(),
+        _ => None,
+    }
+}
+
+fn key_of_file() -> J {
+    serde_json::from_str(KEY_OF_ISS).unwrap()
+}
+
+/// The directory a `key_of_iss_v1.json` case names: a raw key map, or
+/// persist's [`HeldKeys`] holding its records in order.
+fn key_of_directory(c: &J) -> Box<dyn KeyDirectory> {
+    match c["directory"].as_str().unwrap() {
+        "raw" => Box::new(dir(seeds(c))),
+        "records" => {
+            let mut held = HeldKeys::new();
+            for r in c["records_hex"].as_array().unwrap() {
+                held.insert_record(hx(r)).unwrap();
+            }
+            Box::new(held)
+        }
+        d => panic!("directory {d}"),
+    }
+}
+
+/// The record row the signing key's own held record names in
+/// `refs.target` (its predecessor's record).
+fn own_record_target(c: &J, st: &[u8]) -> Digest32 {
+    let kid = super::ingest::statement_kid(st).unwrap();
+    c["records_hex"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(hx)
+        .find(|r| super::ingest::statement_kid(r) == Some(kid))
+        .and_then(|r| super::liveness::statement_parts(&r))
+        .and_then(|(_, p)| super::names::names_of(&p).ok())
+        .and_then(|n| super::names::single(&n, "target"))
+        .unwrap()
+        .0
+}
+
+/// What persist answers where it differs from Verify's `KeyRecordDirectory`
+/// (module docs): persist's verdict for the case, or `None` where they agree.
+fn key_of_divergence(c: &J) -> Option<String> {
+    let st = hx(&c["statement_hex"]);
+    match c["id"].as_str().unwrap() {
+        // B's statement over B2's rotation record is not held at all: the
+        // rotation waits on B (key seed 2), I2101 "a missing link waits".
+        // Verify: kid_not_of_iss.
+        "rotation_without_predecessor_statement" => Some(format!(
+            "{WAITING_KID}{}",
+            hex::encode(thumbprint(key(2).public_key()))
+        )),
+        // The predecessor's statement is held and waits on its key, whose
+        // record is not held: persist names the record `target` names
+        // (I2101); Verify names the predecessor key. Both wait.
+        "rotation_genesis_not_held" | "rotation_two_hops_middle_missing" => Some(format!(
+            "waiting{COLON}record{COLON}{}",
+            hex::encode(own_record_target(c, &st))
+        )),
+        _ => None,
+    }
+}
+
+/// I2366 — the key-of-issuer check's known answers through Verify's reader
+/// over persist's directory, whose `KeyDirectory::key_of` is
+/// [`HeldKeys::key_of`]: one verdict for the reader and the door.
+#[test]
+fn i2366_key_of_iss_through_persists_directory() {
+    let f = key_of_file();
+    let cases = f["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 24, "I2366: every case is replayed");
+    let mut diverged = 0usize;
+    for c in cases {
+        let id = c["id"].as_str().unwrap();
+        let st = hx(&c["statement_hex"]);
+        let keys = key_of_directory(c);
+        let got = match c["level"].as_str().unwrap() {
+            "statement" => reader_label(&verify_row_statement(&st, keys.as_ref())),
+            "family" => {
+                assert_eq!(c["model"], "vendored", "I2366 {id}");
+                match verify_row_in_family(&st, keys.as_ref(), &VendoredFamilyModel) {
+                    FamilyVerdict::Valid { .. } => "valid".into(),
+                    FamilyVerdict::Invalid(i) => format!("invalid{COLON}{}", invalid_label(&i)),
+                    FamilyVerdict::FamilyInvalid(fault) => {
+                        format!("family_invalid{COLON}{}", fault_label(&fault))
+                    }
+                    FamilyVerdict::Waiting(m) => missing_label(&m),
+                }
+            }
+            l => panic!("level {l}"),
+        };
+        let want = match key_of_divergence(c) {
+            Some(ours) => {
+                diverged += 1;
+                ours
+            }
+            None => c["expect"].as_str().unwrap().to_owned(),
+        };
+        assert_eq!(got, want, "I2366 {id} (Verify: {})", c["expect"]);
+    }
+    assert_eq!(
+        diverged, 3,
+        "I2366: the three stated divergences are replayed"
+    );
+}
+
+/// I2367 — the same cases at persist's door: `kid_not_of_iss` is refused by
+/// that token, a wait is the retryable unknown-signer error. (A valid case
+/// is the reader's to answer: these rows carry no `dimension`, so the door's
+/// family step is not what they test.)
+#[test]
+fn i2367_key_of_iss_at_the_door() {
+    let f = key_of_file();
+    let mut refused = 0usize;
+    for c in f["cases"].as_array().unwrap() {
+        if c["level"] != "statement" {
+            continue;
+        }
+        let id = c["id"].as_str().unwrap();
+        let st = hx(&c["statement_hex"]);
+        let keys = key_of_directory(c);
+        let got = admit_row(&st, keys.as_ref(), None, SelectContext::default());
+        let expect =
+            key_of_divergence(c).unwrap_or_else(|| c["expect"].as_str().unwrap().to_owned());
+        let mut parts = expect.split(COLON);
+        match (parts.next(), parts.next()) {
+            (Some("invalid"), Some("kid_not_of_iss")) => {
+                refused += 1;
+                assert_eq!(
+                    label(&got),
+                    format!("refused:{}", malformed_row::KID_NOT_OF_ISS),
+                    "I2367 {id}"
+                );
+            }
+            (Some("waiting"), _) => assert!(
+                matches!(got, Err(Error::AttesterKeyUnknown { .. })),
+                "I2367 {id}: {}",
+                label(&got)
+            ),
+            _ => {}
+        }
+    }
+    assert_eq!(refused, 8, "I2367: the kid_not_of_iss cases ran");
 }

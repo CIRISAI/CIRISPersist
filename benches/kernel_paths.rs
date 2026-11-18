@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | `owner_of` | `admission::owner_of` | `seat::Seats::one("owner", key)` |
 //! | `trust_root_valid` | `trust_root::trust_root_valid` | `trust::honours`, `trust::reaches` |
-//! | `delegation_walk` | `admission::reachable_under_scope`, `check_delegation_cycle_admission` | `trust::reaches` (a cycle visited once), the seat walk's depth |
+//! | `delegation_walk` | `admission::reachable_under_scope` (v62.0.0: the cycle gate arms are deleted with the gate) | `trust::reaches` (a cycle visited once), the seat walk's depth |
 //! | `held_head` | `group_supersede_admit::held_head_verdict` (via the supersede door) | `seat::Seats::tips`, `line::settle` |
 //! | `accord_recovery` | `accord_recovery::{recovery_commitment_in_force, verify_accord_recovery}` | `seat::seat_rule` over the lineage |
 //! | `admission_door` | `put_attestation_authored` (the `put_attestation` gauntlet, no AV-76 quota) | `layers::kept`, `layers::conclude` |
@@ -50,9 +50,8 @@ use ciris_persist::federation::accord_recovery::{
 };
 use ciris_persist::federation::accord_test_support as ops;
 use ciris_persist::federation::admission::{
-    check_delegation_cycle_admission, owner_of, owner_of_pre_kernel, reachable_under_scope,
-    steward_bindings_of, truncate_to_substrate_resolution, DelegationTermBounds,
-    DELEGATION_SCOPE_MODERATE,
+    owner_of, owner_of_pre_kernel, reachable_under_scope, steward_bindings_of,
+    truncate_to_substrate_resolution, DelegationTermBounds, DELEGATION_SCOPE_MODERATE,
 };
 use ciris_persist::federation::canonical_community::{accord_family_key_id, NEXT_PERSIST_ROW_HASH};
 use ciris_persist::federation::cohort::Cohort;
@@ -661,42 +660,10 @@ fn bench_delegation_walk(c: &mut Criterion) {
                 )
             });
         });
-        // The cycle gate on a candidate edge tip → root: it closes a cycle
-        // of `depth + 1` hops. Pre-kernel it was refused while the chain was
-        // within the ceiling; v62.0.0 (slice C) refuses no edge for closing
-        // a cycle (the kernel's walk visits it once), so every depth admits.
-        // Not written: the gate is asked, the row is not stored.
-        let closing = moderate_edge(&format!("walk-close-{depth}"), &tip, &root);
-        group.bench_function(BenchmarkId::new("cycle_gate_closing", depth), |b| {
-            let s = fx();
-            let now = chrono::Utc::now();
-            let r = rt.block_on(check_delegation_cycle_admission(&s.backend, &closing, now));
-            assert!(
-                r.is_ok(),
-                "depth {depth}: v62 refuses no cycle-closing edge"
-            );
-            b.iter(|| {
-                black_box(
-                    rt.block_on(check_delegation_cycle_admission(&s.backend, &closing, now))
-                        .is_err(),
-                )
-            });
-        });
-        // The cycle gate on an edge outsider → root: no cycle, the search
-        // walks the whole chain from the root.
-        let open = moderate_edge(&format!("walk-open-{depth}"), "walk-outsider", &root);
-        group.bench_function(BenchmarkId::new("cycle_gate_open", depth), |b| {
-            let s = fx();
-            let now = chrono::Utc::now();
-            rt.block_on(check_delegation_cycle_admission(&s.backend, &open, now))
-                .expect("no cycle");
-            b.iter(|| {
-                black_box(
-                    rt.block_on(check_delegation_cycle_admission(&s.backend, &open, now))
-                        .is_ok(),
-                )
-            });
-        });
+        // v62.0.0 (kernel pass 2): the `cycle_gate_closing` / `cycle_gate_open`
+        // arms measured the v54 cycle gate, which is deleted (the kernel's walk
+        // visits a cycle once; no edge is refused for closing one). Their
+        // baselines in `pre-kernel` have no v62 counterpart.
     }
     group.finish();
 }
@@ -830,8 +797,9 @@ fn bench_held_head(c: &mut Criterion) {
         let cell: OnceCell<LineageFixture> = OnceCell::new();
         let fx = || cell.get_or_init(|| rt.block_on(lineage_fixture(len)));
         // A forked version: a valid, quorum-signed version whose prior is the
-        // founding version, not the held head. The door refuses it (persist's
-        // `held_head_verdict`; the kernel holds it as a second tip).
+        // founding version, not the held head. v62.0.0 (kernel pass 2, K1):
+        // the door holds it as a second tip (`held_head_verdict` answers
+        // through the kernel; CC 2.7.8), idempotently on every re-offer.
         // Two forks, each signed up front: off the founding version, and off
         // the held head's parent (a stale prior one version back).
         for (case, prior) in [("fork_from_root", 0usize), ("fork_from_parent", 1)] {
@@ -853,8 +821,8 @@ fn bench_held_head(c: &mut Criterion) {
                     ))
                     .expect("prepare fork");
                 let r = rt.block_on(submit_version(d, &v));
-                assert!(r.is_err(), "{case}: the fork is refused: {r:?}");
-                b.iter(|| black_box(rt.block_on(submit_version(d, &v)).is_err()));
+                assert!(r.is_ok(), "{case}: the fork is held as a tip: {r:?}");
+                b.iter(|| black_box(rt.block_on(submit_version(d, &v)).is_ok()));
             });
         }
     }
@@ -1407,13 +1375,6 @@ fn smoke() {
                     ))
                     .expect("walk");
                 assert!(hit, "depth 4 reach");
-                let closing = moderate_edge("smoke-close", &walk_key(4, 4), &walk_key(4, 0));
-                let r = rt.block_on(check_delegation_cycle_admission(
-                    &s.backend,
-                    &closing,
-                    chrono::Utc::now(),
-                ));
-                assert!(r.is_err(), "cycle refused: {r:?}");
             }),
         ),
         (

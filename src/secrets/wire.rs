@@ -339,6 +339,86 @@ pub struct SecretsErrorResponse {
     pub detail: String,
 }
 
+// ── v62.0.0: the request signature (one composite) ─────────────────
+
+/// Header carrying the caller's edition-2 identity-ref
+/// (`urn:ietf:params:oauth:ckt:sha-256:…`, the kid its key statements
+/// carry). Unchanged NAME since v1.1.0; v62.0.0 changed what it holds: an
+/// edition-2 identity-ref, never an earlier-form `federation_keys.key_id`.
+pub const HEADER_KEY_ID: &str = "x-ciris-signing-key-id";
+
+/// v62.0.0 — header carrying the ONE composite signature (base64, standard
+/// alphabet, padded) over [`canonical_request`]: CC 2.6.1.7
+/// ML-DSA-65-Ed25519, 3373 bytes (`mldsaSig || ed25519Sig`). It replaces the
+/// two component headers (`x-ciris-signature-ed25519` +
+/// `x-ciris-signature-ml-dsa-65`): the composite rule admits no standalone
+/// component signer.
+pub const HEADER_SIGNATURE: &str = "x-ciris-signature";
+
+/// v62.0.0 — the component-signature headers of the earlier form. A request
+/// carrying any of them is refused by name (`secrets_signature_earlier_form`)
+/// rather than verified or silently ignored, so a client that was not
+/// upgraded learns why. The third spelling is the one the pre-v62
+/// `FederatedSecretsClient` emitted.
+pub const EARLIER_FORM_SIGNATURE_HEADERS: [&str; 3] = [
+    "x-ciris-signature-ed25519",
+    "x-ciris-signature-ml-dsa-65",
+    "x-ciris-signature-mldsa-65",
+];
+
+/// v62.0.0 — the domain tag that opens every [`canonical_request`]. It keeps
+/// a request signature from ever reading as any other signed object of the
+/// composite key (a COSE `Sig_structure` opens with a CBOR array head, never
+/// with this text).
+pub const REQUEST_SIGNATURE_CONTEXT: &[u8] = b"ciris-persist:secrets-request:v1";
+
+/// v62.0.0 — **the bytes a secrets request's composite signature covers.**
+///
+/// ```text
+/// REQUEST_SIGNATURE_CONTEXT
+///   || u32be(len(method))         || method          (as sent, e.g. "GET")
+///   || u32be(len(path_and_query)) || path_and_query  (the request target as sent)
+///   || u64be(len(body))           || body            (the raw body bytes; empty for GET / DELETE)
+/// ```
+///
+/// Every part is length-prefixed, so two different requests never share
+/// these bytes. The method and the request target are covered (the earlier
+/// form signed the body alone, so a GET's signature over the empty body was
+/// valid for every other GET and for DELETE): a signature now authorizes the
+/// one route, query and body it was made for.
+///
+/// `path_and_query` is the origin-form request target exactly as the client
+/// sends it (`/api/v1/secrets?limit=10`), percent-encoding included, with no
+/// scheme or authority.
+#[must_use]
+pub fn canonical_request(method: &str, path_and_query: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        REQUEST_SIGNATURE_CONTEXT.len()
+            + 4
+            + method.len()
+            + 4
+            + path_and_query.len()
+            + 8
+            + body.len(),
+    );
+    out.extend_from_slice(REQUEST_SIGNATURE_CONTEXT);
+    out.extend_from_slice(
+        &u32::try_from(method.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(method.as_bytes());
+    out.extend_from_slice(
+        &u32::try_from(path_and_query.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(path_and_query.as_bytes());
+    out.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,9 +20,10 @@
 //! - a binding naming the room from a NON-targeted placement (federation) is
 //!   an organisation's bond, not an audience: #1062's gate refuses it
 //!   (`owner_binding_affiliation_refused`; the room is no affiliation);
-//! - a second, different owner's binding of the node is still refused (the
-//!   single-owner gate), and a `delegates_to` at community scope that names
-//!   a foreign subject is still refused by `named_subject`.
+//! - a second, different owner's binding of the node is held (v62.0.0,
+//!   I2844: the single-owner gate is deleted; two counted owners read as
+//!   unowned), and a `delegates_to` at community scope that names a foreign
+//!   subject is still refused by `named_subject`.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -186,14 +187,26 @@ pub(crate) mod bodies {
                 .is_none(),
             "I1511: the refused bond stores nothing"
         );
-        // A different owner is still refused, whatever the scope.
+        // v62.0.0 (kernel pass 2, I2844; KERNEL_SEAMS B1 / C557) — a different
+        // owner is no longer refused at any scope: the binding is held, and
+        // cosigned by the node (the fixture sealer's co-scrub) the seat counts
+        // two owners and reads the node as unowned, fail-closed.
         let rival = binding_at(
             &peer,
             &node,
             cohort_scope::COMMUNITY,
             Some(("community_key_id", &room)),
         );
-        put(d, &rival).await.expect_err("I1511: a second owner");
+        put(d, &rival)
+            .await
+            .expect("I2844: a second owner's binding is held, not refused");
+        assert!(
+            matches!(
+                crate::federation::admission::owner_of(d, &node).await,
+                Err(Error::AmbiguousNodeOwner { .. })
+            ),
+            "I2844: two counted owners read as unowned"
+        );
         // v61 S2 (#1161) — a delegates_to naming a subject outside the room's
         // audience is refused on the audience rule.
         let mut named = binding_at(

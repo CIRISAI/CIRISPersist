@@ -163,6 +163,9 @@ mod tests {
         // a ranked or a mirror row is not a two-path window here
         assert!(!specs.contains_key("moderator_election"));
         assert!(!specs.contains_key("moderation_action"));
-        assert_eq!(specs.len(), 7);
+        // v62.0.0 (CC rc20): `community_remove` is a `cosigned` row (enact =
+        // the room's protocol), not a two-path window; six remain.
+        assert!(!specs.contains_key("community_remove"));
+        assert_eq!(specs.len(), 6);
     }
 }

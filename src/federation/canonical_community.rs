@@ -235,6 +235,11 @@ async fn accord_holder_seated_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave W1) — the accord is the genesis bundle in force: a
+    // holder of it is a seat of the accord (`edition2::trust_root_group`).
+    if super::edition2::trust_root_group::is_bundle_holder(directory, key_id).await? {
+        return Ok(true);
+    }
     let Some(family) =
         super::trust_root::resolve_family_root(directory, accord_family_key_id()).await?
     else {
@@ -297,6 +302,12 @@ pub async fn check_founder_eligible<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave W1) — a holder of the genesis bundle in force is a seated
+    // holder (#972: nothing more is asked of one), read before its key
+    // record: the bundle placed its key.
+    if super::edition2::trust_root_group::is_bundle_holder(directory, founder).await? {
+        return Ok(());
+    }
     let Some(record) = directory.lookup_public_key(founder).await? else {
         return Err(violation(
             community_key_id,
@@ -415,6 +426,15 @@ async fn accord_quorum_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave W1; CC 3.2 citing CC 2.7.5, CC 2.6.1.11) — an edition-2 birth: its
+    // voices are the held `group:roster` statements of the version (and the
+    // vouched ones at its door), counted against a strict majority of the
+    // holders of the genesis bundle in force.
+    if let Some(signers) =
+        super::edition2::trust_root_group::version_signers(directory, &signed.community).await?
+    {
+        return super::edition2::trust_root_group::bundle_quorum_over(directory, &signers).await;
+    }
     let Some(family) =
         super::trust_root::resolve_family_root(directory, accord_family_key_id()).await?
     else {
@@ -464,6 +484,10 @@ where
 }
 
 fn insufficient(signed: &SignedCommunity) -> Error {
+    // v62.0.0 (wave W1) — at an edition-2 door the voices so far are short:
+    // the voice is kept and the version waits for the next one (a no-op
+    // outside a vouch).
+    super::edition2::group::note_short();
     Error::RosterAuthorityUnauthorized {
         group_key_id: signed.community.community_key_id.clone(),
         offered_authority_key_id: signed.authority_key_id.clone(),
@@ -790,11 +814,18 @@ impl Memo {
     where
         F: FederationDirectory + ?Sized,
     {
-        let Some(rec) = self.record(directory, key_id).await? else {
-            return Ok(false);
-        };
         let when = at.unwrap_or(self.now);
-        let (arm, next_edge) = founder_arm_at(directory, &rec, when).await?;
+        // v62.0.0 (wave W1) — a holder of the genesis bundle in force is the
+        // holder arm, whatever this node's key-record read model holds.
+        let (arm, next_edge) =
+            if super::edition2::trust_root_group::is_bundle_holder(directory, key_id).await? {
+                (FounderArm::Holder, None)
+            } else {
+                let Some(rec) = self.record(directory, key_id).await? else {
+                    return Ok(false);
+                };
+                founder_arm_at(directory, &rec, when).await?
+            };
         if at.is_none() {
             if let Some(t) = next_edge {
                 self.bound(t);
@@ -1030,6 +1061,26 @@ where
             signers.insert(sig.member_id.clone());
         }
     }
+    // v62.0.0 (wave W1) — an edition-2 version carries no quorum signatures:
+    // its voices are the held `group:roster` statements of the version (and
+    // the vouched ones at its door), each verified at the edition-2 door.
+    // They count as a verified signature does above: a prior founder that
+    // counts at the link's instant.
+    let edition2_voices =
+        super::edition2::trust_root_group::version_signers(directory, &next.community).await?;
+    if let Some(voices) = &edition2_voices {
+        for v in voices {
+            if !prior_founders.contains(&v.as_str())
+                || signers.contains(v)
+                || !memo
+                    .founder_counts(directory, id, v, Some(amended_at), seated_since(chain, v))
+                    .await?
+            {
+                continue;
+            }
+            signers.insert(v.clone());
+        }
+    }
     // The seats: prior's recorded members, minus every founder that does not
     // count at the link's instant — resigned, node-bearing (#925), withdrawn or
     // never conferred — so an ineligible seat never inflates the denominator.
@@ -1068,6 +1119,8 @@ where
         high_water: None,
     });
     if !verdict.admits() {
+        // v62.0.0 (wave W1) — short at an edition-2 door: the voice waits.
+        super::edition2::group::note_short();
         return Err(Error::RosterAuthorityUnauthorized {
             group_key_id: id.to_owned(),
             offered_authority_key_id: next.authority_key_id.clone(),
@@ -1075,7 +1128,11 @@ where
             shortfall: verdict.shortfall().cloned(),
         });
     }
-    if !signers.contains(&next.authority_key_id) {
+    // v62.0.0 (wave W1) — an edition-2 version has no single authority: its
+    // signature columns name its first voice in key order, which may be a
+    // voice that is not counted (a seat the version adds). The count above
+    // is its whole authorization.
+    if edition2_voices.is_none() && !signers.contains(&next.authority_key_id) {
         return Err(violation(
             id,
             super::admission::TRUST_ROOT_RULE_CHAIN,
@@ -1085,7 +1142,14 @@ where
             ),
         ));
     }
-    super::verify_community_admission(directory, next).await?;
+    // v62.0.0 (wave W1) — an edition-2 version's authority is one of its
+    // voices, verified at the edition-2 door (above: it is a counted
+    // signer); its signature columns hold the composite markers, which the
+    // earlier verifier reads only under the door's vouch. A re-judge outside
+    // the door reads the voices instead.
+    if edition2_voices.is_none() {
+        super::verify_community_admission(directory, next).await?;
+    }
     Ok(amended_at)
 }
 
@@ -1382,6 +1446,20 @@ where
             c.witness_quorum
         ))),
     );
+    // v62.0.0 (wave W1) — the edition-2 inputs: the holders of the genesis
+    // bundle in force (the holder arm and the birth's count) and the held
+    // `group:roster` voices of the community (a version's signers).
+    let bundle_holders = super::edition2::trust_root_group::bundle_holder_refs(directory).await?;
+    feed("bundle_holders", &serde_json::json!(bundle_holders));
+    let roster_voices: Vec<String> = super::edition2::trust_root_group::roster_statements(
+        directory,
+        &signed.community.community_key_id,
+    )
+    .await?
+    .iter()
+    .map(hex::encode)
+    .collect();
+    feed("edition2_roster_voices", &serde_json::json!(roster_voices));
     let family_id = accord_family_key_id();
     // PR #921 review (Codex, F1) — every read here PROPAGATES its failure. A
     // key built over a failed read keyed exactly like a genuinely empty
@@ -1526,6 +1604,72 @@ where
     stored_standing_at(directory, community_key_id, crate::host::clock::now()).await
 }
 
+/// v62.0.0 (wave W1b; CC 3.2 T3, CC 4.4.3.34, CC 2.6.1.12) — **the READ
+/// verdict** at a trust-root id, at `now`:
+///
+/// - an **edition-2 trust root** (its stored version has edition-2
+///   `group:roster` voices, [`super::edition2::trust_root_group::version_signers`]):
+///   the chain verdict ([`chain_standing_at`]) AND this node's own T3 chain,
+///   the node being its own seed ([`super::trust_root::own_chain_to`]): a live
+///   `trust:accepts:v1` edge from the node (or its owner) to the root, and
+///   the root's live `trust:charter:v1` self-edge carrying a well-formed
+///   pre-rotation commitment. A chain that holds without them is
+///   `NotRooted`, by name;
+/// - an **earlier-form** chain: read only while the earlier-form doors are
+///   open ([`super::edition2::door::earlier_form_doors_shut`]); shut, it is
+///   `NotRooted` ("nothing carries", CC 2.6.1.12).
+///
+/// The doors (admission, chain apply, supersede) read the chain verdict
+/// alone: what a version extends is a property of the chain, not of whether
+/// this node accepts the root.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn stored_standing_at<F>(
+    directory: &F,
+    community_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<StoredStanding, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let chain = chain_standing_at(directory, community_key_id, now).await?;
+    let held = match &chain {
+        StoredStanding::Rooted(h) | StoredStanding::Stalled { held: h, .. } => h.clone(),
+        StoredStanding::Absent | StoredStanding::NotRooted { .. } => return Ok(chain),
+    };
+    let edition2 = super::edition2::trust_root_group::version_signers(directory, &held.community)
+        .await?
+        .is_some();
+    if !edition2 {
+        if super::edition2::door::earlier_form_doors_shut() {
+            return Ok(StoredStanding::NotRooted {
+                reason: "an earlier-form trust-root chain: the earlier form is shut at this \
+                         node's doors (CC 2.6.1.12)"
+                    .into(),
+            });
+        }
+        return Ok(chain);
+    }
+    let own = super::trust_root::own_chain_to(directory, community_key_id, now).await?;
+    if !own.accepted {
+        return Ok(StoredStanding::NotRooted {
+            reason: "this node holds no live trust:accepts:v1 edge to the root (CC 3.2 T3: \
+                     the evaluating node's own chain)"
+                .into(),
+        });
+    }
+    if !own.chartered {
+        return Ok(StoredStanding::NotRooted {
+            reason: "the root holds no live trust:charter:v1 self-edge carrying a pre-rotation \
+                     commitment (CC 3.2 T3)"
+                .into(),
+        });
+    }
+    Ok(chain)
+}
+
 /// Re-judge the row stored at `community_key_id` AT `now` (see the module
 /// doc). Called by every read side and by the doors before deciding what an
 /// offered row extends. ROOTED ⇔ the stored row conforms, its CHAIN (stored
@@ -1538,7 +1682,7 @@ where
 /// # Errors
 ///
 /// Directory read failures.
-pub async fn stored_standing_at<F>(
+pub async fn chain_standing_at<F>(
     directory: &F,
     community_key_id: &str,
     now: chrono::DateTime<chrono::Utc>,
@@ -2689,8 +2833,9 @@ where
         .and_then(|v| v.community))
 }
 
-/// `Some(accord family id)` when `community_key_id` is a ROOTED trust-root
-/// community — the community arm of
+/// `Some(accord family id)` when `community_key_id` is a ROOTED earlier-form
+/// trust-root community; `Some(community_key_id)` itself for a ROOTED
+/// edition-2 trust root (W1b: it is its own root) — the community arm of
 /// [`trust_root_valid`](super::trust_root::trust_root_valid).
 ///
 /// # Errors
@@ -2703,9 +2848,33 @@ pub async fn rooted_community_family<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave W1b; CC 3.2 T3) — an EDITION-2 trust root is its own
+    // root: its legs (the user's acceptance edge, its own charter self-edge)
+    // are read at its own id, never at the accord family's name. Its CHAIN
+    // verdict decides the arm; the user's edge leg is the caller's to read
+    // (`trust_root_valid` asks it for ITS user, not for this node).
+    if let Some(held) = directory.lookup_community(community_key_id).await? {
+        if super::edition2::trust_root_group::version_signers(directory, &held)
+            .await?
+            .is_some()
+        {
+            return Ok(
+                match chain_standing_at(directory, community_key_id, crate::host::clock::now())
+                    .await?
+                {
+                    StoredStanding::Rooted(_) | StoredStanding::Stalled { .. } => {
+                        Some(community_key_id.to_owned())
+                    }
+                    StoredStanding::Absent | StoredStanding::NotRooted { .. } => None,
+                },
+            );
+        }
+    }
     // v51.0.0 (CC 3.2 T7; PR #943 review): a STALLED root is valid but
     // non-admitting — T4 holds, nothing detaches. Its chain still verifies
     // from an accord birth; liveness gates new admissions, never validity.
+    // v62.0.0 (wave W1b) — an earlier-form chain is read through
+    // `stored_standing`, so only while the earlier-form doors are open.
     Ok(match stored_standing(directory, community_key_id).await {
         Ok(StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }) => {
             Some(accord_family_key_id().to_owned())
@@ -2841,7 +3010,7 @@ where
     let now = crate::host::clock::now();
     check_founders_eligible(directory, community, now).await?;
     let mut memo = Memo::at(now);
-    let standing = stored_standing_at(directory, &community.community_key_id, now).await?;
+    let standing = chain_standing_at(directory, &community.community_key_id, now).await?;
     if let Some(held) = standing.held() {
         match extends(held, &chain)? {
             Extends::Same => return Ok(true),
@@ -3055,7 +3224,7 @@ where
     let id = offered.community.community_key_id.as_str();
     let now = crate::host::clock::now();
     let mut memo = Memo::at(now);
-    let standing = stored_standing_at(directory, id, now).await?;
+    let standing = chain_standing_at(directory, id, now).await?;
     let (start, replaces) = match (&standing, standing.held()) {
         (StoredStanding::Absent, _) => return Ok(None),
         (_, Some(held)) => {
@@ -3124,6 +3293,22 @@ where
                 Some(authorization),
             )
             .await?;
+        // v62.0.0 (kernel pass 2, K1, I2811) — the supersede door holds a
+        // version that does not name the held head as a tip rather than
+        // refusing it. A chain hop held as a tip (a concurrent write moved
+        // the head) did not extend the chain: it stops here, as the stale
+        // refusal stopped it before (`lost_race` reads the Conflict).
+        let head_now = directory
+            .lookup_community(id)
+            .await?
+            .map(|c| c.persist_row_hash);
+        if head_now.as_deref() != Some(row_hash(&version.community)?.as_str()) {
+            return Err(Error::Conflict(format!(
+                "trust-root chain {id}: version {} was held as a tip beside the head, not \
+                 applied over it (the head moved); retryable",
+                i + 1
+            )));
+        }
         written += 1;
     }
     Ok(Some(written))
@@ -3150,10 +3335,12 @@ where
     if !is_trust_root_grade(&stored) {
         return Ok(false);
     }
-    Ok(stored_standing(directory, community_key_id)
-        .await?
-        .held()
-        .is_some())
+    Ok(
+        chain_standing_at(directory, community_key_id, crate::host::clock::now())
+            .await?
+            .held()
+            .is_some(),
+    )
 }
 
 /// The local supersede door's half (`supersede_community_signed`): for a
@@ -3178,7 +3365,7 @@ where
 {
     let id = new.community.community_key_id.clone();
     let now = crate::host::clock::now();
-    let standing = stored_standing_at(directory, &id, now).await?;
+    let standing = chain_standing_at(directory, &id, now).await?;
     match standing.held() {
         Some(held) => {
             // v51.0.0 (CIRISPersist#938, T6 §3) — restore discipline: the
@@ -3844,32 +4031,9 @@ where
 {
     use super::steward_purge::unauthorised_reason as why;
     use ciris_verify_core::threshold::ThresholdMember;
-    let head = match stored_standing_at(directory, community_key_id, now).await? {
-        StoredStanding::Rooted(head) => head,
-        StoredStanding::Stalled { reason, .. } => {
-            return Ok(Err((
-                why::STALLED,
-                format!(
-                    "the trust root {community_key_id:?} is stalled ({reason}): valid but \
-                 non-admitting (CC 3.2 T7), so it authorises nothing new"
-                ),
-            )))
-        }
-        StoredStanding::NotRooted { reason } => {
-            return Ok(Err((
-                why::ROOT_NOT_ROOTED,
-                format!("the row at {community_key_id:?} is not rooted ({reason})"),
-            )))
-        }
-        StoredStanding::Absent => {
-            return Ok(Err((
-                why::ROOT_NOT_HELD,
-                format!(
-                "no community row at {community_key_id:?}: the claimant is not a trust root this \
-                 node holds"
-            ),
-            )))
-        }
+    let head = match trust_root_head(directory, community_key_id, now).await? {
+        Ok(head) => head,
+        Err(refusal) => return Ok(Err(refusal)),
     };
     if signatures.is_empty() {
         return Ok(Err((
@@ -3941,6 +4105,66 @@ where
             )));
         }
     }
+    count_over_trust_root(directory, &head, signers, now).await
+}
+
+/// v62.0.0 (wave T2) — the trust root's ROOTED head, or why there is none
+/// (the refusal pair [`trust_root_cosigners_over`] answers). Shared by the
+/// cosigned-envelope count and the edition-2 voice count
+/// ([`trust_root_counts_voices`]).
+///
+/// # Errors
+/// Directory reads.
+async fn trust_root_head<F>(
+    directory: &F,
+    community_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Result<Box<SignedCommunity>, (&'static str, String)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::steward_purge::unauthorised_reason as why;
+    Ok(
+        match stored_standing_at(directory, community_key_id, now).await? {
+            StoredStanding::Rooted(head) => Ok(head),
+            StoredStanding::Stalled { reason, .. } => Err((
+                why::STALLED,
+                format!(
+                    "the trust root {community_key_id:?} is stalled ({reason}): valid but \
+                 non-admitting (CC 3.2 T7), so it authorises nothing new"
+                ),
+            )),
+            StoredStanding::NotRooted { reason } => Err((
+                why::ROOT_NOT_ROOTED,
+                format!("the row at {community_key_id:?} is not rooted ({reason})"),
+            )),
+            StoredStanding::Absent => Err((
+                why::ROOT_NOT_HELD,
+                format!(
+                "no community row at {community_key_id:?}: the claimant is not a trust root this \
+                 node holds"
+            ),
+            )),
+        },
+    )
+}
+
+/// v62.0.0 (wave T2) — the trust root's own `consensus_protocol` over
+/// `signers` (seats already checked): the ONE count both purge
+/// authorisations run.
+///
+/// # Errors
+/// Directory reads.
+async fn count_over_trust_root<F>(
+    directory: &F,
+    head: &SignedCommunity,
+    signers: std::collections::BTreeSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Result<std::collections::BTreeSet<String>, (&'static str, String)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::steward_purge::unauthorised_reason as why;
     let mut seats: Vec<super::consensus::Seat> = Vec::with_capacity(head.community.members.len());
     for m in &head.community.members {
         seats.push(super::consensus::Seat {
@@ -3978,6 +4202,68 @@ where
             ),
         ))),
     }
+}
+
+/// v62.0.0 (wave T2) — **the trust root's count over an edition-2 notice's
+/// voices**: `voices` are the issuers of the notice's held statements, each
+/// verified by the edition-2 door (`cosign::edition2_voices` re-admits
+/// them), so no signature is checked here. The root must be rooted, every
+/// voice a seat of its head (a non-seat is a refusal, not a discount, as
+/// for a cosignature), and the head's protocol met
+/// ([`count_over_trust_root`], the same count).
+///
+/// # Errors
+/// `Ok(Err((reason, detail)))` as [`trust_root_cosigners_over`]; `Err` is a
+/// directory read failure.
+pub async fn trust_root_counts_voices<F>(
+    directory: &F,
+    community_key_id: &str,
+    voices: &std::collections::BTreeSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Result<std::collections::BTreeSet<String>, (&'static str, String)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let head = match trust_root_head(directory, community_key_id, now).await? {
+        Ok(head) => head,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    counts_voices_over_head(directory, &head, voices, now).await
+}
+
+/// v62.0.0 (wave T2) — [`trust_root_counts_voices`] past the standing read:
+/// every voice a seat of `head`, then the head's own protocol
+/// ([`count_over_trust_root`]). Separate so a witness can hand it a head
+/// directly.
+///
+/// # Errors
+/// As [`trust_root_counts_voices`].
+pub(crate) async fn counts_voices_over_head<F>(
+    directory: &F,
+    head: &SignedCommunity,
+    voices: &std::collections::BTreeSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Result<std::collections::BTreeSet<String>, (&'static str, String)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::steward_purge::unauthorised_reason as why;
+    let community_key_id = head.community.community_key_id.as_str();
+    if voices.is_empty() {
+        return Ok(Err((
+            why::NO_COSIGNATURE,
+            "no statement of the notice is held".to_owned(),
+        )));
+    }
+    for v in voices {
+        if !head.community.members.iter().any(|m| m.key_id == *v) {
+            return Ok(Err((
+                why::NOT_A_SEAT,
+                format!("voice {v:?} holds no seat on the trust root {community_key_id:?}"),
+            )));
+        }
+    }
+    count_over_trust_root(directory, head, voices.clone(), now).await
 }
 
 /// v53.1.7 — I547's oracle: [`live_charter_rows`] as v53.1.6 shipped it,

@@ -842,7 +842,7 @@ where
 {
     let (room, members) = audience_members(dir, scope, group).await?;
     for member in &members {
-        for o in dir.list_identity_occurrences_active(member).await? {
+        for o in crate::federation::replication_audience::devices_of(dir, member).await? {
             if o.occurrence_key_id != recipient {
                 continue;
             }
@@ -880,7 +880,7 @@ impl AudienceSnapshot {
         let (room, members) = audience_members(dir, scope, group).await?;
         let mut out = Vec::with_capacity(members.len());
         for member in members {
-            let occ = dir.list_identity_occurrences_active(&member).await?;
+            let occ = crate::federation::replication_audience::devices_of(dir, &member).await?;
             out.push((member, occ));
         }
         Ok(Self {
@@ -2239,46 +2239,78 @@ where
     emit_planned(backend, signer_key_id, axis, emit_one).await
 }
 
-/// #851 (§20.3) — **publish this node's own content-only occurrence under
-/// `identity_key_id`**: the envelope names the node as `attesting_key_id` and
-/// `occurrence_key_id`, carries this node's content-KEM pubkeys and NO
+/// #851 (§20.3) — **publish this node's own occurrence under
+/// `identity_key_id`**, carrying this node's content-KEM pubkeys and no
 /// transport destination (the node's transport identity lives on its own
-/// plane), is signed by `signer` (the node's LocalSigner), and is admitted
-/// through the gated door — so the stored row is signed-put and the plane
-/// advertises it. Admission's `signer_acts_for` lifts the node to
-/// `identity_key_id` through its live owner binding (§20.2); a node with no
-/// such binding on this backend is refused here, exactly as a peer would
-/// refuse it.
+/// plane).
+///
+/// v62.0.0 (v62 P8; O1's bind, CC 3.3.6) — an edition-2 `identity:occurrence`
+/// bind ([`crate::federation::edition2::occurrence::publish_bind`]): `signer`
+/// (this node's key, the occurrence) states its OWN voice; the bind's AUTHOR
+/// (`bind_author(identity_key_id)`: the identity, or an agent identity's
+/// owner) signs with `author_signer` when it is in hand, else its voice is
+/// returned DRAFTED for the owner's pen (`author_draft`; the signed statement
+/// is submitted through the statement door). The node never authors a bind
+/// of another identity alone: an author that would be this node, under an
+/// identity that is not this node, is refused. The self pair
+/// (`identity_key_id` = this node) lands on its one statement.
+///
+/// # Errors
+/// `InvalidArgument` for a node-authored bind of another identity, or an
+/// author signer that is not the author; `composite_signing_unavailable`;
+/// the door's refusals.
 pub async fn publish_self_occurrence_with_local_signer<B>(
     backend: &B,
     signer: &crate::signing::LocalSigner,
     identity_key_id: &str,
     device_class: &str,
     valid_until: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<crate::federation::SignedIdentityOccurrence, Error>
+    author_signer: Option<&crate::signing::LocalSigner>,
+) -> Result<crate::federation::edition2::occurrence::OccurrenceBindOutcome, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
+    use crate::federation::edition2::occurrence::{
+        bind_author, publish_bind, self_roster_head, BindTerms,
+    };
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     let me = signer.federation_id().await;
+    let ms = |t: chrono::DateTime<chrono::Utc>| u64::try_from(t.timestamp_millis()).unwrap_or(0);
+    let asserted_at_ms = ms(crate::host::clock::now());
+    let author = bind_author(backend, identity_key_id, asserted_at_ms).await?;
+    if author == me && identity_key_id != me {
+        return Err(Error::InvalidArgument(format!(
+            "publish_self_occurrence: the bind of {identity_key_id} would be authored by this \
+             node ({me}); an occurrence is authored by its identity (or an agent's owner), \
+             never by the node alone (CC 3.3.6)"
+        )));
+    }
     let kem = backend
         .load_or_init_content_kem_identity()
         .await
         .map_err(map_blob_err)?;
-    let enc = crate::federation::EncryptionPubkeys {
-        x25519_base64: kem.x25519_pubkey_b64,
-        ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
+    let decode = |what: &str, b64: &str| {
+        B64.decode(b64)
+            .map_err(|e| Error::Backend(format!("publish_self_occurrence: {what}: {e}")))
     };
-    publish_signed_content_only_occurrence(
-        backend,
-        signer,
-        identity_key_id,
-        &me,
-        device_class,
-        None,
-        enc,
-        valid_until,
-    )
-    .await
+    let terms = BindTerms {
+        author,
+        identity_key_id: identity_key_id.to_owned(),
+        occurrence_key_id: me,
+        device_class: device_class.to_owned(),
+        asserted_at_ms,
+        valid_until_ms: valid_until.map(ms),
+        hardware_attestation: None,
+        encryption_pubkeys: Some((
+            decode("x25519", &kem.x25519_pubkey_b64)?,
+            decode("ml_kem_768", &kem.ml_kem_768_pubkey_b64)?,
+        )),
+        transport: None,
+        // CC rc21: `refs.head`, the identity's current self-roster head.
+        head: self_roster_head(backend, identity_key_id).await?,
+        further_heads: Vec::new(),
+    };
+    publish_bind(backend, Some(signer), author_signer, &terms).await
 }
 
 /// v44.5.0 (§21.3, CIRISPersist#856) — **the one producer of the content-only
@@ -2304,6 +2336,10 @@ pub async fn publish_signed_content_only_occurrence<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
+    // v62.0.0 (v62 P8) — the `LocalSelfSigner` JCS envelope is the earlier
+    // form: it exists only while the earlier-form doors are open. The
+    // edition-2 producer is `edition2::occurrence::publish_bind`.
+    super::edition2::door::refuse_earlier_form("identity_occurrence")?;
     let me = signer.federation_id().await;
     // Millisecond-exact: the envelope carries the millisecond rendering and
     // the gate requires the typed instant to carry nothing below it.

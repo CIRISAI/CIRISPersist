@@ -1651,7 +1651,7 @@ mod run_two_node {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i188_two_node_sqlite() {
-        super::two_node::i188_the_minter_rewraps_its_own_history(
+        Box::pin(super::two_node::i188_the_minter_rewraps_its_own_history(
             "sqlite::memory:",
             "sqlite::memory:",
             &suffix(),
@@ -1659,7 +1659,7 @@ mod run_two_node {
                 as crate::federation::epoch_minter_invariants::bodies::Pick<
                     crate::store::sqlite::SqliteBackend,
                 >,
-        )
+        ))
         .await;
     }
 
@@ -1669,7 +1669,7 @@ mod run_two_node {
         let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
             return;
         };
-        super::two_node::i188_the_minter_rewraps_its_own_history(
+        Box::pin(super::two_node::i188_the_minter_rewraps_its_own_history(
             &a,
             &b,
             &suffix(),
@@ -1677,7 +1677,7 @@ mod run_two_node {
                 as crate::federation::epoch_minter_invariants::bodies::Pick<
                     crate::store::postgres::PostgresBackend,
                 >,
-        )
+        ))
         .await;
     }
 

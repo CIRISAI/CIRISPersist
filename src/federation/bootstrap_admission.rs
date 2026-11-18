@@ -487,6 +487,16 @@ pub mod test_support {
         attested: &str,
         attestation_type: &str,
     ) -> Attestation {
+        // v62.0.0 (E0) — edition 2 has no type-keyed wire shape: the row
+        // type is one of five (CC 2.6.1), and the family is the header's. Under
+        // the switch the family travels as a `scores` row's dimension.
+        if crate::federation::edition2::fixture_switch::emit_edition2()
+            && !crate::federation::types::attestation_type::ALL.contains(&attestation_type)
+        {
+            let mut row = scores_row(id, attester, attested, attestation_type);
+            crate::federation::tier_ingest::test_support::reseal(&mut row);
+            return row;
+        }
         let envelope = serde_json::json!({ "note": "type-keyed wire shape" });
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(attester, &envelope);

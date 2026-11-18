@@ -17,9 +17,9 @@
 //!   signed an hour ahead of `t0` is refused at `received_at = t0` and
 //!   admitted at `received_at = t0 + 1h`, with `fold_at` its own instant both
 //!   times;
-//! - (2) a fold still at receipt (`check_delegation_cycle_admission`, a
-//!   #1049 candidate): with `c → e` live until `t0 + 1h`, `e → c` closes a
-//!   cycle at `received_at = t0` and nothing at `t0 + 2h`;
+//! - (2) the cycle that was a fold at receipt (the v54 cycle gate, deleted
+//!   in v62.0.0's kernel pass 2): with `c → e` live until `t0 + 1h`, `e → c`
+//!   plans an insert at `received_at = t0` and at `t0 + 2h` alike;
 //! - (3) a fold on `fold_at` (`check_community_trust_grant_admission`, the
 //!   owner bindings in force): with the owner's binding signed at
 //!   2026-05-01, a capture grant is refused at `fold_at` a month earlier and

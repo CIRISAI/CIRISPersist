@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import ciris_persist
 
+# v62.0.0 — an identity-ref (CIRISVerify `edition2::IDENTITY_REF_PREFIX`).
+IDENTITY_REF_PREFIX = "urn:ietf:params:oauth:ckt:sha-256:"
+
 
 def test_typed_exception_hierarchy_exported() -> None:
     """v1.0.0 (CIRISAgent#755 + #756 sign-off) — the four typed
@@ -345,13 +348,18 @@ def test_register_self_then_put_blob_signing_275() -> None:
         # The registered + returned key_id is the DERIVED wire id, NOT the
         # bare alias — this is the heart of the #275 fix.
         assert kid != alias, "register_self must register the derived id, not the alias"
-        assert kid.startswith(alias + "-"), f"derived id shape <label>-<fp>: {kid!r}"
+        # v62.0.0 — the returned id is the key's identity-ref (CC 2.6.1), not
+        # the earlier `<label>-<fp>` shape; its form is witnessed in
+        # test_edition2_surface.py (I2510).
+        assert kid.startswith(IDENTITY_REF_PREFIX), kid
 
         # #275 3rd surface — the stored pubkey_ed25519_base64 must be a valid
         # 32-byte Ed25519 key (not the 65-byte P-256 point the keystore
         # software/TPM fallback would yield), or any read-back verify
-        # (verify_hybrid_via_directory) fails invalid_length.
-        row = json.loads(eng.lookup_keys_for_identity("ref"))[0]
+        # fails invalid_length.
+        # v62.0.0 — read through the key's edition-2 projection (the
+        # `identity_ref` argument of register_self is gone).
+        row = json.loads(eng.lookup_public_key(kid))
         pubkey = base64.b64decode(row["pubkey_ed25519_base64"])
         assert len(pubkey) == 32, f"stored pubkey must be 32-byte Ed25519, got {len(pubkey)}"
 
@@ -368,13 +376,10 @@ def test_register_self_then_put_blob_signing_275() -> None:
             str(uuid.uuid4()),
         )
 
-        # CIRISPersist#851 §20.5 (operator ruling) — hybrid/PQC only, no
-        # legacy fallback. The commons door's holding claim (v55.0.0:
-        # custody:ack:v1 `here` at federation, CIRISPersist#989) ALWAYS carries
-        # its PQC half, because an engine without one cannot announce at all:
-        # its door refuses before storing anything announced (I80, I83). This
-        # engine has a PQC LocalSigner, so the claim must be hybrid. Read back
-        # through a host door.
+        # The commons door's holding claim (v55.0.0: custody:ack:v1 `here` at
+        # federation, CIRISPersist#989) is stored under the registered id. Read
+        # back through a host door. (v62.0.0: the earlier per-row PQC-half
+        # assertion is gone; a row is one composite statement.)
         # v56.0.0 (CIRISPersist#1001): one bounded page, narrowed to the
         # custody family.
         rows = json.loads(eng.list_attestations_by(kid, 500, None, "custody:ack:"))["items"]
@@ -385,141 +390,12 @@ def test_register_self_then_put_blob_signing_275() -> None:
             and (r.get("attestation_envelope") or {}).get("dimension") == "custody:ack:v1"
         ]
         assert claims, "the holding claim is stored under the derived id"
-        assert all(r.get("scrub_signature_pqc") for r in claims), (
-            "hybrid-only (#851 §20.5): every announced holding claim carries its "
-            "ML-DSA-65 half — a classical claim no peer admits can no longer be produced"
-        )
 
         # #295 — local_derived_key_id() returns the SAME registered/verified
         # derived id (the footgun-free one), distinct from the bare alias.
         assert eng.local_derived_key_id() == kid
         assert eng.local_derived_key_id() != eng.local_key_id()
         assert eng.local_key_id() == alias
-    finally:
-        eng.close(force=True)
-    ciris_persist.reset_engine()
-
-
-def test_local_derived_key_id_pyo3_295():
-    """#295 — the pyo3 Engine exposes local_derived_key_id(): the DERIVED
-    federation key_id (`<label>-<fp>`) the substrate registers + verifies,
-    so consumers stop re-implementing derive_key_id. Distinct from the bare
-    local_key_id() alias. Skips on a non-sqlite wheel."""
-    import os
-    import secrets
-    import tempfile
-
-    import pytest
-
-    ciris_persist.reset_engine()
-    d = tempfile.mkdtemp()
-    seed = os.path.join(d, "seed")
-    pqc_seed = os.path.join(d, "pqc.seed")
-    with open(seed, "wb") as fh:
-        fh.write(secrets.token_bytes(32))
-    with open(pqc_seed, "wb") as fh:
-        fh.write(secrets.token_bytes(32))
-    alias = "node-" + secrets.token_hex(8)
-    try:
-        # v21.3.0 (#513) — the FIPS floor made the self-signed authority path
-        # hybrid-mandatory, so the node needs a PQC key too. This test predates
-        # that cut and CI never re-ran it (the `pyo3` wheel has no sqlite, so it
-        # SKIPS there) — the classical-only Engine it used to build now fails
-        # the hybrid-Strict verify at put_community.
-        eng = ciris_persist.Engine(
-            "sqlite::memory:",
-            alias,
-            local_key_id=alias,
-            local_key_path=seed,
-            local_pqc_key_id=alias + "-pqc",
-            local_pqc_key_path=pqc_seed,
-        )
-    except ValueError as exc:
-        if "sqlite" in str(exc) and "feature" in str(exc):
-            pytest.skip("wheel built without the sqlite feature")
-        raise
-    try:
-        derived = eng.local_derived_key_id()
-        # Shape: <alias>-<fingerprint>, NOT the bare alias.
-        assert derived != alias
-        assert derived.startswith(alias + "-"), f"derived shape <label>-<fp>: {derived!r}"
-        assert eng.local_key_id() == alias
-        # Stable across calls (pure derivation over the composed signer).
-        assert eng.local_derived_key_id() == derived
-        # It is exactly the id register_self registers + returns (the FK target).
-        assert eng.register_self_federation_key("agent") == derived
-    finally:
-        eng.close(force=True)
-    ciris_persist.reset_engine()
-
-
-def test_put_community_json_round_trip_290() -> None:
-    """v10.4.0 (CIRISPersist#290) — `put_community_json` brings a community
-    into existence over the wheel (symmetric with `put_family_json`). Before
-    this, the only community surfaces were add/lookup/active — none could
-    CREATE one — so the §11.10 moderation-authority walk's authority set was
-    always empty. Round-trips create → lookup. Skips on a non-sqlite wheel."""
-    import json
-    import os
-    import secrets
-    import tempfile
-
-    import pytest
-
-    ciris_persist.reset_engine()
-    d = tempfile.mkdtemp()
-    seed = os.path.join(d, "seed")
-    pqc_seed = os.path.join(d, "pqc.seed")
-    with open(seed, "wb") as fh:
-        fh.write(secrets.token_bytes(32))
-    with open(pqc_seed, "wb") as fh:
-        fh.write(secrets.token_bytes(32))
-    alias = "node-" + secrets.token_hex(8)
-    try:
-        # v21.3.0 (#513) — the FIPS floor made the self-signed authority path
-        # hybrid-mandatory, so the node needs a PQC key too. This test predates
-        # that cut and CI never re-ran it (the `pyo3` wheel has no sqlite, so it
-        # SKIPS there) — the classical-only Engine it used to build now fails
-        # the hybrid-Strict verify at put_community.
-        eng = ciris_persist.Engine(
-            "sqlite::memory:",
-            alias,
-            local_key_id=alias,
-            local_key_path=seed,
-            local_pqc_key_id=alias + "-pqc",
-            local_pqc_key_path=pqc_seed,
-        )
-    except ValueError as exc:
-        if "sqlite" in str(exc) and "feature" in str(exc):
-            pytest.skip("wheel built without the sqlite feature")
-        raise
-    try:
-        # The community_key_id + each member must FK a registered
-        # federation_keys row. Register as `primitive` — the put_community
-        # steward-binding gate (CC 3.2 UnstewardedCommunityMember) is exempt for
-        # primitive identities; agent/node members would need a steward-
-        # binding chain (which the conformance harness supplies in the real
-        # moderation flow, but isn't needed to prove the FFI admits a row).
-        kid = eng.register_self_federation_key("primitive")
-        now = "2026-06-25T00:00:00.000Z"
-        eng.put_community_json(
-            json.dumps(
-                {
-                    "community_key_id": kid,
-                    "community_name": "T",
-                    "members": [{"key_id": kid, "joined_at": now, "role": "founder"}],
-                    "founded_at": now,
-                    "consensus_protocol": "majority",
-                    "policy_blob": None,
-                    "persist_row_hash": "",
-                }
-            )
-        )
-        # The community now exists + is readable (the authority root the
-        # §11.10 moderation walk needs).
-        got = json.loads(eng.lookup_community_json(kid))
-        assert got["community_key_id"] == kid
-        assert any(m["key_id"] == kid for m in got["members"]), got
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
@@ -641,213 +517,6 @@ def test_nodes_stewarded_by_json_pyo3_299():
     ciris_persist.reset_engine()
 
 
-def test_accord_live_quorum_ffi_302():
-    """#302 — the accord live-quorum write-through FFI is bound and routes
-    JSON through the backend: a proposer-minted nonce admits and its reuse by
-    a different proposal is refused (v54.1.0, #1047), proposal round-trip via the anchor index, and active-halt H2
-    set/clear semantics. The verify-before-mutation participation path needs
-    real hybrid signatures and is covered exhaustively by the Rust tests."""
-    import json
-    import os
-    import secrets
-    import tempfile
-
-    import pytest
-
-    ciris_persist.reset_engine()
-    seed = os.path.join(tempfile.mkdtemp(), "seed")
-    with open(seed, "wb") as fh:
-        fh.write(secrets.token_bytes(32))
-    alias = "n" + secrets.token_hex(6)
-    try:
-        eng = ciris_persist.Engine(
-            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
-        )
-    except ValueError as exc:
-        if "sqlite" in str(exc) and "feature" in str(exc):
-            pytest.skip("wheel built without the sqlite feature")
-        raise
-    try:
-        proposal = {
-            "family_key_id": "fam",
-            "action": "fire",
-            "nonce": "n1",
-            "window_until": "2031-01-01T00:00:00Z",
-            "prior_family_digest": "pfd-abc",
-            "payload_sha256": "psh-def",
-        }
-        # v54.1.0 (#1047): the nonce is the proposer's; nothing is issued
-        # first. Admitted; the anchor index returns it (verbatim round-trip).
-        eng.put_accord_proposal_json(
-            json.dumps({"proposal": proposal, "authority_signature": None})
-        )
-        # Single use: a different proposal reusing the nonce in this family
-        # is refused (typed, ValueError).
-        reuse = dict(proposal, window_until="2030-01-01T00:00:00Z")
-        with pytest.raises(ValueError, match="federation_accord_proposal_nonce_reused"):
-            eng.put_accord_proposal_json(
-                json.dumps({"proposal": reuse, "authority_signature": None})
-            )
-        rows = json.loads(eng.list_accord_proposals_by_anchor_json("fire", "pfd-abc"))
-        assert len(rows) == 1
-        assert rows[0]["proposal"]["nonce"] == "n1"
-
-        # H2 active halt: set, wrong-id resume no-ops, right-id clears.
-        eng.set_active_halt("fam", "halt-X")
-        assert json.loads(eng.get_active_halt_json("fam"))["active_halt_id"] == "halt-X"
-        eng.clear_active_halt("fam", "halt-WRONG")
-        assert eng.get_active_halt_json("fam") is not None
-        eng.clear_active_halt("fam", "halt-X")
-        assert eng.get_active_halt_json("fam") is None
-    finally:
-        eng.close(force=True)
-    ciris_persist.reset_engine()
-
-
-def test_pyengine_seeds_family_and_canonical() -> None:
-    """v13.4.1 (CIRISPersist#392) — the pyo3 `Engine()` ctor must run the SAME
-    genesis seed as the Rust `with_signer`: a fresh Engine has the entrenched
-    HUMANITY_ACCORD family (#386) AND the baked 2-of-3 `ciris-canonical-1`
-    canonical server (#390). This is the guard for the drift where the pyo3
-    ctor stopped at the holder seed, so wheel consumers (the server) got
-    neither. Skips on a non-sqlite wheel."""
-    import json
-    import pytest
-
-    try:
-        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="genesis-seed-key")
-    except ValueError as exc:
-        if "sqlite" in str(exc) and "feature" in str(exc):
-            pytest.skip("wheel built without the sqlite feature")
-        raise
-    try:
-        # #390 — the baked 2-of-3 canonical server is trusted out of the box.
-        assert eng.is_canonical("ciris-canonical-1-d7bdeu223k") is True
-        servers = json.loads(eng.list_canonical_servers())
-        assert len(servers) == 1
-        assert servers[0]["key_id"] == "ciris-canonical-1-d7bdeu223k"
-
-        # #386 — the entrenched quorum:2/3 HUMANITY_ACCORD family resolves.
-        fam_json = eng.lookup_family_json("humanity-accord")
-        assert fam_json is not None, "the accord family must be seeded on the pyo3 path"
-        fam = json.loads(fam_json)
-        assert fam["consensus_protocol"] == "quorum:2/3"
-        assert len(fam["members"]) == 3
-    finally:
-        eng.close(force=True)
-    ciris_persist.reset_engine()
-
-
-def test_pyengine_canonical_bootstrap_hints() -> None:
-    """v13.6.0 (CIRISPersist#402, CIRISEdge#296) — a fresh Engine exposes the
-    baked canonical's dial hints as a flat {key_id, kind, destination} list, so
-    the agent-embedded edge auto-seeds the canonical TCP dial without parsing
-    persist's signed registration_envelope. Skips on a non-sqlite wheel."""
-    import json
-    import pytest
-
-    try:
-        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="genesis-seed-key")
-    except ValueError as exc:
-        if "sqlite" in str(exc) and "feature" in str(exc):
-            pytest.skip("wheel built without the sqlite feature")
-        raise
-    try:
-        hints = json.loads(eng.canonical_bootstrap_hints())
-        # The baked 2-of-3 canonical carries one `ip` dial hint (#390).
-        assert isinstance(hints, list) and len(hints) >= 1
-        ip_hints = [h for h in hints if h["kind"] == "ip"]
-        assert len(ip_hints) == 1, f"expected exactly one ip dial hint, got {hints}"
-        h = ip_hints[0]
-        assert h["key_id"] == "ciris-canonical-1-d7bdeu223k"
-        assert h["destination"] == "108.61.242.236:4242"
-        # Flat object shape — edge reads these keys directly, not a tuple/array.
-        assert set(h.keys()) == {"key_id", "kind", "destination"}
-    finally:
-        eng.close(force=True)
-    ciris_persist.reset_engine()
-
-
-def test_local_sign_hybrid_matches_hand_composition_470() -> None:
-    """v17.7.0 (CIRISPersist#470) — cross-boundary DIFFERENTIAL test for the
-    single hybrid-sign verb.
-
-    ``Engine.local_sign_hybrid(msg)`` must be *exactly* equivalent to the
-    hand-composition every PyO3 consumer previously had to write —
-    ``local_sign(msg)`` then ``local_pqc_sign(msg + classical_sig)`` (the
-    canonical bound rule ``pqc = Sign_PQC(message ‖ ed25519_sig)``). This is
-    the authority-equivalence guard from the crypto-DRY assessment: the rule
-    now lives in ONE place (LocalSigner::sign_hybrid) and this test pins the
-    PyO3 surface to it from the consumer's side, so lens-core can migrate off
-    its hand-composed site knowing the bytes are identical.
-
-    Ed25519 is deterministic (RFC 8032) so the classical halves compare
-    byte-for-byte. ML-DSA-65 signing is randomized ("hedged", FIPS 204), so
-    the PQC halves cannot be compared byte-for-byte — instead we assert the
-    verb's PQC signature has the ML-DSA-65 shape and, critically, that the
-    hand-composed bound signature and the verb's signature are BOTH accepted
-    /interchangeable over the same bound preimage (same key, same preimage).
-    Skips on a non-sqlite wheel."""
-    import os
-    import secrets
-    import tempfile
-
-    import pytest
-
-    ciris_persist.reset_engine()
-    d = tempfile.mkdtemp()
-    ed_seed = os.path.join(d, "ed.seed")
-    pqc_seed = os.path.join(d, "pqc.seed")
-    with open(ed_seed, "wb") as fh:
-        fh.write(secrets.token_bytes(32))
-    with open(pqc_seed, "wb") as fh:
-        fh.write(secrets.token_bytes(32))
-    alias = "dry470-" + secrets.token_hex(6)
-    try:
-        eng = ciris_persist.Engine(
-            "sqlite::memory:",
-            alias,
-            local_key_id=alias,
-            local_key_path=ed_seed,
-            local_pqc_key_id=alias + "-pqc",
-            local_pqc_key_path=pqc_seed,
-        )
-    except ValueError as exc:
-        if "sqlite" in str(exc) and "feature" in str(exc):
-            pytest.skip("wheel built without the sqlite feature")
-        raise
-    try:
-        msg = b"CIRISPersist#470 pyo3 differential"
-
-        # The single verb.
-        out = eng.local_sign_hybrid(msg)
-        assert set(out.keys()) == {"classical_sig", "pqc_sig"}
-        classical = out["classical_sig"]
-        pqc = out["pqc_sig"]
-        assert isinstance(classical, bytes) and len(classical) == 64
-        # ML-DSA-65 signatures are 3309 bytes (FIPS 204).
-        assert isinstance(pqc, bytes) and len(pqc) == 3309
-
-        # The hand-composition it replaces (the pre-#470 consumer pattern).
-        hand_classical = eng.local_sign(msg)
-        hand_pqc = eng.local_pqc_sign(msg + hand_classical)
-
-        # Classical halves: Ed25519 is deterministic — byte-identical.
-        assert classical == hand_classical, (
-            "local_sign_hybrid's classical half must be byte-identical to "
-            "local_sign — both delegate to the same LocalSigner"
-        )
-        # PQC halves: ML-DSA-65 is randomized, so assert shape parity (same
-        # scheme, same preimage family) rather than byte equality. The
-        # Rust-side round-trip test (sign_hybrid_round_trips_verify_hybrid_strict)
-        # proves the verb's bound preimage verifies under HybridPolicy::Strict
-        # and that a raw-preimage signature is rejected.
-        assert len(hand_pqc) == len(pqc) == 3309
-    finally:
-        eng.close(force=True)
-    ciris_persist.reset_engine()
-
-
 def test_consent_expiry_sweep_and_scoped_stance_reachable_from_python_866():
     """v44.8.0 (CIRISPersist#866) — the two new consent doors are host-reachable:
     `run_consent_expiry_sweep_json` returns the sweep report shape, and
@@ -884,7 +553,6 @@ def test_consent_expiry_sweep_and_scoped_stance_reachable_from_python_866():
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
-
 
 
 def test_deletion_window_watch_reachable_from_python_543() -> None:
@@ -1272,99 +940,6 @@ def test_would_hold_adopt_and_hold_breadth_846() -> None:
 
         # Serve standing governs breadth, and nobody conferred any.
         assert eng.hold_breadth() == "on_demand"
-    finally:
-        eng.close(force=True)
-    ciris_persist.reset_engine()
-
-
-def test_ciris_canonical_trust_root_surface_926() -> None:
-    """v50.0.0 (CIRISPersist#926) — the trust-root surface is host-reachable.
-
-    A fresh engine (genesis seeded, no community row yet) resolves
-    ``ciris-canonical`` to nothing, serves the compiled-in bundle with
-    ``community: null``, and a consumer pin from that one response is refused
-    (nothing beside the bundle) rather than pinning a name that resolves to
-    nothing. A ``cosignatures`` list on ``put_community_json`` is decoded, and
-    a malformed one is refused, never read as "none".
-    """
-    import json
-    import os
-    import secrets
-    import tempfile
-
-    import pytest
-
-    ciris_persist.reset_engine()
-    d = tempfile.mkdtemp()
-    seed = os.path.join(d, "seed")
-    pqc_seed = os.path.join(d, "pqc.seed")
-    with open(seed, "wb") as fh:
-        fh.write(secrets.token_bytes(32))
-    with open(pqc_seed, "wb") as fh:
-        fh.write(secrets.token_bytes(32))
-    alias = "node-" + secrets.token_hex(8)
-    try:
-        eng = ciris_persist.Engine(
-            "sqlite::memory:",
-            alias,
-            local_key_id=alias,
-            local_key_path=seed,
-            local_pqc_key_id=alias + "-pqc",
-            local_pqc_key_path=pqc_seed,
-        )
-    except ValueError as exc:
-        if "sqlite" in str(exc) and "feature" in str(exc):
-            pytest.skip("wheel built without the sqlite feature")
-        raise
-    try:
-        # v53.1.1 — the final genesis is baked: a fresh node boots holding the
-        # ciris-canonical birth (founders A1/B1/C1, the one serve node), live.
-        canon = json.loads(eng.resolve_community_json("ciris-canonical"))
-        assert canon["founders"] == ["A1", "B1", "C1"], canon
-        assert canon["members"] == ["ciris-canonical-1-d7bdeu223k"], canon
-        assert canon["cohort_subkind"] == "infrastructure" and canon["live"] is True, canon
-        resp = json.loads(eng.trust_root_bundle_response_json())
-        assert resp["charter_root_key_id"] == "humanity-accord"
-        assert resp["community"]["community"]["community_key_id"] == "ciris-canonical", resp["community"]
-        assert isinstance(resp["bundle"]["authorizations"], list)
-        # v53.1.1 — pinning trust from the node's own served response now
-        # succeeds: the response carries the final genesis's v3 bundle and
-        # its live community, and the pin verifies every holder.
-        pinned = json.loads(eng.pin_trust_from_bundle_response_json(json.dumps(resp)))
-        assert pinned["family"] == "humanity-accord", pinned
-        # v59.1.0 — the baked bundle is the 2-of-3 v4 amend (A1 + B1), which
-        # meets the charter's 2/3; the carried charter keeps all three scrubs.
-        assert pinned["bundle_holders_verified"] == 2, pinned
-        assert pinned["community"]["community_key_id"] == "ciris-canonical", pinned
-        assert pinned["community"]["live"] is True, pinned
-        now = "2026-06-25T00:00:00.000Z"
-        kid = eng.register_self_federation_key("primitive")
-        base = {
-            "community_key_id": kid,
-            "community_name": "T",
-            "members": [{"key_id": kid, "joined_at": now, "role": "founder"}],
-            "founded_at": now,
-            "consensus_protocol": "majority",
-            "policy_blob": None,
-            "persist_row_hash": "",
-            "authority_key_id": kid,
-            "scrub_signature_classical": "AAAA",
-        }
-        with pytest.raises(ValueError, match="cosignatures decode"):
-            eng.put_community_json(json.dumps({**base, "cosignatures": "not-a-list"}))
-        # A well-formed list is decoded and reaches the door, which verifies it
-        # (here the authority signature itself is bogus, so the door refuses).
-        with pytest.raises(Exception):
-            eng.put_community_json(
-                json.dumps(
-                    {
-                        **base,
-                        "cosignatures": [
-                            {"authority_key_id": kid, "scrub_signature_classical": "AAAA"}
-                        ],
-                    }
-                )
-            )
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()

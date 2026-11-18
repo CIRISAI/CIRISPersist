@@ -566,83 +566,116 @@ impl GenesisPosture {
     }
 }
 
+/// v62.0.0 (slice C1) — the genesis in force, read for the posture: Verify's
+/// reader over the held `ceg-genesis-bundle/2` voices and the rows they name
+/// (`edition2::genesis::genesis_in_force`). Every leg below is read from it.
+async fn bundle_in_force<D>(
+    dir: &D,
+) -> Result<crate::federation::edition2::genesis::GenesisInForce, GenesisFault>
+where
+    D: FederationDirectory + ?Sized,
+{
+    crate::federation::edition2::genesis::genesis_in_force(dir)
+        .await
+        .map_err(|e| GenesisFault::unreadable(GenesisLeg::Anchor, e.to_string()))
+}
+
+/// The roster leg of a genesis in force: a holder every tip seats.
+fn roster_leg(
+    g: &crate::federation::edition2::genesis::GenesisInForce,
+) -> Result<(), GenesisFault> {
+    if g.held == 0 {
+        return Err(GenesisFault::absent(
+            GenesisLeg::Anchor,
+            "no `ceg-genesis-bundle/2` is held: a node before its genesis (CC 2.6.1.11)",
+        ));
+    }
+    // The door stores only bundles Verify reads Valid, and the reader is
+    // pure: a held bundle that no longer reads Valid was altered under the
+    // node (a voice or a named row changed or removed).
+    if g.held > g.valid.len() {
+        return Err(GenesisFault::divergent(
+            GenesisLeg::Anchor,
+            format!(
+                "{} of the {} held genesis bundles no longer read Valid: a voice or a named                  row was altered or removed",
+                g.held - g.valid.len(),
+                g.held
+            ),
+        ));
+    }
+    if g.common.is_none() {
+        return Err(GenesisFault::absent(
+            GenesisLeg::Anchor,
+            "a fork of the genesis (two Valid first bundles): a reader roots on neither              (CC 2.6.1.11)",
+        ));
+    }
+    if g.holders().is_empty() {
+        return Err(GenesisFault::absent(
+            GenesisLeg::Anchor,
+            "the tips of the genesis in force share no holder under one key (CC 2.6.1.11)",
+        ));
+    }
+    Ok(())
+}
+
 /// v31.0.0 (CIRISPersist#648) — the SEAT legs: the roster and the threshold.
 ///
-/// The reporting predicate. [`genesis_posture`] extends it with
-/// [`GenesisLeg::Canonical`]; [`require_constitutional_root`] narrows it to
-/// [`accord_roster_seated`] alone. All three walk the same legs in the same
-/// order, differing only in how far they get to before answering.
+/// v62.0.0 (slice C1): both are the genesis bundle in force. Its holders are
+/// the roster and its charter the threshold, so this is
+/// [`accord_roster_seated`].
 pub async fn constitutional_seat<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: FederationDirectory + ?Sized,
 {
-    accord_roster_seated(dir).await?;
-    super::verify_family_seeded(dir).await
+    accord_roster_seated(dir).await
 }
 
 /// v31.0.0 (CIRISPersist#648) — **the leg a conferral gate actually rests on**:
-/// the baked A1/B1/C1 accord-holder rows, live and non-divergent.
+/// the accord's roster, live and non-divergent.
 ///
-/// The REPORTING form, used by [`constitutional_seat`] and [`genesis_posture`].
-/// The gate form is [`require_seated_accord_roster`], which asks the same
-/// question of whichever roster the calling gate is tallying against — see
-/// there for why the two differ.
+/// v62.0.0 (slice C1): the holders of the `ceg-genesis-bundle/2` in force
+/// (Verify's placement, common to every tip). `Absent` with no bundle held,
+/// on a fork of the genesis, or with no holder common to the tips;
+/// `Divergent` when a held bundle no longer reads Valid; `Unreadable` when
+/// the store cannot be read.
 pub async fn accord_roster_seated<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: FederationDirectory + ?Sized,
 {
-    super::verify_anchor_seeded(dir).await
+    roster_leg(&bundle_in_force(dir).await?)
 }
 
 /// v31.0.0 (CIRISPersist#648) — **the read-time posture**, re-derived from the
 /// directory on every call rather than remembered from boot.
 ///
 /// Recomputed rather than cached because the transition this issue exists for
-/// happens WHILE the process runs: an operator boots 31.0.0 pre-genesis, runs
-/// the ceremony against it, and the node is rooted without a restart. A posture
-/// captured at construction would report `pre_genesis` forever and the banner
-/// would outlive the condition it warns about.
+/// happens WHILE the process runs: an operator boots pre-genesis, the genesis
+/// bundle arrives at the import door, and the node is rooted without a
+/// restart.
 ///
-/// Mirrors [`seed_family_and_canonical`](super::seed_family_and_canonical)'s
-/// leg order and its test-anchor skip, so the posture cannot disagree with what
-/// the seeder actually attempted.
+/// v62.0.0 (slice C1): read from the `ceg-genesis-bundle/2` in force alone.
+/// The roster leg ([`accord_roster_seated`]), then the canonical leg: a seat
+/// (`serve_nodes`) every tip lists alike (ruling C). The bundle carries the
+/// charter, so there is no separate family, delegation or community leg.
 pub async fn genesis_posture<D>(dir: &D) -> GenesisPosture
 where
     D: FederationDirectory + ?Sized,
 {
-    if let Err(f) = constitutional_seat(dir).await {
+    let g = match bundle_in_force(dir).await {
+        Ok(g) => g,
+        Err(f) => return f.into(),
+    };
+    if let Err(f) = roster_leg(&g) {
         return f.into();
     }
-    // #449 — under a live test-anchor override the baked 2-of-3 canonical is
-    // not seedable by construction (its A1/B1 scrubs cannot verify against the
-    // swapped SW roster), so the seeder skips it and the posture must skip it
-    // too. Dead code on a prod build.
-    // #973 — with a software ceremony installed the seeder runs every leg
-    // against it, so the posture evaluates every leg too.
-    if super::test_anchor_override_active() && !super::test_ceremony_installed() {
-        return GenesisPosture::Entrenched;
+    if g.seats().is_empty() {
+        return GenesisFault::absent(
+            GenesisLeg::Canonical,
+            "the genesis in force seats no serve node every tip lists alike (ruling C)",
+        )
+        .into();
     }
-    if let Err(f) = super::verify_canonical_seeded(dir).await {
-        return f.into();
-    }
-    // v31.0.0 (CIRISPersist#648) — the FOURTH leg, and the one 31.0.0 actually
-    // fails. The three legs above are ALL the key plane, which the stale baked
-    // seed still installs cleanly; only the delegation plane is refused by the
-    // #643 mirror and #598 instant gates. Without this check a 31.0.0 node
-    // reports `entrenched`, renders no banner, and a server enables agent mode
-    // — on a root whose conferral rows can never be installed. A posture that
-    // cannot see the plane conferring everything is not reporting on a trust
-    // root; it is reporting on a key list.
-    if let Err(f) = super::verify_delegation_plane_seeded(dir).await {
-        return f.into();
-    }
-    // #973 — the FIFTH leg, evaluated only when a ceremony has baked the
-    // community asset. With no asset compiled in this is `Ok` without a read,
-    // so the posture is exactly what it was before the leg existed.
-    match super::verify_canonical_community_seeded(dir).await {
-        Ok(()) => GenesisPosture::Entrenched,
-        Err(f) => f.into(),
-    }
+    GenesisPosture::Entrenched
 }
 
 /// v31.0.0 (CIRISPersist#648) — **the enumerated fail-closed set.**
@@ -777,10 +810,28 @@ where
 /// the wrapper the non-`_over_roster` gates use, mirroring how
 /// [`check_canonical_role_admission`](crate::federation::admission::check_canonical_role_admission)
 /// wraps its own `_over_roster` core.
+///
+/// v62.0.0 (slice C1): the roster is first the holders of the
+/// `ceg-genesis-bundle/2` in force ([`accord_roster_seated`]). A store that
+/// cannot be read refuses `unreadable`; a divergent one refuses `divergent`.
 pub async fn require_constitutional_root<D>(dir: &D, operation: &'static str) -> Result<(), Error>
 where
     D: FederationDirectory + ?Sized,
 {
+    match accord_roster_seated(dir).await {
+        Ok(()) => return Ok(()),
+        Err(f @ (GenesisFault::Divergent { .. } | GenesisFault::Unreadable { .. })) => {
+            return Err(Error::NoConstitutionalRootYet {
+                operation,
+                leg: f.leg(),
+                fault_kind: f.as_str(),
+                detail: f.detail().to_owned(),
+            });
+        }
+        Err(GenesisFault::Absent { .. }) => {}
+    }
+    // TODO(json-cut): the earlier-form roster, until the JSON doors shut and
+    // the baked JSON genesis is deleted (slice F / C5). Both empty refuses.
     require_seated_accord_roster(
         dir,
         operation,

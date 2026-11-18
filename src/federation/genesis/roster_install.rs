@@ -8,6 +8,11 @@
 //! door for them, so a labelled `trust:accepts` edge naming the imported head
 //! deferred for ever as "head not yet held".
 //!
+//! v62.0.0 (json-cut, slice C5): the bundle/1 import door
+//! (`install_genesis_bundle_roster`) and its report types are deleted. A
+//! bundle/2 arrives through `edition2::genesis::put_genesis_bundle`; what is
+//! left here is the boot seed's accord-head rule.
+//!
 //! # The successor rule for a genesis head
 //!
 //! CC 3.2 T6: a genesis head carries an empty `prev_head_digest`, so a second
@@ -38,7 +43,7 @@
 //! the same settings"); an IMPORTED bundle never replaces a rooted row (the
 //! #926 rule — the accord's lever over a rooted community is its founders).
 
-use super::{bundle_family_charter_digest, GenesisBakeReport, GenesisBundle};
+use super::{bundle_family_charter_digest, GenesisBundle};
 use crate::federation::types::{Family, SignedFamily};
 use crate::federation::{Error, FederationDirectory};
 use serde::{Deserialize, Serialize};
@@ -49,7 +54,9 @@ use serde::{Deserialize, Serialize};
 pub enum RosterSource {
     /// The compiled-in bundle, at boot.
     Bake,
-    /// A verified bundle received on a live node (`install_genesis_bundle_roster`).
+    /// A bundle received on a live node. v62.0.0 (json-cut C5): the bundle/1
+    /// import door is deleted; no producer of this variant remains.
+    /// TODO(json-cut C5): remove with the boot seed after the E flip.
     Import,
 }
 
@@ -68,27 +75,6 @@ pub enum RosterRecordOutcome {
         /// Why, by name.
         reason: String,
     },
-}
-
-/// One roster record's report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RosterRecordReport {
-    /// `family` or `community`.
-    pub kind: String,
-    /// The record's key id.
-    pub id: String,
-    /// What happened.
-    #[serde(flatten)]
-    pub outcome: RosterRecordOutcome,
-}
-
-/// What [`install_genesis_bundle_roster`] did.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RosterInstall {
-    /// The serve-node and delegation-plane bake (`bake_assembled_genesis`).
-    pub bake: GenesisBakeReport,
-    /// The roster records, in bundle order (family, then community).
-    pub records: Vec<RosterRecordReport>,
 }
 
 /// The accord family's genesis head a bundle puts in force: the signed record
@@ -245,118 +231,6 @@ where
         "genesis roster: the held accord head is replaced by the bundle's genesis head"
     );
     Ok(RosterRecordOutcome::Successor)
-}
-
-/// **Install a bundle's roster records** — the accord family's genesis head
-/// ([`install_accord_genesis_head`]) and the `ciris-canonical` birth (the boot
-/// seed's [`seed_canonical_community_from`](super::seed_canonical_community_from)).
-/// A record the bundle does not carry is not reported.
-///
-/// # Errors
-///
-/// Directory failures.
-pub async fn install_bundle_roster_records<D>(
-    dir: &D,
-    bundle: &GenesisBundle,
-    source: RosterSource,
-) -> Result<Vec<RosterRecordReport>, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    let mut out = Vec::new();
-    let signed = bundle_accord_genesis(bundle);
-    out.push(RosterRecordReport {
-        kind: "family".to_owned(),
-        id: signed.family.family_key_id.clone(),
-        outcome: install_accord_genesis_head(dir, bundle).await?,
-    });
-    let canon = crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID;
-    if let Some(birth) = bundle.community_record(canon) {
-        use super::CommunityLegOutcome as C;
-        let outcome = match super::seed_canonical_community_from(dir, Some(birth), source).await {
-            Ok(C::Installed) => RosterRecordOutcome::Installed,
-            Ok(C::AlreadyHeld) => RosterRecordOutcome::AlreadyHeld,
-            Ok(C::Replaced) => RosterRecordOutcome::Successor,
-            Ok(C::HeldDiffers) => RosterRecordOutcome::Refused {
-                reason: "community_held_differs: this node holds another record under the id; a \
-                         held birth is never replaced by an import, and the bake replaces only a prior-genesis birth"
-                    .to_owned(),
-            },
-            Ok(C::NotBaked) => unreachable!("an asset was passed"),
-            Err(f) => RosterRecordOutcome::Refused {
-                reason: format!("community_birth_refused: {f:?}"),
-            },
-        };
-        out.push(RosterRecordReport {
-            kind: "community".to_owned(),
-            id: canon.to_owned(),
-            outcome,
-        });
-    }
-    Ok(out)
-}
-
-/// v53.1.0 — **install a verified genesis bundle on a live node** (the import
-/// door; CIRISServer's `/v1/trust-root/import`).
-///
-/// 1. [`verify_ceremony_outputs`](super::verify_ceremony_outputs) — the
-///    bundle's holders must be this build's accord roster, its quorum, family
-///    record and birth must verify on a throwaway directory. A refusal writes
-///    NOTHING ([`Error::GenesisBundleInvalid`] naming the stage).
-/// 2. [`bake_assembled_genesis`](super::bake_assembled_genesis) — serve nodes
-///    and the delegation plane, with its own anti-rollback rule.
-/// 3. [`install_bundle_roster_records`] — the same function the boot seed
-///    uses.
-///
-/// This node's own genesis posture is not touched: the posture is computed
-/// against the compiled bundle on every read, and nothing here changes what is
-/// compiled in. Re-importing the same bundle writes nothing and reports
-/// `AlreadyPresent` / `AlreadyHeld`.
-///
-/// A bundle of ANOTHER accord (other holders) is refused at step 1: a
-/// version-3 bundle names the reserved `humanity-accord` / `ciris-canonical`
-/// ids, and this node verifies those against its own roster.
-///
-/// # Errors
-///
-/// [`Error::GenesisBundleInvalid`] on a refused bundle; the bake's errors;
-/// directory failures.
-///
-/// v60.0.0 (CIRISPersist#1002): step 1's throwaway directory is provisioned by
-/// `scratch` (normally the same backend as `dir`; see
-/// [`GenesisScratch`](super::scratch::GenesisScratch)).
-pub async fn install_genesis_bundle_roster<D>(
-    dir: &D,
-    scratch: &dyn super::scratch::GenesisScratch,
-    bundle: &GenesisBundle,
-) -> Result<RosterInstall, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    let json = serde_json::to_string(bundle)
-        .map_err(|e| Error::Backend(format!("serialize the bundle: {e}")))?;
-    super::verify_ceremony_outputs(&json, scratch)
-        .await
-        .map_err(|r| Error::GenesisBundleInvalid {
-            detail: r.to_string(),
-        })?;
-    // v53.1.2 (CIRISPersist#984 row 11) — the accord head FIRST, as the boot
-    // seed does (`seed_family_and_canonical` runs `seed_accord_family` before
-    // the delegation plane). The bake admits the charter THROUGH the family it
-    // names, so on a node holding no accord head the charter and lifecycle
-    // rows were skipped ("no constitutional trust root yet"); the head and
-    // birth then landed naming a charter no row held, and the next boot's
-    // compiled rows — of any vintage — filled the holes and took the head and
-    // the birth with them (`charter_superseded`). Only the node holding NO
-    // accord head takes the early install: a held head is judged once, by
-    // the successor rule, in the post-bake pass that reports it.
-    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
-    if dir.lookup_family(accord).await?.is_none() {
-        let _ = install_accord_genesis_head(dir, bundle).await?;
-    }
-    let bake = super::bake_assembled_genesis(dir, &json).await?;
-    let records = install_bundle_roster_records(dir, bundle, RosterSource::Import).await?;
-    Ok(RosterInstall { bake, records })
 }
 
 #[cfg(all(test, feature = "sqlite"))]

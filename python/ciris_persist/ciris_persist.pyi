@@ -104,6 +104,21 @@ class PoolExhausted(RuntimeError):
     / ``store_pool_exhausted`` / ``audit_pool_exhausted`` /
     ``secrets_pool_exhausted``)."""
 
+class Waiting(ValueError):
+    """v62.0.0 (CC 2.7) — a federation refusal that says WAIT: a row this
+    one depends on (a signer's key record, a row it names, a roster's
+    protocol, a delegation edge) is not held on this node yet. Nothing was
+    stored, and the SAME row re-offered after that lands can be admitted:
+    park it and re-offer, do not drop it. A ``ValueError`` subclass (every
+    wait arm raised ``ValueError`` before v62), so ``except ValueError``
+    still catches it; catch ``Waiting`` first to tell a wait from a terminal
+    refusal. The message still leads with the kind token. Attributes:
+    ``kind`` (the token, e.g. ``federation_attester_key_unknown``,
+    ``federation_link_not_held``) and ``retryable`` (always ``True``)."""
+
+    kind: str
+    retryable: bool
+
 class NodeIdentityRequired(PersistError):
     """v57.0.0 (CIRISPersist#988) — an act that must record a
     ``hard_case:{kind}`` row (an erasure, a peer removal) was refused before
@@ -630,29 +645,6 @@ class Engine:
     def add_peer_record_json(self, payload_json: str) -> None:
         """(derived) deontic — Federation directory: add a peer record. Atomically inserts a federation_keys identity row + a federation_peer_metadata row with default trust = "u..."""
 
-    def adopt_scrub_upgrade(
-        self,
-        signed_key_record_json: str,
-    ) -> str:
-        """v12.2.0 (CIRISPersist#351) — adopt-scrub-**upgrade** this node's
-        own key row: replace its self-signed record with the
-        accord-anchor-scrubbed one (same `key_id` + pubkey) so it can root.
-        FFI mirror of the Rust `Engine.adopt_scrub_upgrade`.
-
-        `signed_key_record_json` is the granting-authority-scrubbed
-        `SignedKeyRecord` (`scrub_key_id` = an accord holder). Verifies the
-        scrub-signature (Strict, same gate as `register_federation_key`)
-        THEN the backend's monotonic gated UPDATE.
-
-        Returns:
-            ``"upgraded"`` or ``"already_adopted"``.
-
-        Raises:
-            ValueError: JSON decode failure, verification failure, pubkey
-                change, anchored-to-a-different-record, or missing row.
-            RuntimeError: backend / IO error.
-        """
-
     def adopt_sealed_blob_json(self, payload_json: str) -> str:
         """(derived) deontic — #846 (BLOB_REPLICATION.md §6.1) — adopt a sealed blob received from a peer: store the AtRestEnvelope verbatim at the tier and under the (community,..."""
 
@@ -673,6 +665,70 @@ class Engine:
 
     def apply_replicated_key_grant(self, signed_key_grant_json: str) -> str:
         """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13), v55.0.0 (#989, CC 3.3.2 rc7) — admit one replicated key-grant row and project its wrap. FFI mirror..."""
+
+    def apply_replicated_statement(self, statement: bytes, offered_row_id: str) -> str:
+        """v62.0.0 — the replicated edition-2 statement door: one ``COSE_Sign1``
+        statement as a peer delivered it, under the 64-hex id the peer offered
+        it as, at tier ``federation``, through every gate
+        ``put_edition2_statement`` runs. The edition-2 twin of
+        ``apply_replicated_attestation``.
+
+        Returns JSON; every outcome advances the sender's cursor:
+        ``{"outcome": "admitted"|"unchanged", "plane", "row_id", "new",
+        "advances_cursor": true}`` or ``{"outcome": "refused", "reason":
+        "store_conflict", "advances_cursor": true}``.
+
+        Raises:
+            ValueError: ``federation_attester_key_unknown`` (retryable: the
+                signer's key record is not held; do NOT advance the cursor);
+                ``federation_malformed_row: edition2: <token>`` and every
+                attestation-gate refusal, as ``put_edition2_statement``; a
+                malformed ``offered_row_id``.
+        """
+
+    def amendment_standings_json(self, agent: str) -> str:
+        """v62.0.0 (CC 2.7, CC 3.1.5) — the standing of every identity
+        amendment about ``agent``, read now. An amendment is admitted and HELD
+        while the approval it cites does not authorise it; a later approval
+        makes it count with nothing re-written. Ask this, never the bare row's
+        presence. Retraction is not applied (the reader's usual fold).
+
+        Returns a JSON list: ``[{"row_id": str, "standing": "in_force" | "held",
+        "token": str | null, "reason": str | null, "detail": str | null}]``;
+        ``token`` is ``identity_amendment_unauthorized`` or
+        ``amendment_digest_mismatch``.
+        """
+
+    def bundles_in_force_json(self) -> str:
+        """v62.0.0 (CC 2.6.1.11, CC 2.7.8) — the genesis bundles in force on
+        this node: the tips of the held genesis lineage as CIRISVerify places
+        them. The bundle/2 accessor that replaces reading bundle/1
+        ``serve_nodes[].record.key_id``.
+
+        Returns a JSON list, empty when no bundle is held, one entry per tip:
+        ``{"object_id": hex, "version": int, "prev": hex | null,
+        "asserted_at": ms, "family_key_id": str, "holders": [identity-ref, ...],
+        "serve_nodes": [identity-ref, ...], "counted": [identity-ref, ...]}``.
+        Two entries are a fork: a reader takes only what both name.
+        """
+
+    def put_edition2_statement(self, statement: bytes, offered_row_id: str | None = None) -> str:
+        """v62.0.0 (CC 2.6.1, 2.6.1.12) — the edition-2 statement door, local
+        or replicated: one ``COSE_Sign1`` (tag 18) statement as received.
+        ``offered_row_id`` is the 64-hex id the carrier names it by, if any;
+        it must be the id the bytes compute.
+
+        Returns JSON ``{"plane": "key_plane"|"voice"|"row"|"pending", "row_id": hex,
+        "new": bool}``.
+
+        Raises:
+            ValueError: ``federation_malformed_row: edition2: <token>``
+                (``earlier_form_object`` for a JSON object or bytes in no form,
+                ``row_id_mismatch``, ``row_ref_edition_1``, ...); the retryable
+                ``federation_attester_key_unknown``; every attestation-gate
+                refusal exactly as ``put_attestation`` raises it; a malformed
+                ``offered_row_id``.
+        """
 
     def apply_replicated_key_record(
         self,
@@ -718,9 +774,6 @@ class Engine:
 
     def apply_replicated_purge_json(self, bundle_json: str) -> str:
         """(derived) deontic — v54.1.0 (CIRISPersist#1046) — apply a peer's purge bundle: the notice is re-verified against THIS node's trust root and the digest re-derived from..."""
-
-    def bake_assembled_genesis(self, bundle_json: str) -> str:
-        """(derived) deontic — v19.1.0 (CIRISPersist#490) — bake an assembled genesis trust-root bundle (the ceremony artifact JSON, the operator-saved genesis_v2.json). Verifies... [build-conditional: #[cfg(any(feature = "postgres", feature = "sqlite"))]]"""
 
     def blackhole_prune_expired_iso(self, now_iso: str) -> int:
         """(derived) deontic — Federation blackhole rules: drop every rule whose until is in the past relative to now_iso. Permanent rules (until IS NULL) are NEVER pruned. Retur..."""
@@ -951,9 +1004,6 @@ class Engine:
 
     def has_accord_conferred_role(self, key_id: str, role: str) -> bool:
         """(derived) deontic — v17.0.0 (CIRISPersist#440, CC 3.4.9) — does key_id hold role effectively? True iff the stored federation_keys row claims role on either role surfac..."""
-
-    def install_genesis_bundle_roster_json(self, bundle_json: str) -> str:
-        """(derived) deontic — v53.1.0 — install a verified genesis bundle (the ceremony artifact JSON) on this node: verify its ceremony outputs against THIS build's accord rost... [build-conditional: #[cfg(any(feature = "postgres", feature = "sqlite"))]]"""
 
     def install_storage_budget_v1(self, wire_json: str, ed25519_pubkey_base64: str, ml_dsa_65_pubkey_base64: str) -> int:
         """(derived) deontic — #370 (§Q B2/B3, CC 6.1.5.2) — INSTALL a signed StorageBudgetV1 so it governs this node's capacity eviction. Verifies the bound-hybrid signature aga..."""
@@ -1668,7 +1718,10 @@ class Engine:
 
         The full verdict as JSON: ``{edge_exists, root_self_declares,
         charter_has_recovery, last_drill_at, drill_freshness, halt_latched,
-        valid, root_kind, charter_quorum?, bounded_until?}``. One call for two
+        valid, root_kind, charter_quorum?, bounded_until?, not_rooted?}``.
+        ``not_rooted`` (v62.0.0) is present only when the id holds a
+        trust-root community record whose chain does not root: the reason
+        it is not valid (it never reads as a key root). One call for two
         signals, because they are one verdict -- a drill is a property *of* a
         root, and the walk that decides validity is the walk that finds the
         drill.
@@ -2237,6 +2290,9 @@ class Engine:
     def root_binding(self, key_id: str, claimed_pubkey_ed25519_base64: str) -> str:
         """(derived) ontological — Cold-start binding-rooting primitive (CIRISPersist#94)."""
 
+    def seal_trace_statement(self, trace_json: str, trace_level: str) -> tuple[bytes, bytes]:
+        """(derived) ontological — v62.0.0 (wave P7; CC 3.1.5) — scrub a trace with persist's own scrubber and seal the scrubbed bytes as its `trace:complete:v1` row."""
+
     def self_enc_pubkeys(self) -> dict[str, Any]:
         """(derived) ontological — v19.2.0 (CIRISPersist#493) — the node's own content-tier self-encryption pubkeys, derived from the engine's local signing seed (public halves only)..."""
 
@@ -2586,6 +2642,41 @@ class Engine:
 
     def blob_provenance_from_attestation_json(self, attestation_json: str, sha256_hex: str, epoch: int | None = None, minter_key_id: str | None = None) -> str:
         """(derived) empirical — v46.0.0 (CIRISPersist#876, FSD/EPOCH_MINTER.md) — the provenance of a blob, read off the attestation it flowed from."""
+
+    def edition2_statements_since(self, cursor: str | None = None, limit: int = 1000) -> list[tuple[str, bytes]]:
+        """v62.0.0 — serve the held edition-2 statements after ``cursor``, in
+        this node's admission order, at most ``limit`` (clamped to 1000). Each
+        item is ``(cursor, statement)``: the statement's bytes as received and
+        the opaque cursor (``"<admitted_us>:<statement_id hex>"``) to pass
+        back to resume after it. None starts from the first.
+
+        Raises:
+            ValueError: a malformed cursor.
+        """
+
+    def edition2_held_reason(self, row_id: str) -> str | None:
+        """v62.0.0 (CC 2.7.3) — why a held edition-2 row concludes nothing.
+        ``row_id`` is 64 hex. Returns JSON ``{"row_id", "family", "tier",
+        "replicated", "plane", "reason", "detail", "since_us"}``, or None
+        when the row is concluded
+        (its typed row is in its table) or not held. ``reason`` is a token:
+        ``count_short``, ``owner_unseated``, ``steward_unproven``,
+        ``amendment_digest_mismatch``, ``refold_refused``, ``refolding``. A
+        ``put_edition2_statement`` that answered ``"pending"`` is held.
+
+        Raises:
+            ValueError: a malformed id.
+        """
+
+    def edition2_held_rows(self, after: str | None = None, limit: int = 1000) -> str:
+        """v62.0.0 (CC 2.7.3) — the held edition-2 rows that conclude nothing,
+        in row-id order after ``after`` (64 hex; None from the first), at
+        most ``limit`` (clamped to 1000). Returns a JSON array of the objects
+        ``edition2_held_reason`` returns.
+
+        Raises:
+            ValueError: a malformed ``after``.
+        """
 
     def cache_stats(self) -> dict[str, Any]:
         """(derived) empirical — v53.1.8 (CIRISPersist#1014) — [crate::Engine::cache_stats] as a dict keyed by cache (repository_statistics, scoring_factors), each {hits, misses, e..."""
@@ -3289,6 +3380,27 @@ class Engine:
 
     def put_blob_chunks_json(self, payload_json: str) -> None:
         """(derived) empirical — v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload."""
+
+    def put_blob_edition2(
+        self,
+        sha256_hex: str,
+        body_inline_b64: str | None,
+        external_ref_json: str | None,
+        media_type: str | None,
+        claim_hex: str,
+    ) -> None:
+        """v62.0.0 (v62 P8) — Blob ingest with an EXTERNAL edition-2
+        holding claim: ``claim_hex`` is the holder's ``custody:{kind}``
+        statement (``here``, at ``federation``, naming this blob and its
+        size), signed outside persist. The bytes are checked and stored,
+        then the claim goes through the statement door; a refused claim
+        leaves no bytes this call stored. Replaces ``put_blob_json``'s
+        ``PutBlobAttestation`` (signed over its JCS image) on the clean mesh.
+
+        ``body_inline_b64`` XOR ``external_ref_json`` — exactly one.
+        Raises ``ValueError`` for a malformed claim or body, and the blob
+        error's type for a refusal (the proxy decision runs on the claim's
+        holder)."""
 
     def put_blob_json(self, payload_json: str) -> None:
         """v2.3.0 (#103) — Lower-level blob ingest accepting a fully
@@ -4487,6 +4599,12 @@ def set_caller_scope(label: str | None = None) -> str | None:
 
 def dimension_rejection_is_retryable(reason: str) -> bool:
     """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_dimension_rejected refusal named succeed? reason is the refus..."""
+
+def earlier_form_doors_shut() -> bool:
+    """v62.0.0 (CC 2.6.1.12) — are the earlier-form doors shut on this build?
+    False until the switch flips; then every earlier-form JSON door raises
+    ``ValueError("federation_malformed_row: <plane>: earlier_form_object ...")``
+    before it decodes its object."""
 
 def key_grant_refusal_is_retryable(reason: str) -> bool:
     """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_key_grant_refused refusal named succeed? reason is the refusa..."""

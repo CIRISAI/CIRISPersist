@@ -419,8 +419,7 @@ pub mod orchestrate {
 
         let mut out = Vec::new();
         for member in &roster {
-            let all = backend
-                .list_identity_occurrences_active(&member.key_id)
+            let all = crate::federation::replication_audience::devices_of(backend, &member.key_id)
                 .await
                 .map_err(map_dir_err)?;
             // v53.0.0 (CIRISPersist#963, coordinator ruling) — a device the
@@ -883,13 +882,13 @@ pub mod orchestrate {
         if report.minted {
             report.rotated_from = Some(newest);
         }
-        let newcomer: std::collections::HashSet<String> = backend
-            .list_identity_occurrences_active(member_key_id)
-            .await
-            .map_err(map_dir_err)?
-            .into_iter()
-            .map(|o| o.occurrence_key_id)
-            .collect();
+        let newcomer: std::collections::HashSet<String> =
+            crate::federation::replication_audience::devices_of(backend, member_key_id)
+                .await
+                .map_err(map_dir_err)?
+                .into_iter()
+                .map(|o| o.occurrence_key_id)
+                .collect();
         for r in backend
             .community_dek_member_grant_recipients(community_key_id, minter_key_id, ensured.epoch)
             .await?

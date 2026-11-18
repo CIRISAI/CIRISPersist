@@ -343,6 +343,91 @@ pub enum AttestationEvidence {
     /// `accord_custody_attestation` admits the same tier under the same
     /// condition). Never admissible without a live test anchor.
     SoftwareOnlyTest(SoftwareOnlyTestMarker),
+    /// v62.0.0 (wave W1b; CC 4.2.2.1) — **an edition-2 key record's custody
+    /// evidence**, as the read model projects it
+    /// (`edition2::projection::attestation_evidence_of`): the class, the
+    /// ML-DSA half's custody and the attestation chain. Checked by walking
+    /// the chain to this node's key-attestation roots for the record's own
+    /// Ed25519 half, as the genesis reader's custody gate does at seating.
+    /// LAST: an untagged parse tries every earlier shape first.
+    Edition2Custody(Edition2CustodyEvidence),
+}
+
+/// v62.0.0 (wave W1b; CC 4.2.2.1) — the body of
+/// [`AttestationEvidence::Edition2Custody`]. A member the record does not
+/// state is absent (never `null`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Edition2CustodyEvidence {
+    /// The hardware class the holder claims (`YubiKey_5_FIPS`, ...).
+    pub hardware_class: String,
+    /// `same_element` | `removable_offline`, where stated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_custody: Option<String>,
+    /// The attestation chain, hex DER, leaf first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain: Vec<String>,
+}
+
+/// v62.0.0 (wave W1b; CC 4.2.2.1) — the edition-2 custody gate over a key
+/// record's projected evidence: the class is a YubiKey PIV class with a
+/// chain (other classes' chains are not verified yet: unattested, as the
+/// genesis reader holds them), the chain verifies to one of this node's
+/// key-attestation roots (`edition2::genesis::attestation_roots`) for the
+/// record's Ed25519 half and attests that class, and `pq_custody`, where
+/// stated, is one of the two CC values.
+fn check_edition2_custody(
+    key_id: &str,
+    attested_ed25519: Option<&[u8]>,
+    ev: &Edition2CustodyEvidence,
+) -> Result<(), Error> {
+    use ciris_verify_core::trust_anchor_store::{environments, Purpose};
+    let refuse = |detail: String| Error::AccordHolderRequiresAttestationEvidence {
+        key_id: key_id.to_owned(),
+        detail,
+    };
+    if let Some(c) = ev.pq_custody.as_deref() {
+        if c != "same_element" && c != "removable_offline" {
+            return Err(refuse(format!(
+                "pq_custody {c:?} is not a CC 4.2.2.1 value"
+            )));
+        }
+    }
+    if ev.hardware_class != ciris_verify_core::edition2::genesis::CLASS_YUBIKEY_5_FIPS
+        || ev.chain.is_empty()
+    {
+        return Err(refuse(format!(
+            "hardware_class {:?} with {} chain certificate(s): unattested (only a YubiKey PIV \
+             chain is verified)",
+            ev.hardware_class,
+            ev.chain.len()
+        )));
+    }
+    let Some(ed) = attested_ed25519 else {
+        return Err(refuse(
+            "the record carries no Ed25519 half to attest".into(),
+        ));
+    };
+    let chain: Vec<Vec<u8>> = ev
+        .chain
+        .iter()
+        .map(|h| hex::decode(h).map_err(|e| refuse(format!("chain: {e}"))))
+        .collect::<Result<_, _>>()?;
+    let (leaf, above) = chain.split_first().expect("non-empty");
+    let above: Vec<&[u8]> = above.iter().map(Vec::as_slice).collect();
+    let roots = crate::federation::edition2::genesis::attestation_roots();
+    for root in roots.resolve_x509(Purpose::KeyAttestation, environments::YUBIKEY_PIV) {
+        if let Ok(v) = ciris_verify_core::accord_custody_attestation::verify_yubikey_piv_attestation(
+            leaf, &above, root, ed,
+        ) {
+            if v.hardware_class == ev.hardware_class {
+                return Ok(());
+            }
+        }
+    }
+    Err(refuse(
+        "the attestation chain does not verify to a key-attestation root for this key".into(),
+    ))
 }
 
 /// The hardware arm's body — the pre-#545 `AttestationEvidence` shape,
@@ -596,6 +681,11 @@ impl HardwareAttestationPolicy {
                 return self
                     .check_android_generation_custody(key_id, attested_ed25519, &a)
                     .map(Some);
+            }
+            // v62.0.0 (wave W1b; CC 4.2.2.1) — an edition-2 record's custody.
+            AttestationEvidence::Edition2Custody(ev) => {
+                check_edition2_custody(key_id, attested_ed25519, &ev)?;
+                return Ok(None);
             }
             AttestationEvidence::Hardware(hw) => *hw,
         };

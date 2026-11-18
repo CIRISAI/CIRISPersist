@@ -347,11 +347,27 @@ pub fn ballot_rows(b: &Ballot<'_>, arm: &Arm) -> Vec<KRow> {
 pub fn admits(b: &Ballot<'_>) -> Result<Answer<bool>, NoCell> {
     let elig = eligible_seats(b);
     let arm = arm_over(b, &elig)?;
-    Ok(Answer {
-        value: count_over(b, &arm, &elig),
-        rows: Vec::new(),
-        rule: "seat::seat_rule/Conf::Group (count over the resolved head)",
-    })
+    Ok(Answer::reading(
+        count_over(b, &arm, &elig),
+        Vec::new(),
+        ballot_reads(b),
+        "seat::seat_rule/Conf::Group (count over the resolved head)",
+    ))
+}
+
+/// v62.0.0 (kernel pass 2, I2810) — what a ballot's count reads: the
+/// standing of every seat on the resolved head, of every voice, and of the
+/// person the change names. The group's own [`DepKey::Roster`] is the
+/// caller's to add: a ballot carries the roster it resolved, not the group's
+/// key id.
+fn ballot_reads(b: &Ballot<'_>) -> Vec<super::DepKey> {
+    b.roster
+        .iter()
+        .map(|s| s.key_id.clone())
+        .chain(b.signers.iter().cloned())
+        .chain(b.subject.map(str::to_owned))
+        .map(super::DepKey::Standing)
+        .collect()
 }
 
 /// [`admits`] over the eligible seats the caller already resolved
@@ -373,11 +389,12 @@ pub fn admits_by_rows(b: &Ballot<'_>) -> Result<Answer<bool>, NoCell> {
     let kept = layers::kept(&rows, |_| true);
     let c = layers::conclude(kept, |p| seat_rule(p, law, &NoCut, &|_| true), None);
     let counted = rows.last().expect("the counted row is last").id;
-    Ok(Answer {
-        value: c.concluded_id(&counted),
-        rows: rows.iter().map(|r| r.id).collect(),
-        rule: "seat::seat_rule/Conf::Group",
-    })
+    Ok(Answer::reading(
+        c.concluded_id(&counted),
+        rows.iter().map(|r| r.id).collect(),
+        ballot_reads(b),
+        "seat::seat_rule/Conf::Group",
+    ))
 }
 
 /// The seat rule's `Conf::Group` arm (`ciris_kernel::seat::seat_rule`) over

@@ -2,12 +2,15 @@
 //! files.** I1850, I1851.
 //!
 //! Verify 23.0.0 published independent vectors that persist and CIRISKernel
-//! pin. Persist keeps byte-identical copies of four, taken from the
-//! `v23.0.0` tag (the row statements at Verify `23.1.3`), under `tests/vectors/verify_v23/`:
+//! pin. Persist keeps byte-identical copies, taken from the `v23.0.0` tag
+//! (the edition-2 files at Verify `23.3.0`, slice C3), under
+//! `tests/vectors/verify_v23/`:
 //!
-//! | file | Verify path at v23.0.0 |
+//! | file | Verify path at the tag |
 //! |---|---|
-//! | `edition2/row_statements_v1.json` (re-pinned at **Verify 23.1.3**, slice E2a) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/row_statements_v3.json` (**Verify 23.3.0**, slice C3; v1 retired) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/key_of_iss_v1.json` (**Verify 23.3.0**, 24 cases) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `accord_halt/accord_halt_v2.json` (**Verify 23.3.0**; v1 retired) | `src/ciris-verify-core/tests/vectors/accord_halt/` |
 //! | `composite/mldsa65_ed25519_draft_kats.json` | `src/ciris-crypto/tests/vectors/composite/` |
 //! | `accord_lineage/accord_recovery_refusals_v1.json` | `src/ciris-verify-core/tests/vectors/accord_lineage/` |
 //! | `substrate_composite/composite_signatures_v1.json` | `src/ciris-verify-core/tests/vectors/substrate_composite/` |
@@ -21,17 +24,32 @@
 //!   composite arm): every case verifies under the vector's composite key, and
 //!   every refusal is refused.
 //!
+//! - **I2360** (slice C3) the three Verify 23.3.0 files carry the case
+//!   counts they have at Verify tag 23.3.0 (ffd7af1).
+//!
 //! To re-pin from a later tag: copy the file, update its digest here, and
-//! say why in the CHANGELOG. `edition2/row_statements_v1.json` is the
-//! Verify 23.1.3 copy (slice E2a: 17 key records, 27 vendored-family cases), the
-//! file persist's door replays (`edition2::verify_vectors_replay`, I1901).
+//! say why in the CHANGELOG. `edition2/row_statements_v3.json` and
+//! `edition2/key_of_iss_v1.json` are the files persist's door replays
+//! (`edition2::verify_vectors_replay`, I1901, I2365–I2367);
+//! `accord_halt/accord_halt_v2.json` the halt door's
+//! (`edition2::halt_invariants`, I2361–I2364).
 
 /// `(path under tests/vectors/verify_v23/, bytes, pinned SHA-256)`.
 const PINNED: &[(&str, &[u8], &str)] = &[
     (
-        "edition2/row_statements_v1.json",
-        include_bytes!("../../tests/vectors/verify_v23/edition2/row_statements_v1.json"),
-        "b0603a5dd757e5b36a840735a1ec5379c1ec6bc450260f41e9846b7cd05a8166",
+        "edition2/row_statements_v3.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/row_statements_v3.json"),
+        "0c072516dea1d89132567e0f343ca47a2183df79697651685aa557d739cdf920",
+    ),
+    (
+        "edition2/key_of_iss_v1.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/key_of_iss_v1.json"),
+        "bd584d9b31b7271dc86c05a29eec75044b5fe74aae8dd586701a227f09001333",
+    ),
+    (
+        "accord_halt/accord_halt_v2.json",
+        include_bytes!("../../tests/vectors/verify_v23/accord_halt/accord_halt_v2.json"),
+        "a70536271ee3d19af4390c4c603e17a4cba54fa18449d6296d3696f6756e9581",
     ),
     (
         "composite/mldsa65_ed25519_draft_kats.json",
@@ -72,7 +90,8 @@ fn len_of(v: &serde_json::Value, key: &str) -> usize {
     v[key].as_array().map_or(0, Vec::len)
 }
 
-/// I1850 — the four files are the bytes taken at Verify's tags (v23.0.0; row statements Verify 23.1.3).
+/// I1850 — the files are the bytes taken at Verify's tags (v23.0.0; the
+/// edition-2 and halt files Verify 23.3.0).
 #[test]
 fn i1850_verify_v23_vectors_are_pinned_by_sha256() {
     for (path, bytes, pinned) in PINNED {
@@ -81,20 +100,6 @@ fn i1850_verify_v23_vectors_are_pinned_by_sha256() {
             *pinned,
             "I1850: tests/vectors/verify_v23/{path} is not the pinned copy"
         );
-    }
-    let rows = vector("edition2/row_statements_v1.json");
-    for (key, n) in [
-        ("valid", 5),
-        ("refusals", 40),
-        ("earlier_form", 5),
-        ("family", 9),
-        ("family_vendored", 27),
-        ("key_directory", 5),
-        ("key_records", 17),
-        ("objects", 6),
-        ("references", 11),
-    ] {
-        assert_eq!(len_of(&rows, key), n, "I1850: row_statements_v1 `{key}`");
     }
     let kats = vector("composite/mldsa65_ed25519_draft_kats.json");
     assert!(
@@ -108,6 +113,37 @@ fn i1850_verify_v23_vectors_are_pinned_by_sha256() {
         len_of(&composite, "cases"),
         12,
         "I1850: substrate composite"
+    );
+}
+
+/// I2360 — the Verify 23.3.0 files parse with the case counts they carry at
+/// Verify tag 23.3.0 (a re-copy from another tag is red here as well as on its digest).
+#[test]
+fn i2360_verify_23_3_vectors_carry_their_case_counts() {
+    let rows = vector("edition2/row_statements_v3.json");
+    for (key, n) in [
+        ("valid", 4),
+        ("refusals", 42),
+        ("family", 9),
+        ("family_vendored", 33),
+        ("family_vendored_groups", 4),
+        ("key_directory", 4),
+        ("key_records", 17),
+        ("objects", 6),
+        ("references", 11),
+    ] {
+        assert_eq!(len_of(&rows, key), n, "I2360: row_statements_v3 `{key}`");
+    }
+    let key_of = vector("edition2/key_of_iss_v1.json");
+    assert_eq!(len_of(&key_of, "cases"), 24, "I2360: key_of_iss_v1");
+    let halt = vector("accord_halt/accord_halt_v2.json");
+    for (key, n) in [("invocations", 21), ("lifecycles", 22), ("latch", 13)] {
+        assert_eq!(len_of(&halt, key), n, "I2360: accord_halt_v2 `{key}`");
+    }
+    assert_eq!(
+        halt["rosters"].as_object().map_or(0, serde_json::Map::len),
+        2,
+        "I2360: accord_halt_v2 rosters"
     );
 }
 

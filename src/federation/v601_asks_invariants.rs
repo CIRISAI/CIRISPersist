@@ -31,12 +31,15 @@
 //! - **I1365 (CIRISPersist#1120; CC 3.1.5 rc10)** — `identity_amendment:v1`
 //!   admits only citing an admitted `deferral:response:approved:v1` about the
 //!   same agent, signed by a seated WA (the agent node's owner, compared self
-//!   to self at the response's instant). Refused
-//!   `identity_amendment_unauthorized`, each with its condition: a response
-//!   not held, a rejected response, a response by a stranger, a response about
-//!   another agent, evidence that does not cite the response, an amendment
-//!   signed by a key that is not the agent's; an unowned agent has no seated
-//!   WA. Ill-shaped `amendment_digest` / `authorized_by` are malformed rows.
+//!   to self at the response's instant). v62 (CC 2.7): what the CITED
+//!   RESPONSE decides never refuses the amendment. A response not held, a
+//!   rejected response, a response by a stranger, a response about another
+//!   agent, and an unowned agent (no seated WA) each leave the amendment
+//!   ADMITTED and HELD (`amendment_standing` is not in force, reporting
+//!   `identity_amendment_unauthorized` with its condition). Still refused
+//!   `identity_amendment_unauthorized` at the door: evidence that does not
+//!   cite the response, an amendment signed by a key that is not the agent's.
+//!   Ill-shaped `amendment_digest` / `authorized_by` are malformed rows.
 //! - **I1368 (CIRISPersist#1120, CIRISServer#601)** — the split home: the
 //!   owner (a `user`) binds the NODE (`responsible_for`), the agent key is
 //!   the owner's occurrence (the `self:delegates_to:agent_occurrence:v1`
@@ -44,7 +47,8 @@
 //!   approval authorises the agent's self-subject amendment: the person the
 //!   signing key is an occurrence of is its owner. The same shape whose
 //!   principal is not a `user`, and an agent key with no anchor, are still
-//!   refused `response_signer_not_a_seated_wa`.
+//!   not in force: admitted and held, `response_signer_not_a_seated_wa`
+//!   (v62, CC 2.7).
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -423,7 +427,12 @@ pub(crate) mod bodies {
                 by,
                 about,
                 dimension,
-                serde_json::json!({ "references_attestation_id": request_id }),
+                // v62 (CC 3.1.5 rc21) — the approval names the text it
+                // approves; every amendment below carries this digest.
+                serde_json::json!({
+                    "references_attestation_id": request_id,
+                    "amendment_digest": "cd".repeat(32),
+                }),
             )
         };
         let amendment = |by: &str, about: &str, authorized_by: &str, cite: bool| {
@@ -454,6 +463,33 @@ pub(crate) mod bodies {
                 "I1365 ({what}): expected {reason}, got {text}"
             );
         };
+        // v62 (CC 2.7) — a condition the CITED RESPONSE decides never refuses
+        // the amendment: it is admitted and held, not in force, reporting
+        // the token.
+        let held = |s: Option<ia::AmendmentStanding>, reason: &str, what: &str| {
+            let s = s.unwrap_or_else(|| panic!("I1365 ({what}): not an amendment"));
+            assert!(!s.is_in_force(), "I1365 ({what}): held, not in force");
+            assert_eq!(
+                s.token(),
+                Some(ia::IDENTITY_AMENDMENT_UNAUTHORIZED),
+                "I1365 ({what}): {s:?}"
+            );
+            assert_eq!(s.reason(), Some(reason), "I1365 ({what}): {s:?}");
+        };
+        // Admitted (CC 2.7), then its standing read now.
+        let admitted_standing = |r: Attestation, what: &'static str| async move {
+            put(r.clone())
+                .await
+                .unwrap_or_else(|e| panic!("I1365 ({what}): admitted and held: {e}"));
+            assert!(d
+                .get_attestation(&r.attestation_id)
+                .await
+                .unwrap()
+                .is_some());
+            crate::federation::identity_amendment::amendment_standing(d, &r)
+                .await
+                .unwrap()
+        };
 
         // The owner (the seated WA) approves: the amendment admits.
         let approved = response(&owner, &agent, ia::DEFERRAL_APPROVED_DIMENSION);
@@ -461,17 +497,20 @@ pub(crate) mod bodies {
         put(approved).await.expect("I1365: the owner's approval");
         let ok = amendment(&agent, &agent, &approved_id, true);
         let ok_id = ok.attestation_id.clone();
-        put(ok)
+        put(ok.clone())
             .await
             .unwrap_or_else(|e| panic!("I1365: the authorised amendment admits: {e}"));
         assert!(d.get_attestation(&ok_id).await.unwrap().is_some());
+        assert_eq!(
+            ia::amendment_standing(d, &ok).await.unwrap(),
+            Some(ia::AmendmentStanding::InForce),
+            "I1365: the authorised amendment is in force"
+        );
 
         // A response this node does not hold.
         let missing = uuid::Uuid::new_v4().to_string();
-        refused(
-            put(amendment(&agent, &agent, &missing, true))
-                .await
-                .unwrap_err(),
+        held(
+            admitted_standing(amendment(&agent, &agent, &missing, true), "not held").await,
             ia::unauthorized_reason::RESPONSE_NOT_HELD,
             "not held",
         );
@@ -479,10 +518,8 @@ pub(crate) mod bodies {
         let rejected = response(&owner, &agent, ia::DEFERRAL_REJECTED_DIMENSION);
         let rejected_id = rejected.attestation_id.clone();
         put(rejected).await.expect("I1365: the owner's rejection");
-        refused(
-            put(amendment(&agent, &agent, &rejected_id, true))
-                .await
-                .unwrap_err(),
+        held(
+            admitted_standing(amendment(&agent, &agent, &rejected_id, true), "rejected").await,
             ia::unauthorized_reason::NOT_APPROVED,
             "rejected",
         );
@@ -492,10 +529,8 @@ pub(crate) mod bodies {
         put(by_stranger)
             .await
             .expect("I1365: a stranger's row stores");
-        refused(
-            put(amendment(&agent, &agent, &by_stranger_id, true))
-                .await
-                .unwrap_err(),
+        held(
+            admitted_standing(amendment(&agent, &agent, &by_stranger_id, true), "stranger").await,
             ia::unauthorized_reason::NOT_A_SEATED_WA,
             "stranger",
         );
@@ -505,10 +540,12 @@ pub(crate) mod bodies {
         put(elsewhere)
             .await
             .expect("I1365: the other agent's approval");
-        refused(
-            put(amendment(&agent, &agent, &elsewhere_id, true))
-                .await
-                .unwrap_err(),
+        held(
+            admitted_standing(
+                amendment(&agent, &agent, &elsewhere_id, true),
+                "another agent",
+            )
+            .await,
             ia::unauthorized_reason::ABOUT_ANOTHER_AGENT,
             "another agent",
         );
@@ -534,14 +571,16 @@ pub(crate) mod bodies {
             &stranger,
             &unowned,
             ia::DEFERRAL_APPROVED_DIMENSION,
-            serde_json::json!({}),
+            serde_json::json!({ "amendment_digest": "cd".repeat(32) }),
         );
         let for_unowned_id = for_unowned.attestation_id.clone();
         put(for_unowned).await.expect("I1365: stores");
-        refused(
-            put(amendment(&unowned, &unowned, &for_unowned_id, true))
-                .await
-                .unwrap_err(),
+        held(
+            admitted_standing(
+                amendment(&unowned, &unowned, &for_unowned_id, true),
+                "unowned",
+            )
+            .await,
             ia::unauthorized_reason::NOT_A_SEATED_WA,
             "unowned",
         );
@@ -573,7 +612,7 @@ pub(crate) mod bodies {
                 &serde_json::json!({
                     "id": id,
                     "dimension": ia::IDENTITY_AMENDMENT_DIMENSION,
-                    "amendment_digest": "ef".repeat(32),
+                    "amendment_digest": "cd".repeat(32),
                     "authorized_by": authorized_by,
                     "evidence_refs": [authorized_by],
                 }),
@@ -601,7 +640,13 @@ pub(crate) mod bodies {
             put(ok)
                 .await
                 .expect("I1365: the owner approves for the agent");
-            put(about(&occ, &multi, &ok_id)).await.unwrap_or_else(|e| {
+            let amended = about(&occ, &multi, &ok_id);
+            assert_eq!(
+                ia::amendment_standing(d, &amended).await.unwrap(),
+                Some(ia::AmendmentStanding::InForce),
+                "I1365: an occurrence's amendment under the owner's approval is in force"
+            );
+            put(amended).await.unwrap_or_else(|e| {
                 panic!(
                     "I1365: an occurrence of the agent amends it (owner on the {}): {e}",
                     if owner_on_occurrence {
@@ -717,11 +762,15 @@ pub(crate) mod bodies {
                 &approver,
                 &agent,
                 ia::DEFERRAL_APPROVED_DIMENSION,
-                serde_json::json!({ "references_attestation_id": request_id }),
+                // v62 (CC 3.1.5 rc21) — the approval names the amended text.
+                serde_json::json!({
+                    "references_attestation_id": request_id,
+                    "amendment_digest": "cd".repeat(32),
+                }),
             );
             let approved_id = approved.attestation_id.clone();
             put(approved).await.expect("I1368: the approval stores");
-            put(row(
+            let amendment = row(
                 &agent,
                 &agent,
                 ia::IDENTITY_AMENDMENT_DIMENSION,
@@ -730,20 +779,33 @@ pub(crate) mod bodies {
                     "authorized_by": approved_id,
                     "evidence_refs": [approved_id],
                 }),
-            ))
-            .await
+            );
+            let admitted = put(amendment.clone()).await;
+            // v62 (CC 2.7) — admitted whatever the approval says; its force
+            // is its standing, read now.
+            let standing = match &admitted {
+                Ok(()) => ia::amendment_standing(d, &amendment).await,
+                Err(_) => Ok(None),
+            };
+            (admitted, standing)
         };
-        let refused = |r: Result<(), Error>, what: &str| {
-            let e = r.expect_err(what);
-            let text = e.to_string();
-            assert!(
-                matches!(e, Error::InvalidArgument(_))
-                    && text.contains(&format!(
-                        "{}: {}",
-                        ia::IDENTITY_AMENDMENT_UNAUTHORIZED,
-                        ia::unauthorized_reason::NOT_A_SEATED_WA
-                    )),
-                "I1368 ({what}): expected not-a-seated-WA, got {text}"
+        let refused = |(admitted, standing): (
+            Result<(), Error>,
+            Result<Option<ia::AmendmentStanding>, Error>,
+        ),
+                       what: &str| {
+            admitted.unwrap_or_else(|e| panic!("I1368 ({what}): admitted and held: {e}"));
+            let s = standing.unwrap().expect("an amendment");
+            assert!(!s.is_in_force(), "I1368 ({what}): held, not in force");
+            assert_eq!(
+                s.token(),
+                Some(ia::IDENTITY_AMENDMENT_UNAUTHORIZED),
+                "I1368 ({what})"
+            );
+            assert_eq!(
+                s.reason(),
+                Some(ia::unauthorized_reason::NOT_A_SEATED_WA),
+                "I1368 ({what}): expected not-a-seated-WA, got {s:?}"
             );
         };
 
@@ -763,9 +825,13 @@ pub(crate) mod bodies {
             None,
             "I1368: the agent key carries no owner binding"
         );
-        amend(agent.clone(), owner.clone())
-            .await
-            .unwrap_or_else(|e| panic!("I1368: the split home's amendment admits: {e}"));
+        let (admitted, standing) = amend(agent.clone(), owner.clone()).await;
+        admitted.unwrap_or_else(|e| panic!("I1368: the split home's amendment admits: {e}"));
+        assert_eq!(
+            standing.unwrap(),
+            Some(ia::AmendmentStanding::InForce),
+            "I1368: the split home's amendment is in force"
+        );
         // A stranger's approval on the same home still holds no seat.
         let stranger = format!("i1368-stranger-{tag}");
         ts::register_user_role_key(d, &stranger).await;

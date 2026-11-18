@@ -6,7 +6,10 @@
 Fixture trees (a Cargo.toml, a manifest, a tsv) under EVIDENCE_TSV_ROOT. The
 check must be red on drift in each direction (a row only the tsv has, an entry
 only the manifest has) and on a stale version stamp, and the real tree must
-pass.
+pass. v62.0.0: the span_sha256 column — a src/ row's cell is the hash of the
+cited item's text, so a body change under an unchanged name reds the check, a
+symbol that is not exactly one item fails generation, and `span_excluded`
+holds only while the symbol does not hash.
 """
 from __future__ import annotations
 
@@ -22,6 +25,18 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import evidence_tsv as et  # noqa: E402
+import span_of  # noqa: E402
+
+# The fixture sources the two src/ rows cite (and the late entries' targets).
+SOURCES = {
+    "src/federation/admission.rs": "pub fn resolve_withdraws_admission_rule_at() -> u8 {\n    1\n}\n",
+    "src/federation/topology.rs": "/// doc\npub const DEFAULT_DELEGATION_DEPTH: usize = 5;\n",
+    "src/lib.rs": "pub fn y() {}\npub fn twice() {}\nmod m { pub fn twice() {} }\n",
+}
+
+
+def span(path: str, sym: str) -> str:
+    return span_of.span_sha256(SOURCES[path], sym)
 
 
 def entry(dec, claim, path, **kw):
@@ -45,6 +60,9 @@ class Fixture(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / "evidence").mkdir()
         (self.root / et.MANIFEST_REL).parent.mkdir(parents=True)
+        for rel, text in SOURCES.items():
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / rel).write_text(text)
         (self.root / "Cargo.toml").write_text('[package]\nname = "ciris-persist"\nversion = "54.1.0"\n\n[dependencies]\nx = { version = "1.0" }\n')
         self.write_manifest(ENTRIES)
         self.assertEqual(self.run_main("write")[0], 0)
@@ -68,9 +86,11 @@ class Fixture(unittest.TestCase):
     def test_the_generated_rows(self):
         rows = [r for r in self.tsv().read_text().splitlines() if r and not r.startswith("#")][1:]
         self.assertEqual(rows, [
-            "3.3.1\tCLM-a\tCIRISPersist\tsrc/federation/admission.rs#resolve_withdraws_admission_rule_at\tciris-persist@54.1.0",
-            "4.1.1\tCLM-b\tCIRISPersist\tsrc/federation/topology.rs#DEFAULT_DELEGATION_DEPTH\tciris-persist@54.1.0",
-            "3.1.1\tCLM-c\tCIRISPersist\tciris-verify-core/src/accord_genesis.rs#build\tciris-persist@31.0.0",
+            "3.3.1\tCLM-a\tCIRISPersist\tsrc/federation/admission.rs#resolve_withdraws_admission_rule_at\tciris-persist@54.1.0\t"
+            + span("src/federation/admission.rs", "resolve_withdraws_admission_rule_at"),
+            "4.1.1\tCLM-b\tCIRISPersist\tsrc/federation/topology.rs#DEFAULT_DELEGATION_DEPTH\tciris-persist@54.1.0\t"
+            + span("src/federation/topology.rs", "DEFAULT_DELEGATION_DEPTH"),
+            "3.1.1\tCLM-c\tCIRISPersist\tciris-verify-core/src/accord_genesis.rs#build\tciris-persist@31.0.0\t",
         ])
         self.assertIn("\n\n# a section note\n4.1.1\t", self.tsv().read_text())
         self.assertEqual(self.run_main("check")[0], 0)
@@ -103,6 +123,37 @@ class Fixture(unittest.TestCase):
         self.write_manifest(bad)
         with self.assertRaises(SystemExit):
             self.run_main("check")
+
+    def test_a_body_change_under_an_unchanged_name_is_red(self):
+        src = self.root / "src/federation/admission.rs"
+        src.write_text(src.read_text().replace("    1\n", "    2\n"))
+        rc, out = self.run_main("check")
+        self.assertEqual(rc, 1)
+        self.assertIn("+3.3.1\tCLM-a", out)
+        # a doc comment above the item is not its span
+        src.write_text("/// a new doc line\n" + SOURCES["src/federation/admission.rs"])
+        self.assertEqual(self.run_main("check")[0], 0)
+
+    def test_a_symbol_that_is_not_one_item_fails_generation(self):
+        for sym in ("missing", "twice"):
+            self.write_manifest(ENTRIES + [entry("5.1", "CLM-new", f"src/lib.rs#{sym}")])
+            with self.assertRaises(SystemExit):
+                self.run_main("check")
+
+    def test_span_excluded_holds_only_while_the_symbol_does_not_hash(self):
+        ok = entry("5.1", "CLM-new", "src/lib.rs#twice", span_excluded="two declarations")
+        self.write_manifest(ENTRIES + [ok])
+        self.assertEqual(self.run_main("write")[0], 0)
+        self.assertIn("src/lib.rs#twice\tciris-persist@54.1.0\t\n", self.tsv().read_text())
+        stale = entry("5.1", "CLM-new", "src/lib.rs#y", span_excluded="no longer true")
+        self.write_manifest(ENTRIES + [stale])
+        with self.assertRaises(SystemExit):
+            self.run_main("check")
+        for bad in (entry("5.1", "CLM-new", "src/lib.rs#twice", span_excluded=""),
+                    entry("5.2", "CLM-new", "ciris-verify-core/src/x.rs#y", crate="c@1", span_excluded="x")):
+            self.write_manifest(ENTRIES + [bad])
+            with self.assertRaises(SystemExit):
+                self.run_main("check")
 
     def test_a_cross_repo_row_needs_its_own_stamp(self):
         self.write_manifest([entry("3.1.1", "CLM-c", "ciris-verify-core/src/x.rs#y")])

@@ -1,45 +1,45 @@
-//! **I1907**: the genesis bundle's generic rules (CC 2.6.1.11, CC 5.3.4, and
-//! the settled bundle/2 rule, CIRISPersist#1274).
+//! **I2300–I2304**: the genesis bundle/2 reader in persist, pure (no store),
+//! against CIRISVerify 23.3.0's own known answers (vendored at
+//! `tests/vectors/verify_v23/genesis/`, SHA-256 pinned).
 //!
-//! - The fresh genesis (`version` 1, no `prev`) counts only when every
-//!   holder of the roster signed. One holder short, a stranger standing in,
-//!   or a holder whose key is not held is `genesis_bundle_count_unmet`, which
-//!   concludes nothing and is never a finding against the bundle.
-//! - The voices share one object id, computed here (`["CEG-object/2", typ,
-//!   null, payload]`). A voice over other payload bytes is another object: it
-//!   is not counted and not merged. A pin that differs is
-//!   `genesis_bundle_not_pinned`.
-//! - `genesis_bundle_malformed` covers:
-//!   - `iat` absent or not ⌊asserted_at / 1000⌋ (`iat_mismatch`);
-//!   - `version` 1 with a prev, a version other than 1 without one, or a
-//!     version not prev's plus one (`version_prev_mismatch`).
-//! - A later bundle counts a strict majority of its predecessor's holders,
-//!   plus every holder it adds.
-//! - A row statement offered as a voice is `edition2_not_a_row`. A JSON
-//!   bundle is `earlier_form_object`.
-//! - Ruling C: a seat is canonical exactly when its identity-ref is in
-//!   `serve_nodes` of the bundle in force. A key in both `holders` and
-//!   `serve_nodes` is `holders_seats_overlap`.
-//! - A seat's X-Wing keys come from its binding. `transit_xwing_pubkey` and
-//!   `onion_hop_xwing_pubkey` are 1216 bytes each, signed by the seat, with
-//!   no shared half. The v1 pair, another signer, a short key, a missing
-//!   onion key or a shared half is `genesis_bundle_seat_binding`.
+//! - I2300: the vendored files are Verify 23.3.0's, byte for byte.
+//! - I2301: every case of `genesis_bundles_v2.json` read through
+//!   [`read_lineage`] gives Verify's verdict for each offered object, with a
+//!   case's predecessor chain HELD (each held first bundle rooted by its own
+//!   object id, as the store re-reads it) and its anchor rooting only what
+//!   it offers:
+//!   - Valid: the placement (object id, version, prev, accord, counted,
+//!     recovered, holders, seats, halt fuse);
+//!   - Invalid: `genesis_bundle_malformed` with Verify's reason;
+//!   - Waiting: the rows, prev and kids it waits on;
+//!   - concludes nothing: Verify's token and detail.
+//!
+//!   The one case not replayed is `later_prev_not_valid`: its predecessor is
+//!   given only as an object id that is not Valid, and persist holds no
+//!   bundle by id alone (a held predecessor is re-read from its voices).
+//! - I2302: on the fork cases, the genesis in force ([`GenesisInForce`])
+//!   reports Verify's forks, head, and the tips' common holders and seats.
+//! - I2303: persist's tokens are Verify's.
+//! - I2304: `genesis_reseat_v1.json` read the same way: a seat re-seated at a
+//!   new key keeps its identity-ref and canonical standing, at the new key and
+//!   its X-Wing keys; a binding not signed by the key the bundle places for
+//!   the seat is `genesis_bundle_row_invalid` (`row_signer`).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::{self, Value};
-use ciris_verify_core::edition2::family::SelectContext;
+use ciris_verify_core::edition2::genesis::{CommitmentFault, CustodyFault, Inconclusive, RowFault};
 use ciris_verify_core::edition2::{sig_structure, Digest32};
+use ciris_verify_core::trust_anchor_store::{environments, single, Purpose, TrustAnchorStore};
+use serde_json::Value as J;
 
-use super::door::admit_row;
 use super::door_invariants::fixture::*;
 use super::genesis::{
-    group_by_object, seat_xwing_from_binding, verify_bundle, BundleContext, BundleInForce,
-    CountRule, GENESIS_BUNDLE_TYP,
+    in_force_of, read_lineage, Fork, GenesisInForce, GenesisPlacement, GenesisVerdict,
+    LineageInput, LineageReading, GENESIS_BUNDLE_TYP,
 };
-use super::names::RowId;
-use crate::federation::{malformed_row, Error};
+use crate::federation::malformed_row;
 
 /// One holder's voice over a bundle payload `{version, asserted_at, refs?}`,
 /// its `iat` derived from `asserted_at`.
@@ -86,388 +86,565 @@ pub(crate) fn voice_over(k: &CompositeSigningKey, payload: &Value, iat: Option<u
     ))
 }
 
-fn reason(e: &Error) -> &'static str {
-    match e {
-        Error::MalformedRow { reason, .. } => reason,
-        other => other.kind(),
+/// CIRISVerify 23.3.0's genesis vectors, as vendored, and the readers of
+/// their case lists (shared with the store witnesses, I2310–I2318).
+pub(crate) mod vectors {
+    use std::collections::BTreeMap;
+    use std::sync::OnceLock;
+
+    use ciris_verify_core::edition2::Digest32;
+    use serde_json::Value as J;
+
+    use crate::federation::edition2::genesis::Anchor;
+
+    macro_rules! vendored {
+        ($f:literal) => {
+            include_str!(concat!("../../../tests/vectors/verify_v23/genesis/", $f))
+        };
     }
-}
 
-fn message(e: &Error) -> String {
-    match e {
-        Error::MalformedRow { message, .. } => message.clone(),
-        other => format!("{other:?}"),
-    }
-}
-
-fn holders() -> [CompositeSigningKey; 3] {
-    [key(40), key(41), key(42)]
-}
-
-fn roster(ks: &[CompositeSigningKey]) -> BTreeSet<Digest32> {
-    ks.iter().map(kid).collect()
-}
-
-fn none() -> BTreeSet<Digest32> {
-    BTreeSet::new()
-}
-
-#[test]
-fn i1907_the_fresh_genesis_needs_every_holder() {
-    let hs = holders();
-    let held = holding(&[&hs[0], &hs[1], &hs[2], &key(43)]);
-    let (r, ms) = (roster(&hs), none());
-    let cx = BundleContext {
-        roster: &r,
-        count: CountRule::Every,
-        must_sign: &ms,
-        pin: None,
-        predecessor: None,
-    };
-    let all: Vec<Vec<u8>> = hs.iter().map(|k| bundle_voice(k, 1, None, 5_000)).collect();
-    let b = verify_bundle(&all, &held, &cx).unwrap();
-    assert_eq!(
-        (b.version, b.prev, b.signed_by.len()),
-        (1, None, 3),
-        "I1907"
-    );
-    let pb = super::door::raw_payload(&all[0]).unwrap();
-    assert_eq!(
-        b.object_id,
-        RowId::of_object(GENESIS_BUNDLE_TYP, None, &pb),
-        "I1907"
-    );
-    assert_eq!(group_by_object(&all).len(), 1, "I1907: one object");
-    for (what, voices, h) in [
-        ("short", all[..2].to_vec(), held.clone()),
-        (
-            "stranger",
-            vec![
-                all[0].clone(),
-                all[1].clone(),
-                bundle_voice(&key(43), 1, None, 5_000),
-            ],
-            held.clone(),
-        ),
-        ("unheld", all.clone(), holding(&[&hs[0], &hs[1]])),
-    ] {
-        let e = verify_bundle(&voices, &h, &cx).unwrap_err();
-        assert_eq!(
-            reason(&e),
-            malformed_row::GENESIS_BUNDLE_COUNT_UNMET,
-            "I1907 {what}"
-        );
-    }
-}
-
-#[test]
-fn i1907_one_payload_one_id_and_the_pin() {
-    let hs = holders();
-    let held = holding(&[&hs[0], &hs[1], &hs[2]]);
-    let (r, ms) = (roster(&hs), none());
-    let all: Vec<Vec<u8>> = hs.iter().map(|k| bundle_voice(k, 1, None, 5_000)).collect();
-    let free = BundleContext {
-        roster: &r,
-        count: CountRule::Every,
-        must_sign: &ms,
-        pin: None,
-        predecessor: None,
-    };
-    let id = verify_bundle(&all, &held, &free).unwrap().object_id;
-    // A voice over other bytes is another object: not counted.
-    let mut differs = all.clone();
-    differs[2] = bundle_voice(&hs[2], 1, None, 6_000);
-    assert_eq!(group_by_object(&differs).len(), 2, "I1907");
-    let e = verify_bundle(&differs, &held, &free).unwrap_err();
-    assert_eq!(
-        reason(&e),
-        malformed_row::GENESIS_BUNDLE_COUNT_UNMET,
-        "I1907 other object"
-    );
-    let pinned = BundleContext {
-        pin: Some(&id.0),
-        ..free.clone()
-    };
-    assert!(verify_bundle(&all, &held, &pinned).is_ok(), "I1907 pin");
-    let mut other = id.0;
-    other[31] ^= 1;
-    let wrong = BundleContext {
-        pin: Some(&other),
-        ..free.clone()
-    };
-    let e = verify_bundle(&all, &held, &wrong).unwrap_err();
-    assert_eq!(
-        reason(&e),
-        malformed_row::GENESIS_BUNDLE_NOT_PINNED,
-        "I1907"
-    );
-}
-
-#[test]
-fn i1907_iat_is_required_and_derived() {
-    let hs = holders();
-    let held = holding(&[&hs[0], &hs[1], &hs[2]]);
-    let (r, ms) = (roster(&hs), none());
-    let cx = BundleContext {
-        roster: &r,
-        count: CountRule::Every,
-        must_sign: &ms,
-        pin: None,
-        predecessor: None,
-    };
-    let payload = map(vec![
-        ("version", Value::Uint(1)),
-        ("asserted_at", Value::Uint(5_999)),
-    ]);
-    for (what, iat) in [
-        ("absent", None),
-        ("off by one", Some(6)),
-        ("ms not s", Some(5_999)),
-    ] {
-        let voices: Vec<Vec<u8>> = hs.iter().map(|k| voice_over(k, &payload, iat)).collect();
-        let e = verify_bundle(&voices, &held, &cx).unwrap_err();
-        assert_eq!(
-            reason(&e),
-            malformed_row::GENESIS_BUNDLE_MALFORMED,
-            "I1907 iat {what}"
-        );
-        assert!(message(&e).starts_with("iat_mismatch"), "I1907 iat {what}");
-    }
-    let voices: Vec<Vec<u8>> = hs
-        .iter()
-        .map(|k| voice_over(k, &payload, Some(5)))
-        .collect();
-    assert!(
-        verify_bundle(&voices, &held, &cx).is_ok(),
-        "I1907 iat = floor"
-    );
-}
-
-#[test]
-fn i1907_version_prev_and_the_later_count() {
-    let hs = holders();
-    let added = key(46);
-    let held = holding(&[&hs[0], &hs[1], &hs[2], &added]);
-    let (r, ms) = (roster(&hs), none());
-    let every = BundleContext {
-        roster: &r,
-        count: CountRule::Every,
-        must_sign: &ms,
-        pin: None,
-        predecessor: None,
-    };
-    let v = |ver, prev: Option<&Digest32>| -> Vec<Vec<u8>> {
-        hs.iter()
-            .map(|k| bundle_voice(k, ver, prev, 1_000))
-            .collect()
-    };
-    let p: Digest32 = [5; 32];
-    for (what, voices) in [("2 no prev", v(2, None)), ("1 with prev", v(1, Some(&p)))] {
-        let e = verify_bundle(&voices, &held, &every).unwrap_err();
-        assert_eq!(
-            reason(&e),
-            malformed_row::GENESIS_BUNDLE_MALFORMED,
-            "I1907 {what}"
-        );
-        assert!(
-            message(&e).starts_with("version_prev_mismatch"),
-            "I1907 {what}"
-        );
-    }
-    let must = [kid(&added)].into_iter().collect::<BTreeSet<_>>();
-    let later = BundleContext {
-        roster: &r,
-        count: CountRule::StrictMajority,
-        must_sign: &none(),
-        pin: None,
-        predecessor: Some((&p, 1)),
-    };
-    let two: Vec<Vec<u8>> = hs[..2]
-        .iter()
-        .map(|k| bundle_voice(k, 2, Some(&p), 1_000))
-        .collect();
-    assert_eq!(
-        verify_bundle(&two, &held, &later).unwrap().prev,
-        Some(RowId(p)),
-        "I1907 2 of 3"
-    );
-    let e = verify_bundle(&two[..1], &held, &later).unwrap_err();
-    assert_eq!(
-        reason(&e),
-        malformed_row::GENESIS_BUNDLE_COUNT_UNMET,
-        "I1907 1 of 3"
-    );
-    // An added holder must sign beside the majority.
-    let with_added = BundleContext {
-        must_sign: &must,
-        ..later.clone()
-    };
-    let e = verify_bundle(&two, &held, &with_added).unwrap_err();
-    assert_eq!(
-        reason(&e),
-        malformed_row::GENESIS_BUNDLE_COUNT_UNMET,
-        "I1907 added absent"
-    );
-    let mut three = two.clone();
-    three.push(bundle_voice(&added, 2, Some(&p), 1_000));
-    assert!(
-        verify_bundle(&three, &held, &with_added).is_ok(),
-        "I1907 added signed"
-    );
-    let skip: Vec<Vec<u8>> = hs[..2]
-        .iter()
-        .map(|k| bundle_voice(k, 3, Some(&p), 1_000))
-        .collect();
-    let e = verify_bundle(&skip, &held, &later).unwrap_err();
-    assert_eq!(
-        reason(&e),
-        malformed_row::GENESIS_BUNDLE_MALFORMED,
-        "I1907 skip"
-    );
-}
-
-#[test]
-fn i1907_rows_and_json_are_not_bundles() {
-    let hs = holders();
-    let held = holding(&[&hs[0], &hs[1], &hs[2]]);
-    let (r, ms) = (roster(&hs), none());
-    let cx = BundleContext {
-        roster: &r,
-        count: CountRule::Every,
-        must_sign: &ms,
-        pin: None,
-        predecessor: None,
-    };
-    let row = row_with_refs(&hs[0], 1, map(vec![("target", ref2(&[1; 32]))]));
-    let e = verify_bundle(&[row], &held, &cx).unwrap_err();
-    assert_eq!(reason(&e), malformed_row::EDITION2_NOT_A_ROW, "I1907");
-    let e = verify_bundle(&[br#"{"version":4}"#.to_vec()], &held, &cx).unwrap_err();
-    assert_eq!(
-        reason(&e),
-        malformed_row::EDITION2_EARLIER_FORM_OBJECT,
-        "I1907"
-    );
-}
-
-#[test]
-fn i1907_ruling_c_canonical_is_membership_in_serve_nodes() {
-    let hs = holders();
-    let seat = key(47);
-    let stranger = key(48);
-    let held = holding(&[&hs[0], &hs[1], &hs[2]]);
-    let (r, ms) = (roster(&hs), none());
-    let cx = BundleContext {
-        roster: &r,
-        count: CountRule::Every,
-        must_sign: &ms,
-        pin: None,
-        predecessor: None,
-    };
-    let payload = |hold: Vec<&str>, seats: Vec<&str>| {
-        map(vec![
-            ("version", Value::Uint(1)),
-            ("asserted_at", Value::Uint(2_000)),
-            ("holders", text_set(&hold)),
-            ("serve_nodes", text_set(&seats)),
-        ])
-    };
-    let hrefs: Vec<String> = hs.iter().map(iref).collect();
-    let hr: Vec<&str> = hrefs.iter().map(String::as_str).collect();
-    let seat_ref = iref(&seat);
-    let p = payload(hr.clone(), vec![&seat_ref]);
-    let voices: Vec<Vec<u8>> = hs.iter().map(|k| voice_over(k, &p, Some(2))).collect();
-    let b = verify_bundle(&voices, &held, &cx).unwrap();
-    let f = BundleInForce::of(&b).unwrap();
-    assert!(f.is_canonical(&seat_ref), "I1907 C: the seat");
-    assert!(!f.is_canonical(&iref(&stranger)), "I1907 C: not a seat");
-    assert!(
-        !f.is_canonical(&hrefs[0]),
-        "I1907 C: a holder is not a seat"
-    );
-    // A key both holder and seat.
-    let p = payload(hr.clone(), vec![hr[0]]);
-    let voices: Vec<Vec<u8>> = hs.iter().map(|k| voice_over(k, &p, Some(2))).collect();
-    let e = BundleInForce::of(&verify_bundle(&voices, &held, &cx).unwrap()).unwrap_err();
-    assert!(message(&e).starts_with("holders_seats_overlap"), "I1907");
-}
-
-fn binding(seat: &CompositeSigningKey, extra: Vec<(&str, Value)>) -> Vec<u8> {
-    let mut m = vec![
-        ("asserted_at", Value::Uint(10)),
-        ("author", Value::Text(iref(seat))),
+    /// `genesis_bundles_v2.json` (the case list).
+    pub(crate) const V2: &str = vendored!("genesis_bundles_v2.json");
+    /// The statements of `genesis_bundles_v2.json`, split as Verify splits them.
+    pub(crate) const POOL: [&str; 8] = [
+        vendored!("pool_v2_0.json"),
+        vendored!("pool_v2_1.json"),
+        vendored!("pool_v2_2.json"),
+        vendored!("pool_v2_3.json"),
+        vendored!("pool_v2_4.json"),
+        vendored!("pool_v2_5.json"),
+        vendored!("pool_v2_6.json"),
+        vendored!("pool_v2_7.json"),
     ];
-    m.extend(extra);
-    ciris_verify_core::edition2::sign_row_statement(
-        seat,
-        &iref(seat),
-        &iref(seat),
-        "scores",
-        "key:revocation",
-        &map(m),
-        vec![],
-    )
-    .unwrap()
+    /// `genesis_reseat_v1.json` (its own pool inside).
+    pub(crate) const RESEAT: &str = vendored!("genesis_reseat_v1.json");
+
+    /// Each vendored file and its SHA-256 at Verify's `v23.3.0` tag
+    /// (ffd7af1, `src/ciris-verify-core/tests/vectors/edition2/genesis/`).
+    pub(crate) fn pinned() -> [(&'static str, &'static str, &'static str); 10] {
+        [
+            (
+                "genesis_bundles_v2.json",
+                V2,
+                "395819725ad28899fcff8ee75f238d09a319d5a0a8d3e242f91d7f973fa52153",
+            ),
+            (
+                "genesis_reseat_v1.json",
+                RESEAT,
+                "11cd3aba1af28cd9cf9d1d2328b529b1aed1efd80b552b0283cd6ed7e6abc0e2",
+            ),
+            (
+                "pool_v2_0.json",
+                POOL[0],
+                "58fe47afd852e4c5a7015b96a112bd54ea6e58a483d55e49996250fa73a08a87",
+            ),
+            (
+                "pool_v2_1.json",
+                POOL[1],
+                "4146bc7ec18c6fecc7112b231d139693a34f7e7c1faa8382fa89ecf82ddc3f21",
+            ),
+            (
+                "pool_v2_2.json",
+                POOL[2],
+                "52cb089f6321480f5ea6a54c10ae4730009aa9666b50b53e38bb00fbd9b3280f",
+            ),
+            (
+                "pool_v2_3.json",
+                POOL[3],
+                "20a3846db5e01901b0acc87ab3f5d3079d4b67a60e204655157d242c1fdbb04a",
+            ),
+            (
+                "pool_v2_4.json",
+                POOL[4],
+                "b705cb9caaa7f2cabfae3cc1c606dd956accf0d3a37633ba57de5f7d7c30b9dd",
+            ),
+            (
+                "pool_v2_5.json",
+                POOL[5],
+                "9a98fd0301e554fe4659ae2d96cda6998472297da4a336a500f42d4af02acddf",
+            ),
+            (
+                "pool_v2_6.json",
+                POOL[6],
+                "98e299f74ed60e899b24ef8c7b3a4bfffa080b556afc77b8017da9aaa0944ac2",
+            ),
+            (
+                "pool_v2_7.json",
+                POOL[7],
+                "635adb0daa6402b951ac8766c9c6423680e130c1a9949aaa9b0f05b35a560a08",
+            ),
+        ]
+    }
+
+    /// `genesis_bundles_v2.json` with its pool merged in under `pool`.
+    pub(crate) fn v2() -> &'static J {
+        static F: OnceLock<J> = OnceLock::new();
+        F.get_or_init(|| {
+            let mut f: J = serde_json::from_str(V2).unwrap();
+            let mut pool = serde_json::Map::new();
+            for part in POOL {
+                let J::Object(m) = serde_json::from_str::<J>(part).unwrap() else {
+                    panic!("a pool file is a map");
+                };
+                pool.extend(m);
+            }
+            f["pool"] = J::Object(pool);
+            f
+        })
+    }
+
+    /// `genesis_reseat_v1.json`.
+    pub(crate) fn reseat() -> &'static J {
+        static F: OnceLock<J> = OnceLock::new();
+        F.get_or_init(|| serde_json::from_str(RESEAT).unwrap())
+    }
+
+    pub(crate) fn hex32(s: &str) -> Digest32 {
+        hex::decode(s).unwrap().try_into().unwrap()
+    }
+
+    pub(crate) fn case<'a>(f: &'a J, id: &str) -> &'a J {
+        f["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("no case {id}"))
+    }
+
+    fn pool(f: &J, k: &J) -> Vec<u8> {
+        hex::decode(f["pool"][k.as_str().unwrap()].as_str().unwrap()).unwrap()
+    }
+
+    /// A case's bundle statements.
+    pub(crate) fn statements(f: &J, c: &J) -> Vec<Vec<u8>> {
+        c["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| pool(f, k))
+            .collect()
+    }
+
+    /// A case's rows, by row id.
+    pub(crate) fn rows(f: &J, c: &J) -> BTreeMap<Digest32, Vec<u8>> {
+        c["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (hex32(r["id"].as_str().unwrap()), pool(f, &r["statement"])))
+            .collect()
+    }
+
+    /// A case's statements and rows in one list, as the door takes them.
+    pub(crate) fn offered(f: &J, c: &J) -> Vec<Vec<u8>> {
+        let mut out = statements(f, c);
+        out.extend(rows(f, c).into_values());
+        out
+    }
+
+    /// A case's anchor.
+    pub(crate) fn anchor(c: &J) -> Option<Anchor> {
+        let a = &c["anchor"];
+        if a.is_null() {
+            return None;
+        }
+        if let Some(t) = a.get("thumbprints") {
+            return Some(Anchor::Thumbprints(
+                t.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| hex32(x.as_str().unwrap()))
+                    .collect(),
+            ));
+        }
+        Some(Anchor::ObjectId(hex32(a["object_id"].as_str().unwrap())))
+    }
+
+    /// The cases a case's `predecessors` name, transitively, ancestors first.
+    pub(crate) fn ancestors<'a>(f: &'a J, c: &J) -> Vec<&'a J> {
+        let mut out = Vec::new();
+        for p in c["predecessors"].as_array().unwrap() {
+            if let Some(id) = p.get("case").and_then(J::as_str) {
+                let a = case(f, id);
+                for x in ancestors(f, a) {
+                    if !out.iter().any(|y: &&J| std::ptr::eq(*y, x)) {
+                        out.push(x);
+                    }
+                }
+                if !out.iter().any(|y: &&J| std::ptr::eq(*y, a)) {
+                    out.push(a);
+                }
+            }
+        }
+        out
+    }
+
+    /// The file's mock attestation root (DER).
+    pub(crate) fn root_der(f: &J) -> Vec<u8> {
+        hex::decode(f["attestation_root_der"].as_str().unwrap()).unwrap()
+    }
 }
 
-#[test]
-fn i1907_a_seats_xwing_keys_come_from_its_binding() {
-    let seat = key(44);
-    let other = key(45);
-    let held = holding(&[&seat, &other]);
-    let transit = vec![7u8; 1216];
-    let onion = vec![8u8; 1216];
-    let admit = |st: Vec<u8>| admit_row(&st, &held, None, SelectContext::default()).unwrap();
-    let both = |t: &[u8], o: &[u8]| {
-        vec![
-            ("transit_xwing_pubkey", Value::Bytes(t.to_vec())),
-            ("onion_hop_xwing_pubkey", Value::Bytes(o.to_vec())),
-        ]
-    };
-    let ok = admit(binding(&seat, both(&transit, &onion)));
-    let (t, o) = seat_xwing_from_binding(&ok, &kid(&seat)).unwrap();
+use vectors::{ancestors, anchor, case, rows, statements};
+
+fn h(d: &Digest32) -> String {
+    hex::encode(d)
+}
+
+fn sha_hex(b: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(b))
+}
+
+fn strs(v: &J) -> Vec<String> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The mock root alone: the replay does not lean on the process-wide test
+/// roots the store witnesses register.
+fn mock_roots(f: &J) -> TrustAnchorStore {
+    TrustAnchorStore::new().with_store(single(
+        environments::YUBIKEY_PIV,
+        Purpose::KeyAttestation,
+        vec![vectors::root_der(f)],
+    ))
+}
+
+/// A case read through persist's lineage reader: its ancestors' statements
+/// held, its own offered under its anchor, every row given.
+fn read_case(f: &J, c: &J, roots: &TrustAnchorStore) -> (LineageReading, GenesisInForce) {
+    let chain = ancestors(f, c);
+    let held: Vec<Vec<u8>> = chain.iter().flat_map(|a| statements(f, a)).collect();
+    let mut all_rows: BTreeMap<Digest32, Vec<u8>> = BTreeMap::new();
+    for a in &chain {
+        all_rows.extend(rows(f, a));
+    }
+    all_rows.extend(rows(f, c));
+    let offered = statements(f, c);
+    let a = anchor(c);
+    let reading = read_lineage(&LineageInput {
+        held: &held,
+        offered: &offered,
+        rows: &all_rows,
+        anchor: a.as_ref(),
+        attestation_roots: roots,
+    });
+    let in_force = in_force_of(&reading, &all_rows);
+    (reading, in_force)
+}
+
+fn check_placement(id: &str, p: &GenesisPlacement, e: &J) {
+    assert_eq!(h(&p.object_id), e["object_id"].as_str().unwrap(), "{id}");
+    assert_eq!(u64::from(p.version), e["version"].as_u64().unwrap(), "{id}");
+    assert_eq!(p.asserted_at, e["asserted_at"].as_u64().unwrap(), "{id}");
     assert_eq!(
-        (t.to_vec(), o.to_vec()),
-        (transit.clone(), onion.clone()),
-        "I1907"
+        p.family_key_id,
+        e["family_key_id"].as_str().unwrap(),
+        "{id}"
     );
-    let mut shared_x = onion.clone();
-    shared_x[1184..].copy_from_slice(&transit[1184..]);
-    let mut v1 = both(&transit, &onion);
-    v1.push((
-        "transit_kex_pubkeys",
-        map(vec![("x25519", Value::Bytes(vec![1; 32]))]),
-    ));
-    for (what, row, signer) in [
-        (
-            "other signer",
-            admit(binding(&other, both(&transit, &onion))),
-            kid(&seat),
-        ),
-        (
-            "short",
-            admit(binding(&seat, both(&transit[..1215], &onion))),
-            kid(&seat),
-        ),
-        (
-            "no onion",
-            admit(binding(
-                &seat,
-                vec![("transit_xwing_pubkey", Value::Bytes(transit.clone()))],
-            )),
-            kid(&seat),
-        ),
-        (
-            "shared half",
-            admit(binding(&seat, both(&transit, &shared_x))),
-            kid(&seat),
-        ),
-        ("v1 pair", admit(binding(&seat, v1)), kid(&seat)),
-    ] {
-        let e = seat_xwing_from_binding(&row, &signer).unwrap_err();
+    assert_eq!(
+        p.prev.map(|d| h(&d)),
+        e["prev"].as_str().map(str::to_owned),
+        "{id}: prev"
+    );
+    assert_eq!(p.counted, strs(&e["counted"]), "{id}: counted");
+    assert_eq!(p.recovered.as_deref(), e["recovered"].as_str(), "{id}");
+    if let Some(fuse) = e.get("halt_fuse").and_then(J::as_u64) {
+        assert_eq!(u64::from(p.charter.halt_fuse()), fuse, "{id}: fuse");
+    }
+    let eh = e["holders"].as_array().unwrap();
+    assert_eq!(p.holders.len(), eh.len(), "{id}: holders");
+    for (x, y) in p.holders.iter().zip(eh) {
+        assert_eq!(x.identity_ref, y["identity_ref"].as_str().unwrap(), "{id}");
+        assert_eq!(h(&x.kid), y["kid"].as_str().unwrap(), "{id}");
+        assert_eq!(h(&x.record), y["record"].as_str().unwrap(), "{id}");
         assert_eq!(
-            reason(&e),
-            malformed_row::GENESIS_BUNDLE_SEAT_BINDING,
-            "I1907 {what}"
+            h(&x.recovery_commitment),
+            y["recovery_commitment"].as_str().unwrap(),
+            "{id}"
         );
     }
+    let es = e["seats"].as_array().unwrap();
+    assert_eq!(p.seats.len(), es.len(), "{id}: seats");
+    for (x, y) in p.seats.iter().zip(es) {
+        assert_eq!(x.identity_ref, y["identity_ref"].as_str().unwrap(), "{id}");
+        assert_eq!(h(&x.kid), y["kid"].as_str().unwrap(), "{id}");
+        assert_eq!(h(&x.record), y["record"].as_str().unwrap(), "{id}");
+        assert_eq!(h(&x.binding), y["binding"].as_str().unwrap(), "{id}");
+        assert_eq!(x.valid_until, y["valid_until"].as_u64().unwrap(), "{id}");
+        assert_eq!(
+            sha_hex(&x.transit_xwing_pubkey),
+            y["transit_xwing_pubkey_sha256"].as_str().unwrap(),
+            "{id}"
+        );
+        assert_eq!(
+            sha_hex(&x.onion_hop_xwing_pubkey),
+            y["onion_hop_xwing_pubkey_sha256"].as_str().unwrap(),
+            "{id}"
+        );
+    }
+}
+
+/// Each object the case offers gives the case's expected verdict.
+fn check_case(f: &J, c: &J, roots: &TrustAnchorStore) -> GenesisInForce {
+    let id = c["id"].as_str().unwrap();
+    let (reading, in_force) = read_case(f, c, roots);
+    let offered: BTreeMap<String, &GenesisVerdict> = reading
+        .objects
+        .iter()
+        .filter(|o| o.offered)
+        .map(|o| (h(&o.reading.object_id), &o.reading.verdict))
+        .collect();
+    let expect = c["expect"].as_array().unwrap();
+    assert_eq!(offered.len(), expect.len(), "{id}: objects");
+    for e in expect {
+        let oid = e["object_id"].as_str().unwrap();
+        let got = offered
+            .get(oid)
+            .unwrap_or_else(|| panic!("{id}: object {oid} not read"));
+        match (e["verdict"].as_str().unwrap(), got) {
+            ("valid", GenesisVerdict::Valid(p)) => check_placement(id, p, &e["placement"]),
+            ("invalid", GenesisVerdict::Invalid(m)) => {
+                assert_eq!(e["token"], malformed_row::GENESIS_BUNDLE_MALFORMED, "{id}");
+                assert_eq!(m.reason(), e["detail"].as_str().unwrap(), "{id}");
+            }
+            ("waiting", GenesisVerdict::Waiting(w)) => {
+                let ew = &e["waiting"];
+                assert_eq!(
+                    w.rows.iter().map(h).collect::<Vec<_>>(),
+                    strs(&ew["rows"]),
+                    "{id}"
+                );
+                assert_eq!(
+                    w.kids.iter().map(h).collect::<Vec<_>>(),
+                    strs(&ew["kids"]),
+                    "{id}"
+                );
+                assert_eq!(
+                    w.prev.map(|d| h(&d)),
+                    ew["prev"].as_str().map(str::to_owned),
+                    "{id}: prev"
+                );
+            }
+            ("nothing", GenesisVerdict::Nothing(i)) => {
+                assert_eq!(i.token(), e["token"].as_str().unwrap(), "{id}: {i:?}");
+                assert_eq!(i.detail(), e["detail"].as_str(), "{id}: {i:?}");
+            }
+            (want, got) => panic!("{id}: want {want}, got {got:?}"),
+        }
+    }
+    in_force
+}
+
+/// I2300: the vendored files are Verify 23.3.0's, byte for byte.
+#[test]
+fn i2300_the_genesis_vectors_are_verify_23_3_0s() {
+    for (name, body, sha) in vectors::pinned() {
+        assert_eq!(sha_hex(body.as_bytes()), sha, "I2300: {name}");
+    }
+    assert!(
+        vectors::v2()["cases"].as_array().unwrap().len() >= 105,
+        "I2300: the case list"
+    );
+}
+
+/// I2301: every case through persist's lineage reader gives Verify's
+/// verdict for each object it offers.
+#[test]
+fn i2301_every_v2_case_reads_through_persists_lineage() {
+    let f = vectors::v2();
+    let roots = mock_roots(f);
+    let mut skipped = Vec::new();
+    let mut replayed = 0usize;
+    for c in f["cases"].as_array().unwrap() {
+        let id = c["id"].as_str().unwrap();
+        if c["predecessors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.get("not_valid").is_some())
+        {
+            skipped.push(id);
+            continue;
+        }
+        check_case(f, c, &roots);
+        replayed += 1;
+    }
+    assert_eq!(skipped, vec!["later_prev_not_valid"], "I2301: the one skip");
+    assert!(replayed >= 104, "I2301: {replayed} cases");
+}
+
+/// I2302: on the fork cases, the genesis in force reports Verify's forks,
+/// head, and the tips' common holders and seats.
+#[test]
+fn i2302_forks_are_held_as_tips_and_only_the_common_counts() {
+    let f = vectors::v2();
+    let roots = mock_roots(f);
+    let mut seen = 0usize;
+    for c in f["cases"].as_array().unwrap() {
+        let Some(fx) = c.get("forks") else {
+            continue;
+        };
+        let id = c["id"].as_str().unwrap();
+        let in_force = check_case(f, c, &roots);
+        let forks: Vec<(String, Option<String>, Vec<String>)> = in_force
+            .forks
+            .iter()
+            .map(|fk| match fk {
+                Fork::Genesis { bundles } => {
+                    ("genesis".into(), None, bundles.iter().map(h).collect())
+                }
+                Fork::Successors { prev, bundles } => (
+                    "successors".into(),
+                    Some(h(prev)),
+                    bundles.iter().map(h).collect(),
+                ),
+            })
+            .collect();
+        let want: Vec<(String, Option<String>, Vec<String>)> = fx["forks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| {
+                (
+                    x["kind"].as_str().unwrap().into(),
+                    x["prev"].as_str().map(str::to_owned),
+                    strs(&x["bundles"]),
+                )
+            })
+            .collect();
+        assert_eq!(forks, want, "I2302 {id}: forks");
+        assert_eq!(
+            in_force.head.as_ref().map(|p| h(&p.object_id)),
+            fx["head"].as_str().map(str::to_owned),
+            "I2302 {id}: head"
+        );
+        match (&in_force.common, fx["common"].as_object()) {
+            (None, None) => {
+                assert!(in_force.holders().is_empty(), "I2302 {id}");
+                assert!(in_force.seats().is_empty(), "I2302 {id}");
+            }
+            (Some(t), Some(w)) => {
+                assert_eq!(
+                    t.tips.iter().map(h).collect::<Vec<_>>(),
+                    strs(&w["tips"]),
+                    "{id}"
+                );
+                let holders: Vec<String> = in_force
+                    .holders()
+                    .iter()
+                    .map(|x| x.identity_ref.clone())
+                    .collect();
+                assert_eq!(holders, strs(&w["holders"]), "I2302 {id}: holders");
+                let seats: Vec<String> = in_force
+                    .seats()
+                    .iter()
+                    .map(|x| x.identity_ref.clone())
+                    .collect();
+                assert_eq!(seats, strs(&w["seats"]), "I2302 {id}: seats");
+                for s in &seats {
+                    assert!(in_force.is_canonical(s), "I2302 {id}: common seat");
+                }
+            }
+            (got, want) => panic!("I2302 {id}: common {got:?}, want {want:?}"),
+        }
+        seen += 1;
+    }
+    assert!(seen >= 5, "I2302: the fork cases");
+}
+
+/// I2303: persist's tokens are Verify's.
+#[test]
+fn i2303_persists_genesis_tokens_are_verifys() {
+    use ciris_verify_core::edition2::genesis::GENESIS_BUNDLE_MALFORMED;
+    assert_eq!(
+        malformed_row::GENESIS_BUNDLE_MALFORMED,
+        GENESIS_BUNDLE_MALFORMED
+    );
+    let pairs = [
+        (
+            Inconclusive::NotAnchored,
+            malformed_row::GENESIS_BUNDLE_NOT_ANCHORED,
+        ),
+        (
+            Inconclusive::PrevNotValid,
+            malformed_row::GENESIS_BUNDLE_PREV_NOT_VALID,
+        ),
+        (
+            Inconclusive::RowUnplaced {
+                row: None,
+                party: None,
+            },
+            malformed_row::GENESIS_BUNDLE_ROW_UNPLACED,
+        ),
+        (
+            Inconclusive::RowInvalid {
+                row: [0; 32],
+                fault: RowFault::Signer,
+            },
+            malformed_row::GENESIS_BUNDLE_ROW_INVALID,
+        ),
+        (
+            Inconclusive::HolderCustody {
+                holder: String::new(),
+                fault: CustodyFault::NoClass,
+            },
+            malformed_row::GENESIS_HOLDER_CUSTODY,
+        ),
+        (
+            Inconclusive::CountUnmet,
+            malformed_row::GENESIS_BUNDLE_COUNT_UNMET,
+        ),
+        (
+            Inconclusive::Commitment(CommitmentFault::Spent),
+            malformed_row::GENESIS_BUNDLE_COUNT_UNMET,
+        ),
+    ];
+    for (i, t) in pairs {
+        assert_eq!(i.token(), t, "I2303: {i:?}");
+        assert!(malformed_row::ALL.contains(&t), "I2303: {t} is listed");
+    }
+}
+
+/// I2304: a seat re-seated at a new key keeps its identity-ref and its
+/// standing, at the new key; a binding the placed key did not sign is
+/// `genesis_bundle_row_invalid` (`row_signer`).
+#[test]
+fn i2304_a_reseated_seat_keeps_its_identity_ref_at_the_new_key() {
+    let f = vectors::reseat();
+    let roots = mock_roots(f);
+    let cases = f["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 4, "I2304: the case list");
+    for c in cases {
+        check_case(f, c, &roots);
+    }
+    let c = case(f, "reseat_seat_new_key");
+    let (_, in_force) = read_case(f, c, &roots);
+    let s1 = &f["parties"]["S1"];
+    let s1n = &f["parties"]["S1N"];
+    assert_ne!(s1["kid"], s1n["kid"], "I2304: a new key");
+    let iss = s1["iss"].as_str().unwrap();
+    assert!(in_force.is_canonical(iss), "I2304: still canonical");
+    let seat = in_force.seat(iss).unwrap();
+    assert_eq!(
+        h(&seat.kid),
+        s1n["kid"].as_str().unwrap(),
+        "I2304: the new key"
+    );
+    let xw = &f["seat_xwing"]["S1N"];
+    assert_eq!(
+        hex::encode(seat.transit_xwing_pubkey),
+        xw["transit_xwing_pubkey"].as_str().unwrap(),
+        "I2304: the new key's transit X-Wing key"
+    );
+    assert_eq!(
+        hex::encode(seat.onion_hop_xwing_pubkey),
+        xw["onion_hop_xwing_pubkey"].as_str().unwrap(),
+        "I2304"
+    );
 }

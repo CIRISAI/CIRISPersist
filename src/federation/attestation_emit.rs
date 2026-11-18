@@ -557,6 +557,7 @@ where
     .then_some(iss.as_str());
     let mut payload = payload_from_envelope(
         &envelope,
+        &family,
         asserted_at_ms,
         author,
         &["references_attestation_id"],
@@ -635,7 +636,10 @@ where
     let row_id = match outcome {
         super::edition2::ingest::StatementOutcome::Row { row_id, .. }
         | super::edition2::ingest::StatementOutcome::Voice { row_id, .. }
-        | super::edition2::ingest::StatementOutcome::KeyPlane { row_id, .. } => row_id,
+        | super::edition2::ingest::StatementOutcome::KeyPlane { row_id, .. }
+        // X2 build fix: T1's counted row short of its voices is held; the
+        // produced statement still names its row.
+        | super::edition2::ingest::StatementOutcome::Pending { row_id, .. } => row_id,
     };
     Ok(EmittedAttestation {
         attestation_id: row_id.hex(),

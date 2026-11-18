@@ -186,6 +186,13 @@ where
         if !is_user_key(dir, &identity).await? {
             continue;
         }
+        // v62.0.0 (v62 P5c; CC rc21 3.3.6) — a machine key is never a key of
+        // a person: once the earlier form is shut, a held row binding one
+        // under a person makes it no self of theirs (a node cannot vote as
+        // its owner).
+        if !super::replication_audience::occurrence_counts(dir, &identity, key).await? {
+            continue;
+        }
         let revocations = dir
             .list_identity_occurrence_revocations_for(&identity)
             .await?

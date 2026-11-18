@@ -257,18 +257,11 @@ where
     D: FederationDirectory + ?Sized,
 {
     let identity = framed.revocation()?.identity_key_id;
-    let single_signer = dir.lookup_public_key(&identity).await?.is_some_and(|k| {
-        identity_type::set_contains(&k.identity_type, identity_type::NODE)
-            || identity_type::set_contains(&k.identity_type, identity_type::AGENT)
-    });
-    if single_signer {
+    if is_single_signer_identity(dir, &identity).await? {
         return Ok(());
     }
-    let roster = super::self_roster::roster_now(dir, &identity).await?;
-    let mut signed: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    if roster.contains(&framed.attesting_key_id) {
-        signed.insert(&framed.attesting_key_id);
-    }
+    let mut offered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    offered.insert(framed.attesting_key_id.clone());
     for (i, scrub) in row.additional_scrubs.iter().enumerate() {
         super::tier_ingest::verify_envelope_hybrid_signature(
             dir,
@@ -284,24 +277,84 @@ where
                 row.attestation_id, scrub.scrub_key_id
             ))
         })?;
-        if roster.contains(&scrub.scrub_key_id) {
-            signed.insert(&scrub.scrub_key_id);
-        }
+        offered.insert(scrub.scrub_key_id.clone());
     }
-    let need = ciris_verify_core::accord_genesis::strict_majority(roster.len());
-    if roster.is_empty() || signed.len() < need {
+    let count = roster_majority(dir, &identity, &offered).await?;
+    if !count.met() {
         return Err(malformed(
             super::malformed_row::CARRIER_WITHOUT_ROSTER_QUORUM,
             format!(
                 "occurrence revocation carrier for {identity:?}: a user self's carrier needs a \
-                 strict majority of its current live roster ({need} of {}); {} signed — re-propose \
+                 strict majority of its current live roster ({} of {}); {} signed — re-propose \
                  the revocation through the two-path door (CC 3.1.5, 3.3.6.3)",
-                roster.len(),
-                signed.len()
+                count.need, count.roster, count.signed
             ),
         ));
     }
     Ok(())
+}
+
+/// v62.0.0 (wave T2) — **(A) of the structural rule**: is `identity` a
+/// `node` or `agent` (single-signer in any case)? Shared by the carrier
+/// ([`check_carrier_admission`]) and the edition-2
+/// `identity:occurrence_revocation` door (`edition2::typed`), so one rule
+/// decides both.
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn is_single_signer_identity<D>(dir: &D, identity: &str) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(dir.lookup_public_key(identity).await?.is_some_and(|k| {
+        identity_type::set_contains(&k.identity_type, identity_type::NODE)
+            || identity_type::set_contains(&k.identity_type, identity_type::AGENT)
+    }))
+}
+
+/// v62.0.0 (wave T2) — what [`roster_majority`] counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RosterCount {
+    /// The live roster's size.
+    pub roster: usize,
+    /// How many distinct roster keys signed.
+    pub signed: usize,
+    /// The strict majority of the roster.
+    pub need: usize,
+}
+
+impl RosterCount {
+    /// A strict majority of a non-empty roster signed.
+    #[must_use]
+    pub(crate) fn met(&self) -> bool {
+        self.roster > 0 && self.signed >= self.need
+    }
+}
+
+/// v62.0.0 (wave T2) — **(B) of the structural rule, counted**: of the
+/// `signers` offered, the distinct keys on `identity`'s CURRENT live roster
+/// ([`super::self_roster::roster_now`]), against its strict majority
+/// (verify-core's `strict_majority`). A signer off the roster is not
+/// counted. The carrier's count (the edition-2 door runs the self-roster's
+/// two-path decision instead, `self_roster::gate_edition2`).
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn roster_majority<D>(
+    dir: &D,
+    identity: &str,
+    signers: &std::collections::BTreeSet<String>,
+) -> Result<RosterCount, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let roster = super::self_roster::roster_now(dir, identity).await?;
+    let signed = signers.iter().filter(|s| roster.contains(*s)).count();
+    Ok(RosterCount {
+        roster: roster.len(),
+        signed,
+        need: ciris_verify_core::accord_genesis::strict_majority(roster.len()),
+    })
 }
 
 /// **The receiver's rule** (the generic verify defers to it, as it does for

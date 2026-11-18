@@ -1767,15 +1767,18 @@ pub mod bodies {
     /// arm's door) and the stored set is unchanged; a supersede to a fused set
     /// (`supersede`, the replicated `Supersede` arm's door) likewise. Control:
     /// the same upgrade keeping `node` alone is adopted.
-    pub async fn clause_a_on_the_rewrite_doors<U, UF, S, SF>(
+    pub(crate) async fn clause_a_on_the_rewrite_doors<U, UF, S, SF>(
         d: &dyn FederationDirectory,
         tag: &str,
         upgrade: U,
         supersede: S,
     ) where
         U: Fn(SignedKeyRecord) -> UF,
+        // v62.0.0 (json-cut C5): the `adopt_scrub_upgrade` door is deleted;
+        // the upgrade is driven through the shared plan's `ScrubUpgrade` write
+        // (the replicated `Upgrade` arm's door).
         UF: std::future::Future<
-            Output = Result<crate::federation::register::AdoptScrubOutcome, Error>,
+            Output = Result<crate::federation::key_plane::KeyRecordWritten, Error>,
         >,
         S: Fn(SignedKeyRecord) -> SF,
         SF: std::future::Future<
@@ -2552,7 +2555,12 @@ mod runners {
         super::bodies::clause_a_on_the_rewrite_doors(
             &b as &dyn crate::federation::FederationDirectory,
             &format!("clause-a-rw-{}", suffix()),
-            |r| crate::federation::FederationDirectory::adopt_scrub_upgrade(&b, r),
+            |r| {
+                crate::federation::key_plane::key_record_write_planned(
+                    &b,
+                    crate::federation::key_plane::KeyRecordWrite::ScrubUpgrade { record: r.record },
+                )
+            },
             |r| crate::federation::key_plane::supersede_canonical_planned(&b, r),
         )
         .await;
@@ -2573,7 +2581,12 @@ mod runners {
         super::bodies::clause_a_on_the_rewrite_doors(
             &b as &dyn crate::federation::FederationDirectory,
             &format!("clause-a-rw-{}", suffix()),
-            |r| crate::federation::FederationDirectory::adopt_scrub_upgrade(&b, r),
+            |r| {
+                crate::federation::key_plane::key_record_write_planned(
+                    &b,
+                    crate::federation::key_plane::KeyRecordWrite::ScrubUpgrade { record: r.record },
+                )
+            },
             |r| crate::federation::key_plane::supersede_canonical_planned(&b, r),
         )
         .await;

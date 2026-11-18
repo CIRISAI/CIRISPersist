@@ -1735,6 +1735,30 @@ pub trait BlobStorage: Send + Sync {
         attestation: PutBlobAttestation,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// v62.0.0 (wave T2) — [`Self::put_blob`] with an EDITION-2 holding
+    /// claim: `claim` is the holder's `custody:{kind}` statement (`here`, at
+    /// `federation`, naming this blob and its size; the twin is
+    /// `edition2::fixture_switch::custody_statement`). The bytes are checked
+    /// and stored as `put_blob` stores them, then the claim goes through the
+    /// statement door (`edition2::ingest::put_statement`), so the holder
+    /// directory reads it as any custody report. The default refuses; the
+    /// sqlite and postgres backends override
+    /// (`blob_admit::put_blob_edition2_planned`).
+    fn put_blob_edition2(
+        &self,
+        sha256: &[u8; 32],
+        body: BlobBody,
+        media_type: Option<&str>,
+        claim: &[u8],
+    ) -> impl Future<Output = Result<(), BlobError>> + Send {
+        let _ = (sha256, body, media_type, claim);
+        async {
+            Err(BlobError::InvalidArgument(
+                "put_blob_edition2: this backend has no edition-2 blob door".into(),
+            ))
+        }
+    }
+
     /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
     /// bytes **without** emitting a holding claim.
     ///

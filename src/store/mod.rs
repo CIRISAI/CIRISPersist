@@ -44,6 +44,10 @@ pub mod edition_upgrade;
 /// v62.0.0 (slice E2b): I1953–I1959. The upgrade witnesses, both dialects.
 #[cfg(test)]
 mod edition_upgrade_invariants;
+/// v62.0.0 (CC 2.7) — I3604, I3605: a foreign-key refusal from either
+/// driver is the one wait, `federation_link_not_held`.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod link_not_held_invariants;
 /// #840 (I43/I44) — the migration-immutability gate and V070's repair.
 mod migration_immutability;
 /// v62.0.0 (WASM_UEFI_READINESS P6) — persist applies its own migrations:
@@ -100,7 +104,7 @@ pub mod sqlite;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_conn_model;
 /// v60.0.0 (CIRISPersist#1002) — a migrated in-memory clone of one template
-/// per process: the SQLite genesis scratch and the test constructor.
+/// per process: the test constructor (the genesis scratch is deleted, v62.0.0).
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite_scratch;
 /// v61.1.0 (CIRISPersist#1238): I1660–I1663. Every SQLite write transaction

@@ -38,14 +38,14 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc18";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc20";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "d7f9e69118afcdf510d2f572914fac00faa1b3fe7476ad7eb0523c32b4ab9f0b";
+    "c6631c9cd71a7f1094ea538b3b0ae643656ca118da9032492b6592b8858d2545";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 192;
+pub const VENDORED_N_FAMILIES: usize = 186;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -55,32 +55,33 @@ pub const VENDORED_N_FAMILIES: usize = 192;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc18; see [`VENDORED_CC_COMMIT`] for the tag), together with
+/// (CC 1.0-rc20; see [`VENDORED_CC_COMMIT`] for the tag), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "3ba2096fd5f60c22131cb6743c0acb5cbb892fc739e6cedc15c4e68011f763a6";
+    "4ad83caa00b33a4b7097f8fa655ced9d47cf56de6cb258b604a7744cb2abcca0";
 
 /// The CIRISConstitution commit every vendored CC manifest was copied from: the
-/// commit the `v1.0-rc18` tag names (`646df978`, tag object `ae5a2a01`), copied
-/// from the tag with `git show v1.0-rc18:manifests/<file>`, never a branch tip
-/// (CIRISPersist#753; v61.3.0, CIRISPersist#1252, from rc15 `ace6b74`). The
+/// commit the `v1.0-rc20` tag names (`d4bd2a6b`, tag object `e9761fb9`), copied
+/// from the tag with `git show v1.0-rc20:manifests/<file>`, never a branch tip
+/// (CIRISPersist#753; v62.0.0, from rc18 `646df978`; v61.3.0,
+/// CIRISPersist#1252, from rc15 `ace6b74`). The
 /// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`], and the
-/// files in [`super::cc_manifests`]), and `scripts/check_vendored_cc.sh v1.0-rc18`
+/// files in [`super::cc_manifests`]), and `scripts/check_vendored_cc.sh v1.0-rc20`
 /// byte-compares all of them against the tag before a persist release that
-/// names rc18 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "646df97853efeb1c068db2719ae70ffc342a2247";
+/// names rc20 is tagged.
+pub const VENDORED_CC_COMMIT: &str = "d4bd2a6b0583b8bc57c06a89f265557d357a3191";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "32f060a6fa431d3d6f6b00d0dc238451fc8cb50ddeea34b7cd73ebfe35200fa3";
+    "5c8bcf87732b37f9e653e0e45190ae599d6f86f077b5ca02bd6c7a7039806002";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =
-    "c457126ebf9df0f192bd4762eb09469bd981abf6c06097e1ee7c16d81276ec76";
+    "1312c45ada371caa7217417c5ebbcb81abbb8dcf7c45dff832f3dfa9ae02c00b";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -926,8 +927,6 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "accord:invoke:drill:{drill_id}",
     "accord:invoke:notify:{notify_id}",
     "accord:lifecycle",
-    "accord:lifecycle:active",
-    "accord:lifecycle:confirmed",
     "activity_tier:{period}",
     "age_assurance:{level}:{band}:{version}",
     "age_self_declared:band:{band}:{version}",
@@ -947,12 +946,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "bond_posted:{currency}",
     "build:registered:{target}",
     "capacity:composite",
-    "capacity:core_identity",
-    "capacity:incompleteness_awareness",
-    "capacity:integrity",
     "capacity:relay_delivery",
-    "capacity:resilience",
-    "capacity:sustained_coherence",
     "capacity_assurance:reversible_excluded:{domain}:{version}",
     "capacity_assurance:reversible_pending:{domain}:{version}",
     "capacity_assurance:{level}:{domain}:{band}:{version}",
@@ -979,18 +973,14 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "content_class:{class}",
     "content_rating:{scheme}:{rating}",
     "corpus_health:n_eff_measurable",
-    "credits:{domain}:{language}:substrate_building",
     "credits:{domain}:{language}:{subject}",
     "cw_class:{class}",
     "delivery:{class}",
     "delivery_receipt:{stream_id}",
-    "detection:conscience_override_rate",
     "detection:correlated_action:{axis}",
-    "detection:cross_agent_divergence",
     "detection:distributive:access:{resource_type}",
     "detection:hash_chain_integrity",
     "detection:intra_agent_consistency",
-    "detection:temporal_drift",
     "dma:csdma:*",
     "dma:dsdma:{domain}:*",
     "dma:idma:*",
@@ -1138,6 +1128,18 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "ballot:moderator",
     "ballot:moderator_acceptance",
     "cosign:{state}",
+    // rc20 (CIRISConstitution v1.0-rc20 @ d4bd2a6b; v62.0.0) — five families
+    // added. Three are the folds of eleven literal leaves into one
+    // closed-vocabulary row each (the leaves are in RETIRED_FAMILIES; every
+    // dimension they matched still matches, through the new row): the
+    // halt's two lifecycle rows, the five capacity factors and three of the
+    // five detectors. The other two are the v62 kinds: the location proof as
+    // a row (CC 3.3.3) and the blessing trust family.
+    "accord:lifecycle:{kind}",
+    "capacity:{factor}",
+    "detection:{detector}",
+    "location_proof:{version}",
+    "trust:blessing",
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,
@@ -1159,6 +1161,27 @@ pub const RETIRED_FAMILIES: &[&str] = &[
     // moved persist's emitters onto it; a carrier row of the type is refused at
     // every door (`RETIRED_CARRIER_STEMS`); the dimension row is gone.
     "holds_bytes:sha256:{prefix}",
+    // rc20 (CIRISConstitution v1.0-rc20 @ d4bd2a6b; v62.0.0): ten literal
+    // leaves folded into a closed-vocabulary row of the same stem, so every
+    // dimension they matched still matches, and binds the leaf as the
+    // segment: `accord:lifecycle:{kind}` ∈ active | confirmed (CC 3.1.1),
+    // `capacity:{factor}` (CC 3.1.8.1) and `detection:{detector}` ∈
+    // cross_agent_divergence | temporal_drift | conscience_override_rate
+    // (CC 3.1.8.2).
+    "accord:lifecycle:active",
+    "accord:lifecycle:confirmed",
+    "capacity:core_identity",
+    "capacity:incompleteness_awareness",
+    "capacity:integrity",
+    "capacity:resilience",
+    "capacity:sustained_coherence",
+    "detection:conscience_override_rate",
+    "detection:cross_agent_divergence",
+    "detection:temporal_drift",
+    // rc20: the `substrate_building` subject is no longer its own row; a
+    // `credits:{domain}:{language}:substrate_building:v1` dimension is the
+    // open `{subject}` of `credits:{domain}:{language}:{subject}`.
+    "credits:{domain}:{language}:substrate_building",
 ];
 
 #[cfg(test)]
@@ -1917,10 +1940,12 @@ mod tests {
     #[test]
     fn lookup_resolves_through_the_one_matcher_924() {
         let prefix = |d: &str| lookup(d).map(|e| e.prefix.as_str());
+        // rc20 retired the `substrate_building` row: the dimension is the
+        // open `{subject}` of the one remaining `credits:` family.
         assert_eq!(
             prefix("credits:rust:en:substrate_building:v1"),
-            Some("credits:{domain}:{language}:substrate_building"),
-            "the most literal family wins, not the alphabetically first"
+            Some("credits:{domain}:{language}:{subject}"),
+            "rc20: substrate_building is a subject, not its own family"
         );
         assert_eq!(
             prefix("credits:rust:en:alice:v1"),

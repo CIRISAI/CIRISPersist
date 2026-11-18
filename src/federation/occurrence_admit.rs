@@ -76,6 +76,15 @@ pub(crate) trait OccurrenceStore: FederationDirectory + Sized {
 
     /// The wire-index entry of the pair's `identity:occurrence:v1` row.
     async fn index_occurrence_row(&self, row_id: Option<&str>) -> Result<(), Error>;
+
+    /// v62.0.0 (wave O1) — in ONE transaction: an edition-2 bind's
+    /// last-signed-wins upsert (strictly newer `asserted_at` only, at a fresh
+    /// serve position), `attesting_key_id` and `signed_envelope` from
+    /// `planned.signed`, `signature` NULL, and its #930 history row whether
+    /// or not it applied. No earlier-form `identity:occurrence:v1` row is
+    /// minted: the bind is its edition-2 statements. Returns whether the
+    /// upsert took the record.
+    async fn store_edition2_occurrence(&self, planned: PlannedOccurrence) -> Result<bool, Error>;
 }
 
 /// The device-class and encryption-key gates, the row hash, the column
@@ -103,9 +112,17 @@ fn plan_occurrence(
     // #446 — the binding's route is materialized into the
     // `transport_destinations` read model AFTER the write (only when it
     // applied, for the signed door).
+    // v62.0.0 (wave O1; E8's finding) — an occurrence already out of its
+    // half-open window at write projects no route (the read side filters
+    // one that expires later: `transport_routes::fold_one_live_key`).
+    // The end of the half-open window only: an assertion stamped within the
+    // clock-skew tolerance ahead of now still projects.
+    let now = crate::host::clock::now();
+    let in_window = row.valid_until.is_none_or(|u| now < u);
     let projected_route = row
         .transport_binding
         .as_ref()
+        .filter(|_| in_window)
         .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at))
         .transpose()?;
     Ok((
@@ -126,6 +143,16 @@ pub(crate) async fn put_identity_occurrence_planned<D: OccurrenceStore>(
     occurrence: SignedIdentityOccurrence,
 ) -> Result<(), Error> {
     super::edition2::door::refuse_earlier_form("identity_occurrence")?;
+    // v62.0.0 (wave O1) — the identity-set exclusion on every occurrence
+    // door: no machine key under a person, no person key under a machine
+    // (`occurrence_binds_machine_to_person`), as the edition-2 door.
+    super::edition2::occurrence::check_identity_set_exclusion(
+        dir,
+        &occurrence.identity_occurrence.identity_key_id,
+        &occurrence.identity_occurrence.occurrence_key_id,
+        &occurrence.identity_occurrence.device_class,
+    )
+    .await?;
     // v14.0.0 (CIRISPersist#418) — the hybrid signature over the exact
     // producer envelope, the signer's authority and §5.6.8.8.2 C4 key
     // separation, BEFORE any write. One gate for HTTP and the wire.
@@ -176,6 +203,16 @@ pub(crate) async fn put_identity_occurrence_local_planned<D: OccurrenceStore>(
     dir: &D,
     occurrence: IdentityOccurrence,
 ) -> Result<(), Error> {
+    // v62.0.0 (wave O1) — the trusted-local door keeps the identity-set
+    // exclusion too: a local write binds no machine key under a person and
+    // no person key under a machine (`occurrence_binds_machine_to_person`).
+    super::edition2::occurrence::check_identity_set_exclusion(
+        dir,
+        &occurrence.identity_key_id,
+        &occurrence.occurrence_key_id,
+        &occurrence.device_class,
+    )
+    .await?;
     let (planned, projected_route) = plan_occurrence(occurrence, None)?;
     dir.store_planned_local_occurrence(planned).await?;
     // #446 — the trusted-local path projects too: it is an accepted write.
@@ -183,4 +220,87 @@ pub(crate) async fn put_identity_occurrence_local_planned<D: OccurrenceStore>(
         super::transport_routes::project_occurrence_route(dir, route).await?;
     }
     Ok(())
+}
+
+/// v62.0.0 (wave O1) — the route an accepted occurrence projects into
+/// `transport_destinations` (#446): written AFTER the occurrence's own
+/// transaction commits ([`after_edition2_occurrence`]).
+pub(crate) type ProjectedRoute = super::TransportDestination;
+
+/// v62.0.0 (wave O1; C1's atomic genesis import) — **the edition-2 bind's
+/// plan, pure**: the JSON door's plan (device class, encryption keys, the
+/// row hash, the route), with the bind's author and its statements as the
+/// stored container. No I/O. The writes are the backends' tx-level helpers
+/// (`sqlite::sqlite_store_edition2_occurrence`,
+/// `PostgresBackend::pg_store_edition2_occurrence`), which a caller runs
+/// inside its own transaction; the follow-on steps are
+/// [`after_edition2_occurrence`], after that transaction commits.
+///
+/// # Errors
+/// `federation_device_class_rejected`; a malformed encryption key; the row
+/// hash or route encoding.
+pub(crate) fn plan_edition2_occurrence(
+    bind: super::edition2::occurrence::OccurrenceBind,
+) -> Result<(PlannedOccurrence, Option<ProjectedRoute>), Error> {
+    let envelope = bind.envelope();
+    let super::edition2::occurrence::OccurrenceBind {
+        occurrence: row,
+        author_key_id,
+        ..
+    } = bind;
+    plan_occurrence(
+        row,
+        Some(PlannedOccurrenceSignature {
+            attesting_key_id: author_key_id,
+            signed_envelope: envelope,
+            // Not written: the bind's authority is its held statements.
+            signature_json: String::new(),
+        }),
+    )
+}
+
+/// v62.0.0 (wave O1) — **what follows an edition-2 bind's commit**, never
+/// inside a transaction: when the upsert `applied`, the route projection
+/// and the owner's epoch re-wrap (`identity != occurrence` only; a genesis
+/// seat's self pair has none).
+///
+/// # Errors
+/// The route projection's write.
+pub(crate) async fn after_edition2_occurrence<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    applied: bool,
+    identity: &str,
+    occurrence: &str,
+    route: Option<&ProjectedRoute>,
+) -> Result<(), Error> {
+    if !applied {
+        return Ok(());
+    }
+    if let Some(route) = route {
+        super::transport_routes::project_occurrence_route(dir, route).await?;
+    }
+    if identity != occurrence {
+        super::rewrap_after_admission(dir, identity, occurrence).await;
+    }
+    Ok(())
+}
+
+/// v62.0.0 (wave O1; CC 3.3.6) — the door's write: every backend's
+/// `put_identity_occurrence_edition2`. The gates ran in
+/// [`super::edition2::occurrence::put_occurrence_voice`]; this plans
+/// ([`plan_edition2_occurrence`]), writes in the backend's own transaction
+/// (`store_edition2_occurrence`, which wraps the tx-level helper), then runs
+/// [`after_edition2_occurrence`].
+pub(crate) async fn put_identity_occurrence_edition2_planned<D: OccurrenceStore>(
+    dir: &D,
+    bind: super::edition2::occurrence::OccurrenceBind,
+) -> Result<bool, Error> {
+    let pair = (
+        bind.occurrence.identity_key_id.clone(),
+        bind.occurrence.occurrence_key_id.clone(),
+    );
+    let (planned, route) = plan_edition2_occurrence(bind)?;
+    let applied = dir.store_edition2_occurrence(planned).await?;
+    after_edition2_occurrence(dir, applied, &pair.0, &pair.1, route.as_ref()).await?;
+    Ok(applied)
 }

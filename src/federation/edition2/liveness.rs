@@ -9,7 +9,7 @@
 //! **The reading** ([`HeldKeys::liveness`]):
 //! - A key is **live** at an instant when one of its valid records covers that
 //!   instant, and no revocation by one of the three revokers has taken effect
-//!   by then. A record covers `[asserted_at, valid_until]`, or
+//!   by then. A record covers `[asserted_at, valid_until)` (half-open, CC ruling; [`crate::kernel::key_end::within_record`]), or
 //!   `[asserted_at, ∞)` where it states no end.
 //! - Renewals that do not name each other all count, so the key lives to the
 //!   greatest end they state.
@@ -66,16 +66,42 @@
 //! key signed only by other keys never makes it a key of another identity;
 //! it may still make the key live to sign as itself (liveness above).
 //!
-//! TODO(verify-23.3-pin): CIRISVerify 23.3.0 adds `KeyDirectory::key_of`
-//! (`Yes` / `No` / `Waiting`, `MissingKey::Record`). [`KeyOwnership`],
-//! [`KeyOf`] and [`ChainMissing`] are its shape; at the pin they are
-//! replaced by Verify's and [`HeldKeys::key_of`] becomes persist's impl.
+//! **One check, two callers** (v62.0.0, slice C3: CIRISVerify 23.3.0).
+//! Verify's row reader asks `KeyDirectory::key_of` itself, after the
+//! signature verifies and only when `kid` is not `iss`, and refuses
+//! `kid_not_of_iss`. `HeldKeys` (and the scoped views its own records are
+//! verified through) answer that question with [`HeldKeys::key_of`], so
+//! Verify's reader and persist's door give one verdict. [`KeyOf`] and
+//! [`ChainMissing`] stay persist's richer reading (the seat arm's
+//! [`ChainMissing::Bundle`] has no Verify counterpart); [`KeyOf::to_verify`]
+//! is the one mapping onto Verify's `KeyOf` / `MissingKey`.
 //!
-//! TODO(key_end): when slice C's kernel adapter is merged, this reading is
-//! the kernel's `key_end` conclusion (`well_formed`, `conclude_rule`, `live`,
-//! `ended`, `retained`) over `KeyEndRow`s built from these records. Until
-//! then it is a persist read with the same inputs. No row but a record of
-//! the key and a revocation by one of the three enters it.
+//! Where this reading and Verify's `KeyRecordDirectory` agree and differ
+//! (`edition2/key_of_iss_v1.json`, replayed in `verify_vectors_replay`):
+//! - as Verify: a co-statement over the rotation held and not valid under
+//!   `iss` (none waiting) hands on nothing; a named record held as some
+//!   other row hands on nothing; a named record not held is waited on;
+//! - a rotation whose predecessor statement is not held at all WAITS on the
+//!   predecessor key here (a door receives a row's voices one at a time,
+//!   CC 2.6.1.8; I2101), where Verify's directory answers `No`;
+//! - a rotation whose predecessor statement waits names the link I2101
+//!   names (the predecessor key when its record is held, else the record
+//!   `target` names), where Verify names the key that statement waits on.
+//!   Both wait: the verdict is the same, the link named differs.
+//!
+//! **Through the kernel** (v62.0.0, kernel pass 2, K1, I2814–I2817): whether
+//! a held, verified record covers the instant is the kernel's `key_end`
+//! conclusion ([`crate::kernel::key_end`]: `well_formed` under the end rule
+//! and the `key_record_max_secs` ceiling, `conclude_rule`, `live`) over the
+//! key's records and its own revocations, never a sweep. The kernel reads a
+//! record as covering `[asserted_at, valid_until)` (CC 2.6.2: "has not yet
+//! reached its `valid_until`"), so a statement signed AT `valid_until` is
+//! not covered (retryable); the earlier inclusive reading is the
+//! differential's reference, the named class `key_end_half_open`. What stays
+//! persist's: verifying each record (Verify's `verify_row_statement`), and
+//! the owner / roster revokers ([`RevokerStanding`]), which the kernel's
+//! key-end reading does not count (CC 2.4.1.1: "No other row enters that
+//! reading") and persist keeps until a ruling.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -85,7 +111,8 @@ use ciris_crypto::composite::CompositePublicKey;
 use ciris_verify_core::cde::{self, Value};
 use ciris_verify_core::edition2::keys::{check_key_record, KeyRecord, KEY_RECORD_FAMILY};
 use ciris_verify_core::edition2::{
-    identity_ref, verify_row_statement, Digest32, KeyDirectory, KeyLookup, MissingKey, Verdict,
+    identity_ref, verify_row_statement, Digest32, KeyDirectory, KeyLookup, KeyOf as VerifyKeyOf,
+    MissingKey, Verdict,
 };
 
 /// The family of a key revocation (CC 3.1.3, `key:revocation:v1`'s family id).
@@ -97,9 +124,10 @@ const MAX_DEPTH: usize = ciris_verify_core::edition2::keys::MAX_RECORD_DEPTH;
 /// Who besides the key itself may revoke it (CC 2.4.1.1, "Who may revoke a
 /// key"): its owner under the owner-binding, and the roster that seats it.
 ///
-/// TODO(key_end): the edition-2 owner-binding and roster rows are read by the
-/// kernel adapter (slice C). Until it lands, a host that holds them answers
-/// here.
+/// v62.0.0 (kernel pass 2, K1): the kernel's key-end reading counts the
+/// key's own revocation only (CC 2.4.1.1); these two revokers are persist's,
+/// kept on top of it until a ruling. A host that holds the edition-2
+/// owner-binding and roster rows answers here.
 pub trait RevokerStanding: Send + Sync {
     /// Does `revoker` (an identity-ref) hold standing to revoke `subject` (an
     /// identity-ref), other than as the key itself?
@@ -141,6 +169,9 @@ pub struct HeldKeys {
     revocations: Vec<Vec<u8>>,
     standing: Arc<dyn RevokerStanding>,
     seats: BundleSeats,
+    /// v62.0.0 (wave O1, I3020) — the key-of-issuer check's occurrence arm
+    /// ([`super::occurrence::OccurrenceSeats`]).
+    occurrences: super::occurrence::OccurrenceSeats,
 }
 
 impl Default for HeldKeys {
@@ -196,6 +227,7 @@ impl HeldKeys {
             revocations: Vec::new(),
             standing: Arc::new(SelfOnly),
             seats: BundleSeats::default(),
+            occurrences: super::occurrence::OccurrenceSeats::none(),
         }
     }
 
@@ -204,6 +236,15 @@ impl HeldKeys {
     #[must_use]
     pub fn with_seats(mut self, seats: BundleSeats) -> Self {
         self.seats = seats;
+        self
+    }
+
+    /// v62.0.0 (wave O1, I3020; CC 3.3.6, the rc21 rule) — with the live,
+    /// unevicted occurrences the key-of-issuer check admits as keys of their
+    /// identity ([`super::occurrence::occurrence_seats_for`]).
+    #[must_use]
+    pub fn with_occurrences(mut self, occurrences: super::occurrence::OccurrenceSeats) -> Self {
+        self.occurrences = occurrences;
         self
     }
 
@@ -247,6 +288,7 @@ impl HeldKeys {
             revocations: Vec::new(),
             standing: Arc::clone(&self.standing),
             seats: self.seats.clone(),
+            occurrences: self.occurrences.clone(),
         }
     }
 
@@ -275,14 +317,48 @@ impl HeldKeys {
             Ok(valid) => valid,
             Err(other) => return other,
         };
-        if with_revocations && self.revoked(kid, at, depth) {
+        let honoured = if with_revocations {
+            self.honoured_at(kid, depth)
+        } else {
+            Vec::new()
+        };
+        // The three revokers (persist's; the kernel counts the key's own,
+        // presented below too): final.
+        if in_effect(&honoured, at) {
             return Liveness::Revoked;
         }
-        // Renewals all count: the instant is covered by any one of them.
+        // v62.0.0 (kernel pass 2, K1, I2817) — whether a record covers the
+        // instant is the kernel's key-end conclusion over the key's records
+        // and its own revocations. Renewals all count: the instant is
+        // covered by any one of them.
+        let key = hex::encode(kid);
+        let views = key_end_views(&key, kid, &valid, &honoured);
+        let answer = crate::kernel::key_end::key_live(&views, &key, at);
+        #[cfg(test)]
+        crate::kernel::differential::key_end(
+            &key,
+            at,
+            // persist's former reading, inclusive of `valid_until` (the
+            // differential's reference)
+            valid
+                .iter()
+                .any(|v| inclusive((v.record.asserted_at, v.record.valid_until), at)),
+            answer.value,
+            // every record that covered `at` inclusively ends exactly there
+            valid
+                .iter()
+                .filter(|v| inclusive((v.record.asserted_at, v.record.valid_until), at))
+                .all(|v| v.record.valid_until == Some(at)),
+        );
+        if !answer.value {
+            return Liveness::NotCovered;
+        }
+        let kept: Vec<crate::kernel::view::RowId> = answer.rows;
         valid
             .into_iter()
+            .filter(|v| kept.contains(&crate::kernel::view::RowId(v.row_id)))
             .map(|v| v.record)
-            .filter(|r| r.asserted_at <= at && r.valid_until.is_none_or(|u| at <= u))
+            .filter(|r| covers((r.asserted_at, r.valid_until), at))
             .max_by_key(|r| r.valid_until.unwrap_or(u64::MAX))
             .map_or(Liveness::NotCovered, |r| Liveness::Live(Box::new(r)))
     }
@@ -335,6 +411,7 @@ impl HeldKeys {
                         Ok(rec) if rec.kid == *kid => valid.push(ValidRecord {
                             record: rec,
                             row_id: row.row_id,
+                            signer: row.kid,
                             statement: st.clone(),
                         }),
                         _ => {}
@@ -356,9 +433,9 @@ impl HeldKeys {
 
     /// **Is `kid` a key of the identity whose genesis key is `iss`?**
     /// (v62.0.0, JSON-cut slice A, I2101; module docs, "Whose key it is".)
-    /// The shape of CIRISVerify 23.3.0's `KeyDirectory::key_of`: `iss` is
-    /// the thumbprint inside the statement's `iss`. A key is its own
-    /// genesis key's (`kid == iss`).
+    /// `iss` is the thumbprint inside the statement's `iss`. A key is its
+    /// own genesis key's (`kid == iss`). Verify's reader reaches this
+    /// through `KeyDirectory::key_of` ([`KeyOf::to_verify`]).
     #[must_use]
     pub fn key_of(&self, kid: &Digest32, iss: &Digest32) -> KeyOf {
         self.key_of_at_depth(kid, iss, 0)
@@ -373,6 +450,13 @@ impl HeldKeys {
         }
         let statements = self.records.get(kid).map_or(&[][..], Vec::as_slice);
         let iss_ref = identity_ref(iss);
+        // v62.0.0 (wave O1, I3020; CC 3.3.6, CC 3.1.3, the rc21 rule) — the
+        // occurrence arm: a key admitted as a live, unevicted
+        // `identity:occurrence` of `iss` at the statement's instant is a key
+        // of `iss` ([`super::occurrence::occurrence_seats_for`]).
+        if self.occurrences.admits(&iss_ref, kid) {
+            return KeyOf::Yes;
+        }
         let rows = self.record_voices(kid, statements, depth);
         let mut missing: Vec<ChainMissing> = Vec::new();
         for (row_id, voices) in &rows {
@@ -397,8 +481,15 @@ impl HeldKeys {
                 .filter(|v| v.row.kid != *kid && v.row.iss == iss_ref)
                 .collect();
             if preds.is_empty() {
-                // Wait on the key whose record `target` names, when held;
-                // else on the record itself.
+                // v62.0.0 (slice C3) — another key's statement over this
+                // row is held, and none waits: none is a predecessor's under
+                // `iss`, and it hands on nothing (Verify's
+                // `KeyRecordDirectory`, `key_of_iss_v1.json`).
+                if self.co_statements_refused(kid, statements, row_id, depth) {
+                    continue;
+                }
+                // None held, or one waits: wait on the key whose record
+                // `target` names, when held; else on the record itself.
                 missing.push(match self.record_owner(&target, depth) {
                     Some(p) => ChainMissing::Kid(p),
                     None => ChainMissing::Record(target),
@@ -418,7 +509,13 @@ impl HeldKeys {
                 let window = match window {
                     Some(Some(w)) => w,
                     _ => {
-                        missing.push(ChainMissing::Record(target));
+                        // v62.0.0 (slice C3) — a named row held as something
+                        // other than the predecessor's record breaks the
+                        // chain; one not held at all is the link it waits on
+                        // (Verify's `KeyRecordDirectory`).
+                        if !self.holds_row(&target) {
+                            missing.push(ChainMissing::Record(target));
+                        }
                         continue;
                     }
                 };
@@ -504,6 +601,53 @@ impl HeldKeys {
         rows
     }
 
+    /// Is a statement over the row `row` held among the records?
+    fn holds_row(&self, row: &Digest32) -> bool {
+        self.records
+            .values()
+            .flatten()
+            .any(|st| super::names::RowId::of_statement(st).is_some_and(|r| r.0 == *row))
+    }
+
+    /// Is a statement over the record row `row`, filed under `kid` and
+    /// signed by another key, held, with none of them waiting on a key? The
+    /// caller found no predecessor voice under `iss`, so such statements are
+    /// held and refused: the rotation hands on nothing.
+    fn co_statements_refused(
+        &self,
+        kid: &Digest32,
+        statements: &[Vec<u8>],
+        row: &Digest32,
+        depth: usize,
+    ) -> bool {
+        let mut held = false;
+        for st in statements {
+            let Some((protected, payload)) = statement_parts(st) else {
+                continue;
+            };
+            let signer = protected
+                .get_int(4)
+                .and_then(Value::as_bytes)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok());
+            if signer.is_none_or(|s| s == *kid)
+                || !super::names::RowId::of_statement(st).is_some_and(|r| r.0 == *row)
+            {
+                continue;
+            }
+            held = true;
+            let scoped = Scoped {
+                held: self,
+                depth: depth + 1,
+                own: *kid,
+                own_key: check_key_record(&payload).ok().map(|r| r.key),
+            };
+            if matches!(verify_row_statement(st, &scoped), Verdict::Waiting { .. }) {
+                return false;
+            }
+        }
+        held
+    }
+
     /// The key whose held record has row id `row`, if any.
     fn record_owner(&self, row: &Digest32, depth: usize) -> Option<Digest32> {
         self.records.iter().find_map(|(k, sts)| {
@@ -555,19 +699,6 @@ impl HeldKeys {
                             .iter()
                             .any(|v| v.row.kid == *pred && v.row.iss == iss)
                     })
-            })
-    }
-
-    /// Has a revocation by one of the three revokers taken effect for `kid`
-    /// by `at`?
-    fn revoked(&self, kid: &Digest32, at: u64, depth: usize) -> bool {
-        self.honoured_at(kid, depth)
-            .iter()
-            .any(|r| match r.revoked_after {
-                // Absent: revoke-all.
-                None => true,
-                // Statements signed before the bound still stand.
-                Some(bound) => at >= bound,
             })
     }
 
@@ -635,13 +766,83 @@ pub struct ValidRecord {
     pub record: KeyRecord,
     /// The record row's id.
     pub row_id: Digest32,
+    /// v62.0.0 (kernel pass 2, K1) — the kid whose voice over the row is
+    /// this statement (the key itself, or a predecessor's over a rotation).
+    pub signer: Digest32,
     /// The statement as held.
     pub statement: Vec<u8>,
 }
 
-/// Does a record's `[asserted_at, valid_until]` window cover `at`?
+/// Does a record's window cover `at`? v62.0.0 (CC ruling, kernel pass 2,
+/// K1): half-open, `[asserted_at, valid_until)`, through the one boundary
+/// function ([`crate::kernel::key_end::within_record`]) — the key-of-iss
+/// chain's predecessor record covering a rotation's instant, and a key's own
+/// liveness, read the same window.
 fn covers((from, until): (u64, Option<u64>), at: u64) -> bool {
+    crate::kernel::key_end::within_record(at, from, until)
+}
+
+/// The former, inclusive window `[asserted_at, valid_until]`: the
+/// differential's reference only (test builds).
+#[cfg(test)]
+fn inclusive((from, until): (u64, Option<u64>), at: u64) -> bool {
     from <= at && until.is_none_or(|u| at <= u)
+}
+
+/// Has one of the honoured revocations taken effect at `at`?
+fn in_effect(honoured: &[HonouredRevocation], at: u64) -> bool {
+    honoured.iter().any(|r| match r.revoked_after {
+        // Absent: revoke-all.
+        None => true,
+        // Statements signed before the bound still stand.
+        Some(bound) => at >= bound,
+    })
+}
+
+/// v62.0.0 (kernel pass 2, K1) — the key's verified records, one view per
+/// record row with the keys whose voices over it verified, and its OWN
+/// honoured revocations, as the kernel's key-end rows
+/// ([`crate::kernel::key_end::KeyEndView`]).
+fn key_end_views(
+    key: &str,
+    kid: &Digest32,
+    valid: &[ValidRecord],
+    honoured: &[HonouredRevocation],
+) -> Vec<crate::kernel::key_end::KeyEndView> {
+    use crate::kernel::key_end::{end_rule, KeyEndKind, KeyEndView};
+    use crate::kernel::view::RowId;
+    let mut by_row: BTreeMap<Digest32, (&KeyRecord, Vec<String>)> = BTreeMap::new();
+    for v in valid {
+        let e = by_row
+            .entry(v.row_id)
+            .or_insert_with(|| (&v.record, Vec::new()));
+        let signer = hex::encode(v.signer);
+        if !e.1.contains(&signer) {
+            e.1.push(signer);
+        }
+    }
+    let mut out: Vec<KeyEndView> = by_row
+        .into_iter()
+        .map(|(row_id, (rec, sigs))| {
+            KeyEndView::of_record(
+                RowId(row_id),
+                key,
+                KeyEndKind::Record {
+                    from: rec.asserted_at,
+                    until: rec.valid_until,
+                    sigs,
+                    end: end_rule(&rec.identity_type),
+                },
+            )
+        })
+        .collect();
+    out.extend(
+        honoured
+            .iter()
+            .filter(|r| r.row.kid == *kid)
+            .map(|r| KeyEndView::self_revocation(RowId(r.row.row_id), key, r.revoked_after)),
+    );
+    out
 }
 
 /// One verified voice over a record row of a key.
@@ -650,9 +851,8 @@ struct Voice {
     row: ciris_verify_core::edition2::VerifiedRow,
 }
 
-/// What a key-chain link waits on ([`KeyOf::Waiting`]).
-///
-/// TODO(verify-23.3-pin): Verify's `MissingKey` (`Kid`, `Record`).
+/// What a key-chain link waits on ([`KeyOf::Waiting`]). Verify's
+/// `MissingKey` carries the first two ([`KeyOf::to_verify`]).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChainMissing {
     /// A key, by its thumbprint: its statement over the rotation, or its
@@ -672,9 +872,9 @@ pub enum ChainMissing {
 /// an earlier bundle's: a holder or serve node re-seated at a new key by a
 /// later bundle is read at that key only.
 ///
-/// TODO(verify-bundle-reader): slice C fills this from Verify's bundle
-/// placement (`bundles_in_force`). Until then the store door holds
-/// [`BundleSeats::not_held`].
+/// `edition2::genesis::bundle_seats_in_force` yields it from Verify's
+/// bundle placement. TODO(bundle-seats): the store door does not read it
+/// yet and holds [`BundleSeats::not_held`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BundleSeats(Option<BTreeMap<String, std::collections::BTreeSet<Digest32>>>);
 
@@ -718,9 +918,8 @@ impl BundleSeats {
     }
 }
 
-/// Whether a key is a key of an identity ([`HeldKeys::key_of`]).
-///
-/// TODO(verify-23.3-pin): Verify's `KeyOf` (`#[non_exhaustive]`).
+/// Whether a key is a key of an identity ([`HeldKeys::key_of`]):
+/// persist's reading, mapped onto Verify's `KeyOf` by [`KeyOf::to_verify`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyOf {
     /// It is: the chain reaches the identity's genesis key.
@@ -731,31 +930,30 @@ pub enum KeyOf {
     Waiting(Vec<ChainMissing>),
 }
 
-/// **A key directory that also answers whose key a kid is** (v62.0.0, JSON
-/// cut slice A, I2101): the edition-2 door asks it after Verify's verdict
-/// when `kid` is not the `iss` genesis key.
-///
-/// TODO(verify-23.3-pin): this is CIRISVerify 23.3.0's provided
-/// `KeyDirectory::key_of`, with the same default; at the pin it is deleted
-/// and `HeldKeys` implements Verify's method with [`HeldKeys::key_of`].
-pub trait KeyOwnership: KeyDirectory {
-    /// Is `kid` a key of the identity whose genesis key's thumbprint is
-    /// `iss`? Not known: [`KeyOf::No`].
-    fn key_of(&self, kid: &Digest32, iss: &Digest32) -> KeyOf {
-        let _ = (kid, iss);
-        KeyOf::No
+impl KeyOf {
+    /// **The one mapping onto CIRISVerify 23.3.0's `KeyDirectory::key_of`
+    /// answer** (v62.0.0, slice C3). A key or a record maps to Verify's
+    /// `MissingKey::Kid` / `MissingKey::Record`. [`ChainMissing::Bundle`]
+    /// (no genesis bundle in force held) has no Verify counterpart: it maps
+    /// to `MissingKey::Kid(kid)`, the signing key the bundle would seat, so
+    /// the reading stays retryable.
+    #[must_use]
+    pub fn to_verify(&self, kid: &Digest32) -> VerifyKeyOf {
+        match self {
+            KeyOf::Yes => VerifyKeyOf::Yes,
+            KeyOf::No => VerifyKeyOf::No,
+            KeyOf::Waiting(m) => VerifyKeyOf::Waiting(
+                m.iter()
+                    .map(|c| match c {
+                        ChainMissing::Kid(k) => MissingKey::Kid(*k),
+                        ChainMissing::Record(r) => MissingKey::Record(*r),
+                        ChainMissing::Bundle => MissingKey::Kid(*kid),
+                    })
+                    .collect(),
+            ),
+        }
     }
 }
-
-impl KeyOwnership for HeldKeys {
-    fn key_of(&self, kid: &Digest32, iss: &Digest32) -> KeyOf {
-        HeldKeys::key_of(self, kid, iss)
-    }
-}
-
-/// A bare map of keys holds no records: each key is only its own genesis
-/// key's.
-impl KeyOwnership for BTreeMap<Digest32, CompositePublicKey> {}
 
 /// A `key:revocation` the reading honours ([`HeldKeys::honoured_revocations`]).
 #[derive(Clone, Debug)]
@@ -786,7 +984,23 @@ impl KeyDirectory for Scoped<'_> {
                 .clone()
                 .map_or(KeyLookup::Invalid, |k| KeyLookup::Held(Box::new(k)));
         }
-        lookup_of(self.held.resolve(kid, asserted_at, self.depth, true), kid)
+        lookup_of(
+            self.held.resolve(kid, asserted_at, self.depth, true),
+            kid,
+            asserted_at,
+        )
+    }
+
+    /// A record's own statement names the issuer it claims; here that claim
+    /// only lets the record read as a record of its key. Whether the key is
+    /// the issuer's is [`HeldKeys::key_of`]'s chain (Verify's `Scoped`).
+    fn key_of(&self, kid: &Digest32, iss: &Digest32) -> VerifyKeyOf {
+        if *kid == self.own {
+            return VerifyKeyOf::Yes;
+        }
+        self.held
+            .key_of_at_depth(kid, iss, self.depth)
+            .to_verify(kid)
     }
 }
 
@@ -797,23 +1011,46 @@ struct RecordsOnly<'a> {
 
 impl KeyDirectory for RecordsOnly<'_> {
     fn lookup(&self, kid: &Digest32, asserted_at: u64) -> KeyLookup {
-        lookup_of(self.held.resolve(kid, asserted_at, self.depth, false), kid)
+        lookup_of(
+            self.held.resolve(kid, asserted_at, self.depth, false),
+            kid,
+            asserted_at,
+        )
+    }
+
+    fn key_of(&self, kid: &Digest32, iss: &Digest32) -> VerifyKeyOf {
+        self.held
+            .key_of_at_depth(kid, iss, self.depth)
+            .to_verify(kid)
     }
 }
 
-fn lookup_of(l: Liveness, kid: &Digest32) -> KeyLookup {
+fn lookup_of(l: Liveness, kid: &Digest32, at: u64) -> KeyLookup {
     match l {
         Liveness::Live(r) => KeyLookup::Held(Box::new(r.key)),
-        // Retryable: a record covering the instant, or the key itself, may
-        // still arrive (CC 2.4.1.1). Reported as a key to wait on.
-        Liveness::NotCovered | Liveness::NotHeld => KeyLookup::Waiting(vec![MissingKey::Kid(*kid)]),
+        // Retryable: the key itself may still arrive (CC 2.4.1.1).
+        Liveness::NotHeld => KeyLookup::Waiting(vec![MissingKey::Kid(*kid)]),
+        // Retryable: a record of the key covering the instant may still
+        // arrive (CC 2.4.1.1; Verify 23.3.0's `MissingKey::CoveringRecord`).
+        Liveness::NotCovered => KeyLookup::Waiting(vec![MissingKey::CoveringRecord {
+            kid: *kid,
+            at_ms: at,
+        }]),
         Liveness::Waiting(m) => KeyLookup::Waiting(m),
         Liveness::Revoked | Liveness::Invalid => KeyLookup::Invalid,
     }
 }
 
+/// The directory Verify's reader reads a statement through: `lookup` is
+/// [`HeldKeys::liveness`], and `key_of` (the key-of-issuer check,
+/// `kid_not_of_iss`) is [`HeldKeys::key_of`], the one check the door also
+/// runs (v62.0.0, slice C3).
 impl KeyDirectory for HeldKeys {
     fn lookup(&self, kid: &Digest32, asserted_at: u64) -> KeyLookup {
-        lookup_of(self.liveness(kid, asserted_at), kid)
+        lookup_of(self.liveness(kid, asserted_at), kid, asserted_at)
+    }
+
+    fn key_of(&self, kid: &Digest32, iss: &Digest32) -> VerifyKeyOf {
+        HeldKeys::key_of(self, kid, iss).to_verify(kid)
     }
 }

@@ -785,14 +785,18 @@ mod run {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1178_sqlite() {
-        b::i1178_goals_are_the_projection_of_goal_rows(&sqlite().await, &tag()).await;
+        Box::pin(b::i1178_goals_are_the_projection_of_goal_rows(
+            &sqlite().await,
+            &tag(),
+        ))
+        .await;
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i1178_postgres() {
         let Some(p) = postgres().await else { return };
-        b::i1178_goals_are_the_projection_of_goal_rows(&p, &tag()).await;
+        Box::pin(b::i1178_goals_are_the_projection_of_goal_rows(&p, &tag())).await;
     }
 
     #[cfg(feature = "sqlite")]

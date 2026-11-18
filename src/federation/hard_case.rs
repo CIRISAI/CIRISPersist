@@ -947,21 +947,338 @@ pub fn project_hard_case_row(row: &super::types::Attestation) -> Option<HardCase
     if !is_hard_case_dimension(dimension) {
         return None;
     }
-    let body = row.attestation_envelope.get(BODY_MEMBER)?;
-    let mut event: HardCaseEvent = serde_json::from_value(body.clone()).ok()?;
-    // The body must be the event the dimension and the id name: a row whose
-    // three disagree is not one this door wrote. v61.1.0 (H3) — the id is the
-    // v1 id or the signer's emitter-bound fallback.
-    if hard_case_dimension(&event.kind) != dimension
-        || !(hard_case_attestation_id(&event.event_id) == row.attestation_id
-            || hard_case_attestation_id_for_emitter(&row.attesting_key_id, &event.event_id)
-                == row.attestation_id)
+    // v62.0.0 (v62 P3, CC 2.6.1.3) — a row carrying an edition-2 statement is
+    // fenced by the id the statement's bytes compute, never by an id derived
+    // from its `event_id` ([`edition2_hard_case_event`]).
+    let mut event = match row
+        .attestation_envelope
+        .get(super::edition2::ingest::STATEMENT_MEMBER)
     {
+        Some(carried) => edition2_hard_case_event(row, carried)?,
+        None => {
+            let body = row.attestation_envelope.get(BODY_MEMBER)?;
+            let event: HardCaseEvent = serde_json::from_value(body.clone()).ok()?;
+            // The body must be the event the id names: a row whose parts
+            // disagree is not one this door wrote. v61.1.0 (H3) — the id is
+            // the v1 id or the signer's emitter-bound fallback.
+            if !(hard_case_attestation_id(&event.event_id) == row.attestation_id
+                || hard_case_attestation_id_for_emitter(&row.attesting_key_id, &event.event_id)
+                    == row.attestation_id)
+            {
+                return None;
+            }
+            event
+        }
+    };
+    // The body must be the event the dimension names, in either form.
+    if hard_case_dimension(&event.kind) != dimension {
         return None;
     }
     // v60.0.0 — the emitter is the row's SIGNER, whatever the body says.
     event.emitter_key_id = row.attesting_key_id.clone();
     Some(event)
+}
+
+/// v62.0.0 (v62 P3; CC 2.6.1.3, CLM-silo-projection-rebuildable) — **the id
+/// fence for a `hard_case:*` row carrying an edition-2 statement.**
+///
+/// The earlier form stored a hard_case row under an id derived from its
+/// event ([`hard_case_attestation_id`], or the signer's
+/// [`hard_case_attestation_id_for_emitter`]), and the projection's fence
+/// asked that id. That fence protected three things: the row's parts agree
+/// (its id, its dimension and its body name one event), a re-record of the
+/// same observation by the same emitter names the same row (idempotence),
+/// and no other key can occupy the id this emitter's record lands under (no
+/// pre-claim). In edition 2 no row is stored under a derived id: the id is
+/// the one this node computes from the statement's bytes,
+/// `SHA-256(CDE(["CEG-row/2", type, family, sub, author, payload]))`
+/// ([`RowId::of_statement`](super::edition2::names::RowId::of_statement)),
+/// so the derived-id comparison can never hold and no edition-2 row would
+/// project. The same three properties, over what an edition-2 row carries:
+///
+/// - **the id is the statement's**: the carried statement's computed row id
+///   equals `attestation_id`. The payload (event body and dimension) and the
+///   author are under that hash, so a row whose id and body disagree cannot
+///   be built from a statement. The crypto tier (`ingest::verify_carried`)
+///   checked the signature when the row came in; this check is pure, so the
+///   from-rows rebuild asks the same.
+/// - **the emitter is the author the id commits to**: `hard_case:{kind}` is an
+///   authored family, so the payload's `author` is in the id; it must be the
+///   row's signer. Two emitters' records of one event are two ids, and no key
+///   can build a statement under another key's id (no pre-claim); one
+///   emitter re-putting the same statement names the same row, and the door
+///   keeps it once (idempotence).
+/// - **the parts agree**: the envelope's `dimension` and `hard_case` members
+///   are the statement payload's, and the row type is `scores`. The event
+///   projected is read from the payload, never from envelope text alone.
+///
+/// `hard_case_events` stays keyed on `event_id`: when two held rows project
+/// one `event_id` (two emitters, or one emitter's two statements for it),
+/// [`projection_outranks`] names the one the table holds, in every arrival
+/// order. An edition-2 row id (64 hex) is never the v1 id (a UUID), so it
+/// ranks as an emitter-bound row.
+///
+/// An `emitted_at` the payload carries as POSIX ms (CC 2.6.2's instant form)
+/// is read as that instant; the text form is read as before.
+fn edition2_hard_case_event(
+    row: &super::types::Attestation,
+    carried: &serde_json::Value,
+) -> Option<HardCaseEvent> {
+    use super::edition2::ingest::json_of;
+    use super::edition2::liveness::statement_parts;
+    use super::edition2::names::RowId;
+    let bytes = hex::decode(carried.as_str()?).ok()?;
+    // The id is the statement's, computed here.
+    if RowId::of_statement(&bytes)?.hex() != row.attestation_id {
+        return None;
+    }
+    let (protected, payload) = statement_parts(&bytes)?;
+    if protected.get_int(-70001)?.as_text()? != super::types::attestation_type::SCORES {
+        return None;
+    }
+    // The emitter the id commits to is the row's signer.
+    if payload.get_text("author")?.as_text()? != row.attesting_key_id {
+        return None;
+    }
+    // The envelope's members are the payload's.
+    let dimension = json_of(payload.get_text("dimension")?);
+    let body = json_of(payload.get_text(BODY_MEMBER)?);
+    if row.attestation_envelope.get("dimension") != Some(&dimension)
+        || row.attestation_envelope.get(BODY_MEMBER) != Some(&body)
+    {
+        return None;
+    }
+    serde_json::from_value(edition2_body_instants(body)).ok()
+}
+
+/// The `emitted_at` of an edition-2 hard_case body as the text instant the
+/// event type reads: a POSIX ms integer (CC 2.6.2) becomes
+/// `YYYY-MM-DDTHH:MM:SS.sssZ`; any other value is left for serde to judge.
+fn edition2_body_instants(mut body: serde_json::Value) -> serde_json::Value {
+    let ms = body.get("emitted_at").and_then(serde_json::Value::as_i64);
+    if let (Some(ms), Some(members)) = (ms, body.as_object_mut()) {
+        if let Some(at) = DateTime::<Utc>::from_timestamp_millis(ms) {
+            members.insert(
+                "emitted_at".to_owned(),
+                serde_json::Value::String(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            );
+        }
+    }
+    body
+}
+
+/// v62.0.0 (v62 P3, JSON-cut slice B) — **the row an event is stated as on
+/// the clean mesh**, as the emit recipe's input: `scores`, dimension
+/// `hard_case:{kind}:v1` (family `hard_case:.kind`, authored), the event
+/// whole under the `hard_case` member ([`hard_case_envelope`]), about the
+/// signer itself (`sub` = `iss`), at `cohort_scope = federation`: this is
+/// the MESH-bound statement, an accountability record meant for peers. The
+/// node-local in-transaction row (`attestation_admit::plan_hard_case_row`)
+/// keeps `self`.
+///
+/// `asserted_at` is the caller's: [`statement_instant`] (the event's
+/// `emitted_at`, or the signing key's current record start when that is
+/// later), never the clock at the call. The statement is then a function of
+/// the event and the signing key, so re-recording one observation signs the
+/// same bytes and names the same row id (the idempotence the earlier form's
+/// derived id gave; the author in the id gives what its emitter-bound id
+/// gave: no other key can occupy it). The event's own instant always rides
+/// in the body as `emitted_at`.
+///
+/// # Errors
+/// An envelope that does not serialize or does not read as an
+/// [`EnvelopeCore`](super::envelope::EnvelopeCore).
+pub fn hard_case_emit_input(
+    event: &HardCaseEvent,
+    asserted_at: DateTime<Utc>,
+) -> Result<super::EmitAttestationInput, super::Error> {
+    let mut envelope = hard_case_envelope(event)
+        .map_err(|e| super::Error::Backend(format!("hard_case envelope: {e}")))?;
+    if let Some(members) = envelope.as_object_mut() {
+        members.insert(
+            "asserted_at".to_owned(),
+            serde_json::Value::String(super::admission::render_signed_instant(asserted_at)),
+        );
+        // An edition-2 payload carries no floats (CC 2.6.1.5): a real in the
+        // body (its `detail`) is stated as a fixed-scale integer, at any depth.
+        if let Some(body) = members.get_mut(BODY_MEMBER) {
+            *body = edition2_reals(std::mem::take(body));
+        }
+    }
+    Ok(super::EmitAttestationInput::with_envelope(
+        super::types::attestation_type::SCORES,
+        super::envelope::EnvelopeCore::from_value(envelope)?,
+        super::types::cohort_scope::FEDERATION,
+    ))
+}
+
+/// v62.0.0 (v62 P3) — **the reals of a hard_case body, stated without
+/// floats** (CC 2.6.1.5: an edition-2 payload carries integers; a real is an
+/// integer at the fixed scale of 10^6). `detail` is open vocabulary, so a
+/// real can appear at any depth: every one, whatever member it stands under,
+/// becomes the integer `round(x × 10^6)`, the fixed-scale form the door
+/// type-checks (never a string). Integers, text, booleans and nulls are
+/// unchanged. Applied on the edition-2 producer only; the node-local row
+/// keeps the event as built.
+#[must_use]
+pub fn edition2_reals(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match value {
+        J::Number(n) if n.as_u64().is_none() && n.as_i64().is_none() => match n.as_f64() {
+            Some(x) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let fixed = (x * 1_000_000.0).round() as i64;
+                J::from(fixed)
+            }
+            None => J::Number(n),
+        },
+        J::Array(items) => J::Array(items.into_iter().map(edition2_reals).collect()),
+        J::Object(members) => J::Object(
+            members
+                .into_iter()
+                .map(|(k, v)| (k, edition2_reals(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// v62.0.0 (v62 P3, JSON-cut slice B) — **the hard_case producer on the
+/// clean mesh**: the #570 attribution gate, then the event stated as an
+/// edition-2 statement signed by `signer`'s composite key
+/// ([`edition2::produce::sign_row`](super::edition2::produce::sign_row),
+/// through [`emit_statement`](super::attestation_emit::emit_statement)) and
+/// admitted through the one statement door as this node's authorship, the
+/// door a peer's copy meets. Returns the row id (hex). A re-record of the
+/// same event is the same statement: admitted idempotently, the same id.
+///
+/// The `hard_case:` emitter rule is the door's (`node` or
+/// `substrate_persist`, about itself; a row about another party needs the
+/// `infra:record_hard_case` conferral).
+///
+/// # Errors
+/// The attribution refusal (`AdminActionUnattributed`);
+/// `composite_signing_unavailable`; every refusal of the edition-2 door and
+/// the attestation gates.
+pub async fn state_hard_case<D>(
+    dir: &D,
+    signer: &crate::signing::LocalSigner,
+    event: HardCaseEvent,
+) -> Result<String, super::Error>
+where
+    D: super::FederationDirectory + Sync + ?Sized,
+{
+    check_admin_action_attribution(&event)?;
+    stated_hard_case(dir, signer, &event).await
+}
+
+/// The statement step both producers share: [`hard_case_emit_input`], then
+/// the emit recipe. No attribution gate here: [`state_hard_case`] runs it on
+/// a new event; [`restate_held_hard_case`] restates an event this node's own
+/// door already recorded.
+async fn stated_hard_case<D>(
+    dir: &D,
+    signer: &crate::signing::LocalSigner,
+    event: &HardCaseEvent,
+) -> Result<String, super::Error>
+where
+    D: super::FederationDirectory + Sync + ?Sized,
+{
+    let asserted_at = statement_instant(dir, signer, event.emitted_at).await?;
+    let input = hard_case_emit_input(event, asserted_at)?;
+    let emitted = super::attestation_emit::emit_statement(dir, signer, input, None).await?;
+    Ok(emitted.attestation_id)
+}
+
+/// v62.0.0 (v62 P3, as ruled) — **the instant a hard_case statement is
+/// asserted at**: `max(emitted_at, start)`, where `start` is the earliest
+/// `asserted_at` among the signing key's valid edition-2 records that cover
+/// NOW (its current record; a renewal that also covers now does not move
+/// it). A statement must be covered by its signer's record at its own
+/// instant (CC 2.4.1.1), so an event observed before the current record
+/// (recorded locally before registration, or under an earlier record) is
+/// asserted at the record's start instead of waiting forever; the original
+/// instant stays in the body as `emitted_at`. Deterministic per signing key:
+/// re-restating one event signs the same bytes. With no current record,
+/// `emitted_at` (the door then judges the signer as it would any).
+///
+/// # Errors
+/// `composite_signing_unavailable` for a signer without its PQC half; the
+/// directory's.
+pub async fn statement_instant<D>(
+    dir: &D,
+    signer: &crate::signing::LocalSigner,
+    emitted_at: DateTime<Utc>,
+) -> Result<DateTime<Utc>, super::Error>
+where
+    D: super::FederationDirectory + Sync + ?Sized,
+{
+    let (kid, _iss) = super::edition2::produce::signer_identity(signer)
+        .await
+        .map_err(|e| {
+            super::edition2::emit::composite_signing_unavailable("record_hard_case", &e.to_string())
+        })?;
+    let keys = super::edition2::ingest::held_keys_for_kid(dir, &kid).await?;
+    let now_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+    let start = keys.valid_records(&kid).ok().and_then(|valid| {
+        valid
+            .into_iter()
+            .map(|v| v.record)
+            .filter(|r| r.asserted_at <= now_ms && r.valid_until.is_none_or(|u| now_ms <= u))
+            .map(|r| r.asserted_at)
+            .min()
+    });
+    let emitted_ms = u64::try_from(emitted_at.timestamp_millis()).unwrap_or(0);
+    Ok(match start {
+        Some(s) if s > emitted_ms => i64::try_from(s)
+            .ok()
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .unwrap_or(emitted_at),
+        _ => emitted_at,
+    })
+}
+
+/// v62.0.0 (v62 P3, as ruled: "restate at the crossing") — **a held
+/// node-local hard_case row, restated on the clean mesh.** The in-transaction
+/// door writes a local-tier, unsigned row under its derived id (it holds no
+/// signer, and the row commits with its act). It reaches the mesh only here:
+/// `Engine::enter_mesh` restates its event as an edition-2 statement signed
+/// by `signer` ([`hard_case_emit_input`], `cohort_scope = federation`) and
+/// admits it through the statement door; it never signs the local row in
+/// the earlier form. The local row stays where it is, as the node-local
+/// record; `hard_case_events` holds one event per `event_id`
+/// ([`projection_outranks`] ranks the stated row over the local v1 row).
+///
+/// `Ok(None)` for a row that is not a local hard_case row (it carries a
+/// statement already, or does not project): the caller crosses it as any
+/// other row. The #570 attribution gate is not re-run: the event was
+/// recorded by this node's own door, whose in-transaction emitters carry
+/// their own required members (`admin_action:peer_removal`).
+///
+/// A re-restatement is the same statement (its `asserted_at` is the event's
+/// `emitted_at`), admitted idempotently.
+///
+/// # Errors
+/// As [`state_hard_case`], less the attribution refusal.
+pub async fn restate_held_hard_case<D>(
+    dir: &D,
+    signer: &crate::signing::LocalSigner,
+    row: &super::types::Attestation,
+) -> Result<Option<String>, super::Error>
+where
+    D: super::FederationDirectory + Sync + ?Sized,
+{
+    if row
+        .attestation_envelope
+        .get(super::edition2::ingest::STATEMENT_MEMBER)
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let Some(event) = project_hard_case_row(row) else {
+        return Ok(None);
+    };
+    stated_hard_case(dir, signer, &event).await.map(Some)
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2) — record an OBSERVATION riding on

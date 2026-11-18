@@ -226,6 +226,9 @@ fn parse_age_band_fine_token(attestation_type: &str) -> Option<AgeBandFine> {
 /// module docs for the witness-outranks-self resolution + the
 /// presumption-of-sovereignty `Unknown` default.
 pub async fn age_band(directory: &dyn FederationDirectory, k: &str) -> Result<AgeBand, Error> {
+    // v62.0.0 (wave G0; CC 2.7.3) — a fold reading k's age read every row
+    // about k: a witness that lands or is withdrawn re-folds it.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(k));
     let now = crate::host::clock::now();
     // `list_attestations_for(k)` is ordered asserted_at DESC, so the first
     // matching witness row is the most recent.

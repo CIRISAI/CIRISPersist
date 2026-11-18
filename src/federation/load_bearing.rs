@@ -437,6 +437,12 @@ pub const MAX_DEPENDENCIES_REPORTED: usize = 16;
 /// not a second dimension matcher:
 ///
 /// - the supersets family spelled identically (`dma:pdma:*`, `capacity:composite`);
+/// - else the family with its placeholders filled by the dimension's own binds,
+///   when the walk names that leaf (v62.0.0, CC rc20: `capacity:{factor}`,
+///   `detection:{detector}` and `accord:lifecycle:{kind}` fold leaves the
+///   walk still carries one entry each for, so `capacity:integrity:v1` names
+///   `capacity:integrity`, never a merged entry that would lose each leaf's
+///   CI axes and predicate);
 /// - else the supersets `stem:*` wildcard the registry family sits under
 ///   (`consent:replication:{version}` → `consent:*`, `trust:{job}:{version}` →
 ///   `trust:*`) — the walk predates the registry's finer rows;
@@ -461,13 +467,34 @@ pub fn family_for_dimension(dimension: &str) -> Option<&'static str> {
     fn wildcard_stem(k: &str) -> Option<&str> {
         k.strip_suffix('*').filter(|s| s.ends_with(':'))
     }
+    // `capacity:{factor}` with `factor → integrity` is `capacity:integrity`.
+    fn bound_leaf(family: &str, binds: &std::collections::BTreeMap<String, String>) -> String {
+        family
+            .split(':')
+            .map(|seg| {
+                seg.strip_prefix('{')
+                    .and_then(|s| s.strip_suffix('}'))
+                    .and_then(|name| binds.get(name))
+                    .map_or(seg, String::as_str)
+            })
+            .collect::<Vec<&str>>()
+            .join(":")
+    }
     match m.family {
-        Some(family) => keys.iter().copied().find(|k| *k == family).or_else(|| {
-            keys.iter()
-                .copied()
-                .filter(|k| wildcard_stem(k).is_some_and(|stem| family.starts_with(stem)))
-                .max_by_key(|k| k.len())
-        }),
+        Some(family) => keys
+            .iter()
+            .copied()
+            .find(|k| *k == family)
+            .or_else(|| {
+                let leaf = bound_leaf(family, &m.binds);
+                keys.iter().copied().find(|k| *k == leaf)
+            })
+            .or_else(|| {
+                keys.iter()
+                    .copied()
+                    .filter(|k| wildcard_stem(k).is_some_and(|stem| family.starts_with(stem)))
+                    .max_by_key(|k| k.len())
+            }),
         None => {
             let stem = registry::family_stem(dimension);
             keys.iter()
@@ -1921,6 +1948,22 @@ mod tests {
         assert_eq!(
             family_for_dimension("bond_posted:USD:v1"),
             Some("bond_posted:{currency}")
+        );
+        // v62.0.0 (CC rc20): a folded leaf names the walk's own per-leaf
+        // family through its bind, not a wildcard and not nothing.
+        assert_eq!(
+            family_for_dimension("capacity:integrity:v1"),
+            Some("capacity:integrity")
+        );
+        assert_eq!(
+            family_for_dimension("detection:temporal_drift:v1"),
+            Some("detection:temporal_drift")
+        );
+        // `substrate_building` is an open `{subject}` at rc20: the exact
+        // registry family is in the walk, so it wins.
+        assert_eq!(
+            family_for_dimension("credits:rust:en:substrate_building:v1"),
+            Some("credits:{domain}:{language}:{subject}")
         );
         assert_eq!(
             family_for_dimension("dma:pdma:principled_evaluation:v1"),

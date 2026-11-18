@@ -94,10 +94,16 @@
 //! # Error flattening
 //!
 //! [`crate::federation::Error`] is not guaranteed serde-round-trippable,
-//! so every method failure is flattened to
-//! [`DirectoryOpResult::Err`]`(String)` carrying `Error::to_string()`.
-//! The consumer maps that back to a generic error on its side; the
-//! structured error variant does not cross the ABI.
+//! so the structured error variant does not cross the ABI. Since v62.0.0
+//! (ABI 14, CC 2.7) its READING does: a method failure is
+//! [`DirectoryOpResult::TypedErr`] carrying the error's stable `kind()`
+//! token, its [`crate::federation::Error::is_wait`] answer and its
+//! `to_string()`, and the consumer proxy rebuilds it as
+//! [`crate::federation::Error::Relayed`] (a `federation_backend` as
+//! [`crate::federation::Error::Backend`]). Before v62 every failure was
+//! [`DirectoryOpResult::Err`]`(String)`, rebuilt as `Backend`, so a
+//! retryable ordering gap reached a capsule host as a database outage.
+//! `Err(String)` remains for the failures with no federation kind.
 
 use std::ffi::c_void;
 use std::future::Future;
@@ -306,6 +312,13 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// of the same signer). A consumer built against 12 fails to decode it on the
 /// hot path (the v6 / v8 / v10 payload-type form).
 ///
+/// v14 (v62.0.0, CC 2.7) — the result wire gains
+/// [`DirectoryOpResult::TypedErr`] ([`CapsuleError`]: the error's kind, its
+/// [`Error::is_wait`] and its text), and every op whose method answers a
+/// federation error now fails with it instead of `Err(String)`. A consumer
+/// built against 13 fails to decode an existing op's failure (the v5
+/// `AttestationOutcome` form).
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -318,7 +331,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 13;
+pub const DIRECTORY_ABI_VERSION: u32 = 14;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -1390,6 +1403,47 @@ pub enum DirectoryOp {
     /// installed policy, not the default. Result rides
     /// `HardwareAttestationPolicy`. APPEND-ONLY (Growth).
     HardwareAttestationPolicy {},
+    /// v62.0.0 (JSON-cut slice D, CC 2.6.1, 2.6.1.12) — **the edition-2
+    /// statement door**, [`crate::federation::edition2::ingest::put_statement`]
+    /// at tier `federation`, run inside persist's `.so` over persist's own
+    /// directory: one `COSE_Sign1` statement as received. An earlier-form
+    /// object is refused `earlier_form_object` by the door itself. Result
+    /// rides `Edition2StatementOutcome`. APPEND-ONLY (Growth).
+    PutEdition2Statement {
+        /// The statement's bytes as received.
+        statement: Vec<u8>,
+        /// The row id the carrier names it by, if any: it must be the one
+        /// this node computes (`row_id_mismatch`).
+        offered_row_id: Option<[u8; 32]>,
+    },
+    /// v62.0.0 (JSON-cut slice D) — **the replicated statement door**,
+    /// [`crate::federation::edition2::ingest::apply_replicated_statement`]:
+    /// one statement a peer delivered under the id it offered. A statement
+    /// whose signer's key record is not held is the retryable
+    /// `federation_attester_key_unknown` error (the cursor must not advance);
+    /// a lost race is `Refused`. Result rides `ReplicatedStatementOutcome`.
+    /// APPEND-ONLY (Growth).
+    ApplyReplicatedStatement {
+        /// The statement's bytes as the peer delivered them.
+        statement: Vec<u8>,
+        /// The row id the peer offered it as.
+        offered_row_id: [u8; 32],
+    },
+    /// v62.0.0 (JSON-cut slice D) —
+    /// [`FederationDirectory::edition2_statements_since`]: the held
+    /// statements after `cursor`, in this node's admission order, as
+    /// received. Result rides `Edition2StatementPage`. APPEND-ONLY (Growth).
+    Edition2StatementsSince {
+        /// Resume after this position (`None`: from the first).
+        cursor: Option<Edition2Cursor>,
+        /// At most this many (the store clamps to its page bound).
+        limit: u32,
+    },
+    /// v62.0.0 (JSON-cut slice D, CC 2.6.1.11, 2.7.8) —
+    /// [`crate::federation::edition2::genesis::bundles_in_force`]: the tips of
+    /// the held genesis lineage as CIRISVerify places them (two are a fork).
+    /// Result rides `BundlesInForce`. APPEND-ONLY (Growth).
+    BundlesInForce {},
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1667,6 +1721,525 @@ pub enum DirectoryOpResult {
     OptionalString(Option<String>),
     /// v61.4.0 (CIRISPersist#1244 round 2) — `hardware_attestation_policy`. APPEND-ONLY (Growth).
     HardwareAttestationPolicy(crate::federation::HardwareAttestationPolicy),
+    /// v62.0.0 (JSON-cut slice D) — what `PutEdition2Statement` did.
+    /// APPEND-ONLY (Growth).
+    Edition2StatementOutcome(Edition2StatementOutcome),
+    /// v62.0.0 (JSON-cut slice D) — `ApplyReplicatedStatement`'s typed
+    /// outcome: a `Refused` is a policy outcome carried HERE, never flattened
+    /// to [`Self::Err`]. APPEND-ONLY (Growth).
+    ReplicatedStatementOutcome(Edition2ReplicatedOutcome),
+    /// v62.0.0 (JSON-cut slice D) — `edition2_statements_since`.
+    /// APPEND-ONLY (Growth).
+    Edition2StatementPage(Vec<Edition2ServedStatement>),
+    /// v62.0.0 (JSON-cut slice D) — `bundles_in_force`. APPEND-ONLY (Growth).
+    BundlesInForce(Vec<Edition2BundleInForce>),
+    /// v62.0.0 (CC 2.7) — **a method failure with its reading**: the
+    /// error's stable `kind()` token, its [`Error::is_wait`] answer and its
+    /// text ([`CapsuleError`]). Every op whose method answers a
+    /// [`crate::federation::Error`] fails with this; [`Self::Err`] stays for
+    /// the failures that carry no federation kind (an op that does not parse,
+    /// a host that offers no blackhole or detection surface, the derived
+    /// detection door). The consumer's proxy rebuilds it as
+    /// [`Error::Relayed`] (a relayed `federation_backend` as
+    /// [`Error::Backend`] itself), so a retryable ordering gap no longer
+    /// reaches a capsule host as a database outage. APPENDED, but an existing
+    /// op can now answer it, so a consumer built against 13 fails to decode
+    /// it: [`DIRECTORY_ABI_VERSION`] 13 → 14.
+    TypedErr(CapsuleError),
+}
+
+/// v62.0.0 (CC 2.7) — a failed op's error as it crosses the capsule: what
+/// [`DirectoryOpResult::TypedErr`] carries. Built by [`op_err`] /
+/// [`op_err_typed`] on the host side; [`CapsuleError::into_error`] on the
+/// consumer side. Its own shape is pinned by [`DIRECTORY_ABI_VERSION`] (the
+/// digest gate reads enum bodies only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsuleError {
+    /// The host error's stable [`Error::kind`] token.
+    pub kind: String,
+    /// The host's [`Error::is_wait`]: `true` for an ordering gap a re-offer
+    /// can turn into an admission.
+    pub wait: bool,
+    /// The host error's text, exactly as the pre-v62 `Err(String)` carried
+    /// it (or [`typed_error_string`] on the ops that already used it).
+    pub message: String,
+}
+
+/// The kinds a consumer interns, at most: the host's kind tokens are a
+/// closed set (one per [`Error`] arm plus the refusal tokens some arms
+/// carry), so this bound is never reached by a conformant host; a host that
+/// sends more is answered `federation_backend` rather than growing the
+/// consumer's memory.
+const MAX_RELAYED_KINDS: usize = 1024;
+
+/// The `&'static str` for a relayed kind token, interned once per distinct
+/// token. A token that is not lowercase snake case of at most 96 bytes, or
+/// past [`MAX_RELAYED_KINDS`], is `federation_backend`.
+fn intern_relayed_kind(kind: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static KINDS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    const FALLBACK: &str = "federation_backend";
+    let well_formed = !kind.is_empty()
+        && kind.len() <= 96
+        && kind
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if !well_formed {
+        return FALLBACK;
+    }
+    let set = KINDS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut held = match set.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(&k) = held.get(kind) {
+        return k;
+    }
+    if held.len() >= MAX_RELAYED_KINDS {
+        return FALLBACK;
+    }
+    let leaked: &'static str = Box::leak(kind.to_owned().into_boxed_str());
+    held.insert(leaked);
+    leaked
+}
+
+impl CapsuleError {
+    /// The host side: `e` with its kind, its wait and its text.
+    #[must_use]
+    pub fn of(e: &Error) -> Self {
+        Self {
+            kind: e.kind().to_owned(),
+            wait: e.is_wait(),
+            message: e.to_string(),
+        }
+    }
+
+    /// The consumer side: the error the proxy answers. A relayed
+    /// `federation_backend` is [`Error::Backend`] with the host's text,
+    /// byte-identical to the pre-v62 flattening (so [`Error::is_duplicate_key`]
+    /// and every other reader of that arm read it as before); every other
+    /// kind is [`Error::Relayed`], whose `kind()` and `is_wait()` are the
+    /// host's.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        if self.kind == "federation_backend" {
+            return Error::Backend(self.message);
+        }
+        Error::Relayed {
+            kind: intern_relayed_kind(&self.kind),
+            wait: self.wait,
+            message: self.message,
+        }
+    }
+}
+
+impl DirectoryOpResult {
+    /// v62.0.0 — the pre-v62 reading of a failure: a
+    /// [`Self::TypedErr`] becomes [`Self::Err`] with the same text, anything
+    /// else is unchanged. For a consumer that branches on the text only.
+    #[must_use]
+    pub fn into_flattened(self) -> Self {
+        match self {
+            Self::TypedErr(t) => Self::Err(t.message),
+            other => other,
+        }
+    }
+}
+
+/// v62.0.0 (CC 2.7) — a failed op's answer: [`DirectoryOpResult::TypedErr`]
+/// carrying `e`'s kind, its [`Error::is_wait`] and `e.to_string()` (the text
+/// the pre-v62 `Err(String)` carried).
+#[must_use]
+pub fn op_err(e: &Error) -> DirectoryOpResult {
+    DirectoryOpResult::TypedErr(CapsuleError::of(e))
+}
+
+/// [`op_err`] with [`typed_error_string`] as the text, for the ops that
+/// already answered that reading (the edition-2 ops and the earlier-form
+/// refusal).
+#[must_use]
+pub fn op_err_typed(e: &Error) -> DirectoryOpResult {
+    DirectoryOpResult::TypedErr(CapsuleError {
+        message: typed_error_string(e),
+        ..CapsuleError::of(e)
+    })
+}
+
+// ── v62.0.0 (JSON-cut slice D) — the edition-2 payload types ────────────
+//
+// The edition-2 store's own types (`RowId`, `StatementCursor`,
+// `ServedStatement`, `BundleInForce`, `StatementOutcome`) carry no serde
+// derive; these are their wire mirrors, converted at the dispatch arm. Each is
+// NEW at v62, so it is growth, and its own shape is pinned by
+// `DIRECTORY_ABI_VERSION` from here on (the digest gate reads enum bodies
+// only).
+
+/// The wire mirror of [`crate::federation::edition2::store::StatementCursor`]:
+/// a position in this node's admission order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Edition2Cursor {
+    /// The admission position, POSIX µs.
+    pub admitted_us: i64,
+    /// The statement id.
+    pub statement_id: [u8; 32],
+}
+
+impl From<crate::federation::edition2::store::StatementCursor> for Edition2Cursor {
+    fn from(c: crate::federation::edition2::store::StatementCursor) -> Self {
+        Self {
+            admitted_us: c.admitted_us,
+            statement_id: c.statement_id,
+        }
+    }
+}
+
+impl From<Edition2Cursor> for crate::federation::edition2::store::StatementCursor {
+    fn from(c: Edition2Cursor) -> Self {
+        Self {
+            admitted_us: c.admitted_us,
+            statement_id: c.statement_id,
+        }
+    }
+}
+
+/// The wire mirror of [`crate::federation::edition2::store::ServedStatement`]:
+/// one held statement as received (CC 2.6.1.2), with its position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edition2ServedStatement {
+    /// Pass the last one served back as the cursor.
+    pub cursor: Edition2Cursor,
+    /// The statement's bytes as received.
+    pub bytes: Vec<u8>,
+}
+
+impl From<crate::federation::edition2::store::ServedStatement> for Edition2ServedStatement {
+    fn from(s: crate::federation::edition2::store::ServedStatement) -> Self {
+        Self {
+            cursor: s.cursor.into(),
+            bytes: s.bytes,
+        }
+    }
+}
+
+/// The wire mirror of [`crate::federation::edition2::ingest::StatementOutcome`]:
+/// where the edition-2 door kept a statement. `row_id` is the id THIS node
+/// computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Edition2StatementOutcome {
+    /// A key-plane row (`key:record`, `key:revocation`).
+    KeyPlane {
+        /// The row id.
+        row_id: [u8; 32],
+        /// Was it new.
+        new: bool,
+    },
+    /// A further voice of a row already held.
+    Voice {
+        /// The row id.
+        row_id: [u8; 32],
+        /// Was the statement new.
+        new: bool,
+    },
+    /// A row admitted through the attestation gates.
+    Row {
+        /// The row id.
+        row_id: [u8; 32],
+        /// Was the statement new.
+        new: bool,
+    },
+    /// v62.0.0 (T1) — a counted row short of its count: the statement is
+    /// held, the row waits for its voices. APPENDED.
+    Pending {
+        /// The row id.
+        row_id: [u8; 32],
+        /// Was the statement new.
+        new: bool,
+    },
+}
+
+impl From<crate::federation::edition2::ingest::StatementOutcome> for Edition2StatementOutcome {
+    fn from(o: crate::federation::edition2::ingest::StatementOutcome) -> Self {
+        use crate::federation::edition2::ingest::StatementOutcome as S;
+        match o {
+            S::KeyPlane { row_id, new } => Self::KeyPlane {
+                row_id: row_id.0,
+                new,
+            },
+            S::Voice { row_id, new } => Self::Voice {
+                row_id: row_id.0,
+                new,
+            },
+            S::Row { row_id, new } => Self::Row {
+                row_id: row_id.0,
+                new,
+            },
+            S::Pending { row_id, new } => Self::Pending {
+                row_id: row_id.0,
+                new,
+            },
+        }
+    }
+}
+
+/// The wire mirror of
+/// [`crate::federation::edition2::ingest::ReplicatedStatementOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Edition2ReplicatedOutcome {
+    /// New here and kept.
+    Admitted(Edition2StatementOutcome),
+    /// Already held byte for byte: nothing changed.
+    Unchanged(Edition2StatementOutcome),
+    /// Not kept; the store is untouched. Advances the sender's cursor.
+    Refused {
+        /// Which branch refused.
+        reason: crate::federation::attestation_apply::AttestationRefusalReason,
+    },
+}
+
+impl From<crate::federation::edition2::ingest::ReplicatedStatementOutcome>
+    for Edition2ReplicatedOutcome
+{
+    fn from(o: crate::federation::edition2::ingest::ReplicatedStatementOutcome) -> Self {
+        use crate::federation::edition2::ingest::ReplicatedStatementOutcome as R;
+        match o {
+            R::Admitted(s) => Self::Admitted(s.into()),
+            R::Unchanged(s) => Self::Unchanged(s.into()),
+            R::Refused { reason } => Self::Refused { reason },
+        }
+    }
+}
+
+/// The wire mirror of one tip of
+/// [`crate::federation::edition2::genesis::bundles_in_force`] (Verify's
+/// `GenesisPlacement`): the members PyO3's `bundles_in_force_json` serves,
+/// with the identity-refs only (a consumer that needs a seat's keys reads its
+/// key record).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edition2BundleInForce {
+    /// The bundle's object id.
+    pub object_id: [u8; 32],
+    /// `version`.
+    pub version: u32,
+    /// `refs.prev`, on a later bundle.
+    pub prev: Option<[u8; 32]>,
+    /// `asserted_at`, POSIX ms.
+    pub asserted_at: u64,
+    /// The accord's name.
+    pub family_key_id: String,
+    /// The roster's identity-refs, in `holders` order.
+    pub holders: Vec<String>,
+    /// The seats' identity-refs, in `serve_nodes` order.
+    pub serve_nodes: Vec<String>,
+    /// The identity-refs whose statements counted, sorted.
+    pub counted: Vec<String>,
+}
+
+impl From<&crate::federation::edition2::genesis::GenesisPlacement> for Edition2BundleInForce {
+    fn from(t: &crate::federation::edition2::genesis::GenesisPlacement) -> Self {
+        Self {
+            object_id: t.object_id,
+            version: t.version,
+            prev: t.prev,
+            asserted_at: t.asserted_at,
+            family_key_id: t.family_key_id.clone(),
+            holders: t.holders.iter().map(|h| h.identity_ref.clone()).collect(),
+            serve_nodes: t.seats.iter().map(|x| x.identity_ref.clone()).collect(),
+            counted: t.counted.clone(),
+        }
+    }
+}
+
+/// v62.0.0 (JSON-cut slice D) — an [`Error`] flattened for the capsule WITH
+/// its stable reading: `"{kind}: {plane}: {reason}: {message}"` for a
+/// [`Error::MalformedRow`] (the prefix is Python's
+/// `ValueError("federation_malformed_row: {plane}: {reason}")`), and
+/// `"{kind}: {message}"` for every other error, so a consumer tells the
+/// retryable `federation_attester_key_unknown` from a terminal refusal
+/// without parsing prose. Used by the edition-2 ops and the earlier-form
+/// refusal; the older ops keep their `to_string()` flattening.
+#[must_use]
+pub fn typed_error_string(e: &Error) -> String {
+    match e {
+        Error::MalformedRow {
+            plane,
+            reason,
+            message,
+        } => format!("{}: {plane}: {reason}: {message}", e.kind()),
+        other => format!("{}: {other}", other.kind()),
+    }
+}
+
+/// v62.0.0 (JSON-cut slice D, CC 2.6.1.12) — **the earlier-form refusal at
+/// the capsule.** Each op that carries an earlier-form signed object (a JSON
+/// object signed over its JCS image) answers
+/// [`crate::federation::edition2::door::refuse_earlier_form`]'s refusal
+/// before dispatch, under the plane the Rust door names. It is inert until
+/// [`crate::federation::edition2::door::EARLIER_FORM_DOORS_SHUT`] is `true`.
+/// A row that carries its edition-2 statement (`ceg_statement`) is the
+/// edition-2 door's mapping and passes
+/// ([`crate::federation::edition2::door::refuse_earlier_form_row`]).
+///
+/// # Errors
+/// `federation_malformed_row` / `earlier_form_object` once the doors are shut.
+pub fn refuse_earlier_form_op(op: &DirectoryOp) -> Result<(), Error> {
+    use crate::federation::edition2::door::{refuse_earlier_form, refuse_earlier_form_row};
+    match op {
+        DirectoryOp::PutAttestation { attestation }
+        | DirectoryOp::PutAttestationAuthored { attestation }
+        | DirectoryOp::ApplyReplicatedAttestation { attestation }
+        | DirectoryOp::PutAttestationSynced { attestation, .. }
+        | DirectoryOp::ApplyReplicatedAttestationSynced { attestation, .. } => {
+            refuse_earlier_form_row("attestation", &attestation.attestation)
+        }
+        other => match earlier_form_op_plane(other) {
+            Some(plane) => refuse_earlier_form(plane),
+            None => Ok(()),
+        },
+    }
+}
+
+/// v62.0.0 (JSON-cut slice D) — the door plane of each [`DirectoryOp`] that
+/// carries an earlier-form signed object, `None` for the rest. Exhaustive, so
+/// an appended op must be classified here before it compiles.
+#[must_use]
+pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
+    match op {
+        // ── inbound earlier-form signed objects ──
+        DirectoryOp::PutPublicKey { .. } | DirectoryOp::ApplyReplicatedKeyRecord { .. } => {
+            Some("key_record")
+        }
+        DirectoryOp::PutRevocation { .. } => Some("revocation"),
+        DirectoryOp::PutLocationProof { .. } => Some("location_proof"),
+        DirectoryOp::PutIdentityOccurrence { .. } => Some("identity_occurrence"),
+        DirectoryOp::PutIdentityOccurrenceRevocation { .. } => {
+            Some("identity_occurrence_revocation")
+        }
+        DirectoryOp::PutFamily { .. } => Some("family"),
+        DirectoryOp::PutCommunity { .. } => Some("community"),
+        DirectoryOp::PutTransportDestination { .. }
+        | DirectoryOp::PutSignedTransportDestination { .. } => Some("transport_destination"),
+        DirectoryOp::ApplyReplicatedAccordEvidence { .. } => Some("accord_evidence"),
+        DirectoryOp::PutLineageHeadCosign { .. } => Some("lineage_head_cosign"),
+        DirectoryOp::PutAttestation { .. }
+        | DirectoryOp::PutAttestationAuthored { .. }
+        | DirectoryOp::PutAttestationSynced { .. }
+        | DirectoryOp::ApplyReplicatedAttestation { .. }
+        | DirectoryOp::ApplyReplicatedAttestationSynced { .. } => Some("attestation"),
+        // ── reads, folds and node-local writes: no signed object in ──
+        DirectoryOp::LookupPublicKey { .. }
+        | DirectoryOp::ListTransportDestinationsFor { .. }
+        | DirectoryOp::LookupSharedInstanceLease { .. }
+        | DirectoryOp::AcquireSharedInstanceLease { .. }
+        | DirectoryOp::HeartbeatSharedInstance { .. }
+        | DirectoryOp::ReleaseSharedInstanceLease { .. }
+        | DirectoryOp::ListAccordHolders { .. }
+        | DirectoryOp::PeerMetadataFor { .. }
+        | DirectoryOp::ListHeldFountainContent { .. }
+        | DirectoryOp::EvictFountainContentToTier { .. }
+        | DirectoryOp::EvictFountainContentHardDelete { .. }
+        | DirectoryOp::ReachableUnderScope { .. }
+        | DirectoryOp::BuildDelegationGraph { .. }
+        | DirectoryOp::AddPeerRecord { .. }
+        | DirectoryOp::RemovePeerRecord { .. }
+        | DirectoryOp::UpdatePeerAlias { .. }
+        | DirectoryOp::UpdatePeerTrust { .. }
+        | DirectoryOp::UpdatePeerNotes { .. }
+        | DirectoryOp::UpdatePeerPolicy { .. }
+        | DirectoryOp::LookupIdentityForOccurrence { .. }
+        | DirectoryOp::ListAllTransportDestinations { .. }
+        | DirectoryOp::ListTransportDestinationsByDestination { .. }
+        | DirectoryOp::ListSignedIdentityOccurrencesFor { .. }
+        | DirectoryOp::ListSignedRecords { .. }
+        | DirectoryOp::ListSignedTransportDestinationsFor { .. }
+        | DirectoryOp::ResolveEncryptionKeys { .. }
+        | DirectoryOp::ListIdentityOccurrenceRevocationsFor { .. }
+        | DirectoryOp::ListScores { .. }
+        | DirectoryOp::ResolveScores { .. }
+        | DirectoryOp::ListAttestationLog { .. }
+        | DirectoryOp::RecordAnnouncedPeer { .. }
+        | DirectoryOp::ListAnnouncedPeers
+        | DirectoryOp::TrustRootValid { .. }
+        | DirectoryOp::CapabilityRootsToTrustedRoot { .. }
+        | DirectoryOp::ListConsentPeers { .. }
+        | DirectoryOp::ListSignedLocationProofsSince { .. }
+        | DirectoryOp::ListSignedTransportDestinationsSince { .. }
+        | DirectoryOp::ListAttestationsSince { .. }
+        | DirectoryOp::LookupSignedRecordByContentHash { .. }
+        | DirectoryOp::RebuildSignedWireIndex
+        | DirectoryOp::ResolveTransitEligibility { .. }
+        | DirectoryOp::RevocationsFor { .. }
+        | DirectoryOp::ListSignedAccordQuorumEvidenceSince { .. }
+        | DirectoryOp::ListWireHashesSince { .. }
+        | DirectoryOp::InsertKnownWireHash { .. }
+        | DirectoryOp::KnownWireHashContains { .. }
+        | DirectoryOp::ListKnownWireHashesSince { .. }
+        | DirectoryOp::EvictKnownWireHashes { .. }
+        | DirectoryOp::WithdrawsAdmissionDepth { .. }
+        | DirectoryOp::RevocationsForSubject { .. }
+        | DirectoryOp::TrustDirectionHeldAmong { .. }
+        | DirectoryOp::ListKeyPlaneWireHashesSince { .. }
+        | DirectoryOp::ExecuteAttestationQuery { .. }
+        | DirectoryOp::ListComposersReferencingAny { .. }
+        | DirectoryOp::ListIdentityOccurrenceHistoryByOccurrence { .. }
+        | DirectoryOp::ListIdentityOccurrencesByOccurrenceKey { .. }
+        | DirectoryOp::ListAttestationsNamingByDimension { .. }
+        | DirectoryOp::ListAttestationsSinceByPrefixes { .. }
+        | DirectoryOp::ListOwnerBindingsSince { .. }
+        | DirectoryOp::ListKeysByIdentityType { .. }
+        | DirectoryOp::ListAllTransportDestinationsUnfolded { .. }
+        | DirectoryOp::ListTransportDestinationsByDestinationUnfolded { .. }
+        | DirectoryOp::BlackholeList { .. }
+        | DirectoryOp::BlackholeUpsert { .. }
+        | DirectoryOp::BlackholeRemove { .. }
+        | DirectoryOp::BlackholeRecordHit { .. }
+        | DirectoryOp::BlackholePruneExpired { .. }
+        | DirectoryOp::ListAttestationsReferencing { .. }
+        | DirectoryOp::GetAttestation { .. }
+        | DirectoryOp::ListSettledSelfRosterProposals { .. }
+        | DirectoryOp::ListIdentityOccurrencesFor { .. }
+        | DirectoryOp::GetActiveHalt { .. }
+        | DirectoryOp::LookupRoleWithdrawal { .. }
+        | DirectoryOp::LookupFamily { .. }
+        | DirectoryOp::LookupCommunity { .. }
+        | DirectoryOp::ListFamiliesForMember { .. }
+        | DirectoryOp::FamilyRosterSigners { .. }
+        | DirectoryOp::CommunityRosterSigners { .. }
+        | DirectoryOp::ListFamilyMembershipRevocationsFor { .. }
+        | DirectoryOp::ListFamilyMembershipWideningsFor { .. }
+        | DirectoryOp::ListLineageHeadCosignsFor { .. }
+        | DirectoryOp::LookupSignedCommunity { .. }
+        | DirectoryOp::LookupCanonicalWithdrawal { .. }
+        | DirectoryOp::ListCanonicalWithdrawals { .. }
+        | DirectoryOp::VoteWindowFirstHeld { .. }
+        | DirectoryOp::ListCosignAliases { .. }
+        | DirectoryOp::CosignAlias { .. }
+        | DirectoryOp::GetAccordDecision { .. }
+        | DirectoryOp::ListAccordProposalsByAnchor { .. }
+        | DirectoryOp::PurgeTombstoned { .. }
+        | DirectoryOp::PurgeTombstoneNotices { .. }
+        | DirectoryOp::ListTargetedByDimensionPrefix { .. }
+        | DirectoryOp::KeyGrantHeldOwner { .. }
+        | DirectoryOp::NodeKeyId { .. }
+        | DirectoryOp::WithdrawsDelegationDepth { .. }
+        | DirectoryOp::HardwareAttestationPolicy { .. } => None,
+        // ── the edition-2 doors and reads ──
+        DirectoryOp::PutEdition2Statement { .. }
+        | DirectoryOp::ApplyReplicatedStatement { .. }
+        | DirectoryOp::Edition2StatementsSince { .. }
+        | DirectoryOp::BundlesInForce { .. } => None,
+        // TODO(json-cut): detection events are MESH (RULINGS "Planes"), but
+        // no edition-2 detection door exists yet and the Rust door
+        // (`derived::put_edge_detection_event`) is not wired to the
+        // switch; the capsule follows the Rust door rather than diverge.
+        DirectoryOp::PutEdgeDetectionEvent { .. } => None,
+        // TODO(json-cut): an earlier-form signature check, not a door; its
+        // fate is the "composite components as standalone keys" ruling
+        // (JSON_CUT_PLAN §8.6).
+        DirectoryOp::VerifyHybridViaDirectory { .. } => None,
+    }
 }
 
 /// v61.4.0 (CIRISPersist#1244) — the refusal a blackhole op gets from a
@@ -1716,15 +2289,21 @@ pub async fn dispatch_directory_op(
     op: DirectoryOp,
 ) -> DirectoryOpResult {
     use crate::federation::types::identity_type;
+    // v62.0.0 (JSON-cut slice D) — an op that carries an earlier-form signed
+    // object is refused by name once the doors are shut, before any parse,
+    // with the same reading as the Rust and Python doors.
+    if let Err(e) = refuse_earlier_form_op(&op) {
+        return op_err_typed(&e);
+    }
     match op {
         DirectoryOp::LookupPublicKey { key_id } => match dir.lookup_public_key(&key_id).await {
             Ok(v) => DirectoryOpResult::PublicKey(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::PutTransportDestination { destination } => {
             match dir.put_transport_destination(&destination).await {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListTransportDestinationsFor { occurrence_key_id } => {
@@ -1733,13 +2312,13 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::TransportDestinations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListAllTransportDestinations {} => {
             match dir.list_all_transport_destinations().await {
                 Ok(v) => DirectoryOpResult::TransportDestinations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListTransportDestinationsByDestination { destination } => {
@@ -1748,13 +2327,13 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::TransportDestinations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::LookupSharedInstanceLease { instance_name } => {
             match dir.lookup_shared_instance_lease(&instance_name).await {
                 Ok(v) => DirectoryOpResult::SharedLease(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::AcquireSharedInstanceLease {
@@ -1767,18 +2346,18 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::SharedLease(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::HeartbeatSharedInstance { lease } => {
             match dir.heartbeat_shared_instance(&lease).await {
                 Ok(v) => DirectoryOpResult::SharedLease(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ReleaseSharedInstanceLease { lease } => {
             match dir.release_shared_instance_lease(&lease).await {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListAccordHolders {} => {
@@ -1787,21 +2366,21 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::KeyRecords(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::PutRevocation { revocation } => match dir.put_revocation(revocation).await {
             Ok(()) => DirectoryOpResult::Unit,
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — a host's registration
         // through the capsule is a door: the id names its own key.
         DirectoryOp::PutPublicKey { record } => {
             match crate::federation::register::check_key_id_fingerprint(dir, &record.record).await {
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
                 Ok(()) => match dir.put_public_key(record).await {
                     Ok(()) => DirectoryOpResult::Unit,
-                    Err(e) => DirectoryOpResult::Err(e.to_string()),
+                    Err(e) => op_err(&e),
                 },
             }
         }
@@ -1813,17 +2392,14 @@ pub async fn dispatch_directory_op(
         // its `key:record:v1` row (`ApplyReplicatedAttestation`).
         DirectoryOp::ApplyReplicatedKeyRecord { record } => {
             let _ = record;
-            DirectoryOpResult::Err(
-                crate::federation::Error::EnvelopeKindRetired {
-                    kind: crate::federation::replication_policy::EnvelopeKind::Key,
-                }
-                .to_string(),
-            )
+            op_err(&crate::federation::Error::EnvelopeKindRetired {
+                kind: crate::federation::replication_policy::EnvelopeKind::Key,
+            })
         }
         DirectoryOp::LookupIdentityForOccurrence { occurrence_key_id } => {
             match dir.lookup_identity_for_occurrence(&occurrence_key_id).await {
                 Ok(v) => DirectoryOpResult::IdentityOccurrence(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListSignedIdentityOccurrencesFor { identity_key_id } => {
@@ -1832,7 +2408,7 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::SignedIdentityOccurrences(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListSignedRecords {
@@ -1840,17 +2416,14 @@ pub async fn dispatch_directory_op(
             subject_key_id,
         } => match dir.list_signed_records(kind, &subject_key_id).await {
             Ok(v) => DirectoryOpResult::SignedReplicatedRecords(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         // v59.0.0 (sealed-transport floor) — the framed inbound door is retired.
         DirectoryOp::PutIdentityOccurrenceRevocation { revocation } => {
             let _ = revocation;
-            DirectoryOpResult::Err(
-                crate::federation::Error::EnvelopeKindRetired {
-                    kind: crate::federation::replication_policy::EnvelopeKind::IdentityOccurrenceRevocation,
-                }
-                .to_string(),
-            )
+            op_err(&crate::federation::Error::EnvelopeKindRetired {
+                kind: crate::federation::replication_policy::EnvelopeKind::IdentityOccurrenceRevocation,
+            })
         }
         // #443 — the gate + monotonic apply run INSIDE persist's .so against
         // persist's own vtable; the consumer gets the policy outcome, and a
@@ -1858,7 +2431,7 @@ pub async fn dispatch_directory_op(
         DirectoryOp::PutSignedTransportDestination { signed } => {
             match dir.put_signed_transport_destination(&signed).await {
                 Ok(outcome) => DirectoryOpResult::TransportDestinationApplyOutcome(outcome),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListSignedTransportDestinationsFor { occurrence_key_id } => {
@@ -1867,7 +2440,7 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::SignedTransportDestinations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ResolveEncryptionKeys { occurrence_key_id } => {
@@ -1875,7 +2448,7 @@ pub async fn dispatch_directory_op(
             // persist's `.so`, against persist's own comparator + clock.
             match dir.resolve_encryption_keys(&occurrence_key_id).await {
                 Ok(v) => DirectoryOpResult::EncryptionKeys(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListIdentityOccurrenceRevocationsFor { identity_key_id } => {
@@ -1884,7 +2457,7 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::IdentityOccurrenceRevocations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListScores {
@@ -1897,7 +2470,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::Scores(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::ResolveScores {
             caller_occurrence_key_id,
@@ -1912,7 +2485,7 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::ComposedVerdict(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListAttestationLog {
@@ -1924,7 +2497,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::Scores(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::ListAttestationsNamingByDimension {
             subject_key_id,
@@ -1936,7 +2509,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::Scores(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::ListAttestationsSinceByPrefixes {
             since,
@@ -1947,24 +2520,24 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::ServedAttestationPage(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::ListOwnerBindingsSince { since, limit } => {
             match dir.list_owner_bindings_since(since, limit).await {
                 Ok(v) => DirectoryOpResult::OwnerBindingPage(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListKeysByIdentityType { identity_type } => {
             match dir.list_keys_by_identity_type(&identity_type).await {
                 Ok(v) => DirectoryOpResult::KeyRecords(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListAllTransportDestinationsUnfolded {} => {
             match dir.list_all_transport_destinations_unfolded().await {
                 Ok(v) => DirectoryOpResult::TransportDestinations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListTransportDestinationsByDestinationUnfolded { destination } => {
@@ -1973,7 +2546,7 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::TransportDestinations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         // v61.4.0 (CIRISPersist#1244) — the blackhole and edge-detection
@@ -1983,7 +2556,7 @@ pub async fn dispatch_directory_op(
             None => DirectoryOpResult::Err(NO_BLACKHOLE_SURFACE.into()),
             Some(r) => match r.blackhole_list().await {
                 Ok(v) => DirectoryOpResult::BlackholeRecords(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             },
         },
         DirectoryOp::BlackholeUpsert {
@@ -1997,28 +2570,28 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             },
         },
         DirectoryOp::BlackholeRemove { identity_hash } => match dir.blackhole_rules_surface() {
             None => DirectoryOpResult::Err(NO_BLACKHOLE_SURFACE.into()),
             Some(r) => match r.blackhole_remove(&identity_hash).await {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             },
         },
         DirectoryOp::BlackholeRecordHit { identity_hash } => match dir.blackhole_rules_surface() {
             None => DirectoryOpResult::Err(NO_BLACKHOLE_SURFACE.into()),
             Some(r) => match r.blackhole_record_hit(&identity_hash).await {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             },
         },
         DirectoryOp::BlackholePruneExpired { now } => match dir.blackhole_rules_surface() {
             None => DirectoryOpResult::Err(NO_BLACKHOLE_SURFACE.into()),
             Some(r) => match r.blackhole_prune_expired(now).await {
                 Ok(n) => DirectoryOpResult::U64(n),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             },
         },
         DirectoryOp::ListAttestationsReferencing {
@@ -2029,13 +2602,13 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::AttestationRows(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::GetAttestation { attestation_id } => {
             match dir.get_attestation(&attestation_id).await {
                 Ok(v) => DirectoryOpResult::Attestation(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListSettledSelfRosterProposals { identity_key_id } => {
@@ -2044,55 +2617,55 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::SelfRosterReceipts(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListIdentityOccurrencesFor { identity_key_id } => {
             match dir.list_identity_occurrences_for(&identity_key_id).await {
                 Ok(v) => DirectoryOpResult::IdentityOccurrences(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::GetActiveHalt { family_key_id } => {
             match dir.get_active_halt(&family_key_id).await {
                 Ok(v) => DirectoryOpResult::ActiveHalt(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::LookupRoleWithdrawal { role, key_id } => {
             match dir.lookup_role_withdrawal(&role, &key_id).await {
                 Ok(v) => DirectoryOpResult::RoleWithdrawal(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::LookupFamily { family_key_id } => {
             match dir.lookup_family(&family_key_id).await {
                 Ok(v) => DirectoryOpResult::Family(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::LookupCommunity { community_key_id } => {
             match dir.lookup_community(&community_key_id).await {
                 Ok(v) => DirectoryOpResult::Community(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListFamiliesForMember {
             member_identity_key_id,
         } => match dir.list_families_for_member(&member_identity_key_id).await {
             Ok(v) => DirectoryOpResult::Families(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::FamilyRosterSigners { family_key_id } => {
             match dir.family_roster_signers(&family_key_id).await {
                 Ok(v) => DirectoryOpResult::RosterSigners(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::CommunityRosterSigners { community_key_id } => {
             match dir.community_roster_signers(&community_key_id).await {
                 Ok(v) => DirectoryOpResult::RosterSigners(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListFamilyMembershipRevocationsFor { family_key_id } => {
@@ -2101,7 +2674,7 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::FamilyMembershipRevocations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListFamilyMembershipWideningsFor { family_key_id } => {
@@ -2110,53 +2683,53 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::FamilyMembershipWidenings(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListLineageHeadCosignsFor { lineage_key_id } => {
             match dir.list_lineage_head_cosigns_for(&lineage_key_id).await {
                 Ok(v) => DirectoryOpResult::LineageHeadCosigns(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::LookupSignedCommunity { community_key_id } => {
             match dir.lookup_signed_community(&community_key_id).await {
                 Ok(v) => DirectoryOpResult::SignedCommunity(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::LookupCanonicalWithdrawal { key_id } => {
             match dir.lookup_canonical_withdrawal(&key_id).await {
                 Ok(v) => DirectoryOpResult::CanonicalWithdrawal(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListCanonicalWithdrawals {} => match dir.list_canonical_withdrawals().await {
             Ok(v) => DirectoryOpResult::CanonicalWithdrawals(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::VoteWindowFirstHeld { action_id } => {
             match dir.vote_window_first_held(&action_id).await {
                 Ok(v) => DirectoryOpResult::OptionalInstant(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListCosignAliases { quorum_key } => {
             match dir.list_cosign_aliases(&quorum_key).await {
                 Ok(v) => DirectoryOpResult::CosignAliases(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::CosignAlias { attestation_id } => {
             match dir.cosign_alias(&attestation_id).await {
                 Ok(v) => DirectoryOpResult::CosignAlias(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::GetAccordDecision { proposal_digest } => {
             match dir.get_accord_decision(&proposal_digest).await {
                 Ok(v) => DirectoryOpResult::AccordDecision(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListAccordProposalsByAnchor {
@@ -2168,19 +2741,19 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::AccordProposals(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::PurgeTombstoned { plane, record_ref } => {
             match dir.purge_tombstoned(&plane, &record_ref).await {
                 Ok(v) => DirectoryOpResult::OptionalString(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::PurgeTombstoneNotices { plane, record_ref } => {
             match dir.purge_tombstone_notices(&plane, &record_ref).await {
                 Ok(v) => DirectoryOpResult::WireHashes(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListTargetedByDimensionPrefix {
@@ -2198,12 +2771,12 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::AttestationRows(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::KeyGrantHeldOwner { axis } => match dir.key_grant_held_owner(&axis).await {
             Ok(v) => DirectoryOpResult::OptionalString(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::NodeKeyId {} => DirectoryOpResult::OptionalString(dir.node_key_id()),
         DirectoryOp::WithdrawsDelegationDepth {} => {
@@ -2216,6 +2789,7 @@ pub async fn dispatch_directory_op(
             None => DirectoryOpResult::Err(NO_EDGE_DETECTION_SURFACE.into()),
             Some(s) => match s.put_edge_detection_event(event).await {
                 Ok(()) => DirectoryOpResult::Unit,
+                // A `crate::derived::Error`: no federation kind to carry.
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             },
         },
@@ -2236,11 +2810,11 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(()) => DirectoryOpResult::Unit,
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::ListAnnouncedPeers => match dir.list_announced_peers().await {
             Ok(v) => DirectoryOpResult::AnnouncedPeers(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::TrustRootValid {
             user_key_id,
@@ -2249,7 +2823,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::TrustRootVerdict(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::CapabilityRootsToTrustedRoot {
             user_key_id,
@@ -2264,7 +2838,7 @@ pub async fn dispatch_directory_op(
         .await
         {
             Ok(g) => DirectoryOpResult::TrustedGrant(g),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         // v24.1.0 (CIRISPersist#561) — the transport-hop gate. Note it has no
         // `Err` arm to route: `resolve_transit_eligibility` is fail-CLOSED and
@@ -2282,12 +2856,12 @@ pub async fn dispatch_directory_op(
         .await
         {
             Ok(v) => DirectoryOpResult::TransitEligibility(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::RevocationsFor { revoked_key_id } => {
             match dir.revocations_for(&revoked_key_id).await {
                 Ok(v) => DirectoryOpResult::Revocations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListSignedAccordQuorumEvidenceSince { since, limit } => {
@@ -2296,7 +2870,7 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::AccordQuorumEvidence(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ApplyReplicatedAccordEvidence { evidence } => {
@@ -2330,36 +2904,36 @@ pub async fn dispatch_directory_op(
                     roster_seats,
                     reason,
                 },
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {
             Ok(()) => DirectoryOpResult::Unit,
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::PutIdentityOccurrence { occurrence } => {
             match dir.put_identity_occurrence(occurrence).await {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::PutFamily { family } => match dir.put_family(family).await {
             Ok(()) => DirectoryOpResult::Unit,
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::PutCommunity { community } => match dir.put_community(community).await {
             Ok(()) => DirectoryOpResult::Unit,
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::PutAttestation { attestation } => match dir.put_attestation(attestation).await
         {
             Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::PutAttestationAuthored { attestation } => {
             match dir.put_attestation_authored(attestation).await {
                 Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         // v50.0.0 (CIRISPersist#917) — the pre-v50 op keeps its contract: the
@@ -2379,16 +2953,16 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::PeerMetadataFor { key_id } => match dir.peer_metadata_for(&key_id).await {
             Ok(v) => DirectoryOpResult::PeerMetadata(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::ListHeldFountainContent { publisher_key_id } => {
             match dir.list_held_fountain_content(&publisher_key_id).await {
                 Ok(v) => DirectoryOpResult::FountainHeld(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::EvictFountainContentToTier {
@@ -2400,7 +2974,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(n) => DirectoryOpResult::U64(n),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::EvictFountainContentHardDelete {
             content_id,
@@ -2410,7 +2984,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(n) => DirectoryOpResult::U64(n),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::ReachableUnderScope {
             root,
@@ -2427,7 +3001,7 @@ pub async fn dispatch_directory_op(
         .await
         {
             Ok(v) => DirectoryOpResult::Reachability(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::VerifyHybridViaDirectory {
             canonical_bytes,
@@ -2475,7 +3049,7 @@ pub async fn dispatch_directory_op(
             .await
             {
                 Ok(g) => DirectoryOpResult::DelegationGraph(g),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::AddPeerRecord {
@@ -2493,7 +3067,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(()) => DirectoryOpResult::Unit,
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::RemovePeerRecord {
             key_id,
@@ -2511,43 +3085,43 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::UpdatePeerAlias { key_id, alias } => {
             match dir.update_peer_alias(&key_id, alias).await {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::UpdatePeerTrust { key_id, trust } => {
             match dir.update_peer_trust(&key_id, trust).await {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::UpdatePeerNotes { key_id, notes } => {
             match dir.update_peer_notes(&key_id, notes).await {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::UpdatePeerPolicy { key_id, policy } => {
             match dir.update_peer_policy(&key_id, policy).await {
                 Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListConsentPeers { node_key_id } => {
             match dir.list_consent_peers(&node_key_id).await {
                 Ok(v) => DirectoryOpResult::ConsentPeers(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListSignedLocationProofsSince { since, limit } => {
             match dir.list_signed_location_proofs_since(since, limit).await {
                 Ok(v) => DirectoryOpResult::SignedLocationProofs(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListSignedTransportDestinationsSince { since, limit } => {
@@ -2556,13 +3130,13 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::SignedTransportDestinationsSince(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListAttestationsSince { since, limit } => {
             match dir.list_attestations_since(since, limit).await {
                 Ok(v) => DirectoryOpResult::Attestations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::LookupSignedRecordByContentHash { kind, content_hash } => {
@@ -2571,12 +3145,12 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::OptionalBytes(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::RebuildSignedWireIndex => match dir.rebuild_signed_wire_index().await {
             Ok(v) => DirectoryOpResult::U64(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         // CIRISPersist#785 — the wire-hash reads and the known-but-not-held
         // set. The two `list_*` arms return DIFFERENT result variants for the
@@ -2592,7 +3166,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::WireHashes(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::InsertKnownWireHash {
             kind,
@@ -2604,12 +3178,12 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(()) => DirectoryOpResult::Unit,
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::KnownWireHashContains { kind, content_hash } => {
             match dir.known_wire_hash_contains(&kind, &content_hash).await {
                 Ok(v) => DirectoryOpResult::Bool(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListKnownWireHashesSince {
@@ -2621,18 +3195,18 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::KnownWireHashes(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::EvictKnownWireHashes { cutoff, bound } => {
             match dir.evict_known_wire_hashes(cutoff, bound).await {
                 Ok(v) => DirectoryOpResult::KnownHashEviction(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ApplyReplicatedAttestation { attestation } => {
             match dir.apply_replicated_attestation(attestation).await {
                 Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ApplyReplicatedAttestationSynced {
@@ -2643,12 +3217,12 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::PutLineageHeadCosign { cosign } => {
             match dir.put_lineage_head_cosign(cosign).await {
                 Ok(o) => DirectoryOpResult::LineageCosignOutcome(o),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::WithdrawsAdmissionDepth { attestation_id } => {
@@ -2656,7 +3230,7 @@ pub async fn dispatch_directory_op(
                 Ok(d) => DirectoryOpResult::WithdrawsAdmissionDepth(
                     d.map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
                 ),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::RevocationsForSubject {
@@ -2666,12 +3240,12 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::Revocations(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::TrustDirectionHeldAmong { attestation_ids } => {
             match dir.trust_direction_held_among(&attestation_ids).await {
                 Ok(v) => DirectoryOpResult::WireHashes(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListKeyPlaneWireHashesSince {
@@ -2683,7 +3257,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::WireHashes(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         // The storage half only: the consumer's `query_attestations` wrapper
         // validates, cuts the page and records the read, so calling the
@@ -2691,7 +3265,7 @@ pub async fn dispatch_directory_op(
         DirectoryOp::ExecuteAttestationQuery { query } => {
             match dir.execute_attestation_query(&query).await {
                 Ok(rows) => DirectoryOpResult::AttestationQueryRows(rows),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListComposersReferencingAny {
@@ -2707,7 +3281,7 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::AttestationRows(v),
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
+            Err(e) => op_err(&e),
         },
         DirectoryOp::ListIdentityOccurrenceHistoryByOccurrence { occurrence_key_id } => {
             match dir
@@ -2715,7 +3289,7 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::OccurrenceHistory(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
             }
         }
         DirectoryOp::ListIdentityOccurrencesByOccurrenceKey { occurrence_key_id } => {
@@ -2724,7 +3298,56 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::IdentityOccurrences(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Err(e) => op_err(&e),
+            }
+        }
+        // v62.0.0 (JSON-cut slice D) — the edition-2 doors run inside
+        // persist's `.so` over persist's own directory; their errors keep
+        // their reading (`typed_error_string`).
+        DirectoryOp::PutEdition2Statement {
+            statement,
+            offered_row_id,
+        } => match Box::pin(crate::federation::edition2::ingest::put_statement(
+            dir,
+            &statement,
+            offered_row_id.as_ref(),
+            crate::federation::edition2::ingest::INGEST_TIER,
+        ))
+        .await
+        {
+            Ok(o) => DirectoryOpResult::Edition2StatementOutcome(o.into()),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::ApplyReplicatedStatement {
+            statement,
+            offered_row_id,
+        } => match Box::pin(
+            crate::federation::edition2::ingest::apply_replicated_statement(
+                dir,
+                &statement,
+                &offered_row_id,
+            ),
+        )
+        .await
+        {
+            Ok(o) => DirectoryOpResult::ReplicatedStatementOutcome(o.into()),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::Edition2StatementsSince { cursor, limit } => {
+            let cursor = cursor.map(crate::federation::edition2::store::StatementCursor::from);
+            match dir.edition2_statements_since(cursor.as_ref(), limit).await {
+                Ok(v) => DirectoryOpResult::Edition2StatementPage(
+                    v.into_iter().map(Edition2ServedStatement::from).collect(),
+                ),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::BundlesInForce {} => {
+            match Box::pin(crate::federation::edition2::genesis::bundles_in_force(dir)).await {
+                Ok(v) => DirectoryOpResult::BundlesInForce(
+                    v.iter().map(Edition2BundleInForce::from).collect(),
+                ),
+                Err(e) => op_err_typed(&e),
             }
         }
     }
@@ -3010,6 +3633,19 @@ pub fn build_capsule_with_destructor<'py>(
 
 // ── #329: consumer-side FederationDirectory proxy ──────────────────
 
+/// v62.0.0 (CC 2.7) — the proxy's reading of a host answer: a
+/// [`DirectoryOpResult::TypedErr`] is the host's error, rebuilt with its kind
+/// and its wait ([`CapsuleError::into_error`]); every other answer is the
+/// op's result for the calling method to match. Every proxy method reaches
+/// the host through [`OpsDirectory::run_op`] / `run_op_blocking`, so this is
+/// the one place the typed failure is read.
+fn relay_typed_err(result: DirectoryOpResult) -> Result<DirectoryOpResult, Error> {
+    match result {
+        DirectoryOpResult::TypedErr(t) => Err(t.into_error()),
+        other => Ok(other),
+    }
+}
+
 /// The consumer-side `FederationDirectory` proxy — the mirror of
 /// [`build_persist_directory`] (the producer half).
 ///
@@ -3148,11 +3784,12 @@ impl OpsDirectory {
         })?;
         dtrace("RECV", &op_preview);
 
-        serde_json::from_slice::<DirectoryOpResult>(&result_bytes).map_err(|e| {
+        let result = serde_json::from_slice::<DirectoryOpResult>(&result_bytes).map_err(|e| {
             Error::Backend(format!(
                 "directory ops proxy: result deserialize failure: {e}"
             ))
-        })
+        })?;
+        relay_typed_err(result)
     }
 }
 
@@ -3205,11 +3842,12 @@ impl OpsDirectory {
                 "directory ops proxy: sync op did not complete: {e}"
             ))
         })?;
-        serde_json::from_slice::<DirectoryOpResult>(&bytes).map_err(|e| {
+        let result = serde_json::from_slice::<DirectoryOpResult>(&bytes).map_err(|e| {
             Error::Backend(format!(
                 "directory ops proxy: result deserialize failure: {e}"
             ))
-        })
+        })?;
+        relay_typed_err(result)
     }
 
     /// Run a blackhole op and expect `Unit`.
@@ -4972,6 +5610,35 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    /// v62.0.0 (JSON-cut slice D) — the edition-2 serve listing, proxied.
+    /// The trait default answers EMPTY, which a serving consumer would read
+    /// as "nothing held" (the #1244 fail-open class), so the read crosses.
+    async fn edition2_statements_since(
+        &self,
+        cursor: Option<&crate::federation::edition2::store::StatementCursor>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::edition2::store::ServedStatement>, Error> {
+        match self
+            .run_op(&DirectoryOp::Edition2StatementsSince {
+                cursor: cursor.copied().map(Edition2Cursor::from),
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::Edition2StatementPage(v) => Ok(v
+                .into_iter()
+                .map(|s| crate::federation::edition2::store::ServedStatement {
+                    cursor: s.cursor.into(),
+                    bytes: s.bytes,
+                })
+                .collect()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     /// v61.1.0 (CIRISPersist#1163) — the owner-binding feed, proxied.
     async fn list_owner_bindings_since(
         &self,
@@ -5755,7 +6422,11 @@ mod tests {
             .expect("op result must arrive");
         // SAFETY: single-drop, matched vtable.
         unsafe { (executor.vtable.drop)(executor.data) };
-        serde_json::from_slice(&bytes).expect("deserialize DirectoryOpResult")
+        // v62.0.0 (ABI 14) — these witnesses read a failure's TEXT; a
+        // `TypedErr` carries the same text the pre-v62 `Err` did.
+        serde_json::from_slice::<DirectoryOpResult>(&bytes)
+            .expect("deserialize DirectoryOpResult")
+            .into_flattened()
     }
 
     fn sample_key_record(key_id: &str) -> KeyRecord {
@@ -6360,10 +7031,13 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_13() {
+    fn abi_version_pinned_at_14() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 13,
-            "v61.3.0 (CIRISPersist#1252): ReplicatedAttestationOutcome gained HeldEquivalent \
+            DIRECTORY_ABI_VERSION, 14,
+            "v62.0.0 (CC 2.7): the result wire gained TypedErr, and an existing op's failure \
+             now answers it (the error's kind and wait cross the capsule) — a consumer built \
+             against 13 fails to decode it on the hot path. Previous move: \
+             v61.3.0 (CIRISPersist#1252): ReplicatedAttestationOutcome gained HeldEquivalent \
              (the same act held under another row) — a consumer built against 12 fails to \
              decode it on the hot path. Previous move: \
              v61 (CIRISPersist#991): the six group kinds retired — the signed group cursors \
@@ -6405,7 +7079,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 13,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 14,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -6495,9 +7169,12 @@ mod tests {
         // DIRECTORY_ABI_VERSION stays 13.
         // v61.4.0 round 2 (CIRISPersist#1244) — GROWTH: the rooting reads and
         // the fail-open trust reads APPENDED (29 ops); ABI stays 13.
+        // v62.0.0 (JSON-cut slice D) — GROWTH: `PutEdition2Statement`,
+        // `ApplyReplicatedStatement`, `Edition2StatementsSince` and
+        // `BundlesInForce` APPENDED, nothing existing touched; ABI stays 13.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "10f494612b504776fad61ddd55b88d70ffcdf6dd6c6ba1387d9e3db5b4ca9f8e",
+            "72341051723f44a4549be63fd77144eb7ef532cd2ba7d8e9a4c7113ae39d1c4f",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -6556,9 +7233,14 @@ mod tests {
         // v61.4.0 (CIRISPersist#1244) — GROWTH: `BlackholeRecords` APPENDED.
         // v61.4.0 round 2 (CIRISPersist#1244) — GROWTH: 21 result variants
         // APPENDED for the rooting and trust reads.
+        // v62.0.0 (JSON-cut slice D) — GROWTH: `Edition2StatementOutcome`,
+        // `ReplicatedStatementOutcome`, `Edition2StatementPage` and
+        // `BundlesInForce` APPENDED.
+        // v62.0.0 (CC 2.7) — `TypedErr` APPENDED; an existing op now answers
+        // it, so DIRECTORY_ABI_VERSION 13 → 14 (the AttestationOutcome form).
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "e3041d8473605d82d0aad59d6f99920013a38968d4ca66a938a67b4053ed553c",
+            "217a969c2c6cbb33043a3a029d8841f6f923095fe8aa0482692148a881d0781f",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -8720,8 +9402,16 @@ mod tests {
                 let clean = proxy_1244(rt, inner.clone());
                 match (rt.block_on(call(clean)), rt.block_on(call(inner.clone()))) {
                     (Ok(()), Ok(())) => {}
+                    // v62.0.0 (ABI 14) — a host `Backend` crosses as `Backend`
+                    // with the host's text; any other failure as `Relayed`,
+                    // whose text and kind are the host's.
                     (Err(Error::Backend(p)), Err(d)) => {
                         assert_eq!(p, d.to_string(), "I1762 {method}: the host's own failure")
+                    }
+                    (Err(p @ Error::Relayed { .. }), Err(d)) => {
+                        assert_eq!(p.to_string(), d.to_string(), "I1762 {method}: the text");
+                        assert_eq!(p.kind(), d.kind(), "I1762 {method}: the kind crosses");
+                        assert_eq!(p.is_wait(), d.is_wait(), "I1762 {method}: the wait crosses");
                     }
                     (p, d) => panic!("I1762 {method}: proxy {p:?} vs direct {d:?}"),
                 }
@@ -9789,6 +10479,11 @@ mod tests {
         ("add_community_member", PRE_1162),
         ("supersede_group_row", PRE_1162),
         ("list_group_versions", PRE_1162),
+        (
+            "drop_group_tips",
+            "v62.0.0 (wave T1): the merge's tip retirement is the edition-2 \
+          roster door's own write; no DirectoryOp carries it",
+        ),
         ("enter_mesh", PRE_1162),
         ("put_accord_proposal", PRE_1162),
         ("get_accord_proposal", PRE_1162),
@@ -9823,7 +10518,6 @@ mod tests {
         ("store_invalid_replaced_key_record", INHERITED_DEFAULT),
         ("list_key_registration_history", INHERITED_DEFAULT),
         ("list_derived_hex", INHERITED_DEFAULT),
-        ("adopt_genesis_reanchor", INHERITED_DEFAULT),
         ("list_attestations_citing_by_dimension", INHERITED_DEFAULT),
         ("list_consent_peers_for", INHERITED_DEFAULT),
         ("list_live_consent_grants_by", INHERITED_DEFAULT),
@@ -9860,6 +10554,92 @@ mod tests {
         ("purge_delete_tombstoned_attestation", INHERITED_DEFAULT),
         ("purge_delete_tombstoned_trace", INHERITED_DEFAULT),
         ("purge_mark_finalized", INHERITED_DEFAULT),
+        (
+            "put_identity_occurrence_edition2",
+            "v62.0.0 (wave O1) — the edition-2 occurrence bind is written by the \
+             node's own door (`edition2::occurrence::put_occurrence_voice`), reached \
+             through `put_edition2_statement`; no DirectoryOp carries the typed write",
+        ),
+        (
+            "store_projected_trust",
+            "v62.0.0 (wave T2) — the v1.3 trust plane's row re-derived from a held \
+             trust:accepts edge by the node's own door (`edition2::typed`); no DirectoryOp \
+             carries the projection write",
+        ),
+        (
+            "retract_projected_trust",
+            "v62.0.0 (wave T2) — the expiry of a projected trust row on the granter's \
+             withdraws, by the node's own door (`edition2::typed`); no DirectoryOp carries it",
+        ),
+        (
+            "put_delivery_receipt_edition2",
+            "v62.0.0 (wave T2) — an edition-2 delivery receipt's typed write is the \
+             node's own door (`edition2::typed`), reached through \
+             `put_edition2_statement`; no DirectoryOp carries the typed write",
+        ),
+        (
+            "put_edition2_genesis",
+            "v62.0.0 (C1) — the genesis bundle's one-transaction write is the \
+             node's own door (`edition2::genesis::put_genesis_bundle`); no DirectoryOp \
+             carries a bundle's GenesisWrite",
+        ),
+        (
+            "put_touch_claim_local",
+            "v62.0.0 (P5b) — the node-local touch claim is this node's own derived \
+             state (RULINGS: a touch claim is node-local); no DirectoryOp carries it yet",
+        ),
+        (
+            "freshness_floor",
+            "v62.0.0 (P5b) — the node-local freshness floor read; no DirectoryOp \
+             carries it yet",
+        ),
+        (
+            "put_fold_record",
+            "v62.0.0 (wave G0; CC 2.7.3) — the fold's record of a held row is written \
+             by the node's own door (`edition2::fold`), reached through \
+             `put_edition2_statement`; no DirectoryOp carries it",
+        ),
+        (
+            "recheck_attestation",
+            "v62.0.0 (wave G0) — the fold's re-check of a concluded row runs the plan in \
+             the process that owns the store (`edition2::fold`); no DirectoryOp carries it",
+        ),
+        (
+            "clear_occurrence_projection",
+            "v62.0.0 (wave G0 v4) — the occurrence plane's un-project hook runs in the \
+             process that owns the store (`edition2::fold::Plane`); no DirectoryOp carries it",
+        ),
+        (
+            "unconclude_attestation",
+            "v62.0.0 (wave G0) — the fold takes a row it no longer concludes out of its \
+             typed table in the process that owns the store; no DirectoryOp carries it",
+        ),
+        (
+            "note_edition2_roster_proposal",
+            "v62.0.0 (O1) — THIS node's receipt of an edition-2 self-roster \
+             proposal (ceg_roster_proposals), written by its own occurrence door; no DirectoryOp \
+             carries it",
+        ),
+        (
+            "settle_edition2_roster_proposal",
+            "v62.0.0 (O1) — settles THIS node's held self-roster proposal \
+             (the two paths, CC 3.3.6.4); node-local, no DirectoryOp carries it",
+        ),
+        (
+            "list_open_edition2_roster_proposals",
+            "v62.0.0 (O1) — THIS node's open self-roster proposals, read \
+             by its own sweep; node-local, no DirectoryOp carries it",
+        ),
+        (
+            "edition2_roster_proposal",
+            "v62.0.0 (O1) — one of THIS node's held self-roster proposal \
+             receipts, by row id; node-local, no DirectoryOp carries it",
+        ),
+        (
+            "list_group_tips",
+            "v62.0.0 (kernel pass 2, K1): a node-local read of the tips this \
+          node holds; no DirectoryOp carries it yet",
+        ),
     ];
 
     /// **I1162 — proxy parity.** Every `FederationDirectory` method the
@@ -9999,6 +10779,23 @@ mod proxy_gate {
             "`trust_root::resolve_transit_eligibility` is a free, fail-closed function over \
              the directory, not a trait method",
         ),
+        // v62.0.0 (JSON-cut slice D) — the edition-2 doors are free functions
+        // over the directory; the consumer sends the op.
+        (
+            "PutEdition2Statement",
+            "`edition2::ingest::put_statement` is a free door persist runs over its own \
+             directory, so every gate runs on the host's store; no trait method to proxy",
+        ),
+        (
+            "ApplyReplicatedStatement",
+            "`edition2::ingest::apply_replicated_statement` is a free door persist runs over \
+             its own directory; no trait method to proxy",
+        ),
+        (
+            "BundlesInForce",
+            "`edition2::genesis::bundles_in_force` is a free fold over the held genesis \
+             lineage, not a trait method",
+        ),
     ];
 
     /// The body of the first `{ … }` block opening at or after `at`.
@@ -10098,5 +10895,777 @@ mod proxy_gate {
             );
         }
         assert!(missing.is_empty(), "I1322 (#787):\n{}", missing.join("\n"));
+    }
+}
+
+/// v62.0.0 (JSON-cut slice D) — the edition-2 ops and the earlier-form
+/// refusal across the capsule, on sqlite and postgres.
+///
+/// - **I2480 (the statement door crosses).** `PutEdition2Statement` admits a
+///   `key:record` through the C-ABI as the key plane, under the row id this
+///   node computes from the bytes; the same bytes again are `new: false`.
+/// - **I2481 (an earlier-form object at the edition-2 op).** JSON bytes are
+///   refused by the door itself, and the flattened error carries the
+///   reading `federation_malformed_row: {plane}: earlier_form_object`.
+/// - **I2482 (the offered id).** An offered row id the bytes do not name is
+///   `row_id_mismatch`; the store is untouched.
+/// - **I2483 (the replicated door).** `ApplyReplicatedStatement` under the
+///   computed id is `Admitted`, then `Unchanged`, with the plane carried.
+/// - **I2484 (the serve listing crosses, and the proxy reads it).**
+///   `Edition2StatementsSince` pages every held statement once, as received,
+///   in strictly increasing positions; the answer equals the directory's
+///   own, and the consumer proxy (`OpsDirectory`) answers the same instead
+///   of the trait default's empty set.
+/// - **I2485 (bundles in force cross).** `BundlesInForce` answers what
+///   `edition2::genesis::bundles_in_force` answers (none held: empty).
+/// - **I2486 (the earlier-form ops refuse once shut).** With the switch
+///   forced on, `PutAttestation` (a JSON row with no statement) and
+///   `PutIdentityOccurrenceRevocation` answer
+///   `federation_malformed_row: {plane}: earlier_form_object` before any
+///   parse, nothing is stored; with the switch off neither is refused by
+///   that name.
+/// - **I2487 (every inbound op is classified).** Every `Put*` /
+///   `ApplyReplicated*` op is classified earlier-form by
+///   [`earlier_form_op_plane`], or is named here with why.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod edition2_ops {
+    use super::*;
+    use ciris_crypto::composite::CompositeSigningKey;
+    use ciris_verify_core::cde::{self, Value};
+    use ciris_verify_core::edition2::{cose_key, identity_ref, sign_row_statement, thumbprint};
+    use std::sync::mpsc;
+
+    use crate::federation::edition2::names::RowId;
+
+    // ── fixtures (signed before any await: no signing key crosses one) ──
+
+    fn key(n: u8) -> CompositeSigningKey {
+        CompositeSigningKey::from_seeds(&[n; 32], &[n.wrapping_add(100); 32])
+    }
+
+    fn iref(k: &CompositeSigningKey) -> String {
+        identity_ref(&thumbprint(k.public_key()))
+    }
+
+    fn map(mut m: Vec<(&str, Value)>) -> Value {
+        let t = |s: &str| Value::Text(s.into());
+        m.sort_by_key(|(k, _)| cde::encode(&t(k)));
+        Value::Map(m.into_iter().map(|(k, v)| (t(k), v)).collect())
+    }
+
+    /// A self-signed `key:record` of the key seeded `n`.
+    fn key_record(n: u8, at: u64) -> Vec<u8> {
+        let k = key(n);
+        let roles = Value::Array(vec![Value::Text("user".into())]);
+        let payload = map(vec![
+            ("key", cose_key(k.public_key())),
+            ("identity_type", roles),
+            ("asserted_at", Value::Uint(at)),
+            ("author", Value::Text(iref(&k))),
+        ]);
+        sign_row_statement(
+            &k,
+            &iref(&k),
+            &iref(&k),
+            "scores",
+            "key:record",
+            &payload,
+            vec![],
+        )
+        .expect("sign a key:record")
+    }
+
+    fn rid(statement: &[u8]) -> [u8; 32] {
+        RowId::of_statement(statement).expect("a row statement").0
+    }
+
+    fn runtime() -> Arc<tokio::runtime::Runtime> {
+        Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("build tokio runtime"),
+        )
+    }
+
+    /// Drive one op through the C-ABI (the shape a consumer wheel uses).
+    fn run_op(
+        rt: &Arc<tokio::runtime::Runtime>,
+        directory: &Directory,
+        op: &DirectoryOp,
+    ) -> DirectoryOpResult {
+        let op_bytes = serde_json::to_vec(op).expect("serialize op");
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)) as *mut c_void;
+
+        unsafe extern "C" fn cb(ctx: *mut c_void, ptr: *const u8, len: usize) {
+            // SAFETY: single-fire boxed Sender; readable (ptr,len) for the call.
+            let tx: Box<mpsc::Sender<Vec<u8>>> =
+                unsafe { Box::from_raw(ctx as *mut mpsc::Sender<Vec<u8>>) };
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            let _ = tx.send(bytes);
+        }
+
+        // SAFETY: matched data/vtable; readable op bytes; Send-valid ctx/cb.
+        let task_ptr = unsafe {
+            (directory.vtable.build_op)(directory.data, op_bytes.as_ptr(), op_bytes.len(), cb, ctx)
+        };
+        let executor = crate::ffi::executor_capsule::build_persist_executor(rt.clone());
+        // SAFETY: task from build_op; matched executor vtable; single spawn.
+        unsafe { (executor.vtable.spawn)(executor.data, task_ptr) };
+        let bytes = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("op result must arrive");
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (executor.vtable.drop)(executor.data) };
+        // v62.0.0 (ABI 14) — these witnesses read a failure's TEXT; a
+        // `TypedErr` carries the same text the pre-v62 `Err` did.
+        serde_json::from_slice::<DirectoryOpResult>(&bytes)
+            .expect("deserialize DirectoryOpResult")
+            .into_flattened()
+    }
+
+    fn err_of(r: DirectoryOpResult, what: &str) -> String {
+        match r {
+            DirectoryOpResult::Err(s) => s,
+            other => panic!("{what}: expected Err, got {other:?}"),
+        }
+    }
+
+    /// I2480–I2487 over one migrated, EMPTY store.
+    fn body(rt: &Arc<tokio::runtime::Runtime>, dir: Arc<dyn FederationDirectory>) {
+        let s1 = key_record(81, 1_000);
+        let s2 = key_record(82, 2_000);
+        let directory = build_persist_directory(dir.clone());
+
+        // ── I2480 ──
+        for want_new in [true, false] {
+            match run_op(
+                rt,
+                &directory,
+                &DirectoryOp::PutEdition2Statement {
+                    statement: s1.clone(),
+                    offered_row_id: None,
+                },
+            ) {
+                DirectoryOpResult::Edition2StatementOutcome(
+                    Edition2StatementOutcome::KeyPlane { row_id, new },
+                ) => {
+                    assert_eq!(row_id, rid(&s1), "I2480: the node-computed row id");
+                    assert_eq!(new, want_new, "I2480: new on first put only");
+                }
+                other => panic!("I2480: {other:?}"),
+            }
+        }
+
+        // ── I2481 ──
+        let json = br#"{"attestation":{"attestation_id":"a","attesting_key_id":"k"}}"#.to_vec();
+        let e = err_of(
+            run_op(
+                rt,
+                &directory,
+                &DirectoryOp::PutEdition2Statement {
+                    statement: json,
+                    offered_row_id: None,
+                },
+            ),
+            "I2481",
+        );
+        assert!(
+            e.starts_with("federation_malformed_row: ") && e.contains(": earlier_form_object: "),
+            "I2481: the reading crosses: {e}"
+        );
+
+        // ── I2482 ──
+        let e = err_of(
+            run_op(
+                rt,
+                &directory,
+                &DirectoryOp::PutEdition2Statement {
+                    statement: s2.clone(),
+                    offered_row_id: Some([0x5a; 32]),
+                },
+            ),
+            "I2482",
+        );
+        assert!(e.contains(": row_id_mismatch: "), "I2482: {e}");
+        let held = rt
+            .block_on(dir.edition2_statements_since(None, 100))
+            .expect("I2482: read");
+        assert!(
+            held.iter().all(|s| s.bytes != s2),
+            "I2482: a refused statement is not stored"
+        );
+
+        // ── I2483 ──
+        let first = run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ApplyReplicatedStatement {
+                statement: s2.clone(),
+                offered_row_id: rid(&s2),
+            },
+        );
+        let again = run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ApplyReplicatedStatement {
+                statement: s2.clone(),
+                offered_row_id: rid(&s2),
+            },
+        );
+        let kp = Edition2StatementOutcome::KeyPlane {
+            row_id: rid(&s2),
+            new: true,
+        };
+        match first {
+            DirectoryOpResult::ReplicatedStatementOutcome(Edition2ReplicatedOutcome::Admitted(
+                o,
+            )) => assert_eq!(o, kp, "I2483: admitted on the key plane"),
+            other => panic!("I2483 first: {other:?}"),
+        }
+        match again {
+            DirectoryOpResult::ReplicatedStatementOutcome(
+                Edition2ReplicatedOutcome::Unchanged(Edition2StatementOutcome::KeyPlane {
+                    row_id,
+                    new,
+                }),
+            ) => {
+                assert_eq!(row_id, rid(&s2), "I2483");
+                assert!(!new, "I2483: a re-offer is not new");
+            }
+            other => panic!("I2483 again: {other:?}"),
+        }
+
+        // ── I2484 ──
+        let mut served: Vec<Edition2ServedStatement> = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = match run_op(
+                rt,
+                &directory,
+                &DirectoryOp::Edition2StatementsSince { cursor, limit: 1 },
+            ) {
+                DirectoryOpResult::Edition2StatementPage(v) => v,
+                other => panic!("I2484: {other:?}"),
+            };
+            assert!(page.len() <= 1, "I2484: the limit");
+            let Some(last) = page.last() else { break };
+            cursor = Some(last.cursor);
+            served.extend(page);
+        }
+        assert!(
+            served.windows(2).all(|w| w[0].cursor < w[1].cursor),
+            "I2484: strictly increasing positions"
+        );
+        for s in [&s1, &s2] {
+            assert_eq!(
+                served.iter().filter(|x| &x.bytes == s).count(),
+                1,
+                "I2484: each held statement served once, as received"
+            );
+        }
+        let direct: Vec<Edition2ServedStatement> = rt
+            .block_on(dir.edition2_statements_since(None, 100))
+            .expect("I2484: direct read")
+            .into_iter()
+            .map(Edition2ServedStatement::from)
+            .collect();
+        assert_eq!(
+            served, direct,
+            "I2484: the op answers what the directory answers"
+        );
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy =
+            build_ops_directory(build_persist_directory(dir.clone()), executor).expect("abi ok");
+        let via_proxy: Vec<Edition2ServedStatement> = rt
+            .block_on(proxy.edition2_statements_since(None, 100))
+            .expect("I2484: proxy read")
+            .into_iter()
+            .map(Edition2ServedStatement::from)
+            .collect();
+        assert_eq!(
+            via_proxy, direct,
+            "I2484: the consumer proxy reads the host's listing, not the empty default"
+        );
+
+        // ── I2485 ──
+        let direct: Vec<Edition2BundleInForce> = rt
+            .block_on(crate::federation::edition2::genesis::bundles_in_force(
+                dir.as_ref(),
+            ))
+            .expect("I2485: direct")
+            .iter()
+            .map(Edition2BundleInForce::from)
+            .collect();
+        match run_op(rt, &directory, &DirectoryOp::BundlesInForce {}) {
+            DirectoryOpResult::BundlesInForce(v) => {
+                assert_eq!(v, direct, "I2485: the op answers the fold");
+                assert!(v.is_empty(), "I2485: no genesis bundle held");
+            }
+            other => panic!("I2485: {other:?}"),
+        }
+
+        // ── I2486 ── (dispatched in THIS task: the forced switch is
+        // task-local, and the C-ABI spawns onto another task.)
+        use crate::federation::tier_ingest::test_support as ts;
+        let id = uuid::Uuid::new_v4().to_string();
+        let row =
+            ts::bare_attestation(&id, "i2486-signer", "i2486-subject", &serde_json::json!({}));
+        let put_row = || DirectoryOp::PutAttestation {
+            attestation: crate::federation::SignedAttestation {
+                attestation: row.clone(),
+            },
+        };
+        let put_occ_rev = || DirectoryOp::PutIdentityOccurrenceRevocation {
+            revocation: serde_json::json!({ "identity_occurrence_revocation": {} }),
+        };
+        let shut = rt.block_on(
+            crate::federation::edition2::door::with_earlier_form_doors_shut(async {
+                (
+                    dispatch_directory_op(dir.as_ref(), put_row())
+                        .await
+                        .into_flattened(),
+                    dispatch_directory_op(dir.as_ref(), put_occ_rev())
+                        .await
+                        .into_flattened(),
+                )
+            }),
+        );
+        for (r, plane) in [
+            (shut.0, "attestation"),
+            (shut.1, "identity_occurrence_revocation"),
+        ] {
+            let e = err_of(r, "I2486 shut");
+            assert!(
+                e.starts_with(&format!(
+                    "federation_malformed_row: {plane}: earlier_form_object: "
+                )),
+                "I2486: {plane} refused by name: {e}"
+            );
+        }
+        assert!(
+            rt.block_on(dir.get_attestation(&id))
+                .expect("I2486: read")
+                .is_none(),
+            "I2486: nothing stored behind the refusal"
+        );
+        for op in [put_row(), put_occ_rev()] {
+            if let DirectoryOpResult::Err(e) = rt
+                .block_on(dispatch_directory_op(dir.as_ref(), op))
+                .into_flattened()
+            {
+                assert!(
+                    !e.contains("earlier_form_object"),
+                    "I2486: the switch is off, so no earlier-form refusal: {e}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i2480_to_i2486_edition2_ops_cross_the_capsule_sqlite() {
+        let rt = runtime();
+        let backend = rt.block_on(async {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .expect("open sqlite");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        });
+        body(&rt, Arc::new(backend));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn i2480_to_i2486_edition2_ops_cross_the_capsule_pg() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let rt = runtime();
+        let backend = rt.block_on(async {
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        });
+        body(&rt, Arc::new(backend));
+    }
+
+    /// The `Put*` / `ApplyReplicated*` ops that are NOT earlier-form doors,
+    /// each with why.
+    const NOT_EARLIER_FORM: &[(&str, &str)] = &[
+        (
+            "PutEdition2Statement",
+            "the edition-2 door itself; it refuses an earlier-form object by its own form check",
+        ),
+        (
+            "ApplyReplicatedStatement",
+            "the replicated edition-2 door; the same form check runs inside put_statement",
+        ),
+        (
+            "PutEdgeDetectionEvent",
+            "TODO(json-cut): MESH by ruling, but no edition-2 detection door exists and the Rust \
+             door is not on the switch; the capsule follows the Rust door",
+        ),
+    ];
+
+    /// I2487 — from this file's own text (comments stripped): every
+    /// `Put*` / `ApplyReplicated*` variant of [`DirectoryOp`] is named in
+    /// [`earlier_form_op_plane`]'s earlier-form arms (the arms before its
+    /// first `=> None`), or in [`NOT_EARLIER_FORM`] with why — never both.
+    #[test]
+    fn i2487_every_inbound_op_is_classified() {
+        let src: String = include_str!("directory_capsule.rs")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let enum_at = src.find("pub enum DirectoryOp {").expect("the op enum");
+        let enum_end = enum_at + src[enum_at..].find("\n}\n").expect("enum end");
+        let variants: Vec<&str> = src[enum_at..enum_end]
+            .lines()
+            .filter_map(|l| {
+                let name = l.strip_prefix("    ")?;
+                let end = name
+                    .find(|c: char| !c.is_ascii_alphanumeric())
+                    .unwrap_or(name.len());
+                let name = &name[..end];
+                name.starts_with(|c: char| c.is_ascii_uppercase())
+                    .then_some(name)
+            })
+            .collect();
+        assert!(
+            variants.len() >= 115,
+            "I2487: the scan found {} variants",
+            variants.len()
+        );
+        let fn_at = src
+            .find("pub fn earlier_form_op_plane(")
+            .expect("the classifier");
+        let earlier = &src[fn_at..fn_at + src[fn_at..].find("=> None").expect("a None arm")];
+        let classified = |v: &str| {
+            earlier
+                .match_indices(&format!("DirectoryOp::{v}"))
+                .any(|(i, m)| {
+                    !earlier[i + m.len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
+                })
+        };
+        let mut bad = Vec::new();
+        for v in variants
+            .iter()
+            .filter(|v| v.starts_with("Put") || v.starts_with("ApplyReplicated"))
+        {
+            let exempt = NOT_EARLIER_FORM.iter().any(|(n, _)| n == v);
+            match (classified(v), exempt) {
+                (true, true) => bad.push(format!("{v}: classified AND exempt")),
+                (false, false) => bad.push(format!("{v}: not classified earlier-form")),
+                _ => {}
+            }
+        }
+        for (n, why) in NOT_EARLIER_FORM {
+            assert!(variants.contains(n), "I2487: no op `{n}`");
+            assert!(
+                why.split_whitespace().count() >= 8,
+                "I2487: `{n}` needs a reason"
+            );
+        }
+        assert!(bad.is_empty(), "I2487:\n{}", bad.join("\n"));
+    }
+
+    /// I2486 (pure) — the classifier's refusal is inert while the switch is
+    /// off, and names the plane once it is on.
+    #[tokio::test]
+    async fn i2486_the_op_refusal_follows_the_switch() {
+        let op = DirectoryOp::PutIdentityOccurrenceRevocation {
+            revocation: serde_json::json!({}),
+        };
+        refuse_earlier_form_op(&op).expect("I2486: inert while off");
+        let e = crate::federation::edition2::door::with_earlier_form_doors_shut(async {
+            refuse_earlier_form_op(&op)
+        })
+        .await
+        .expect_err("I2486: refused once shut");
+        assert_eq!(
+            typed_error_string(&e)
+                .split(": ")
+                .take(3)
+                .collect::<Vec<_>>(),
+            vec![
+                "federation_malformed_row",
+                "identity_occurrence_revocation",
+                "earlier_form_object"
+            ],
+            "I2486: the reading"
+        );
+        let read = DirectoryOp::LookupPublicKey { key_id: "k".into() };
+        crate::federation::edition2::door::with_earlier_form_doors_shut(async {
+            refuse_earlier_form_op(&read)
+        })
+        .await
+        .expect("I2486: a read is never refused");
+    }
+}
+
+/// v62.0.0 (CC 2.7, wave P9) — **the kind and the wait cross the capsule.**
+///
+/// - **I3602 (sqlite and postgres).** A row signed by a key this node holds
+///   no record of, put through the C-ABI (`build_op` + the executor capsule)
+///   as `PutEdition2Statement`, answers [`DirectoryOpResult::TypedErr`] with
+///   kind `federation_attester_key_unknown` and `wait: true` (before v62 a
+///   failure crossed as `Err(String)` and the proxy rebuilt it as
+///   `federation_backend`); the proxy's reading ([`relay_typed_err`]) is an
+///   error with that kind whose `is_wait()` holds, and nothing is stored. A
+///   JSON body crosses as `federation_malformed_row`, `wait: false` (a
+///   terminal refusal stays terminal). A relayed `federation_backend` is
+///   [`Error::Backend`] with the host's text, byte for byte (the pre-v62
+///   flattening every `Backend` reader keys on), and any other kind keeps
+///   its token through the interner; a kind that is not a token is
+///   `federation_backend`.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod wait_relay {
+    use super::*;
+    use ciris_crypto::composite::CompositeSigningKey;
+    use ciris_verify_core::cde::{self, Value};
+    use ciris_verify_core::edition2::{identity_ref, row_ref, sign_row_statement, thumbprint};
+    use std::sync::mpsc;
+
+    use crate::federation::edition2::names::RowId;
+
+    fn map(mut m: Vec<(&str, Value)>) -> Value {
+        let t = |s: &str| Value::Text(s.into());
+        m.sort_by_key(|(k, _)| cde::encode(&t(k)));
+        Value::Map(m.into_iter().map(|(k, v)| (t(k), v)).collect())
+    }
+
+    /// A score row by a key no store here holds (the shape
+    /// `edition2::ingest_invariants` answers the wait for).
+    fn stranger_row() -> Vec<u8> {
+        let k = CompositeSigningKey::from_seeds(&[98; 32], &[198; 32]);
+        let me = identity_ref(&thumbprint(k.public_key()));
+        let payload = map(vec![
+            ("asserted_at", Value::Uint(5_000)),
+            ("author", Value::Text(me.clone())),
+            ("score", Value::Uint(750_000)),
+            ("confidence", Value::Uint(900_000)),
+            (
+                "dimension",
+                Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
+            ),
+            (
+                "refs",
+                map(vec![(
+                    "also",
+                    map(vec![("cites", Value::Array(vec![row_ref(&[0x31; 32])]))]),
+                )]),
+            ),
+        ]);
+        sign_row_statement(
+            &k,
+            &me,
+            &me,
+            "scores",
+            "evidence:.suite:.kind:.cell:.prefix",
+            &payload,
+            vec![],
+        )
+        .expect("sign a score row")
+    }
+
+    fn runtime() -> Arc<tokio::runtime::Runtime> {
+        Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("build tokio runtime"),
+        )
+    }
+
+    /// One op through the C-ABI, the bytes deserialized as a consumer does
+    /// (NOT flattened: this witness reads the typed failure).
+    fn run_op(
+        rt: &Arc<tokio::runtime::Runtime>,
+        directory: &Directory,
+        op: &DirectoryOp,
+    ) -> DirectoryOpResult {
+        let op_bytes = serde_json::to_vec(op).expect("serialize op");
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)) as *mut c_void;
+
+        unsafe extern "C" fn cb(ctx: *mut c_void, ptr: *const u8, len: usize) {
+            // SAFETY: single-fire boxed Sender; readable (ptr,len) for the call.
+            let tx: Box<mpsc::Sender<Vec<u8>>> =
+                unsafe { Box::from_raw(ctx as *mut mpsc::Sender<Vec<u8>>) };
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            let _ = tx.send(bytes);
+        }
+
+        // SAFETY: matched data/vtable; readable op bytes; Send-valid ctx/cb.
+        let task_ptr = unsafe {
+            (directory.vtable.build_op)(directory.data, op_bytes.as_ptr(), op_bytes.len(), cb, ctx)
+        };
+        let executor = crate::ffi::executor_capsule::build_persist_executor(rt.clone());
+        // SAFETY: task from build_op; matched executor vtable; single spawn.
+        unsafe { (executor.vtable.spawn)(executor.data, task_ptr) };
+        let bytes = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("op result must arrive");
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (executor.vtable.drop)(executor.data) };
+        serde_json::from_slice(&bytes).expect("deserialize DirectoryOpResult")
+    }
+
+    fn typed(r: DirectoryOpResult, what: &str) -> CapsuleError {
+        match r {
+            DirectoryOpResult::TypedErr(t) => t,
+            other => panic!("{what}: expected TypedErr, got {other:?}"),
+        }
+    }
+
+    fn body(rt: &Arc<tokio::runtime::Runtime>, dir: Arc<dyn FederationDirectory>) {
+        let row = stranger_row();
+        let row_id = RowId::of_statement(&row).expect("a row statement");
+        let directory = build_persist_directory(dir.clone());
+
+        // ── I3602: the wait crosses ──
+        let t = typed(
+            run_op(
+                rt,
+                &directory,
+                &DirectoryOp::PutEdition2Statement {
+                    statement: row.clone(),
+                    offered_row_id: None,
+                },
+            ),
+            "I3602 wait",
+        );
+        assert_eq!(t.kind, "federation_attester_key_unknown", "I3602: {t:?}");
+        assert!(t.wait, "I3602: the wait crosses: {t:?}");
+        assert!(
+            t.message.starts_with("federation_attester_key_unknown: "),
+            "I3602: the edition-2 op keeps its typed reading: {t:?}"
+        );
+        let e = relay_typed_err(DirectoryOpResult::TypedErr(t))
+            .expect_err("I3602: the proxy reads a failure");
+        assert_eq!(e.kind(), "federation_attester_key_unknown", "I3602 proxy");
+        assert!(e.is_wait(), "I3602 proxy: still a wait");
+        assert!(
+            rt.block_on(dir.get_attestation(&row_id.hex()))
+                .expect("I3602: read")
+                .is_none(),
+            "I3602: nothing stored behind a wait"
+        );
+
+        // ── I3602: a terminal refusal stays terminal ──
+        let t = typed(
+            run_op(
+                rt,
+                &directory,
+                &DirectoryOp::PutEdition2Statement {
+                    statement: br#"{"attestation":{}}"#.to_vec(),
+                    offered_row_id: None,
+                },
+            ),
+            "I3602 terminal",
+        );
+        assert_eq!(t.kind, "federation_malformed_row", "I3602: {t:?}");
+        assert!(!t.wait, "I3602: terminal: {t:?}");
+        let e = relay_typed_err(DirectoryOpResult::TypedErr(t)).expect_err("I3602");
+        assert_eq!(e.kind(), "federation_malformed_row", "I3602 proxy");
+        assert!(!e.is_wait(), "I3602 proxy: terminal");
+
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i3602_the_kind_and_the_wait_cross_the_capsule_sqlite() {
+        let rt = runtime();
+        let backend = rt.block_on(async {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .expect("open sqlite");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        });
+        body(&rt, Arc::new(backend));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn i3602_the_kind_and_the_wait_cross_the_capsule_pg() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let rt = runtime();
+        let backend = rt.block_on(async {
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        });
+        body(&rt, Arc::new(backend));
+    }
+
+    /// I3602 — the consumer's rebuild, without a backend: `federation_backend`
+    /// is `Backend` byte for byte; another token keeps its kind and wait
+    /// through the interner (twice: the same `&'static str`); a non-token is
+    /// `federation_backend`.
+    #[test]
+    fn i3602_the_rebuild_keeps_the_backend_arm_and_interns_the_kind() {
+        let host = Error::Backend("insert attestation: UNIQUE constraint failed: x".into());
+        let wire = serde_json::to_vec(&op_err(&host)).expect("serialize");
+        let back: DirectoryOpResult = serde_json::from_slice(&wire).expect("deserialize");
+        match relay_typed_err(back) {
+            Err(Error::Backend(s)) => {
+                assert_eq!(s, host.to_string(), "I3602: the pre-v62 flattening");
+                assert!(
+                    Error::Backend(s).is_duplicate_key(),
+                    "I3602: a duplicate still reads as one"
+                );
+            }
+            other => panic!("I3602: {other:?}"),
+        }
+        let host = Error::link_not_held("family", "insert family: FOREIGN KEY constraint failed");
+        let a = CapsuleError::of(&host).into_error();
+        let b = CapsuleError::of(&host).into_error();
+        assert_eq!(a.kind(), "federation_link_not_held", "I3602");
+        assert!(a.is_wait() && b.is_wait(), "I3602: the wait");
+        assert!(
+            std::ptr::eq(a.kind(), b.kind()),
+            "I3602: one interned token per kind"
+        );
+        assert_eq!(a.to_string(), host.to_string(), "I3602: the host's text");
+        let odd = CapsuleError {
+            kind: "Not A Token!".into(),
+            wait: false,
+            message: "m".into(),
+        }
+        .into_error();
+        assert_eq!(odd.kind(), "federation_backend", "I3602: a non-token");
+        assert!(
+            matches!(odd, Error::Relayed { .. }),
+            "I3602: still relayed, with its text"
+        );
     }
 }

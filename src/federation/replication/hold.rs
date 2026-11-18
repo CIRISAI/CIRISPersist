@@ -319,9 +319,12 @@ where
     // v45.0.1 (CIRISPersist#873, `FSD/OCCURRENCE_PRINCIPAL.md` §3) — EVERY
     // principal, plus the node's own key: a shared device is party to both
     // humans' rooms, and the node's own memberships were always its own.
-    let principals = directory
-        .active_identities_for_occurrence(our_key_id)
-        .await?;
+    // v62.0.0 (v62 P5c) — the principals as `principals_of` reads them: the
+    // identities this node is an active occurrence of AND its OWNER (a node
+    // is never an occurrence of a person, CC rc21 3.3.6; its human is its
+    // owner binding).
+    let principals =
+        crate::federation::self_collective::principals_of(directory, our_key_id).await?;
     let mut out = HashSet::new();
     for c in directory
         .list_communities_for_member_active(our_key_id)
@@ -374,10 +377,8 @@ where
     if members.contains(our_key_id) {
         return Ok(true);
     }
-    for p in directory
-        .active_identities_for_occurrence(our_key_id)
-        .await?
-    {
+    // v62.0.0 (v62 P5c) — the node's owner is a principal too.
+    for p in crate::federation::self_collective::principals_of(directory, our_key_id).await? {
         if members.contains(&p)
             && owner_node_receives(
                 directory,
@@ -452,11 +453,14 @@ where
     // human (or their actor occurrence) is this node's own content when the
     // same human owns this node.
     // v53.0.0 (CIRISPersist#963, CC 3.3.7) — and only when that human's allow
-    // list lets it reach THIS node: `self` follows the node's class (a server
-    // or agent occurrence holds none of its owner's `self` content), a family
-    // row follows the owner's list for that family. The principal must hold a
-    // live occurrence of this node (the claimed-nodes rule); an owner binding
-    // alone makes no device.
+    // list lets it reach THIS node, a family row by the owner's list for that
+    // family. v62.0.0 (v62 P5c; CC rc21 6.1 / 3.3.7) — `self` by ONE rule
+    // (`replication_audience::class_allows`): with a list present only when it
+    // names `"self"`, for every class; with none, the class (personal and an
+    // owned agent yes, server class no). The principal is the node's OWNER
+    // (its owner binding) or, while the earlier form is open, a person it is
+    // an occurrence of. A row this node authored is held whatever the list
+    // says (`is_local_or_family` above).
     if !author_local
         && matches!(
             placement,

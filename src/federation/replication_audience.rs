@@ -25,11 +25,20 @@
 //! | server | `server` \| `embedded` \| `service` \| `agent` | no | no | yes |
 //!
 //! CC 3.3.7: "a server or infrastructure node receives no `self` or `family`
-//! content unless the list names it". A list, when present, is exact for the
-//! group scopes; `self` is never listed and always follows the class. A node
+//! content unless the list names it". A list, when present, is exact: for
+//! the group scopes, and (v62.0.0, CC rc21 3.3.7) for `self` too, which flows
+//! only when the list names the literal `"self"` entry, for every class. A node
 //! with no live occurrence for the owner is not one of the owner's devices and
 //! receives none of the owner's content. The origin and refers-to arms
 //! ([`may_receive`]) hold whatever the list says.
+//!
+//! v62.0.0 (v62 P5c; CC rc21 3.3.6) — a machine key (`node` / `agent`) is
+//! never an occurrence of a person, so a person's node is the person's
+//! device by its OWNER BINDING ([`devices_of`], [`owned_device`]): the
+//! binding says WHO the human is, and the node's own self-occurrence (its
+//! key under its own identity) says WHAT KIND of device it is (absent:
+//! `server`; an agent: `agent`). A held row binding a machine key under a
+//! person is read only while the earlier form is open ([`occurrence_counts`]).
 //!
 //! # Public groups (CIRISEdge#761, CC 5.4.6)
 //!
@@ -54,6 +63,17 @@ pub enum NodeClass {
     /// `server` | `embedded` | `service` | `agent`: by default no `self` or
     /// `family` content.
     Server,
+    /// v62.0.0 (v62 P5c; Eric's ruling via CC) — an `agent` key OWNED by the
+    /// owner in question (its live owner binding). Its own class, never a
+    /// person's device class: it is within its owner's `self` for delivery
+    /// (the owner's `self` content reaches it unless the owner's allow list
+    /// for it excludes it), gets `family` content only when that list names
+    /// the family, and the rooms as any member node does. Never produced from
+    /// a `device_class` token alone ([`Self::of_device_class`] maps `agent` to
+    /// [`Self::Server`]): only ownership makes an agent this class
+    /// ([`agent_class_if_owned`]). Signing is unchanged: the agent signs only
+    /// as itself.
+    OwnedAgent,
 }
 
 impl NodeClass {
@@ -96,8 +116,17 @@ pub fn class_allows(
     cohort: OwnerCohort<'_>,
 ) -> bool {
     match cohort {
-        // `self` is never listed: it follows the class.
-        OwnerCohort::SelfContent => class == NodeClass::Personal,
+        // v62.0.0 (v62 P5c; CC rc21 6.1 / 3.3.7) — ONE rule for every
+        // class: with an allow list present, `self` flows only when the list
+        // names the literal `"self"` entry; with none, the class decides
+        // (personal and an owned agent receive `self`, server class does
+        // not). The two always-served kinds of `self` row (the node authored
+        // it, or it is about the node) are `may_receive`'s origin and
+        // refers-to arms, ahead of this rule.
+        OwnerCohort::SelfContent => match list {
+            Some(l) => l.contains(&CohortEntry::self_entry()),
+            None => matches!(class, NodeClass::Personal | NodeClass::OwnedAgent),
+        },
         OwnerCohort::Group { scope, target } => match list {
             Some(l) => l.contains(&CohortEntry {
                 scope: scope.to_owned(),
@@ -105,17 +134,302 @@ pub fn class_allows(
             }),
             None => match class {
                 NodeClass::Personal => true,
-                NodeClass::Server => scope != cs::FAMILY,
+                // An owned agent: no `family` by default, the rooms as any
+                // member node.
+                NodeClass::Server | NodeClass::OwnedAgent => scope != cs::FAMILY,
             },
         },
     }
 }
 
-/// The class `owner` declared for `node`: the `device_class` of the newest
-/// ACTIVE occurrence binding `(owner, node)` that resolves (the occurrence's
-/// consent or this node's own trust — the #932 rule, through
-/// `active_identities_for_occurrence`). `None` when the node is not one of
-/// the owner's devices.
+/// v62.0.0 (v62 P5c; Eric's ruling via CC) — the class of `occ` as a device
+/// of `owner`: [`NodeClass::of_device_class`], except that an `agent` device
+/// OWNED by `owner` ([`owner_of`](super::admission::owner_of)) is
+/// [`NodeClass::OwnedAgent`]. An agent `owner` does not own stays
+/// [`NodeClass::Server`] (never `self` content).
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn agent_class_if_owned<D>(
+    dir: &D,
+    owner: &str,
+    occ: &super::types::IdentityOccurrence,
+) -> Result<Option<NodeClass>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let base = NodeClass::of_device_class(&occ.device_class);
+    if occ.device_class != device_class::AGENT {
+        return Ok(base);
+    }
+    Ok(
+        match super::admission::owner_of(dir, &occ.occurrence_key_id).await {
+            Ok(Some(o)) if o == owner => Some(NodeClass::OwnedAgent),
+            Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => base,
+            Err(e) => return Err(e),
+        },
+    )
+}
+
+// ── v62.0.0 (v62 P5c): a node's human is its OWNER ───────────────────
+//
+// CC rc21 3.3.6 (way (d) and the door, `occurrence_binds_machine_to_person`):
+// a machine key (`node` / `agent`) is never bound under a person's identity.
+// So a person's NODE is never an occurrence of the person; its human is known
+// only through its owner binding ([`owner_of`](super::admission::owner_of),
+// [`nodes_owned_by`](super::admission::nodes_owned_by)), and an agent's human
+// the same way, through the agent's owner binding. Every "whose device is
+// this" read below takes the owner binding; the earlier path (a node read as
+// an occurrence of its person) is read only while the earlier-form doors are
+// open ([`earlier_form_doors_shut`](super::edition2::door::earlier_form_doors_shut)).
+
+/// Is the earlier path (a machine key read as an occurrence of a person)
+/// still read? Only while the earlier-form doors are open.
+fn reads_machine_occurrences() -> bool {
+    !super::edition2::door::earlier_form_doors_shut()
+}
+
+/// Does `k`'s held record name any of `types`?
+async fn key_has_type<D>(dir: &D, k: &str, types: &[&str]) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(dir.lookup_public_key(k).await?.is_some_and(|r| {
+        types
+            .iter()
+            .any(|t| super::types::identity_type::set_contains(&r.identity_type, t))
+    }))
+}
+
+/// v62.0.0 (v62 P5c; CC rc21 3.3.6) — **does the pair (`identity`, `key`)
+/// bind a machine key under a person?** `key`'s record is `node` / `agent`
+/// and `identity`'s is `user` / `accord_holder`. Such a pair is the
+/// forbidden occurrence (`occurrence_binds_machine_to_person`). The self pair
+/// never is.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn machine_under_person<D>(dir: &D, identity: &str, key: &str) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::types::identity_type as it;
+    if identity == key {
+        return Ok(false);
+    }
+    Ok(key_has_type(dir, key, &[it::NODE, it::AGENT]).await?
+        && key_has_type(dir, identity, &[it::USER, it::ACCORD_HOLDER]).await?)
+}
+
+/// v62.0.0 (v62 P5c) — **does the occurrence (`identity`, `key`) make `key`
+/// one of `identity`'s devices?** Always while the earlier form is open;
+/// once it is shut, never for a machine key under a person
+/// ([`machine_under_person`]): that node's human is its owner.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn occurrence_counts<D>(dir: &D, identity: &str, key: &str) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    if reads_machine_occurrences() {
+        return Ok(true);
+    }
+    Ok(!machine_under_person(dir, identity, key).await?)
+}
+
+/// v62.0.0 (v62 P5c) — `identity`'s ACTIVE occurrences that count
+/// ([`occurrence_counts`]).
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn counted_occurrences<D>(
+    dir: &D,
+    identity: &str,
+) -> Result<Vec<super::types::IdentityOccurrence>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut out = Vec::new();
+    for o in dir.list_identity_occurrences_active(identity).await? {
+        if occurrence_counts(dir, identity, &o.occurrence_key_id).await? {
+            out.push(o);
+        }
+    }
+    Ok(out)
+}
+
+/// The device record of `key` as `owner`'s OWNED device, `owner_of(key)`
+/// already known to be `owner`. Occurrence-shaped so the one audience rule
+/// ([`occurrence_may_hold_key`]) and every key fan-out read it as they read
+/// an occurrence:
+/// - `identity_key_id` = `owner`, `occurrence_key_id` = `key`;
+/// - `device_class` = WHAT KIND of device it is: the `device_class` of the
+///   key's own live, unevicted SELF-occurrence (identity = occurrence = the
+///   key: a machine binding its own key under its own identity, which CC
+///   rc21 allows), else `server` (fail-closed: no `self` or `family` content
+///   unless the allow list names it). An `agent` key is always `agent`,
+///   which, owned, decides as [`NodeClass::OwnedAgent`]
+///   ([`agent_class_if_owned`]);
+/// - `asserted_at` and `persist_row_hash` = the newest in-force owner
+///   binding's instant and row id (provenance only: the binding says only
+///   WHO the human is);
+/// - `valid_until` = the key record's end;
+/// - `encryption_pubkeys` / `transport_binding` = the key's OWN singleton
+///   occurrence's (the node's statement of its own keys), when it holds one;
+///   a device with none is a recipient with no keys (excluded at wrap,
+///   fail-secure, and named).
+async fn owned_device_record<D>(
+    dir: &D,
+    owner: &str,
+    key: &str,
+) -> Result<super::types::IdentityOccurrence, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::types::identity_type as it;
+    let now = crate::host::clock::now();
+    let newest = super::admission::owner_bindings_in_force_at(dir, key, now)
+        .await?
+        .into_iter()
+        .max_by_key(|b| b.asserted_at);
+    let rec = dir.lookup_public_key(key).await?;
+    let is_agent = rec
+        .as_ref()
+        .is_some_and(|r| it::set_contains(&r.identity_type, it::AGENT));
+    // The key's own live, unevicted self-occurrence (the ACTIVE fold:
+    // revocations applied, the #421 re-establishment rule): the device's
+    // statement of what kind it is and of its own keys.
+    let own = dir
+        .list_identity_occurrences_active(key)
+        .await?
+        .into_iter()
+        .filter(|o| o.identity_key_id == key && o.occurrence_key_id == key)
+        .filter(|o| o.valid_until.is_none_or(|vu| vu > now))
+        .max_by_key(|o| o.asserted_at);
+    let stated = own
+        .as_ref()
+        .map(|o| o.device_class.as_str())
+        .filter(|c| NodeClass::of_device_class(c).is_some())
+        .map(str::to_owned);
+    let class = if is_agent {
+        device_class::AGENT.to_owned()
+    } else {
+        stated.unwrap_or_else(|| device_class::SERVER.to_owned())
+    };
+    Ok(super::types::IdentityOccurrence {
+        identity_key_id: owner.to_owned(),
+        occurrence_key_id: key.to_owned(),
+        device_class: class,
+        hardware_attestation: None,
+        asserted_at: newest.as_ref().map_or(now, |b| b.asserted_at),
+        valid_until: rec.and_then(|r| r.valid_until),
+        encryption_pubkeys: own.as_ref().and_then(|o| o.encryption_pubkeys.clone()),
+        transport_binding: own.and_then(|o| o.transport_binding),
+        persist_row_hash: newest.map(|b| b.attestation_id).unwrap_or_default(),
+    })
+}
+
+/// v62.0.0 (v62 P5c) — **`key` as one of `owner`'s owned devices**: `Some`
+/// iff `owner_of(key) == owner` (the live owner binding, the node's
+/// cosignature required; an ambiguous owner is no owner, fail closed), as
+/// the occurrence-shaped record [`devices_of`] returns.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn owned_device<D>(
+    dir: &D,
+    owner: &str,
+    key: &str,
+) -> Result<Option<super::types::IdentityOccurrence>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    if owner == key {
+        return Ok(None);
+    }
+    match super::admission::owner_of(dir, key).await {
+        Ok(Some(o)) if o == owner => {}
+        Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    Ok(Some(owned_device_record(dir, owner, key).await?))
+}
+
+/// v62.0.0 (v62 P5c) — **`owner`'s devices**: the ACTIVE occurrences of
+/// `owner` that count ([`counted_occurrences`]: the person's own device
+/// keys, and, only while the earlier form is open, a machine key bound under
+/// them), then every node or agent `owner` OWNS by a live owner binding
+/// ([`nodes_owned_by`](super::admission::nodes_owned_by)) that is not already
+/// listed, as its [`owned_device`] record. The enumeration every audience
+/// and key fan-out walks in place of the raw occurrence list.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn devices_of<D>(
+    dir: &D,
+    owner: &str,
+) -> Result<Vec<super::types::IdentityOccurrence>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut out = counted_occurrences(dir, owner).await?;
+    let listed: BTreeSet<String> = out.iter().map(|o| o.occurrence_key_id.clone()).collect();
+    for n in super::admission::nodes_owned_by(dir, owner).await? {
+        if n == owner || listed.contains(&n) {
+            continue;
+        }
+        out.push(owned_device_record(dir, owner, &n).await?);
+    }
+    Ok(out)
+}
+
+/// The device record `owner` holds for `node`: the newest ACTIVE occurrence
+/// binding `(owner, node)` that resolves (the occurrence's consent or this
+/// node's own trust, the #932 rule, through `active_identities_for_occurrence`,
+/// which since v62 drops a machine key under a person once the earlier form
+/// is shut); else `node` as `owner`'s owned device ([`owned_device`]). `None`
+/// when the node is not one of the owner's devices.
+async fn device_record_of<D>(
+    dir: &D,
+    owner: &str,
+    node: &str,
+) -> Result<Option<super::types::IdentityOccurrence>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    if owner == node {
+        return Ok(None);
+    }
+    if dir
+        .active_identities_for_occurrence(node)
+        .await?
+        .iter()
+        .any(|p| p == owner)
+    {
+        if let Some(o) = dir
+            .list_identity_occurrences_active(owner)
+            .await?
+            .into_iter()
+            .filter(|o| o.occurrence_key_id == node)
+            .max_by_key(|o| o.asserted_at)
+        {
+            return Ok(Some(o));
+        }
+    }
+    owned_device(dir, owner, node).await
+}
+
+/// The class `owner` declared for `node`: the `device_class` of `owner`'s
+/// device record for it ([`device_record_of`]: the newest resolving active
+/// occurrence, else, v62.0.0, the owner binding's stated class). `None` when
+/// the node is not one of the owner's devices.
 pub async fn owner_node_class<D>(
     dir: &D,
     owner: &str,
@@ -124,24 +438,10 @@ pub async fn owner_node_class<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    if owner == node {
-        return Ok(None);
+    match device_record_of(dir, owner, node).await? {
+        Some(o) => agent_class_if_owned(dir, owner, &o).await,
+        None => Ok(None),
     }
-    if !dir
-        .active_identities_for_occurrence(node)
-        .await?
-        .iter()
-        .any(|p| p == owner)
-    {
-        return Ok(None);
-    }
-    Ok(dir
-        .list_identity_occurrences_active(owner)
-        .await?
-        .into_iter()
-        .filter(|o| o.occurrence_key_id == node)
-        .max_by_key(|o| o.asserted_at)
-        .and_then(|o| NodeClass::of_device_class(&o.device_class)))
 }
 
 /// v53.1.6 — **an owner's allow lists, read ONCE.** The owner's
@@ -241,6 +541,13 @@ pub struct OwnerAudience {
     owner: String,
     lists: OwnerAllowLists,
     occurrences: Vec<super::types::IdentityOccurrence>,
+    /// v62.0.0 (v62 P5c) — the nodes and agents the owner OWNS by a live
+    /// owner binding, as their device records ([`owned_device`]), those
+    /// already in `occurrences` excepted.
+    owned: Vec<super::types::IdentityOccurrence>,
+    /// Every key the owner owns (those also in `occurrences` included): an
+    /// owned `agent` device is [`NodeClass::OwnedAgent`].
+    owned_keys: BTreeSet<String>,
 }
 
 impl OwnerAudience {
@@ -250,10 +557,28 @@ impl OwnerAudience {
         D: FederationDirectory + ?Sized,
     {
         crate::observe::fold(crate::observe::Fold::OwnerAudience, async {
+            let occurrences = counted_occurrences(dir, owner).await?;
+            let listed: BTreeSet<String> = occurrences
+                .iter()
+                .map(|o| o.occurrence_key_id.clone())
+                .collect();
+            let mut owned = Vec::new();
+            let mut owned_keys = BTreeSet::new();
+            for n in super::admission::nodes_owned_by(dir, owner).await? {
+                if n == owner {
+                    continue;
+                }
+                if !listed.contains(&n) {
+                    owned.push(owned_device_record(dir, owner, &n).await?);
+                }
+                owned_keys.insert(n);
+            }
             Ok(Self {
                 owner: owner.to_owned(),
                 lists: OwnerAllowLists::read(dir, owner).await?,
-                occurrences: dir.list_identity_occurrences_active(owner).await?,
+                occurrences,
+                owned,
+                owned_keys,
             })
         })
         .await
@@ -269,19 +594,25 @@ impl OwnerAudience {
     where
         D: FederationDirectory + ?Sized,
     {
-        if self.owner == node
-            || !dir
-                .active_identities_for_occurrence(node)
-                .await?
-                .contains(&self.owner)
-        {
+        if self.owner == node {
             return Ok(false);
         }
-        let Some(occ) = self
-            .occurrences
-            .iter()
-            .filter(|o| o.occurrence_key_id == node)
-            .max_by_key(|o| o.asserted_at)
+        let by_occurrence = if dir
+            .active_identities_for_occurrence(node)
+            .await?
+            .contains(&self.owner)
+        {
+            self.occurrences
+                .iter()
+                .filter(|o| o.occurrence_key_id == node)
+                .max_by_key(|o| o.asserted_at)
+        } else {
+            None
+        };
+        // v62.0.0 (v62 P5c) — else the node is the owner's by its owner
+        // binding.
+        let Some(occ) =
+            by_occurrence.or_else(|| self.owned.iter().find(|o| o.occurrence_key_id == node))
         else {
             return Ok(false);
         };
@@ -298,9 +629,15 @@ impl OwnerAudience {
         if occ.occurrence_key_id == self.owner {
             return true;
         }
-        let Some(class) = NodeClass::of_device_class(&occ.device_class) else {
+        let Some(mut class) = NodeClass::of_device_class(&occ.device_class) else {
             return false;
         };
+        // v62.0.0 (v62 P5c) — an agent this owner owns is its own class.
+        if occ.device_class == device_class::AGENT
+            && self.owned_keys.contains(&occ.occurrence_key_id)
+        {
+            class = NodeClass::OwnedAgent;
+        }
         class_allows(
             class,
             self.lists.list_for(&occ.occurrence_key_id).as_ref(),
@@ -346,24 +683,10 @@ where
     D: FederationDirectory + ?Sized,
 {
     // The occurrence must resolve to the owner (#932: its consent or this
-    // node's own trust); then the newest active row decides, through the
-    // same body the key fan-outs ask.
-    if owner == node
-        || !dir
-            .active_identities_for_occurrence(node)
-            .await?
-            .iter()
-            .any(|p| p == owner)
-    {
-        return Ok(false);
-    }
-    let Some(occ) = dir
-        .list_identity_occurrences_active(owner)
-        .await?
-        .into_iter()
-        .filter(|o| o.occurrence_key_id == node)
-        .max_by_key(|o| o.asserted_at)
-    else {
+    // node's own trust), or (v62.0.0, v62 P5c) the node is the owner's by
+    // its owner binding; then that device record decides, through the same
+    // body the key fan-outs ask.
+    let Some(occ) = device_record_of(dir, owner, node).await? else {
         return Ok(false);
     };
     occurrence_may_hold_key(dir, owner, &occ, cohort).await
@@ -389,7 +712,8 @@ where
     if occ.occurrence_key_id == member {
         return Ok(true);
     }
-    let Some(class) = NodeClass::of_device_class(&occ.device_class) else {
+    // v62.0.0 (v62 P5c) — an agent `member` owns is its own class.
+    let Some(class) = agent_class_if_owned(dir, member, occ).await? else {
         return Ok(false);
     };
     let list = owner_allow_list(dir, member, &occ.occurrence_key_id).await?;
@@ -421,7 +745,8 @@ where
 }
 
 /// The nodes of `owner` that `cohort` reaches: the owner's ACTIVE occurrences
-/// that resolve to the owner (#932) and pass [`owner_node_receives`]. Sorted.
+/// that resolve to the owner (#932) and, v62.0.0, the nodes it owns by a live
+/// owner binding, that pass [`owner_node_receives`]. Sorted.
 pub async fn owner_nodes_receiving<D>(
     dir: &D,
     owner: &str,
@@ -434,7 +759,9 @@ where
     // node, where each node used to re-read both.
     let audience = OwnerAudience::read(dir, owner).await?;
     let mut nodes: BTreeSet<String> = BTreeSet::new();
-    for o in &audience.occurrences {
+    // v62.0.0 (v62 P5c) — the owner's counted occurrences AND the nodes it
+    // owns by a live owner binding.
+    for o in audience.occurrences.iter().chain(audience.owned.iter()) {
         if o.occurrence_key_id != owner {
             nodes.insert(o.occurrence_key_id.clone());
         }

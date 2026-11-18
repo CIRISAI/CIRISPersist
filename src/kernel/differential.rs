@@ -12,8 +12,12 @@
 //! | [`Class::Custom`] | CC 4.4.3.6's protocol table has six arms, no `custom:` | `consensus::evaluate` |
 //! | [`Class::WeightedWhole`] | CC 3.3.4 "Each weight and the threshold is a whole number" | `consensus::evaluate` |
 //! | [`Class::NodeCosign`] | CC 3.2 *The first binding (MUST)*: counts "only when the node's own key cosigned it" | `owner_of` |
-//! | [`Class::ForkAsTip`] | CC 2.7.8 "Two versions of one head wait as tips" | `held_head_verdict` |
-//! | [`Class::CycleVisitedOnce`] | CC 4.4.3.34 / KERNEL.md 5: the walk visits a cycle once; nothing is refused for closing one | the delegation cycle gate |
+//! | [`Class::ForkAsTip`] | CC 2.7.8 "Two versions of one head wait as tips" | `held_head_verdict` (switched in kernel pass 2: persist's side is its former refusal, the reference) |
+//! | [`Class::KeyEndHalfOpen`] | CC 2.6.2's freshness row: "the attestation has not yet reached its `valid_until`" | `HeldKeys::liveness` (kernel pass 2) |
+//!
+//! v62.0.0 (kernel pass 2): `CycleVisitedOnce` (the delegation cycle gate,
+//! CC 4.4.3.34) is no longer a class: the gate is deleted, so there is no
+//! persist answer left to disagree with the kernel's walk.
 //!
 //! **Counting.** With `CIRIS_KERNEL_DIFF_LOG=<file>` set, each call appends
 //! one tab-separated line `function  class  key  persist  kernel  test` (the key
@@ -38,8 +42,10 @@ pub enum Class {
     NodeCosign,
     /// A version that does not name the held head is held as a tip.
     ForkAsTip,
-    /// A cycle-closing delegation is not refused.
-    CycleVisitedOnce,
+    /// v62.0.0 (kernel pass 2, K1) — at exactly a record's `valid_until`
+    /// the record has ended (the kernel's `[from, until)`); persist's
+    /// former reading covered it.
+    KeyEndHalfOpen,
     /// None of the above: a disagreement no CC sentence explains.
     Unexplained,
 }
@@ -53,7 +59,7 @@ impl Class {
             Class::WeightedWhole => "weighted_whole",
             Class::NodeCosign => "node_cosign",
             Class::ForkAsTip => "fork_as_tip",
-            Class::CycleVisitedOnce => "cycle_visited_once",
+            Class::KeyEndHalfOpen => "key_end_half_open",
             Class::Unexplained => "UNEXPLAINED",
         }
     }
@@ -213,26 +219,6 @@ pub fn trust_edge(user: &str, root: &str, persist: bool, kernel: bool, rows: usi
     );
 }
 
-/// The delegation cycle gate: persist refused (`Some(hops)`) or admitted.
-pub fn cycle_gate(row: &crate::federation::types::Attestation, persist_refused: Option<usize>) {
-    let class = if persist_refused.is_some() {
-        Class::CycleVisitedOnce
-    } else {
-        Class::Agree
-    };
-    record(
-        "check_delegation_cycle_admission",
-        class,
-        &key_of(&[
-            &row.attesting_key_id,
-            &row.attested_key_id,
-            &row.attestation_id,
-        ]),
-        &format!("{persist_refused:?}"),
-        "admit",
-    );
-}
-
 /// `held_head_verdict`: persist's verdict against the kernel's head reading.
 pub fn held_head(
     group: &str,
@@ -273,5 +259,28 @@ pub fn held_head(
         ]),
         &persist_ok.to_string(),
         &format!("{reading:?}"),
+    );
+}
+
+/// v62.0.0 (kernel pass 2, K1) — `HeldKeys::liveness`: persist's former
+/// coverage reading (inclusive of `valid_until`) against the kernel's
+/// key-end conclusion, after the revocations (which are persist's, and
+/// read before either). `at_an_end`: some valid record states exactly `at`
+/// as its `valid_until`.
+pub fn key_end(key: &str, at: u64, persist_covers: bool, kernel_live: bool, at_an_end: bool) {
+    let class = if persist_covers == kernel_live {
+        Class::Agree
+    } else if persist_covers && !kernel_live && at_an_end {
+        Class::KeyEndHalfOpen
+    } else {
+        Class::Unexplained
+    };
+    let at_s = at.to_string();
+    record(
+        "HeldKeys::liveness",
+        class,
+        &key_of(&[key, &at_s]),
+        &persist_covers.to_string(),
+        &kernel_live.to_string(),
     );
 }

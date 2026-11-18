@@ -319,6 +319,7 @@ mod tests {
             events: vec![BatchEvent::CompleteTrace {
                 trace,
                 trace_level: TraceLevel::Detailed,
+                statement: None,
             }],
             batch_timestamp: chrono::Utc::now(),
             consent_timestamp: chrono::Utc::now(),

@@ -159,10 +159,34 @@ pub async fn build_caller_admission_from_directory(
     // occurrence key is not bound as an occurrence of any identity, OR
     // (Ask 6) when the binding has an effective revocation: the caller
     // IS its own identity, with no inherited family/community admission.
-    let identity_key_id = match directory
+    // v62.0.0 (v62 P5c; CC rc21 3.3.6) — a held row binding a machine key
+    // under a person counts for nothing once the earlier form is shut, and a
+    // node or agent with no counted occurrence reads as its OWNER (its human
+    // is known only through its owner binding).
+    let counted = match directory
         .lookup_identity_for_occurrence(occurrence_key_id)
         .await?
     {
+        Some(o)
+            if crate::federation::replication_audience::occurrence_counts(
+                directory,
+                &o.identity_key_id,
+                occurrence_key_id,
+            )
+            .await? =>
+        {
+            Some(o)
+        }
+        _ => None,
+    };
+    let identity_key_id = match counted {
+        None => match crate::federation::admission::owner_of(directory, occurrence_key_id).await {
+            Ok(Some(owner)) => owner,
+            Ok(None) | Err(crate::federation::Error::AmbiguousNodeOwner { .. }) => {
+                occurrence_key_id.clone()
+            }
+            Err(e) => return Err(e),
+        },
         Some(occurrence) => {
             // v16.0.0 (#421): THE fold comparator — a re-established
             // occurrence (asserted after its revocation) regains identity
@@ -178,7 +202,6 @@ pub async fn build_caller_admission_from_directory(
                 occurrence.identity_key_id
             }
         }
-        None => occurrence_key_id.clone(),
     };
 
     // Step 2 — identity → ACTIVE families. Members are identity keys; the

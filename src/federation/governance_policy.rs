@@ -151,6 +151,21 @@ pub struct PolicyRow {
     pub reverse_path: bool,
     /// `community`, `self`, `role`, `halt`, `cosign`.
     pub corridor: String,
+    /// v62.0.0 (CC rc20) — the row's `counted` cells (`count_set`, `voice`,
+    /// `counted_at`, `voices`, `target_silent`, `changes_set`,
+    /// `target_voice`), each `{value, cc_ref?}`. Absent before rc20 (null).
+    #[serde(default)]
+    pub counted: serde_json::Value,
+}
+
+impl PolicyRow {
+    /// v62.0.0 (CC rc20, 4.5.13) — the row's `target_voice` cell is `yes`:
+    /// the target's own row naming the act is one of the voices counted,
+    /// though the target is not in the count set (`community_invite`).
+    #[must_use]
+    pub fn target_voice(&self) -> bool {
+        self.counted["target_voice"]["value"] == "yes"
+    }
 }
 
 /// The vendored table (CC 4.5.13).
@@ -481,6 +496,16 @@ mod tests {
     /// A mutation of one table row.
     type Mutate = dyn Fn(&mut serde_json::Value);
 
+    /// v62.0.0 (CC rc20) — `community_remove` became a `cosigned` row (its
+    /// enact is the room's `protocol`), so the table carries no forward-only
+    /// two-path row any more. The forward-only corridor probes read it back as
+    /// the rc18 row it was (two-path, enact 2/3, no cancel, no floor), so the
+    /// forward-only corridor arm stays witnessed.
+    fn as_forward_only_two_path(r: &mut serde_json::Value) {
+        r["kind"] = "two_path".into();
+        r["enact"] = serde_json::json!({"num": 2, "den": 3});
+    }
+
     fn reason(e: Error) -> &'static str {
         match e {
             Error::GovernancePolicyRefused { reason, .. } => reason,
@@ -544,22 +569,31 @@ mod tests {
                 "default_standing",
                 "default_irreversible",
                 "community_invite",
-                "community_remove",
                 "self_roster_add",
                 "self_roster_evict"
             ]
         );
+        // v62.0.0 (CC rc20 re-vendor): `community_remove` is a `cosigned` row
+        // now (its count is the group's consensus_protocol), and rc20 adds six
+        // more rows, none two-path. In table order.
         assert_eq!(
             other,
             [
+                "community_remove",
                 "moderation_action",
+                "moderation_overturn",
+                "moderator_recall",
                 "accord_halt",
                 "custodian_replace",
                 "affiliation_member_action",
                 // rc18 (CIRISPersist#1252 re-vendor): a `ranked` row persist
                 // has no door for (the `ballot:moderator` families are
                 // registered and not gated); read as not two-path.
-                "moderator_election"
+                "moderator_election",
+                "cosigned_act",
+                "accord_majority",
+                "poll",
+                "wa_adjudication"
             ]
         );
         // A door may decide only a standing-base row: the community rows'
@@ -670,12 +704,18 @@ mod tests {
             ),
             (
                 "community_remove",
-                &|r| r["enact"] = serde_json::json!({"num": 1, "den": 7}),
+                &|r| {
+                    as_forward_only_two_path(r);
+                    r["enact"] = serde_json::json!({"num": 1, "den": 7});
+                },
                 CorridorRefusal::EnactBySingleVoter,
             ),
             (
                 "community_remove",
-                &|r| r["enact"] = serde_json::json!({"num": 1, "den": 3}),
+                &|r| {
+                    as_forward_only_two_path(r);
+                    r["enact"] = serde_json::json!({"num": 1, "den": 3});
+                },
                 CorridorRefusal::EnactBelowStrictMajority,
             ),
         ];
@@ -688,6 +728,7 @@ mod tests {
         // A forward-only row enacting on exactly half (strictly more than
         // 1/2) is at the strict-majority floor, inside.
         let t = with_row("community_remove", |r| {
+            as_forward_only_two_path(r);
             r["enact"] = serde_json::json!({"num": 1, "den": 2});
         });
         let row = t.row("community_remove").unwrap();
@@ -695,6 +736,7 @@ mod tests {
         assert_eq!(t.check_corridor(row, &p).unwrap(), Ok(()));
         // The forward-only row's window floor is checked too.
         let t = with_row("community_remove", |r| {
+            as_forward_only_two_path(r);
             r["window_class"] = "content_24h".into();
             r["window_secs"] = 86_400.into();
         });
@@ -706,6 +748,7 @@ mod tests {
             "a content-class row's floor is 24 h"
         );
         let t = with_row("community_remove", |r| {
+            as_forward_only_two_path(r);
             r["window_class"] = "ruled_24h".into();
             r["window_secs"] = 86_400.into();
         });

@@ -25,51 +25,35 @@
 //! anyway; the custody proof is the separate #268 CEG artifact). See
 //! `SqliteBackend::seed_genesis_accord_holders` / the Postgres twin.
 
-/// v59.0.0 (CIRISPersist#1106) — the AMEND ceremony: a pinned bundle plus the
-/// serve nodes' transport rows, authorized by the charter's quorum.
-pub mod amend;
 pub mod bundle;
-/// v53.0.0 (CIRISPersist#973, CC rc7) — the genesis ceremony assembler.
-pub mod ceremony;
-/// CIRISPersist#973 — verify a ceremony's two outputs before they are baked.
-pub mod ceremony_verify;
-/// v60.0.0 (CIRISPersist#1002) — the per-backend scratch a genesis replay runs on.
-pub mod scratch;
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-mod scratch_invariants;
-pub use ceremony_verify::verify_ceremony_outputs;
-pub use ceremony_verify::{
-    CeremonyOutputsRefusal, CeremonyOutputsRefused, CeremonyOutputsVerified,
-};
+// v62.0.0 (json-cut, slice C5): the bundle/1 ceremony assembler (`ceremony`),
+// its outputs verifier (`ceremony_verify`), the amend (`amend`), the
+// per-backend replay scratch (`scratch`) and the software ceremony minter
+// (`test_ceremony`) are deleted. A genesis bundle is a `ceg-genesis-bundle/2`
+// statement set read by Verify (`edition2::genesis`).
 /// v47.4.0 (CIRISPersist#805) — the `CIRIS_TEST_TRUST_ROOT*` block minter.
 #[cfg(feature = "test-anchor")]
 pub mod test_anchor_block;
-/// CIRISPersist#973 — the software ceremony minter (dry run).
-#[cfg(feature = "test-anchor")]
-pub mod test_ceremony;
+// TODO(json-cut C5): remove after E flip — the bundle/1 type and its reader
+// stay only while the boot seed and the test call sites read the baked seed.
 pub use bundle::{
-    bake_assembled_genesis, check_serve_transport_destinations, parse_genesis_bundle,
-    verify_bundle_quorum, BakeItemOutcome, GenesisAuthorization, GenesisBakeReport, GenesisBundle,
-    GenesisRosterRecord, GENESIS_BUNDLE_VERSION, SERVE_TRANSPORT_DESTINATIONS_VERSION,
-    SERVE_TRANSPORT_DESTINATION_INVALID,
+    check_serve_transport_destinations, parse_genesis_bundle, verify_bundle_quorum,
+    GenesisAuthorization, GenesisBundle, GenesisRosterRecord, GENESIS_BUNDLE_VERSION,
+    SERVE_TRANSPORT_DESTINATIONS_VERSION, SERVE_TRANSPORT_DESTINATION_INVALID,
 };
 #[cfg(feature = "test-anchor")]
 pub use test_anchor_block::*;
-#[cfg(feature = "test-anchor")]
-pub use test_ceremony::*;
 
 pub mod posture;
-/// v53.1.0 — a bundle's roster records, one function for the boot seed and
-/// the import door.
+/// v53.1.0 — a bundle's roster records (the boot seed's accord-head rule; the
+/// bundle/1 import door is deleted in v62.0.0).
 pub mod roster_install;
 pub use posture::{
     constitutional_seat, genesis_posture, require_constitutional_root, AbsentReason,
     BakeNotAdoptedReason, GenesisFault, GenesisLeg, GenesisPosture, ROOT_REQUIRING_GATES,
 };
-pub use roster_install::install_genesis_bundle_roster;
 pub use roster_install::{
-    bundle_accord_genesis, install_accord_genesis_head, install_bundle_roster_records,
-    RosterInstall, RosterRecordOutcome, RosterRecordReport, RosterSource,
+    bundle_accord_genesis, install_accord_genesis_head, RosterRecordOutcome, RosterSource,
 };
 
 use super::SignedKeyRecord;
@@ -710,66 +694,12 @@ where
 /// [`verify_bundle_quorum`] re-derives authority from persist's own state
 /// regardless.
 ///
-/// Unlike the placeholder, this artifact IS bakeable via
-/// [`bake_assembled_genesis`]: it carries the authorizations the quorum gate
-/// requires.
-const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
-
-/// CIRISPersist#973 — the software ceremony this process boots against, when
-/// one is installed. Test-anchor only.
-#[cfg(feature = "test-anchor")]
-type InstalledTestCeremony = &'static GenesisBundle;
-
-#[cfg(feature = "test-anchor")]
-static TEST_CEREMONY: std::sync::RwLock<Option<InstalledTestCeremony>> =
-    std::sync::RwLock::new(None);
-
-/// CIRISPersist#973 — **install a software ceremony's outputs for this
-/// process**: from now on, while the test anchor is live, every reader of the
-/// compiled bundle reads this one instead (v53.0.0: the community birth is a
-/// member of the bundle, CC rc7), and the boot seed
-/// runs its full leg order against them (it otherwise skips everything past
-/// the family under a test anchor). The dry run of a re-mint: mint (or have
-/// the host's ceremony routes produce) the bundle, install it, boot.
+/// Unlike the placeholder, this artifact carries the authorizations the quorum
+/// gate requires (the bundle/1 bake door that installed such an artifact on a
+/// live node, `bake_assembled_genesis`, is deleted in v62.0.0).
 ///
-/// A second call replaces the first (a re-mint). The values are leaked: this
-/// is a per-process test fixture, never a production path — the whole seam is
-/// compiled out without the `test-anchor` feature, and inert unless the
-/// runtime test-anchor override is armed.
-#[cfg(feature = "test-anchor")]
-pub fn install_test_ceremony_outputs(bundle: GenesisBundle) {
-    let bundle: &'static GenesisBundle = Box::leak(Box::new(bundle));
-    *TEST_CEREMONY.write().expect("test ceremony lock") = Some(bundle);
-}
-
-/// CIRISPersist#973 — remove an installed software ceremony.
-#[cfg(feature = "test-anchor")]
-pub fn clear_test_ceremony_outputs() {
-    *TEST_CEREMONY.write().expect("test ceremony lock") = None;
-}
-
-/// The installed software ceremony, honoured ONLY while the test-anchor
-/// override is live.
-#[cfg(feature = "test-anchor")]
-fn installed_test_ceremony() -> Option<InstalledTestCeremony> {
-    if !test_anchor_override_active() {
-        return None;
-    }
-    *TEST_CEREMONY.read().expect("test ceremony lock")
-}
-
-/// CIRISPersist#973 — is a software ceremony installed and honoured? Const
-/// `false` on a production build.
-pub(crate) fn test_ceremony_installed() -> bool {
-    #[cfg(feature = "test-anchor")]
-    {
-        installed_test_ceremony().is_some()
-    }
-    #[cfg(not(feature = "test-anchor"))]
-    {
-        false
-    }
-}
+/// TODO(json-cut C5): remove after E flip, with the seed it backs.
+const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
 
 /// Parse-once accessor for the baked canonical genesis **bundle**
 /// (v23.0.0, CIRISPersist#551 item 1 — replaces `canonical_genesis_records`;
@@ -780,15 +710,11 @@ pub(crate) fn test_ceremony_installed() -> bool {
 ///
 /// Panics if the embedded JSON is not a valid bundle (build-time-checked
 /// constant; caught by [`tests::canonical_seed_is_a_bundle_and_is_2of3_accord_conferred`]).
+// TODO(json-cut C5): remove after E flip (C2's fixture_genesis replaces it).
 pub fn canonical_genesis_bundle() -> &'static GenesisBundle {
     use std::sync::OnceLock;
-    // #973 — under a live test anchor with a software ceremony installed, the
-    // ceremony's bundle stands in for the compiled one. Compiled out of a
-    // production build.
-    #[cfg(feature = "test-anchor")]
-    if let Some(bundle) = installed_test_ceremony() {
-        return bundle;
-    }
+    // v62.0.0 (json-cut C5): the #973 software-ceremony seam (a test-anchor
+    // process booting against an installed bundle/1) is deleted.
     static PARSED: OnceLock<GenesisBundle> = OnceLock::new();
     PARSED.get_or_init(|| {
         parse_genesis_bundle(CANONICAL_SEED_JSON)
@@ -959,7 +885,7 @@ pub fn check_genesis_rebake_purge_admission_under(
 /// The family reservation could be ABSOLUTE at the peer door because the
 /// ceremony writes families through a different method
 /// ([`put_family_local`](super::FederationDirectory::put_family_local)). The
-/// delegation plane has no second door: [`bake_assembled_genesis`], the host's
+/// delegation plane has no second door: the bundle/1 bake (deleted in v62.0.0), the host's
 /// stage-1 boot write, and a peer's replication all arrive at
 /// `put_attestation`. So the reservation names an AUTHOR instead:
 ///
@@ -1077,6 +1003,7 @@ pub fn check_genesis_attestation_reserved(row: &super::Attestation) -> Result<()
 /// present is a `put_public_key` no-op; a `key_id` collision with different
 /// content surfaces as an `Err` (never a silent overwrite — the same
 /// trust-root-takeover invariant as the family bake).
+// TODO(json-cut C5): remove after E flip (the baked bundle/1 seed).
 pub async fn seed_canonical_servers<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
@@ -1088,9 +1015,10 @@ where
         //  - absent (a FRESH node) → `put_public_key`: insert through the m-of-n
         //    canonical gate (holders are seeded first, so the scrubs verify).
         //  - present + SELF-SIGNED (the canonical node holds its OWN minted
-        //    `node` row, #394) → `adopt_scrub_upgrade`: upgrade it to the baked
-        //    scrubbed canonical. NO `owner_of` gate (a fresh canonical has no
-        //    owner graph), which the replicated-apply Upgrade path would impose.
+        //    `node` row, #394) → `apply_replicated_key_record`'s Upgrade arm.
+        //    v62.0.0 (json-cut C5): the `adopt_scrub_upgrade` door that took
+        //    this case without the `owner_of` gate is deleted; a refusal by
+        //    that gate is a logged skip below, never a boot abort.
         //  - present + ALREADY ANCHOR-SCRUBBED but DIFFERENT (#410 — an upgraded
         //    fleet node holds a PRIOR baked canonical, e.g. the :4243 record
         //    before the :4242 re-bake) → route through `apply_replicated_key_record`
@@ -1106,9 +1034,6 @@ where
             .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup canonical {kid}: {e}")))?;
         let res: Result<(), crate::federation::Error> = match existing {
             None => dir.put_public_key(sr.clone()).await,
-            Some(row) if row.scrub_key_id == row.key_id => {
-                dir.adopt_scrub_upgrade(sr.clone()).await.map(|_| ())
-            }
             Some(_) => {
                 use crate::federation::register::ReplicatedKeyOutcome as O;
                 match dir.apply_replicated_key_record(sr.clone()).await {
@@ -2484,158 +2409,6 @@ pub(crate) async fn assert_below_quorum_row_cannot_confer(
     );
 }
 
-/// v31.1.0 (CIRISPersist#665 review) — **RE-RUNNING THE SAVED CEREMONY MUST
-/// REPAIR THE NODE'S OWN CEREMONY ROW.**
-///
-/// Equal `asserted_at` was one undifferentiated case and it is two. A row whose
-/// signed envelope is byte-identical to the bundle's, with only UNSIGNED
-/// material altered, failed whole-row equality and then failed the strict
-/// recency test — the envelope-bound instants are identical — and fell into the
-/// bake's anti-rollback refusal.
-///
-/// So the operator's saved artifact could not repair the node's own ceremony
-/// row. When that ceremony is newer than the compiled-in artifact the boot seed
-/// cannot help either, and posture rejects the damaged row, leaving another full
-/// ceremony as the only recovery — on the exact path an operator reaches for
-/// during an incident.
-///
-/// There is no rollback risk in the case at all: the signed bytes are identical,
-/// so restoring the unsigned material to what the ceremony stated is not a
-/// supersession.
-///
-/// # The assertion is that the repair HAPPENED
-///
-/// A witness that only asserted "the bake returned `Ok`" would pass with the
-/// repair silently skipped — `AlreadyPresent` and `Skipped` are both non-error
-/// outcomes, and both are reachable by other routes. So this asserts the
-/// outcome is a re-anchor AND that the co-signature set is actually back.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-#[cfg(feature = "sqlite")]
-pub(crate) async fn assert_saved_ceremony_repairs_its_own_row(
-    dir: &dyn super::FederationDirectory,
-    tag: &str,
-) {
-    let id = &canonical_genesis_bundle().attestations[0]
-        .attestation
-        .attestation_id;
-    let damaged = dir
-        .get_attestation(id)
-        .await
-        .expect("read back")
-        .unwrap_or_else(|| panic!("[{tag}] the damaged row must be installed"));
-    assert!(
-        damaged.additional_scrubs.is_empty(),
-        "[{tag}] the fixture must have thinned the co-signature set"
-    );
-
-    let report = bundle::bake_assembled_genesis(dir, CANONICAL_SEED_JSON)
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "[{tag}] re-running the SAVED ceremony bundle must repair its own row, not be \
-                 refused as a rollback — this is the operator's incident path: {e}"
-            )
-        });
-
-    let outcome = report
-        .attestations
-        .iter()
-        .find(|(rid, _)| rid == id)
-        .map(|(_, o)| o.clone())
-        .unwrap_or_else(|| panic!("[{tag}] the report must mention {id}"));
-    assert_eq!(
-        outcome,
-        bundle::BakeItemOutcome::ReAnchored,
-        "[{tag}] and the repair must actually have been PERFORMED — `AlreadyPresent` or \
-         `Skipped` here would be the repair silently not happening while the bake still \
-         returned Ok"
-    );
-
-    let repaired = dir
-        .get_attestation(id)
-        .await
-        .expect("read back")
-        .unwrap_or_else(|| panic!("[{tag}] {id} vanished across the repair"));
-    assert_eq!(
-        repaired.additional_scrubs,
-        canonical_genesis_bundle().attestations[0]
-            .attestation
-            .additional_scrubs,
-        "[{tag}] the ceremony's own co-signature set is restored"
-    );
-    verify_delegation_plane_seeded(dir)
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] and the plane can confer again: {e}"));
-}
-
-/// v31.1.0 (CIRISPersist#665 review) — **A LOST BAKE RACE MUST NOT BE REPORTED
-/// AS SUCCESS.**
-///
-/// `bake_assembled_genesis`'s insert branch mapped a duplicate-key error to
-/// `AlreadyPresent` on the strength of the collision alone. A duplicate proves
-/// somebody won the race; it does not prove the winner wrote THIS bundle's row.
-/// So two concurrent bakes carrying different content both returned success
-/// while the corpus held one of them — and since each id races independently,
-/// possibly a mix of the two ceremonies. There is no final plane verification in
-/// the bake to catch it.
-///
-/// The window is reproduced the way the others in this file are — as data, not
-/// as timing. The caller has already installed the WINNER's row (the current
-/// baked artifact) under the id; the bake is then handed a bundle whose row for
-/// that id is different, and its `get_attestation` → `put_attestation` sequence
-/// collides for real, against the real backend.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-#[cfg(feature = "sqlite")]
-pub(crate) async fn assert_lost_bake_race_is_not_reported_as_success(
-    dir: &dyn super::FederationDirectory,
-    tag: &str,
-) {
-    let baked = &canonical_genesis_bundle().attestations[0];
-    let id = &baked.attestation.attestation_id;
-
-    // The loser's classification: this bundle's row is NOT what is installed.
-    let installed = dir
-        .get_attestation(id)
-        .await
-        .expect("read back")
-        .unwrap_or_else(|| panic!("[{tag}] the winner's row must be installed"));
-    let loser = super::SignedAttestation {
-        attestation: prior_ceremony_row(id),
-    };
-    assert_ne!(
-        installed.original_content_hash, loser.attestation.original_content_hash,
-        "[{tag}] the fixture must have the winner holding DIFFERENT content"
-    );
-
-    let outcome = bundle::classify_after_duplicate(dir, &loser)
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] classifying a lost race must not fault: {e}"));
-    match outcome {
-        bundle::BakeItemOutcome::Skipped(why) => {
-            assert!(
-                why.contains("DIFFERENT content"),
-                "[{tag}] and the report names what actually happened: {why}"
-            );
-        }
-        other => panic!(
-            "[{tag}] losing a race to a DIFFERENT ceremony must never report success — a bake \
-             that says `AlreadyPresent` here is claiming a ceremony the corpus does not hold: \
-             {other:?}"
-        ),
-    }
-
-    // And the converse: when the winner wrote exactly this bundle's row, the
-    // duplicate IS an honest `AlreadyPresent`.
-    let same = bundle::classify_after_duplicate(dir, baked)
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] {e}"));
-    assert_eq!(
-        same,
-        bundle::BakeItemOutcome::AlreadyPresent,
-        "[{tag}] a race lost to somebody writing the SAME row is genuinely already present"
-    );
-}
-
 /// v31.1.0 (CIRISPersist#665 review) — **A REFUSED REPLACEMENT MUST NOT DELETE
 /// THE ROW IT WAS REPLACING.**
 ///
@@ -2920,87 +2693,6 @@ pub(crate) async fn assert_stale_initializer_cannot_delete_the_winner(
     verify_delegation_plane_seeded(dir)
         .await
         .unwrap_or_else(|e| panic!("[{tag}] and the plane still verifies: {e}"));
-}
-
-/// v31.1.0 (CIRISPersist#665 review) — **THE SUCCESSOR WITNESS: an authenticated
-/// re-ceremony supersedes the boot-seeded plane, and a rollback bundle does
-/// not.**
-///
-/// Both halves of the second review P1, through the real
-/// [`bake_assembled_genesis`](bundle::bake_assembled_genesis) with two REAL
-/// artifacts — no synthesized bundle, because a fabricated one would prove a
-/// property of the fabrication and the whole question here is whether real
-/// quorum-verified ceremony bytes can land.
-///
-/// The caller arrives with a plane holding the PREVIOUS ceremony's rows.
-///
-/// Before this cut the bake's delegation loop was a bare `put_attestation`, and
-/// #665 gave the boot seed the same three ids — so on any node that had ever
-/// booted, every re-ceremony collided on all three, reported `Skipped`, and
-/// returned a partially applied bake while retaining the old plane. The
-/// documented candidate re-mint path was unusable on every node in the fleet.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-pub(crate) async fn assert_ceremony_supersedes_boot_seeded_plane(
-    dir: &dyn super::FederationDirectory,
-    tag: &str,
-) {
-    // The v31 bundle offered as a CEREMONY over the v30 plane — the upgrade a
-    // real re-mint performs.
-    let report = bundle::bake_assembled_genesis(dir, CANONICAL_SEED_JSON)
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] a quorum-verified re-ceremony must land: {e}"));
-    for (id, outcome) in &report.attestations {
-        assert!(
-            matches!(
-                outcome,
-                bundle::BakeItemOutcome::ReAnchored
-                    | bundle::BakeItemOutcome::Anchored
-                    | bundle::BakeItemOutcome::AlreadyPresent
-            ),
-            "[{tag}] the ceremony must APPLY to {id}, not report it skipped: {outcome:?}. A bake \
-             that returns success while retaining the old delegation plane is the finding"
-        );
-    }
-    for sa in &canonical_genesis_bundle().attestations {
-        let id = &sa.attestation.attestation_id;
-        let row = dir
-            .get_attestation(id)
-            .await
-            .expect("read back")
-            .unwrap_or_else(|| panic!("[{tag}] {id} missing after the ceremony"));
-        assert_eq!(
-            row.original_content_hash, sa.attestation.original_content_hash,
-            "[{tag}] {id} must carry the CEREMONY's content, not the superseded plane's"
-        );
-    }
-    verify_delegation_plane_seeded(dir)
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] and the plane verifies after the ceremony: {e}"));
-
-    // The bake is IDEMPOTENT on a plane it has already applied — the second run
-    // must not re-anchor, or a re-ceremony would delete and re-install the
-    // constitutional root every time it ran.
-    let again = bundle::bake_assembled_genesis(dir, CANONICAL_SEED_JSON)
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] a repeated ceremony must be a no-op: {e}"));
-    for (id, outcome) in &again.attestations {
-        assert_eq!(
-            *outcome,
-            bundle::BakeItemOutcome::AlreadyPresent,
-            "[{tag}] {id} is already the ceremony's own row on the second pass"
-        );
-    }
-
-    // NOTE — the delegation loop's ANTI-ROLLBACK half is deliberately NOT
-    // witnessed through `bake_assembled_genesis` here. Offering the v30 bundle
-    // over a current plane is refused by the SERVE-NODE loop's `valid_from`
-    // check before the delegation loop is ever reached, so an assertion here
-    // would pass while testing the wrong loop — and the only way to reach the
-    // delegation loop with an older attestation is a bundle assembled to do it,
-    // which is a fabricated artifact proving a property of the fabrication.
-    // Delegation anti-rollback is witnessed where it can be witnessed honestly:
-    // on the predicate (`candidate_is_strictly_newer`) and on the boot path
-    // (`LeftAsNewerCeremony`), both in `assert_refused_replacement_classes`.
 }
 
 /// v31.1.0 (CIRISPersist#665 review) — **THE DAMAGE WITNESS: a stored genesis
@@ -3289,7 +2981,7 @@ where
     // code on a prod build (the fence compiles the branch out).
     // #973 — unless a software ceremony is installed: then every leg below
     // runs against ITS bundle and community, which the test roster signed.
-    if test_anchor_override_active() && !test_ceremony_installed() {
+    if test_anchor_override_active() {
         tracing::warn!(
             "CIRIS_TESTING_MODE: test trust root active — skipping the baked \
              2-of-3 canonical genesis seed (the harness mints its own canonical \
@@ -3735,8 +3427,8 @@ where
 ///
 /// Two doors write this plane: the BOOT SEED, which installs the compiled-in
 /// baked bundle, and
-/// [`bake_assembled_genesis`](super::genesis::bundle::bake_assembled_genesis),
-/// which installs a quorum-verified ceremony bundle. Until the #665 review they
+/// `bake_assembled_genesis` (deleted in v62.0.0, json-cut C5), which installed
+/// a quorum-verified ceremony bundle. Until the #665 review they
 /// did not know the other existed, and every P1 raised against this file was
 /// that gap seen from a different side. The closed set, so the next person to
 /// touch either door has it at the definition site:
@@ -4245,8 +3937,7 @@ where
 ///
 /// Both doors onto this plane ask it, and neither may write an older statement
 /// over a newer one. It is the same discipline the SERVE-NODE half of
-/// [`bake_assembled_genesis`](super::genesis::bundle::bake_assembled_genesis)
-/// has always had (`valid_from` must advance), finally applied to the
+/// `bake_assembled_genesis` (deleted in v62.0.0) had (`valid_from` must advance), finally applied to the
 /// delegation half — which had no recency check of any kind, which is how the
 /// boot seed came to roll a live re-ceremony back to the compiled-in bytes.
 ///
@@ -4564,59 +4255,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    /// CIRISPersist#973 — **the software-ceremony seam is fenced, from disk.**
-    /// Every item that lets a process boot against something other than the
-    /// compiled bundle and community asset sits directly under
-    /// `#[cfg(feature = "test-anchor")]`, and the accessors consult the seam
-    /// only inside that cfg. A production build therefore contains none of it
-    /// (the `sqlite`-only build compiling is the other half).
-    #[test]
-    fn the_test_ceremony_seam_is_fenced_973() {
-        let src = include_str!("mod.rs");
-        let cfg = "#[cfg(feature = \"test-anchor\")]";
-        for item in [
-            "pub mod test_ceremony;",
-            "pub use test_ceremony::*;",
-            "type InstalledTestCeremony",
-            "static TEST_CEREMONY:",
-            "pub fn install_test_ceremony_outputs(",
-            "pub fn clear_test_ceremony_outputs(",
-            "fn installed_test_ceremony(",
-            "pub(crate) fn test_anchor_holder_record(",
-        ] {
-            let at = src
-                .find(item)
-                .unwrap_or_else(|| panic!("seam item {item:?} not found"));
-            let before: Vec<&str> = src[..at]
-                .lines()
-                .rev()
-                .skip_while(|l| l.trim().is_empty())
-                .take_while(|l| !l.trim().is_empty())
-                .collect();
-            assert!(
-                before.iter().any(|l| l.trim() == cfg),
-                "{item:?} is not under {cfg}: {before:?}"
-            );
-        }
-        // Each READ of the seam is itself under the cfg. The needle is
-        // assembled so this test's own text does not count.
-        let call = ["installed_test_", "ceremony()"].concat();
-        let fenced: usize = [
-            format!("{cfg}\n    if let Some(bundle) = {call}"),
-            format!("{cfg}\n    {{\n        {call}.is_some()"),
-        ]
-        .iter()
-        .map(|p| src.matches(p.as_str()).count())
-        .sum();
-        assert_eq!(fenced, 2, "the two fenced reads");
-        assert_eq!(
-            src.matches(&call).count(),
-            fenced + 1,
-            "a read of the test-ceremony seam outside {cfg} (the definition + 2 reads)"
-        );
-        assert!(include_str!("test_ceremony.rs").contains("`test-anchor` feature"));
-    }
-
     /// v53.0.0 (CC rc7, T5) — **the community birth is a member of the pinned
     /// bundle, never a file beside it.** The separate asset is gone; the
     /// shipped bundle is version 2 and carries no birth, so the leg is inert
@@ -5218,9 +4856,8 @@ mod tests {
     /// REFUSED with the typed `GenesisBundleInvalid`, by a message that names
     /// the shape it got. The pre-v23 failure mode was the opposite of loud: a
     /// record list seeded an inert node that rooted and reported healthy.
-    #[tokio::test]
-    #[cfg(feature = "sqlite")]
-    async fn legacy_bare_record_list_seed_is_refused_loudly_551() {
+    #[test]
+    fn legacy_bare_record_list_seed_is_refused_loudly_551() {
         let legacy = r#"[{"record":{"key_id":"ciris-canonical-1-d7bdeu223k"}}]"#;
         let err = parse_genesis_bundle(legacy).expect_err("a bare record list is not a seed");
         assert!(
@@ -5236,13 +4873,8 @@ mod tests {
             assert!(msg.contains(want), "refusal must say {want:?}, got: {msg}");
         }
 
-        // The same refusal through the operator-facing door — one parse door,
-        // one message, so an artifact and the seed asset cannot disagree.
-        let backend = crate::store::test_backend::test_backend();
-        let baked = super::bake_assembled_genesis(&backend, legacy)
-            .await
-            .expect_err("bake must refuse the legacy shape identically");
-        assert!(baked.to_string().contains("bare JSON array"));
+        // v62.0.0 (json-cut C5): the operator-facing bake door is deleted;
+        // the parse door is the only one left.
     }
 
     /// v13.4.0 (CIRISPersist#390) — the baked canonical seed parses, is
@@ -5314,78 +4946,6 @@ mod tests {
         seed_canonical_servers(&backend)
             .await
             .expect("idempotent re-seed");
-    }
-
-    /// v13.4.2 (CIRISPersist#394) — the boot-panic regression: the **canonical
-    /// node itself** already holds `ciris-canonical-1` as its OWN self-signed
-    /// `node` row (it minted the identity). The genesis seed MUST **upgrade**
-    /// that row to the 2-of-3 scrubbed canonical (via `adopt_scrub_upgrade`),
-    /// not error on it (which `put_public_key` did → boot abort). After the
-    /// seed the node self-roots as canonical; re-seed is idempotent.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn canonical_seed_upgrades_the_nodes_own_self_signed_row() {
-        use crate::federation::{FederationDirectory, SignedKeyRecord};
-        use crate::store::backend::Backend as _;
-        use crate::store::sqlite::SqliteBackend;
-
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        backend
-            .seed_genesis_accord_holders(accord_holder_genesis_records())
-            .await
-            .expect("holder seed");
-        seed_accord_family(&backend).await.expect("family seed");
-
-        // Pre-seed ciris-canonical-1 as the node's OWN self-signed `node` row —
-        // same pubkeys as the baked record, but self-signed and not canonical.
-        let baked = &canonical_genesis_bundle().serve_nodes[0].record;
-        let mut own = baked.clone();
-        own.scrub_key_id = own.key_id.clone(); // self-signed
-        own.identity_type = identity_type::NODE.to_owned();
-        own.additional_scrubs.clear();
-        own.capability_roles.clear();
-        // v24.1.0 (CIRISPersist#557) — strip the roles from the SIGNED
-        // ENVELOPE too, not just the column. `claims_role` reads BOTH
-        // surfaces, and from the quorum-rooted bake the envelope carries
-        // `infra:attest` — which `check_infra_attest_role_admission` refuses
-        // without accord co-scrub. That refusal is CORRECT and is exactly
-        // what this fixture simulates the absence of: a node that registered
-        // ITSELF cannot claim an accord-conferred role. Clearing only the
-        // column left the envelope claiming it, so the pre-seed was refused
-        // by the very gate the seed upgrade exists to satisfy.
-        if let Some(obj) = own.registration_envelope.as_object_mut() {
-            obj.insert("roles".into(), serde_json::json!([]));
-        }
-        backend
-            .put_public_key(SignedKeyRecord { record: own })
-            .await
-            .expect("pre-seed the node's own self-signed row");
-        assert!(
-            !crate::federation::is_canonical(&backend, &baked.key_id)
-                .await
-                .unwrap(),
-            "the self-signed row is NOT canonical yet"
-        );
-
-        // The genesis seed must UPGRADE it (not error → boot abort).
-        seed_canonical_servers(&backend)
-            .await
-            .expect("must upgrade the pre-existing self-signed row, not error");
-        verify_canonical_seeded(&backend)
-            .await
-            .expect("canonical live after upgrade");
-        assert!(
-            crate::federation::is_canonical(&backend, &baked.key_id)
-                .await
-                .unwrap(),
-            "the node self-roots as canonical after the upgrade"
-        );
-
-        // Reboot idempotence — a second seed over the now-scrubbed row is a no-op.
-        seed_canonical_servers(&backend)
-            .await
-            .expect("idempotent re-seed over the upgraded row");
     }
 
     /// v13.7.0 (CIRISPersist#410) — the genesis seed must SUPERSEDE (not fatally

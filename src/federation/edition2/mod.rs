@@ -3,7 +3,7 @@
 //!
 //! A row of this edition is one or more `COSE_Sign1` statements over one
 //! deterministically encoded payload, signed with the composite ML-DSA-65 +
-//! Ed25519 (CC 2.6.1, 2.6.1.7). Persist reads it with CIRISVerify 23.1.3's
+//! Ed25519 (CC 2.6.1, 2.6.1.7). Persist reads it with CIRISVerify 23.3.0's
 //! edition-2 reader and family matcher ([`ciris_verify_core::edition2`]); it
 //! does not re-implement either. What persist adds is the door around them:
 //!
@@ -17,8 +17,14 @@
 //! | one rule set, two codecs: the statement mapped onto persist's typed row and its gates | [`ingest`] |
 //! | the read models: an edition-2 key and its honoured revocations projected into `federation_keys` / `federation_revocations`; the cross-form refusal | [`projection`] |
 //! | producing: an edition-2 row or object signed with persist's own composite signer | [`produce`] |
-//! | the accord's halt and invocation door (one holder's statement latches; dedup by invocation_id / nonce) | [`halt`] |
+//! | the accord's halt and invocation door over Verify's halt reader (one holder's statement latches; dedup by invocation_id / nonce) | [`halt`] |
 //! | the payload members of each mapped family (the source of `docs/EDITION2_PAYLOADS.md`) | [`payloads`] |
+//! | the group planes: a `group:roster` version and a counted membership change judged by the typed group doors, counted over every voice (v62.0.0, wave T1) | [`group`] |
+//! | a recovery key refused as a signer by its key material (CC 4.2.6) | [`recovery_signer`] |
+//! | the `identity:occurrence` bind (two voices, the typed occurrence table) and the key-of-issuer check's occurrence arm | [`occurrence`] |
+//! | the remaining families with a typed table (occurrence revocation, revocation, takedown notice, custody report, key grant, delivery receipt, cosign state) landed through the JSON form's own door, counted voices included (v62.0.0, wave T2) | [`typed`] |
+//! | a seat's transit key moved only by a counted `transport:canonical_rebind` of the bundle's holders (v62.0.0, wave W1) | [`transport_rebind`] |
+//! | a trust-root community counted over the genesis bundle in force: holders as founders, the birth's count, a founders' link's voices (v62.0.0, wave W1) | [`trust_root_group`] |
 //!
 //! **The rule this module keeps (CC 2.6.1.12).** A node of this form reads and
 //! writes this form only. An object of the earlier form (CC 8.11, a JSON object
@@ -31,48 +37,144 @@
 pub mod door;
 pub mod emit;
 #[cfg(any(test, feature = "test-anchor"))]
+pub mod fixture_genesis;
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod fixture_genesis_custody;
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod fixture_occurrence;
+#[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_switch;
+pub mod fold;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod fold_invariants;
+// v62.0.0 (wave W1b) — a ROOTED edition-2 trust root, for any test.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod fixture_trust_root;
 pub mod genesis;
+pub mod group;
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod group_fixtures;
+pub mod group_serve;
 pub mod halt;
 pub mod ingest;
 pub mod liveness;
 pub mod names;
+pub mod occurrence;
 pub mod payloads;
 pub mod produce;
 pub mod projection;
+pub mod recovery_signer;
 pub mod serve;
+pub mod standing;
 pub mod store;
+pub mod transport_rebind;
+pub mod trust_root_group;
+pub mod typed;
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod typed_fixtures;
+pub mod voices;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod voices_invariants;
 
-#[cfg(test)]
-pub(crate) mod codec;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod composer_invariants;
 #[cfg(test)]
 mod door_invariants;
+// v62.0.0 (wave P1e) — I2925: the emit side states every family digest
+// member (needs edition2::payloads, so it lands at syn1 with P1e.patch).
 #[cfg(test)]
 mod earlier_form_refusal_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod emit_digest_invariants;
+#[cfg(test)]
+mod fixture_genesis_invariants;
 #[cfg(test)]
 mod genesis_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod genesis_store_invariants;
 #[cfg(test)]
+mod group_codec_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod group_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod group_serve_invariants;
+#[cfg(test)]
 mod halt_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod ingest_invariants;
+// v62.0.0 (CC 2.7, wave P9) — I3600, I3601, I3603: a wait is a wait on every
+// surface.
 #[cfg(test)]
 mod key_chain_invariants;
 #[cfg(test)]
 mod liveness_invariants;
 #[cfg(test)]
+mod occurrence_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod occurrence_node_bearing_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod occurrence_roster_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod occurrence_route_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod occurrence_tx_invariants;
+#[cfg(test)]
 mod payloads_invariants;
 #[cfg(test)]
 mod produce_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod wait_invariants;
+// v62.0.0 (wave P1c) — I2914: the door's pure gates precede its first
+// directory read (AV-76), on sqlite and postgres.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod pure_gates_invariants;
+// v62.0.0 (wave P1c) — I2915: the mapping fills the typed `weight` column.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod producer_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod weight_column_invariants;
+// v62.0.0 (v62 P3) — I3055/I3056: the hard_case producer, two nodes.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod hard_case_producer_invariants;
+// v62.0.0 (v62 P8) — I3520–I3532: the crossing, the widening and the
+// occurrence producer state edition 2; a second node admits it.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod crossing_producer_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod projection_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod recovery_signer_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod standing_invariants;
 #[cfg(test)]
 mod verify_vectors_replay;
+// v62.0.0 (wave T2) — I3140–I3149: the typed planes' mapping, pure.
+#[cfg(test)]
+mod typed_codec_invariants;
+// v62.0.0 (wave T2) — I3150–I3169: the typed planes at the door, on sqlite
+// and postgres.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod typed_invariants;
+// v62.0.0 (wave T2, on W1b's rooted trust root) — I3182–I3184: a steward
+// purge executed from its founders' voices and replicated to a second node.
+// Needs `fixture_trust_root` (W1b).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod typed_purge_rooted_invariants;
+// v62.0.0 (v62 P8) — I3530: an external edition-2 holding claim (the door
+// Python's `put_blob_edition2` calls) admitted on a second node.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod external_claim_invariants;
+// v62.0.0 (v62 P8) — I3535–I3537: the detection producer on edition 2.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod detection_producer_invariants;
+// v62.0.0 (v62 P8) — I3546–I3547: the erasure withdraws as the producer's
+// edition-2 statement; the CC 2.4.1.1 carve-out kept.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod erasure_producer_invariants;
+// v62.0.0 (kernel pass 2, K1) — I2819–I2820: the half-open window and
+// `valid_until_not_after_asserted_at`, on sqlite and postgres.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod window_invariants;
 
 pub use ciris_verify_core::edition2::Digest32;
 

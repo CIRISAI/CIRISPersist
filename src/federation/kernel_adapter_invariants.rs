@@ -20,9 +20,9 @@
 //!   (a `unanimous` widening after a removal needs only those remaining).
 //! - **I1846** — a reference cycle (two rows naming each other's peer-chosen
 //!   id) never hangs the trust walk and gives no edge.
-//! - **I1843** — a fork of a held head (two versions naming one head): persist
-//!   refuses it; the kernel holds it as a tip (CC 2.7.8). Witnessed, not
-//!   switched.
+//! - **I1843** — a fork of a held head (two versions naming one head): the
+//!   kernel holds it as a tip (CC 2.7.8). v62.0.0 (kernel pass 2, K1):
+//!   switched — persist holds it too, and the head does not move.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -165,11 +165,12 @@ pub(crate) mod bodies {
 
     /// **I1843** — a FORK of a held head: two versions naming one head. The
     /// family's v1 is held; v2 naming v1 is admitted (the head moves); v3
-    /// naming v1 too — v2's sibling — is the fork. Persist refuses it
-    /// `lineage_prev_head_mismatch` (`held_head_verdict`, unchanged in this
-    /// slice); the kernel reads it as a tip beside v2 (CC 2.7.8: "Two
-    /// versions of one head wait as tips"). The differential witness records
-    /// the call as the `fork_as_tip` departure, on both backends.
+    /// naming v1 too — v2's sibling — is the fork. The kernel reads it as a
+    /// tip beside v2 (CC 2.7.8: "Two versions of one head wait as tips"),
+    /// and v62.0.0 (kernel pass 2, K1) persist holds it so: the supersede is
+    /// `Ok` at the held head's version, and the head is still v2. The
+    /// differential witness records the former refusal as the `fork_as_tip`
+    /// departure, on both backends.
     pub(crate) async fn i1843_a_fork_of_the_held_head_is_a_tip_to_the_kernel(
         d: &dyn FederationDirectory,
         s: &str,
@@ -199,13 +200,15 @@ pub(crate) mod bodies {
         v3.prev_head_digest = v1.persist_row_hash.clone();
         v3.family_name = "v3".into();
         v3.persist_row_hash = String::new();
-        let e = d
+        let v = d
             .supersede_family(ts::sign_family(&holders[0], v3), None)
             .await
-            .expect_err("I1843: persist refuses the fork (held_head_verdict, this slice)");
-        assert!(
-            matches!(&e, crate::federation::Error::Conflict(m) if m.contains("lineage_prev_head_mismatch")),
-            "I1843: {e:?}"
+            .expect("I1843: persist holds the fork as a tip (kernel pass 2)");
+        assert_eq!(v, 2, "I1843: the head's version, unchanged");
+        assert_eq!(
+            d.lookup_family(&fam).await.unwrap().expect("held"),
+            held,
+            "I1843: the head did not move"
         );
         assert_eq!(
             head_reading(

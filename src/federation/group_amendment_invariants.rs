@@ -419,7 +419,9 @@ pub mod bodies {
         assert_eq!(kind.stored(b, &id).await.2, v1_hash, "{tag} I178");
 
         // (4) A amends again (unanimous now: all three sign) before B has the
-        //     first amendment. Offered first, the second is STALE.
+        //     first amendment. Offered first, the second names a version B
+        //     does not hold: v62.0.0 (kernel pass 2, K1; CC 2.7.8, I2812) it
+        //     is held as a tip waiting for that version, and B's head stays.
         let v3 = Content {
             name: "household, renamed twice",
             protocol: consensus_protocol::MAJORITY,
@@ -435,14 +437,16 @@ pub mod bodies {
             "{tag} I178: A is at version 3"
         );
         let served_v3 = kind.served(a, &id).await;
-        let e = kind
-            .put(b, served_v3.clone())
+        kind.put(b, served_v3.clone())
             .await
-            .expect_err("a proof naming a version B does not hold must be refused");
-        assert!(
-            is_conflict_containing(&e, "stale supersede_proof")
-                && is_conflict_containing(&e, "retryable"),
-            "{tag} I178: the stale refusal says so: {e}"
+            .unwrap_or_else(|e| panic!("{tag} I178: v3 is held as a tip on B: {e}"));
+        assert_eq!(
+            b.list_group_tips(kind.cohort(), &id)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I178: list_group_tips: {e}"))
+                .len(),
+            1,
+            "{tag} I178: B holds v3 as a tip"
         );
         assert_eq!(
             kind.stored(b, &id).await.2,

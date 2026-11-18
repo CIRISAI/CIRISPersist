@@ -1,603 +1,1285 @@
-//! The genesis bundle of this edition, `ceg-genesis-bundle/2`: the generic
-//! parts (CC 2.6.1.11, CC 2.6.1.12, CC 5.3.4).
+//! The genesis bundle of this edition, `ceg-genesis-bundle/2` (CC 2.6.1.11,
+//! CC 4.2.6, CC 5.3.4), read by CIRISVerify 23.3.0's bundle reader
+//! (`ciris_verify_core::edition2::genesis`).
 //!
-//! The payload rule belongs to CC and the verifier. CIRISConstitution's
-//! proposal (`rc20-review/genesis/PROPOSAL.md`, built from persist's
-//! superseded draft `docs/GENESIS_BUNDLE_V2_DRAFT.md`, CIRISPersist#1274) has
-//! not landed, and persist builds no payload member from it. This module
-//! holds what is true under CC 2.6.1.11 and the proposal alike:
+//! The payload rule, the count, the anchor, the named rows, the custody gate,
+//! roster changes, recovery and re-seating are all Verify's. Persist consumes
+//! the [`GenesisPlacement`] the reader yields and never places a row again.
+//! What persist adds is the store around it:
 //!
-//! - every voice is a `ceg-object-statement` with `typ`
-//!   `ceg-genesis-bundle/2`, read by Verify 23.1.3's `verify_object_statement`:
-//!   - a JSON bundle (the earlier form) is `earlier_form_object`;
-//!   - a row is `edition2_not_a_row`;
-//!   - a voice that is Invalid or Waiting is not counted, and the others
-//!     stand;
-//! - the bundle is **counted**: one statement per holder over one payload,
-//!   with no `author`, so every voice has one object id, computed here
-//!   (`["CEG-object/2", typ, null, payload]`). Statements over other payload
-//!   bytes are other objects ([`group_by_object`]), never merged and never
-//!   counted;
-//! - a reader holding a pin roots only the pinned object. Any other bundle
-//!   roots nothing for it (`genesis_bundle_not_pinned`);
-//! - `version` is a sequence from 1. No `refs.prev` means the fresh genesis
-//!   at `version` 1. With a prev, it is prev's version plus one
-//!   (`genesis_bundle_malformed`, `version_prev_mismatch`). This is a consistency check,
-//!   never a rank;
-//! - the count:
-//!   - the fresh genesis is signed by **every** holder;
-//!   - a later bundle is signed by a strict majority of its predecessor's
-//!     holders, plus every holder it adds or whose commitment it changes
-//!     ([`CountRule`], [`BundleContext::must_sign`]);
-//!   - a voice from a key outside the counting roster counts for nothing;
-//!   - a count not met concludes nothing (`genesis_bundle_count_unmet`). The
-//!     bundle is held, never finally refused;
-//! - a seat's X-Wing keys are live from the binding the genesis names
-//!   ([`seat_xwing_from_binding`]). After that they move only by a counted
-//!   `transport:canonical_rebind` (CC 3.3.6.2; persist's
-//!   `transport_rebind::rebind_held_for` reads the carried row).
+//! - **The door** ([`put_genesis_bundle`]). One statement list carries bundle
+//!   voices and the rows they name (key records, seat bindings, a recovery
+//!   key's record). The voices may be several objects: a whole lineage can
+//!   travel at once. Each object is read in lineage order ([`read_lineage`]):
+//!   - a first bundle not held yet is rooted by the caller's [`Anchor`];
+//!   - a first bundle already held is rooted by its own object id;
+//!   - a later bundle is read against its held predecessor.
+//!
+//!   The door then stores what Verify reads Valid: first its named rows, then
+//!   its voices. Nothing of a bundle that is not Valid is stored:
+//!   - a bundle waiting on a named row or its predecessor is the retryable
+//!     unknown-signer error;
+//!   - an Invalid bundle is `genesis_bundle_malformed` with Verify's reason;
+//!   - a bundle that concludes nothing carries Verify's own token.
+//! - **The bundles in force** ([`genesis_in_force`]), re-derived from the
+//!   held voices and rows on every call (cached by content hash), never by
+//!   instant:
+//!   - `prev` links are followed to the head (`follow_to_head`);
+//!   - a fork is held as tips (`find_forks`), and a reader acts only on what
+//!     every tip names (`tips_in_common`, CC 2.6.1.11).
+//! - **Canonical standing, ruling C**: a key is canonical when its
+//!   identity-ref is a seat (`serve_nodes`) of the bundle in force, common to
+//!   every tip ([`is_canonical_by_bundle`]). With no bundle held, no key is
+//!   canonical, and the node is pre-genesis.
+//! - **The accord's halt roster** ([`GenesisInForce::halt_roster`]): the
+//!   holders of the bundle in force for an accord, each at the key the bundle
+//!   places for it. With no bundle held, the halt waits
+//!   (`edition2::halt::roster_in_force`).
+//!
+//! The custody gate verifies the holders' attestation chains against
+//! [`attestation_roots`], which is Verify's baked store in production.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, PoisonError};
 
-use ciris_verify_core::cde::Value;
-use ciris_verify_core::edition2::{verify_object_statement, Digest32, ObjectVerdict};
+use ciris_verify_core::cde::{self, Value};
+// Verify's roster type: persist's `edition2::halt::HaltRoster` is a
+// re-export of it at the 23.3.0 pin (slice C3).
+use ciris_crypto::composite::CompositePublicKey;
+use ciris_verify_core::edition2::accord_halt::{HaltRoster, RosterHolder};
+use ciris_verify_core::edition2::family::SelectContext;
+use ciris_verify_core::edition2::genesis::BINDING_FAMILY;
+use ciris_verify_core::edition2::genesis::{
+    follow_to_head, read_genesis_bundles, tips_in_common, GenesisInput, Head, Inconclusive,
+    Predecessor,
+};
+pub use ciris_verify_core::edition2::genesis::{
+    Anchor, BundleReading, Fork, GenesisCharter, GenesisPlacement, GenesisVerdict, PlacedHolder,
+    PlacedSeat, PlacedWitness, TipsInCommon,
+};
+use ciris_verify_core::edition2::keys::{check_key_record, KEY_RECORD_FAMILY};
+use ciris_verify_core::edition2::{
+    object_id, statement_id, Digest32, KeyDirectory, KeyLookup, KeyOf,
+};
+use ciris_verify_core::trust_anchor_store::TrustAnchorStore;
 
-use super::door::{raw_payload, require_statement_form, AdmittedRow, PLANE};
-use super::liveness::statement_parts;
+use super::door::{AdmittedRow, PLANE};
+use super::liveness::{BundleSeats, KEY_REVOCATION_FAMILY};
 use super::names::{names_of, single, RowId};
-use crate::federation::{malformed_row, Error};
+use super::store::HeldObject;
+use crate::federation::{malformed_row, Error, FederationDirectory};
 
 /// The `typ` of the genesis bundle of this edition.
-pub const GENESIS_BUNDLE_TYP: &str = "ceg-genesis-bundle/2";
+pub const GENESIS_BUNDLE_TYP: &str = ciris_verify_core::edition2::genesis::GENESIS_BUNDLE_TYP;
 
-/// The genesis bundle's own reasons (`federation_malformed_row`).
+/// The genesis bundle's own reasons (`federation_malformed_row`). Each is
+/// the token Verify's reader answers with.
 pub mod token {
     pub use crate::federation::malformed_row::{
         GENESIS_BUNDLE_COUNT_UNMET as COUNT_UNMET, GENESIS_BUNDLE_MALFORMED as MALFORMED,
-        GENESIS_BUNDLE_NOT_PINNED as NOT_PINNED,
-        GENESIS_BUNDLE_READER_UNAVAILABLE as READER_UNAVAILABLE,
-        GENESIS_BUNDLE_SEAT_BINDING as SEAT_BINDING,
+        GENESIS_BUNDLE_NOT_ANCHORED as NOT_ANCHORED,
+        GENESIS_BUNDLE_PREV_NOT_VALID as PREV_NOT_VALID, GENESIS_BUNDLE_ROW_INVALID as ROW_INVALID,
+        GENESIS_BUNDLE_ROW_UNPLACED as ROW_UNPLACED, GENESIS_HOLDER_CUSTODY as HOLDER_CUSTODY,
     };
+
+    /// The label of a bundle that waits on a named row or its predecessor
+    /// ([`super::NotPlaced::token`]). It is never a refusal: the door
+    /// answers it with the retryable unknown-signer error.
+    pub const WAITING: &str = "genesis_bundle_waiting";
 }
-
-/// The X-Wing public key length: ML-KEM-768 `pk_M` (1184) then X25519 `pk_X`
-/// (32) (CC 3.3.6.2).
-pub const XWING_PUBKEY_LEN: usize = 1216;
-
-/// The ML-KEM-768 half's length.
-const XWING_PK_M_LEN: usize = 1184;
 
 fn refuse(reason: &'static str, message: impl Into<String>) -> Error {
     Error::malformed_row(PLANE, reason, message)
 }
 
-/// How a bundle is counted (CC 5.3.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CountRule {
-    /// Every holder of the roster: the fresh genesis.
-    Every,
-    /// A strict majority of the predecessor's holders (2·valid > n): a later
-    /// bundle.
-    StrictMajority,
+// ------------------------------------------------------------------ roots
+
+#[cfg(any(test, feature = "test-anchor"))]
+static TEST_ATTESTATION_ROOTS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+#[cfg(any(test, feature = "test-anchor"))]
+fn test_attestation_roots() -> Vec<Vec<u8>> {
+    TEST_ATTESTATION_ROOTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
-impl CountRule {
-    fn met(self, valid: usize, n: usize) -> bool {
-        match self {
-            CountRule::Every => valid == n,
-            CountRule::StrictMajority => 2 * valid > n,
-        }
-    }
+#[cfg(not(any(test, feature = "test-anchor")))]
+fn test_attestation_roots() -> Vec<Vec<u8>> {
+    Vec::new()
 }
 
-/// What the caller holds to judge a bundle by.
-#[derive(Clone, Debug)]
-pub struct BundleContext<'a> {
-    /// The holders whose voices count, by key thumbprint. For the fresh
-    /// genesis this is the roster the bundle seats. For a later bundle it is
-    /// the predecessor's.
-    pub roster: &'a BTreeSet<Digest32>,
-    /// How the roster's voices are counted.
-    pub count: CountRule,
-    /// Holders who must sign beside the count: on a later bundle, each one it
-    /// adds and each continuing one whose commitment it changes.
-    pub must_sign: &'a BTreeSet<Digest32>,
-    /// The pinned object id, when the reader holds one (CC 5.3.4).
-    pub pin: Option<&'a Digest32>,
-    /// The predecessor's `(object id, version)`, when the bundle names one.
-    pub predecessor: Option<(&'a Digest32, u64)>,
-}
-
-/// A bundle whose generic rules hold and whose count is met.
-#[derive(Clone, Debug)]
-pub struct VerifiedBundle {
-    /// The object id, computed here.
-    pub object_id: RowId,
-    /// `version`.
-    pub version: u64,
-    /// `refs.prev`, when present.
-    pub prev: Option<RowId>,
-    /// The holders whose voices counted.
-    pub signed_by: BTreeSet<Digest32>,
-    /// The decoded payload, for the payload rule's reader.
-    pub payload: Value,
-}
-
-/// Statements grouped by the object id their payload bytes give. Bytes that
-/// carry no payload are left out: the reader refuses them.
+/// The trust store of the bundle reader's custody gate (CC 4.2.2.1): Verify's
+/// baked roots (`trust_anchor_store::baked::default_store`). A test build
+/// adds the roots registered with [`add_test_attestation_root`] as further
+/// YubiKey PIV key-attestation roots.
 #[must_use]
-pub fn group_by_object(voices: &[Vec<u8>]) -> BTreeMap<RowId, Vec<Vec<u8>>> {
-    let mut out: BTreeMap<RowId, Vec<Vec<u8>>> = BTreeMap::new();
-    for v in voices {
-        if let Some(p) = raw_payload(v) {
-            out.entry(RowId::of_object(GENESIS_BUNDLE_TYP, None, &p))
-                .or_default()
-                .push(v.clone());
-        }
+pub fn attestation_roots() -> TrustAnchorStore {
+    use ciris_verify_core::trust_anchor_store::{baked, environments, single, Purpose};
+    let store = baked::default_store();
+    let extra = test_attestation_roots();
+    if extra.is_empty() {
+        store
+    } else {
+        store.with_store(single(
+            environments::YUBIKEY_PIV,
+            Purpose::KeyAttestation,
+            extra,
+        ))
     }
-    out
 }
 
-/// Verify one bundle's voices under its generic rules.
-///
-/// # Errors
-/// - `earlier_form_object` for a voice of the earlier form;
-/// - `edition2_not_a_row` for a row, or another `typ`;
-/// - `row_ref_edition_1` for an edition-1 `refs.prev`;
-/// - [`token`]'s reasons. `count_unmet` and `not_pinned` conclude nothing
-///   for this reader. They are not a finding against the bundle.
-pub fn verify_bundle(
-    voices: &[Vec<u8>],
-    keys: &dyn super::liveness::KeyOwnership,
-    cx: &BundleContext<'_>,
-) -> Result<VerifiedBundle, Error> {
-    // The object: the first voice's payload. Others over other bytes are
-    // other objects, and do not count here.
-    let mut object: Option<(RowId, Vec<u8>)> = None;
-    let mut signed_by = BTreeSet::new();
-    let mut voiced = BTreeSet::new();
-    let mut payload: Option<Value> = None;
-    for v in voices {
-        require_statement_form(v)?;
-        if let Some((protected, _)) = statement_parts(v) {
-            if protected.get_int(-70001).is_some() {
-                return Err(refuse(
-                    malformed_row::EDITION2_NOT_A_ROW,
-                    "a row statement offered as a genesis bundle voice",
-                ));
-            }
-        }
-        let Some(pb) = raw_payload(v) else {
-            continue;
-        };
-        let id = RowId::of_object(GENESIS_BUNDLE_TYP, None, &pb);
-        match &object {
-            None => object = Some((id, pb.clone())),
-            Some((oid, _)) if *oid != id => continue,
-            Some(_) => {}
-        }
-        let o = match verify_object_statement(v, keys) {
-            ObjectVerdict::Valid(o) => o,
-            // A voice Invalid on its own, or waiting on its key, is not
-            // counted; the others stand.
-            ObjectVerdict::Invalid(_) | ObjectVerdict::Waiting { .. } => continue,
-        };
-        if o.typ != GENESIS_BUNDLE_TYP {
-            return Err(refuse(
-                malformed_row::EDITION2_NOT_A_ROW,
-                format!("a `{}` object offered as a genesis bundle", o.typ),
-            ));
-        }
-        // The reader's own id must be the one computed here: the bundle has
-        // no author, so a voice that carries one is another object.
-        if o.object_id != id.0 {
-            continue;
-        }
-        // Every statement's `iat` is required and is ⌊asserted_at / 1000⌋
-        // (the settled bundle/2 rule; CC 2.6.2).
-        let asserted_at = o.payload.get_text("asserted_at").and_then(Value::as_u64);
-        match (o.iat, asserted_at) {
-            (Some(iat), Some(at)) if iat == at / 1000 => {}
-            _ => {
-                return Err(refuse(
-                    token::MALFORMED,
-                    format!(
-                        "iat_mismatch: a statement's iat {:?} is not floor(asserted_at {:?} / \
-                         1000)",
-                        o.iat, asserted_at
-                    ),
-                ));
-            }
-        }
-        // A voice counts only under a key of its `iss` (I2101): one whose
-        // key is of another identity, or whose chain waits, is not counted;
-        // the others stand.
-        if super::door::require_key_of_iss(keys, &o.kid, &o.iss).is_err() {
-            continue;
-        }
-        voiced.insert(o.kid);
-        if cx.roster.contains(&o.kid) {
-            signed_by.insert(o.kid);
-        }
-        payload.get_or_insert(o.payload);
+/// **Test builds only.** Add a YubiKey PIV key-attestation root (DER) to
+/// [`attestation_roots`] for the rest of the process. Roots are only ever
+/// added, so a test never narrows another's. A test ceremony whose holders
+/// carry mock attestation chains registers its mock root before it calls
+/// [`put_genesis_bundle`]. In a `test-anchor` build outside `cfg(test)` this
+/// does nothing unless Verify's test-anchor mode is active.
+#[cfg(any(test, feature = "test-anchor"))]
+pub fn add_test_attestation_root(der: Vec<u8>) {
+    if !cfg!(test) && !ciris_verify_core::test_anchor::test_anchor_active() {
+        return;
     }
-    let Some((object_id, _)) = object else {
-        return Err(refuse(token::COUNT_UNMET, "the bundle carries no voice"));
+    let mut roots = TEST_ATTESTATION_ROOTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if !roots.contains(&der) {
+        roots.push(der);
+    }
+}
+
+// ------------------------------------------------------------------ statements
+
+/// A `COSE_Sign1`'s parts: the protected header and payload, as signed and
+/// decoded. No check: judging is the reader's.
+struct CoseParts {
+    protected_raw: Vec<u8>,
+    payload_raw: Vec<u8>,
+    protected: Value,
+    payload: Value,
+}
+
+fn cose_parts(bytes: &[u8]) -> Option<CoseParts> {
+    let Value::Tag(18, inner) = cde::decode(bytes).ok()? else {
+        return None;
     };
-    if let Some(pin) = cx.pin {
-        if *pin != object_id.0 {
-            return Err(refuse(
-                token::NOT_PINNED,
-                format!(
-                    "the bundle's object id {} is not the pinned {}: it roots nothing for this \
-                     reader (CC 5.3.4)",
-                    object_id.hex(),
-                    hex::encode(pin)
-                ),
-            ));
-        }
+    let parts = inner.as_array()?;
+    if parts.len() != 4 {
+        return None;
     }
-    let Some(payload) = payload else {
-        return Err(refuse(
-            token::COUNT_UNMET,
-            "no voice of the bundle verifies under a held key",
-        ));
-    };
-    super::door::refuse_edition_one(&payload)?;
-    let names = names_of(&payload).map_err(|e| {
-        refuse(
-            malformed_row::EDITION2_STATEMENT_INVALID,
-            format!("refs: {e:?}"),
-        )
-    })?;
-    let prev = single(&names, "prev");
-    let version = payload
-        .get_text("version")
-        .and_then(Value::as_u64)
-        .filter(|v| *v >= 1)
-        .ok_or_else(|| {
-            refuse(
-                token::MALFORMED,
-                "version_prev_mismatch: `version` is absent or zero",
-            )
-        })?;
-    match (prev, cx.predecessor) {
-        (None, _) if version != 1 => {
-            return Err(refuse(
-                token::MALFORMED,
-                format!("version_prev_mismatch: a bundle with no prev is the fresh genesis, version 1, not {version}"),
-            ));
-        }
-        (Some(_), _) if version == 1 => {
-            return Err(refuse(
-                token::MALFORMED,
-                "version_prev_mismatch: a bundle of version 1 names no prev (CC 2.6.1.11)",
-            ));
-        }
-        (Some(p), Some((pid, pver))) if p.0 != *pid || version != pver + 1 => {
-            return Err(refuse(
-                token::MALFORMED,
-                format!(
-                    "version_prev_mismatch: prev names {} at version {version}; the held predecessor is {} at {pver}",
-                    p.hex(),
-                    hex::encode(pid)
-                ),
-            ));
-        }
-        _ => {}
-    }
-    let missing: Vec<String> = cx
-        .must_sign
-        .iter()
-        .filter(|k| !voiced.contains(*k))
-        .map(hex::encode)
-        .collect();
-    if cx.roster.is_empty()
-        || !cx.count.met(signed_by.len(), cx.roster.len())
-        || !missing.is_empty()
-    {
-        return Err(refuse(
-            token::COUNT_UNMET,
-            format!(
-                "{} of the counting roster's {} holders signed under {:?}; holders who must \
-                 sign and did not: {missing:?} (CC 5.3.4)",
-                signed_by.len(),
-                cx.roster.len(),
-                cx.count
-            ),
-        ));
-    }
-    Ok(VerifiedBundle {
-        object_id,
-        version,
-        prev,
-        signed_by,
+    let protected_raw = parts[0].as_bytes()?.to_vec();
+    let payload_raw = parts[2].as_bytes()?.to_vec();
+    let protected = cde::decode(&protected_raw).ok()?;
+    let payload = cde::decode(&payload_raw).ok()?;
+    Some(CoseParts {
+        protected_raw,
+        payload_raw,
+        protected,
         payload,
     })
 }
 
-/// A seat's live X-Wing keys from the binding row the genesis names (CC
-/// 3.3.6.2, CEREMONY.md step 2): `(transit_xwing_pubkey,
-/// onion_hop_xwing_pubkey)`.
-///
-/// The binding is an admitted edition-2 row signed by the seat's own key. It
-/// carries both keys, each a byte string of exactly [`XWING_PUBKEY_LEN`], and
-/// no half equal to the other key's half (the in-row separation). Edition 2
-/// carries no v1 `transit_kex_pubkeys` pair: a binding with one is refused,
-/// never read.
-///
-/// The members are read at the payload's top level. Where they stand inside
-/// the binding's family is the payload rule CC has not landed. The reader
-/// moves with it.
-///
-/// # Errors
-/// [`token::SEAT_BINDING`].
-pub fn seat_xwing_from_binding(
-    binding: &AdmittedRow,
-    seat_kid: &Digest32,
-) -> Result<([u8; XWING_PUBKEY_LEN], [u8; XWING_PUBKEY_LEN]), Error> {
-    if binding.kid != *seat_kid {
-        return Err(refuse(
-            token::SEAT_BINDING,
-            "the binding is not signed by the seat's own key",
-        ));
+/// A bundle voice's object id and `refs.prev`, from its bytes: `None` for a
+/// statement whose `typ` is not `ceg-genesis-bundle/2`. The object id is
+/// computed here, as Verify computes it (`["CEG-object/2", typ, author /
+/// null, payload]`).
+fn voice_of(p: &CoseParts) -> Option<(Digest32, Option<Digest32>)> {
+    let typ = p.protected.get_int(16).and_then(Value::as_text)?;
+    if typ != GENESIS_BUNDLE_TYP {
+        return None;
     }
-    if binding.payload.get_text("transit_kex_pubkeys").is_some() {
-        return Err(refuse(
-            token::SEAT_BINDING,
-            "an edition-2 binding carries the v1 `transit_kex_pubkeys` pair: the edition's \
-             transit key is X-Wing only",
-        ));
-    }
-    let member = |name: &str| {
-        binding
-            .payload
-            .get_text(name)
-            .and_then(Value::as_bytes)
-            .and_then(|b| <[u8; XWING_PUBKEY_LEN]>::try_from(b).ok())
-            .ok_or_else(|| {
-                refuse(
-                    token::SEAT_BINDING,
-                    format!("the binding carries no `{name}` byte string of 1216 bytes"),
-                )
-            })
-    };
-    let transit = member("transit_xwing_pubkey")?;
-    let onion = member("onion_hop_xwing_pubkey")?;
-    if transit[..XWING_PK_M_LEN] == onion[..XWING_PK_M_LEN]
-        || transit[XWING_PK_M_LEN..] == onion[XWING_PK_M_LEN..]
-    {
-        return Err(refuse(
-            token::SEAT_BINDING,
-            "the transit and onion-hop X-Wing keys share a half (CC 3.3.6.2 key separation)",
-        ));
-    }
-    Ok((transit, onion))
+    let author = p.payload.get_text("author").and_then(Value::as_text);
+    let oid = object_id(GENESIS_BUNDLE_TYP, author, &p.payload_raw);
+    let prev = names_of(&p.payload)
+        .ok()
+        .and_then(|n| single(&n, "prev"))
+        .map(|r| r.0);
+    Some((oid, prev))
 }
 
-/// What a verified bundle seats, read from its settled members `holders` and
-/// `serve_nodes` (sets of identity-refs; CC 5.3.4, the settled bundle/2
-/// rule). When Verify publishes its bundle reader, persist consumes the
-/// placement that reader yields and does not place rows again.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BundleInForce {
-    /// The bundle's object id.
-    pub object_id: Option<RowId>,
-    /// The accord's roster.
-    pub holders: BTreeSet<String>,
-    /// The seated serve nodes.
-    pub serve_nodes: BTreeSet<String>,
-}
-
-fn identity_ref_set(payload: &Value, member: &str) -> Result<BTreeSet<String>, Error> {
-    let arr = payload
-        .get_text(member)
-        .and_then(Value::as_array)
-        .filter(|a| !a.is_empty())
-        .ok_or_else(|| {
-            refuse(
-                token::MALFORMED,
-                format!("members_missing: `{member}` is not a non-empty set"),
-            )
-        })?;
-    let mut out = BTreeSet::new();
-    let mut last: Option<Vec<u8>> = None;
-    for v in arr {
-        let t = v
-            .as_text()
-            .filter(|t| ciris_verify_core::edition2::is_identity_ref(t))
-            .ok_or_else(|| {
-                refuse(
-                    token::MALFORMED,
-                    format!("members_missing: `{member}` holds a non identity-ref"),
-                )
-            })?;
-        let enc = ciris_verify_core::cde::encode(v);
-        if last.as_ref().is_some_and(|l| *l >= enc) {
-            return Err(refuse(
-                token::MALFORMED,
-                format!("`{member}` is not a set in CDE order (federation_set_semantics_unsorted)"),
-            ));
-        }
-        last = Some(enc);
-        out.insert(t.to_owned());
-    }
-    Ok(out)
-}
-
-impl BundleInForce {
-    /// Read the seated sets from a verified bundle.
-    ///
-    /// # Errors
-    /// `genesis_bundle_malformed`: a set missing, unsorted, or holding a
-    /// non identity-ref, or `holders` and `serve_nodes` overlapping
-    /// (`holders_seats_overlap`).
-    pub fn of(bundle: &VerifiedBundle) -> Result<Self, Error> {
-        let holders = identity_ref_set(&bundle.payload, "holders")?;
-        let serve_nodes = identity_ref_set(&bundle.payload, "serve_nodes")?;
-        if !holders.is_disjoint(&serve_nodes) {
-            return Err(refuse(
-                token::MALFORMED,
-                "holders_seats_overlap: a key is both a holder and a seat",
-            ));
-        }
-        Ok(BundleInForce {
-            object_id: Some(bundle.object_id),
-            holders,
-            serve_nodes,
+/// The rows a bundle payload names (every `refs` name but `prev`).
+fn named_by(payload: &Value) -> Vec<Digest32> {
+    names_of(payload)
+        .map(|ns| {
+            ns.into_iter()
+                .filter(|n| n.role != "prev")
+                .map(|n| n.row.0)
+                .collect()
         })
+        .unwrap_or_default()
+}
+
+/// A held voice's store record, read from its bytes.
+fn held_object(object: Digest32, bytes: &[u8]) -> Option<HeldObject> {
+    let p = cose_parts(bytes)?;
+    let kid = <[u8; 32]>::try_from(p.protected.get_int(4)?.as_bytes()?).ok()?;
+    let iss = p.protected.get_int(15)?.get_int(1)?.as_text()?.to_owned();
+    Some(HeldObject {
+        object_id: RowId(object),
+        statement_id: statement_id(&p.protected_raw, &p.payload_raw),
+        typ: GENESIS_BUNDLE_TYP.to_owned(),
+        kid,
+        iss,
+        bytes: bytes.to_vec(),
+    })
+}
+
+// ------------------------------------------------------------------ the lineage
+
+/// What [`read_lineage`] is given.
+#[derive(Clone, Copy, Debug)]
+pub struct LineageInput<'a> {
+    /// The held voices. A held first bundle is rooted by its own object id:
+    /// the door admitted it under the anchor of its day.
+    pub held: &'a [Vec<u8>],
+    /// The offered voices. A first bundle among them that is not held is
+    /// rooted by [`Self::anchor`].
+    pub offered: &'a [Vec<u8>],
+    /// The row statements the reader holds or was given, by row id.
+    pub rows: &'a BTreeMap<Digest32, Vec<u8>>,
+    /// The reader's anchor for a first bundle not held (CC 5.3.4). `None`:
+    /// nothing new is rooted.
+    pub anchor: Option<&'a Anchor>,
+    /// The custody gate's roots ([`attestation_roots`]).
+    pub attestation_roots: &'a TrustAnchorStore,
+}
+
+/// One object of the lineage, as Verify read it.
+#[derive(Clone, Debug)]
+pub struct LineageObject {
+    /// Verify's reading of the object.
+    pub reading: BundleReading,
+    /// The object's voices that no reader step refused: what the store keeps.
+    pub kept: Vec<Vec<u8>>,
+    /// The rows its payload names (every `refs` name but `prev`).
+    pub named: Vec<Digest32>,
+    /// `refs.prev`.
+    pub prev: Option<Digest32>,
+    /// A voice of it is held.
+    pub held: bool,
+    /// A voice of it was offered.
+    pub offered: bool,
+}
+
+/// Every object of the lineage, in read order (roots first, then each
+/// object after its predecessor; last, any whose predecessor nothing names).
+#[derive(Clone, Debug, Default)]
+pub struct LineageReading {
+    /// The objects.
+    pub objects: Vec<LineageObject>,
+    /// Statements (indices into `held ++ offered`) that are no bundle voice:
+    /// another `typ`, or bytes that do not decode. Verify would refuse each
+    /// on its own; the others stand.
+    pub unreadable: Vec<usize>,
+}
+
+struct Pending {
+    prev: Option<Digest32>,
+    voices: Vec<Vec<u8>>,
+    named: Vec<Digest32>,
+    held: bool,
+    offered: bool,
+}
+
+/// **Read a genesis lineage** with Verify's reader, object by object in
+/// `prev` order, each against its held predecessor's reading (Valid, or
+/// not Valid). Pure: no clock, no I/O.
+#[must_use]
+pub fn read_lineage(input: &LineageInput<'_>) -> LineageReading {
+    let mut out = LineageReading::default();
+    let mut objects: BTreeMap<Digest32, Pending> = BTreeMap::new();
+    let all = input
+        .held
+        .iter()
+        .map(|b| (b, true))
+        .chain(input.offered.iter().map(|b| (b, false)));
+    for (i, (bytes, held)) in all.enumerate() {
+        let Some(parts) = cose_parts(bytes) else {
+            out.unreadable.push(i);
+            continue;
+        };
+        let Some((oid, prev)) = voice_of(&parts) else {
+            out.unreadable.push(i);
+            continue;
+        };
+        let o = objects.entry(oid).or_insert_with(|| Pending {
+            prev,
+            voices: Vec::new(),
+            named: named_by(&parts.payload),
+            held: false,
+            offered: false,
+        });
+        if held {
+            o.held = true;
+        } else {
+            o.offered = true;
+        }
+        if !o.voices.contains(bytes) {
+            o.voices.push(bytes.clone());
+        }
     }
 
-    /// **Canonical standing under ruling C** (CIRISPersist#1274, CC 4.2.1):
-    /// a seat is canonical exactly when its identity-ref is in `serve_nodes`
-    /// of the bundle in force. The identity-ref names the key's genesis key,
-    /// so standing survives record renewals and rotation (CC 2.6.1.7). It
-    /// moves only by a later bundle.
+    let mut read: BTreeMap<Digest32, BundleReading> = BTreeMap::new();
+    let mut order: Vec<Digest32> = Vec::new();
+    loop {
+        let ready: Vec<Digest32> = objects
+            .iter()
+            .filter(|(id, o)| {
+                !read.contains_key(*id) && o.prev.is_none_or(|p| read.contains_key(&p))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        for id in ready {
+            let r = read_one(&id, &objects[&id], &read, input);
+            read.insert(id, r);
+            order.push(id);
+        }
+    }
+    // The rest name a predecessor no held or offered voice carries (or a
+    // cycle): Verify answers Waiting on it.
+    let rest: Vec<Digest32> = objects
+        .keys()
+        .filter(|id| !read.contains_key(*id))
+        .copied()
+        .collect();
+    for id in rest {
+        let r = read_one(&id, &objects[&id], &BTreeMap::new(), input);
+        read.insert(id, r);
+        order.push(id);
+    }
+
+    for id in order {
+        let (Some(reading), Some(p)) = (read.remove(&id), objects.remove(&id)) else {
+            continue;
+        };
+        let refused: BTreeSet<usize> = reading.refused.iter().map(|r| r.index).collect();
+        let kept = p
+            .voices
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !refused.contains(i))
+            .map(|(_, v)| v)
+            .collect();
+        out.objects.push(LineageObject {
+            reading,
+            kept,
+            named: p.named,
+            prev: p.prev,
+            held: p.held,
+            offered: p.offered,
+        });
+    }
+    out
+}
+
+/// Verify's reading of one object, its voices alone, against its
+/// predecessor's reading when one was read.
+fn read_one(
+    id: &Digest32,
+    o: &Pending,
+    read: &BTreeMap<Digest32, BundleReading>,
+    input: &LineageInput<'_>,
+) -> BundleReading {
+    let own;
+    let anchor = match o.prev {
+        Some(_) => None,
+        None if o.held => {
+            own = Anchor::ObjectId(*id);
+            Some(&own)
+        }
+        None => input.anchor,
+    };
+    let preds: Vec<Predecessor<'_>> = match o.prev.and_then(|p| read.get(&p).map(|r| (p, r))) {
+        Some((_, r)) if r.verdict.placement().is_some() => r
+            .verdict
+            .placement()
+            .map(Predecessor::Valid)
+            .into_iter()
+            .collect(),
+        Some((p, _)) => vec![Predecessor::NotValid(p)],
+        None => Vec::new(),
+    };
+    let reading = read_genesis_bundles(&GenesisInput {
+        statements: &o.voices,
+        rows: input.rows,
+        anchor,
+        predecessors: &preds,
+        attestation_roots: input.attestation_roots,
+    });
+    // Statements refused before grouping are this object's own voices:
+    // file them with it, so the store keeps none of them.
+    let top = reading.refused;
+    match reading.bundles.into_iter().find(|b| b.object_id == *id) {
+        Some(mut b) => {
+            b.refused.extend(top);
+            b
+        }
+        // Every voice was refused on its own: nothing counts.
+        None => BundleReading {
+            object_id: *id,
+            verdict: GenesisVerdict::Nothing(Inconclusive::CountUnmet),
+            refused: top,
+        },
+    }
+}
+
+// ------------------------------------------------------------------ in force
+
+/// **The genesis in force**, as the held voices and rows give it.
+#[derive(Clone, Debug, Default)]
+pub struct GenesisInForce {
+    /// How many bundle objects are held. The door stores only bundles
+    /// Verify reads Valid, so more held than [`Self::valid`] means a held
+    /// bundle no longer reads Valid (the posture's `divergent`).
+    pub held: usize,
+    /// Every held bundle Verify reads Valid, in lineage order.
+    pub valid: Vec<GenesisPlacement>,
+    /// The head, following `prev` from the root, when there is no fork.
+    pub head: Option<GenesisPlacement>,
+    /// Every fork among the Valid bundles; non-empty means no head.
+    pub forks: Vec<Fork>,
+    /// The tips and what every tip names. `None` with nothing held, or on a
+    /// fork of the genesis (two Valid first bundles), where a reader roots on
+    /// neither.
+    pub common: Option<TipsInCommon>,
+    /// The Valid lineage as served (CC 2.6.1.2): each bundle's named rows,
+    /// then its voices, in lineage order, as received.
+    pub statements: Vec<Vec<u8>>,
+}
+
+impl GenesisInForce {
+    /// Is a Valid genesis held?
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        !self.valid.is_empty()
+    }
+
+    /// The accord's name (`family_key_id`), which a later bundle never
+    /// changes.
+    #[must_use]
+    pub fn family_key_id(&self) -> Option<&str> {
+        self.head
+            .as_ref()
+            .or_else(|| self.valid.first())
+            .map(|p| p.family_key_id.as_str())
+    }
+
+    /// The tips: the head, or each tip of a fork of successors.
+    #[must_use]
+    pub fn tips(&self) -> Vec<&GenesisPlacement> {
+        if let Some(h) = &self.head {
+            return vec![h];
+        }
+        self.common
+            .as_ref()
+            .map(|c| {
+                c.tips
+                    .iter()
+                    .filter_map(|t| self.valid.iter().find(|p| p.object_id == *t))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The holders every tip seats under the same key.
+    #[must_use]
+    pub fn holders(&self) -> &[PlacedHolder] {
+        self.common
+            .as_ref()
+            .map_or(&[][..], |c| c.holders.as_slice())
+    }
+
+    /// The seats every tip lists with the same key and X-Wing keys.
+    #[must_use]
+    pub fn seats(&self) -> &[PlacedSeat] {
+        self.common.as_ref().map_or(&[][..], |c| c.seats.as_slice())
+    }
+
+    /// The seat of `identity_ref`, if every tip seats it alike.
+    #[must_use]
+    pub fn seat(&self, identity_ref: &str) -> Option<&PlacedSeat> {
+        self.seats().iter().find(|s| s.identity_ref == identity_ref)
+    }
+
+    /// **Canonical standing under ruling C**: `identity_ref` is a seat of
+    /// the bundle in force (of every tip). The identity-ref names the key's
+    /// genesis key, so standing survives a re-seat at a new key.
     #[must_use]
     pub fn is_canonical(&self, identity_ref: &str) -> bool {
-        self.serve_nodes.contains(identity_ref)
+        self.seat(identity_ref).is_some()
+    }
+
+    /// The keys the bundle in force seats, by identity-ref: each holder and
+    /// each seat at its placed key. No bundle held:
+    /// [`BundleSeats::not_held`].
+    #[must_use]
+    pub fn bundle_seats(&self) -> BundleSeats {
+        if !self.is_held() {
+            return BundleSeats::not_held();
+        }
+        BundleSeats::held(
+            self.holders()
+                .iter()
+                .map(|h| (h.identity_ref.clone(), h.kid))
+                .chain(self.seats().iter().map(|s| (s.identity_ref.clone(), s.kid))),
+        )
+    }
+
+    /// **The halt roster** of `accord_root`: the holders of the bundle in
+    /// force, each at its placed key, when the accord in force is
+    /// `accord_root`. `None` (the halt waits) with no bundle held, on a fork
+    /// of the genesis, or for another accord.
+    ///
+    /// The bundle named is the head, or the first tip of a fork. The fuse is
+    /// the head's charter's `halt_fuse_secs`, or the tips' when they agree.
+    #[must_use]
+    pub fn halt_roster(&self, accord_root: &str) -> Option<HaltRoster> {
+        let common = self.common.as_ref()?;
+        if self.family_key_id()? != accord_root {
+            return None;
+        }
+        let bundle = match &self.head {
+            Some(h) => h.object_id,
+            None => *common.tips.first()?,
+        };
+        let fuse = match &self.head {
+            Some(h) => h.charter.halt_fuse_secs,
+            None => {
+                let tips = self.tips();
+                let mut it = tips.iter().map(|t| t.charter.halt_fuse_secs);
+                let first = it.next().flatten();
+                if it.all(|f| f == first) {
+                    first
+                } else {
+                    None
+                }
+            }
+        };
+        Some(HaltRoster::new(
+            accord_root.to_owned(),
+            bundle,
+            common
+                .holders
+                .iter()
+                .map(|h| RosterHolder {
+                    identity_ref: h.identity_ref.clone(),
+                    key: h.key.clone(),
+                })
+                .collect(),
+            fuse,
+        ))
     }
 }
 
-/// **The genesis door** (approved for slice E2a). It verifies a bundle's
-/// generic rules, takes the placement from CIRISVerify's bundle verdict (the
-/// holders, and each seat with its two X-Wing keys, consumed and never placed
-/// again here), then stores the voices in `ceg_statements` (typ
-/// `ceg-genesis-bundle/2`; `row_type`, `family`, `sub` NULL).
-///
-/// TODO(verify-bundle-reader): Verify's reader does not exist at Verify 23.1.3. Until
-/// it does, the placement step refuses `genesis_bundle_reader_unavailable`
-/// and NOTHING is stored. A bundle held without its placement would seat
-/// rows no reader has placed.
-///
-/// # Errors
-/// [`verify_bundle`]'s; `genesis_bundle_reader_unavailable`.
-pub async fn put_genesis_bundle<F>(
+/// The genesis in force a lineage reading gives (the store's re-read, and
+/// the pure witnesses').
+pub(crate) fn in_force_of(
+    r: &LineageReading,
+    rows: &BTreeMap<Digest32, Vec<u8>>,
+) -> GenesisInForce {
+    let valid: Vec<GenesisPlacement> = r
+        .objects
+        .iter()
+        .filter_map(|o| o.reading.verdict.placement().cloned())
+        .collect();
+    let refs: Vec<&GenesisPlacement> = valid.iter().collect();
+    let (head, forks) = match follow_to_head(&refs) {
+        Head::Head(p) => (Some(p.clone()), Vec::new()),
+        Head::Fork(f) => (None, f),
+        Head::Nothing => (None, Vec::new()),
+    };
+    let common = tips_in_common(&refs);
+    let mut statements = Vec::new();
+    let mut served_rows = BTreeSet::new();
+    for o in &r.objects {
+        if o.reading.verdict.placement().is_none() {
+            continue;
+        }
+        for id in &o.named {
+            if served_rows.insert(*id) {
+                if let Some(b) = rows.get(id) {
+                    statements.push(b.clone());
+                }
+            }
+        }
+        statements.extend(o.kept.iter().cloned());
+    }
+    GenesisInForce {
+        held: r.objects.iter().filter(|o| o.held).count(),
+        valid,
+        head,
+        forks,
+        common,
+        statements,
+    }
+}
+
+/// The rows each voice's payload names, by row id: the held one, else the
+/// `carried` one, if given. Also the ids of those that are held.
+async fn named_rows<F>(
     dir: &F,
     voices: &[Vec<u8>],
-    cx: &BundleContext<'_>,
-) -> Result<VerifiedBundle, Error>
+    carried: &BTreeMap<Digest32, Vec<u8>>,
+) -> Result<(BTreeMap<Digest32, Vec<u8>>, BTreeSet<Digest32>), Error>
 where
-    F: crate::federation::FederationDirectory + ?Sized,
+    F: FederationDirectory + ?Sized,
 {
-    let mut keys = super::liveness::HeldKeys::new();
+    let mut want = BTreeSet::new();
     for v in voices {
-        if let Some(kid) = super::ingest::statement_kid(v) {
-            for st in dir
-                .edition2_statements_about(
-                    ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY,
-                    &ciris_verify_core::edition2::identity_ref(&kid),
-                )
-                .await?
-            {
-                keys.insert_record(st);
+        if let Some(p) = cose_parts(v) {
+            if voice_of(&p).is_some() {
+                want.extend(named_by(&p.payload));
             }
         }
     }
-    let bundle = verify_bundle(voices, &keys, cx)?;
-    place_by_verify_reader(&bundle)?;
-    for v in voices {
-        if let ObjectVerdict::Valid(o) = verify_object_statement(v, &keys) {
-            if o.object_id == bundle.object_id.0 {
-                dir.put_edition2_object(&super::store::HeldObject {
-                    object_id: bundle.object_id,
-                    statement_id: o.statement_id,
-                    typ: o.typ,
-                    kid: o.kid,
-                    iss: o.iss,
-                    bytes: v.clone(),
-                })
-                .await?;
-            }
+    let mut rows = BTreeMap::new();
+    let mut held = BTreeSet::new();
+    for id in want {
+        if let Some(h) = dir.edition2_voices(&RowId(id)).await?.into_iter().next() {
+            rows.insert(id, h);
+            held.insert(id);
+        } else if let Some(c) = carried.get(&id) {
+            rows.insert(id, c.clone());
         }
     }
-    Ok(bundle)
+    Ok((rows, held))
 }
 
-/// The placement step: CIRISVerify's bundle verdict. TODO(verify-bundle-reader).
-fn place_by_verify_reader(bundle: &VerifiedBundle) -> Result<(), Error> {
-    Err(refuse(
-        token::READER_UNAVAILABLE,
-        format!(
-            "bundle {} verified its generic rules, but its placement is CIRISVerify's bundle \
-             reader's, which Verify 23.1.3 does not ship: nothing is stored",
-            bundle.object_id.hex()
-        ),
-    ))
+const CACHE_LEN: usize = 8;
+
+/// Readings by the content they were read from: the reader is pure, so the
+/// same voices, rows and roots give the same answer.
+static IN_FORCE_CACHE: Mutex<Vec<(Digest32, GenesisInForce)>> = Mutex::new(Vec::new());
+
+fn cache_key(voices: &[Vec<u8>], rows: &BTreeMap<Digest32, Vec<u8>>) -> Digest32 {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    let mut sorted: Vec<&Vec<u8>> = voices.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    for v in sorted {
+        h.update((v.len() as u64).to_be_bytes());
+        h.update(v);
+    }
+    h.update([0xff]);
+    for (id, b) in rows {
+        h.update(id);
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b);
+    }
+    h.update([0xfe]);
+    for r in test_attestation_roots() {
+        h.update((r.len() as u64).to_be_bytes());
+        h.update(&r);
+    }
+    h.finalize().into()
 }
 
-/// **The bundles in force**: the tips of the held genesis lineage, followed
-/// by `refs.prev` links from a fresh genesis (version 1, no prev), never by
-/// instant (CC 2.6.1.11, CC 2.7.8). With a pin, only the pinned genesis
-/// roots a lineage. With none, every held fresh genesis does, and two of
-/// them are a fork: both are tips.
+fn cache_get(key: &Digest32) -> Option<GenesisInForce> {
+    IN_FORCE_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, f)| f.clone())
+}
+
+fn cache_put(key: Digest32, f: &GenesisInForce) {
+    let mut c = IN_FORCE_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if c.iter().any(|(k, _)| *k == key) {
+        return;
+    }
+    if c.len() >= CACHE_LEN {
+        c.remove(0);
+    }
+    c.push((key, f.clone()));
+}
+
+/// **The genesis in force** on this node: every held voice and the rows it
+/// names, read by Verify's reader in lineage order (each held first bundle
+/// rooted by its own object id).
 ///
 /// # Errors
 /// Directory read failures.
-pub async fn bundles_in_force<F>(
-    dir: &F,
-    pin: Option<&Digest32>,
-) -> Result<Vec<BundleInForce>, Error>
+pub async fn genesis_in_force<F>(dir: &F) -> Result<GenesisInForce, Error>
 where
-    F: crate::federation::FederationDirectory + ?Sized,
+    F: FederationDirectory + ?Sized,
 {
     let voices = dir.edition2_objects(GENESIS_BUNDLE_TYP).await?;
-    let mut nodes: BTreeMap<RowId, (Option<RowId>, Value)> = BTreeMap::new();
-    for (id, vs) in group_by_object(&voices) {
-        let Some((_, payload)) = vs.first().and_then(|v| statement_parts(v)) else {
-            continue;
-        };
-        let prev = names_of(&payload).ok().and_then(|n| single(&n, "prev"));
-        nodes.insert(id, (prev, payload));
+    if voices.is_empty() {
+        return Ok(GenesisInForce::default());
     }
-    let mut frontier: Vec<RowId> = nodes
-        .iter()
-        .filter(|(id, (prev, _))| prev.is_none() && pin.is_none_or(|p| id.0 == *p))
-        .map(|(id, _)| *id)
-        .collect();
-    let mut tips = Vec::new();
-    let mut seen = BTreeSet::new();
-    while let Some(id) = frontier.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        let children: Vec<RowId> = nodes
-            .iter()
-            .filter(|(_, (prev, _))| *prev == Some(id))
-            .map(|(c, _)| *c)
-            .collect();
-        if children.is_empty() {
-            let (_, payload) = &nodes[&id];
-            let vb = VerifiedBundle {
-                object_id: id,
-                version: payload
-                    .get_text("version")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                prev: nodes[&id].0,
-                signed_by: BTreeSet::new(),
-                payload: payload.clone(),
-            };
-            if let Ok(f) = BundleInForce::of(&vb) {
-                tips.push(f);
-            }
-        }
-        frontier.extend(children);
+    let (rows, _) = named_rows(dir, &voices, &BTreeMap::new()).await?;
+    let key = cache_key(&voices, &rows);
+    if let Some(hit) = cache_get(&key) {
+        return Ok(hit);
     }
-    Ok(tips)
+    let roots = attestation_roots();
+    let reading = read_lineage(&LineageInput {
+        held: &voices,
+        offered: &[],
+        rows: &rows,
+        anchor: None,
+        attestation_roots: &roots,
+    });
+    let f = in_force_of(&reading, &rows);
+    cache_put(key, &f);
+    Ok(f)
 }
 
-/// **Canonical standing under ruling C** over the held lineage: the key's
-/// identity-ref is in `serve_nodes` of every bundle in force. A reader that
-/// holds two tips takes only what both name (CC 2.7.8). With no bundle held,
-/// no edition-2 key is canonical.
+/// **The bundles in force**: the tips of the held Valid lineage (one
+/// without a fork), followed by `refs.prev`, never by instant (CC 2.6.1.11).
+///
+/// # Errors
+/// Directory read failures.
+pub async fn bundles_in_force<F>(dir: &F) -> Result<Vec<GenesisPlacement>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let f = genesis_in_force(dir).await?;
+    Ok(f.tips().into_iter().cloned().collect())
+}
+
+/// **Canonical standing under ruling C** over the held lineage: the
+/// identity-ref is a seat of the bundle in force, common to every tip. With
+/// no bundle held, no edition-2 key is canonical.
 ///
 /// # Errors
 /// Directory read failures.
 pub async fn is_canonical_by_bundle<F>(dir: &F, identity_ref: &str) -> Result<bool, Error>
 where
-    F: crate::federation::FederationDirectory + ?Sized,
+    F: FederationDirectory + ?Sized,
 {
-    let tips = bundles_in_force(dir, None).await?;
-    Ok(!tips.is_empty() && tips.iter().all(|t| t.is_canonical(identity_ref)))
+    Ok(genesis_in_force(dir).await?.is_canonical(identity_ref))
+}
+
+/// The keys the bundle in force seats, by identity-ref
+/// ([`GenesisInForce::bundle_seats`]), for the key-of-issuer check's seat
+/// arm.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn bundle_seats_in_force<F>(dir: &F) -> Result<BundleSeats, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(genesis_in_force(dir).await?.bundle_seats())
+}
+
+/// What the trust-root route serves: the Valid lineage's named rows and
+/// voices, as received ([`GenesisInForce::statements`]). The same list at
+/// [`put_genesis_bundle`] on a fresh node, with an anchor that roots the
+/// first bundle, reproduces the lineage.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn genesis_statements<F>(dir: &F) -> Result<Vec<Vec<u8>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(genesis_in_force(dir).await?.statements)
+}
+
+// ------------------------------------------------------------------ the door
+
+/// An offered bundle the door did not place. Nothing of it was stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotPlaced {
+    /// The object id.
+    pub object_id: Digest32,
+    /// Verify's token ([`token`]), or [`token::WAITING`].
+    pub token: &'static str,
+    /// Verify's reason or detail; for a waiting bundle, what it waits on.
+    pub detail: Option<String>,
+    /// It waits on a named row or its predecessor: retryable.
+    pub waiting: bool,
+}
+
+/// What [`put_genesis_bundle`] did.
+#[derive(Clone, Debug)]
+pub struct GenesisAdmission {
+    /// Each offered bundle Verify read Valid, in lineage order. Its named
+    /// rows and voices are held.
+    pub placed: Vec<GenesisPlacement>,
+    /// Each offered bundle that is not Valid.
+    pub not_placed: Vec<NotPlaced>,
+    /// Offered statements (by index) that are neither a bundle voice nor a
+    /// row: each refused on its own, the others stand.
+    pub unreadable: Vec<usize>,
+    /// The genesis in force after the store.
+    pub in_force: GenesisInForce,
+}
+
+fn not_placed(object_id: Digest32, v: &GenesisVerdict) -> Option<NotPlaced> {
+    let (token, detail, waiting) = match v {
+        GenesisVerdict::Valid(_) => return None,
+        GenesisVerdict::Invalid(m) => (token::MALFORMED, Some(m.reason().to_owned()), false),
+        GenesisVerdict::Waiting(w) => {
+            let mut on: Vec<String> = w
+                .rows
+                .iter()
+                .map(|r| format!("row:{}", hex::encode(r)))
+                .collect();
+            on.extend(w.prev.iter().map(|p| format!("prev:{}", hex::encode(p))));
+            on.extend(w.kids.iter().map(|k| format!("kid:{}", hex::encode(k))));
+            (token::WAITING, Some(on.join(",")), true)
+        }
+        GenesisVerdict::Nothing(i) => (i.token(), i.detail().map(str::to_owned), false),
+    };
+    Some(NotPlaced {
+        object_id,
+        token,
+        detail,
+        waiting,
+    })
+}
+
+fn error_of(n: &NotPlaced) -> Error {
+    let oid = hex::encode(n.object_id);
+    if n.waiting {
+        let first = n
+            .detail
+            .as_deref()
+            .and_then(|d| d.split(',').next())
+            .unwrap_or_default();
+        return Error::unknown_signer(&format!("{GENESIS_BUNDLE_TYP}:{first}"), PLANE);
+    }
+    refuse(
+        n.token,
+        format!(
+            "{}: bundle {oid} is not placed (CC 2.6.1.11); nothing of it is stored",
+            n.detail.as_deref().unwrap_or(n.token)
+        ),
+    )
+}
+
+/// The keys a Valid bundle places: each holder's, seat's and witness's, and
+/// the key each named `key:record` records (a recovery key's included).
+/// Verify's reader has judged whose each is (CC 2.6.1.11: a key changes
+/// hands only by a bundle), so a placed key answers for the identity a row
+/// it signs names, as Verify's own `PlacedKey` does.
+struct BundleKeys(BTreeMap<Digest32, CompositePublicKey>);
+
+impl BundleKeys {
+    fn of(p: &GenesisPlacement, named: &[Digest32], rows: &BTreeMap<Digest32, Vec<u8>>) -> Self {
+        let mut m = BTreeMap::new();
+        for h in &p.holders {
+            m.insert(h.kid, h.key.clone());
+        }
+        for s in &p.seats {
+            m.insert(s.kid, s.key.clone());
+        }
+        for w in &p.witnesses {
+            m.insert(w.kid, w.key.clone());
+        }
+        for id in named {
+            let Some(parts) = rows.get(id).and_then(|b| cose_parts(b)) else {
+                continue;
+            };
+            if let Ok(r) = check_key_record(&parts.payload) {
+                m.insert(r.kid, r.key);
+            }
+        }
+        BundleKeys(m)
+    }
+}
+
+impl KeyDirectory for BundleKeys {
+    fn lookup(&self, kid: &Digest32, _asserted_at: u64) -> KeyLookup {
+        self.0
+            .get(kid)
+            .cloned()
+            .map_or(KeyLookup::NotHeld, |k| KeyLookup::Held(Box::new(k)))
+    }
+
+    fn key_of(&self, kid: &Digest32, _iss: &Digest32) -> KeyOf {
+        if self.0.contains_key(kid) {
+            KeyOf::Yes
+        } else {
+            KeyOf::No
+        }
+    }
+}
+
+/// A named row's own refusal, as the bundle's: the row's token, the message
+/// naming the bundle and the row.
+fn named_row_refused(object: &Digest32, row: &Digest32, e: Error) -> Error {
+    match e {
+        Error::MalformedRow {
+            plane,
+            reason,
+            message,
+        } => Error::malformed_row(
+            plane,
+            reason,
+            format!(
+                "bundle {} names row {}, which its own door refuses (a row is the same row \
+                 inside a bundle and alone): {message}",
+                hex::encode(object),
+                hex::encode(row)
+            ),
+        ),
+        other => other,
+    }
+}
+
+/// **The named rows' own doors** (CC ruling (a): "a row is the same row
+/// inside a bundle and alone"). Each named row not held is admitted by the
+/// edition-2 door (`door::admit_row`: form, size, Verify's verdict in its
+/// family, the key-of-issuer check, the row id, the key-record end rule)
+/// under the keys the bundle places, then its closed payload is checked
+/// (`payloads::check`). A seat binding's occurrence gates that read the
+/// store alone (acts-for, the clock-skew bound) are answered by the
+/// placement and the host clock. Nothing is read or stored. The rows come back
+/// key plane first, so a row a named key signs follows that key's record.
+///
+/// # Errors
+/// The first named row's refusal, under the row's own token
+/// ([`named_row_refused`]).
+fn admit_named(
+    object: &Digest32,
+    p: &GenesisPlacement,
+    named: &[Digest32],
+    rows: &BTreeMap<Digest32, Vec<u8>>,
+    held: &BTreeSet<Digest32>,
+) -> Result<Vec<AdmittedRow>, Error> {
+    let keys = BundleKeys::of(p, named, rows);
+    let mut out = Vec::new();
+    for id in named {
+        if held.contains(id) {
+            continue;
+        }
+        let Some(bytes) = rows.get(id) else {
+            continue;
+        };
+        let a = super::door::admit_row(bytes, &keys, Some(id), SelectContext::default())
+            .map_err(|e| named_row_refused(object, id, e))?;
+        super::payloads::check(&a.family, &a.payload)
+            .map_err(|e| named_row_refused(object, id, e))?;
+        if a.family == BINDING_FAMILY {
+            // The occurrence door's store-reading gates, answered by the
+            // placement: the binding's author acts for its identity because
+            // the bundle seats that key for it (CC 2.6.1.11), and its
+            // instant is not ahead of this node's clock.
+            if !p
+                .seats
+                .iter()
+                .any(|s| s.identity_ref == a.iss && s.kid == a.kid)
+            {
+                return Err(named_row_refused(
+                    object,
+                    id,
+                    refuse(
+                        token::ROW_INVALID,
+                        "row_signer: the binding is not signed by the key the bundle places \
+                         for its seat",
+                    ),
+                ));
+            }
+            let at = i64::try_from(a.asserted_at_ms)
+                .ok()
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .ok_or_else(|| {
+                    named_row_refused(
+                        object,
+                        id,
+                        refuse(
+                            malformed_row::EDITION2_PAYLOAD_INVALID,
+                            "`asserted_at` is not an instant",
+                        ),
+                    )
+                })?;
+            crate::federation::operational::check_skew_bound(at, crate::host::clock::now())
+                .map_err(|e| named_row_refused(object, id, e))?;
+        }
+        out.push(a);
+    }
+    out.sort_by_key(|a| !(a.family == KEY_RECORD_FAMILY || a.family == KEY_REVOCATION_FAMILY));
+    Ok(out)
+}
+
+/// A test seam on [`GenesisWrite`]: a backend fails the transaction after
+/// every write and before the commit. Always [`WriteFault::None`] outside
+/// the witnesses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WriteFault {
+    /// No fault.
+    #[default]
+    None,
+    /// Fail after every write, before the commit (the rollback witness).
+    BeforeCommit,
+}
+
+/// **What a placed genesis offer writes, in ONE backend transaction**
+/// ([`FederationDirectory::put_edition2_genesis`]): all or nothing. The
+/// backend answers whether each planned occurrence's upsert applied, in
+/// order.
+#[derive(Clone, Debug, Default)]
+pub struct GenesisWrite {
+    /// Each named row its own door admitted, key plane first
+    /// (`ceg_statements`, `ceg_row_names`).
+    pub rows: Vec<AdmittedRow>,
+    /// The read models of the keys the bundles place (`federation_keys`,
+    /// `federation_revocations`).
+    pub keys: super::projection::ProjectionSet,
+    /// Each kept bundle voice (`ceg_statements`, typ `ceg-genesis-bundle/2`).
+    pub objects: Vec<HeldObject>,
+    /// Each seat binding's typed occurrence row (`federation_identity_
+    /// occurrences` + its history), planned by the occurrence door's own
+    /// plan (wave O1), written in the same transaction.
+    pub(crate) occurrences: Vec<crate::federation::occurrence_admit::PlannedOccurrence>,
+    /// The witnesses' seam.
+    pub fault: WriteFault,
+}
+
+/// The read models of the keys a placement seats, derived from the held key
+/// plane plus the offer's admitted key records, with the placement's seats
+/// answering whose each placed key is (`HeldKeys::with_seats`). Reads only.
+async fn plan_keys<F>(
+    dir: &F,
+    p: &GenesisPlacement,
+    rows: &[AdmittedRow],
+    into: &mut super::projection::ProjectionSet,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let placed: Vec<(String, Digest32)> = p
+        .holders
+        .iter()
+        .map(|h| (h.identity_ref.clone(), h.kid))
+        .chain(p.seats.iter().map(|s| (s.identity_ref.clone(), s.kid)))
+        .chain(p.witnesses.iter().map(|w| (w.identity_ref.clone(), w.kid)))
+        .collect();
+    let seats = BundleSeats::held(placed.iter().cloned());
+    for (_, kid) in &placed {
+        let mut held = super::ingest::held_keys_for_kid(dir, kid)
+            .await?
+            .with_seats(seats.clone());
+        for r in rows.iter().filter(|r| r.family == KEY_RECORD_FAMILY) {
+            held.insert_record(r.bytes.clone());
+        }
+        let set = super::projection::projection_set(&held, kid)?;
+        for k in set.keys {
+            if !into.keys.iter().any(|x| x.key_id == k.key_id) {
+                into.keys.push(k);
+            }
+        }
+        for r in set.revocations {
+            if !into
+                .revocations
+                .iter()
+                .any(|x| x.revocation_id == r.revocation_id)
+            {
+                into.revocations.push(r);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// **The genesis door.**
+///
+/// `statements` carries bundle voices (one or more objects: a lineage may
+/// travel whole) and the rows they name, in any order; rows already held
+/// need not be sent. `anchor` roots a first bundle not already held (CC
+/// 5.3.4); `None` roots nothing new.
+///
+/// Each offered bundle Verify reads Valid is stored: its named rows, then
+/// its voices in `ceg_statements` (typ `ceg-genesis-bundle/2`; `row_type`,
+/// `family`, `sub` NULL). Nothing of an offered bundle that is not Valid is
+/// stored.
+///
+/// A named row is the same row inside a bundle and alone (CC ruling (a)):
+/// before anything is stored, each named row not held passes its own door
+/// under the keys the bundle places ([`admit_named`]). Then the rows, the
+/// placed keys' read models and the voices are written in ONE backend
+/// transaction ([`GenesisWrite`]): a failure anywhere leaves nothing.
+///
+/// # Errors
+/// - a named row its own door refuses: the WHOLE offer is refused under the
+///   row's own token (e.g. `edition2_payload_invalid` for a seat binding
+///   without `device_class`), and nothing is stored;
+///
+/// and only when no offered bundle is placed:
+/// - `earlier_form_object` for a statement of the earlier form (a bundle/1
+///   JSON object included);
+/// - `genesis_bundle_malformed` when no `ceg-genesis-bundle/2` voice is
+///   offered, and for an Invalid bundle (Verify's reason first in the
+///   message);
+/// - the retryable unknown-signer error (`federation_attester_key_unknown`)
+///   for a bundle waiting on a named row or its predecessor;
+/// - Verify's token for a bundle that concludes nothing:
+///   `genesis_bundle_not_anchored`, `genesis_bundle_prev_not_valid`,
+///   `genesis_bundle_row_unplaced`, `genesis_bundle_row_invalid`,
+///   `genesis_holder_custody`, `genesis_bundle_count_unmet`;
+/// - storage failures (at any time).
+pub async fn put_genesis_bundle<F>(
+    dir: &F,
+    statements: &[Vec<u8>],
+    anchor: Option<&Anchor>,
+) -> Result<GenesisAdmission, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    put_genesis_bundle_with(dir, statements, anchor, WriteFault::None).await
+}
+
+/// [`put_genesis_bundle`] with a write fault injected (the witnesses' seam).
+pub(crate) async fn put_genesis_bundle_with<F>(
+    dir: &F,
+    statements: &[Vec<u8>],
+    anchor: Option<&Anchor>,
+    fault: WriteFault,
+) -> Result<GenesisAdmission, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut offered: Vec<Vec<u8>> = Vec::new();
+    let mut carried: BTreeMap<Digest32, Vec<u8>> = BTreeMap::new();
+    let mut unreadable = Vec::new();
+    for (i, s) in statements.iter().enumerate() {
+        super::door::require_statement_form(s)?;
+        let parts = cose_parts(s);
+        if parts.as_ref().and_then(voice_of).is_some() {
+            // v62.0.0 (kernel pass 2, K1) — a stated window covers some
+            // instant (bundle object voices too).
+            if let Some(p) = parts.as_ref() {
+                super::door::check_valid_until_after_asserted_at(&p.payload)?;
+            }
+            offered.push(s.clone());
+        } else if let Some(id) = RowId::of_statement(s) {
+            carried.entry(id.0).or_insert_with(|| s.clone());
+        } else {
+            unreadable.push(i);
+        }
+    }
+    if offered.is_empty() {
+        return Err(refuse(
+            token::MALFORMED,
+            "no_voice: the statements carry no `ceg-genesis-bundle/2` voice",
+        ));
+    }
+    let held = dir.edition2_objects(GENESIS_BUNDLE_TYP).await?;
+    let every: Vec<Vec<u8>> = held.iter().chain(offered.iter()).cloned().collect();
+    let (rows, held_rows) = named_rows(dir, &every, &carried).await?;
+    let roots = attestation_roots();
+    let reading = read_lineage(&LineageInput {
+        held: &held,
+        offered: &offered,
+        rows: &rows,
+        anchor,
+        attestation_roots: &roots,
+    });
+    // Every Valid offered bundle's named rows pass their own doors BEFORE
+    // anything is stored: a bundle naming a row the door would refuse alone
+    // is refused whole.
+    let mut plans = Vec::new();
+    let mut refused = Vec::new();
+    for o in &reading.objects {
+        if !o.offered {
+            continue;
+        }
+        if let Some(n) = not_placed(o.reading.object_id, &o.reading.verdict) {
+            refused.push(n);
+            continue;
+        }
+        let Some(p) = o.reading.verdict.placement() else {
+            continue;
+        };
+        let admitted = admit_named(&o.reading.object_id, p, &o.named, &rows, &held_rows)?;
+        plans.push((o, p, admitted));
+    }
+    // The keys' read models, derived now (reads only) with the bundle's
+    // placement in view: its seats answer whose each placed key is.
+    let mut write = GenesisWrite {
+        fault,
+        ..GenesisWrite::default()
+    };
+    let mut placed = Vec::new();
+    let mut seen_rows = BTreeSet::new();
+    for (o, p, admitted) in plans {
+        for a in &admitted {
+            if seen_rows.insert(a.row_id) {
+                write.rows.push(a.clone());
+            }
+        }
+        for v in &o.kept {
+            if let Some(obj) = held_object(o.reading.object_id, v) {
+                write.objects.push(obj);
+            }
+        }
+        placed.push(p.clone());
+    }
+    if placed.is_empty() {
+        return Err(refused.first().map_or_else(
+            || {
+                refuse(
+                    token::MALFORMED,
+                    "no_voice: no offered statement is a readable bundle voice",
+                )
+            },
+            error_of,
+        ));
+    }
+    for p in &placed {
+        plan_keys(dir, p, &write.rows, &mut write.keys).await?;
+    }
+    // Each seat binding's typed occurrence row, planned by the occurrence
+    // door's own plan (pure): the bundle's count is its author's authority.
+    let mut after = Vec::new();
+    for a in write.rows.iter().filter(|a| a.family == BINDING_FAMILY) {
+        let occurrence = super::occurrence::read_payload(a)?;
+        let pair = (
+            occurrence.identity_key_id.clone(),
+            occurrence.occurrence_key_id.clone(),
+        );
+        let bind = super::occurrence::OccurrenceBind {
+            occurrence,
+            author_key_id: ciris_verify_core::edition2::identity_ref(&a.kid),
+            row_id: a.row_id,
+            statements: vec![a.bytes.clone()],
+        };
+        let (planned, route) = crate::federation::occurrence_admit::plan_edition2_occurrence(bind)?;
+        write.occurrences.push(planned);
+        after.push((pair, route));
+    }
+    // Every row, every key read model, every occurrence row and every voice:
+    // one transaction. It answers whether each occurrence upsert applied.
+    let applied = dir.put_edition2_genesis(&write).await?;
+    // The routes the bindings project go through their own door after the
+    // commit (wave O1's `after_edition2_occurrence`: the route when the
+    // upsert applied; no re-wrap for a seat, whose pair is itself). A
+    // failure here leaves the genesis held and the route re-projectable.
+    for (((identity, occurrence), route), applied) in after.iter().zip(applied) {
+        crate::federation::occurrence_admit::after_edition2_occurrence(
+            dir,
+            applied,
+            identity,
+            occurrence,
+            route.as_ref(),
+        )
+        .await?;
+    }
+    // v62.0.0 (wave G0; CC 2.7.3) — the bundle's rows are inputs like any
+    // other: every held or concluded row whose fold read what they touch is
+    // re-folded (they bypass `put_statement`, whose tail does this).
+    let mut touched = std::collections::BTreeSet::new();
+    for row in &write.rows {
+        touched.extend(super::fold::touches(row));
+    }
+    Box::pin(super::fold::refold_touched(dir, touched)).await?;
+    let in_force = genesis_in_force(dir).await?;
+    Ok(GenesisAdmission {
+        placed,
+        not_placed: refused,
+        unreadable,
+        in_force,
+    })
 }

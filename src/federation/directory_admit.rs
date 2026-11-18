@@ -7,8 +7,8 @@
 //! [`DirectoryStore`]: the SQL, the serve position, the transaction. It
 //! decides nothing. The peer add's held-row verdict runs INSIDE the
 //! executor's transaction (a conflict rolls the key row back with it), so it
-//! is a shared plan the executor re-asks ([`peer_record_held_verdict`]), the
-//! `recheck_cycle_under_lock` shape.
+//! is a shared plan the executor re-asks ([`peer_record_held_verdict`]) (the
+//! shape of the v54 cycle re-ask, deleted in v62.0.0).
 //!
 //! # Which instant each plan reads
 //!

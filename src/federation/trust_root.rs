@@ -780,6 +780,19 @@ where
     F: FederationDirectory + ?Sized,
 {
     let Some(rec) = directory.lookup_public_key(key_id).await? else {
+        // v62.0.0 (wave W1b; CC 4.2.2.1 "checked where a holder is seated")
+        // — a holder of the genesis bundle in force had its custody (class,
+        // `pq_custody`, attestation chain) gated by the bundle reader when it
+        // was seated, whatever this node's key read model holds.
+        if super::edition2::trust_root_group::is_bundle_holder(directory, key_id).await? {
+            return Ok(HolderHardware {
+                key_id: key_id.to_owned(),
+                class: None,
+                layer_a: true,
+                layer_b: None,
+                refusal: None,
+            });
+        }
         return Ok(HolderHardware {
             key_id: key_id.to_owned(),
             class: None,
@@ -911,6 +924,75 @@ pub struct TrustRootVerdict {
     /// byte-identically to before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounded_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// v62.0.0 (wave W1b; E9 finding 3, CC 2.7) — why an id that holds a
+    /// trust-root COMMUNITY record is not valid: its community chain does not
+    /// root (a short birth count, a founder that no longer counts). Such an
+    /// id never takes the key arm. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_rooted: Option<String>,
+}
+
+/// v62.0.0 (wave W1b; E9 finding 3) — the verdict for an id that holds a
+/// trust-root COMMUNITY record whose chain does not root: not valid, by name,
+/// every leg unestablished. The root's identity-ref is also a key with a
+/// charter self-edge, so the KEY arm at the same id would read it as a 1-of-1
+/// key root and defeat the founders' threshold: it is never taken.
+fn community_not_rooted_verdict(reason: String) -> TrustRootVerdict {
+    TrustRootVerdict {
+        edge_exists: false,
+        root_self_declares: false,
+        charter_has_recovery: false,
+        last_drill_at: None,
+        drill_freshness: DrillFreshness::Red,
+        halt_latched: None,
+        valid: false,
+        root_kind: RootKind::Community,
+        charter_quorum: None,
+        holders_hardware: Vec::new(),
+        holders_hardware_attested: false,
+        bounded_until: None,
+        not_rooted: Some(reason),
+    }
+}
+
+/// v62.0.0 (wave W1b; E9 finding 3) — `Some(reason)` when `root_ref` holds a
+/// trust-root COMMUNITY record (trust-root grade) whose chain does not root
+/// now; the caller must not take the key arm. `None` when no such record is
+/// held.
+async fn community_record_not_rooted<F>(
+    directory: &F,
+    root_ref: &str,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(c) = directory.lookup_community(root_ref).await? else {
+        return Ok(None);
+    };
+    if !super::canonical_community::is_trust_root_grade(&c) {
+        return Ok(None);
+    }
+    use super::canonical_community::StoredStanding;
+    let why = match super::canonical_community::chain_standing_at(
+        directory,
+        root_ref,
+        crate::host::clock::now(),
+    )
+    .await?
+    {
+        StoredStanding::NotRooted { reason } => reason,
+        StoredStanding::Absent => "no community row".to_owned(),
+        StoredStanding::Rooted(_) | StoredStanding::Stalled { .. } => {
+            // Rooted by its chain but not by this reader's arm (an
+            // earlier-form chain while the earlier-form doors are shut).
+            "the community chain is not read on this node (the earlier form is shut)".to_owned()
+        }
+    };
+    Ok(Some(format!(
+        "{root_ref:?} holds a trust-root community record whose chain does not root: {why}. \
+         Its validity comes only from that chain; the key at the same id is never a root \
+         (CC 2.7)"
+    )))
 }
 
 /// v24.1.0 (CIRISPersist#561) — the EARLIER of two expiry bounds, treating
@@ -1265,6 +1347,30 @@ pub(crate) async fn family_quorum_holders_over<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave V1, I3280) — a row carrying its edition-2 statement is
+    // counted by its VOICES (the separate statements over its payload, held
+    // in `ceg_statements`), never by an `additional_scrubs` set it does not
+    // have. The roster, threshold and counted set are read as before; only
+    // the "who signed" step changes. An earlier-form row keeps the scrub
+    // count behind the earlier-form switch (`edition2::voices`).
+    if super::edition2::voices::carried_row_id(row).is_some()
+        || super::edition2::door::earlier_form_doors_shut()
+    {
+        let roster: Vec<String> = match directory.active_family_members(&family.family_key_id).await
+        {
+            Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
+            Err(Error::Unsupported { .. }) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let counted =
+            super::edition2::voices::counted_roster_signers(directory, row, &roster).await?;
+        let quorum = CharterQuorum {
+            distinct_holders: counted.len(),
+            required: family_charter_threshold(family, roster.len()),
+            roster_size: roster.len(),
+        };
+        return Ok((quorum, counted));
+    }
     family_quorum_holders_over_envelope(directory, &row.attestation_envelope, &row.scrubs(), family)
         .await
 }
@@ -1419,6 +1525,203 @@ where
     .await
 }
 
+/// v62.0.0 (wave W1b) — THIS node's own T3 chain to a root
+/// ([`own_chain_to`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnChain {
+    /// A live `trust:accepts:v1` edge to the root from the node's owner, or,
+    /// while the owner has signed no acceptance edge at all, from the node.
+    pub accepted: bool,
+    /// The root's live `trust:charter:v1` self-edge (`delegates_to(root →
+    /// root)`, scope `infra:serve` and `infra:attest`) carrying a well-formed
+    /// pre-rotation commitment.
+    pub chartered: bool,
+}
+
+/// The live acceptance edge leg of `user` to `root` (the kernel's one-hop
+/// walk over the user's labelled edges and their composers), and whether
+/// `user` holds any `trust:accepts:v1` row at all.
+async fn acceptance_of<F>(
+    directory: &F,
+    user: &str,
+    root: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(bool, bool), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let edge_types = [attestation_type::DELEGATES_TO, attestation_type::SUPERSEDES];
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::by(user, FOLD_PAGE)
+        .types(&edge_types)
+        .excluding_dimensions(&jobs_other_than(TRUST_ACCEPTS_DIMENSION))
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    let signed_any = rows.iter().any(|a| {
+        a.attestation_type == attestation_type::DELEGATES_TO
+            && super::admission::envelope_dimension(&a.attestation_envelope)
+                == Some(TRUST_ACCEPTS_DIMENSION)
+    });
+    let by_user = with_slice_composers(directory, rows, None, Some(user)).await?;
+    let edge = kernel_edge_leg(directory, &by_user, user, root, now).await?;
+    Ok((edge.value, signed_any))
+}
+
+/// v62.0.0 (wave W1b; CC 3.2 T3, CC 4.4.3.34) — **THIS node's own T3 chain to
+/// `root`**: the node is its own seed. The acceptance is its owner's (CC 3.2
+/// "Acceptance is the owner's"): the owner's edge governs once the owner has
+/// signed any acceptance edge; until then the node's own edge is read. An
+/// ambiguous owner reads as unowned. No node key: nothing is accepted (the
+/// directory cannot verify on anyone's behalf). The charter leg is the
+/// root's own LABELLED self-edge (CC 3.2 T4a: a row with no label is no
+/// charter). Reads rows only: it never resolves a community arm, so a
+/// standing read may call it.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn own_chain_to<F>(
+    directory: &F,
+    root: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<OwnChain, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let accepted = match directory.node_key_id() {
+        None => false,
+        Some(node) => {
+            let owner = match super::admission::owner_of_unmarked(directory, &node).await {
+                Ok(o) => o,
+                Err(Error::AmbiguousNodeOwner { .. }) => None,
+                Err(e) => return Err(e),
+            };
+            let by_owner = match owner.as_deref() {
+                Some(o) if o != node => Some(acceptance_of(directory, o, root, now).await?),
+                _ => None,
+            };
+            match by_owner {
+                Some((edge, true)) => edge,
+                _ => acceptance_of(directory, &node, root, now).await?.0,
+            }
+        }
+    };
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::by(root, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO])
+        .excluding_dimensions(&jobs_other_than(TRUST_CHARTER_DIMENSION))
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    let by_root = with_slice_composers(directory, rows, None, Some(root)).await?;
+    let refs: Vec<&Attestation> = by_root.iter().collect();
+    let dead = tombstoned_ids(&refs);
+    let chartered = by_root.iter().any(|a| {
+        a.attestation_type == attestation_type::DELEGATES_TO
+            && a.attesting_key_id == root
+            && a.attested_key_id == root
+            && !dead.contains(&a.attestation_id)
+            && !is_expired(a, now)
+            && counts_in_capability_walk(a)
+            && super::admission::envelope_dimension(&a.attestation_envelope)
+                == Some(TRUST_CHARTER_DIMENSION)
+            && scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
+            && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
+            && charter_commitment_well_formed(&a.attestation_envelope)
+    });
+    Ok(OwnChain {
+        accepted,
+        chartered,
+    })
+}
+
+/// v62.0.0 (wave W1b; RULINGS "a conformant infrastructure record rooted in
+/// THIS node's trust set", CC 3.2 T3, CC 4.4.3.34) — **is the edition-2
+/// infrastructure room `room` reached by THIS node's own trust walk?**
+///
+/// Yes when a root this node holds ROOTED (`stored_standing_at`: its chain,
+/// this node's own acceptance edge and its charter; `Stalled` is still valid,
+/// CC 3.2 T7) is:
+/// - the room itself; or
+/// - the author of the `trust:charter:v1` row the room's record cites
+///   (`charter_digest`, the roster's `refs.also.cites`); or
+/// - the source of a live `trust:confers:v1` edge `delegates_to(root →
+///   room)`.
+///
+/// No node key: nothing is reached (the directory cannot verify on anyone's
+/// behalf).
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn infrastructure_reached_here<F>(
+    directory: &F,
+    room: &super::types::Community,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::canonical_community::{stored_standing_at, StoredStanding};
+    if directory.node_key_id().is_none() {
+        return Ok(false);
+    }
+    let id = room.community_key_id.as_str();
+    let rooted = |s: &StoredStanding| {
+        matches!(
+            s,
+            StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }
+        )
+    };
+    if rooted(&stored_standing_at(directory, id, now).await?) {
+        return Ok(true);
+    }
+    let mut roots: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if !room.charter_digest.is_empty() {
+        if let Some(c) = directory.get_attestation(&room.charter_digest).await? {
+            if c.attestation_type == attestation_type::DELEGATES_TO
+                && c.attesting_key_id == c.attested_key_id
+                && super::admission::envelope_dimension(&c.attestation_envelope)
+                    == Some(TRUST_CHARTER_DIMENSION)
+            {
+                roots.insert(c.attesting_key_id);
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(id, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO])
+        .dimension(TRUST_CONFERS_DIMENSION)
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    let about = with_slice_composers(directory, rows, Some(id), None).await?;
+    let refs: Vec<&Attestation> = about.iter().collect();
+    let dead = tombstoned_ids(&refs);
+    for a in &about {
+        if a.attestation_type == attestation_type::DELEGATES_TO
+            && a.attested_key_id == id
+            && a.attesting_key_id != id
+            && !dead.contains(&a.attestation_id)
+            && !is_expired(a, now)
+            && super::admission::envelope_dimension(&a.attestation_envelope)
+                == Some(TRUST_CONFERS_DIMENSION)
+        {
+            roots.insert(a.attesting_key_id.clone());
+        }
+    }
+    for r in roots {
+        if r != id && rooted(&stored_standing_at(directory, &r, now).await?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// v62.0.0 (slice C) — **the edge leg, through the kernel**
 /// ([`crate::kernel::trust`]). Persist's reads decide which of the user's rows
 /// are candidates (toward the root, federation tier, not expired at `now`,
@@ -1448,11 +1751,12 @@ where
     // same root); the user's other rows are no part of this edge
     let candidates: Vec<&Attestation> = by_user.iter().filter(|a| shaped(a)).collect();
     if candidates.is_empty() {
-        return Ok(crate::kernel::Answer {
-            value: false,
-            rows: Vec::new(),
-            rule: "trust::reaches/1",
-        });
+        return Ok(crate::kernel::Answer::reading(
+            false,
+            Vec::new(),
+            vec![crate::kernel::DepKey::Standing(user_key_id.to_owned())],
+            "trust::reaches/1",
+        ));
     }
     // a rotation reaches back through the grants it replaces, whatever their
     // own expiry: the chain's links are read too (CC 3.2 T2)
@@ -1576,6 +1880,7 @@ where
             holders_hardware: Vec::new(),
             holders_hardware_attested: false,
             bounded_until: None,
+            not_rooted: None,
         });
     }
 
@@ -1605,6 +1910,16 @@ where
         }
     }
     let legs_ref = legs_ref.as_str();
+    // v62.0.0 (wave W1b; E9 finding 3, security) — an id that holds a
+    // trust-root COMMUNITY record never takes the KEY arm: its validity comes
+    // only from its community chain, and a chain that does not root is not
+    // valid, by name. Else a community whose founders' count went short would
+    // read valid as the 1-of-1 key root at its own identity-ref.
+    if root_kind == RootKind::Key {
+        if let Some(reason) = community_record_not_rooted(directory, root_ref).await? {
+            return Ok(community_not_rooted_verdict(reason));
+        }
+    }
 
     // One read per authority: the user's edges (+ their tombstones — a
     // withdraws on your own edge is attested by YOU), the root's
@@ -1835,6 +2150,18 @@ where
     // class this node pins a root for (Layer B). Evaluated where the root is
     // judged, from the node's own records — never from a payload the caller
     // carried.
+    // v62.0.0 (wave W1b; CC 4.2.2.1) — an EDITION-2 trust root (the
+    // community arm with no family: the root is its own root) is as attested
+    // as its FOUNDERS: the holders it seats, each judged on its key record's
+    // custody evidence, not the root's own key that signs its charter.
+    if root_kind == RootKind::Community && family.is_none() {
+        if let Some(c) = directory.lookup_community(legs_ref).await? {
+            charter_holders = super::canonical_community::founders(&c)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+        }
+    }
     let policy = directory.hardware_attestation_policy();
     let mut holders_hardware: Vec<HolderHardware> = Vec::with_capacity(charter_holders.len());
     for holder in &charter_holders {
@@ -1926,6 +2253,7 @@ where
         holders_hardware,
         holders_hardware_attested,
         bounded_until: bounded_until.flatten(),
+        not_rooted: None,
     })
 }
 
@@ -2357,13 +2685,17 @@ where
     // Runs AFTER the delegation loop: delegation grants are the specific,
     // cheap path (no quorum crypto); the ceremony check costs a 2-of-3
     // hybrid verification, so cheapest-first ordering holds here too.
-    if super::admission::has_accord_conferred_role_over_roster(
-        directory,
-        subject_key_id,
-        scope,
-        accord_roster_key_ids,
-    )
-    .await?
+    // v62.0.0 (wave W1b; CC 2.6.1.12) — the ceremony plane is the earlier
+    // form's (a co-scrub on a JSON key record): read only while its doors
+    // are open. Edition 2 confers by the delegation rows above.
+    if !super::edition2::door::earlier_form_doors_shut()
+        && super::admission::has_accord_conferred_role_over_roster(
+            directory,
+            subject_key_id,
+            scope,
+            accord_roster_key_ids,
+        )
+        .await?
     {
         let verdict = trust_root_valid(directory, user_key_id, subject_key_id).await?;
         if verdict.valid {
@@ -3265,7 +3597,18 @@ pub(crate) async fn transit_eligibility_walk(
     }
 
     // (C) it self-offers transport.
-    if !peer.claims_role(delegation_scope::INFRA_TRANSPORT) {
+    // v62.0.0 (wave W1b; CC 3.3.6.2 "a node that relays carries one transit
+    // public key `transit_xwing_pubkey` on this `transport_destination`
+    // binding") — in edition 2 a key record carries no roles: the offer is a
+    // live transit key (its occurrence binding, or a seat's bundle binding or
+    // counted re-bind). The earlier form's `infra:transport` role claim is read
+    // only while the earlier-form doors are open.
+    let offers_transport = super::self_at_login::transit_xwing_pubkey_for(directory, peer_key_id)
+        .await?
+        .is_some()
+        || (!super::edition2::door::earlier_form_doors_shut()
+            && peer.claims_role(delegation_scope::INFRA_TRANSPORT));
+    if !offers_transport {
         return Ok((TransitEligibility::denied(), 0));
     }
 
@@ -3465,6 +3808,9 @@ where
 
     let quorum = family_quorum_over(directory, row, &family).await?;
     if !quorum.met() {
+        // v62.0.0 (wave V1b) — short of the family's quorum: an edition-2
+        // charter waits for its holders' voices (`Pending`).
+        super::edition2::voices::note_short();
         return refuse(format!(
             "family charter for {} is signed by {} — the accord's own \
              consensus_protocol {:?} makes this root a threshold, not a seat, and a \
@@ -3948,19 +4294,45 @@ where
     // reason to suppress the error. Asked once, here, so both rungs inherit it.
     let owner = super::admission::owner_of(directory, subject_key_id).await?;
 
+    // ── Canonical, edition 2: a bundle seat whose owner is announced ──
+    //
+    // v62.0.0 (ruling C; v62 security ruling "A serve-seat node needs an
+    // announced owner"; CC rc20 5.4.6). An edition-2 key is canonical by its
+    // seat in `serve_nodes` of the genesis bundle in force, and it carries no
+    // `roles`, so the earlier-form rung below never answers for it. The seat
+    // alone is not serve standing: "While no such binding exists the node
+    // does not serve under the seat". `serves_under_seat` asks both, live.
+    // The bundle in force is the one THIS store holds, i.e. the resolver's
+    // own anchor, which is leg B's question for an edition-2 seat.
+    if ciris_verify_core::edition2::is_identity_ref(subject_key_id)
+        && super::admission::serves_under_seat(directory, subject_key_id).await?
+    {
+        return Ok(ServeTier::Canonical);
+    }
+
     // ── Canonical: leg A ∧ leg B, both already spelled once elsewhere ──
     //
     // Composed rather than re-derived. Persist has spent several releases
     // paying for parallel spellings of one projection (#750 most recently),
     // and a second copy of "is this key canonical" would drift the first time
     // either leg gained a condition.
-    if super::admission::has_accord_conferred_role_over_roster(
-        directory,
-        subject_key_id,
-        INFRA_SERVE_SCOPE,
-        roster_key_ids,
-    )
-    .await?
+    // v62.0.0 (wave W1b; ruling C, CC 2.6.1.11 / 4.4.3.4) — canonical
+    // standing is a seat of the genesis bundle in force: an identity-ref in
+    // its `serve_nodes` (C1's reader), a conferral counted by the accord's
+    // holders, never a key type.
+    if super::edition2::genesis::is_canonical_by_bundle(directory, subject_key_id).await? {
+        return Ok(ServeTier::Canonical);
+    }
+    // The earlier form's ceremony plane (an accord co-scrub on a JSON key
+    // record), only while the earlier-form doors are open (CC 2.6.1.12).
+    if !super::edition2::door::earlier_form_doors_shut()
+        && super::admission::has_accord_conferred_role_over_roster(
+            directory,
+            subject_key_id,
+            INFRA_SERVE_SCOPE,
+            roster_key_ids,
+        )
+        .await?
         && capability_roots_to_trusted_root_over_roster(
             directory,
             resolver_key_id,
@@ -4633,6 +5005,7 @@ pub(crate) mod v53_1_6_reference {
                 holders_hardware: Vec::new(),
                 holders_hardware_attested: false,
                 bounded_until: None,
+                not_rooted: None,
             });
         }
 
@@ -4663,6 +5036,16 @@ pub(crate) mod v53_1_6_reference {
             }
         }
         let legs_ref = legs_ref.as_str();
+        // v62.0.0 (wave W1b; E9 finding 3, security) — an id that holds a
+        // trust-root COMMUNITY record never takes the KEY arm: its validity comes
+        // only from its community chain, and a chain that does not root is not
+        // valid, by name. Else a community whose founders' count went short would
+        // read valid as the 1-of-1 key root at its own identity-ref.
+        if root_kind == RootKind::Key {
+            if let Some(reason) = community_record_not_rooted(directory, root_ref).await? {
+                return Ok(community_not_rooted_verdict(reason));
+            }
+        }
 
         // One read per authority: everything the user attested (edges + their
         // tombstones — a withdraws on your own edge is attested by YOU), and
@@ -4844,6 +5227,18 @@ pub(crate) mod v53_1_6_reference {
         // class this node pins a root for (Layer B). Evaluated where the root is
         // judged, from the node's own records — never from a payload the caller
         // carried.
+        // v62.0.0 (wave W1b; CC 4.2.2.1) — an EDITION-2 trust root (the
+        // community arm with no family: the root is its own root) is as attested
+        // as its FOUNDERS: the holders it seats, each judged on its key record's
+        // custody evidence, not the root's own key that signs its charter.
+        if root_kind == RootKind::Community && family.is_none() {
+            if let Some(c) = directory.lookup_community(legs_ref).await? {
+                charter_holders = crate::federation::canonical_community::founders(&c)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+            }
+        }
         let policy = directory.hardware_attestation_policy();
         let mut holders_hardware: Vec<HolderHardware> = Vec::with_capacity(charter_holders.len());
         for holder in &charter_holders {
@@ -4936,6 +5331,7 @@ pub(crate) mod v53_1_6_reference {
             holders_hardware,
             holders_hardware_attested,
             bounded_until: bounded_until.flatten(),
+            not_rooted: None,
         })
     }
     pub(crate) async fn capability_roots_to_trusted_root_over_roster_reference<F>(
@@ -5150,7 +5546,19 @@ pub(crate) mod v53_1_6_reference {
         }
 
         // (C) it self-offers transport.
-        if !peer.claims_role(delegation_scope::INFRA_TRANSPORT) {
+        // v62.0.0 (wave W1b; CC 3.3.6.2 "a node that relays carries one transit
+        // public key `transit_xwing_pubkey` on this `transport_destination`
+        // binding") — in edition 2 a key record carries no roles: the offer is a
+        // live transit key (its occurrence binding, or a seat's bundle binding or
+        // counted re-bind). The earlier form's `infra:transport` role claim is read
+        // only while the earlier-form doors are open.
+        let offers_transport =
+            crate::federation::self_at_login::transit_xwing_pubkey_for(directory, peer_key_id)
+                .await?
+                .is_some()
+                || (!crate::federation::edition2::door::earlier_form_doors_shut()
+                    && peer.claims_role(delegation_scope::INFRA_TRANSPORT));
+        if !offers_transport {
             return Ok((TransitEligibility::denied(), 0));
         }
 

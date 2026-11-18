@@ -1197,7 +1197,7 @@ pub async fn owner_roots(
     // An ambiguous owner is `Error::AmbiguousNodeOwner`, which is a real
     // finding but not a reason to refuse to migrate; the node's own key record
     // still anchors the walk.
-    if let Ok(Some(owner)) = super::admission::owner_of(directory, self_key_id).await {
+    if let Ok(Some(owner)) = super::admission::owner_of_unmarked(directory, self_key_id).await {
         roots.push(ObjectRef::KeyRecord { key_id: owner });
     }
     Ok(roots)

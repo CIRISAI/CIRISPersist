@@ -1,0 +1,380 @@
+//! v62.0.0 (wave T2) — **the edition-2 twins of the remaining typed-plane
+//! builders** (`edition2::typed`): each takes the typed struct (or the
+//! earlier builder's inputs) and returns the statement it is, signed by an
+//! E0 seed (`fixture_switch`'s model: a seed, or an identity-ref E0 minted;
+//! the statement carries `kid_or_keep(..)` of every key id, and the signer
+//! signs with `signing_key(..)`). Store a twin with `e2::put_statement(d,
+//! &st)`; its row lands in the typed table of its family.
+//!
+//! | earlier builder / struct | twin |
+//! |---|---|
+//! | `fed_revocation` / a `SignedRevocation` (an entity with a key) | [`revocation_statement`] |
+//! | `FramedOccurrenceRevocation` / a carrier row (`carrier_row`) | [`occurrence_revocation_voice`], one per roster key |
+//! | a `takedown_notice:{basis}:v1` scores row | [`takedown_statement`] |
+//! | `custody_ack_envelope` + an emitted `custody:ack:v1` row | [`custody_statement`] |
+//! | `KeyGrantRow::emit_input` | [`key_grant_statement`] |
+//! | a `DeliveryReceipt` literal (`put_delivery_receipt`) | [`delivery_receipt_statement`] |
+//! | a `cosign:{pending,signature}:v1` row | [`cosign_statement`] (kept beside the event only) |
+
+use ciris_verify_core::cde::Value;
+use ciris_verify_core::edition2::{identity_ref, sign_row_statement, thumbprint};
+use ciris_verify_core::namespace_match;
+
+use super::fixture_switch::{kid_or_keep, signing_key};
+use super::names::RowId;
+use super::typed::{
+    cosign_payload, custody_payload, delivery_receipt_payload, key_grant_payload,
+    occurrence_revocation_payload, revocation_payload, takedown_payload, trust_accepts_payload,
+    withdraws_payload, NoticeText, COSIGN_PREFIX, CUSTODY_PREFIX, DELIVERY_RECEIPT_PREFIX,
+    KEY_GRANT_PREFIX, OCCURRENCE_REVOCATION_PREFIX, REVOCATION_PREFIX, TAKEDOWN_PREFIX,
+    TRUST_PREFIX,
+};
+use crate::federation::blobs::GrantWrap;
+use crate::federation::custody_ack::CustodyState;
+use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRow};
+use crate::federation::types::IdentityOccurrenceRevocation;
+
+/// Sign `payload` as `seed`'s statement under the family `family_prefix`
+/// (row type `scores`). `iss` is `kid_or_keep(iss)` when given (a key
+/// signing as an identity it is a seat of: an occurrence key as its
+/// identity), else the signer's own identity-ref. `sub` is
+/// `kid_or_keep(sub)`.
+///
+/// # Panics
+/// A payload with no `asserted_at`.
+#[must_use]
+pub fn typed_statement(
+    seed: &str,
+    iss: Option<&str>,
+    sub: &str,
+    family_prefix: &str,
+    payload: &Value,
+) -> Vec<u8> {
+    let key = signing_key(seed);
+    let iss = iss.map_or_else(|| identity_ref(&thumbprint(key.public_key())), kid_or_keep);
+    sign_row_statement(
+        &key,
+        &iss,
+        &kid_or_keep(sub),
+        "scores",
+        &namespace_match::family_id(family_prefix),
+        payload,
+        vec![],
+    )
+    .expect("typed_fixtures: sign a typed-plane statement")
+}
+
+/// The ms of an instant (fixtures never sign before 1970).
+fn ms(at: chrono::DateTime<chrono::Utc>) -> u64 {
+    u64::try_from(at.timestamp_millis()).expect("typed_fixtures: an instant after 1970")
+}
+
+/// One voice of an `identity:occurrence_revocation` row: `seed` signs the
+/// payload, as the identity (`iss` = `identity_key_id`, the counted voice of
+/// a roster key: CC 3.3.6.4) when `as_identity`, else as itself. Every
+/// voice states the same payload, authored by the identity, naming the
+/// self-roster `head` it is counted over (`refs.head`, REQUIRED, CC27 item
+/// 2). `head: None` names the identity's CURRENT head on `dir`
+/// (`occurrence::current_roster_head`, O1 v7: the latest LANDED roster
+/// row, else the genesis key's `key:record` row); a test of an older or unheld head
+/// passes it. `further_heads` names the further tips the row merges
+/// (`refs.further_heads`; empty for none). The occurrence is the row's `sub`; the struct's key ids are
+/// seeds or E0 kids.
+///
+/// # Panics
+/// An instant before 1970, or a current head that cannot be read (a
+/// fixture).
+pub async fn occurrence_revocation_voice<D: crate::federation::FederationDirectory + ?Sized>(
+    dir: &D,
+    seed: &str,
+    as_identity: bool,
+    rev: &IdentityOccurrenceRevocation,
+    head: Option<&RowId>,
+    further_heads: &[RowId],
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    let identity = kid_or_keep(&rev.identity_key_id);
+    let head = match head {
+        Some(h) => *h,
+        None => super::occurrence::current_roster_head(dir, &identity)
+            .await
+            .expect("typed_fixtures: read the identity's current self-roster head")
+            .expect("typed_fixtures: the identity has a self-roster head (its genesis record)"),
+    };
+    let mut r = rev.clone();
+    r.identity_key_id = identity.clone();
+    r.occurrence_key_id = kid_or_keep(&rev.occurrence_key_id);
+    r.witness_set = rev.witness_set.iter().map(|w| kid_or_keep(w)).collect();
+    let p =
+        occurrence_revocation_payload(&r, &identity, None, &head, further_heads, asserted_at_ms)
+            .expect("typed_fixtures: occurrence revocation payload");
+    typed_statement(
+        seed,
+        as_identity.then_some(identity.as_str()),
+        &r.occurrence_key_id,
+        OCCURRENCE_REVOCATION_PREFIX,
+        &p,
+    )
+}
+
+/// A `revocation:{entity_type}:{reason}:v1` statement by `revoker` about
+/// the key `subject` (seeds or E0 kids), authored by the revoker.
+///
+/// # Panics
+/// An instant before 1970.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn revocation_statement(
+    revoker: &str,
+    subject: &str,
+    entity_type: &str,
+    reason: &str,
+    revoked_at: chrono::DateTime<chrono::Utc>,
+    effective_at: chrono::DateTime<chrono::Utc>,
+    revoked_after: Option<chrono::DateTime<chrono::Utc>>,
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    let p = revocation_payload(
+        &kid_or_keep(revoker),
+        entity_type,
+        reason,
+        revoked_at,
+        effective_at,
+        revoked_after,
+        None,
+        None,
+        asserted_at_ms,
+    )
+    .expect("typed_fixtures: revocation payload");
+    typed_statement(revoker, None, subject, REVOCATION_PREFIX, &p)
+}
+
+/// A `takedown_notice:{basis}:v1` statement by `signer` (the claimant for
+/// a legal basis; one founder's voice for `steward_purge`, whose claimant is
+/// the trust root `claimant`). `holders` are seeds or E0 kids.
+///
+/// # Panics
+/// An instant before 1970.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn takedown_statement(
+    signer: &str,
+    basis: &str,
+    claimant: &str,
+    content_sha256: &[u8; 32],
+    holders: &[&str],
+    expires_at: chrono::DateTime<chrono::Utc>,
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    let holders: Vec<String> = holders.iter().map(|h| kid_or_keep(h)).collect();
+    let notice = NoticeText {
+        claim_text: "the content infringes the claimant's work".to_owned(),
+        good_faith_statement: "stated in good faith".to_owned(),
+        jurisdiction: "US".to_owned(),
+    };
+    let claimant = kid_or_keep(claimant);
+    let p = takedown_payload(
+        basis,
+        &claimant,
+        content_sha256,
+        &holders,
+        &notice,
+        ms(expires_at),
+        asserted_at_ms,
+    )
+    .expect("typed_fixtures: takedown payload");
+    typed_statement(signer, None, &claimant, TAKEDOWN_PREFIX, &p)
+}
+
+/// A `custody:ack:v1` report by `device` about `blob_sha256` (`here` with
+/// `size`, `none` without), placed at `cohort_scope` (`target` its group
+/// where the scope has one). The device is the row's `sub`.
+///
+/// # Panics
+/// A size/state or scope/target mismatch.
+#[must_use]
+pub fn custody_statement(
+    device: &str,
+    blob_sha256: &[u8; 32],
+    size: Option<u64>,
+    cohort_scope: &str,
+    target: Option<&str>,
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    let state = if size.is_some() {
+        CustodyState::Here
+    } else {
+        CustodyState::None
+    };
+    let target = target.map(kid_or_keep);
+    let p = custody_payload(
+        &kid_or_keep(device),
+        blob_sha256,
+        state,
+        size,
+        cohort_scope,
+        target.as_deref(),
+        asserted_at_ms,
+    )
+    .expect("typed_fixtures: custody payload");
+    typed_statement(device, None, device, CUSTODY_PREFIX, &p)
+}
+
+/// A `key_grant:{axis}:v1` statement by `signer`: `row`'s wrap to its
+/// recipient (the row's `sub`). Every key id in `row` (the axis's group,
+/// owner, minter, the recipient) is a seed or an E0 kid.
+///
+/// # Panics
+/// An `at_rest_sha256` that is not 64 hex.
+#[must_use]
+pub fn key_grant_statement(signer: &str, row: &KeyGrantRow, asserted_at_ms: u64) -> Vec<u8> {
+    let axis = match &row.axis {
+        KeyGrantAxis::Epoch {
+            community_key_id,
+            minter_key_id,
+            epoch,
+        } => KeyGrantAxis::Epoch {
+            community_key_id: kid_or_keep(community_key_id),
+            minter_key_id: kid_or_keep(minter_key_id),
+            epoch: *epoch,
+        },
+        KeyGrantAxis::Content {
+            at_rest_sha256,
+            cohort_scope,
+            owner_key_id,
+        } => KeyGrantAxis::Content {
+            at_rest_sha256: at_rest_sha256.clone(),
+            cohort_scope: cohort_scope.clone(),
+            owner_key_id: kid_or_keep(owner_key_id),
+        },
+        KeyGrantAxis::Stream {
+            stream_id,
+            epoch,
+            cohort_scope,
+            owner_key_id,
+        } => KeyGrantAxis::Stream {
+            stream_id: stream_id.clone(),
+            epoch: *epoch,
+            cohort_scope: cohort_scope.clone(),
+            owner_key_id: kid_or_keep(owner_key_id),
+        },
+    };
+    let recipient = kid_or_keep(&row.wrap.recipient_key_id);
+    let flipped = KeyGrantRow {
+        axis,
+        wrap: GrantWrap {
+            recipient_key_id: recipient.clone(),
+            wrap_algorithm: row.wrap.wrap_algorithm.clone(),
+            wrapped_dek: row.wrap.wrapped_dek.clone(),
+        },
+    };
+    let p = key_grant_payload(&kid_or_keep(signer), &flipped, asserted_at_ms)
+        .expect("typed_fixtures: key grant payload");
+    typed_statement(signer, None, &recipient, KEY_GRANT_PREFIX, &p)
+}
+
+/// A `delivery_receipt:{stream_id}:v1` statement by `subscriber` (the
+/// row's `sub`).
+#[must_use]
+pub fn delivery_receipt_statement(
+    subscriber: &str,
+    stream_id: &str,
+    epoch: u64,
+    k: u64,
+    chunk_root: &[u8; 32],
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    let p = delivery_receipt_payload(
+        &kid_or_keep(subscriber),
+        stream_id,
+        epoch,
+        k,
+        chunk_root,
+        asserted_at_ms,
+    );
+    typed_statement(subscriber, None, subscriber, DELIVERY_RECEIPT_PREFIX, &p)
+}
+
+/// A `cosign:{state}:v1` statement by `signer` naming the held event
+/// `event` (its row id); `sub` is the event's group.
+#[must_use]
+pub fn cosign_statement(
+    signer: &str,
+    state: &str,
+    sub: &str,
+    event: &RowId,
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    typed_statement(
+        signer,
+        None,
+        sub,
+        COSIGN_PREFIX,
+        &cosign_payload(state, event, asserted_at_ms),
+    )
+}
+
+/// [`typed_statement`] at a row type other than `scores`.
+///
+/// # Panics
+/// A payload with no `asserted_at`.
+#[must_use]
+pub fn typed_statement_as(
+    seed: &str,
+    row_type: &str,
+    sub: &str,
+    family_prefix: &str,
+    payload: &Value,
+) -> Vec<u8> {
+    let key = signing_key(seed);
+    let iss = identity_ref(&thumbprint(key.public_key()));
+    sign_row_statement(
+        &key,
+        &iss,
+        &kid_or_keep(sub),
+        row_type,
+        &namespace_match::family_id(family_prefix),
+        payload,
+        vec![],
+    )
+    .expect("typed_fixtures: sign a typed-plane statement")
+}
+
+/// `granter`'s `trust:accepts:v1` edge to `key` (seeds or E0 kids): the
+/// edition-2 twin of `grant_trust(SignedTrustGrant)`. `classes` are the
+/// v1.3 `trust_domains` (a Registry grant's); `valid_until` its
+/// `expires_at`; `cohort_scope` `self` makes it anonymous. Scope
+/// `infra:serve`, as the trust-root fixtures' acceptance edges.
+#[must_use]
+pub fn trust_accepts_statement(
+    granter: &str,
+    key: &str,
+    classes: &[&str],
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    cohort_scope: &str,
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    let classes: Vec<String> = classes.iter().map(|c| (*c).to_owned()).collect();
+    let p = trust_accepts_payload(
+        &kid_or_keep(granter),
+        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
+        &classes,
+        valid_until.map(ms),
+        cohort_scope,
+        asserted_at_ms,
+    );
+    typed_statement_as(granter, "delegates_to", key, TRUST_PREFIX, &p)
+}
+
+/// `granter`'s `withdraws` of its held edge `edge` to `key`: the edition-2
+/// twin of `revoke_trust(SignedTrustRevocation)`.
+#[must_use]
+pub fn trust_withdraws_statement(
+    granter: &str,
+    key: &str,
+    edge: &RowId,
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    let p = withdraws_payload(&kid_or_keep(granter), edge, asserted_at_ms);
+    typed_statement_as(granter, "withdraws", key, TRUST_PREFIX, &p)
+}

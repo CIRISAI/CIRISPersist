@@ -33,7 +33,10 @@
 //! On success: submit the inner [`BatchEnvelope`] bytes + sidecar to
 //! the ingest queue via [`IngestHandle::try_submit_with_sidecar`].
 //! Backpressure shape matches `POST /api/v1/accord/events`:
-//! `200 OK` accepted, `429` queue full, `503` persister closed.
+//! `200 OK` accepted, `429` queue full, `503` persister closed. v62.0.0
+//! (CC 2.7): an edge or agent key this node does not hold yet is `424`
+//! [`KIND_KEY_NOT_HELD`] (`verify_unknown_key`) with `retry_after_seconds`,
+//! a wait, never the terminal 422.
 //!
 //! # Persister-side sidecar consumption (open question)
 //!
@@ -154,6 +157,18 @@ pub const KIND_ORPHAN_SECRET: &str = "pipeline_invariant_orphan_secret";
 /// tag in `federation_keys.roles`. Reject with 403.
 pub const KIND_ROLE_TAG: &str = "pipeline_invariant_role_tag";
 
+/// v62.0.0 (CC 2.7) — the edge's or the agent's key record is not held
+/// here YET: a WAIT, answered `424 Failed Dependency` with
+/// `retry_after_seconds`, never the terminal 422. The token is the ingest
+/// path's own for the same fact ([`crate::verify::Error::UnknownKey`]'s
+/// `kind()`), so a lens edge reads one token on both doors. Re-send the
+/// same envelope after the key plane catches up.
+pub const KIND_KEY_NOT_HELD: &str = "verify_unknown_key";
+
+/// How long a sender waits before re-offering an envelope whose key was not
+/// held (the route's other retryable answers use the same).
+const KEY_NOT_HELD_RETRY_AFTER_SECONDS: u32 = 5;
+
 /// Role tag required for the pipeline ingest writer (v1.3.0 #46).
 const ROLE_PIPELINE_WRITER: &str = "cirislens_pipeline_writer";
 /// Alternate role tag accepted for the pipeline ingest writer
@@ -230,6 +245,11 @@ where
             detail = %detail,
             "pipeline ingest rejected: edge signature failed verify"
         );
+        // v62.0.0 (CC 2.7) — an edge key this node does not hold yet is a
+        // wait, not a bad signature.
+        if is_unknown_key(&e) {
+            return key_not_held_response(detail);
+        }
         return invariant_response(KIND_EDGE_SIGNATURE, detail);
     }
 
@@ -246,11 +266,13 @@ where
     .await
     {
         Ok(Some(rec)) => rec,
+        // v62.0.0 (CC 2.7) — the key was dropped between the verify and
+        // this read: not held, a wait.
         Ok(None) => {
-            return invariant_response(
-                KIND_EDGE_SIGNATURE,
-                format!("edge key not in directory: {}", envelope.edge_key_id),
-            );
+            return key_not_held_response(format!(
+                "edge key not in directory: {}",
+                envelope.edge_key_id
+            ));
         }
         Err(e) => {
             tracing::error!(error = %e, "edge key lookup failed during role-tag check");
@@ -293,15 +315,36 @@ where
     //    in-depth). Same path the persister uses; running it pre-queue
     //    fails fast on a compromised-edge / forged-inner-trace path.
     for event in &envelope.envelope.events {
-        let BatchEvent::CompleteTrace { trace, .. } = event;
+        let BatchEvent::CompleteTrace {
+            trace, statement, ..
+        } = event;
+        // v62.0.0 (wave P7; CC 3.1.5) — an inner trace carrying its
+        // `trace:complete:v1` row is verified by the edition-2 statement door
+        // when the persister ingests the batch (`ingest::admit_trace_statement`,
+        // before anything of the trace is written); there is no component
+        // signature to check here. One without is the earlier form: refused by
+        // name once the earlier-form doors are shut, else checked as before.
+        if statement.is_some() {
+            continue;
+        }
+        if let Err(e) =
+            crate::federation::edition2::door::refuse_earlier_form(crate::ingest::TRACE_PLANE)
+        {
+            return invariant_response(
+                crate::federation::edition2::token::EARLIER_FORM_OBJECT,
+                format!("{e}"),
+            );
+        }
         let key = match Backend::lookup_public_key(&*state.directory, &trace.signature_key_id).await
         {
             Ok(Some(k)) => k,
+            // v62.0.0 (CC 2.7) — the agent's key record has not reached
+            // this node yet: a wait, as on the ingest path.
             Ok(None) => {
-                return invariant_response(
-                    KIND_INNER_SIGNATURE,
-                    format!("unknown agent key {}", trace.signature_key_id),
-                );
+                return key_not_held_response(format!(
+                    "unknown agent key {}",
+                    trace.signature_key_id
+                ));
             }
             Err(e) => {
                 // Backend lookup failure — 503 is the conventional
@@ -472,6 +515,28 @@ where
 /// Build a 422 response carrying a stable kind token + detail. The
 /// shape matches [`IngestError::PipelineInvariant`] — the wire body
 /// is the AV-15-safe surface lens consumers parse.
+/// v62.0.0 (CC 2.7) — is this verify failure "the key is not held here"?
+/// `verify_hybrid_via_directory` reports it as
+/// `VerifyError::Crypto("verify_unknown_key")`.
+fn is_unknown_key(e: &VerifyError) -> bool {
+    matches!(e, VerifyError::Crypto(msg) if msg.contains(KIND_KEY_NOT_HELD))
+}
+
+/// v62.0.0 (CC 2.7) — the WAIT: `424`, [`KIND_KEY_NOT_HELD`], with
+/// `retry_after_seconds`.
+fn key_not_held_response(detail: String) -> Response {
+    tracing::info!(kind = KIND_KEY_NOT_HELD, detail = %detail, "pipeline ingest waits");
+    (
+        StatusCode::FAILED_DEPENDENCY,
+        Json(ErrorResponse {
+            kind: KIND_KEY_NOT_HELD,
+            detail,
+            retry_after_seconds: Some(KEY_NOT_HELD_RETRY_AFTER_SECONDS),
+        }),
+    )
+        .into_response()
+}
+
 fn invariant_response(kind: &'static str, detail: String) -> Response {
     tracing::warn!(kind = %kind, detail = %detail, "pipeline ingest rejected");
     (
@@ -806,6 +871,7 @@ mod tests {
             events: vec![BatchEvent::CompleteTrace {
                 trace,
                 trace_level: TraceLevel::Generic,
+                statement: None,
             }],
             batch_timestamp: "2026-04-30T15:00:00+00:00".parse().unwrap(),
             consent_timestamp: "2025-01-01T00:00:00Z".parse().unwrap(),
@@ -912,6 +978,45 @@ mod tests {
                 ErrorOrAccepted::Accepted => panic!("expected error, got 200 OK"),
             }
         }
+    }
+
+    /// v62.0.0 (CC 2.7, wave P9) — **I3609: a key this node does not hold yet
+    /// is a retryable wait at the pipeline route**, the ingest path's token
+    /// (`verify_unknown_key`) at `424` with `retry_after_seconds`, never the
+    /// terminal 422: an agent key not registered (the envelope re-signed by
+    /// the edge, so the edge gate passes), and an edge key not registered.
+    #[tokio::test]
+    async fn i3609_a_key_not_held_is_a_retryable_424() {
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+
+        let mut env = make_signed_pipeline_envelope(make_signed_batch(1)).await;
+        for event in &mut env.envelope.events {
+            let BatchEvent::CompleteTrace { trace, .. } = event;
+            trace.signature_key_id = "ciris-agent-key:not-held-here".into();
+        }
+        sign_edge(&mut env).await;
+        let (status, body) = post_envelope(&app, &env).await;
+        assert_eq!(
+            status,
+            StatusCode::FAILED_DEPENDENCY,
+            "I3609 agent: {body:?}"
+        );
+        let e = body.expect_error();
+        assert_eq!(e.kind, KIND_KEY_NOT_HELD, "I3609 agent");
+        assert!(e.retry_after_seconds.is_some(), "I3609 agent: retryable");
+
+        let mut env = make_signed_pipeline_envelope(make_signed_batch(1)).await;
+        env.edge_key_id = "cirislens-edge-not-held-here".into();
+        sign_edge(&mut env).await;
+        let (status, body) = post_envelope(&app, &env).await;
+        assert_eq!(
+            status,
+            StatusCode::FAILED_DEPENDENCY,
+            "I3609 edge: {body:?}"
+        );
+        let e = body.expect_error();
+        assert_eq!(e.kind, KIND_KEY_NOT_HELD, "I3609 edge");
+        assert!(e.retry_after_seconds.is_some(), "I3609 edge: retryable");
     }
 
     /// Happy path: well-formed envelope flows through every gate.

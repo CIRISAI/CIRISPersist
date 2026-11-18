@@ -35,9 +35,23 @@ pub(crate) const EDITION_ONE_HEAD: i32 = 216;
 /// - `store_edition_deletions` — the local-tier record of an earlier store's
 ///   deletion ([`crate::store::edition_upgrade`]).
 /// - `ceg_statements`, `ceg_row_names` — slice E2a's edition-2 statements.
+/// - `federation_group_tips` — kernel pass 2 (K1, I2812): a group version
+///   held as a tip beside the head (CC 2.7.8).
+/// - `ceg_roster_proposals` — v62.0.0 (wave O1, S1): this node's receipts of
+///   edition-2 self-roster proposals.
+/// - `ceg_fold_state`, `ceg_fold_reads` — wave G0 (CC 2.7.3): each folded
+///   row's arrival, plane and slot, why a held row concludes nothing, and
+///   what each row's fold read.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
-pub(crate) const EDITION_TWO_ADDITIONS: &[&str] =
-    &["store_edition_deletions", "ceg_statements", "ceg_row_names"];
+pub(crate) const EDITION_TWO_ADDITIONS: &[&str] = &[
+    "store_edition_deletions",
+    "ceg_statements",
+    "ceg_row_names",
+    "federation_group_tips",
+    "ceg_roster_proposals",
+    "ceg_fold_state",
+    "ceg_fold_reads",
+];
 
 /// The columns edition 2 adds to edition 1's `federation_keys`: the
 /// projection of a verified edition-2 key:record (slice E2a) keeps every FK to

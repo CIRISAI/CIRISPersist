@@ -162,6 +162,11 @@ where
     }) {
         return Ok(());
     }
+    // v62.0.0 (wave T1) — the countersign not voiced YET is a short count,
+    // not a refusal: the edition-2 group door keeps the voice (Pending, held
+    // `count_short` in the fold) and the official's later voice lands it.
+    // Outside the door's attempt this is a no-op and the refusal stands.
+    super::edition2::group::note_short();
     Err(Error::RosterAuthorityUnauthorized {
         group_key_id: community.community_key_id.clone(),
         offered_authority_key_id: primary.to_owned(),

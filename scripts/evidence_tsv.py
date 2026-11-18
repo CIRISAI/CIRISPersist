@@ -17,6 +17,19 @@ the generated file exactly as release.sh's re-stamp does. Any other row (a
 cross-repo citation) pins the entry's own `crate`, the version of the crate
 that defines the symbol, which is not ours to stamp.
 
+The span_sha256 column is derived too (v62.0.0, CC rc20 constitution/EVIDENCE.md
+"Span hashes"): for a `src/` row, the SHA-256 of the cited item's own source text,
+computed by `scripts/span_of.py`, CC's reference extractor copied whole (the copied
+block unchanged). A cross-repo row leaves the cell empty. So `check` reds when a
+cited item's body changes under an unchanged name, and the claim it backs is
+re-read in the commit that regenerates the file. A src/ row whose symbol is
+missing or declared more than once fails generation: a pointer that does not
+name exactly one item is not evidence. The one exception is an entry carrying
+`span_excluded` (a reason): a pointer CC's own register cites in a form the
+extractor cannot pin (an enum variant; a free fn sharing its name with a
+method). Its cell stays empty, and an entry that carries the field while its
+symbol DOES hash is refused, so the exception cannot outlive its cause.
+
 WHY. The cc-conformance attestation (#1028) signs this file, and until v54.1.0
 it was edited by hand. 131 of its 174 rows existed only in the tsv, so the
 manifest and the signed registry could drift with nothing to compare them
@@ -25,11 +38,21 @@ manifest and the signed registry could drift with nothing to compare them
 from __future__ import annotations
 
 import difflib
+import functools
 import json
 import os
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import span_of  # noqa: E402  (CC tools/span_of.py, copied whole)
+
+# The reference extractor masks comments and literals over the whole file on
+# every call, and evidence rows cite the same large files hundreds of times.
+# `spans` hashes file by file, so the mask is memoized for one file at a time
+# (the copied block itself stays unchanged; a mask is ~8 bytes per source byte).
+span_of._code_mask = functools.lru_cache(maxsize=1)(span_of._code_mask)
 
 TARGET = "evidence/cc_impl.tsv"
 MANIFEST_REL = "src/federation/namespace/namespace_supersets.json"
@@ -43,8 +66,10 @@ HEADER = """\
 # evidence_export[CIRISPersist]; edit the manifest, then `scripts/evidence_tsv.py write`
 # (CIRISPersist#1052). src/ rows pin this crate's Cargo.toml version.
 # persist's half of the #519 item-6 field_processor_matrix → CLM-nsproc citation loop.
-# Columns: decimal_id, claim_id, repo, path#symbol, crate@version
-decimal_id\tclaim_id\trepo\tpath#symbol\tcrate@version
+# span_sha256: SHA-256 of the cited item's own source text (scripts/span_of.py, CC's
+# reference extractor; CC constitution/EVIDENCE.md "Span hashes"); empty on cross-repo rows.
+# Columns: decimal_id, claim_id, repo, path#symbol, crate@version, span_sha256
+decimal_id\tclaim_id\trepo\tpath#symbol\tcrate@version\tspan_sha256
 """
 
 
@@ -55,8 +80,38 @@ def crate_version(cargo_toml: str) -> str:
     return m.group(1)
 
 
-def generate(manifest: dict, version: str) -> str:
-    rows, seen = [], set()
+def spans(root: Path, cited: dict) -> dict:
+    """`{(file, symbol): span_sha256}` for every cited `src/` item, file by file.
+
+    `cited` maps `(file, symbol)` to `(where, span_excluded)` of its first
+    entry. SystemExit on an unreadable file, a symbol that does not name exactly
+    one item, or a `span_excluded` entry whose symbol does name one. An
+    excluded item's cell is empty.
+    """
+    out, by_file = {}, {}
+    for (file, symbol), (where, excluded) in cited.items():
+        by_file.setdefault(file, []).append((symbol, where, excluded))
+    for file, symbols in by_file.items():
+        try:
+            text = (root / file).read_text(encoding="utf-8")
+        except OSError as e:
+            raise SystemExit(f"{symbols[0][1]}: {file} unreadable for its span: {e}")
+        for symbol, where, excluded in symbols:
+            try:
+                h = span_of.span_sha256(text, symbol)
+            except ValueError as e:
+                if excluded:
+                    out[(file, symbol)] = ""
+                    continue
+                raise SystemExit(f"{where}: no single item {file}#{symbol} to hash: {e}")
+            if excluded:
+                raise SystemExit(f"{where}: {file}#{symbol} hashes; drop its span_excluded")
+            out[(file, symbol)] = h
+    return out
+
+
+def generate(manifest: dict, version: str, root: Path) -> str:
+    entries, seen, cited = [], set(), {}
     for n, e in enumerate(manifest["evidence_export"]["CIRISPersist"]):
         where = f"evidence_export.CIRISPersist[{n}] ({e.get('claim_id')})"
         tgt = e.get("tsv_target")
@@ -72,10 +127,22 @@ def generate(manifest: dict, version: str) -> str:
         stamp = f"ciris-persist@{version}" if path.startswith("src/") else e.get("crate")
         if not stamp:
             raise SystemExit(f"{where}: a cross-repo row needs its own `crate` stamp")
-        row = (e["decimal_id"], e["claim_id"], e["repo"], path, stamp)
-        if row in seen:
-            raise SystemExit(f"{where}: duplicate row {row}")
-        seen.add(row)
+        key = (e["decimal_id"], e["claim_id"], e["repo"], path, stamp)
+        if key in seen:
+            raise SystemExit(f"{where}: duplicate row {key}")
+        seen.add(key)
+        excluded = e.get("span_excluded")
+        if excluded is not None and (not excluded or not path.startswith("src/")):
+            raise SystemExit(f"{where}: span_excluded needs a reason and a src/ row")
+        if path.startswith("src/"):
+            cited.setdefault(tuple(path.split("#", 1)), (where, excluded is not None))
+        entries.append((e, key, where))
+    hashed = spans(root, cited)
+    rows = []
+    for e, key, where in entries:
+        path = key[3]
+        span = hashed[tuple(path.split("#", 1))] if path.startswith("src/") else ""
+        row = (*key, span)
         # Free text the registry carries between rows (a section note) rides
         # on the entry it precedes: a blank line or `#` lines only.
         before = e.get("tsv_comment_before") or []
@@ -99,7 +166,7 @@ def main(argv: list[str]) -> int:
     root = Path(os.environ.get("EVIDENCE_TSV_ROOT") or Path(__file__).resolve().parent.parent)
     tsv = root / TARGET
     text = generate(json.loads((root / MANIFEST_REL).read_text()),
-                    crate_version((root / "Cargo.toml").read_text()))
+                    crate_version((root / "Cargo.toml").read_text()), root)
     if argv[1] == "print":
         sys.stdout.write(text)
     elif argv[1] == "write":

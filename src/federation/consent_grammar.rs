@@ -312,8 +312,10 @@ pub struct ConsentTransferPolicy {
     /// author is not the node): the owner's group cohorts whose content that
     /// node receives. `None` (absent) = the node class's default; `Some([])`
     /// = explicitly none. Sorted by (`scope`, `target`) as UTF-8 bytes and
-    /// deduplicated; `self` is never listed. See
-    /// [`super::replication_audience`].
+    /// deduplicated. v62.0.0 (v62 P5c; CC rc21 6.1 / 3.3.7) — the literal
+    /// entry `"self"` ([`SELF_COHORT_ENTRY`]) names the owner's own `self`
+    /// cohort; present, the list is exact for `self` too, for every class.
+    /// See [`super::replication_audience`].
     #[serde(default)]
     pub cohorts: Option<Vec<CohortEntry>>,
 }
@@ -321,13 +323,97 @@ pub struct ConsentTransferPolicy {
 /// v53.0.0 (CIRISPersist#963, CC 3.3.7) — one entry of a grant's
 /// [`ConsentTransferPolicy::cohorts`]: a group named by its placement scope
 /// and key id, the pair persist uses for every placed row.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// v62.0.0 (v62 P5c; CC rc21 6.1 / 3.3.7) — or the owner's own `self`
+/// cohort, written on the wire as the literal JSON string `"self"`
+/// ([`SELF_COHORT_ENTRY`]) and held as `{scope: "self", target: ""}`
+/// ([`Self::self_entry`]). A group entry is the object `{scope, target}`
+/// (unknown members refused); an object naming `scope: "self"` is refused (the
+/// `self` entry is the literal alone). Ordered by (`scope`, `target`) as
+/// UTF-8 bytes, so `"self"` sorts after every group scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CohortEntry {
-    /// `family` | `community` | `affiliations` (closed; `self` is never listed).
+    /// `family` | `community` | `affiliations`, or `self` for the literal
+    /// `"self"` entry.
     pub scope: String,
-    /// The group's key id, byte-exact.
+    /// The group's key id, byte-exact; empty for the `self` entry.
     pub target: String,
+}
+
+/// v62.0.0 (v62 P5c; CC rc21 6.1 / 3.3.7) — the literal `cohorts` entry that
+/// names the owner's own `self` cohort.
+pub const SELF_COHORT_ENTRY: &str = "self";
+
+impl CohortEntry {
+    /// The owner's own `self` cohort (the literal `"self"` entry).
+    #[must_use]
+    pub fn self_entry() -> Self {
+        Self {
+            scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+            target: String::new(),
+        }
+    }
+
+    /// Is this the literal `"self"` entry?
+    #[must_use]
+    pub fn is_self(&self) -> bool {
+        self.scope == crate::federation::types::cohort_scope::SELF && self.target.is_empty()
+    }
+}
+
+/// The wire object of a group entry: exactly `scope` and `target`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GroupEntryWire {
+    scope: String,
+    target: String,
+}
+
+/// A `cohorts` entry as it travels: the literal `"self"` or a group object.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CohortEntryWire {
+    Literal(String),
+    Group(GroupEntryWire),
+}
+
+impl Serialize for CohortEntry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.is_self() {
+            serializer.serialize_str(SELF_COHORT_ENTRY)
+        } else {
+            GroupEntryWire {
+                scope: self.scope.clone(),
+                target: self.target.clone(),
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CohortEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        match CohortEntryWire::deserialize(deserializer)? {
+            CohortEntryWire::Literal(s) if s == SELF_COHORT_ENTRY => Ok(Self::self_entry()),
+            CohortEntryWire::Literal(s) => Err(D::Error::custom(format!(
+                "\"cohorts\" entry {s:?} is neither the literal \"self\" nor a {{scope, target}} \
+                 object (CC 3.3.7)"
+            ))),
+            CohortEntryWire::Group(g)
+                if g.scope == crate::federation::types::cohort_scope::SELF =>
+            {
+                Err(D::Error::custom(
+                    "\"cohorts\" names the self cohort as an object: it is the literal \"self\" \
+                     (CC 3.3.7)",
+                ))
+            }
+            CohortEntryWire::Group(g) => Ok(Self {
+                scope: g.scope,
+                target: g.target,
+            }),
+        }
+    }
 }
 
 /// The closed `scope` set a [`CohortEntry`] may name (CC 3.3.7).
@@ -342,10 +428,14 @@ pub const COHORT_ENTRY_SCOPES: [&str; 3] = [
 /// increasing). `String`'s `Ord` is byte order, which is the CC order.
 fn check_cohorts_shape(cohorts: &[CohortEntry]) -> Result<(), String> {
     for e in cohorts {
+        // v62.0.0 (v62 P5c; CC rc21 3.3.7) — the literal `"self"` entry.
+        if e.is_self() {
+            continue;
+        }
         if !COHORT_ENTRY_SCOPES.contains(&e.scope.as_str()) {
             return Err(format!(
-                "\"cohorts\" entry scope {:?} is not family | community | affiliations \
-                 (`self` is never listed; CC 3.3.7)",
+                "\"cohorts\" entry scope {:?} is not family | community | affiliations, nor \
+                 the literal \"self\" (CC 3.3.7)",
                 e.scope
             ));
         }
@@ -624,10 +714,12 @@ pub fn consent_grammar_manifest() -> serde_json::Value {
         // block, so a member added to the closed grammar moves the hash.
         "optional_members": ["purpose", "valid_until", "for_key_id", "cohorts"],
         // v53.0.0 (#963, CC 3.3.7) — the `cohorts` entry shape.
+        // v62.0.0 (v62 P5c; CC rc21 3.3.7) — the literal `"self"` entry.
         "cohort_entry": {
             "members": ["scope", "target"],
             "scopes": COHORT_ENTRY_SCOPES,
-            "order": "sorted by (scope, target) as UTF-8 bytes, deduplicated",
+            "self_entry": SELF_COHORT_ENTRY,
+            "order": "sorted by (scope, target) as UTF-8 bytes, deduplicated; the literal \"self\" last",
         },
         "defaults": {
             "direction": "egress",
@@ -698,8 +790,16 @@ pub fn consent_grammar_sha256() -> String {
 /// manifest. Previous value:
 /// `8230589131945c4b4db3c2e7ca2187e6c02543cd8f084b0f8862eb951d2c82ac`
 /// (from v49.0.0 until this re-pin).
+/// v62.0.0 (v62 P5c; CC rc21 6.1 / 3.3.7) — RE-PINNED because the GRAMMAR
+/// changed: a `cohorts` list may carry the literal entry `"self"` (the
+/// owner's own `self` cohort; `cohort_entry.self_entry` in the manifest).
+/// Previous value:
+/// `4d473eac6f2bfde1a78b01e9a2ac8442fc9adb5207c7adeb51d509215b79e843`
+/// (v53.0.0 until this re-pin). The new value was computed outside cargo
+/// over the manifest's JCS bytes (the old value reproduced first, byte for
+/// byte); the `consent_grammar_hash_is_pinned` witness checks it.
 pub const CONSENT_GRAMMAR_HASH: &str =
-    "4d473eac6f2bfde1a78b01e9a2ac8442fc9adb5207c7adeb51d509215b79e843";
+    "fe545f6b7f412d59a67c8b27106368a44714387da9cea81646037483210f30fa";
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {

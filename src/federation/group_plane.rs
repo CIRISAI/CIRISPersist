@@ -1004,6 +1004,16 @@ where
     if !dir.group_plane_present().await? {
         return Ok(GroupRowSync::NotHeld);
     }
+    // v62.0.0 (wave T1) — an edition-2 group statement's typed record mints
+    // no earlier-form row: its statements (`ceg_statements`) are its proof,
+    // so the projection's pointer is cleared.
+    if super::edition2::group::vouched() {
+        return Ok(if dir.link_group_plane_row(link, None).await? {
+            GroupRowSync::WithoutRow
+        } else {
+            GroupRowSync::NotHeld
+        });
+    }
     let row = match dir.read_group_object(&link).await? {
         Some(stored) => match offered {
             Some(o) if o.link() == link && o.same_object_at_substrate(&stored) => {
@@ -1041,6 +1051,14 @@ tokio::task_local! {
 #[must_use]
 pub(crate) fn applying_replicated_group_row() -> bool {
     REPLICATED_GROUP_ROW.try_with(|()| ()).is_ok()
+}
+
+/// v62.0.0 (wave T1) — run `fut` as a REPLICATED group-plane row's typed
+/// door ([`applying_replicated_group_row`] reads `true`): the edition-2
+/// door's replicated statement (`edition2::group`) skips the gates that bind
+/// only the local door, exactly as [`apply_group_plane_row`] does.
+pub(crate) async fn as_replicated_group_row<T>(fut: impl std::future::Future<Output = T>) -> T {
+    REPLICATED_GROUP_ROW.scope((), fut).await
 }
 
 /// Which door a group-plane row arrived through: a community record's door
@@ -1206,7 +1224,8 @@ where
             GroupRowDoor::Replicated => {
                 use super::group_amendment::ReplicatedCommunityOutcome as O;
                 match dir.apply_replicated_community(s).await? {
-                    O::Inserted | O::Superseded | O::Unchanged => {}
+                    // X2 build fix: K1's fork held as a tip is applied, not refused.
+                    O::Inserted | O::Superseded | O::Unchanged | O::HeldAsTip => {}
                     O::Refused { reason } => {
                         return Ok(GroupPlaneApplied::Refused(match reason {
                             super::group_amendment::ReplicatedCommunityRefusal::ConflictingRecord => {
@@ -1490,13 +1509,24 @@ pub(crate) async fn check_cosigned_withdraws(
             )
             .await?;
             let persons = persons.at(row.asserted_at);
-            let counted = super::reverse_quorum::count_distinct_roster_scrubs(
-                directory,
-                &row.attestation_envelope,
-                &scrubs,
-                &persons.roster_with_devices(&ids, scrubs.iter().map(|s| s.scrub_key_id.as_str())),
-            )
-            .await;
+            // v62.0.0 (wave V1, I3282) — an edition-2 `withdraws` is counted
+            // by its voices (`edition2::voices`): each voice's `iss` is
+            // already its person, so the roster is the seated ids. An
+            // earlier-form row keeps the scrub count behind the switch.
+            let counted = if super::edition2::voices::carried_row_id(row).is_some()
+                || super::edition2::door::earlier_form_doors_shut()
+            {
+                super::edition2::voices::counted_roster_signers(directory, row, &ids).await?
+            } else {
+                super::reverse_quorum::count_distinct_roster_scrubs(
+                    directory,
+                    &row.attestation_envelope,
+                    &scrubs,
+                    &persons
+                        .roster_with_devices(&ids, scrubs.iter().map(|s| s.scrub_key_id.as_str())),
+                )
+                .await
+            };
             // Retracting a widening takes a member off; retracting a removal
             // puts one back. v61 S2 (CIRISPersist#1143) — withdrawing a
             // community's record dissolves it: a whole-group change, judged

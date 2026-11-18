@@ -233,6 +233,9 @@ where
     let quorum =
         super::trust_root::family_quorum_over(dir.as_dyn_directory(), row, &family).await?;
     if quorum.distinct_holders < quorum.required {
+        // v62.0.0 (wave V1b) — short of the accord holders: an edition-2
+        // re-bind waits for their voices (`Pending`).
+        super::edition2::voices::note_short();
         return Err(refuse(format!(
             "{} distinct verified accord holder(s) signed it; the charter requires {}",
             quorum.distinct_holders, quorum.required

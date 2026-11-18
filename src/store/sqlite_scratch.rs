@@ -8,10 +8,9 @@
 //! migration applied and runs the open-time passes over an empty store, so a
 //! clone is a backend in exactly the state a fresh migrated one is.
 //!
-//! Two callers: the genesis scratch (the SQLite [`GenesisScratch`]) and the
-//! test constructor (`store::test_backend`).
-//!
-//! [`GenesisScratch`]: crate::federation::genesis::scratch::GenesisScratch
+//! One caller: the test constructor (`store::test_backend`). v62.0.0
+//! (json-cut C5): the genesis scratch that also used it is deleted with the
+//! bundle/1 ceremony.
 
 use std::sync::Arc;
 
@@ -65,20 +64,4 @@ pub(crate) async fn migrated_in_memory() -> Result<SqliteBackend, Error> {
     );
     backend.run_migrations().await?;
     Ok(backend)
-}
-
-#[async_trait::async_trait]
-impl crate::federation::genesis::scratch::GenesisScratch for SqliteBackend {
-    /// A migrated in-memory clone, seeded with `holders`; nothing to release.
-    async fn provision_genesis_scratch(
-        &self,
-        holders: &[crate::federation::SignedKeyRecord],
-    ) -> Result<crate::federation::genesis::scratch::ScratchDirectory, crate::federation::Error>
-    {
-        let b = migrated_in_memory()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("genesis scratch: {e}")))?;
-        b.seed_genesis_accord_holders(holders).await?;
-        Ok(crate::federation::genesis::scratch::ScratchDirectory::owned(Box::new(b)))
-    }
 }

@@ -201,12 +201,6 @@ const VETTED: &[(&str, &str, usize, &str)] = &[
         1,
         "the debug-tools panic hook: must not take the clock seam's lock while panicking",
     ),
-    (
-        "federation/genesis/scratch.rs",
-        ".block_on(",
-        1,
-        "the genesis scratch release on drop (P9's scratch leg): its own slice, not v62-A",
-    ),
 ];
 
 fn is_test_anchor_cfg(line: &str) -> bool {

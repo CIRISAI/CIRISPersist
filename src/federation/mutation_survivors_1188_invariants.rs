@@ -15,9 +15,10 @@
 //!   against the held head (`group_supersede_admit::held_head_verdict`)
 //!   reads the offered head's proof and names the group it refuses: a proof
 //!   naming another prior is a stale proof even when `prev_head_digest`
-//!   names the held head; an unheld group, a stale proof and a lineage
-//!   mismatch each name the group's key; a head naming the held version (by
-//!   proof and by `prev_head_digest`) passes.
+//!   names the held head; an unheld group and a stale proof each name the
+//!   group's key; a head naming the held version (by proof and by
+//!   `prev_head_digest`) passes. v62.0.0 (kernel pass 2, K1): a head naming
+//!   another version is held as a tip (I2811), no longer a lineage refusal.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod pure {
@@ -181,8 +182,10 @@ mod pure {
             // Nothing held: nothing to supersede.
             let e = held_head_verdict(&head(&key, HELD, None), None)
                 .expect_err("I1622: an unheld group has nothing to supersede");
+            // v62.0.0 (CC 2.7) — a group not held is a link not held: the
+            // wait, never a terminal refusal.
             assert!(
-                matches!(e, crate::federation::Error::InvalidArgument(_)),
+                matches!(e, crate::federation::Error::LinkNotHeld { .. }) && e.is_wait(),
                 "I1622 {kind}: {e}"
             );
             names(&e, "unheld");
@@ -198,14 +201,15 @@ mod pure {
                 "I1622 {kind}: {e}"
             );
             names(&e, "stale-proof");
-            // A version that names another predecessor.
-            let e = held_head_verdict(&head(&key, "i1622-another-head", None), Some(HELD))
-                .expect_err("I1622: a version names the head it succeeds");
-            assert!(
-                is_conflict(&e, "lineage_prev_head_mismatch"),
-                "I1622 {kind}: {e}"
+            // A version that names another predecessor: v62.0.0 (kernel
+            // pass 2, K1) — held as a tip beside the head, never refused
+            // (CC 2.7.8; I2811).
+            assert_eq!(
+                held_head_verdict(&head(&key, "i1622-another-head", None), Some(HELD))
+                    .unwrap_or_else(|e| panic!("I1622 {kind}: a sibling is a tip: {e}")),
+                crate::federation::group_supersede_admit::HeadVerdict::Tip,
+                "I1622 {kind}"
             );
-            names(&e, "lineage");
         }
     }
 }

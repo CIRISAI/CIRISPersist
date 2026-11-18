@@ -43,6 +43,24 @@ pub(crate) struct PlannedTouchClaim<'a> {
     pub(crate) signature_json: String,
 }
 
+/// v62.0.0 (v62 P5b) — a NODE-LOCAL touch the plan admitted: the floor's
+/// fields, and nothing signed (the node is the only author; the row never
+/// crosses the mesh).
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedLocalTouch<'a> {
+    /// What is being kept alive.
+    pub(crate) target_key_id: &'a str,
+    /// The kind of thing `target_key_id` names.
+    pub(crate) target_kind: &'a str,
+    /// The lower bound to merge (monotonic max).
+    pub(crate) fresh_as_of: DateTime<Utc>,
+    /// The mandatory privacy row, checked.
+    pub(crate) cohort_scope: &'a str,
+    /// The writing node's own key id (`node_key_id`), or empty when the
+    /// store has none: provenance only, never a signer.
+    pub(crate) node_key_id: String,
+}
+
 /// A wholeness witness the plan admitted, its integer columns checked into
 /// the stored widths.
 #[derive(Debug, Clone)]
@@ -96,6 +114,17 @@ pub(crate) trait EvidenceStore: FederationDirectory + Sized {
     async fn store_planned_touch_claim(
         &self,
         planned: PlannedTouchClaim<'_>,
+    ) -> Result<bool, Error>;
+
+    /// v62.0.0 (v62 P5b) — the same monotonic-max merge for a node-local
+    /// touch: `true` when the floor advanced. The row is stored under
+    /// [`NODE_LOCAL_TOUCH_FORM`](super::types::NODE_LOCAL_TOUCH_FORM), with an
+    /// empty `signature` and `{}` as `signed_envelope` (an advanced
+    /// earlier-form row loses its signature: the floor it now holds is the
+    /// node's own).
+    async fn store_planned_touch_claim_local(
+        &self,
+        planned: PlannedLocalTouch<'_>,
     ) -> Result<bool, Error>;
 
     /// In ONE transaction: insert the witness (idempotent on
@@ -236,6 +265,53 @@ pub(crate) async fn put_touch_claim_planned<D: EvidenceStore>(
             claim,
             envelope_json,
             signature_json,
+        })
+        .await?;
+    Ok(if advanced {
+        TouchApplyOutcome::Advanced
+    } else {
+        TouchApplyOutcome::NotFresher
+    })
+}
+
+/// v62.0.0 (v62 P5b; RULINGS "a touch claim is node-local";
+/// CC_FAMILYMAP_ANSWER: a node-local fold) — **the door: every backend's
+/// `put_touch_claim_local`.** The node's own write of its freshness floor:
+/// no object, no signature (the node is the only author, and the floor never
+/// crosses the mesh), so no earlier-form refusal applies. The rules the
+/// signed door enforced on the floor itself stand, verify-before-mutation:
+/// a non-empty target, a closed-set `cohort_scope`
+/// ([`check_cohort_scope`](super::admission::check_cohort_scope), the
+/// mandatory privacy row), the future-skew guard at the door's one clock
+/// read ([`check_touch_fresh_as_of_skew`](super::admission::check_touch_fresh_as_of_skew),
+/// [`DEFAULT_MAX_TOUCH_SKEW`](super::admission::DEFAULT_MAX_TOUCH_SKEW)),
+/// then the monotonic-max merge.
+pub(crate) async fn put_touch_claim_local_planned<D: EvidenceStore>(
+    dir: &D,
+    target_key_id: &str,
+    target_kind: &str,
+    fresh_as_of: DateTime<Utc>,
+    cohort_scope: &str,
+) -> Result<TouchApplyOutcome, Error> {
+    if target_key_id.is_empty() || target_kind.is_empty() {
+        return Err(Error::InvalidArgument(
+            "touch_claim: target_key_id and target_kind must be non-empty".into(),
+        ));
+    }
+    super::admission::check_cohort_scope(cohort_scope)?;
+    let received_at = crate::host::clock::now();
+    super::admission::check_touch_fresh_as_of_skew(
+        fresh_as_of,
+        received_at,
+        super::admission::DEFAULT_MAX_TOUCH_SKEW,
+    )?;
+    let advanced = dir
+        .store_planned_touch_claim_local(PlannedLocalTouch {
+            target_key_id,
+            target_kind,
+            fresh_as_of,
+            cohort_scope,
+            node_key_id: dir.node_key_id().unwrap_or_default(),
         })
         .await?;
     Ok(if advanced {

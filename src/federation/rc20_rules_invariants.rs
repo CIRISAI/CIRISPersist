@@ -12,8 +12,10 @@
 //! - **I1872 / I1873** (CC 3.3.6.2) — the X-Wing keys `transit_xwing_pubkey`
 //!   and `onion_hop_xwing_pubkey`: 1216 bytes, typed accessors, and the
 //!   per-half reuse refusals (`self_at_login::test_support::run_xwing_matrix`).
-//! - **I1874 / I1875** — the re-bind witness and THE RULE (a seat-published
-//!   X-Wing key is not live): `tests/xwing_rebind_1274.rs`.
+//! - **I1874 / I1875** — the earlier-form re-bind witness and THE RULE (a
+//!   seat-published X-Wing key is not live): `tests/xwing_rebind_1274.rs`,
+//!   deleted in v62.0.0 (json-cut C5) with the bundle/1 software ceremony it
+//!   booted from. THE RULE needs an edition-2 witness (E slice).
 //! - **I1878 / I1879** (CC 4.2.1 / 3.4.7.1 / 8.11.27) — the canonical standing
 //!   is the accord's conferral: a v61 earlier-form `canonical,node` record
 //!   resolves by its verifying co-scrub; a `canonical` label whose co-scrub

@@ -160,6 +160,16 @@ pub enum BatchEvent {
         /// Same value as the batch's `trace_level`. Carried on the
         /// envelope element for §7 gating consistency checks.
         trace_level: TraceLevel,
+        /// v62.0.0 (wave P7; CC 2.6.1, 3.1.5) — the trace's `trace:complete:v1`
+        /// ROW: one composite `COSE_Sign1` statement under the agent's key,
+        /// standard base64 (URL-safe accepted). Its payload names `trace` by
+        /// content hash (`manifest.content_hash`, `evidence_refs`), so the
+        /// trace beside it is the object the agent signed for. Absent on an
+        /// earlier-form trace (Ed25519 + bound ML-DSA-65 members on the trace
+        /// itself), which the trace door refuses once the earlier-form doors
+        /// are shut. See `crate::ingest::admit_trace_statement`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        statement: Option<String>,
     },
     // NOTE: when loose events arrive (TRACE_WIRE_FORMAT.md §13 forward
     // compat), add new variants here. Today this enum is effectively
@@ -317,7 +327,9 @@ mod tests {
         assert_eq!(env.trace_schema_version.as_str(), "2.7.0");
         assert_eq!(env.events.len(), 1);
         match &env.events[0] {
-            BatchEvent::CompleteTrace { trace, trace_level } => {
+            BatchEvent::CompleteTrace {
+                trace, trace_level, ..
+            } => {
                 assert_eq!(*trace_level, TraceLevel::Generic);
                 assert_eq!(trace.thought_id, "th_std_abc");
             }

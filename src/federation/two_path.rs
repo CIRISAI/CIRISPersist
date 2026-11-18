@@ -283,6 +283,13 @@ pub struct Counts {
     /// The target signed something since the proposal arrived (asked only
     /// where the policy's silence rule applies).
     pub target_spoke: bool,
+    /// v62.0.0 (CC rc20, 4.5.13 `target_voice`) — the target's own yes naming
+    /// the act is held AND the row's `target_voice` cell is `yes`
+    /// ([`PolicyRow::target_voice`](crate::federation::governance_policy::PolicyRow::target_voice);
+    /// `community_invite` only at rc20). It is one voice toward the count
+    /// minimum and the FLOOR, never toward ENACT's fraction, and the target
+    /// is never a member of the count set.
+    pub target_voice: bool,
     /// The window has closed on the node's clock.
     pub window_closed: bool,
 }
@@ -318,11 +325,15 @@ impl TwoPathPolicy {
     /// (`tools/build_governance_policy.py` `decide`, TwoPath.tla's landing
     /// rule), with the self roster's [`AtWindow::StayOpen`]:
     ///
-    /// 1. approvals ≥ ENACT and reversible → lands (forward, at once);
+    /// `voices` = approvals + 1 when [`Counts::target_voice`]; ENACT is met
+    /// when approvals ≥ ENACT **and** voices ≥ the count minimum (CC rc20
+    /// 4.5.13: "one voice never decides who is in a room").
+    ///
+    /// 1. ENACT met and reversible → lands (forward, at once);
     /// 2. the window open → pending;
     /// 3. objections ≥ CANCEL → cancelled (`cancel_reached`);
-    /// 4. approvals ≥ ENACT → lands (forward: the irreversible waited);
-    /// 5. a reverse path, a silent target, approvals ≥ FLOOR → lands (reverse);
+    /// 4. ENACT met → lands (forward: the irreversible waited);
+    /// 5. a reverse path, a silent target, voices ≥ FLOOR → lands (reverse);
     /// 6. else cancelled (`no_reverse_path` / `target_spoke` / `below_floor`).
     ///
     /// Under [`AtWindow::StayOpen`] steps 3 and 6 leave it pending instead.
@@ -334,7 +345,9 @@ impl TwoPathPolicy {
         c: Counts,
         opens_at: DateTime<Utc>,
     ) -> TwoPathDecision {
-        let enact_met = c.approvals >= r.enact;
+        let min_count = self.floor_class.min_count();
+        let voices = c.approvals + usize::from(c.target_voice);
+        let enact_met = c.approvals >= r.enact && voices >= min_count;
         if enact_met && !self.irreversible {
             return TwoPathDecision::Lands {
                 path: LandingPath::Quorum,
@@ -344,7 +357,10 @@ impl TwoPathPolicy {
         let lone_open = self.reverse_path && !cancel_reached && !c.target_spoke;
         let pending = TwoPathDecision::Pending {
             earliest_lone_at: lone_open.then_some(opens_at),
-            needs: r.enact.saturating_sub(c.approvals),
+            needs: r
+                .enact
+                .saturating_sub(c.approvals)
+                .max(min_count.saturating_sub(voices)),
         };
         let cancelled = |reason| match self.at_window {
             AtWindow::Cancel => TwoPathDecision::Cancelled { reason },
@@ -367,7 +383,7 @@ impl TwoPathPolicy {
         if c.target_spoke {
             return cancelled(CancelReason::TargetSpoke);
         }
-        if r.floor.is_some_and(|f| c.approvals >= f) {
+        if r.floor.is_some_and(|f| voices >= f) {
             return TwoPathDecision::Lands {
                 path: LandingPath::Lone,
             };
@@ -735,6 +751,8 @@ pub fn decide(
                     .target_acts
                     .iter()
                     .any(|at| *at >= proposal.received_at),
+            // A self roster's rows carry `target_voice: no` (CC rc20 4.5.13).
+            target_voice: false,
             window_closed: now >= opens_at,
         },
         opens_at,
@@ -1443,7 +1461,9 @@ mod tests {
     /// by the RUNTIME reader ([`PolicyTable::policy_of`](crate::federation::governance_policy::PolicyTable::policy_of)),
     /// its thresholds resolve to the vector's, and
     /// [`TwoPathPolicy::decide_counts`] returns the vector's verdict, path and
-    /// reason — all 732. A vector over a non-standing base (the provisional
+    /// reason — all 732 at rc9; 819 at rc20, whose vectors also carry the
+    /// count minimum on enact ("one voice never decides who is in a room")
+    /// and the target's own yes (`target_voice`, CC 4.5.13). A vector over a non-standing base (the provisional
     /// expected-active law, not built) names its base count, which the
     /// decision over counts takes as given; those are counted.
     #[test]
@@ -1488,7 +1508,12 @@ mod tests {
             if roster != base {
                 skipped += 1;
             }
-            let p = policy_of(v["family"].as_str().expect("family"));
+            let family = v["family"].as_str().expect("family");
+            let p = policy_of(family);
+            // rc20: a vector without the field reads false; the target's yes
+            // counts only on a row whose `target_voice` cell is yes.
+            let target_voice = v["target_voice"].as_bool().unwrap_or(false)
+                && table.row(family).expect("row").target_voice();
             let r = p.resolve_over(base, base);
             let want = |k: &str| v["thresholds"][k].as_u64().map(|x| x as usize);
             assert_eq!(
@@ -1503,6 +1528,7 @@ mod tests {
                     approvals: n("approvals"),
                     objections: n("objections"),
                     target_spoke: false,
+                    target_voice,
                     window_closed: elapsed >= p.window_secs,
                 },
                 t(p.window_secs),
@@ -1542,7 +1568,7 @@ mod tests {
             "every vector replays"
         );
         assert_eq!(
-            skipped, 216,
+            skipped, 204,
             "of which the expected-active vectors (N = 10 000, base 344) take their base count as given"
         );
     }

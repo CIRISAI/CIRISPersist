@@ -90,7 +90,7 @@ async fn single_owner<F: FederationDirectory + ?Sized>(
     dir: &F,
     key_id: &str,
 ) -> Result<Option<String>, Error> {
-    match super::admission::owner_of(dir, key_id).await {
+    match super::admission::owner_of_unmarked(dir, key_id).await {
         Ok(owner) => Ok(owner),
         Err(Error::AmbiguousNodeOwner { .. }) => Ok(None),
         Err(e) => Err(e),
@@ -149,6 +149,50 @@ async fn displaces<F: FederationDirectory + ?Sized>(
     Ok(owners.of(&newer.occurrence_key_id).await? == Some(owner))
 }
 
+/// v62.0.0 (wave O1; E8's finding) — **a route an occurrence projected, read
+/// against that occurrence's window.** A route row is an occurrence's
+/// projection when one of the held occurrences of its key projects exactly it
+/// (`OccurrenceTransportBinding::project_route`: kind, destination, the
+/// occurrence's own `asserted_at`, epoch 0). It is expired at `now_ms` when
+/// every occurrence that projects it is out of its half-open window
+/// (`kernel::key_end::within_record`): no route once `now ≥ valid_until`.
+/// A route no occurrence projects (an announce, a signed route) is not read
+/// here.
+async fn expired_projection<F: FederationDirectory + ?Sized>(
+    dir: &F,
+    windows: &mut std::collections::HashMap<String, Vec<super::IdentityOccurrence>>,
+    row: &TransportDestination,
+    now_ms: u64,
+) -> Result<bool, Error> {
+    if row.epoch != 0 || row.retired_at.is_some() {
+        return Ok(false);
+    }
+    if !windows.contains_key(&row.occurrence_key_id) {
+        let held = dir
+            .list_identity_occurrences_by_occurrence_key(&row.occurrence_key_id)
+            .await?;
+        windows.insert(row.occurrence_key_id.clone(), held);
+    }
+    let ms = |t: chrono::DateTime<chrono::Utc>| u64::try_from(t.timestamp_millis()).unwrap_or(0);
+    let projecting: Vec<&super::IdentityOccurrence> = windows[&row.occurrence_key_id]
+        .iter()
+        .filter(|o| {
+            o.transport_binding.as_ref().is_some_and(|tb| {
+                tb.project_route(&o.occurrence_key_id, o.asserted_at)
+                    .is_ok_and(|p| {
+                        p.transport_kind == row.transport_kind
+                            && p.destination == row.destination
+                            && p.asserted_at == row.asserted_at
+                    })
+            })
+        })
+        .collect();
+    Ok(!projecting.is_empty()
+        && projecting.iter().all(|o| {
+            !crate::kernel::key_end::within_record(now_ms, ms(o.asserted_at), o.valid_until.map(ms))
+        }))
+}
+
 async fn fold_with<F: FederationDirectory + ?Sized>(
     dir: &F,
     owners: &mut Owners<'_, F>,
@@ -156,8 +200,15 @@ async fn fold_with<F: FederationDirectory + ?Sized>(
 ) -> Result<Vec<TransportDestination>, Error> {
     let mut by_destination: std::collections::HashMap<String, Vec<TransportDestination>> =
         std::collections::HashMap::new();
+    let mut windows: std::collections::HashMap<String, Vec<super::IdentityOccurrence>> =
+        std::collections::HashMap::new();
+    let now_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
+        // v62.0.0 (wave O1) — an expired occurrence keeps no live route.
+        if expired_projection(dir, &mut windows, &row, now_ms).await? {
+            continue;
+        }
         if !by_destination.contains_key(&row.destination) {
             let held = dir
                 .list_transport_destinations_by_destination_unfolded(&row.destination)
@@ -166,6 +217,11 @@ async fn fold_with<F: FederationDirectory + ?Sized>(
         }
         let mut displaced = false;
         for other in &by_destination[&row.destination] {
+            // v62.0.0 (wave O1) — only a live route displaces: an expired
+            // occurrence's projection displaces nothing.
+            if expired_projection(dir, &mut windows, other, now_ms).await? {
+                continue;
+            }
             if displaces(owners, other, &row).await? {
                 displaced = true;
                 break;

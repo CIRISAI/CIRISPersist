@@ -154,11 +154,18 @@ pub fn edge_leg(rows: &[KRow], user: &str, root: &str) -> Answer<bool> {
             depth: 0,
         });
     }
-    Answer {
-        value: reaches(&edges, &user.to_owned(), &(), 1, &root.to_owned()),
-        rows: live,
-        rule: "trust::reaches/1",
-    }
+    // v62.0.0 (kernel pass 2, I2810) — the read set: the user's standing
+    // (its edges toward the root) and every presented row's citers (a
+    // composer naming one can end it)
+    let reads = std::iter::once(super::DepKey::Standing(user.to_owned()))
+        .chain(rows.iter().map(|r| super::DepKey::Refs(r.id)))
+        .collect();
+    Answer::reading(
+        reaches(&edges, &user.to_owned(), &(), 1, &root.to_owned()),
+        live,
+        reads,
+        "trust::reaches/1",
+    )
 }
 
 #[cfg(test)]

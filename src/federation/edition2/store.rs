@@ -118,6 +118,57 @@ where
     Ok(next_admitted_us(crate::host::clock::now(), last))
 }
 
+/// v62.0.0 (v62 P8) — sqlite: **re-stamp a row's statements at THIS node's
+/// next admission position**, in the caller's write transaction, when the
+/// row crosses into the mesh (`enter_mesh` over an edition-2 row). A local
+/// row's statement was stamped when it was put, and the serve filter withheld
+/// it then (local tier) while a peer's cursor moved past it; without the
+/// re-stamp a peer that already paged past that position would never be
+/// served the crossed row. Returns the statements re-stamped (none for a row
+/// whose id is not an edition-2 row id).
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn restamp_row_sqlite(
+    tx: &rusqlite::Connection,
+    row_id_hex: &str,
+) -> Result<usize, rusqlite::Error> {
+    let Some(row_id) = id_of_hex(row_id_hex) else {
+        return Ok(0);
+    };
+    let admitted = next_admitted_us_sqlite(tx)?;
+    tx.execute(
+        "UPDATE ceg_statements SET admitted_us = ?1 WHERE row_id = ?2",
+        rusqlite::params![admitted, &row_id[..]],
+    )
+}
+
+/// v62.0.0 (v62 P8) — postgres: [`restamp_row_sqlite`], in the caller's
+/// transaction.
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn restamp_row_postgres<C>(
+    client: &C,
+    row_id_hex: &str,
+) -> Result<u64, tokio_postgres::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    let Some(row_id) = id_of_hex(row_id_hex) else {
+        return Ok(0);
+    };
+    let admitted = next_admitted_us_postgres(client).await?;
+    client
+        .execute(
+            "UPDATE cirislens.ceg_statements SET admitted_us = $1 WHERE row_id = $2",
+            &[&admitted, &&row_id[..]],
+        )
+        .await
+}
+
 /// sqlite: store an admitted row's statement and its names, idempotently, in
 /// the caller's transaction. Returns whether the statement was new.
 ///

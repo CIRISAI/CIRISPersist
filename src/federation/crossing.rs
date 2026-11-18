@@ -44,6 +44,16 @@
 //!   no actor signature to co-scrub ([`Error::NoActorSignature`]): the fabric
 //!   is never the only signer of an actor's claim.
 //!
+//! * [`TierPromotionCustody::Statement`] — v62.0.0 (v62 P8): an edition-2
+//!   row's custody is its own statement (CC 2.6.1): the actor's composite
+//!   signature over the row's payload, admitted when the row was put. The
+//!   crossing re-admits that statement through the edition-2 door against
+//!   the keys held NOW ([`super::attestation_emit::mapped_row`]) and flips
+//!   the tier; nothing is re-signed and nothing is JCS-signed. A row id is a
+//!   function of the payload and never of the tier, so restating the same
+//!   payload at the same scope IS this statement (the same row id, and the
+//!   same bytes from a deterministic signer).
+//!
 //! Every signature the plan admits — the actor's, the node's, and each
 //! pre-existing co-scrub — is **verified here, before the flip**, against the
 //! signer's registered pubkeys under `HybridPolicy::Strict`. That is the
@@ -79,6 +89,13 @@
 //! * [`canonical_bytes`] — the ONE spelling of "the bytes a signer signs".
 //! * [`build_widening`] — the supersedes envelope for a widening, built from
 //!   the prior so the payload is reused (CC 8.1.5: no body re-upload).
+//! * v62.0.0 (v62 P8) — on the clean mesh: [`plan_enter_mesh`] crosses an
+//!   edition-2 row on its own statement ([`TierPromotionCustody::Statement`]);
+//!   a widening is a RESTATEMENT ([`restate_at_audience`], held to
+//!   [`check_restated_widening`]), not a `supersedes` (an edition-2 composer
+//!   needs its target held, which a peer outside the prior's audience never
+//!   is); an earlier-form local row is restated from [`restatement_input`]
+//!   once the earlier-form doors are shut.
 //!
 //! Sign-at-write for local rows (so a deferred row has something to co-scrub)
 //! is the local door's job: [`super::types::LocalAttestationInput::bind_for_signing`]
@@ -377,9 +394,37 @@ pub enum TierPromotionCustody {
     /// [`ScrubSig::cosigned_at`] MUST be set: the co-signer stamps when it
     /// signed — the crossing does not stamp on its behalf.
     NodeCoScrub(ScrubSig),
+    /// v62.0.0 (v62 P8) — an edition-2 row crosses on its own statement:
+    /// [`StatementCustody::statement`] must be the statement the row carries,
+    /// and it is re-admitted through the edition-2 door before the flip.
+    Statement(StatementCustody),
+}
+
+/// v62.0.0 (v62 P8) — the custody of an edition-2 row's crossing: the row's
+/// own statement, offered back, and the instant the crossing happens.
+#[derive(Debug, Clone)]
+pub struct StatementCustody {
+    /// The row's carried statement (`ceg_statement`), as held.
+    pub statement: Vec<u8>,
+    /// The crossing's instant (`promoted_at`), at the substrate resolution;
+    /// taken from the caller so every backend writes the same one.
+    pub crossed_at: DateTime<Utc>,
 }
 
 impl TierPromotionCustody {
+    /// v62.0.0 (v62 P8) — the custody an edition-2 row crosses on: its own
+    /// carried statement, at `now` (substrate resolution). `None` for a row
+    /// that carries no statement (an earlier-form row).
+    #[must_use]
+    pub fn of_statement(row: &Attestation, now: DateTime<Utc>) -> Option<Self> {
+        super::edition2::emit::carried_statement(row).map(|statement| {
+            Self::Statement(StatementCustody {
+                statement,
+                crossed_at: admission::truncate_to_substrate_resolution(now),
+            })
+        })
+    }
+
     /// **The instant the crossing happened**, taken from the party that
     /// signed: the actor's `scrub_timestamp`, or the node's `cosigned_at`.
     ///
@@ -395,6 +440,7 @@ impl TierPromotionCustody {
     pub fn crossing_at(&self) -> Result<DateTime<Utc>, Error> {
         match self {
             Self::ActorSigned(reseal) => Ok(reseal.scrub_timestamp),
+            Self::Statement(c) => Ok(c.crossed_at),
             Self::NodeCoScrub(scrub) => {
                 let raw = scrub.cosigned_at.as_deref().ok_or_else(|| {
                     Error::InvalidArgument(
@@ -546,9 +592,26 @@ pub async fn plan_enter_mesh(
     if current.tier == attestation_tier::FEDERATION {
         return Ok(None);
     }
+    // v62.0.0 (wave P7; CC ruling) — an unsigned trace stays local: a
+    // `trace:*` row with no edition-2 statement never crosses.
+    crate::ingest::refuse_unsigned_trace_crossing(current)?;
     // Deterministic on every backend: the signer's own instant, never a clock
     // read inside the storage layer. See `TierPromotionCustody::crossing_at`.
     let now = custody.crossing_at()?;
+    // v62.0.0 (v62 P8) — an edition-2 row crosses on its own statement, never
+    // through the JCS arms below; a JCS custody offered for one is refused.
+    if super::edition2::emit::carried_statement(current).is_some()
+        != matches!(custody, TierPromotionCustody::Statement(_))
+    {
+        return Err(Error::InvalidArgument(format!(
+            "attestation {}: an edition-2 row crosses on its own statement \
+             (TierPromotionCustody::Statement), and only an edition-2 row does",
+            current.attestation_id
+        )));
+    }
+    if let TierPromotionCustody::Statement(c) = custody {
+        return plan_statement_crossing(dir, current, ci, c, self_key_id, now).await;
+    }
     let mut row = current.clone();
     // Canonical at rest: the local door stores the producer's tokens verbatim
     // (`1.0` vs `1`); JCS(x) == JCS(canonical(x)), so this is not a preimage
@@ -589,6 +652,13 @@ pub async fn plan_enter_mesh(
             row.scrub_key_id = reseal.scrub_key_id.clone();
             row.scrub_timestamp = reseal.scrub_timestamp;
             Custody::ActorSigned
+        }
+        // Answered above: an edition-2 row returns before the JCS arms.
+        TierPromotionCustody::Statement(_) => {
+            return Err(Error::InvalidArgument(format!(
+                "attestation {}: a statement custody reached the JCS arms",
+                row.attestation_id
+            )))
         }
         TierPromotionCustody::NodeCoScrub(scrub) => {
             if row.scrub_signature_classical.is_empty() {
@@ -684,6 +754,57 @@ pub async fn plan_enter_mesh(
     row.persist_row_hash = super::types::compute_persist_row_hash(&for_hash)?;
 
     let crossing = report(&row, applied, now);
+    Ok(Some(EnterPlan { row, crossing }))
+}
+
+/// v62.0.0 (v62 P8) — **the [`EnterPlan`] of an edition-2 row**: the row's
+/// own statement, re-admitted now through the edition-2 door against the keys
+/// this node holds ([`super::attestation_emit::mapped_row`]: the key-of-issuer
+/// check, liveness at the signed instant, the payload rules), must name THIS
+/// row (its row id and attester); then the promotion admission stack and the
+/// nine axes run as for any crossing. The signed bytes, the envelope (the
+/// mapping's), `original_content_hash` and `persist_row_hash` (the row id)
+/// are the row's as admitted: only `tier`, `promoted_at` and
+/// `pqc_completed_at` move. Nothing is signed here.
+async fn plan_statement_crossing(
+    dir: &dyn FederationDirectory,
+    current: &Attestation,
+    ci: &ContextualIntegrity,
+    custody: &StatementCustody,
+    self_key_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<EnterPlan>, Error> {
+    use sha2::{Digest, Sha256};
+    let held = super::edition2::emit::carried_statement(current).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "attestation {}: no edition-2 statement to cross on",
+            current.attestation_id
+        ))
+    })?;
+    if held != custody.statement {
+        return Err(Error::PromotionMovedThePreimage {
+            attestation_id: current.attestation_id.clone(),
+            stored_hash: hex::encode(Sha256::digest(&held)),
+            offered_hash: hex::encode(Sha256::digest(&custody.statement)),
+        });
+    }
+    let readmitted = super::attestation_emit::mapped_row(dir, &custody.statement).await?;
+    if readmitted.attestation_id != current.attestation_id
+        || readmitted.attesting_key_id != current.attesting_key_id
+    {
+        return Err(Error::CustodyIsNotTheActor {
+            attestation_id: current.attestation_id.clone(),
+            attesting_key_id: current.attesting_key_id.clone(),
+            scrub_key_id: readmitted.attesting_key_id,
+        });
+    }
+    let mut row = current.clone();
+    row.tier = attestation_tier::FEDERATION.to_owned();
+    row.promoted_at = Some(now);
+    row.pqc_completed_at = Some(now);
+    check_promotion_admission(dir, &row, self_key_id).await?;
+    check_contextual_integrity(dir, &row, &row, ci, &row.cohort_scope.clone(), false, now).await?;
+    let crossing = report(&row, Custody::ActorSigned, now);
     Ok(Some(EnterPlan { row, crossing }))
 }
 
@@ -1376,4 +1497,344 @@ pub fn build_widening(
         expires_at: prior.expires_at,
         weight: prior.weight,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// v62.0.0 (v62 P8) — widen_audience on the clean mesh: a restatement.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// v62.0.0 (v62 P8) — **an edition-2 widening, before it is signed**: the
+/// prior's row type, family and payload restated at the wider audience.
+#[derive(Debug, Clone)]
+pub struct Restatement {
+    /// The prior's family (header -70002).
+    pub family: String,
+    /// The prior's row type (header -70001).
+    pub row_type: String,
+    /// The prior's payload at the new placement.
+    pub payload: ciris_verify_core::cde::Value,
+}
+
+/// The payload members a restatement replaces because they ARE the
+/// placement: the scope and the cohort-target aliases.
+fn is_restatement_placement_member(member: &str) -> bool {
+    member == row_paths::COHORT_SCOPE || admission::COHORT_TARGET_ENVELOPE_FIELDS.contains(&member)
+}
+
+/// The payload member a placement's cohort target rides in on an edition-2
+/// row: `community_id` for a room (a common member, CC 2.6.1.4) and
+/// `family_key_id` for a family (the alias the cohort-target read takes).
+fn restatement_target_member(audience: &Audience) -> Option<&'static str> {
+    match audience {
+        Audience::Family { .. } => Some("family_key_id"),
+        Audience::Community { .. } | Audience::Affiliations { .. } => Some("community_id"),
+        Audience::SelfOnly | Audience::Species | Audience::Biosphere | Audience::Federation => None,
+    }
+}
+
+/// A JSON-pointer path's segments (`/a/b` or a bare `a`), unescaped.
+fn pointer_segments(path: &str) -> Vec<String> {
+    path.strip_prefix('/')
+        .unwrap_or(path)
+        .split('/')
+        .map(|s| s.replace("~1", "/").replace("~0", "~"))
+        .collect()
+}
+
+/// Remove the member `segments` names from a CBOR map, descending through
+/// nested maps; a path that names nothing removes nothing.
+fn strip_cbor(value: &mut ciris_verify_core::cde::Value, segments: &[String]) {
+    use ciris_verify_core::cde::Value;
+    let (Some(first), Value::Map(m)) = (segments.first(), value) else {
+        return;
+    };
+    if segments.len() == 1 {
+        m.retain(|(k, _)| k.as_text() != Some(first.as_str()));
+        return;
+    }
+    if let Some((_, inner)) = m
+        .iter_mut()
+        .find(|(k, _)| k.as_text() == Some(first.as_str()))
+    {
+        strip_cbor(inner, &segments[1..]);
+    }
+}
+
+/// v62.0.0 (v62 P8; CC 4.4.3.3.1 / 8.1.5 on the clean mesh) — **restate an
+/// edition-2 row at a wider audience**: the prior's own statement's row
+/// type, family and payload, with `cohort_scope` (and the cohort target) the
+/// new placement's and the members `strip` names removed (a consent
+/// `StripField` restriction, JSON-pointer paths). Everything else is the
+/// prior's payload verbatim, `asserted_at` included: the claim's instant
+/// crosses with the claim (CIRISPersist#801).
+///
+/// A restatement and not a `supersedes`: an edition-2 composer must find its
+/// target held (`WithdrawsTargetUnheld`), and a peer outside the prior's
+/// audience never holds it, so a `supersedes` over a `self` row could never
+/// reach the audience it widens to. The restatement is a row of its own (the
+/// row id moves with `cohort_scope`), signed by the actor, and the earlier
+/// form's `widened_at` / `differs_in` / `references_attestation_id` are not
+/// members of a closed family payload (`edition2::payloads`).
+///
+/// # Errors
+/// [`Error::WideningMalformed`] for a prior that carries no edition-2
+/// statement, or a `strip` naming a member a widening never strips
+/// ([`WIDENING_PROTECTED_MEMBERS`], `author`, the placement).
+pub fn restate_at_audience(
+    prior: &Attestation,
+    new_scope: &Audience,
+    strip: &[String],
+) -> Result<Restatement, Error> {
+    use ciris_verify_core::cde::Value;
+    let malformed = |reason: String| Error::WideningMalformed {
+        prior_attestation_id: prior.attestation_id.clone(),
+        reason,
+    };
+    let statement = super::edition2::emit::carried_statement(prior).ok_or_else(|| {
+        malformed("the prior carries no edition-2 statement to restate".to_owned())
+    })?;
+    let (family, row_type) = super::edition2::emit::family_of_statement(&statement)
+        .ok_or_else(|| malformed("the prior's statement names no family".to_owned()))?;
+    let (_, mut payload) = super::edition2::liveness::statement_parts(&statement)
+        .ok_or_else(|| malformed("the prior's statement does not decode".to_owned()))?;
+    for path in strip {
+        let segments = pointer_segments(path);
+        let top = segments.first().map(String::as_str).unwrap_or("");
+        if WIDENING_PROTECTED_MEMBERS.contains(&top)
+            || top == "author"
+            || is_restatement_placement_member(top)
+        {
+            return Err(malformed(format!(
+                "`strip` names {path:?}: a widening never strips the claim's identity, its \
+                 instants, its author or its placement"
+            )));
+        }
+        strip_cbor(&mut payload, &segments);
+    }
+    let Value::Map(members) = payload else {
+        return Err(malformed("the prior's payload is not a map".to_owned()));
+    };
+    let mut m: Vec<(Value, Value)> = members
+        .into_iter()
+        .filter(|(k, _)| !k.as_text().is_some_and(is_restatement_placement_member))
+        .collect();
+    m.push((
+        Value::Text(row_paths::COHORT_SCOPE.to_owned()),
+        Value::Text(new_scope.cohort_scope().to_owned()),
+    ));
+    if let (Some(member), Some(target)) = (
+        restatement_target_member(new_scope),
+        new_scope.cohort_target(),
+    ) {
+        m.push((
+            Value::Text(member.to_owned()),
+            Value::Text(target.to_owned()),
+        ));
+    }
+    Ok(Restatement {
+        family,
+        row_type,
+        payload: super::edition2::emit::sorted_map(m),
+    })
+}
+
+/// v62.0.0 (v62 P8) — **the shape rule of an edition-2 widening**
+/// ([`restate_at_audience`]'s, read back off the signed statement): by the
+/// prior's attester, federation-tier, the prior's row type, family, subject,
+/// subjects and weight, a strictly wider `cohort_scope`, the claim's instant
+/// unchanged, and — member by member — the prior's payload, except the
+/// placement and the members `strip` removed. Any other difference is
+/// [`Error::WideningReAuthors`].
+///
+/// # Errors
+/// [`Error::WideningMalformed`], [`Error::CustodyIsNotTheActor`],
+/// [`Error::AudienceNotWider`], [`Error::WideningReAuthors`].
+pub fn check_restated_widening(
+    prior: &Attestation,
+    signed: &Attestation,
+    strip: &[String],
+) -> Result<(), Error> {
+    let malformed = |reason: String| Error::WideningMalformed {
+        prior_attestation_id: prior.attestation_id.clone(),
+        reason,
+    };
+    let reauthors = |member: &str| Error::WideningReAuthors {
+        prior_attestation_id: prior.attestation_id.clone(),
+        member: member.to_owned(),
+    };
+    if prior.tier != attestation_tier::FEDERATION {
+        return Err(malformed(
+            "the prior row is local-tier; call enter_mesh first (CC 5.3.2.4.2), then widen"
+                .to_owned(),
+        ));
+    }
+    if signed.tier != attestation_tier::FEDERATION {
+        return Err(malformed(
+            "the widening row must be federation-tier".to_owned(),
+        ));
+    }
+    if signed.attesting_key_id != prior.attesting_key_id {
+        return Err(Error::CustodyIsNotTheActor {
+            attestation_id: signed.attestation_id.clone(),
+            attesting_key_id: prior.attesting_key_id.clone(),
+            scrub_key_id: signed.attesting_key_id.clone(),
+        });
+    }
+    if signed.attestation_type != prior.attestation_type {
+        return Err(reauthors("attestation_type"));
+    }
+    let (Some(prior_st), Some(signed_st)) = (
+        super::edition2::emit::carried_statement(prior),
+        super::edition2::emit::carried_statement(signed),
+    ) else {
+        return Err(malformed(
+            "both rows carry their edition-2 statements".to_owned(),
+        ));
+    };
+    if super::edition2::emit::family_of_statement(&prior_st)
+        != super::edition2::emit::family_of_statement(&signed_st)
+    {
+        return Err(reauthors("family"));
+    }
+    check_strictly_wider(prior, &signed.cohort_scope)?;
+    if signed.asserted_at != prior.asserted_at {
+        return Err(reauthors(paths::ASSERTED_AT));
+    }
+    if signed.attested_key_id != prior.attested_key_id {
+        return Err(reauthors(row_paths::ATTESTED_KEY_ID));
+    }
+    if sorted(&signed.subject_key_ids) != sorted(&prior.subject_key_ids) {
+        return Err(reauthors(row_paths::SUBJECT_KEY_IDS));
+    }
+    if signed.weight != prior.weight {
+        return Err(reauthors(row_paths::WEIGHT));
+    }
+    let (Some((_, prior_p)), Some((_, signed_p))) = (
+        super::edition2::liveness::statement_parts(&prior_st),
+        super::edition2::liveness::statement_parts(&signed_st),
+    ) else {
+        return Err(malformed("a statement does not decode".to_owned()));
+    };
+    let (Some(prior_m), Some(signed_m)) = (prior_p.as_map(), signed_p.as_map()) else {
+        return Err(malformed("both payloads must be maps".to_owned()));
+    };
+    let stripped = |member: &str| strip.iter().any(|p| differs_in_covers(p, member));
+    for (k, v) in prior_m {
+        let Some(name) = k.as_text() else {
+            return Err(malformed("a payload member key is not text".to_owned()));
+        };
+        if is_restatement_placement_member(name) {
+            continue;
+        }
+        match signed_p.get_text(name) {
+            Some(nv) if nv == v => {}
+            None | Some(_) if stripped(name) => {}
+            _ => return Err(reauthors(name)),
+        }
+    }
+    for (k, _) in signed_m {
+        let name = k.as_text().unwrap_or("");
+        if !is_restatement_placement_member(name) && prior_p.get_text(name).is_none() {
+            return Err(reauthors(name));
+        }
+    }
+    Ok(())
+}
+
+/// v62.0.0 (v62 P8) — **an earlier-form local row as the input its
+/// edition-2 restatement is produced from**, once the earlier-form doors are
+/// shut: the row's type, subject, subjects, scope, expiry, weight and
+/// envelope members (its `row` mirror dropped: a statement binds its row
+/// itself), stated at `asserted_at` ([`super::hard_case::statement_instant`]:
+/// the row's own instant, or the signing key's current record's start when
+/// the row is older than the key, so the key covers it). The producer
+/// ([`super::attestation_emit::produce_row`]) maps the members onto the
+/// payload, as for any emit. A self-attested row (`attested == attesting`)
+/// is stated about its signer.
+///
+/// # Errors
+/// An envelope that is not an object.
+pub fn restatement_input(
+    row: &Attestation,
+    asserted_at: DateTime<Utc>,
+) -> Result<super::EmitAttestationInput, Error> {
+    let mut envelope = row.attestation_envelope.clone();
+    if let Some(o) = envelope.as_object_mut() {
+        o.remove(paths::ROW);
+        o.insert(
+            paths::ASSERTED_AT.to_owned(),
+            serde_json::Value::String(admission::render_signed_instant(asserted_at)),
+        );
+    }
+    let core = super::envelope::EnvelopeCore::from_value(envelope)?;
+    let mut input = super::EmitAttestationInput::with_envelope(
+        row.attestation_type.clone(),
+        core,
+        row.cohort_scope.clone(),
+    );
+    input.attested_key_id =
+        (row.attested_key_id != row.attesting_key_id).then(|| row.attested_key_id.clone());
+    input.subject_key_ids = row.subject_key_ids.clone();
+    input.expires_at = row.expires_at;
+    input.weight = row.weight;
+    Ok(input)
+}
+
+/// v62.0.0 (v62 P8) — **widen an edition-2 row by restating it, signed by
+/// `signer`** (the prior's actor; the caller decides who that is): the
+/// restatement ([`restate_at_audience`]) signed through
+/// `edition2::produce::sign_row`, read back through the edition-2 door
+/// (`attestation_emit::mapped_row`), held to [`check_restated_widening`]
+/// and the nine axes ([`check_contextual_integrity`], the prior as the
+/// claim), then admitted through the statement door (`put_statement`,
+/// `Authored`, federation tier). The same restatement again is
+/// `AlreadyWidened` (the same row id). The prior is untouched. Usable with a
+/// directory and a signer alone (no Engine).
+///
+/// # Errors
+/// [`restate_at_audience`]'s and [`check_restated_widening`]'s refusals;
+/// `composite_signing_unavailable`; the door's and the gates' refusals.
+pub async fn widen_by_restatement<D>(
+    dir: &D,
+    prior: &Attestation,
+    ci: &ContextualIntegrity,
+    signer: &crate::signing::LocalSigner,
+    strip: &[String],
+) -> Result<MeshCrossingOutcome, Error>
+where
+    D: FederationDirectory + Sync + ?Sized,
+{
+    let restated = restate_at_audience(prior, &ci.recipient_see, strip)?;
+    let statement = super::edition2::produce::sign_row(
+        signer,
+        &prior.attested_key_id,
+        &restated.row_type,
+        &restated.family,
+        &restated.payload,
+    )
+    .await
+    .map_err(|e| super::edition2::emit::produce_error("widen_audience", e))?;
+    let signed = super::attestation_emit::mapped_row(dir, &statement).await?;
+    check_restated_widening(prior, &signed, strip)?;
+    let now = crate::host::clock::now();
+    check_contextual_integrity(dir, &signed, prior, ci, &signed.cohort_scope, true, now).await?;
+    // Idempotent per audience: the same restatement is the same row id.
+    if dir.get_attestation(&signed.attestation_id).await?.is_some() {
+        return Ok(MeshCrossingOutcome::AlreadyWidened {
+            prior_attestation_id: prior.attestation_id.clone(),
+        });
+    }
+    super::edition2::ingest::put_statement_with_origin(
+        dir,
+        &statement,
+        None,
+        attestation_tier::FEDERATION,
+        super::replication::admission::WriteOrigin::Authored,
+    )
+    .await?;
+    Ok(MeshCrossingOutcome::Crossed(report(
+        &signed,
+        Custody::ActorSigned,
+        now,
+    )))
 }

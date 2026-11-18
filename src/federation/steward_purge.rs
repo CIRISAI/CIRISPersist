@@ -1882,6 +1882,29 @@ where
     let terms = notice_terms(&notice.envelope)?;
     let unauth =
         |reason: &'static str, detail: String| unauthorised(Some(&terms.notice_id), reason, detail);
+    check_notice_window(&terms, now)?;
+    match super::canonical_community::trust_root_cosigners_over(
+        directory,
+        &terms.claimant_key_id,
+        &notice.envelope,
+        &notice.cosignatures,
+        now,
+    )
+    .await?
+    {
+        Ok(signers) => Ok((terms, signers)),
+        Err((reason, detail)) => Err(unauth(reason, detail)),
+    }
+}
+
+/// The notice's window at `now`: not asserted in the future (beyond the
+/// touch skew), not expired. Shared by both authorisations.
+fn check_notice_window(
+    terms: &NoticeTerms,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    let unauth =
+        |reason: &'static str, detail: String| unauthorised(Some(&terms.notice_id), reason, detail);
     let skew = super::admission::DEFAULT_MAX_TOUCH_SKEW;
     if terms.asserted_at > now + skew {
         return Err(unauth(
@@ -1898,11 +1921,61 @@ where
             format!("the notice expired at {}", terms.expires_at.to_rfc3339()),
         ));
     }
-    match super::canonical_community::trust_root_cosigners_over(
+    Ok(())
+}
+
+/// v62.0.0 (wave T2; CC 2.6.1.9, CC 3.3.2) — **the authorisation of an
+/// edition-2 `takedown_notice:steward_purge` row**, named by its row id: the
+/// notice's terms read from its payload (the notice id IS the row id, the
+/// selection digest its `content_sha256`), the window as for the earlier
+/// form, and the trust root's own `consensus_protocol` counted over the
+/// notice's VOICES: the issuers of its held statements, each re-admitted by
+/// the edition-2 door (`cosign::edition2_voices`), through the same count
+/// the cosigned form meets (`canonical_community::trust_root_counts_voices`).
+/// Each founder's statement is one voice; none carries a signature object.
+///
+/// # Errors
+///
+/// [`token::UNAUTHORISED`]: no statement held (`no_cosignature`), a payload
+/// that is not a steward purge (`notice_malformed`), the window, the root's
+/// standing, a voice that is no seat, the protocol not met; directory reads.
+pub async fn verify_purge_authorisation_edition2<F>(
+    directory: &F,
+    notice_row: &super::edition2::names::RowId,
+) -> Result<(NoticeTerms, BTreeSet<String>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    authorise_edition2_at(directory, notice_row, purge_clock()).await
+}
+
+/// [`verify_purge_authorisation_edition2`] at the calling door's one clock
+/// reading.
+async fn authorise_edition2_at<F>(
+    directory: &F,
+    notice_row: &super::edition2::names::RowId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(NoticeTerms, BTreeSet<String>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let id = notice_row.hex();
+    let unauth = |reason: &'static str, detail: String| unauthorised(Some(&id), reason, detail);
+    let held = directory.edition2_voices(notice_row).await?;
+    let Some(first) = held.first() else {
+        return Err(unauth(
+            unauthorised_reason::NO_COSIGNATURE,
+            "no statement of the notice is held".to_owned(),
+        ));
+    };
+    let terms = notice_terms_of_statement(first, &id)
+        .map_err(|detail| unauth(unauthorised_reason::NOTICE_MALFORMED, detail))?;
+    check_notice_window(&terms, now)?;
+    let voices = super::cosign::edition2_voices(directory, notice_row).await?;
+    match super::canonical_community::trust_root_counts_voices(
         directory,
         &terms.claimant_key_id,
-        &notice.envelope,
-        &notice.cosignatures,
+        &voices,
         now,
     )
     .await?
@@ -1910,6 +1983,60 @@ where
         Ok(signers) => Ok((terms, signers)),
         Err((reason, detail)) => Err(unauth(reason, detail)),
     }
+}
+
+/// The terms of an edition-2 steward purge notice, from its statement's
+/// payload (`edition2::typed::takedown_payload`'s members). The notice id is
+/// the row id.
+fn notice_terms_of_statement(statement: &[u8], notice_id: &str) -> Result<NoticeTerms, String> {
+    use ciris_verify_core::cde::Value;
+    let (_, payload) = super::edition2::liveness::statement_parts(statement)
+        .ok_or_else(|| "the held statement does not decode".to_owned())?;
+    let text = |m: &str| payload.get_text(m).and_then(Value::as_text);
+    if text("legal_basis") != Some(STEWARD_PURGE_BASIS) {
+        return Err(format!(
+            "the notice's legal_basis is not {STEWARD_PURGE_BASIS:?}"
+        ));
+    }
+    let instant = |m: &str| {
+        payload
+            .get_text(m)
+            .and_then(Value::as_u64)
+            .and_then(|ms| i64::try_from(ms).ok())
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .ok_or_else(|| format!("the notice carries no `{m}` (uint, ms)"))
+    };
+    let selection_digest = match payload.get_text("content_sha256").and_then(Value::as_array) {
+        Some([alg, d]) if alg.as_i64() == Some(-16) => d
+            .as_bytes()
+            .filter(|b| b.len() == 32)
+            .map(hex::encode)
+            .ok_or_else(|| "content_sha256 is not a SHA-256 digest".to_owned())?,
+        _ => return Err("the notice carries no content_sha256 digest".to_owned()),
+    };
+    let selection_counts = match payload.get_text("selection_counts") {
+        None => None,
+        Some(m) => Some(
+            m.as_map()
+                .ok_or_else(|| "selection_counts is not a map".to_owned())?
+                .iter()
+                .map(|(k, v)| match (k.as_text(), v.as_u64()) {
+                    (Some(k), Some(n)) => Ok((k.to_owned(), n)),
+                    _ => Err("selection_counts maps text to uint".to_owned()),
+                })
+                .collect::<Result<BTreeMap<String, u64>, String>>()?,
+        ),
+    };
+    Ok(NoticeTerms {
+        notice_id: notice_id.to_owned(),
+        claimant_key_id: text("claimant")
+            .ok_or_else(|| "the notice names no claimant".to_owned())?
+            .to_owned(),
+        selection_digest,
+        selection_counts,
+        asserted_at: instant("asserted_at")?,
+        expires_at: instant("expires_at")?,
+    })
 }
 
 // ── the stored plane ───────────────────────────────────────────────────────
@@ -2137,8 +2264,106 @@ pub async fn purge_rows<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (slice F, G2's finding) — the earlier-form JSON notice door.
+    super::edition2::door::refuse_earlier_form("purge")?;
     let now = purge_clock();
     let (terms, signers) = authorise_at(directory, notice, now).await?;
+    let notice_jcs = String::from_utf8(notice_signing_bytes(&notice.envelope)?)
+        .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
+    let cosignatures_json = serde_json::to_string(&notice.cosignatures)
+        .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+    execute_purge(
+        directory,
+        selection,
+        AuthorisedNotice {
+            terms,
+            signers,
+            notice_jcs,
+            cosignatures_json,
+        },
+        executed_by,
+        now,
+    )
+    .await
+}
+
+/// v62.0.0 (wave T2; CC 2.6.1.9, CC 4.5.3) — **`purge_rows` for an
+/// edition-2 `takedown_notice:steward_purge` notice**, named by its row id.
+/// The authorisation is the founders' VOICES (the notice's held statements),
+/// counted by the trust root's own protocol
+/// ([`verify_purge_authorisation_edition2`]); everything after it is
+/// [`purge_rows`]'s own execution, unchanged (the selection, the counts, the
+/// digest, whole-or-nothing retractions, the one-transaction header and
+/// tombstones).
+///
+/// The ledger header keeps the preimages of the edition-2 notice: the
+/// notice id is its row id; `notice_jcs` holds
+/// `{"edition2_statements": [hex, ..]}` (every held voice,
+/// [`edition2_notice_envelope`]) and `cosignatures_json` is `[]`. Served,
+/// that object IS the bundle's notice envelope, and
+/// [`apply_replicated_purge`] re-admits the statements and re-counts them
+/// (the edition-2 count), never an earlier-form cosignature.
+///
+/// # Errors
+///
+/// As [`verify_purge_authorisation_edition2`] and [`purge_rows`].
+pub async fn purge_rows_edition2<F>(
+    directory: &F,
+    selection: &PurgeSelection,
+    notice_row: &super::edition2::names::RowId,
+    executed_by: &str,
+) -> Result<PurgeReport, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let now = purge_clock();
+    let (terms, signers) = authorise_edition2_at(directory, notice_row, now).await?;
+    let held = directory.edition2_voices(notice_row).await?;
+    let notice_jcs = serde_json::to_string(&edition2_notice_envelope(&held))
+        .map_err(|e| Error::Backend(format!("voices encode: {e}")))?;
+    let cosignatures_json = "[]".to_owned();
+    execute_purge(
+        directory,
+        selection,
+        AuthorisedNotice {
+            terms,
+            signers,
+            notice_jcs,
+            cosignatures_json,
+        },
+        executed_by,
+        now,
+    )
+    .await
+}
+
+/// An authorised notice, whichever form authorised it: its terms, its
+/// counted signers, and the two ledger preimages.
+struct AuthorisedNotice {
+    terms: NoticeTerms,
+    signers: BTreeSet<String>,
+    notice_jcs: String,
+    cosignatures_json: String,
+}
+
+/// **The purge's execution** after its authorisation, one body for both
+/// forms (what [`purge_rows`] did after `authorise_at`).
+async fn execute_purge<F>(
+    directory: &F,
+    selection: &PurgeSelection,
+    notice: AuthorisedNotice,
+    executed_by: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<PurgeReport, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let AuthorisedNotice {
+        terms,
+        signers,
+        notice_jcs,
+        cosignatures_json,
+    } = notice;
     let resolved = resolve_selection(directory, selection).await?;
     let live = resolved.counts();
     check_counts(&terms, &live)?;
@@ -2183,10 +2408,6 @@ where
     }
     // INTERIM: no human subject until the notice is a row (nothing written).
     refuse_human_subjects(directory, &records, &parties, false, Some(&terms.notice_id)).await?;
-    let notice_jcs = String::from_utf8(notice_signing_bytes(&notice.envelope)?)
-        .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
-    let cosignatures_json = serde_json::to_string(&notice.cosignatures)
-        .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
     let tombstones: Vec<PurgeTombstone> = records
         .iter()
         .enumerate()
@@ -2579,6 +2800,103 @@ where
     Ok(report)
 }
 
+/// v62.0.0 (wave T2) — the envelope member an edition-2 notice's statements
+/// ride under, in the ledger's `notice_jcs` and a served bundle's notice.
+pub const EDITION2_STATEMENTS_MEMBER: &str = "edition2_statements";
+
+/// v62.0.0 (wave T2) — **the notice envelope of an edition-2 purge**: its
+/// held statements (lowercase hex) under [`EDITION2_STATEMENTS_MEMBER`].
+/// What `purge_rows_edition2` records and a bundle carries.
+#[must_use]
+pub fn edition2_notice_envelope(statements: &[Vec<u8>]) -> serde_json::Value {
+    serde_json::json!({
+        EDITION2_STATEMENTS_MEMBER: statements.iter().map(hex::encode).collect::<Vec<_>>(),
+    })
+}
+
+/// The statements an edition-2 notice envelope carries; `Ok(None)` for an
+/// earlier-form notice.
+///
+/// # Errors
+/// [`token::UNAUTHORISED`] (`notice_malformed`) for a member that is not a
+/// non-empty array of lowercase hex.
+fn edition2_statements_of(envelope: &serde_json::Value) -> Result<Option<Vec<Vec<u8>>>, Error> {
+    let Some(member) = envelope.get(EDITION2_STATEMENTS_MEMBER) else {
+        return Ok(None);
+    };
+    let malformed = |detail: &str| {
+        unauthorised(
+            None,
+            unauthorised_reason::NOTICE_MALFORMED,
+            format!("{EDITION2_STATEMENTS_MEMBER}: {detail}"),
+        )
+    };
+    let items = member
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| malformed("not a non-empty array"))?;
+    items
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .and_then(|h| hex::decode(h).ok())
+                .ok_or_else(|| malformed("an item is not hex"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// A replicated edition-2 notice's statements, admitted HERE through the
+/// one statement door (each re-verified; a steward purge voice is kept), and
+/// the row id they share.
+///
+/// # Errors
+/// The door's refusal of any statement; `notice_malformed` for statements
+/// naming different rows.
+async fn admit_replicated_notice<F>(
+    directory: &F,
+    statements: &[Vec<u8>],
+) -> Result<super::edition2::names::RowId, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut row: Option<super::edition2::names::RowId> = None;
+    for st in statements {
+        super::edition2::ingest::put_statement(
+            directory,
+            st,
+            None,
+            super::edition2::ingest::INGEST_TIER,
+        )
+        .await?;
+        let id = super::edition2::names::RowId::of_statement(st).ok_or_else(|| {
+            unauthorised(
+                None,
+                unauthorised_reason::NOTICE_MALFORMED,
+                "a carried statement is not a row statement".to_owned(),
+            )
+        })?;
+        match row {
+            None => row = Some(id),
+            Some(r) if r == id => {}
+            Some(r) => {
+                return Err(unauthorised(
+                    Some(&r.hex()),
+                    unauthorised_reason::NOTICE_MALFORMED,
+                    format!("a carried statement names row {}, not the notice", id.hex()),
+                ))
+            }
+        }
+    }
+    row.ok_or_else(|| {
+        unauthorised(
+            None,
+            unauthorised_reason::NOTICE_MALFORMED,
+            "the bundle carries no statement".to_owned(),
+        )
+    })
+}
+
 // ── replication ────────────────────────────────────────────────────────────
 
 /// The replicated tombstone (CIRISConstitution#165 §3): the notice, its WHOLE
@@ -2667,9 +2985,25 @@ pub async fn apply_replicated_purge<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    super::edition2::door::refuse_earlier_form("purge")?;
     let now = purge_clock();
-    let (terms, _signers) = authorise_at(directory, &bundle.notice, now).await?;
+    // v62.0.0 (wave T2) — an edition-2 notice rides as its statements: each
+    // is admitted here through the statement door, and the founders' voices
+    // are counted by the trust root's protocol (the edition-2 count), never
+    // an earlier-form cosignature.
+    let edition2 = edition2_statements_of(&bundle.notice.envelope)?;
+    let (terms, notice_row) = match &edition2 {
+        Some(statements) => {
+            let row = admit_replicated_notice(directory, statements).await?;
+            (
+                authorise_edition2_at(directory, &row, now).await?.0,
+                Some(row),
+            )
+        }
+        None => {
+            super::edition2::door::refuse_earlier_form("purge")?;
+            (authorise_at(directory, &bundle.notice, now).await?.0, None)
+        }
+    };
     let mut records = Vec::with_capacity(bundle.record_ids.len());
     for (i, id) in bundle.record_ids.iter().enumerate() {
         let mut r = parse_record_id(id)?;
@@ -2756,10 +3090,21 @@ where
         Some(&terms.notice_id),
     )
     .await?;
-    let notice_jcs = String::from_utf8(notice_signing_bytes(&bundle.notice.envelope)?)
-        .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
-    let cosignatures_json = serde_json::to_string(&bundle.notice.cosignatures)
-        .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+    let (notice_jcs, cosignatures_json) = if let Some(row) = &notice_row {
+        let held = directory.edition2_voices(row).await?;
+        (
+            serde_json::to_string(&edition2_notice_envelope(&held))
+                .map_err(|e| Error::Backend(format!("voices encode: {e}")))?,
+            "[]".to_owned(),
+        )
+    } else {
+        (
+            String::from_utf8(notice_signing_bytes(&bundle.notice.envelope)?)
+                .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?,
+            serde_json::to_string(&bundle.notice.cosignatures)
+                .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?,
+        )
+    };
     let tombstones: Vec<PurgeTombstone> = records
         .iter()
         .enumerate()

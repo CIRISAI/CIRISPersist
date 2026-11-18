@@ -63,7 +63,7 @@ const NOT_BUILT: &[(&str, &str, &str, &str, NotYet)] = &[
     ),
     (
         "3.1.9.7",
-        "A community declares a Goal as it issues a licence",
+        "A group declares a Goal by its own vote",
         "CIRISPersist#1154",
         "v62",
         NotYet::TextOnly,
@@ -118,8 +118,10 @@ mod tests {
     #[test]
     fn i1499_the_rc14_text_not_built_here_is_not_built() {
         // v61.3.0 (CIRISPersist#1252) — every CC file is vendored at rc18; the
-        // table's rows were re-read there (none of them is built).
-        assert_eq!(VENDORED_CC_VERSION, "1.0-rc18", "the table is read at rc18");
+        // table's rows were re-read there (none of them is built). v62.0.0:
+        // re-read at rc20; the Goal row's anchor moved with its text (a group,
+        // not only a community, declares a Goal by its own vote).
+        assert_eq!(VENDORED_CC_VERSION, "1.0-rc20", "the table is read at rc20");
         let tsv = std::fs::read_to_string(root().join("evidence/cc_impl.tsv")).expect("cc_impl");
         let claims: Vec<&str> = tsv
             .lines()

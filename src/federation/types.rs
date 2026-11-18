@@ -788,7 +788,7 @@ pub mod owner_binding {
     /// `steward_bind` path sets the dimension; a raw `emit_attestation_self`
     /// `delegates_to` — the only expressible owner-binding path per CC 2.4.1.2,
     /// and what CIRISConformance probes — carries only this). Keying on the
-    /// dimension ALONE let the raw-emit path bypass the single-owner gate.
+    /// dimension ALONE let the raw-emit path bypass the owner fold.
     pub const CC_DELEGATION_PURPOSE: &str = "owner_binding";
 }
 
@@ -1127,7 +1127,48 @@ pub mod delegation_scope {
         // v60.1.0 (CIRISPersist#1119) — APPENDED, never inserted: a consumer
         // mirrors this list by position.
         INFRA_RELAY,
+        // v62.0.0 (P6) — the secrets API's three capabilities, APPENDED in
+        // tier order. See [`SECRETS`].
+        SECRETS_READER,
+        SECRETS_WRITER,
+        SECRETS_ADMIN,
     ];
+
+    /// v62.0.0 (P6; RULINGS "Planes": the secrets API is LOCAL) —
+    /// `secrets:reader`: call the secrets API's read routes (list, retrieve,
+    /// filter config read, stats, access logs).
+    ///
+    /// A CAPABILITY conferred by a `self:delegates_to` row from the node's
+    /// owner to the caller's key, read by the `server::secrets` door
+    /// (feature `secrets-server`) through `trust_root::owner_granted_scope`
+    /// (the serve tier's owner-grant predicate). It replaces the earlier form's `cirislens_secrets_reader`
+    /// role tag, a string the key record carried about itself (CC 3.4.7: no
+    /// key declares itself into a duty).
+    ///
+    /// **No tier covers another.** `secrets:admin` is not a parent of
+    /// `secrets:writer` under `admission::scope_covers` (siblings, not a
+    /// `:`-narrowing), and the door asks for each route's own token: an owner
+    /// granting all three names all three.
+    pub const SECRETS_READER: &str = "secrets:reader";
+    /// v62.0.0 (P6) — `secrets:writer`: call the secrets API's mutating
+    /// routes (store, try_claim, encrypt, decrypt, recall, forget, filter
+    /// config write, reencrypt_all). See [`SECRETS_READER`].
+    pub const SECRETS_WRITER: &str = "secrets:writer";
+    /// v62.0.0 (P6) — `secrets:admin`: rotate the secrets master key. See
+    /// [`SECRETS_READER`].
+    pub const SECRETS_ADMIN: &str = "secrets:admin";
+
+    /// v62.0.0 (P6) — the secrets axis: capabilities on THIS node's LOCAL
+    /// secrets plane, conferred by its owner. Its own axis: not [`INFRA`]
+    /// (what a key does AS infrastructure for the mesh), not [`AGENCY`] (what
+    /// a key does on a principal's behalf), not [`MODERATION`] (acts about
+    /// another party), not [`RECOVERY`]. Tier order: reader, writer, admin.
+    ///
+    /// CC 4.4.3.4.3 note: a key whose record holds `node` may carry only
+    /// `infra:*` (`admission::check_node_agency_admission`), so these scopes
+    /// cannot be delegated to a `node` key. A secrets caller is an agent or a
+    /// user key.
+    pub const SECRETS: &[&str] = &[SECRETS_READER, SECRETS_WRITER, SECRETS_ADMIN];
 
     /// v30.7.0 (CIRISPersist#625) — the `infra:*` axis: what a key may do as
     /// INFRASTRUCTURE.
@@ -1248,6 +1289,10 @@ pub mod delegation_scope {
         ),
         (
             "types::RECOVERY",
+            "an axis subset of ALL, not a single value",
+        ),
+        (
+            "types::SECRETS",
             "an axis subset of ALL, not a single value",
         ),
         // ── newly VISIBLE once the scan went crate-wide (#636) ──
@@ -4625,6 +4670,40 @@ impl SignedTouchClaim {
     }
 }
 
+/// v62.0.0 (v62 P5b) — the `freshness_floor.signer_form` token a node-local
+/// touch is stored under. The table keeps the earlier form's NOT NULL signed
+/// columns (V300 reproduces edition 1's DDL byte for byte, I1950), so a
+/// node-local row marks itself here, with an empty `signature` and an
+/// empty-object `signed_envelope`: it carries no signature and claims none.
+/// Never a [`SignerForm`] token, so the earlier form's read
+/// (`lookup_freshness_floor`) skips such a row by it.
+pub const NODE_LOCAL_TOUCH_FORM: &str = "node_local";
+
+/// v62.0.0 (v62 P5b; RULINGS "a touch claim is node-local";
+/// CC_FAMILYMAP_ANSWER: a NODE-LOCAL fold, CC 2.4.1 "node-local derived
+/// state") — **a freshness floor as this node holds it**: the fields the
+/// floor's fold reads, whichever write set them (the node-local
+/// [`crate::federation::FederationDirectory::put_touch_claim_local`] or the
+/// earlier-form signed `put_touch_claim`). Read with
+/// [`crate::federation::FederationDirectory::freshness_floor`].
+///
+/// It carries no signer and no signature: the node is the only author of a
+/// node-local floor, and the floor never crosses the mesh. The privacy note
+/// on [`SignedTouchClaim`] holds unchanged: `cohort_scope` is mandatory, and
+/// a consumer exposing a floor to a peer applies the same cohort/consent
+/// gating as for any other cohort-scoped read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessFloor {
+    /// What is being kept alive (see [`SignedTouchClaim::target_key_id`]).
+    pub target_key_id: String,
+    /// The kind of thing `target_key_id` names (open vocabulary).
+    pub target_kind: String,
+    /// The lower bound: "alive no earlier than this instant". Monotonic max.
+    pub fresh_as_of: DateTime<Utc>,
+    /// The mandatory privacy row (one of the closed `cohort_scope` values).
+    pub cohort_scope: String,
+}
+
 // ─── Trust hierarchy (v1.3.0, CIRISPersist#46 + #47) ───────────────
 //
 // Persist absorbs NodeCore's `crate::trust` module surface at the
@@ -6929,11 +7008,16 @@ mod tests {
         // now", where MODERATION answers "what may be done about this party".
         // Folding it into MODERATION would tell an operator picker that
         // succession is a moderation action.
+        // v62.0.0 (P6) — SECRETS is the fifth axis: capabilities on this
+        // node's LOCAL secrets plane, conferred by its owner. Not INFRA (no
+        // mesh duty), not AGENCY (no principal), not MODERATION (no act
+        // about another party), not RECOVERY.
         for (name, set) in [
             ("INFRA", ds::INFRA),
             ("AGENCY", ds::AGENCY),
             ("MODERATION", ds::MODERATION),
             ("RECOVERY", ds::RECOVERY),
+            ("SECRETS", ds::SECRETS),
         ] {
             for v in set {
                 assert!(
@@ -6952,7 +7036,7 @@ mod tests {
         assert!(
             missing.is_empty(),
             "scope(s) in ALL belong to no axis subset: {missing:?}. Every scope has an axis — add \
-             it to INFRA, AGENCY, MODERATION or RECOVERY, or say why a FIFTH axis exists."
+             it to INFRA, AGENCY, MODERATION, RECOVERY or SECRETS, or say why a SIXTH axis exists."
         );
 
         // Non-vacuity: an empty or tiny set would satisfy everything above.
@@ -6961,6 +7045,7 @@ mod tests {
                 && ds::AGENCY.len() >= 4
                 && ds::MODERATION.len() >= 5
                 && !ds::RECOVERY.is_empty()
+                && ds::SECRETS.len() == 3
         );
     }
 
@@ -6973,7 +7058,8 @@ mod tests {
     fn infra_relay_is_appended_and_pinned_by_position() {
         use super::delegation_scope as ds;
         assert_eq!(ds::INFRA_RELAY, "infra:relay");
-        assert_eq!(ds::ALL.len(), 25);
+        // v62.0.0 (P6): 25 + the three secrets scopes, appended after it.
+        assert_eq!(ds::ALL.len(), 28);
         assert_eq!(
             ds::ALL[24],
             ds::INFRA_RELAY,
@@ -6988,6 +7074,30 @@ mod tests {
         );
         assert_eq!(ds::INFRA[11], ds::INFRA_CLASSIFY_CONTENT);
         assert!(ds::INFRA_RELAY.starts_with(ds::INFRA_PREFIX));
+    }
+
+    /// v62.0.0 (P6, I3211) — the secrets scopes are APPENDED to `ALL` in tier
+    /// order, after `infra:relay`, and `SECRETS` is exactly those three: a
+    /// consumer mirrors `ALL` by position.
+    #[test]
+    fn secrets_scopes_are_appended_and_pinned_by_position() {
+        use super::delegation_scope as ds;
+        assert_eq!(ds::SECRETS_READER, "secrets:reader");
+        assert_eq!(ds::SECRETS_WRITER, "secrets:writer");
+        assert_eq!(ds::SECRETS_ADMIN, "secrets:admin");
+        assert_eq!(
+            &ds::ALL[24..],
+            &[
+                ds::INFRA_RELAY,
+                ds::SECRETS_READER,
+                ds::SECRETS_WRITER,
+                ds::SECRETS_ADMIN
+            ]
+        );
+        assert_eq!(
+            ds::SECRETS,
+            &[ds::SECRETS_READER, ds::SECRETS_WRITER, ds::SECRETS_ADMIN]
+        );
     }
 
     /// v30.7.0 (CIRISPersist#625) — **every `delegation_scope` constant is either
@@ -7219,6 +7329,7 @@ mod tests {
             ("AGENCY", ds::AGENCY),
             ("MODERATION", ds::MODERATION),
             ("RECOVERY", ds::RECOVERY),
+            ("SECRETS", ds::SECRETS),
         ] {
             for v in axis {
                 assert!(

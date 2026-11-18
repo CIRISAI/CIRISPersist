@@ -502,6 +502,12 @@ mod tests {
             required_identity_type: identity_type::LENSCORE_DETECTOR,
             manifest_marker: identity_type::LENSCORE_DETECTOR,
         },
+        // v62.0.0 (CC rc20): the CC registry folds the next three leaves into
+        // one row, `detection:{detector}` (closed vocabulary). `family` here
+        // keys the supersets walk's `invariant_registry`, which keeps one
+        // entry per leaf with its own text, so the leaf names stay;
+        // `load_bearing::family_for_dimension` maps the rc20 row's bind back
+        // to the leaf.
         ReservedFact {
             family: "detection:conscience_override_rate",
             sample_attestation_type: "detection:conscience_override_rate",

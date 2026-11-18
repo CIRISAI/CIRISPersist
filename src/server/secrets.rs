@@ -4,9 +4,8 @@
 //! which are HTTP-exposed; the 3 in-process-only methods —
 //! `process_incoming_text`, `decapsulate_secrets_in_parameters`,
 //! `test_encryption`, `migrate_to_hardware_key` — stay behind the
-//! trait). FederatedSecretsClient (`src/secrets/client.rs`,
-//! deferred to a separate task) calls these routes so consumer
-//! code can swap in-process ↔ federated transparently.
+//! trait). FederatedSecretsClient (`src/secrets/client.rs`) calls these
+//! routes so consumer code can swap in-process ↔ federated transparently.
 //!
 //! # Trait-shape constraint
 //!
@@ -18,46 +17,69 @@
 //! mirrors how the pipeline ingest route parameterizes over
 //! `F: FederationDirectory` (`server/mod.rs::AppState`).
 //!
-//! # Hybrid-verify on the wire
+//! # v62.0.0 — who may call, and how a request is signed
 //!
-//! Every mutating request body must be hybrid-signed by the
-//! steward (`X-Ciris-Signing-Key-Id` + `X-Ciris-Signature-Ed25519` +
-//! optional `X-Ciris-Signature-MlDsa-65` headers). Persist
-//! verifies via the existing
-//! [`crate::verify::verify_hybrid_via_directory`] path — same
-//! directory the legacy trace-verify route consults. GET routes
-//! are read-only and also signature-verify on the URI path bytes
-//! (an empty body is canonicalized as `""`).
+//! The secrets API is this node's **LOCAL plane** (v62 RULINGS, "Planes").
+//! Every route but `GET /api/v1/secrets/health` runs [`authorize_request`]:
 //!
-//! Reject 401 on signature failure; 403 on role-tag failure (NOT
-//! enforced today — see FSD §5 role-tag deferral below); 400 on
-//! malformed body; 404 on not-found; 500 on backend; 503 on
-//! backend-unavailable.
+//! 1. **One composite signature.** The request carries
+//!    [`HEADER_KEY_ID`] (the caller's edition-2 identity-ref) and
+//!    [`HEADER_SIGNATURE`] (base64 of ONE CC 2.6.1.7 ML-DSA-65-Ed25519
+//!    composite, 3373 bytes) over
+//!    [`canonical_request`](crate::secrets::wire::canonical_request)`(method,
+//!    path_and_query, body)`. It is verified under the composite key of the
+//!    caller's **live** edition-2 `key:record` (the key plane's own reading,
+//!    `edition2::liveness`, at this node's clock): a revoked, lapsed or
+//!    unknown key authenticates nothing. The two component headers of the
+//!    earlier form (`x-ciris-signature-ed25519` /
+//!    `x-ciris-signature-ml-dsa-65`) are refused by name
+//!    ([`KIND_SIGNATURE_EARLIER_FORM`]): the composite rule admits no
+//!    standalone component signer.
+//! 2. **A delegated capability.** Each route needs one scope —
+//!    `secrets:reader`, `secrets:writer` or `secrets:admin`
+//!    ([`SecretsTier::scope`]) — conferred on the caller's key by a live
+//!    `self:delegates_to` row from **this node's owner**
+//!    ([`admission::owner_of`], the kernel's owner seat; the node's
+//!    cosignature is required). The predicate is
+//!    `trust_root::owner_granted_scope`, the one the serve tier's
+//!    owner-grant rung reads (tombstones, expiry, envelope `valid_until`,
+//!    federation tier), never a second spelling of it. A withdrawn grant
+//!    confers nothing.
 //!
-//! # Role-tag enforcement (deferred)
+//! **No tier covers another**: the three tokens are siblings under the
+//! scope grammar (`admission::scope_covers` is a `:`-narrowing), so an owner
+//! that wants a key to read and write grants both. **No authority is read
+//! from the caller's own record**: neither its `identity_type` nor any role
+//! list (CC 3.4.7, "No key declares itself into a duty"). The earlier form's
+//! `capability_roles` (`cirislens_secrets_reader` / `_writer` / `_admin`) is
+//! gone.
 //!
-//! FSD §5 specifies three role tiers — `cirislens_secrets_reader`
-//! / `cirislens_secrets_writer` / `cirislens_secrets_admin`. The
-//! current [`crate::federation::types::KeyRecord`] schema carries
-//! `identity_type` + `identity_ref` but no role list. v1.1.0
-//! accepts any directory-registered key (no role-tag enforcement)
-//! and defers the schema addition (V020+ migration) to a v1.1.x
-//! follow-up. Same gap-pattern as `src/server/pipeline.rs`.
+//! Status codes: 401 for a signature that is missing, earlier-form, invalid,
+//! or made by a key that is not held or not live; 403 for a capability not
+//! delegated or a conferrer that cannot be resolved (no node identity, no
+//! owner, an ambiguous owner); 503 when the directory cannot be read; then
+//! 400 / 404 / 500 / 503 from the service as before.
 //!
 //! [`SecretsService`]: crate::secrets::SecretsService
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{OriginalUri, Path, Query, State};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 
-use crate::federation::FederationDirectory;
+use crate::federation::edition2::ingest::{held_keys_for_kid, kid_of_identity_ref};
+use crate::federation::edition2::liveness::Liveness;
+use crate::federation::types::delegation_scope;
+use crate::federation::{admission, trust_root, FederationDirectory};
 use crate::secrets::types::MasterKeyRef;
+pub use crate::secrets::wire::{
+    canonical_request, EARLIER_FORM_SIGNATURE_HEADERS, HEADER_KEY_ID, HEADER_SIGNATURE,
+};
 use crate::secrets::wire::{
     AccessLogsQuery, AccessLogsResponse, ClaimResultWire, DecryptRequest, DecryptResponse,
     EncryptRequest, EncryptResponse, FilterConfigResponse, FilterConfigUpdateRequest,
@@ -69,121 +91,60 @@ use crate::secrets::wire::{
 };
 use crate::secrets::{SecretsError, SecretsService};
 use crate::store::Backend;
-use crate::verify::hybrid::VerifyError;
-use crate::verify::{verify_hybrid_via_directory, HybridPolicy};
 use crate::ClaimResult;
 
-// ── Hybrid-verify header tokens ────────────────────────────────────
+// ── v62.0.0 refusal tokens (AV-15 `kind`) ──────────────────────────
 
-/// Header carrying the steward's `federation_keys.key_id`.
-pub const HEADER_KEY_ID: &str = "x-ciris-signing-key-id";
-/// Header carrying the Ed25519 signature (base64) over the request
-/// body bytes.
-pub const HEADER_ED25519: &str = "x-ciris-signature-ed25519";
-/// Header carrying the ML-DSA-65 signature (base64).
-///
-/// **REQUIRED as of v37.0.0.** It was optional during the hybrid-pending
-/// rollout window, when [`verify_request`] ran under
-/// `HybridPolicy::Ed25519Fallback`; that window closed in the v37.0.0
-/// break. A request omitting this header is refused with
-/// `verify_hybrid_pending_rejected`, and the signing key must have a
-/// `pubkey_ml_dsa_65` registered in `federation_keys`.
-pub const HEADER_ML_DSA_65: &str = "x-ciris-signature-ml-dsa-65";
+/// 401 — [`HEADER_KEY_ID`] or [`HEADER_SIGNATURE`] is absent.
+pub const KIND_SIGNATURE_MISSING: &str = "secrets_signature_missing";
+/// 401 — the request carries an earlier-form component-signature header
+/// ([`EARLIER_FORM_SIGNATURE_HEADERS`]). Refused before any key is read.
+pub const KIND_SIGNATURE_EARLIER_FORM: &str = "secrets_signature_earlier_form";
+/// 401 — the composite does not verify over the canonical request under the
+/// caller's live key, or the header is not base64 of a 3373-byte composite.
+pub const KIND_SIGNATURE_INVALID: &str = "secrets_signature_invalid";
+/// 401 — [`HEADER_KEY_ID`] is not an edition-2 identity-ref, or this node
+/// holds no valid `key:record` for it.
+pub const KIND_SIGNATURE_UNKNOWN_KEY: &str = "secrets_signature_unknown_key";
+/// 401 — the caller's key is held but not live at this node's clock: revoked,
+/// outside its record's window, or waiting on a key this node does not hold.
+pub const KIND_SIGNER_NOT_LIVE: &str = "secrets_signer_not_live";
+/// 403 — no live `self:delegates_to` from this node's owner confers the
+/// route's scope on the caller's key. Replaces the earlier form's
+/// `secrets_role_tag`.
+pub const KIND_NOT_DELEGATED: &str = "secrets_capability_not_delegated";
+/// 403 — the conferrer cannot be resolved: this node has no identity
+/// (`FederationDirectory::node_key_id`), no live owner, or more than one.
+/// Fails closed: no owner, no grant.
+pub const KIND_CONFERRER_UNRESOLVED: &str = "secrets_conferrer_unresolved";
+/// 503 — the directory could not be read while authorizing.
+pub const KIND_DIRECTORY_UNAVAILABLE: &str = "secrets_directory_unavailable";
 
-// ── v1.3.0 (CIRISPersist#46) — Role-tag tiers ──────────────────────
+// ── v62.0.0 — the three capabilities ───────────────────────────────
 
-/// Read-only secrets routes (`get_list` / `get_retrieve` /
-/// `get_filter_config` / `get_stats` / `get_health` /
-/// `get_access_logs`) require this role tag (or any higher tier).
-pub const ROLE_SECRETS_READER: &str = "cirislens_secrets_reader";
-/// Mutating secrets routes (`post_store` / `post_try_claim` /
-/// `post_encrypt` / `post_decrypt` / `post_recall` /
-/// `post_reencrypt_all` / `delete_forget` / `put_filter_config`)
-/// require this role tag (or any higher tier).
-pub const ROLE_SECRETS_WRITER: &str = "cirislens_secrets_writer";
-/// Master-key rotation (`post_rotate_master_key`) requires this
-/// role tag.
-pub const ROLE_SECRETS_ADMIN: &str = "cirislens_secrets_admin";
-
-/// Stable error kind token for role-tag rejection (403).
-pub const KIND_ROLE_TAG: &str = "secrets_role_tag";
-
-/// Tier required by a route — used by [`require_role`] to gate
-/// access. Higher tiers implicitly satisfy lower tiers
-/// (admin > writer > reader).
+/// The capability a route requires. Each maps to ONE delegation scope
+/// ([`Self::scope`]); no tier implies another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecretsTier {
+pub enum SecretsTier {
+    /// Read routes: list, retrieve, filter config read, stats, access logs.
     Reader,
+    /// Mutating routes: store, try_claim, encrypt, decrypt, recall, forget,
+    /// filter config write, reencrypt_all.
     Writer,
+    /// Master-key rotation.
     Admin,
 }
 
 impl SecretsTier {
-    fn allowed_roles(self) -> &'static [&'static str] {
+    /// The `self:delegates_to` scope token this tier requires.
+    #[must_use]
+    pub fn scope(self) -> &'static str {
         match self {
-            Self::Reader => &[ROLE_SECRETS_READER, ROLE_SECRETS_WRITER, ROLE_SECRETS_ADMIN],
-            Self::Writer => &[ROLE_SECRETS_WRITER, ROLE_SECRETS_ADMIN],
-            Self::Admin => &[ROLE_SECRETS_ADMIN],
+            Self::Reader => delegation_scope::SECRETS_READER,
+            Self::Writer => delegation_scope::SECRETS_WRITER,
+            Self::Admin => delegation_scope::SECRETS_ADMIN,
         }
     }
-}
-
-/// Look up the caller's KeyRecord and require at least one role tag
-/// matching `tier`. Returns 403 on missing tag, 503 on backend
-/// lookup failure, 401 on missing/malformed key_id header.
-async fn require_role<F>(
-    directory: &F,
-    headers: &HeaderMap,
-    tier: SecretsTier,
-) -> Result<(), Response>
-where
-    F: FederationDirectory,
-{
-    let key_id = headers
-        .get(HEADER_KEY_ID)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::UNAUTHORIZED,
-                "secrets_signature_missing",
-                format!("missing {} header", HEADER_KEY_ID),
-            )
-        })?;
-    let record = directory.lookup_public_key(key_id).await.map_err(|e| {
-        tracing::error!(error = %e, key_id, "role-tag lookup failed");
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "secrets_directory_unavailable",
-            format!("{e}"),
-        )
-    })?;
-    let record = record.ok_or_else(|| {
-        error_response(
-            StatusCode::FORBIDDEN,
-            KIND_ROLE_TAG,
-            format!("unknown key_id {key_id}"),
-        )
-    })?;
-    let allowed = tier.allowed_roles();
-    let has_role = record
-        .capability_roles
-        .iter()
-        .any(|r| allowed.contains(&r.as_str()));
-    if !has_role {
-        tracing::warn!(
-            key_id, roles = ?record.capability_roles, tier = ?tier,
-            "secrets route rejected: role-tag missing"
-        );
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            KIND_ROLE_TAG,
-            format!(
-                "key {} missing required role for {:?} tier (allowed: {:?})",
-                key_id, tier, allowed
-            ),
-        ));
-    }
-    Ok(())
 }
 
 // ── State ──────────────────────────────────────────────────────────
@@ -192,7 +153,7 @@ where
 ///
 /// Generic over `S: SecretsService` (RPITIT trait — see module doc
 /// for the dyn-safety rationale) and `F: FederationDirectory` for
-/// the hybrid-verify lookup path.
+/// the key plane and the owner's grants.
 pub struct SecretsAppState<S, F>
 where
     S: SecretsService + 'static,
@@ -202,8 +163,10 @@ where
     /// [`crate::secrets::postgres::PostgresBackend`] or
     /// [`crate::secrets::sqlite::SqliteSecretsBackend`]).
     pub service: Arc<S>,
-    /// Federation directory used to look up the steward's hybrid
-    /// pubkey pair for inbound request-body signature verification.
+    /// Federation directory: the caller's edition-2 key records, this
+    /// node's identity and owner, and the owner's `self:delegates_to`
+    /// grants. Its `node_key_id` must be set, or every signed route is
+    /// refused ([`KIND_CONFERRER_UNRESOLVED`]).
     pub directory: Arc<F>,
 }
 
@@ -260,148 +223,247 @@ where
         .with_state(state)
 }
 
-// ── Signature verification helper ──────────────────────────────────
+// ── v62.0.0: authentication + authorization ────────────────────────
 
-/// Outcome of header signature extraction.
-struct SignedRequest {
-    /// Steward `key_id`.
-    key_id: String,
-    /// Base64 Ed25519 signature.
-    ed25519: String,
-    /// Optional base64 ML-DSA-65 signature.
-    ml_dsa_65: Option<String>,
+/// The origin-form request target (`/path?query`) of `uri`, as the client
+/// sent it: the `path_and_query` input of
+/// [`canonical_request`](crate::secrets::wire::canonical_request).
+fn path_and_query(uri: &axum::http::Uri) -> &str {
+    uri.path_and_query()
+        .map_or_else(|| uri.path(), axum::http::uri::PathAndQuery::as_str)
 }
 
-// clippy::result_large_err (new in 1.97, only trips under a wide
-// `--all-features` clippy pass — CI's narrower feature set never hit it):
-// the `Err` arm is an axum `Response`, which IS the intended short-circuit
-// return for an HTTP handler helper (an early `Response` back out through
-// `?`); boxing it would only add an indirection with no behavior change.
+/// 503 for a directory read that failed while authorizing.
+fn directory_unavailable(e: &crate::federation::Error, what: &str) -> Response {
+    tracing::error!(error = %e, what, "secrets authorization: directory read failed");
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        KIND_DIRECTORY_UNAVAILABLE,
+        format!("{what}: {e}"),
+    )
+}
+
+/// **Who signed this request?** Verify the ONE composite signature over
+/// [`canonical_request`](crate::secrets::wire::canonical_request)`(method,
+/// path_and_query, body)` under the caller's LIVE edition-2 key, and return
+/// the caller's identity-ref.
+///
+/// The earlier-form component headers are refused by name first, before
+/// any key is read. A key id that is not an identity-ref names no edition-2
+/// key: it is unknown, never looked up in the earlier-form read model.
+///
+/// # Errors
+/// The ready 401 / 503 [`Response`].
+// clippy::result_large_err — the `Err` arm is an axum `Response`, the
+// intended early return of a handler helper.
 #[allow(clippy::result_large_err)]
-fn extract_signatures(headers: &HeaderMap) -> Result<SignedRequest, Response> {
+pub async fn authenticate_request<F>(
+    directory: &F,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<String, Response>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if let Some(h) = EARLIER_FORM_SIGNATURE_HEADERS
+        .iter()
+        .find(|h| headers.contains_key(**h))
+    {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            KIND_SIGNATURE_EARLIER_FORM,
+            format!(
+                "the request carries the earlier-form component-signature header {h:?}. \
+                 v62.0.0: a secrets request is signed with ONE composite \
+                 (ML-DSA-65-Ed25519) signature over canonical_request(method, \
+                 path_and_query, body), sent in {HEADER_SIGNATURE}; the composite rule \
+                 admits no standalone component signer. Not a key-validity problem."
+            ),
+        ));
+    }
+    let missing = |name: &str| {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            KIND_SIGNATURE_MISSING,
+            format!("missing {name} header"),
+        )
+    };
     let key_id = headers
         .get(HEADER_KEY_ID)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::UNAUTHORIZED,
-                "secrets_signature_missing",
-                format!("missing {} header", HEADER_KEY_ID),
-            )
-        })?
+        .ok_or_else(|| missing(HEADER_KEY_ID))?
         .to_owned();
-    let ed25519 = headers
-        .get(HEADER_ED25519)
+    let sig_b64 = headers
+        .get(HEADER_SIGNATURE)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            error_response(
+        .ok_or_else(|| missing(HEADER_SIGNATURE))?;
+    let sig = BASE64.decode(sig_b64.trim()).map_err(|e| {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            KIND_SIGNATURE_INVALID,
+            format!("{HEADER_SIGNATURE} is not base64: {e}"),
+        )
+    })?;
+    let Some(kid) = kid_of_identity_ref(&key_id) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            KIND_SIGNATURE_UNKNOWN_KEY,
+            format!(
+                "{HEADER_KEY_ID} {key_id:?} is not an edition-2 identity-ref \
+                 (urn:ietf:params:oauth:ckt:sha-256:…); v62.0.0 authenticates only \
+                 edition-2 keys"
+            ),
+        ));
+    };
+    let held = held_keys_for_kid(directory, &kid)
+        .await
+        .map_err(|e| directory_unavailable(&e, "caller key records"))?;
+    let now = crate::host::clock::now();
+    let at = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+    let record = match held.liveness(&kid, at) {
+        Liveness::Live(record) => record,
+        Liveness::NotHeld | Liveness::Invalid => {
+            return Err(error_response(
                 StatusCode::UNAUTHORIZED,
-                "secrets_signature_missing",
-                format!("missing {} header", HEADER_ED25519),
-            )
-        })?
-        .to_owned();
-    let ml_dsa_65 = headers
-        .get(HEADER_ML_DSA_65)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned());
-    Ok(SignedRequest {
-        key_id,
-        ed25519,
-        ml_dsa_65,
-    })
+                KIND_SIGNATURE_UNKNOWN_KEY,
+                format!("this node holds no valid key:record for {key_id}"),
+            ));
+        }
+        Liveness::Revoked => {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                KIND_SIGNER_NOT_LIVE,
+                format!("{key_id} is revoked"),
+            ));
+        }
+        Liveness::NotCovered => {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                KIND_SIGNER_NOT_LIVE,
+                format!("no record of {key_id} covers this node's clock ({now})"),
+            ));
+        }
+        Liveness::Waiting(keys) => {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                KIND_SIGNER_NOT_LIVE,
+                format!(
+                    "{key_id}'s record waits on {} key(s) this node does not hold",
+                    keys.len()
+                ),
+            ));
+        }
+    };
+    let message = canonical_request(method.as_str(), path_and_query(uri), body);
+    if let Err(e) = record.key.verify(&message, &sig) {
+        tracing::warn!(
+            error = %e,
+            key_id = %key_id,
+            "secrets route rejected: composite signature failed"
+        );
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            KIND_SIGNATURE_INVALID,
+            format!(
+                "the composite signature does not verify over \
+                 canonical_request({}, {:?}, <{} body bytes>) under {key_id}'s live key: {e}",
+                method.as_str(),
+                path_and_query(uri),
+                body.len()
+            ),
+        ));
+    }
+    Ok(key_id)
 }
 
-/// Verify the request signature against the federation directory,
-/// then enforce the role-tag tier for this route. On failure, returns
-/// a 401 (signature) or 403 (role) response.
+/// **May `caller` use `tier`?** True iff this node's owner
+/// ([`admission::owner_of`] over [`FederationDirectory::node_key_id`]) holds
+/// a live `self:delegates_to` to `caller` bearing [`SecretsTier::scope`]
+/// (`trust_root::owner_granted_scope`). Nothing about `caller`'s own record
+/// is read.
 ///
-/// v1.3.0 (CIRISPersist#46): `tier` gates which `federation_keys.roles`
-/// values are accepted (admin > writer > reader). Pre-V020 rows have
-/// empty `roles` → reject. Routes that need reader-tier access pass
-/// [`SecretsTier::Reader`]; mutating routes pass [`SecretsTier::Writer`];
-/// master-key rotation passes [`SecretsTier::Admin`].
-async fn verify_and_authorize<F>(
+/// # Errors
+/// The ready 403 / 503 [`Response`].
+#[allow(clippy::result_large_err)]
+pub async fn authorize_caller<F>(
     directory: &F,
-    headers: &HeaderMap,
-    body: &[u8],
+    caller: &str,
     tier: SecretsTier,
 ) -> Result<(), Response>
 where
-    F: FederationDirectory,
+    F: FederationDirectory + ?Sized,
 {
-    verify_request(directory, headers, body).await?;
-    require_role(directory, headers, tier).await
+    let scope = tier.scope();
+    let Some(node) = directory.node_key_id() else {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            KIND_CONFERRER_UNRESOLVED,
+            "this node has no identity (node_key_id unset), so no owner can confer \
+             a secrets capability"
+                .to_owned(),
+        ));
+    };
+    let owner = match admission::owner_of(directory, &node).await {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                KIND_CONFERRER_UNRESOLVED,
+                format!("node {node} has no live owner, so no owner can confer {scope}"),
+            ));
+        }
+        Err(e @ crate::federation::Error::AmbiguousNodeOwner { .. }) => {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                KIND_CONFERRER_UNRESOLVED,
+                format!("{e} — no single owner confers {scope}; refused (fail closed)"),
+            ));
+        }
+        Err(e) => return Err(directory_unavailable(&e, "node owner")),
+    };
+    match trust_root::owner_granted_scope(directory, caller, &owner, scope).await {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::warn!(
+                caller, owner = %owner, scope,
+                "secrets route rejected: capability not delegated"
+            );
+            Err(error_response(
+                StatusCode::FORBIDDEN,
+                KIND_NOT_DELEGATED,
+                format!(
+                    "{caller} holds no live self:delegates_to from this node's owner \
+                     {owner} bearing scope {scope:?} (scopes do not cover one another: \
+                     grant each tier the key needs)"
+                ),
+            ))
+        }
+        Err(e) => Err(directory_unavailable(&e, "owner's delegations")),
+    }
 }
 
-/// Verify the request signature against the federation directory.
-/// On failure, returns a 401 response ready to surface to the caller.
-async fn verify_request<F>(directory: &F, headers: &HeaderMap, body: &[u8]) -> Result<(), Response>
+/// [`authenticate_request`] then [`authorize_caller`]: the gate every signed
+/// route runs. Returns the caller's identity-ref.
+///
+/// # Errors
+/// The ready 401 / 403 / 503 [`Response`].
+#[allow(clippy::result_large_err)]
+pub async fn authorize_request<F>(
+    directory: &F,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    tier: SecretsTier,
+) -> Result<String, Response>
 where
-    F: FederationDirectory,
+    F: FederationDirectory + ?Sized,
 {
-    let sig = extract_signatures(headers)?;
-    // v37.0.0 — Strict, still matching the pipeline ingest route (which
-    // flipped in the same cut). The "once steward keys are PQC-complete
-    // fleet-wide" wait ends here by operator declaration. This route
-    // authenticates SECRETS traffic — store / retrieve / decrypt /
-    // reencrypt_all — so it is the last plane that should have been
-    // accepting a classical-only signature: an Ed25519-only credential is
-    // exactly what a store-now-decrypt-later adversary needs. A steward
-    // sending no `x-ciris-signature-ml-dsa-65` header is now refused with
-    // `verify_hybrid_pending_rejected`.
-    let outcome = verify_hybrid_via_directory(
-        directory,
-        body,
-        &sig.key_id,
-        &sig.ed25519,
-        sig.ml_dsa_65.as_deref(),
-        HybridPolicy::Strict,
-        None,
-    )
-    .await;
-    match outcome {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let kind = match &e {
-                VerifyError::Crypto(msg) if msg.contains("verify_unknown_key") => {
-                    "secrets_signature_unknown_key"
-                }
-                _ => "secrets_signature_invalid",
-            };
-            // v37.0.0 — name the flag-day cause. A steward that simply
-            // stopped being accepted overnight will otherwise read this
-            // 401 as a revoked/rotated credential and go re-register a
-            // key that was never the problem.
-            let detail = match &e {
-                VerifyError::HybridPendingRejected => format!(
-                    "{e} — NOTE (v37.0.0 flag day): secrets routes now verify under \
-                     HybridPolicy::Strict. An Ed25519-only request signature was \
-                     accepted through v36.x and is REFUSED here: send the \
-                     {HEADER_ML_DSA_65} header and register the signing key's \
-                     ML-DSA-65 pubkey in federation_keys. This is not a \
-                     key-validity or revocation problem."
-                ),
-                VerifyError::PqcFieldsMustBeBoth => format!(
-                    "{e} — the {HEADER_ML_DSA_65} header and this key_id's \
-                     federation_keys.pubkey_ml_dsa_65 must BOTH be present or \
-                     BOTH absent, and exactly one of them is. Either the \
-                     request omitted the header for a PQC-registered key \
-                     (v37.0.0: send it — HybridPolicy::Strict requires it), or \
-                     it sent the header for a key with no registered PQC \
-                     pubkey (register it). Not a key-validity problem."
-                ),
-                _ => format!("{e}"),
-            };
-            tracing::warn!(
-                error = %e,
-                key_id = %sig.key_id,
-                detail = %detail,
-                "secrets route rejected: signature verification failed"
-            );
-            Err(error_response(StatusCode::UNAUTHORIZED, kind, detail))
-        }
-    }
+    let caller = authenticate_request(directory, method, uri, headers, body).await?;
+    authorize_caller(directory, &caller, tier).await?;
+    Ok(caller)
 }
 
 // ── Error mapping ──────────────────────────────────────────────────
@@ -437,7 +499,7 @@ fn error_response(status: StatusCode, kind: &str, detail: String) -> Response {
         .into_response()
 }
 
-// clippy::result_large_err — see `extract_signatures`'s comment above; same
+// clippy::result_large_err — see `authenticate_request`'s comment above; same
 // intended-early-Response shape.
 #[allow(clippy::result_large_err)]
 fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
@@ -455,6 +517,8 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response
 /// `POST /api/v1/secrets/store` — manually-keyed encrypt-and-store.
 async fn post_store<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response
@@ -462,8 +526,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        SecretsTier::Writer,
+    )
+    .await
     {
         return r;
     }
@@ -492,6 +563,8 @@ where
 /// `POST /api/v1/secrets/try_claim` — atomic-claim store.
 async fn post_try_claim<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response
@@ -499,8 +572,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        SecretsTier::Writer,
+    )
+    .await
     {
         return r;
     }
@@ -548,6 +628,8 @@ where
 /// decrypt=true)` which is the UUID-keyed read path.
 async fn get_retrieve<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(uuid): Path<String>,
     Query(q): Query<RetrieveSecretQuery>,
@@ -559,8 +641,15 @@ where
     // GET routes verify on the empty body (matches the
     // edge-signature convention for the pipeline route at the
     // wire-canonicalization layer).
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &[],
+        SecretsTier::Reader,
+    )
+    .await
     {
         return r;
     }
@@ -597,6 +686,8 @@ where
 /// return metadata-only or plaintext.
 async fn post_recall<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(uuid): Path<String>,
     body: axum::body::Bytes,
@@ -605,8 +696,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        SecretsTier::Writer,
+    )
+    .await
     {
         return r;
     }
@@ -632,6 +730,8 @@ where
 /// `GET /api/v1/secrets` — metadata-only listing.
 async fn get_list<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Query(q): Query<ListSecretsQuery>,
 ) -> Response
@@ -639,8 +739,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &[],
+        SecretsTier::Reader,
+    )
+    .await
     {
         return r;
     }
@@ -654,6 +761,8 @@ where
 /// `DELETE /api/v1/secrets/{uuid}?accessor=...` — audited delete.
 async fn delete_forget<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(uuid): Path<String>,
     Query(q): Query<ForgetSecretQuery>,
@@ -662,8 +771,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Writer).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &[],
+        SecretsTier::Writer,
+    )
+    .await
     {
         return r;
     }
@@ -676,6 +792,8 @@ where
 /// `POST /api/v1/secrets/encrypt` — direct AES-GCM encrypt.
 async fn post_encrypt<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response
@@ -683,8 +801,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        SecretsTier::Writer,
+    )
+    .await
     {
         return r;
     }
@@ -707,6 +832,8 @@ where
 /// body would split the canonicalization story for the steward).
 async fn post_decrypt<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response
@@ -714,8 +841,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        SecretsTier::Writer,
+    )
+    .await
     {
         return r;
     }
@@ -732,14 +866,23 @@ where
 /// `GET /api/v1/secrets/filter_config` — read current pattern catalog.
 async fn get_filter_config<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response
 where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &[],
+        SecretsTier::Reader,
+    )
+    .await
     {
         return r;
     }
@@ -758,6 +901,8 @@ where
 /// signing-key-id header so callers don't duplicate it).
 async fn put_filter_config<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response
@@ -765,23 +910,25 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    // The authenticated caller (its edition-2 identity-ref) is the accessor
+    // for audit: the request is signed by that key and authorized for it.
+    let accessor = match authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        SecretsTier::Writer,
+    )
+    .await
     {
-        return r;
-    }
+        Ok(caller) => caller,
+        Err(r) => return r,
+    };
     let req: FilterConfigUpdateRequest = match parse_body(&body) {
         Ok(v) => v,
         Err(r) => return r,
     };
-    // Use the signing key_id as the accessor for audit — the
-    // request is already authenticated to that key. v1.1.x
-    // follow-up: add an explicit accessor field to the body.
-    let accessor = headers
-        .get(HEADER_KEY_ID)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_owned();
     match state.service.update_filter_config(req, accessor).await {
         Ok(result) => (StatusCode::OK, Json::<FilterConfigUpdateResponse>(result)).into_response(),
         Err(e) => map_secrets_error(e),
@@ -789,13 +936,25 @@ where
 }
 
 /// `GET /api/v1/secrets/stats` — service-wide stats.
-async fn get_stats<S, F>(State(state): State<SecretsAppState<S, F>>, headers: HeaderMap) -> Response
+async fn get_stats<S, F>(
+    State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response
 where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &[],
+        SecretsTier::Reader,
+    )
+    .await
     {
         return r;
     }
@@ -826,6 +985,8 @@ where
 /// `GET /api/v1/secrets/access_logs` — paginated audit trail.
 async fn get_access_logs<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Query(q): Query<AccessLogsQuery>,
 ) -> Response
@@ -833,8 +994,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &[], SecretsTier::Reader).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &[],
+        SecretsTier::Reader,
+    )
+    .await
     {
         return r;
     }
@@ -863,6 +1031,8 @@ where
 /// secret under a new master key.
 async fn post_reencrypt_all<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response
@@ -870,8 +1040,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Writer).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        SecretsTier::Writer,
+    )
+    .await
     {
         return r;
     }
@@ -913,6 +1090,8 @@ where
 /// master key (generated when `new_master_b64` is absent).
 async fn post_rotate_master_key<S, F>(
     State(state): State<SecretsAppState<S, F>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response
@@ -920,8 +1099,15 @@ where
     S: SecretsService + 'static,
     F: FederationDirectory + Backend + 'static,
 {
-    if let Err(r) =
-        verify_and_authorize(&*state.directory, &headers, &body, SecretsTier::Admin).await
+    if let Err(r) = authorize_request(
+        &*state.directory,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        SecretsTier::Admin,
+    )
+    .await
     {
         return r;
     }
@@ -952,86 +1138,37 @@ where
     }
 }
 
+// v62.0.0 (P6) — the authorization witnesses (I3200–I3210), sqlite AND
+// postgres, through the router. Apart from `tests` below (its owner rewrites
+// those against this door).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod authz_invariants;
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
+    use super::authz_invariants::{self as authz, STEWARD};
     use super::*;
-    use crate::federation::{
-        types::{algorithm, identity_type},
-        KeyRecord, SignedKeyRecord,
-    };
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::secrets::sqlite::SqliteSecretsBackend;
     use crate::store::sqlite::SqliteBackend;
     use axum::body::Body;
     use axum::http::Request;
-    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    /// Fixed signing seed for the steward — tests are reproducible.
-    const STEWARD_SEED: [u8; 32] = [0x5Au8; 32];
-    /// `key_id` the steward identifies itself by in `federation_keys`.
-    const STEWARD_KEY_ID: &str = "secrets-steward-test-1";
-    /// v37.0.0 — the steward's ML-DSA-65 half. Secrets routes verify
-    /// under `HybridPolicy::Strict` now, so a classical-only steward
-    /// cannot authenticate any route.
-    const STEWARD_PQC_SEED: [u8; 32] = [0xA7u8; 32];
-
-    fn steward_mldsa() -> ciris_keyring::MlDsa65SoftwareSigner {
-        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
-            &STEWARD_PQC_SEED,
-            "secrets-steward-test-1-pqc",
-        )
-        .expect("deterministic ML-DSA-65 keypair from seed")
-    }
-
+    /// v62.0.0 (P6) — this node (`authz::NODE`) is owned by `authz::OWNER`,
+    /// who grants [`STEWARD`] (an edition-2 `agent` key) all three secrets
+    /// scopes with one `self:delegates_to`. The earlier form seeded a JSON
+    /// `KeyRecord` carrying `capability_roles`; an edition-2 key carries no
+    /// roles, and the door reads none.
     async fn build_app() -> (Router, Arc<SqliteSecretsBackend>, Arc<SqliteBackend>) {
         let backend = Arc::new(SqliteBackend::open_in_memory().await.unwrap());
         backend.run_migrations().await.unwrap();
-        // Seed the steward key in federation_keys.
-        let sk = SigningKey::from_bytes(&STEWARD_SEED);
-        let vk: VerifyingKey = sk.verifying_key();
-        let pubkey_b64 = BASE64.encode(vk.to_bytes());
-        let steward_pqc_pk = {
-            use ciris_keyring::PqcSigner as _;
-            steward_mldsa().public_key().await.expect("ml-dsa pk")
-        };
-        let key = KeyRecord {
-            key_id: STEWARD_KEY_ID.into(),
-            pubkey_ed25519_base64: pubkey_b64,
-            // v37.0.0 — hybrid-COMPLETE. Under `HybridPolicy::Strict` a
-            // row with no PQC pubkey cannot authenticate anything.
-            pubkey_ml_dsa_65_base64: Some(BASE64.encode(&steward_pqc_pk)),
-            algorithm: algorithm::HYBRID.into(),
-            identity_type: identity_type::PRIMITIVE.into(),
-            identity_ref: "steward".into(),
-            valid_from: "2026-01-01T00:00:00Z".parse().unwrap(),
-            valid_until: None,
-            registration_envelope: serde_json::json!({"id": STEWARD_KEY_ID}),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "c2lnbmF0dXJl".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: STEWARD_KEY_ID.into(),
-            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            // v1.3.0 (CIRISPersist#46): grant the test steward all
-            // three secrets role tiers so existing tests continue to
-            // pass against routes now gated by `verify_and_authorize`.
-            capability_roles: vec![
-                ROLE_SECRETS_READER.to_owned(),
-                ROLE_SECRETS_WRITER.to_owned(),
-                ROLE_SECRETS_ADMIN.to_owned(),
-            ],
-            attestation_evidence: None,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        FederationDirectory::put_public_key(&*backend, SignedKeyRecord { record: key })
-            .await
-            .unwrap();
+        backend.set_node_key_id(e2::kid(authz::NODE));
+        authz::seat_steward(&*backend).await;
         // Build the secrets backend on the same connection.
         let secrets = Arc::new(SqliteSecretsBackend::new(backend.conn_handle()));
         // Bootstrap a master key so encrypt / store paths work.
@@ -1046,54 +1183,17 @@ mod tests {
         (router(state), secrets, backend)
     }
 
-    /// Sign a request body with the steward fixture key, HYBRID.
-    ///
-    /// v37.0.0 — returns both halves. The PQC half signs
-    /// `(body || ed25519_sig)`, the bound form `verify_hybrid`
-    /// reconstructs. Under `HybridPolicy::Strict` the classical half
-    /// alone authenticates nothing, so there is no Ed25519-only variant
-    /// of this helper — the witness that needs that shape builds it
-    /// inline and says why.
-    async fn sign(body: &[u8]) -> (String, String) {
-        use ciris_keyring::PqcSigner as _;
-        let sk = SigningKey::from_bytes(&STEWARD_SEED);
-        let ed_sig = sk.sign(body).to_bytes();
-        let mut bound = Vec::with_capacity(body.len() + ed_sig.len());
-        bound.extend_from_slice(body);
-        bound.extend_from_slice(&ed_sig);
-        let pqc_sig = steward_mldsa().sign(&bound).await.expect("ml-dsa sign");
-        (BASE64.encode(ed_sig), BASE64.encode(&pqc_sig))
-    }
-
+    /// v62.0.0 — ONE composite over `canonical_request("POST", uri, body)`.
     async fn signed_post(uri: &str, body: Vec<u8>) -> Request<Body> {
-        let (sig, pqc) = sign(&body).await;
-        Request::post(uri)
-            .header("content-type", "application/json")
-            .header(HEADER_KEY_ID, STEWARD_KEY_ID)
-            .header(HEADER_ED25519, &sig)
-            .header(HEADER_ML_DSA_65, &pqc)
-            .body(Body::from(body))
-            .unwrap()
+        authz::signed("POST", uri, body, STEWARD)
     }
 
     async fn signed_get(uri: &str) -> Request<Body> {
-        let (sig, pqc) = sign(&[]).await;
-        Request::get(uri)
-            .header(HEADER_KEY_ID, STEWARD_KEY_ID)
-            .header(HEADER_ED25519, &sig)
-            .header(HEADER_ML_DSA_65, &pqc)
-            .body(Body::empty())
-            .unwrap()
+        authz::signed("GET", uri, Vec::new(), STEWARD)
     }
 
     async fn signed_delete(uri: &str) -> Request<Body> {
-        let (sig, pqc) = sign(&[]).await;
-        Request::delete(uri)
-            .header(HEADER_KEY_ID, STEWARD_KEY_ID)
-            .header(HEADER_ED25519, &sig)
-            .header(HEADER_ML_DSA_65, &pqc)
-            .body(Body::empty())
-            .unwrap()
+        authz::signed("DELETE", uri, Vec::new(), STEWARD)
     }
 
     async fn body_json<T: serde::de::DeserializeOwned>(resp: Response) -> T {
@@ -1187,7 +1287,7 @@ mod tests {
         assert_eq!(err.kind, "secrets_signature_missing");
     }
 
-    /// Flipped signature byte → 401 + invalid token.
+    /// Flipped composite byte → 401 + invalid token.
     #[tokio::test]
     async fn unauthorized_bad_signature() {
         let (app, _secrets, _backend) = build_app().await;
@@ -1197,123 +1297,24 @@ mod tests {
             "accessor": "z",
         }))
         .unwrap();
-        let (good_sig, pqc) = sign(&body).await;
-        let mut sig_bytes = BASE64.decode(good_sig).unwrap();
-        sig_bytes[0] ^= 0xFF;
-        let bad_sig = BASE64.encode(&sig_bytes);
+        let mut sig = e2::signing_key(STEWARD)
+            .sign(&canonical_request("POST", "/api/v1/secrets/store", &body))
+            .expect("composite sign");
+        sig[0] ^= 0xFF;
         let resp = app
             .clone()
-            .oneshot(
-                Request::post("/api/v1/secrets/store")
-                    .header("content-type", "application/json")
-                    .header(HEADER_KEY_ID, STEWARD_KEY_ID)
-                    .header(HEADER_ED25519, &bad_sig)
-                    .header(HEADER_ML_DSA_65, &pqc)
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
+            .oneshot(authz::request(
+                "POST",
+                "/api/v1/secrets/store",
+                body,
+                &e2::kid(STEWARD),
+                &BASE64.encode(&sig),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let err: SecretsErrorResponse = body_json(resp).await;
         assert_eq!(err.kind, "secrets_signature_invalid");
-    }
-
-    /// v37.0.0 — `HybridPolicy::Strict` on the secrets routes.
-    ///
-    /// A CLASSICAL-ONLY steward — `federation_keys` row with no
-    /// `pubkey_ml_dsa_65`, sending no `x-ciris-signature-ml-dsa-65`
-    /// header, valid Ed25519 signature over the exact body, fully
-    /// role-tagged — was ACCEPTED through v36.x under `Ed25519Fallback`.
-    /// It is refused now. PQC absence is the only defect.
-    ///
-    /// The row must be hybrid-PENDING for `HybridPendingRejected` to be
-    /// the refusal: if the row HAS a PQC pubkey and only the header is
-    /// missing, `verify_hybrid`'s both-or-neither pairing fires first and
-    /// yields `PqcFieldsMustBeBoth` instead. Both refuse; the details
-    /// differ so an operator can tell "never registered PQC" from
-    /// "header stripped in flight".
-    #[tokio::test]
-    async fn ed25519_only_secrets_signature_is_rejected_under_strict() {
-        let (app, _secrets, backend) = build_app().await;
-        // A v36-era steward: registered + role-tagged, but classical-only.
-        const LEGACY_STEWARD_KEY_ID: &str = "secrets-steward-test-legacy";
-        let sk = SigningKey::from_bytes(&STEWARD_SEED);
-        let legacy = KeyRecord {
-            key_id: LEGACY_STEWARD_KEY_ID.into(),
-            pubkey_ed25519_base64: BASE64.encode(sk.verifying_key().to_bytes()),
-            // Deliberately hybrid-PENDING.
-            pubkey_ml_dsa_65_base64: None,
-            algorithm: algorithm::HYBRID.into(),
-            identity_type: identity_type::PRIMITIVE.into(),
-            identity_ref: "steward-legacy".into(),
-            valid_from: "2026-01-01T00:00:00Z".parse().unwrap(),
-            valid_until: None,
-            registration_envelope: serde_json::json!({"id": LEGACY_STEWARD_KEY_ID}),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "c2lnbmF0dXJl".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: LEGACY_STEWARD_KEY_ID.into(),
-            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: vec![
-                ROLE_SECRETS_READER.to_owned(),
-                ROLE_SECRETS_WRITER.to_owned(),
-                ROLE_SECRETS_ADMIN.to_owned(),
-            ],
-            attestation_evidence: None,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        FederationDirectory::put_public_key(&*backend, SignedKeyRecord { record: legacy })
-            .await
-            .unwrap();
-
-        let body = serde_json::to_vec(&serde_json::json!({
-            "plaintext": "x",
-            "description": "y",
-            "accessor": "z",
-        }))
-        .unwrap();
-        let ed_sig = BASE64.encode(sk.sign(&body).to_bytes());
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::post("/api/v1/secrets/store")
-                    .header("content-type", "application/json")
-                    .header(HEADER_KEY_ID, LEGACY_STEWARD_KEY_ID)
-                    .header(HEADER_ED25519, &ed_sig)
-                    // HEADER_ML_DSA_65 deliberately omitted.
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let err: SecretsErrorResponse = body_json(resp).await;
-        assert_eq!(err.kind, "secrets_signature_invalid");
-        // HAND-WRITTEN: the exact upstream refusal — reds if the policy
-        // drifts back to a soft posture.
-        assert!(
-            err.detail
-                .contains("hybrid-pending row rejected by Strict policy"),
-            "expected the Strict refusal; got: {}",
-            err.detail
-        );
-        // LOUD: name the flag day and rule out the credential.
-        assert!(
-            err.detail.contains("HybridPolicy::Strict")
-                && err.detail.contains("x-ciris-signature-ml-dsa-65"),
-            "detail must name the policy flip and the missing header; got: {}",
-            err.detail
-        );
-        assert!(
-            err.detail
-                .contains("not a key-validity or revocation problem"),
-            "detail must rule OUT the credential, the likeliest misdiagnosis; got: {}",
-            err.detail
-        );
     }
 
     /// Unknown UUID → 404 + secrets_not_found token.
@@ -1379,18 +1380,14 @@ mod tests {
             "new_config": {"patterns": ["api_key"]},
         }))
         .unwrap();
-        let (sig, pqc) = sign(&body).await;
         let resp = app
             .clone()
-            .oneshot(
-                Request::put("/api/v1/secrets/filter_config")
-                    .header("content-type", "application/json")
-                    .header(HEADER_KEY_ID, STEWARD_KEY_ID)
-                    .header(HEADER_ED25519, &sig)
-                    .header(HEADER_ML_DSA_65, &pqc)
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
+            .oneshot(authz::signed(
+                "PUT",
+                "/api/v1/secrets/filter_config",
+                body,
+                STEWARD,
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

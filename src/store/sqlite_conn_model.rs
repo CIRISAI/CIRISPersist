@@ -434,9 +434,23 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("edition2_rows_naming", ConnClass::Read),
     ("put_edition2_object", ConnClass::Write),
     ("put_edition2_statement", ConnClass::Write),
+    // v62.0.0 (wave G0; CC 2.7.3) — the fold store.
+    ("put_fold_record", ConnClass::Write),
+    ("fold_held", ConnClass::Read),
+    ("fold_held_page", ConnClass::Read),
+    ("fold_dependents", ConnClass::Read),
+    // v62.0.0 (wave G0 v4) — the arrival/plane record and the occurrence
+    // plane's un-project hook.
+    ("fold_state", ConnClass::Read),
+    ("fold_slot_rows", ConnClass::Read),
+    ("fold_any_refolding", ConnClass::Read),
+    ("clear_occurrence_projection", ConnClass::Write),
     // v62.0.0 (slice J0) — the edition-2 read models, the cross-form
     // refusal's edition read, and the statement serve listing.
     ("upsert_edition2_key_projection", ConnClass::Write),
+    // v62.0.0 (wave T1; CC 2.7.8) — a merge's tips leave the tip store.
+    ("drop_group_tips", ConnClass::Write),
+    ("put_edition2_genesis", ConnClass::Write),
     ("key_edition", ConnClass::Read),
     ("edition2_statements_since", ConnClass::Read),
     // v61 (CIRISPersist#934, S4b) — the group supersede executor.
@@ -449,6 +463,16 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v61 (CIRISPersist#934, S4b) — the identity-occurrence executor.
     ("store_planned_occurrence", ConnClass::Write),
     ("store_planned_local_occurrence", ConnClass::Write),
+    // v62.0.0 (wave O1) — the edition-2 bind: the door's transaction, and
+    // the tx-level helper C1's genesis import calls inside its own.
+    ("store_edition2_occurrence", ConnClass::Write),
+    ("sqlite_store_edition2_occurrence", ConnClass::HelperWrite),
+    // v62.0.0 (wave O1, S1) — the edition-2 self-roster receipts.
+    ("note_edition2_roster_proposal", ConnClass::Write),
+    ("list_open_edition2_roster_proposals", ConnClass::Read),
+    ("settle_edition2_roster_proposal", ConnClass::Write),
+    ("edition2_roster_proposal", ConnClass::Read),
+    ("list_settled_edition2_roster_proposals", ConnClass::Read),
     // v61 (CIRISPersist#934, S4b) — the transport-destination executor.
     ("store_planned_destination", ConnClass::Write),
     ("store_planned_signed_destination", ConnClass::Write),
@@ -497,6 +521,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_location_proof", ConnClass::Write),
     ("store_planned_location_proof_withdrawal", ConnClass::Write),
     ("store_planned_touch_claim", ConnClass::Write),
+    ("store_planned_touch_claim_local", ConnClass::Write),
     ("store_planned_witness", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
@@ -566,7 +591,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("count_overrides", ConnClass::Read),
     ("count_traces", ConnClass::Read),
     ("cross_agent_divergence", ConnClass::Read),
-    ("delete_blob", ConnClass::Write),
+    ("delete_blob_guarded", ConnClass::Write),
     ("enqueue_outbound", ConnClass::Write),
     ("enter_mesh", ConnClass::Write),
     ("evict_fountain_content_hard_delete", ConnClass::Write),
@@ -669,6 +694,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_fountain_decay_candidates", ConnClass::Read),
     ("list_goals", ConnClass::Read),
     ("list_group_versions", ConnClass::Read),
+    ("list_group_tips", ConnClass::Read),
     ("list_hard_case_events", ConnClass::Read),
     ("list_held_fountain_content", ConnClass::Read),
     ("list_identity_occurrence_revocations_for", ConnClass::Read),
@@ -727,6 +753,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("lookup_community", ConnClass::Read),
     ("lookup_family", ConnClass::Read),
     ("lookup_freshness_floor", ConnClass::Read),
+    // v62.0.0 (v62 P5b) — the floor as the node holds it.
+    ("freshness_floor", ConnClass::Read),
     ("lookup_identity_for_occurrence", ConnClass::Read),
     (
         "list_identity_occurrences_by_occurrence_key",

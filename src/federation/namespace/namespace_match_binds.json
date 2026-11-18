@@ -1,9 +1,9 @@
 {
  "_meta": {
-  "cc_commit": "646df97853efeb1c068db2719ae70ffc342a2247",
+  "cc_commit": "d4bd2a6b0583b8bc57c06a89f265557d357a3191",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
-  "vectors_sha256": "c457126ebf9df0f192bd4762eb09469bd981abf6c06097e1ee7c16d81276ec76"
+  "vectors_sha256": "1312c45ada371caa7217417c5ebbcb81abbb8dcf7c45dff832f3dfa9ae02c00b"
  },
  "binds": [
   {
@@ -51,18 +51,11 @@
   },
   {
    "binds": {
+    "kind": "active",
     "version": "v1"
    },
    "dimension": "accord:lifecycle:active:v1",
-   "family": "accord:lifecycle:active",
-   "refusal": null
-  },
-  {
-   "binds": {
-    "version": "v1"
-   },
-   "dimension": "accord:lifecycle:confirmed:v1",
-   "family": "accord:lifecycle:confirmed",
+   "family": "accord:lifecycle:{kind}",
    "refusal": null
   },
   {
@@ -274,79 +267,69 @@
   },
   {
    "binds": {
+    "kind": "active",
     "version": "v1"
    },
    "dimension": "accord:lifecycle:active:v1",
-   "family": "accord:lifecycle:active",
+   "family": "accord:lifecycle:{kind}",
    "refusal": null
   },
   {
    "binds": {},
    "dimension": "accord:lifecycle:active:V1",
-   "family": "accord:lifecycle:active",
+   "family": "accord:lifecycle:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
    "dimension": "accord:lifecycle:active:v1:v2",
-   "family": "accord:lifecycle:active",
+   "family": "accord:lifecycle:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
    "dimension": "accord:lifecycle:active:v1beta",
-   "family": "accord:lifecycle:active",
+   "family": "accord:lifecycle:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
    "dimension": "Accord:lifecycle:active:v1",
-   "family": "accord:lifecycle:active",
+   "family": "accord:lifecycle:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {},
+   "binds": {
+    "kind": "active"
+   },
    "dimension": "accord:lifecycle:active",
-   "family": "accord:lifecycle:active",
+   "family": "accord:lifecycle:{kind}",
    "refusal": "missing_version_segment"
   },
   {
    "binds": {
+    "kind": "ACTIVE"
+   },
+   "dimension": "accord:lifecycle:ACTIVE:v1",
+   "family": "accord:lifecycle:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "kind": "confirmed",
     "version": "v1"
    },
    "dimension": "accord:lifecycle:confirmed:v1",
-   "family": "accord:lifecycle:confirmed",
+   "family": "accord:lifecycle:{kind}",
    "refusal": null
   },
   {
-   "binds": {},
-   "dimension": "accord:lifecycle:confirmed:V1",
-   "family": "accord:lifecycle:confirmed",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "accord:lifecycle:confirmed:v1:v2",
-   "family": "accord:lifecycle:confirmed",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "accord:lifecycle:confirmed:v1beta",
-   "family": "accord:lifecycle:confirmed",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Accord:lifecycle:confirmed:v1",
-   "family": "accord:lifecycle:confirmed",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "accord:lifecycle:confirmed",
-   "family": "accord:lifecycle:confirmed",
-   "refusal": "missing_version_segment"
+   "binds": {
+    "kind": "not_a_listed_value"
+   },
+   "dimension": "accord:lifecycle:not_a_listed_value:v1",
+   "family": "accord:lifecycle:{kind}",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {
@@ -461,6 +444,56 @@
   {
    "binds": {
     "band": "minor",
+    "level": "government",
+    "version": "v1"
+   },
+   "dimension": "age_assurance:government:minor:v1",
+   "family": "age_assurance:{level}:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "adult",
+    "level": "provider",
+    "version": "v1"
+   },
+   "dimension": "age_assurance:provider:adult:v1",
+   "family": "age_assurance:{level}:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "under_13",
+    "level": "provider",
+    "version": "v1"
+   },
+   "dimension": "age_assurance:provider:under_13:v1",
+   "family": "age_assurance:{level}:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "13_15",
+    "level": "provider",
+    "version": "v1"
+   },
+   "dimension": "age_assurance:provider:13_15:v1",
+   "family": "age_assurance:{level}:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "16_17",
+    "level": "provider",
+    "version": "v1"
+   },
+   "dimension": "age_assurance:provider:16_17:v1",
+   "family": "age_assurance:{level}:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "minor",
     "level": "not_a_listed_value",
     "version": "v1"
    },
@@ -523,6 +556,42 @@
    "dimension": "age_self_declared:band:MINOR:v1",
    "family": "age_self_declared:band:{band}:{version}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "band": "adult",
+    "version": "v1"
+   },
+   "dimension": "age_self_declared:band:adult:v1",
+   "family": "age_self_declared:band:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "under_13",
+    "version": "v1"
+   },
+   "dimension": "age_self_declared:band:under_13:v1",
+   "family": "age_self_declared:band:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "13_15",
+    "version": "v1"
+   },
+   "dimension": "age_self_declared:band:13_15:v1",
+   "family": "age_self_declared:band:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "16_17",
+    "version": "v1"
+   },
+   "dimension": "age_self_declared:band:16_17:v1",
+   "family": "age_self_declared:band:{band}:{version}",
+   "refusal": null
   },
   {
    "binds": {
@@ -674,6 +743,15 @@
    "dimension": "archive_release:WA_APPROVAL:v1",
    "family": "archive_release:{basis}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "basis": "lawful_order",
+    "version": "v1"
+   },
+   "dimension": "archive_release:lawful_order:v1",
+   "family": "archive_release:{basis}",
+   "refusal": null
   },
   {
    "binds": {
@@ -1288,120 +1366,6 @@
    "binds": {
     "version": "v1"
    },
-   "dimension": "capacity:core_identity:v1",
-   "family": "capacity:core_identity",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:core_identity:V1",
-   "family": "capacity:core_identity",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:core_identity:v1:v2",
-   "family": "capacity:core_identity",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:core_identity:v1beta",
-   "family": "capacity:core_identity",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Capacity:core_identity:v1",
-   "family": "capacity:core_identity",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:core_identity",
-   "family": "capacity:core_identity",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "version": "v1"
-   },
-   "dimension": "capacity:incompleteness_awareness:v1",
-   "family": "capacity:incompleteness_awareness",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:incompleteness_awareness:V1",
-   "family": "capacity:incompleteness_awareness",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:incompleteness_awareness:v1:v2",
-   "family": "capacity:incompleteness_awareness",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:incompleteness_awareness:v1beta",
-   "family": "capacity:incompleteness_awareness",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Capacity:incompleteness_awareness:v1",
-   "family": "capacity:incompleteness_awareness",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:incompleteness_awareness",
-   "family": "capacity:incompleteness_awareness",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "version": "v1"
-   },
-   "dimension": "capacity:integrity:v1",
-   "family": "capacity:integrity",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:integrity:V1",
-   "family": "capacity:integrity",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:integrity:v1:v2",
-   "family": "capacity:integrity",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:integrity:v1beta",
-   "family": "capacity:integrity",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Capacity:integrity:v1",
-   "family": "capacity:integrity",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:integrity",
-   "family": "capacity:integrity",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "version": "v1"
-   },
    "dimension": "capacity:relay_delivery:v1",
    "family": "capacity:relay_delivery",
    "refusal": null
@@ -1438,79 +1402,96 @@
   },
   {
    "binds": {
+    "factor": "core_identity",
     "version": "v1"
    },
-   "dimension": "capacity:resilience:v1",
-   "family": "capacity:resilience",
+   "dimension": "capacity:core_identity:v1",
+   "family": "capacity:{factor}",
    "refusal": null
   },
   {
    "binds": {},
-   "dimension": "capacity:resilience:V1",
-   "family": "capacity:resilience",
+   "dimension": "capacity:core_identity:V1",
+   "family": "capacity:{factor}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "capacity:resilience:v1:v2",
-   "family": "capacity:resilience",
+   "dimension": "capacity:core_identity:v1:v2",
+   "family": "capacity:{factor}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "capacity:resilience:v1beta",
-   "family": "capacity:resilience",
+   "dimension": "capacity:core_identity:v1beta",
+   "family": "capacity:{factor}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "Capacity:resilience:v1",
-   "family": "capacity:resilience",
+   "dimension": "Capacity:core_identity:v1",
+   "family": "capacity:{factor}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {},
-   "dimension": "capacity:resilience",
-   "family": "capacity:resilience",
+   "binds": {
+    "factor": "core_identity"
+   },
+   "dimension": "capacity:core_identity",
+   "family": "capacity:{factor}",
    "refusal": "missing_version_segment"
   },
   {
    "binds": {
+    "factor": "CORE_IDENTITY"
+   },
+   "dimension": "capacity:CORE_IDENTITY:v1",
+   "family": "capacity:{factor}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "factor": "integrity",
     "version": "v1"
    },
-   "dimension": "capacity:sustained_coherence:v1",
-   "family": "capacity:sustained_coherence",
+   "dimension": "capacity:integrity:v1",
+   "family": "capacity:{factor}",
    "refusal": null
   },
   {
-   "binds": {},
-   "dimension": "capacity:sustained_coherence:V1",
-   "family": "capacity:sustained_coherence",
-   "refusal": "namespace_dimension_case_malformed"
+   "binds": {
+    "factor": "resilience",
+    "version": "v1"
+   },
+   "dimension": "capacity:resilience:v1",
+   "family": "capacity:{factor}",
+   "refusal": null
   },
   {
-   "binds": {},
-   "dimension": "capacity:sustained_coherence:v1:v2",
-   "family": "capacity:sustained_coherence",
-   "refusal": "namespace_dimension_case_malformed"
+   "binds": {
+    "factor": "incompleteness_awareness",
+    "version": "v1"
+   },
+   "dimension": "capacity:incompleteness_awareness:v1",
+   "family": "capacity:{factor}",
+   "refusal": null
   },
   {
-   "binds": {},
-   "dimension": "capacity:sustained_coherence:v1beta",
-   "family": "capacity:sustained_coherence",
-   "refusal": "namespace_dimension_case_malformed"
+   "binds": {
+    "factor": "sustained_coherence",
+    "version": "v1"
+   },
+   "dimension": "capacity:sustained_coherence:v1",
+   "family": "capacity:{factor}",
+   "refusal": null
   },
   {
-   "binds": {},
-   "dimension": "Capacity:sustained_coherence:v1",
-   "family": "capacity:sustained_coherence",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "capacity:sustained_coherence",
-   "family": "capacity:sustained_coherence",
-   "refusal": "missing_version_segment"
+   "binds": {
+    "factor": "not_a_listed_value"
+   },
+   "dimension": "capacity:not_a_listed_value:v1",
+   "family": "capacity:{factor}",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {
@@ -1689,6 +1670,39 @@
    "dimension": "capacity_assurance:PROVIDER:sample:capacitated:v1",
    "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "band": "capacitated",
+    "domain": "sample",
+    "level": "panel",
+    "version": "v1"
+   },
+   "dimension": "capacity_assurance:panel:sample:capacitated:v1",
+   "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "capacitated",
+    "domain": "sample",
+    "level": "government",
+    "version": "v1"
+   },
+   "dimension": "capacity_assurance:government:sample:capacitated:v1",
+   "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "band": "incapacitated",
+    "domain": "sample",
+    "level": "provider",
+    "version": "v1"
+   },
+   "dimension": "capacity_assurance:provider:sample:incapacitated:v1",
+   "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
+   "refusal": null
   },
   {
    "binds": {
@@ -2803,6 +2817,24 @@
   },
   {
    "binds": {
+    "stance": "revoked",
+    "version": "v1"
+   },
+   "dimension": "consent:state:revoked:v1",
+   "family": "consent:state:{stance}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "stance": "expired",
+    "version": "v1"
+   },
+   "dimension": "consent:state:expired:v1",
+   "family": "consent:state:{stance}",
+   "refusal": null
+  },
+  {
+   "binds": {
     "stance": "not_a_listed_value"
    },
    "dimension": "consent:state:not_a_listed_value:v1",
@@ -3141,63 +3173,20 @@
   },
   {
    "binds": {
+    "state": "signature",
+    "version": "v1"
+   },
+   "dimension": "cosign:signature:v1",
+   "family": "cosign:{state}",
+   "refusal": null
+  },
+  {
+   "binds": {
     "state": "not_a_listed_value"
    },
    "dimension": "cosign:not_a_listed_value:v1",
    "family": "cosign:{state}",
    "refusal": "namespace_vocab_value_unregistered"
-  },
-  {
-   "binds": {
-    "domain": "sample",
-    "language": "sample",
-    "version": "v1"
-   },
-   "dimension": "credits:sample:sample:substrate_building:v1",
-   "family": "credits:{domain}:{language}:substrate_building",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "credits:sample:sample:substrate_building:V1",
-   "family": "credits:{domain}:{language}:substrate_building",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "credits:sample:sample:substrate_building:v1:v2",
-   "family": "credits:{domain}:{language}:substrate_building",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "credits:sample:sample:substrate_building:v1beta",
-   "family": "credits:{domain}:{language}:substrate_building",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Credits:sample:sample:substrate_building:v1",
-   "family": "credits:{domain}:{language}:substrate_building",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
-    "domain": "sample",
-    "language": "sample"
-   },
-   "dimension": "credits:sample:sample:substrate_building",
-   "family": "credits:{domain}:{language}:substrate_building",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "domain": "SAMPLE",
-    "language": "sample"
-   },
-   "dimension": "credits:SAMPLE:sample:substrate_building:v1",
-   "family": "credits:{domain}:{language}:substrate_building",
-   "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {
@@ -3539,44 +3528,6 @@
   },
   {
    "binds": {
-    "version": "v1"
-   },
-   "dimension": "detection:conscience_override_rate:v1",
-   "family": "detection:conscience_override_rate",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "detection:conscience_override_rate:V1",
-   "family": "detection:conscience_override_rate",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "detection:conscience_override_rate:v1:v2",
-   "family": "detection:conscience_override_rate",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "detection:conscience_override_rate:v1beta",
-   "family": "detection:conscience_override_rate",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Detection:conscience_override_rate:v1",
-   "family": "detection:conscience_override_rate",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "detection:conscience_override_rate",
-   "family": "detection:conscience_override_rate",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
     "axis": "sample:sub",
     "version": "v1"
    },
@@ -3622,44 +3573,6 @@
    "dimension": "detection:correlated_action:SAMPLE:sub:v1",
    "family": "detection:correlated_action:{axis}",
    "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
-    "version": "v1"
-   },
-   "dimension": "detection:cross_agent_divergence:v1",
-   "family": "detection:cross_agent_divergence",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "detection:cross_agent_divergence:V1",
-   "family": "detection:cross_agent_divergence",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "detection:cross_agent_divergence:v1:v2",
-   "family": "detection:cross_agent_divergence",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "detection:cross_agent_divergence:v1beta",
-   "family": "detection:cross_agent_divergence",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Detection:cross_agent_divergence:v1",
-   "family": "detection:cross_agent_divergence",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "detection:cross_agent_divergence",
-   "family": "detection:cross_agent_divergence",
-   "refusal": "missing_version_segment"
   },
   {
    "binds": {
@@ -3788,41 +3701,78 @@
   },
   {
    "binds": {
+    "detector": "cross_agent_divergence",
     "version": "v1"
    },
-   "dimension": "detection:temporal_drift:v1",
-   "family": "detection:temporal_drift",
+   "dimension": "detection:cross_agent_divergence:v1",
+   "family": "detection:{detector}",
    "refusal": null
   },
   {
    "binds": {},
-   "dimension": "detection:temporal_drift:V1",
-   "family": "detection:temporal_drift",
+   "dimension": "detection:cross_agent_divergence:V1",
+   "family": "detection:{detector}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "detection:temporal_drift:v1:v2",
-   "family": "detection:temporal_drift",
+   "dimension": "detection:cross_agent_divergence:v1:v2",
+   "family": "detection:{detector}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "detection:temporal_drift:v1beta",
-   "family": "detection:temporal_drift",
+   "dimension": "detection:cross_agent_divergence:v1beta",
+   "family": "detection:{detector}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "Detection:temporal_drift:v1",
-   "family": "detection:temporal_drift",
+   "dimension": "Detection:cross_agent_divergence:v1",
+   "family": "detection:{detector}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {},
-   "dimension": "detection:temporal_drift",
-   "family": "detection:temporal_drift",
+   "binds": {
+    "detector": "cross_agent_divergence"
+   },
+   "dimension": "detection:cross_agent_divergence",
+   "family": "detection:{detector}",
    "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "detector": "CROSS_AGENT_DIVERGENCE"
+   },
+   "dimension": "detection:CROSS_AGENT_DIVERGENCE:v1",
+   "family": "detection:{detector}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "detector": "temporal_drift",
+    "version": "v1"
+   },
+   "dimension": "detection:temporal_drift:v1",
+   "family": "detection:{detector}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "detector": "conscience_override_rate",
+    "version": "v1"
+   },
+   "dimension": "detection:conscience_override_rate:v1",
+   "family": "detection:{detector}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "detector": "not_a_listed_value"
+   },
+   "dimension": "detection:not_a_listed_value:v1",
+   "family": "detection:{detector}",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {
@@ -4346,6 +4296,18 @@
   {
    "binds": {
     "cell": "id1",
+    "kind": "interpret",
+    "prefix": "ab12",
+    "suite": "safety_battery",
+    "version": "v1"
+   },
+   "dimension": "evidence:safety_battery:interpret:id1:ab12:v1",
+   "family": "evidence:{suite}:{kind}:{cell}:{prefix}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "cell": "id1",
     "kind": "capture",
     "prefix": "ab12",
     "suite": "not_a_listed_value"
@@ -4815,6 +4777,114 @@
    "dimension": "hardware_custody:ANDROID_KEYSTORE:v1",
    "family": "hardware_custody:{platform}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "platform": "android_strongbox",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:android_strongbox:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "ios_secure_enclave",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:ios_secure_enclave:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "mac_os_secure_enclave",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:mac_os_secure_enclave:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "tpm_discrete",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:tpm_discrete:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "tpm_firmware",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:tpm_firmware:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "intel_sgx",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:intel_sgx:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "software_only",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:software_only:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "aws_cloud_hsm",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:aws_cloud_hsm:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "azure_hsm",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:azure_hsm:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "gcp_cloud_hsm",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:gcp_cloud_hsm:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "yubi_hsm",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:yubi_hsm:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "platform": "external_secure_element",
+    "version": "v1"
+   },
+   "dimension": "hardware_custody:external_secure_element:v1",
+   "family": "hardware_custody:{platform}",
+   "refusal": null
   },
   {
    "binds": {
@@ -5397,6 +5467,24 @@
   },
   {
    "binds": {
+    "axis": "epoch",
+    "version": "v1"
+   },
+   "dimension": "key_grant:epoch:v1",
+   "family": "key_grant:{axis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "axis": "stream",
+    "version": "v1"
+   },
+   "dimension": "key_grant:stream:v1",
+   "family": "key_grant:{axis}",
+   "refusal": null
+  },
+  {
+   "binds": {
     "axis": "not_a_listed_value"
    },
    "dimension": "key_grant:not_a_listed_value:v1",
@@ -5669,6 +5757,24 @@
   },
   {
    "binds": {
+    "stage": "acceptance",
+    "version": "v1"
+   },
+   "dimension": "lineage_witness:acceptance:v1",
+   "family": "lineage_witness:{stage}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "stage": "decline",
+    "version": "v1"
+   },
+   "dimension": "lineage_witness:decline:v1",
+   "family": "lineage_witness:{stage}",
+   "refusal": null
+  },
+  {
+   "binds": {
     "stage": "not_a_listed_value"
    },
    "dimension": "lineage_witness:not_a_listed_value:v1",
@@ -5723,6 +5829,48 @@
    "dimension": "locality:decision:LOCAL:v1",
    "family": "locality:decision:{scale}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "location_proof:v1",
+   "family": "location_proof:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "version": "V1"
+   },
+   "dimension": "location_proof:V1",
+   "family": "location_proof:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "location_proof:v1:v2",
+   "family": "location_proof:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "version": "v1beta"
+   },
+   "dimension": "location_proof:v1beta",
+   "family": "location_proof:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Location_proof:v1",
+   "family": "location_proof:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "location_proof",
+   "family": "location_proof:{version}",
+   "refusal": "missing_version_segment"
   },
   {
    "binds": {
@@ -5813,6 +5961,51 @@
    "dimension": "membership:PROPOSAL:v1",
    "family": "membership:{stage}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "stage": "acceptance",
+    "version": "v1"
+   },
+   "dimension": "membership:acceptance:v1",
+   "family": "membership:{stage}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "stage": "decline",
+    "version": "v1"
+   },
+   "dimension": "membership:decline:v1",
+   "family": "membership:{stage}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "stage": "widening",
+    "version": "v1"
+   },
+   "dimension": "membership:widening:v1",
+   "family": "membership:{stage}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "stage": "removal",
+    "version": "v1"
+   },
+   "dimension": "membership:removal:v1",
+   "family": "membership:{stage}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "stage": "resignation",
+    "version": "v1"
+   },
+   "dimension": "membership:resignation:v1",
+   "family": "membership:{stage}",
+   "refusal": null
   },
   {
    "binds": {
@@ -6709,6 +6902,195 @@
    "dimension": "prohibited:MEDICAL:v1",
    "family": "prohibited:{category}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "category": "financial",
+    "version": "v1"
+   },
+   "dimension": "prohibited:financial:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "legal",
+    "version": "v1"
+   },
+   "dimension": "prohibited:legal:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "spiritual_direction",
+    "version": "v1"
+   },
+   "dimension": "prohibited:spiritual_direction:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "home_security",
+    "version": "v1"
+   },
+   "dimension": "prohibited:home_security:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "identity_verification",
+    "version": "v1"
+   },
+   "dimension": "prohibited:identity_verification:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "content_moderation",
+    "version": "v1"
+   },
+   "dimension": "prohibited:content_moderation:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "research",
+    "version": "v1"
+   },
+   "dimension": "prohibited:research:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "infrastructure_control",
+    "version": "v1"
+   },
+   "dimension": "prohibited:infrastructure_control:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "weapons_harmful",
+    "version": "v1"
+   },
+   "dimension": "prohibited:weapons_harmful:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "manipulation_coercion",
+    "version": "v1"
+   },
+   "dimension": "prohibited:manipulation_coercion:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "surveillance_mass",
+    "version": "v1"
+   },
+   "dimension": "prohibited:surveillance_mass:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "deception_fraud",
+    "version": "v1"
+   },
+   "dimension": "prohibited:deception_fraud:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "cyber_offensive",
+    "version": "v1"
+   },
+   "dimension": "prohibited:cyber_offensive:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "election_interference",
+    "version": "v1"
+   },
+   "dimension": "prohibited:election_interference:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "biometric_inference",
+    "version": "v1"
+   },
+   "dimension": "prohibited:biometric_inference:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "autonomous_deception",
+    "version": "v1"
+   },
+   "dimension": "prohibited:autonomous_deception:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "hazardous_materials",
+    "version": "v1"
+   },
+   "dimension": "prohibited:hazardous_materials:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "discrimination",
+    "version": "v1"
+   },
+   "dimension": "prohibited:discrimination:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "crisis_escalation",
+    "version": "v1"
+   },
+   "dimension": "prohibited:crisis_escalation:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "pattern_detection",
+    "version": "v1"
+   },
+   "dimension": "prohibited:pattern_detection:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "category": "protective_routing",
+    "version": "v1"
+   },
+   "dimension": "prohibited:protective_routing:v1",
+   "family": "prohibited:{category}",
+   "refusal": null
   },
   {
    "binds": {
@@ -7841,6 +8223,96 @@
   },
   {
    "binds": {
+    "basis": "dsa_article16",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:dsa_article16:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "basis": "tvec_terrorist",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:tvec_terrorist:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "basis": "ncmec_csam",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:ncmec_csam:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "basis": "gifct_cip",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:gifct_cip:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "basis": "community_standards",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:community_standards:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "basis": "perceptual_hash_csam",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:perceptual_hash_csam:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "basis": "osa_illegal_content",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:osa_illegal_content:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "basis": "avmsd_age_inappropriate",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:avmsd_age_inappropriate:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "basis": "court_order",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:court_order:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "basis": "steward_purge",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:steward_purge:v1",
+   "family": "takedown_notice:{basis}",
+   "refusal": null
+  },
+  {
+   "binds": {
     "basis": "not_a_listed_value"
    },
    "dimension": "takedown_notice:not_a_listed_value:v1",
@@ -8256,6 +8728,44 @@
   },
   {
    "binds": {
+    "version": "v1"
+   },
+   "dimension": "trust:blessing:v1",
+   "family": "trust:blessing",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "trust:blessing:V1",
+   "family": "trust:blessing",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "trust:blessing:v1:v2",
+   "family": "trust:blessing",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "trust:blessing:v1beta",
+   "family": "trust:blessing",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Trust:blessing:v1",
+   "family": "trust:blessing",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "trust:blessing",
+   "family": "trust:blessing",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
     "job": "sample",
     "version": "v1"
    },
@@ -8490,6 +9000,33 @@
   },
   {
    "binds": {
+    "state": "seizure",
+    "version": "v1"
+   },
+   "dimension": "wa_adjudication:seizure:v1",
+   "family": "wa_adjudication:{state}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "state": "successor",
+    "version": "v1"
+   },
+   "dimension": "wa_adjudication:successor:v1",
+   "family": "wa_adjudication:{state}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "state": "petition",
+    "version": "v1"
+   },
+   "dimension": "wa_adjudication:petition:v1",
+   "family": "wa_adjudication:{state}",
+   "refusal": null
+  },
+  {
+   "binds": {
     "state": "not_a_listed_value"
    },
    "dimension": "wa_adjudication:not_a_listed_value:v1",
@@ -8636,16 +9173,20 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {},
+   "binds": {
+    "detector": "zz_unminted_leaf"
+   },
    "dimension": "detection:zz_unminted_leaf:v1",
-   "family": null,
-   "refusal": "namespace_family_unregistered"
+   "family": "detection:{detector}",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
-   "binds": {},
+   "binds": {
+    "factor": "zz_unminted_leaf"
+   },
    "dimension": "capacity:zz_unminted_leaf:v1",
-   "family": null,
-   "refusal": "namespace_family_unregistered"
+   "family": "capacity:{factor}",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {},
@@ -8802,13 +9343,13 @@
   {
    "binds": {},
    "dimension": "Detection:zz_unminted_leaf:v1",
-   "family": null,
+   "family": "detection:{detector}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
    "dimension": "Capacity:zz_unminted_leaf:v1",
-   "family": null,
+   "family": "capacity:{factor}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {

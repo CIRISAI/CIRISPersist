@@ -2,8 +2,10 @@
 //! only the three revokers end a key (CC 2.4.1.1, CC 2.6.1.7).
 //!
 //! - With no record held, a statement waits (retryable). A record makes the
-//!   key live over `[asserted_at, valid_until]`. Before `asserted_at` and
-//!   after `valid_until` the statement is retryable, not final. A renewal
+//!   key live over `[asserted_at, valid_until)` — v62.0.0 (kernel pass 2,
+//!   K1): the kernel's key-end reading (CC 2.6.2, "has not yet reached its
+//!   `valid_until`"); at and after `valid_until`, and before `asserted_at`,
+//!   the statement is retryable, not final. A renewal
 //!   extends the key to the greatest end, and a renewal signed after the end
 //!   revives it.
 //! - The end rule at the door:
@@ -85,8 +87,15 @@ fn i1905_only_an_edition2_record_makes_a_key_live() {
         "I1905 at start"
     );
     assert_eq!(
-        verdict(&held, &statement_at(&k, 10_000)),
+        verdict(&held, &statement_at(&k, 9_999)),
         "valid",
+        "I1905 before the end"
+    );
+    // v62.0.0 (kernel pass 2, K1, I2817) — at `valid_until` the record has
+    // ended (the kernel's half-open reading).
+    assert_eq!(
+        verdict(&held, &statement_at(&k, 10_000)),
+        "waiting",
         "I1905 at end"
     );
     assert_eq!(
@@ -327,4 +336,31 @@ fn i1905_only_the_three_revokers_end_a_key() {
         h.lookup(&kid(&k), 5),
         ciris_verify_core::edition2::KeyLookup::Invalid
     ));
+}
+
+/// **I2817** (v62.0.0, kernel pass 2, K1; CC 2.4.1.1, CC 2.6.2) — a key's
+/// liveness is the kernel's key-end conclusion: live over
+/// `[asserted_at, valid_until)` of a held record, `NotCovered` (retryable) at
+/// `valid_until` itself, and live again under a renewal; the key's own
+/// revocation still ends it (final).
+#[test]
+fn i2817_liveness_is_the_kernels_key_end() {
+    let k = key(21);
+    let mut held = HeldKeys::new();
+    held.insert_record(key_record(&k, &["node"], 1_000, Some(10_000)))
+        .unwrap();
+    assert!(
+        matches!(held.liveness(&kid(&k), 9_999), Liveness::Live(_)),
+        "I2817: inside the record"
+    );
+    assert!(
+        matches!(held.liveness(&kid(&k), 10_000), Liveness::NotCovered),
+        "I2817: at valid_until the record has ended"
+    );
+    held.insert_record(key_record(&k, &["node"], 10_000, Some(20_000)))
+        .unwrap();
+    assert!(
+        matches!(held.liveness(&kid(&k), 10_000), Liveness::Live(r) if r.valid_until == Some(20_000)),
+        "I2817: the renewal covers its own start"
+    );
 }

@@ -80,7 +80,6 @@ Classes:
 | file | test | inv. | scans | asserts | class |
 |---|---|---|---|---|---|
 | ceg/list/drive_query_invariants.rs | i143_the_chunk_adopt_reaches_python | I143 | ffi/pyo3.rs, ffi_taxonomy.tsv | `fn adopt_sealed_chunk_json(` defined; tsv names it | AST-COUNT + TEXTUAL |
-| federation/accord_roster_invariants.rs | i450i_genesis_runs_the_coverage_rule | I450i | genesis/ceremony_verify.rs | `check_family_record` calls `charter_commitments_cover(` and propagates | AST-STRUCT |
 | federation/admission.rs | trust_plane_ops_are_classified_and_their_gates_resolve_721 | #721 | admission.rs, emit.rs | each TRUST_PLANE_OPS gate has a `fn` | AST-COUNT (def, data-driven) |
 | federation/blob_surface_gates.rs | i8_every_lifecycle_op_is_reachable_from_engine_and_ffi | I8 | engine.rs, pyo3.rs | 17 symbols named in both | AST-COUNT |
 | 〃 | i13_ffi_blob_bindings_route_errors_through_blob_err_to_py | I13 | pyo3.rs | a fn naming a cascade symbol also calls `blob_err_to_py` | AST-STRUCT |

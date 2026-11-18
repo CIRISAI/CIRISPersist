@@ -18,7 +18,12 @@
 //!   silently on SQL and overwrite on memory);
 //! - a proof naming a prior version this node does not hold: refused as
 //!   STALE ([`Error::Conflict`]; retryable — the intermediate version may not
-//!   have arrived);
+//!   have arrived) — v62.0.0 (kernel pass 2, I2811): only when the version's
+//!   own `prev_head_digest` names the held head (or none). A version naming
+//!   another version, whose proof names that same version, is a TIP (CC
+//!   2.7.8): it passes the same checks against THIS node's head and is held
+//!   beside it ([`ReplicatedCommunityOutcome::HeldAsTip`]); the head does
+//!   not move;
 //! - otherwise the change envelope must describe the offered record and
 //!   [`FederationDirectory::verify_membership_quorum`] must admit it against
 //!   THIS node's prior roster under the group's own protocol. Then the record
@@ -27,8 +32,10 @@
 //!   no authority of its own.
 
 use super::cohort::Cohort;
+use super::group_supersede_admit::HeadVerdict;
 use super::types::{GroupSupersedeProof, SignedCommunity, SignedFamily};
 use super::{Error, FederationDirectory};
+use crate::kernel::head::HeadReading;
 
 /// v50.0.0 (CIRISPersist#925/#931, review) — which door a community record
 /// entered through. The door, never the signer, decides whether the CC 3.2
@@ -61,6 +68,10 @@ pub enum ReplicatedCommunityOutcome {
         /// Why.
         reason: ReplicatedCommunityRefusal,
     },
+    /// v62.0.0 (kernel pass 2, I2811; CC 2.7.8) — the version names another
+    /// version than the held head: held as a tip beside it
+    /// (`federation_group_tips`); the head did not move. APPENDED.
+    HeldAsTip,
 }
 
 /// v50.0.0 (CIRISPersist#931) — why a replicated community record was refused.
@@ -98,6 +109,9 @@ pub(crate) enum CommunityWrite {
     Unchanged,
     /// The held row was replaced by the offered version.
     Superseded,
+    /// v62.0.0 (kernel pass 2) — the offered version was held as a tip; the
+    /// held row was not replaced.
+    HeldAsTip,
 }
 
 /// v50.0.0 (#931; PR #921 review F3) — the store step's result as a typed
@@ -111,6 +125,7 @@ pub(crate) fn replicated_community_outcome(
         Ok(CommunityWrite::Inserted) => Ok(ReplicatedCommunityOutcome::Inserted),
         Ok(CommunityWrite::Unchanged) => Ok(ReplicatedCommunityOutcome::Unchanged),
         Ok(CommunityWrite::Superseded) => Ok(ReplicatedCommunityOutcome::Superseded),
+        Ok(CommunityWrite::HeldAsTip) => Ok(ReplicatedCommunityOutcome::HeldAsTip),
         Err(Error::Conflict(_)) => Ok(ReplicatedCommunityOutcome::Refused {
             reason: ReplicatedCommunityRefusal::ConflictingRecord,
         }),
@@ -157,6 +172,9 @@ struct Offer<'a> {
     /// A family's `consensus_protocol_entrenched`; `None` for a community.
     entrenched: Option<bool>,
     proof: Option<&'a GroupSupersedeProof>,
+    /// v62.0.0 (kernel pass 2) — the version's own signed `prev_head_digest`:
+    /// the version it succeeds, which its proof must name.
+    prev_head_digest: &'a str,
     /// v52.0.0 (#956) — when the amendment's only change removes one member
     /// from the held family record: that member and the held record. Its
     /// signature alone authorizes it.
@@ -211,6 +229,7 @@ where
         consensus_protocol: &f.consensus_protocol,
         entrenched: Some(f.consensus_protocol_entrenched),
         proof: family.supersede_proof.as_ref(),
+        prev_head_digest: &f.prev_head_digest,
         self_leave: super::family_dissolution::self_leave_member(&held, f).map(|l| (l, &held)),
         recovery: super::accord_recovery::verify_accord_recovery(dir, family)
             .await?
@@ -242,7 +261,27 @@ where
         .map_err(|e| Error::Backend(format!("family amendment snapshot serialize: {e}")))?;
     dir.supersede_group_row(Cohort::Family, snapshot, Some(authorization(&offer)))
         .await?;
-    Ok(OccupiedRoute::Settled(CommunityWrite::Superseded))
+    // v62.0.0 (kernel pass 2, I2811) — a version the executor held as a tip
+    // left the head where it was.
+    let head = dir
+        .lookup_family(&f.family_key_id)
+        .await?
+        .map(|h| h.persist_row_hash);
+    Ok(OccupiedRoute::Settled(written_as(
+        head.as_deref(),
+        &offer.offered_hash,
+    )))
+}
+
+/// v62.0.0 (kernel pass 2, I2811) — what a supersede that returned `Ok` did,
+/// read from the head the group holds after it: the offered version is the
+/// head (`Superseded`), or it was held as a tip beside it (`HeldAsTip`).
+fn written_as(head_after: Option<&str>, offered_hash: &str) -> CommunityWrite {
+    if head_after == Some(offered_hash) {
+        CommunityWrite::Superseded
+    } else {
+        CommunityWrite::HeldAsTip
+    }
 }
 
 /// v57.0.0 (CIRISPersist#934 step 2) — what an occupied community id gets,
@@ -309,6 +348,7 @@ where
         consensus_protocol: &c.consensus_protocol,
         entrenched: None,
         proof: community.supersede_proof.as_ref(),
+        prev_head_digest: &c.prev_head_digest,
         self_leave: None,
         recovery: false,
     };
@@ -369,7 +409,15 @@ where
             Ok(
                 match lost_race(dir, &c.community_key_id, &offered_hash, written).await? {
                     Some(0) => OccupiedRoute::Settled(CommunityWrite::Unchanged),
-                    _ => OccupiedRoute::Settled(CommunityWrite::Superseded),
+                    _ => {
+                        // v62.0.0 (kernel pass 2, I2811) — held as a tip, or
+                        // the head
+                        let head = dir
+                            .lookup_community(&c.community_key_id)
+                            .await?
+                            .map(|h| h.persist_row_hash);
+                        OccupiedRoute::Settled(written_as(head.as_deref(), &offered_hash))
+                    }
                 },
             )
         }
@@ -472,10 +520,14 @@ where
             &offer.offered_hash,
         ));
     };
-    check_proof_names_prior(
+    // v62.0.0 (kernel pass 2, I2811) — the proof names the version the
+    // offered version names: the held head (a successor), or another (a tip,
+    // judged below against this node's head and held beside it).
+    check_proof_names_versions_prior(
         offer.kind,
         offer.group_key_id,
         proof,
+        offer.prev_head_digest,
         &stored.persist_row_hash,
     )?;
     // v53.0.0 (CC 4.2.6) — a recovery's proof is not a membership change
@@ -597,13 +649,22 @@ pub(crate) fn check_proof_names_prior(
 /// not judged: a node that never held the earlier versions takes the served
 /// version as it finds it, as it always has (a served family carries no
 /// chain), so a non-empty value there is not evidence of anything.
+///
+/// v62.0.0 (kernel pass 2, I2811; CC 2.7.8) — **a fork is held as a tip.**
+/// The version that does not name the held head is no longer refused: the
+/// kernel's reading of the two versions
+/// ([`crate::kernel::head::head_answer`]) is a tip beside the head (or a
+/// row waiting for the head it names), and the answer is
+/// [`HeadVerdict::Tip`]: the executor holds it, the head does not move.
+/// The former rule ([`prev_head_names_held`]) still decides
+/// [`HeadVerdict::Extends`], and is the differential's reference.
 pub(crate) fn check_prev_head_names_held(
     kind: &str,
     group_key_id: &str,
     offered_prev_head_digest: &str,
     stored_persist_row_hash: &str,
     authorization: Option<&serde_json::Value>,
-) -> Result<(), Error> {
+) -> Result<HeadVerdict, Error> {
     let verdict = prev_head_names_held(
         kind,
         group_key_id,
@@ -620,7 +681,50 @@ pub(crate) fn check_prev_head_names_held(
         offered_prev_head_digest.is_empty() && authorization.is_some(),
         verdict.is_ok(),
     );
-    verdict
+    let reading = crate::kernel::head::head_answer(
+        group_key_id,
+        Some(stored_persist_row_hash),
+        offered_prev_head_digest,
+    )
+    .value;
+    match (verdict, reading) {
+        (Ok(()), _) => Ok(HeadVerdict::Extends),
+        (Err(_), HeadReading::Tip) => Ok(HeadVerdict::Tip),
+        // the kernel reads a version that names no held head as a tip; one
+        // that names the held head is admitted above, so this arm is the
+        // former refusal, kept rather than turned into an admission
+        (Err(e), HeadReading::Extends | HeadReading::NothingHeld) => Err(e),
+    }
+}
+
+/// v62.0.0 (kernel pass 2, I2811) — **the proof rides on the version it
+/// proves.** A `supersede_proof` names the prior its quorum replaced; the
+/// version's own signed `prev_head_digest` names the version it succeeds.
+/// When the version names the held head (or none), the proof must name the
+/// held head ([`check_proof_names_prior`]: a STALE proof otherwise,
+/// retryable). When it names another version, it is a tip, and the proof
+/// must name that same version: a proof naming a third is a contradiction
+/// inside one row, refused for its shape before the kernel (CIRISKernel
+/// `DIFFERENCES.md` row 8).
+pub(crate) fn check_proof_names_versions_prior(
+    kind: &str,
+    group_key_id: &str,
+    proof: &GroupSupersedeProof,
+    offered_prev_head_digest: &str,
+    stored_persist_row_hash: &str,
+) -> Result<(), Error> {
+    if offered_prev_head_digest.is_empty() || offered_prev_head_digest == stored_persist_row_hash {
+        return check_proof_names_prior(kind, group_key_id, proof, stored_persist_row_hash);
+    }
+    if proof.prior_persist_row_hash == offered_prev_head_digest {
+        return Ok(());
+    }
+    Err(Error::Conflict(format!(
+        "{kind} {group_key_id}: supersede_proof_contradicts_prev_head — the proof replaces \
+         persist_row_hash {named:?}, but the version it rides on names prev_head_digest \
+         {offered_prev_head_digest:?}; a proof and its version name one prior (CC 2.7.8)",
+        named = proof.prior_persist_row_hash
+    )))
 }
 
 /// [`check_prev_head_names_held`]'s rule.

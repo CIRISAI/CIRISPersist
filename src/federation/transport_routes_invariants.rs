@@ -343,7 +343,11 @@ pub(crate) mod bodies {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
         let identity = format!("{tag}-occid");
-        ts::register_identity_key(d, &identity, USER).await;
+        // v62.0.0 (wave O1) — a NODE identity: a node or agent key is never
+        // an occurrence of a person (`occurrence_binds_machine_to_person`,
+        // every occurrence door), so the two machine occurrences bind under a
+        // machine identity.
+        ts::register_identity_key(d, &identity, NODE).await;
         for (occ, ty, want) in [
             (format!("{tag}-occnode"), NODE, 1usize),
             (format!("{tag}-occagent"), AGENT, 0usize),

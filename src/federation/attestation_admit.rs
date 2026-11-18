@@ -32,16 +32,13 @@
 //!   two after-steps that were also written three times (the #771 re-put
 //!   verdict on an occupied id, the #963 re-wrap after a consent-list change).
 //!
-//! # The one re-ask an executor makes
+//! # No re-ask
 //!
-//! A cycle-gated `delegates_to` (CIRISPersist#1031) is checked by the plan
-//! with the graph unlocked, then checked AGAIN by the executor under its
-//! delegation write lock in the same step as the INSERT (Codex on PR #1050):
-//! a writer of the reverse edge may have committed between the two. The
-//! executor does not decide that either — it calls
-//! [`PlannedAttestation::recheck_cycle_under_lock`] with the graph view its
-//! lock covers (the backend itself on memory and sqlite, the open transaction
-//! on postgres).
+//! v62.0.0 (kernel pass 2) — the executor re-asked one gate under a lock: the
+//! v54 delegation cycle gate (CIRISPersist#1031), re-run under the delegation
+//! write lock in the INSERT's step. The kernel's walk visits a cycle once and
+//! refuses no edge for closing one (CC 4.4.3.34), so the gate, its lock and
+//! the re-ask are deleted; the executor decides nothing.
 
 use std::sync::Arc;
 
@@ -76,11 +73,11 @@ pub(crate) struct AdmissionCx<'a> {
 ///   attach-freshness window W (`check_attach_freshness`, CC 2.6.7).
 ///
 /// #934 changes no behaviour, so each gate reads the instant it read before
-/// the plan existed. Four folds read the receipt clock today and still read
+/// the plan existed. Three folds read the receipt clock today and still read
 /// `received_at` (`check_capacity_consent_admission`,
-/// `check_delegation_cycle_admission`, `check_peer_deadmission`,
-/// `check_trust_charter_admission`): candidates for #1049. Which gate reads
-/// which is pinned by `store::parity`'s `PLAN_INSTANTS`.
+/// `check_peer_deadmission`, `check_trust_charter_admission`): candidates for
+/// #1049. (v62.0.0: the fourth, the delegation cycle gate, is deleted.)
+/// Which gate reads which is pinned by `store::parity`'s `PLAN_INSTANTS`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PlanInstants {
     /// The row's signed instant: where folds over other rows are judged.
@@ -169,30 +166,6 @@ pub(crate) struct PlannedAttestation {
     /// The signed-wire-index locator (#507b), federation tier only; the hash
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
-    cycle_gated: bool,
-    /// The receipt instant the plan judged the cycle at; the under-lock re-ask
-    /// judges at it too.
-    received_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl PlannedAttestation {
-    /// Does the store step hold the delegation write lock (CIRISPersist#1031)?
-    pub(crate) fn cycle_gated(&self) -> bool {
-        self.cycle_gated
-    }
-
-    /// The cycle gate, asked again under the executor's delegation write lock,
-    /// in the same step as the INSERT (see the module doc). A no-op for a row
-    /// that is not [`Self::cycle_gated`].
-    pub(crate) async fn recheck_cycle_under_lock<G>(&self, graph: &G) -> Result<(), Error>
-    where
-        G: super::attestation_query::AttestationQueryExec + ?Sized,
-    {
-        if !self.cycle_gated {
-            return Ok(());
-        }
-        super::admission::check_delegation_cycle_admission(graph, &self.row, self.received_at).await
-    }
 }
 
 /// What the executor's store step found.
@@ -238,9 +211,8 @@ pub(crate) trait AttestationStore:
         -> Result<(), Error>;
 
     /// Store an admitted row: the row, its projections and its depth in one
-    /// transaction (under the delegation write lock when
-    /// [`PlannedAttestation::cycle_gated`]), then its trace rows and its wire
-    /// index. An occupied id writes nothing and reports the stored hash.
+    /// transaction, then its trace rows and its wire index. An occupied id
+    /// writes nothing and reports the stored hash.
     async fn store_planned_attestation(
         &self,
         planned: PlannedAttestation,
@@ -346,6 +318,51 @@ pub(crate) trait AttestationStore:
         &self,
         received_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), Error>;
+}
+
+tokio::task_local! {
+    /// v62.0.0 (wave G0) — set while [`recheck_planned`] runs the plan.
+    static RECHECK: ();
+}
+
+/// Is the plan running as the fold's re-check ([`recheck_planned`])?
+fn rechecking() -> bool {
+    RECHECK.try_with(|_| ()).is_ok()
+}
+
+/// v62.0.0 (wave G0; CC 2.7.3) — **re-ask every gate about a row the fold
+/// concluded**, writing nothing: the plan ([`plan_put_attestation`]) with the
+/// held-re-offer short-cut off, judged at the row's own instant and read as
+/// this node's own authorship (the re-check spends no peer's quota). `Ok`
+/// when the plan still admits it (an `Insert` or a composer replay); the plan
+/// is dropped unexecuted. The fold runs it inside an attempt
+/// (`edition2::fold`), where a gate's marked fold condition un-concludes the
+/// row; this function only answers.
+///
+/// # Errors
+/// The plan's refusals.
+pub(crate) async fn recheck_planned<D>(dir: &D, row: &super::Attestation) -> Result<(), Error>
+where
+    D: AttestationStore,
+{
+    let instants = PlanInstants {
+        fold_at: row.asserted_at,
+        received_at: crate::host::clock::now(),
+    };
+    RECHECK
+        .scope(
+            (),
+            plan_put_attestation(
+                dir,
+                super::SignedAttestation {
+                    attestation: row.clone(),
+                },
+                &WriteOrigin::Authored,
+                instants,
+            ),
+        )
+        .await
+        .map(|_| ())
 }
 
 /// The door: every backend's `put_attestation_with_origin` is this call.
@@ -590,6 +607,16 @@ where
     let cx = dir.admission_cx();
     let mut row = attestation.attestation;
 
+    // v62.0.0 (wave P1c) — a row carrying an edition-2 statement must be
+    // exactly what that statement derives, checked FIRST: pure (no read, no
+    // signature, no canonicalization of the offered envelope). A carrying
+    // row's envelope is sized by its statement, not by the earlier-form cap
+    // (`admission::check_envelope_size_admission`), so a forged envelope
+    // beside a small valid statement is refused here, before any gate pays
+    // for it. `verify_carried` still judges the statement at tier 3. A no-op
+    // for a row that carries none.
+    crate::federation::edition2::ingest::check_carried_projection(&row)?;
+
     // ── AV-76 TIER 0 — the free prologue ────────────────────────
     // Neither check below reads the row's content or touches the
     // substrate. Before v22.0.0 (CIRISPersist#543 finding 4) the memory
@@ -625,7 +652,10 @@ where
     // an index hit that resolves to a byte-identical held row settles; an
     // oversized or otherwise inadmissible row is never held, so it misses
     // and meets the pure gates below exactly as before.
+    // v62.0.0 (wave G0) — the fold's re-check of a CONCLUDED row asks every
+    // gate again, so it never settles as a re-offer ([`recheck_planned`]).
     if row.tier == crate::federation::types::attestation_tier::FEDERATION
+        && !rechecking()
         && crate::federation::replication_policy::settle_if_held(
             dir,
             crate::federation::replication_policy::EnvelopeKind::Attestation,
@@ -768,6 +798,12 @@ where
     // payment-processor identifier anywhere in its envelope. Pure; the same
     // gate at every door.
     crate::federation::operational::check_licence_payload(&row)?;
+    // v62 (CC rc21, CC 3.1) — a key in a family name is its bare thumbprint
+    // segment: a URN in a `dimension`, or a second spelling of a key segment,
+    // is a malformed row. Pure; the same gate at every door.
+    crate::federation::namespace::key_segment::check_dimension_key_segments(
+        &row.attestation_envelope,
+    )?;
 
     // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
     // `consent:state:*` row is refused unless its signed envelope carries
@@ -883,33 +919,51 @@ where
     // statement reads its signer's identity set from the signer's live
     // edition-2 `key:record`, never from the earlier store's
     // `federation_keys` (CC 2.6.1.12). The same gates follow.
-    let attesting_identity_type = match crate::federation::edition2::ingest::carried_identity_type(
-        dir.as_dyn_directory(),
-        &row,
-    )
-    .await?
-    {
-        Some(t) => t,
-        None => dir
-            .attesting_identity_type(&row.attesting_key_id)
-            .await?
-            // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart from a
-            // bad signature (retryable once the Key row lands).
-            .ok_or_else(|| {
-                crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation")
-            })?,
-    };
+    //
+    // v62.0.0 (P4, I3080/I3082) — and its standing for a reserved family is
+    // CONFERRED, not read off that set (CC rc20 3.4.7): the policy below runs
+    // `check_conferred` for such a row, and `check_reserved_prefix_admission`
+    // (tier 4) asks the conferral plane.
+    let (attesting_identity_type, standing) =
+        match crate::federation::edition2::ingest::carried_identity_type(
+            dir.as_dyn_directory(),
+            &row,
+        )
+        .await?
+        {
+            Some(t) => (t, crate::federation::admission::EmitterStanding::Conferred),
+            None => (
+                dir.attesting_identity_type(&row.attesting_key_id)
+                    .await?
+                    // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart from a
+                    // bad signature (retryable once the Key row lands).
+                    .ok_or_else(|| {
+                        crate::federation::Error::unknown_signer(
+                            &row.attesting_key_id,
+                            "attestation",
+                        )
+                    })?,
+                crate::federation::admission::EmitterStanding::Declared,
+            ),
+        };
     // AV-76 D2 — the lookup above is a hard DATA dependency of the
     // dimension policy here (`attesting_identity_type`); the pair moves
     // as a unit and its internal order is fixed. The default policy
     // enforces the `accord:*` × `accord_holder` rule and the four-test
     // operational-language gate on `scores` attestations; structural
     // primitives are exempt. See `src/federation/admission.rs`.
-    crate::federation::admission::DimensionAdmissionPolicy::default().check(
-        &row.attestation_type,
-        crate::federation::admission::envelope_dimension(&row.attestation_envelope),
-        &attesting_identity_type,
-    )?;
+    {
+        let policy = crate::federation::admission::DimensionAdmissionPolicy::default();
+        let dim = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
+        match standing {
+            crate::federation::admission::EmitterStanding::Conferred => {
+                policy.check_conferred(&row.attestation_type, dim, &attesting_identity_type)?;
+            }
+            crate::federation::admission::EmitterStanding::Declared => {
+                policy.check(&row.attestation_type, dim, &attesting_identity_type)?;
+            }
+        }
+    }
 
     // v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a `revoked`
     // consent_record at local tier MAY *transit* the local write path
@@ -1161,25 +1215,34 @@ where
     // federation`. Backend-symmetric; verify-before-mutation.
     crate::federation::admission::check_minor_owner_binding_not_announced(dir, &row).await?;
 
-    // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
-    // is refused: the recipient must not already reach the granter through live
-    // `delegates_to` edges. Backend-symmetric with SQLite + Postgres; verify-before-mutation.
     // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — a term-bearing
     // `delegates_to` (issuance, moderation, `sub_delegation`, or in an
     // affiliation's hierarchy) carries a bounded term:
     // `delegation_term_required`. Every backend, verify-before-mutation.
+    // v62.0.0 (kernel pass 2) — the v54 cycle gate (CIRISPersist#1031) is
+    // deleted: the kernel's walk visits a cycle once (CC 4.4.3.34), so no
+    // edge is refused for closing one.
     crate::federation::admission::check_delegation_term_admission(dir, &row).await?;
-    crate::federation::admission::check_delegation_cycle_admission(dir, &row, received_at).await?;
 
-    // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
-    // gate: a node has AT MOST ONE responsible steward, so a second,
-    // distinct-owner owner-binding `delegates_to(U → node)` is rejected. This
-    // is what makes the `self` cohort boundary well-defined. Backend-symmetric
-    // with SQLite + Postgres; verify-before-mutation.
-    crate::federation::admission::check_single_node_owner_admission(dir, &row).await?;
+    // v62.0.0 (kernel pass 2, KERNEL_SEAMS B1 / C557) — the single-owner gate
+    // is gone: no owner-binding is refused for naming a second owner. The
+    // kernel's owner seat (`owner_of`) holds every binding and counts one only
+    // when the node's own key cosigned it; two counted owners read as unowned.
+    // What stays: the roster W bound on the binding's signer (B5, not yet a
+    // kernel conclusion), and the CC 3.2 ceremony step 4 refusal of an
+    // uncosigned post-reclaim rebinding (#578).
+    crate::federation::admission::check_owner_binding_roster_fresh(dir, &row).await?;
+    crate::federation::ownership_reclaim::check_post_reclaim_rebinding_admission(dir, &row).await?;
     // v60.0.0 (CIRISPersist#1062) — an owner-binding that names an
     // organisation is cosigned under that affiliation's protocol.
     crate::federation::admission::check_owner_binding_affiliation_admission(dir, &row).await?;
+    // v62.0.0 (wave V1b, CC 3.2 / C557, ruling (a)) — an edition-2 owner
+    // binding is counted: the owner's, the bound key's and (naming one) the
+    // affiliation's voices; short, the door keeps the voice (`Pending`).
+    crate::federation::admission::check_owner_binding_counted(dir, &row).await?;
+    // v62.0.0 (wave V1b, CC 4.4.3.12) — an affiliation's counted officer
+    // appointment waits (`Pending`) for the quorum at the head it names.
+    crate::federation::admission::check_officer_appointment_counted(dir, &row).await?;
 
     // v18.2.0 — trust-charter admission (the charter walk). AV-76: a
     // directory walk, so it stays in tier 4.
@@ -1386,7 +1449,6 @@ where
     let withdraws_depth = (row.attestation_type
         == crate::federation::types::attestation_type::WITHDRAWS)
         .then(|| dir.withdraws_delegation_depth());
-    let cycle_gated = crate::federation::admission::delegation_cycle_gated(&row);
     // v61.1.0 (CIRISPersist#1198, CIRISPersist#1220) — ONE first-held
     // instant for both receipts this row can open: the door's one clock read
     // (`received_at`, so the plan reads no clock of its own, #934), at
@@ -1412,8 +1474,6 @@ where
         cosign_receipt,
         cosign_signature,
         wire_index_key,
-        cycle_gated,
-        received_at,
     })))
 }
 
@@ -1539,6 +1599,8 @@ where
     // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
     // holder claim, so only the struct is checked here.
     crate::federation::media_source::check_media_source(&envelope_value)?;
+    // v62 (CC rc21, CC 3.1) — the key-segment gate, at the local door too.
+    crate::federation::namespace::key_segment::check_dimension_key_segments(&envelope_value)?;
     // v61 (CC 2.6.2) — a signed instant is `.sssZ` at the local door too:
     // a row written in another form could never be promoted. `expires_at` is
     // the door's own to stamp from the typed column (#598), so it is not read
@@ -2288,6 +2350,10 @@ pub(crate) async fn put_detection_planned<D>(
 where
     D: AttestationStore,
 {
+    // v62.0.0 (v62 P8) — the earlier form (a detection hybrid-signed over its
+    // `canonical_bytes`, written local) exists only behind the switch; the
+    // edition-2 producer is `derived::detection_row::state_detection`.
+    super::edition2::door::refuse_earlier_form("detection")?;
     let received_at = crate::host::clock::now();
     dir.rehome_legacy_detection_events(received_at).await?;
     let body = crate::derived::detection_row::DetectionProjection::from(event);

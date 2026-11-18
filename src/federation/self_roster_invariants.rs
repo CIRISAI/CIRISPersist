@@ -548,14 +548,22 @@ pub(crate) mod bodies {
             Some(f.clone()),
             "I1137: the node has one owner, the self"
         );
-        match d
-            .put_attestation(SignedAttestation {
-                attestation: binding(&e1, &node),
-            })
-            .await
-        {
-            Err(Error::NodeAlreadyOwned { .. }) => {}
-            other => panic!("I1137: another self's key binding the node: {other:?}"),
+        // I2843 (v62.0.0, kernel pass 2, KERNEL_SEAMS B1 / C557) — another
+        // self's key binding the node is no longer refused: it is HELD, and
+        // with the node's cosignature (the fixture sealer's) the seat counts
+        // two selves, so the node reads as unowned (fail-closed), never as
+        // whichever self bound first.
+        d.put_attestation(SignedAttestation {
+            attestation: binding(&e1, &node),
+        })
+        .await
+        .expect("I2843: another self's key binding the node is held");
+        match crate::federation::admission::owner_of(d, &node).await {
+            Err(Error::AmbiguousNodeOwner { owners, .. }) => assert!(
+                owners.contains(&f) && owners.len() == 2,
+                "I2843: the two selves are the counted owners: {owners:?}"
+            ),
+            other => panic!("I2843: two selves bound the node, got {other:?}"),
         }
     }
 

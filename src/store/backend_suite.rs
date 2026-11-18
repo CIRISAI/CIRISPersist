@@ -1999,172 +1999,6 @@ mod tests {
         assert!(!bad.valid, "(3) a mislabeled lever confers nothing");
     }
 
-    /// v19.1.0 (CIRISPersist#490) — THE acceptance witness: bake the REAL
-    /// 2026-07-23 humanity-accord ceremony artifact (`genesis_v2.json`,
-    /// byte-exact, sha256 44be2cf8…) against a node holding the REAL baked
-    /// genesis state (A1/B1/C1 roster + the prior roles-less canonical
-    /// anchor — the exact state that refused the adopt in the field).
-    ///
-    /// Proves end-to-end, with production cryptography:
-    /// 1. the bundle quorum (A1+B1 hybrid YubiKey authorizations) verifies
-    ///    against persist's OWN roster + directory-pinned keys;
-    /// 2. the anchored-but-different canonical is RE-ANCHORED (the exact
-    ///    "downgrade/replace refused" case, now authenticated);
-    /// 3. the #486 lift makes the re-blessed record claim `infra:serve`
-    ///    (envelope-attested, top-level `roles:[]` on the wire);
-    /// 4. the delegation plane admits (the charter passes the v19.0.0
-    ///    pre-rotation gate; the serve grant lands);
-    /// 5. re-baking the same artifact is a no-op (idempotent).
-    #[tokio::test]
-    async fn bake_real_genesis_v2_artifact_490() {
-        use crate::federation::genesis::{bake_assembled_genesis, BakeItemOutcome};
-        let backend = test_backend();
-
-        // Seed the REAL baked genesis state: the A1/B1/C1 holder roster…
-        // v22.0.0 (CIRISPersist#543) — through `seed_genesis_accord_holders`,
-        // the same door the sqlite + postgres genesis paths use, NOT bare
-        // `put_public_key`. The baked ceremony evidence is a #268 custody
-        // attestation with a stale-by-design nonce; re-checking it at every
-        // boot is a category error, which is exactly why the backends have a
-        // dedicated seed entry point.
-        backend
-            .seed_genesis_accord_holders(
-                &crate::federation::genesis::effective_accord_holder_records(),
-            )
-            .await
-            .expect("seed accord holder roster");
-        // …and the PRIOR canonical anchor — the PRE-CEREMONY roles-less
-        // record (kept as a fixture: the live baked seed is now the
-        // re-blessed one, so the field-refusal state must be seeded
-        // explicitly).
-        let prev: Vec<crate::federation::SignedKeyRecord> =
-            serde_json::from_str(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/canonical_seed_pre_ceremony.json"
-            )))
-            .expect("pre-ceremony seed fixture parses");
-        for rec in prev {
-            backend
-                .put_public_key(rec)
-                .await
-                .expect("seed prior canonical anchor");
-        }
-        let canon = "ciris-canonical-1-d7bdeu223k";
-        let before = crate::federation::FederationDirectory::lookup_public_key(&backend, canon)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            !before.claims_role("infra:serve"),
-            "fixture: prior anchor is dark (no infra:serve) — the #480 state"
-        );
-
-        // v31.2.0 (CIRISPersist#660) — seed the constitutional family before
-        // baking. The re-minted ceremony's `genesis-charter` attests TO
-        // `humanity-accord`, so the delegation plane cannot land against a node
-        // that has never heard of the family: `put_attestation` refuses with
-        // "attested_key_id humanity-accord resolves as neither a registered
-        // federation_keys row nor a constitutional family known to this node".
-        // The #557 dry-run test already seeded it in the same order; this arm
-        // was relying on the old fixture's shape.
-        crate::federation::genesis::seed_accord_family(&backend)
-            .await
-            .expect("seed the constitutional family");
-
-        // Bake the REAL artifact.
-        let artifact = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/genesis_v2.json"
-        ));
-        let report = bake_assembled_genesis(&backend, artifact)
-            .await
-            .expect("the real ceremony artifact must verify and bake");
-        assert_eq!(
-            report.quorum_verified, 2,
-            "A1+B1 hybrid authorizations verified"
-        );
-        assert_eq!(
-            report.serve_nodes,
-            vec![(canon.to_owned(), BakeItemOutcome::ReAnchored)],
-            "the anchored-but-different canonical is re-anchored under quorum"
-        );
-        // v31.0.0 (CIRISPersist#648) — the delegation plane is regime-branched
-        // on the ARTIFACT, not on an edited expectation.
-        //
-        // `genesis_v2.json` is the REAL 2026-07-23 ceremony artifact and it was
-        // signed before the #643 row mirror existed, so its delegation rows
-        // carry no signed `row` object and `put_attestation` refuses them. That
-        // gate closes the verb-substitution and authority-injection attacks and
-        // is not weakened here: a genesis-shaped carve-out would be a permanent
-        // hole in exactly the rows that grant everything.
-        //
-        // The KEY plane above is untouched and still proves the whole #490
-        // acceptance story (quorum verifies, the anchored-but-different
-        // canonical re-anchors under quorum, the #486 lift opens the trace
-        // plane). What the delegation half asserts now is the truth of a
-        // pre-v31 build: every row is SKIPPED, naming #643. When the same
-        // holders re-sign under the new envelope shape for 31.1.0, this flips
-        // back to `Anchored` by itself.
-        let artifact_bundle: crate::federation::genesis::GenesisBundle =
-            serde_json::from_str(artifact).expect("artifact parses");
-        let row_bound =
-            crate::federation::genesis::bundle_delegation_plane_v31_shaped(&artifact_bundle);
-        for (id, outcome) in &report.attestations {
-            match &row_bound {
-                Ok(()) => assert!(
-                    matches!(
-                        outcome,
-                        BakeItemOutcome::Anchored | BakeItemOutcome::AlreadyPresent
-                    ),
-                    "delegation-plane row {id} must land, got {outcome:?}"
-                ),
-                Err(_) => match outcome {
-                    BakeItemOutcome::Skipped(why) => assert!(
-                        crate::federation::genesis::is_v31_binding_refusal(why),
-                        "row {id} must be skipped BY THE BINDING GATE, not for some other \
-                         reason: {why}"
-                    ),
-                    other => panic!(
-                        "a pre-v31 delegation row {id} must be refused by the #643 gate, \
-                         got {other:?} — the gate has a hole"
-                    ),
-                },
-            }
-        }
-
-        // The mesh is bright: the re-blessed record claims infra:serve
-        // (the #486 lift over the envelope-attested set).
-        let after = crate::federation::FederationDirectory::lookup_public_key(&backend, canon)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(after.claims_role("infra:serve"), "the trace plane opens");
-        assert!(after.claims_role(crate::federation::types::identity_type::CANONICAL));
-        assert!(
-            after.valid_from > before.valid_from,
-            "anti-rollback ordering"
-        );
-
-        // Idempotent: same artifact again → nothing changes, no error.
-        let again = bake_assembled_genesis(&backend, artifact)
-            .await
-            .expect("re-bake is a no-op, not an error");
-        assert_eq!(
-            again.serve_nodes,
-            vec![(canon.to_owned(), BakeItemOutcome::AlreadyPresent)],
-            "idempotent re-bake"
-        );
-
-        // A tampered bundle (flipped byte in an authorization) refuses and
-        // writes NOTHING.
-        let mut tampered: serde_json::Value = serde_json::from_str(artifact).unwrap();
-        tampered["authorizations"][0]["signature_classical"] = serde_json::json!("QUFBQQ==");
-        let err = bake_assembled_genesis(&backend, &tampered.to_string())
-            .await
-            .expect_err("tampered authorization must refuse");
-        assert_eq!(err.kind(), "federation_genesis_bundle_invalid");
-    }
-
     /// v21.0.0 (CIRISPersist#502 E1) — a forged revocation (scrub sig by a
     /// key OTHER than the declared revoking key) is REJECTED. The attack:
     /// any linked peer forging `{revoked: victim, revoking: any-existing}`
@@ -4091,11 +3925,11 @@ mod tests {
         assert_eq!(err.kind(), "witness_admit_malformed_root");
     }
 
-    // ── CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — single-owner gate ──
+    // ── CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the owner seat ──
 
     /// Build an OWNER-BINDING `delegates_to(owner → node)` carrying the CC
-    /// 1.13.3.3 / CC 3.2 ownership dimension (what the single-owner gate +
-    /// `owner_of` key on) with infra-only scope, re-signed for the
+    /// 1.13.3.3 / CC 3.2 ownership dimension (what `owner_of` keys on) with
+    /// infra-only scope, re-signed for the
     /// federation-tier ingest gate. Distinct from [`fix_node_delegates_to`],
     /// which builds a plain (non-ownership) infra delegation.
     fn fix_owner_binding(id: &str, owner: &str, node: &str) -> Attestation {
@@ -4128,16 +3962,16 @@ mod tests {
     /// 2.4.1.2 canonical marker only** (`delegation_purpose: "owner_binding"`,
     /// **no `dimension`**) — the shape a raw `emit_attestation_self` `delegates_to`
     /// carries, and exactly what CIRISConformance `test_551` probes. Before the
-    /// fix, the gate keyed on the internal dimension alone and this path was
-    /// UNGATED (a second distinct owner was admitted — CC 3.2 violated).
+    /// fix, the owner fold keyed on the internal dimension alone and this path
+    /// was invisible to it.
     fn fix_owner_binding_cc(id: &str, owner: &str, node: &str) -> Attestation {
         use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
         let mut att = fix_attestation(id, owner, node, owner);
         att.attestation_type = attestation_type::DELEGATES_TO.into();
         crate::federation::tier_ingest::test_support::reseal(&mut att);
         // CC 2.4.1.2 marker ONLY (no `dimension`). Carries the infra scopes so
-        // it clears the node-agency gate and actually reaches the single-owner
-        // gate under test (the marker recognition is the thing being proven).
+        // it clears the node-agency gate and is stored, so the owner seat reads
+        // it (the marker recognition is the thing being proven).
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "kind": "delegates_to",
@@ -4148,13 +3982,20 @@ mod tests {
         att
     }
 
-    /// v13.3.0 (CIRISPersist#378) — the single-owner gate + `owner_of` now fire
-    /// on the **CC-marker raw-emit path** (`delegation_purpose: "owner_binding"`,
-    /// no dimension), not only persist's internal-dimension `steward_bind` path.
-    /// A second distinct owner via the raw path is rejected; `owner_of` resolves
-    /// the first. This is the exact bypass CIRISConformance `test_551` caught.
+    /// v13.3.0 (CIRISPersist#378) — `owner_of` fires on the **CC-marker
+    /// raw-emit path** (`delegation_purpose: "owner_binding"`, no dimension),
+    /// not only persist's internal-dimension `steward_bind` path (the bypass
+    /// CIRISConformance `test_551` caught).
+    ///
+    /// **I2841** (v62.0.0, kernel pass 2, KERNEL_SEAMS B1 / C557) — a second,
+    /// DIFFERENT owner via the same path is no longer refused
+    /// (`federation_node_already_owned` is gone): its binding is HELD. Both
+    /// bindings are cosigned by the node (the fixture sealer co-scrubs an
+    /// owner binding by its node), so the kernel's owner seat counts two
+    /// owners and reads the node as unowned — `AmbiguousNodeOwner`,
+    /// fail-closed — never as whichever binding arrived first.
     #[tokio::test]
-    async fn single_owner_gate_rejects_second_distinct_owner_via_cc_marker() {
+    async fn i2841_a_second_distinct_owner_via_cc_marker_is_held_and_reads_unowned() {
         use crate::federation::admission::owner_of;
         let backend = test_backend();
         seed_ob_keys(&backend).await;
@@ -4173,30 +4014,50 @@ mod tests {
             "owner_of must resolve the CC-marker owner-binding"
         );
 
-        // A second, DIFFERENT owner via the same CC-marker path is REJECTED.
-        let err = backend
+        // A second, DIFFERENT owner via the same CC-marker path is HELD.
+        backend
             .put_attestation(SignedAttestation {
                 attestation: fix_owner_binding_cc("ob-cc2", "ob-owner2", "ob-node"),
             })
             .await
-            .unwrap_err();
-        assert_eq!(
-            err.kind(),
-            "federation_node_already_owned",
-            "second distinct owner via the CC-marker raw-emit path must be rejected, got {err:?}"
+            .expect("I2841: a second distinct owner's binding is held, not refused");
+        assert!(
+            backend.get_attestation("ob-cc2").await.unwrap().is_some(),
+            "I2841: the second binding is stored"
         );
-        assert_eq!(
-            owner_of(&backend, "ob-node").await.unwrap(),
-            Some("ob-owner".to_string()),
-            "the rejected second binding left no trace"
+        match owner_of(&backend, "ob-node").await {
+            Err(crate::federation::Error::AmbiguousNodeOwner { owners, .. }) => assert_eq!(
+                owners,
+                vec!["ob-owner".to_string(), "ob-owner2".to_string()],
+                "I2841: both counted owners are named, sorted"
+            ),
+            other => panic!("I2841: two counted owners read as unowned, got {other:?}"),
+        }
+
+        // A binding the node never cosigned names no owner: it changes nothing.
+        let mut stranger = fix_owner_binding_cc("ob-cc3", "ob-owner2", "ob-node");
+        stranger.additional_scrubs.clear();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: stranger,
+            })
+            .await
+            .expect("I2841: an uncosigned owner binding is held");
+        assert!(
+            matches!(
+                owner_of(&backend, "ob-node").await,
+                Err(crate::federation::Error::AmbiguousNodeOwner { .. })
+            ),
+            "I2841: the uncosigned binding neither adds nor resolves an owner"
         );
     }
 
     /// Ownership is transferable, not permanent: after the incumbent binding
-    /// lapses (expiry → non-live), a DIFFERENT owner may bind. The gate honors
-    /// the same liveness predicate as `steward_bindings_of`.
+    /// lapses (expiry → non-live), a DIFFERENT owner's binding is the one the
+    /// owner seat counts. (v62.0.0: no gate stands between the two; the
+    /// kernel's owner seat presents only a live binding.)
     #[tokio::test]
-    async fn single_owner_gate_admits_new_owner_after_incumbent_expires() {
+    async fn the_owner_after_the_incumbent_expires_is_the_new_owner() {
         use crate::federation::admission::owner_of;
         let backend = test_backend();
         seed_ob_keys(&backend).await;
@@ -4567,53 +4428,6 @@ mod tests {
             .expect("seed the baked plane");
         crate::federation::genesis::assert_refused_replacement_keeps_the_row(&backend, "sqlite")
             .await;
-    }
-
-    /// v31.1.0 (CIRISPersist#665 review) — **re-running the
-    /// saved ceremony repairs the node's own ceremony row.**
-    #[tokio::test]
-    async fn saved_ceremony_repairs_its_own_row_sqlite_665() {
-        let backend = test_backend();
-        backend
-            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
-            .await
-            .expect("holders seed");
-        crate::federation::genesis::seed_family_and_canonical(&backend)
-            .await
-            .expect("seed the baked plane");
-        // Thin the co-signature set beneath persist, leaving the signed
-        // envelope — and therefore the bound instants — byte-identical.
-        {
-            let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
-                .attestation
-                .attestation_id;
-            backend
-                .test_execute(&format!(
-                    "UPDATE federation_attestations SET additional_scrubs = '[]' \
-                     WHERE attestation_id = '{target}'"
-                ))
-                .await;
-        }
-        crate::federation::genesis::assert_saved_ceremony_repairs_its_own_row(&backend, "sqlite")
-            .await;
-    }
-
-    /// v31.1.0 (CIRISPersist#665 review) — **a lost bake race
-    /// must not be reported as success.**
-    #[tokio::test]
-    async fn lost_bake_race_is_not_reported_as_success_sqlite_665() {
-        let backend = test_backend();
-        backend
-            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
-            .await
-            .expect("holders seed");
-        crate::federation::genesis::seed_family_and_canonical(&backend)
-            .await
-            .expect("the winner installs the current plane");
-        crate::federation::genesis::assert_lost_bake_race_is_not_reported_as_success(
-            &backend, "sqlite",
-        )
-        .await;
     }
 
     /// v31.1.0 (CIRISPersist#665 review) — **a forged holder claim must not

@@ -149,7 +149,6 @@ Engine	add_community_member	deontic
 Engine	add_moderator	deontic	
 Engine	add_peer_record_json	deontic	
 Engine	admission_cache_stats	empirical	
-Engine	adopt_scrub_upgrade	deontic	
 Engine	adopt_sealed_blob_json	deontic	
 Engine	adopt_sealed_chunk_json	deontic	
 Engine	adopt_sealed_chunks_json	deontic	
@@ -165,6 +164,8 @@ Engine	apply_replicated_accord_evidence	deontic
 Engine	apply_replicated_attestation	deontic
 Engine	apply_replicated_key_grant	deontic
 Engine	apply_replicated_key_record	deontic
+Engine	apply_replicated_statement	deontic	
+Engine	put_edition2_statement	deontic	
 Engine	attestation_insert_local	empirical	
 Engine	attestation_insert_local_many	empirical	
 Engine	attestation_upsert_local	empirical	
@@ -179,13 +180,11 @@ Engine	audit_verify_all_chains	testimonial	self_audit
 Engine	audit_verify_chain	testimonial	self_audit
 Engine	backfill_trace_attestations	procedural	
 Engine	backfill_v020_trust_rows	procedural	
-Engine	bake_assembled_genesis	deontic	
 Engine	cache_stats	empirical	
 Engine	cirisnode_amend_goal_json	empirical	
 Engine	cirisnode_check_goal_projection	empirical	
 Engine	cirisnode_recant_goal_json	empirical	
 Engine	cirisnode_rehome_goals	axiotic	
-Engine	install_genesis_bundle_roster_json	deontic	
 Engine	blackhole_list_json	empirical	
 Engine	blackhole_prune_expired_iso	deontic	
 Engine	blackhole_record_hit	deontic	
@@ -193,6 +192,8 @@ Engine	blackhole_remove	deontic
 Engine	blackhole_upsert	deontic	
 Engine	blob_storage_capsule	structural	
 Engine	body_sha256	pragmatic	
+Engine	bundles_in_force_json	deontic	
+Engine	amendment_standings_json	deontic	
 Engine	build_corpus_want_v1	deontic	
 Engine	build_storage_budget_v1	deontic	
 Engine	cache_budget_bytes	epistemic	
@@ -303,6 +304,9 @@ Engine	emit_attestation	deontic
 Engine	emit_attestation_self	deontic	
 Engine	emit_key_grant	deontic
 Engine	emit_pending_key_grants	deontic
+Engine	edition2_statements_since	empirical	
+Engine	edition2_held_reason	empirical	
+Engine	edition2_held_rows	empirical	
 Engine	licences_issued_under_json	deontic	
 Engine	licensure_status_set	deontic	
 Engine	list_key_registration_history	empirical	
@@ -462,6 +466,7 @@ Engine	local_pqc_sign	ontological
 Engine	local_public_key_b64	ontological	
 Engine	local_sign	ontological	
 Engine	local_sign_hybrid	ontological	
+Engine	seal_trace_statement	ontological	
 Engine	local_signer_capsule	structural	
 Engine	locale_leaf_hash_hex	pragmatic	
 Engine	locale_merkle_root_hex	pragmatic	
@@ -511,6 +516,7 @@ Engine	put_blob_chunk_scoped	deontic
 Engine	put_blob_chunks_json	empirical	
 Engine	put_blob_encrypted_community	deontic	
 Engine	put_blob_encrypted_self_family	deontic	
+Engine	put_blob_edition2	deontic	
 Engine	put_blob_json	empirical	
 Engine	put_blob_scoped	deontic	
 Engine	put_blob_signing	deontic	
@@ -714,6 +720,7 @@ MODULE	engine_teardown_wait	structural
 MODULE	engine_teardowns_in_flight	structural	
 MODULE	install_panic_logger	structural	
 MODULE	key_grant_refusal_is_retryable	procedural	
+MODULE	earlier_form_doors_shut	procedural	
 MODULE	namespace_manifest_version	axiomatic	
 MODULE	panic_count	structural	
 MODULE	persist_field_conformance	axiomatic	

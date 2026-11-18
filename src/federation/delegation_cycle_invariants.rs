@@ -8,7 +8,7 @@
 //! an admission: the closing edge is HELD, and the walk's reading of the
 //! graph it closes (retractions, expiry, terms, the trust plane, the ceiling)
 //! is still asserted through `delegation_path_hops`, the same lens the v54
-//! gate read. I597's two writers are both admitted.
+//! gate read. (I597 is deleted; see below.)
 //!
 //! CC 4.1.1's anti-pattern table, row "Cycles (A → B → A)": *"Substrate MUST
 //! detect cycles on the `delegates_to` graph and reject the cycle-closing
@@ -57,17 +57,10 @@
 //! opens the row has expired), so it connects nothing; an edge whose expiry
 //! falls after its term opens still connects.
 //!
-//! I597 — the check and the insert are ONE step (Codex on PR #1050). Two
-//! writers of `A → B` and `B → A` that both finish the graph read before
-//! either inserts would both be admitted. The witness forces exactly that
-//! interleaving: the first writer is paused (a `store::test_hooks` pause) at
-//! the last point before its write, the second writer then runs to completion
-//! or blocks, and the first is resumed. Exactly one edge may be admitted, and
-//! the refused one is `federation_delegation_cycle`. Run as (i) put vs put and
-//! (ii) a local `B → A` crossing (`enter_mesh`) vs a put of `A → B`. On memory
-//! and sqlite both writers share the one backend (its in-process lock is the
-//! serialization); on postgres they are TWO backends with two pools on one
-//! database, so only the advisory lock can serialize them.
+//! I597 (the cycle check and the insert as ONE step under the delegation
+//! write lock, Codex on PR #1050) is deleted in v62.0.0's kernel pass 2 with
+//! the gate, its lock and its re-ask: nothing is refused for closing a cycle,
+//! so there is nothing to serialize.
 
 /// The backend-agnostic witness body; `run` instantiates it per backend.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -208,97 +201,6 @@ pub mod bodies {
                 && r.attested_key_id == to
                 && r.tier == attestation_tier::FEDERATION
         })
-    }
-
-    /// Run `rival` while the first writer is held at its armed pause, then
-    /// resume the first. Returns the rival's result and whether it FINISHED
-    /// while the first writer was held (true = the two were not serialized).
-    async fn rival_while_paused<T>(
-        pause: &crate::store::test_hooks::Pause,
-        rival: impl std::future::Future<Output = T>,
-    ) -> (T, bool) {
-        pause.reached().await;
-        tokio::pin!(rival);
-        match tokio::time::timeout(std::time::Duration::from_secs(3), &mut rival).await {
-            Ok(out) => {
-                pause.resume();
-                (out, true)
-            }
-            Err(_) => {
-                pause.resume();
-                (rival.await, false)
-            }
-        }
-    }
-
-    /// I597 (i) — put vs put. `first` carries the armed
-    /// `delegation_cycle_before_insert` pause; `second` may be the same
-    /// backend or another one on the same database.
-    pub(crate) async fn i597_put_vs_put_admits_one(
-        first: &dyn FederationDirectory,
-        second: &dyn FederationDirectory,
-        pause: std::sync::Arc<crate::store::test_hooks::Pause>,
-        tag: &str,
-    ) {
-        let (a, b) = (format!("{tag}-a"), format!("{tag}-b"));
-        agent(first, &a).await;
-        agent(first, &b).await;
-        let (ra, (rb, b_ran_free)) = tokio::join!(
-            ts::put_delegates_to(first, &a, &b, None),
-            rival_while_paused(&pause, ts::put_delegates_to(second, &b, &a, None)),
-        );
-        // v62.0.0 (slice C) — the kernel refuses no edge for closing a cycle:
-        // both writers are admitted, in whichever order they land.
-        let _ = b_ran_free;
-        assert!(ra.is_ok(), "I597 (i): the first writer admits: {ra:?}");
-        expect_cycle(
-            first,
-            rb,
-            &b,
-            &a,
-            1,
-            "I597 (i): the second writer, serialized behind the first",
-        )
-        .await;
-        assert!(
-            has_fed_edge(first, &a, &b).await && has_fed_edge(first, &b, &a).await,
-            "I597 (i): both edges are held"
-        );
-    }
-
-    /// I597 (ii) — a crossing vs a put. `first` carries the armed
-    /// `delegation_cycle_before_crossing` pause.
-    pub(crate) async fn i597_crossing_vs_put_admits_one(
-        first: &dyn FederationDirectory,
-        second: &dyn FederationDirectory,
-        pause: std::sync::Arc<crate::store::test_hooks::Pause>,
-        tag: &str,
-    ) {
-        let (x, y) = (format!("{tag}-x"), format!("{tag}-y"));
-        agent(first, &x).await;
-        agent(first, &y).await;
-        let (staged_id, ci, custody) = stage_local_edge(first, &y, &x).await;
-        let (rc, (rp, p_ran_free)) = tokio::join!(
-            first.enter_mesh(&staged_id, &ci, &custody),
-            rival_while_paused(&pause, ts::put_delegates_to(second, &x, &y, None)),
-        );
-        // v62.0.0 (slice C) — the kernel refuses no edge for closing a cycle:
-        // the crossing and the put both land.
-        let _ = p_ran_free;
-        assert!(rc.is_ok(), "I597 (ii): the held crossing admits: {rc:?}");
-        expect_cycle(
-            first,
-            rp,
-            &x,
-            &y,
-            1,
-            "I597 (ii): the put, serialized behind the crossing",
-        )
-        .await;
-        assert!(
-            has_fed_edge(first, &y, &x).await && has_fed_edge(first, &x, &y).await,
-            "I597 (ii): both edges are held"
-        );
     }
 
     /// A retraction by `granter` against `grantee` (naming `target` when
@@ -799,77 +701,6 @@ mod run {
                 }
             }
         };
-    }
-
-    /// I597 on one backend `$b`: both writers share it.
-    #[cfg(feature = "sqlite")]
-    macro_rules! i597_single {
-        ($b:expr) => {{
-            let b = $b;
-            let d = &b as &dyn crate::federation::FederationDirectory;
-            let pause = b.test_hooks().arm_pause("delegation_cycle_before_insert");
-            super::bodies::i597_put_vs_put_admits_one(d, d, pause, &format!("i597p-{}", suffix()))
-                .await;
-            let pause = b.test_hooks().arm_pause("delegation_cycle_before_crossing");
-            super::bodies::i597_crossing_vs_put_admits_one(
-                d,
-                d,
-                pause,
-                &format!("i597c-{}", suffix()),
-            )
-            .await;
-        }};
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i597_sqlite() {
-        use crate::store::Backend as _;
-        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        i597_single!(b);
-    }
-
-    /// I597 on postgres: TWO backends, two pools, one database — two
-    /// processes' worth of writers. Neither backend's in-process lock sees the
-    /// other's writer, so only the advisory lock can serialize them.
-    #[cfg(feature = "postgres")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i597_postgres() {
-        use crate::federation::FederationDirectory;
-        use crate::store::Backend as _;
-        let Some(dsn) = crate::test_pg::isolated_dsn() else {
-            eprintln!("i597_postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
-            return;
-        };
-        let b1 = crate::store::postgres::PostgresBackend::connect(&dsn)
-            .await
-            .unwrap();
-        b1.run_migrations().await.unwrap();
-        let b2 = crate::store::postgres::PostgresBackend::connect(&dsn)
-            .await
-            .unwrap();
-        let pause = b1.test_hooks().arm_pause("delegation_cycle_before_insert");
-        super::bodies::i597_put_vs_put_admits_one(
-            &b1 as &dyn FederationDirectory,
-            &b2 as &dyn FederationDirectory,
-            pause,
-            &format!("i597p-{}", suffix()),
-        )
-        .await;
-        let pause = b1
-            .test_hooks()
-            .arm_pause("delegation_cycle_before_crossing");
-        super::bodies::i597_crossing_vs_put_admits_one(
-            &b1 as &dyn FederationDirectory,
-            &b2 as &dyn FederationDirectory,
-            pause,
-            &format!("i597c-{}", suffix()),
-        )
-        .await;
-        eprintln!("i597_postgres: RAN on {dsn}");
     }
 
     #[cfg(feature = "sqlite")]

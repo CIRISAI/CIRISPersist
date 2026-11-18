@@ -80,7 +80,6 @@ def test_the_classes_are_rows_from_python(tmp_path) -> None:
         assert [r["attestation_id"] for r in page["items"]] == [cid], page
         row = page["items"][0]
         assert row["attestation_envelope"]["dimension"] == "contribution:arc_question:v1"
-        assert row["scrub_signature_pqc"], "the row is hybrid-signed"
 
         vid = eng.cirisnode_cast_vote(json.dumps({"contribution_id": cid, "score": 0.5}))
         votes = json.loads(eng.cirisnode_list_votes(cid))

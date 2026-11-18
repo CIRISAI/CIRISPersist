@@ -2798,3 +2798,72 @@ CREATE TABLE ceg_row_names (
     PRIMARY KEY (row_id, named_row_id, role)
 );
 CREATE INDEX ceg_row_names_named ON ceg_row_names (named_row_id, role, row_id);
+
+-- Wave G0 (CC 2.7.3, the fold): every folded row, held or concluded: its
+-- FIRST arrival (replicated or local, tier), its plane and projection slot
+-- (the fold re-folds under exactly that arrival and un-concludes through the
+-- plane), and, while it concludes nothing, why: `reason` a token
+-- (edition2::fold::reason), `detail` the refusal the gate would have raised,
+-- `since_us` THIS node's clock when it was first held for this reason
+-- (node-local, never replicated). A concluded row has `reason` NULL.
+CREATE TABLE ceg_fold_state (
+    row_id          BLOB    NOT NULL PRIMARY KEY
+        CHECK (typeof(row_id) = 'blob' AND length(row_id) = 32),
+    family          TEXT    NOT NULL,
+    tier            TEXT    NOT NULL,
+    replicated      INTEGER NOT NULL CHECK (replicated IN (0, 1)),
+    plane           TEXT    NOT NULL,
+    slot            TEXT    NOT NULL,
+    reason          TEXT,
+    detail          TEXT,
+    since_us        INTEGER CHECK (since_us IS NULL OR typeof(since_us) = 'integer'),
+    CHECK ((reason IS NULL) = (detail IS NULL) AND (reason IS NULL) = (since_us IS NULL))
+);
+CREATE INDEX ceg_fold_state_slot ON ceg_fold_state (slot, row_id);
+CREATE INDEX ceg_fold_state_held ON ceg_fold_state (reason, row_id);
+
+-- Wave G0: the dependency index. Every input a row's last fold evaluation
+-- read (`row:<hex>`, `key:<id>`, `family:<family>`), held or concluded; a
+-- statement that touches a read key re-folds the rows that read it.
+CREATE TABLE ceg_fold_reads (
+    read_key        TEXT    NOT NULL,
+    row_id          BLOB    NOT NULL CHECK (typeof(row_id) = 'blob' AND length(row_id) = 32),
+    PRIMARY KEY (read_key, row_id)
+);
+CREATE INDEX ceg_fold_reads_row ON ceg_fold_reads (row_id);
+
+-- Kernel pass 2 (v62.0.0, K1, I2812; CC 2.7.8 "Two versions of one head wait
+-- as tips"): a family / community version whose prev_head_digest does not
+-- name the held head is held here beside the head, never refused. The live
+-- row stays the head; a held tip re-offered once the version it names is the
+-- head runs the whole supersede door and leaves this table. snapshot is the
+-- signed wrapper as offered.
+CREATE TABLE federation_group_tips (
+    cohort               TEXT NOT NULL
+        CHECK (cohort IN ('family', 'community', 'affiliations')),
+    group_key_id         TEXT NOT NULL,
+    persist_row_hash     TEXT NOT NULL,
+    prev_head_digest     TEXT NOT NULL,
+    snapshot             TEXT NOT NULL CHECK (json_valid(snapshot)),
+    change_authorization TEXT
+        CHECK (change_authorization IS NULL OR json_valid(change_authorization)),
+    held_at              TEXT NOT NULL,    -- RFC-3339
+    PRIMARY KEY (cohort, group_key_id, persist_row_hash)
+);
+
+-- v62.0.0 (wave O1, S1; CC 3.3.6.4): THIS node's receipts of edition-2
+-- self-roster proposals: an identity:occurrence bind awaiting the two paths.
+-- The proposal is the bind's row id (lowercase hex); its statements are in
+-- ceg_statements. No FK: no attestation row backs it. The lone path's window
+-- starts at received_at (this node's first hold).
+CREATE TABLE ceg_roster_proposals (
+    row_id          TEXT    PRIMARY KEY,
+    identity_key_id TEXT    NOT NULL,
+    received_at     TEXT    NOT NULL,
+    settled_at      TEXT,
+    outcome         TEXT,
+    CHECK ((settled_at IS NULL) = (outcome IS NULL))
+);
+CREATE INDEX ceg_roster_proposals_open
+    ON ceg_roster_proposals (identity_key_id, received_at)
+    WHERE settled_at IS NULL;

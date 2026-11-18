@@ -9,23 +9,24 @@
 //! # Wire shape
 //!
 //! Request / response types defined in [`crate::secrets::wire`].
-//! Hybrid sign-verify per the FSD §7 + §8 contract: every request
-//! body is hybrid-signed (Ed25519 + optional ML-DSA-65) by the
-//! caller's steward key. The server's response carries no signature
-//! today — the transport-level mTLS or equivalent is the integrity
-//! gate on responses; future iterations may add response signatures.
+//! The server's response carries no signature today — the
+//! transport-level mTLS or equivalent is the integrity gate on
+//! responses; future iterations may add response signatures.
 //!
-//! # Authentication
+//! # Authentication (v62.0.0)
 //!
-//! Caller passes an [`Arc<LocalSigner>`] at construction; the
-//! client signs every request body via
-//! [`LocalSigner::sign_hybrid`] when PQC is configured, falling
-//! back to [`LocalSigner::sign_ed25519`] when not. Headers
-//! emitted:
+//! Caller passes an [`Arc<LocalSigner>`] at construction. Every request
+//! is signed with ONE composite (ML-DSA-65-Ed25519) signature,
+//! [`LocalSigner::sign_composite`], over
+//! [`canonical_request`]`(method, path_and_query, body)`. Headers emitted:
 //!
-//! - `X-Ciris-Signing-Key-Id: <local-key-id>`
-//! - `X-Ciris-Signature-Ed25519: <base64>`
-//! - `X-Ciris-Signature-MlDsa-65: <base64>` (when PQC is configured)
+//! - `x-ciris-signing-key-id: <the signer's edition-2 identity-ref>`
+//! - `x-ciris-signature: <base64 of the 3373-byte composite>`
+//!
+//! The server authorizes the identity-ref by a `secrets:{reader,writer,admin}`
+//! delegation from its node's owner (`server::secrets`): the signer's key
+//! must be a live edition-2 key on that node, and its owner must have
+//! granted it the scopes it uses.
 //!
 //! # Out-of-scope methods
 //!
@@ -64,26 +65,17 @@ use crate::secrets::types::{
     SecretsServiceStats,
 };
 use crate::secrets::wire::{
-    AccessLogsQuery, AccessLogsResponse, ClaimResultWire, DecryptRequest, DecryptResponse,
-    EncryptRequest, EncryptResponse, FilterConfigResponse, FilterConfigUpdateRequest,
-    FilterConfigUpdateResponse, ForgetSecretResponse, HealthResponse, ListSecretsQuery,
-    ListSecretsResponse, RecallSecretRequest, RecallSecretResponse, ReencryptAllRequest,
-    ReencryptAllResponse, RetrieveSecretResponse, RotateMasterKeyRequest, RotateMasterKeyResponse,
-    SecretsErrorResponse, StatsResponse, StoreSecretRequest, StoreSecretResponse,
-    TryClaimSecretRequest,
+    canonical_request, AccessLogsQuery, AccessLogsResponse, ClaimResultWire, DecryptRequest,
+    DecryptResponse, EncryptRequest, EncryptResponse, FilterConfigResponse,
+    FilterConfigUpdateRequest, FilterConfigUpdateResponse, ForgetSecretResponse, HealthResponse,
+    ListSecretsQuery, ListSecretsResponse, RecallSecretRequest, RecallSecretResponse,
+    ReencryptAllRequest, ReencryptAllResponse, RetrieveSecretResponse, RotateMasterKeyRequest,
+    RotateMasterKeyResponse, SecretsErrorResponse, StatsResponse, StoreSecretRequest,
+    StoreSecretResponse, TryClaimSecretRequest, HEADER_KEY_ID, HEADER_SIGNATURE,
 };
 use crate::secrets::{SecretsError, SecretsService};
 use crate::signing::LocalSigner;
 use crate::ClaimResult;
-
-/// Header carrying the local signer's `federation_keys.key_id`.
-const HEADER_KEY_ID: &str = "X-Ciris-Signing-Key-Id";
-/// Header carrying the Ed25519 signature (base64) over the request
-/// body bytes.
-const HEADER_ED25519: &str = "X-Ciris-Signature-Ed25519";
-/// Header carrying the ML-DSA-65 signature (base64). Optional —
-/// emitted only when the configured [`LocalSigner`] has PQC.
-const HEADER_ML_DSA_65: &str = "X-Ciris-Signature-MlDsa-65";
 
 /// HTTP client mirroring the [`SecretsService`] trait surface.
 ///
@@ -140,53 +132,47 @@ impl FederatedSecretsClient {
         }
     }
 
-    /// Sign a request body with the configured local signer and
-    /// emit the signature headers.
+    /// Sign a request with the configured local signer and emit the
+    /// signature headers.
     ///
-    /// Returns the hybrid signature (Ed25519 + ML-DSA-65). **PQC is
-    /// REQUIRED as of v37.0.0.**
+    /// v62.0.0 — ONE composite signature ([`LocalSigner::sign_composite`])
+    /// over [`canonical_request`]`(method, path_and_query, body)`, and the
+    /// signer's edition-2 identity-ref as the key id. The two component
+    /// headers of the earlier form are gone: the server refuses them by
+    /// name (`secrets_signature_earlier_form`).
     ///
-    /// Through v36.x this fell back to an Ed25519-only signature when the
-    /// signer had no PQC configured, because the server verified under
-    /// `HybridPolicy::Ed25519Fallback`. That server-side policy flipped to
-    /// [`HybridPolicy::Strict`](crate::verify::HybridPolicy::Strict) in the
-    /// v37.0.0 break, so the fallback could now only ever build a request
-    /// the server is guaranteed to refuse with
-    /// `verify_hybrid_pending_rejected`.
-    ///
-    /// Rather than ship a doomed request and surface the cause as a remote
-    /// 401 — which reads as a credential problem — this fails HERE, where
-    /// the actual cause (this signer has no PQC key) is known and can be
-    /// named. Configure the local signer's ML-DSA-65 half; see
-    /// [`crate::signing`].
-    async fn sign_body(&self, body: &[u8]) -> Result<Vec<(&'static str, String)>, SecretsError> {
-        // Hybrid is the only acceptable shape as of v37.0.0. The signer
-        // returns PqcNotConfigured if PQC isn't wired; that is now a
-        // hard, locally-diagnosed failure rather than a silent downgrade.
-        match self.signer.sign_hybrid(body).await {
-            Ok(hybrid) => {
-                let ed25519_b64 = BASE64.encode(&hybrid.classical.signature);
-                let ml_dsa_65_b64 = BASE64.encode(&hybrid.pqc.signature);
-                Ok(vec![
-                    (HEADER_KEY_ID, self.signer.key_id().to_owned()),
-                    (HEADER_ED25519, ed25519_b64),
-                    (HEADER_ML_DSA_65, ml_dsa_65_b64),
-                ])
-            }
-            Err(crate::signing::LocalSignerError::PqcNotConfigured) => {
-                Err(SecretsError::Internal(format!(
-                    "local sign: signer {:?} has no ML-DSA-65 key configured, \
-                     and v37.0.0 secrets routes verify under \
-                     HybridPolicy::Strict — an Ed25519-only signature is \
-                     refused server-side (verify_hybrid_pending_rejected). \
-                     Through v36.x this downgraded silently; it now fails \
-                     here instead of arriving as a remote 401. Configure the \
-                     signer's PQC half.",
+    /// A signer with no ML-DSA-65 half, or one whose PQC signer cannot
+    /// context-sign, cannot make a composite. That fails HERE, where the
+    /// cause is known and can be named, rather than as a remote 401.
+    async fn sign_request(
+        &self,
+        method: &Method,
+        url: &Url,
+        body: &[u8],
+    ) -> Result<Vec<(&'static str, String)>, SecretsError> {
+        let named = |e: crate::signing::LocalSignerError| match e {
+            crate::signing::LocalSignerError::PqcNotConfigured
+            | crate::signing::LocalSignerError::CompositeUnavailable => {
+                SecretsError::Internal(format!(
+                    "local sign: signer {:?} cannot make a composite signature ({e}). \
+                     v62.0.0 secrets requests are signed with ONE ML-DSA-65-Ed25519 \
+                     composite; configure the signer's PQC half with a context-signing \
+                     ML-DSA-65 key.",
                     self.signer.key_id()
-                )))
+                ))
             }
-            Err(e) => Err(SecretsError::Internal(format!("local sign: {e}"))),
-        }
+            other => SecretsError::Internal(format!("local sign: {other}")),
+        };
+        let (_kid, identity_ref) =
+            crate::federation::edition2::produce::signer_identity(&self.signer)
+                .await
+                .map_err(named)?;
+        let message = canonical_request(method.as_str(), &path_and_query(url), body);
+        let sig = self.signer.sign_composite(&message).await.map_err(named)?;
+        Ok(vec![
+            (HEADER_KEY_ID, identity_ref),
+            (HEADER_SIGNATURE, BASE64.encode(sig)),
+        ])
     }
 
     /// Join a path against the configured base URL. Failure is a
@@ -210,7 +196,7 @@ impl FederatedSecretsClient {
         T: serde::de::DeserializeOwned,
     {
         let body_bytes = body.as_deref().unwrap_or(&[]);
-        let headers = self.sign_body(body_bytes).await?;
+        let headers = self.sign_request(&method, &url, body_bytes).await?;
         let mut req = self.client.request(method, url);
         for (k, v) in headers {
             req = req.header(k, v);
@@ -232,6 +218,15 @@ impl FederatedSecretsClient {
         } else {
             Err(map_error_response(resp).await)
         }
+    }
+}
+
+/// The origin-form request target of `url` (`/path?query`), as reqwest
+/// sends it: the `path_and_query` the server's canonical request reads.
+fn path_and_query(url: &Url) -> String {
+    match url.query() {
+        Some(q) => format!("{}?{q}", url.path()),
+        None => url.path().to_owned(),
     }
 }
 
@@ -415,7 +410,7 @@ impl SecretsService for FederatedSecretsClient {
     async fn is_healthy(&self) -> Result<bool, SecretsError> {
         // Health endpoint is unsigned on the server side (matches
         // the top-level `GET /health` convention). We still go
-        // through `issue` for consistency; sign_body emits headers
+        // through `issue` for consistency; sign_request emits headers
         // but the server ignores them.
         let url = self.url("/api/v1/secrets/health")?;
         let resp: HealthResponse = self.issue(Method::GET, url, None).await?;
@@ -645,7 +640,7 @@ mod tests {
 
     /// v38.0.0 — the HYBRID fixture the wire tests use. v37.0.0 flipped
     /// secrets signing to HybridPolicy::Strict, so an Ed25519-only signer
-    /// refuses at `sign_body` — every mock-server test below tests WIRE
+    /// refuses at `sign_request` — every mock-server test below tests WIRE
     /// behaviour, not the signer, and rode the ed-only fixture straight
     /// into that refusal (and from there into the fixture hang, see
     /// [`accept_with_deadline`]). Caught by the first COMPLETED `rest`-leg
@@ -709,45 +704,64 @@ mod tests {
         assert!(dbg.contains("test-steward"));
     }
 
-    /// v38.0.0 — the v37.0.0 contract, finally witnessed on the leg that
-    /// runs it: signing WITHOUT a PQC half REFUSES loudly and locally,
-    /// naming the remedy — never a silent Ed25519-only downgrade that
-    /// arrives as a remote 401. (This test previously asserted the
-    /// pre-v37 downgrade by name; it was red from the flip onward, unseen
-    /// because main's rest-leg runs were cancelled.)
+    /// v62.0.0 — signing WITHOUT a PQC half REFUSES loudly and locally,
+    /// naming the remedy (a composite needs both halves), never a request
+    /// that arrives as a remote 401.
     #[tokio::test]
-    async fn sign_body_refuses_without_pqc_v37() {
+    async fn sign_request_refuses_without_pqc() {
         let signer = make_signer();
         let url = Url::parse("https://persist.example.com").unwrap();
-        let client = FederatedSecretsClient::new(url, signer).expect("construct");
-        let err = client.sign_body(b"hello").await.unwrap_err();
+        let client = FederatedSecretsClient::new(url.clone(), signer).expect("construct");
+        let err = client
+            .sign_request(&Method::POST, &url, b"hello")
+            .await
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("Configure the signer's PQC half"),
+            msg.contains("configure the signer's PQC half"),
             "the refusal must name the remedy: {msg}"
         );
-        assert!(
-            msg.contains("HybridPolicy::Strict"),
-            "and the rule it enforces: {msg}"
-        );
+        assert!(msg.contains("composite"), "and the rule it enforces: {msg}");
     }
 
-    /// The positive twin: a hybrid signer emits all THREE headers, with a
-    /// 64-byte Ed25519 signature and a non-empty ML-DSA-65 half.
+    /// v62.0.0 (P6) — the positive twin: TWO headers, the signer's
+    /// edition-2 identity-ref and ONE 3373-byte composite that verifies
+    /// under the signer's composite key over
+    /// `canonical_request(method, path_and_query, body)`, and over nothing
+    /// else (another target).
     #[tokio::test]
-    async fn sign_body_emits_three_hybrid_headers() {
+    async fn sign_request_emits_one_composite_over_the_canonical_request() {
         let signer = make_hybrid_signer();
-        let url = Url::parse("https://persist.example.com").unwrap();
-        let client = FederatedSecretsClient::new(url, signer).expect("construct");
-        let headers = client.sign_body(b"hello").await.expect("hybrid sign");
-        assert_eq!(headers.len(), 3);
-        assert_eq!(headers[0].0, HEADER_KEY_ID);
-        assert_eq!(headers[0].1, "test-steward");
-        assert_eq!(headers[1].0, HEADER_ED25519);
+        let url = Url::parse("https://persist.example.com/api/v1/secrets?limit=5").unwrap();
+        let client = FederatedSecretsClient::new(url.clone(), signer.clone()).expect("construct");
+        let headers = client
+            .sign_request(&Method::GET, &url, b"")
+            .await
+            .expect("composite sign");
+        assert_eq!(headers.len(), 2);
+        let (_kid, identity_ref) = crate::federation::edition2::produce::signer_identity(&signer)
+            .await
+            .expect("identity");
+        assert_eq!(headers[0], (HEADER_KEY_ID, identity_ref));
+        assert_eq!(headers[1].0, HEADER_SIGNATURE);
         let sig = BASE64.decode(&headers[1].1).expect("base64 decode");
-        assert_eq!(sig.len(), 64);
-        assert_eq!(headers[2].0, HEADER_ML_DSA_65);
-        assert!(!headers[2].1.is_empty());
+        assert_eq!(sig.len(), ciris_crypto::composite::SIGNATURE_LEN);
+        let pk = crate::federation::edition2::produce::composite_public_key(&signer)
+            .await
+            .expect("composite key");
+        pk.verify(
+            &canonical_request("GET", "/api/v1/secrets?limit=5", b""),
+            &sig,
+        )
+        .expect("verifies over the canonical request");
+        assert!(
+            pk.verify(
+                &canonical_request("GET", "/api/v1/secrets/stats", b""),
+                &sig
+            )
+            .is_err(),
+            "the signature covers the request target"
+        );
     }
 
     /// `url(path)` joins paths correctly off the base URL.
@@ -909,15 +923,20 @@ mod tests {
             "got: {text}"
         );
         // Signature headers present.
+        // v62.0.0 — the key id is the signer's edition-2 identity-ref, and
+        // ONE composite header replaces the two component headers.
+        let lower = text.to_ascii_lowercase();
         assert!(
-            text.to_ascii_lowercase()
-                .contains("x-ciris-signing-key-id: test-steward"),
-            "missing key-id header in: {text}"
+            lower.contains("x-ciris-signing-key-id: urn:ietf:params:oauth:ckt:sha-256:"),
+            "missing identity-ref key-id header in: {text}"
         );
         assert!(
-            text.to_ascii_lowercase()
-                .contains("x-ciris-signature-ed25519:"),
-            "missing ed25519 header in: {text}"
+            lower.contains("x-ciris-signature:"),
+            "missing composite signature header in: {text}"
+        );
+        assert!(
+            !lower.contains("x-ciris-signature-ed25519") && !lower.contains("x-ciris-signature-ml"),
+            "no earlier-form component header: {text}"
         );
         // Body carries the wire shape.
         assert!(text.contains("\"plaintext\":\"v\""));

@@ -85,8 +85,21 @@ pub mod token {
     /// "refused with reason under Article 17(3)"). Carried per row in
     /// [`super::ErasureRefusal::reason`], never raised as an error.
     pub const PRODUCER_KEY_NOT_HELD: &str = "erasure_producer_key_not_held";
+    /// v62.0.0 (v62 P8) — an edition-2 row's erasure is refused: its
+    /// producer holds a live key but has not STATED its `withdraws` yet (a
+    /// statement is signed by the producer's composite key; the door holds
+    /// no signer and never writes an unsigned withdraws on the clean mesh).
+    /// The producer states it (`state_erasure_withdraws`, or signs
+    /// `withdraws_draft`) and the door is re-run. Carried per row in
+    /// [`super::ErasureRefusal::reason`], never raised as an error.
+    pub const PRODUCER_WITHDRAWS_UNSTATED: &str = "erasure_producer_withdraws_unstated";
     /// Every token.
-    pub const ALL: &[&str] = &[WITHDRAWS_UNHELD, UNAUTHORISED, PRODUCER_KEY_NOT_HELD];
+    pub const ALL: &[&str] = &[
+        WITHDRAWS_UNHELD,
+        UNAUTHORISED,
+        PRODUCER_KEY_NOT_HELD,
+        PRODUCER_WITHDRAWS_UNSTATED,
+    ];
 }
 
 /// The CC 2.3.2.1 tagged canonical hash naming the agent `agent_id_hash` as a
@@ -337,6 +350,24 @@ where
             });
             continue;
         }
+        // v62.0.0 (v62 P8) — the same authority (rule 1, the producer's own
+        // withdraws), a new form: on an edition-2 row, and for every row once
+        // the earlier-form doors are shut, the withdraws is the producer's
+        // STATEMENT (`state_erasure_withdraws`); the door, which holds no
+        // signer, refuses with reason until it is held, and never plans the
+        // earlier unsigned local row.
+        if super::edition2::door::earlier_form_doors_shut()
+            || target
+                .attestation_envelope
+                .get(super::edition2::ingest::STATEMENT_MEMBER)
+                .is_some()
+        {
+            plan.refused.push(ErasureRefusal {
+                record_id: format!("{}:{id}", PurgePlane::Attestation.as_str()),
+                reason: token::PRODUCER_WITHDRAWS_UNSTATED.to_owned(),
+            });
+            continue;
+        }
         let planned = plan_producer_withdraws(dir, &target, at).await?;
         plan.citations.push(ErasureCitation {
             target: id,
@@ -355,6 +386,13 @@ where
 }
 
 /// Does the host hold a live record of `key` (present, not expired at `at`)?
+///
+/// v62.0.0 (v62 P8) — an edition-2 key (an identity-ref) is read on the
+/// edition-2 key plane: one of its held `key:record`s covers `at` under the
+/// half-open window (`kernel::key_end::within_record`, through
+/// `HeldKeys::liveness`, which honours its revocations). The earlier
+/// `federation_keys.valid_until` read is kept for an earlier-form key id, and
+/// only while the earlier-form doors are open.
 async fn producer_key_held<F>(
     dir: &F,
     key: &str,
@@ -363,10 +401,181 @@ async fn producer_key_held<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    if let Some(kid) = super::edition2::ingest::kid_of_identity_ref(key) {
+        let Ok(at_ms) = u64::try_from(at.timestamp_millis()) else {
+            return Ok(false);
+        };
+        let keys = super::edition2::ingest::held_keys_for_kid(dir, &kid).await?;
+        return Ok(matches!(
+            keys.liveness(&kid, at_ms),
+            super::edition2::liveness::Liveness::Live(_)
+        ));
+    }
+    if super::edition2::door::earlier_form_doors_shut() {
+        return Ok(false);
+    }
     Ok(dir
         .lookup_public_key(key)
         .await?
         .is_some_and(|k| k.valid_until.is_none_or(|u| u > at)))
+}
+
+/// v62.0.0 (v62 P8; CC 4.5.3, CC 2.4.1.1 rule 1, P1's composer rule) — **a
+/// `withdraws` of `target` stated by `iss`, as its parts** `(sub, family,
+/// payload)`: `sub` = `iss`, the family the target's own (a composer carries
+/// its target's family, CC-READING(next-edition)), and the composer payload
+/// (common members only): `asserted_at`, `refs.target` = the target's row id,
+/// the target's `dimension`, and `author` = `iss` when the family is
+/// authored. Who may withdraw is NOT decided here: the one withdraws
+/// predicate decides at the door (rule 1 for the producer; rules 2–4 never
+/// reach an adverse `detection:*` row).
+///
+/// # Errors
+/// `edition2_payload_invalid` for a target that carries no edition-2
+/// statement, or whose id is not an edition-2 row id.
+pub fn withdraws_statement_parts(
+    target: &Attestation,
+    iss: &str,
+    asserted_at_ms: u64,
+) -> Result<(String, String, ciris_verify_core::cde::Value), Error> {
+    use ciris_verify_core::cde::Value;
+    let invalid = |m: String| Error::InvalidArgument(format!("edition2_payload_invalid: {m}"));
+    let statement = super::edition2::emit::carried_statement(target).ok_or_else(|| {
+        invalid(format!(
+            "{} carries no edition-2 statement to withdraw",
+            target.attestation_id
+        ))
+    })?;
+    let (family, _) = super::edition2::emit::family_of_statement(&statement)
+        .ok_or_else(|| invalid("the target's statement names no family".into()))?;
+    let digest = super::edition2::store::id_of_hex(&target.attestation_id)
+        .ok_or_else(|| invalid(format!("{} is not a row id", target.attestation_id)))?;
+    let dimension = target
+        .attestation_envelope
+        .get("dimension")
+        .and_then(serde_json::Value::as_str);
+    let text = |s: &str| Value::Text(s.to_owned());
+    let mut m = vec![
+        (text("asserted_at"), Value::Uint(asserted_at_ms)),
+        (text("refs"), super::edition2::emit::refs_target(&digest)),
+    ];
+    if let Some(d) = dimension {
+        m.push((text("dimension"), text(d)));
+    }
+    if super::edition2::emit::family_is_authored(&family, dimension) {
+        m.push((text("author"), text(iss)));
+    }
+    Ok((iss.to_owned(), family, super::edition2::emit::sorted_map(m)))
+}
+
+/// v62.0.0 (v62 P8) — **a `withdraws` of `target`, drafted for `iss`'s pen**
+/// ([`withdraws_statement_parts`]): an external producer (LensCore's
+/// detector) signs `sig_structure` and submits `Draft::assemble(signature)`
+/// through the statement door.
+///
+/// # Errors
+/// As [`withdraws_statement_parts`]; `iss` that is not an identity-ref.
+pub fn withdraws_draft(
+    target: &Attestation,
+    iss: &str,
+    asserted_at_ms: u64,
+) -> Result<super::edition2::emit::Draft, Error> {
+    let (sub, family, payload) = withdraws_statement_parts(target, iss, asserted_at_ms)?;
+    let kid = super::edition2::ingest::kid_of_identity_ref(iss).ok_or_else(|| {
+        Error::InvalidArgument(format!("withdraws_draft: {iss} is not an identity-ref"))
+    })?;
+    super::edition2::emit::draft_row(
+        &kid,
+        iss,
+        &sub,
+        attestation_type::WITHDRAWS,
+        &family,
+        &payload,
+    )
+    .map_err(|e| super::edition2::emit::produce_error("erasure_withdraws", e))
+}
+
+/// v62.0.0 (v62 P8) — what [`state_erasure_withdraws`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatedErasure {
+    /// `(target, withdraws)` row ids: the producer's rule-1 withdraws now
+    /// held (stated now, or already held).
+    pub stated: Vec<(String, String)>,
+    /// Rows the erasure reaches whose producer is not `signer`: another
+    /// producer's pen states theirs.
+    pub not_this_producer: Vec<String>,
+}
+
+/// v62.0.0 (v62 P8; CC 4.5.3, CLM-erasure-subject-route) — **the producer
+/// states its erasure withdraws** on the clean mesh: for every edition-2
+/// `detection:*` row a DSAR erasure of `agent_id_hash` reaches (one signing
+/// key's traces when `signing_key_id` is given) whose PRODUCER (attester) is
+/// `signer`, a `withdraws` statement ([`withdraws_statement_parts`]) signed by
+/// `signer`'s composite key (`sign_row`) and admitted through the statement
+/// door (`put_statement`, federation tier, so it replicates and a peer's
+/// erasure re-derives it). The authority is unchanged: it must then read as
+/// the producer's RULE-1 withdraws ([`erasing_withdraws`]), or this is an
+/// error (the producer forging no other authority). A row already carrying
+/// its producer's withdraws is reported, not re-stated. Then the DSAR door
+/// ([`plan_store_erasure`]) cites it.
+///
+/// # Errors
+/// `composite_signing_unavailable`; the door's refusals; a withdraws not
+/// admitted as rule 1; directory reads.
+pub(crate) async fn state_erasure_withdraws<D>(
+    dir: &D,
+    signer: &crate::signing::LocalSigner,
+    agent_id_hash: &str,
+    signing_key_id: Option<&str>,
+) -> Result<StatedErasure, Error>
+where
+    D: super::attestation_admit::AttestationStore,
+{
+    let iss = signer.federation_id().await;
+    let mut out = StatedErasure::default();
+    for id in dir
+        .detection_row_ids_for_agent(agent_id_hash, signing_key_id)
+        .await?
+    {
+        let Some(target) = dir.get_attestation(&id).await? else {
+            continue;
+        };
+        if target.attesting_key_id != iss
+            || super::edition2::emit::carried_statement(&target).is_none()
+        {
+            out.not_this_producer.push(id);
+            continue;
+        }
+        if let Some(w) = erasing_withdraws(dir, &target).await? {
+            out.stated.push((id, w.attestation_id));
+            continue;
+        }
+        let at_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+        let (sub, family, payload) = withdraws_statement_parts(&target, &iss, at_ms)?;
+        let statement = super::edition2::produce::sign_row(
+            signer,
+            &sub,
+            attestation_type::WITHDRAWS,
+            &family,
+            &payload,
+        )
+        .await
+        .map_err(|e| super::edition2::emit::produce_error("erasure_withdraws", e))?;
+        super::edition2::ingest::put_statement(
+            dir,
+            &statement,
+            None,
+            super::edition2::ingest::INGEST_TIER,
+        )
+        .await?;
+        let w = erasing_withdraws(dir, &target).await?.ok_or_else(|| {
+            Error::Backend(format!(
+                "the producer's withdraws of {id} was admitted, but not as rule 1"
+            ))
+        })?;
+        out.stated.push((id, w.attestation_id));
+    }
+    Ok(out)
 }
 
 /// A planned producer `withdraws`: the local-tier row, exactly as stored, and

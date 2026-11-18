@@ -980,12 +980,14 @@ where
         core,
         scope,
     );
-    // v55.0.0 (CC 3.1.3.3 rule 5) — the report's freshness is its own
-    // `expires_at`: the signed instant is fixed here (the emit recipe honours
-    // a producer-set `asserted_at`) so the window is exactly 72 hours after it.
+    // v62.0.0 (wave P1, CC 3.1.3.3) — the signed instant is fixed here (the
+    // emit recipe honours a producer-set `asserted_at`). The report is live
+    // [`CUSTODY_LIVE_SECS`] from it, judged by the fold; an edition-2 custody
+    // payload carries no `expires_at` (its map is closed, refused
+    // `edition2_payload_invalid` by `edition2::payloads::check`).
     let now = super::admission::truncate_to_substrate_resolution(crate::host::clock::now());
     input.attestation_envelope.asserted_at = Some(super::admission::render_signed_instant(now));
-    input.expires_at = Some(now + chrono::Duration::seconds(CUSTODY_LIVE_SECS));
+    input.expires_at = None;
     Ok(input)
 }
 

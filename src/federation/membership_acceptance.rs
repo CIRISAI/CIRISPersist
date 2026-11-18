@@ -453,12 +453,21 @@ where
         MembershipRow::Acceptance | MembershipRow::Decline => {
             let member = row.attested_key_id.as_str();
             let proposal_id = env_str(row, "references_attestation_id").unwrap_or_default();
-            let Some(p) = dir
+            let referenced = dir
                 .get_attestation(proposal_id)
                 .await?
-                .filter(|p| p.tier == attestation_tier::FEDERATION)
-                .and_then(as_proposal)
-            else {
+                .filter(|p| p.tier == attestation_tier::FEDERATION);
+            // v62.0.0 (wave V1b; CC 4.4.3.12 "two consents") — an officer's
+            // consent to a held counted appointment is its own acceptance
+            // naming the appointment: the officer signs it, about the
+            // affiliation the appointment names.
+            if let Some(appointment) = referenced
+                .as_ref()
+                .filter(|a| super::admission::is_counted_officer_appointment_row(a))
+            {
+                return check_officer_reply(dir, row, kind, &group, appointment).await;
+            }
+            let Some(p) = referenced.and_then(as_proposal) else {
                 return Err(refuse(&group, member, RULE_PROPOSAL_UNRESOLVED));
             };
             let signer =
@@ -483,6 +492,95 @@ where
             Ok(())
         }
     }
+}
+
+/// v62.0.0 (wave V1b; CC 4.4.3.12) — **a reply to a counted officer
+/// appointment**: signed for the officer (the appointment's attested key, by
+/// person), attested to it, about the affiliation the appointment names,
+/// binding the appointment's content hash; never both an acceptance and a
+/// decline of one appointment.
+async fn check_officer_reply<F>(
+    dir: &F,
+    row: &Attestation,
+    kind: MembershipRow,
+    group: &str,
+    appointment: &Attestation,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let member = row.attested_key_id.as_str();
+    let signer =
+        super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
+    let officer =
+        super::admission::admission_identity_for_writer(dir, &appointment.attested_key_id).await?;
+    let names = super::admission::envelope_cohort_target(&appointment.attestation_envelope)?;
+    if signer != officer
+        || member != appointment.attested_key_id
+        || names != Some(group)
+        || env_str(row, "proposal_hash") != Some(appointment.original_content_hash.as_str())
+    {
+        return Err(refuse(group, member, RULE_ACCEPTANCE_MISMATCH));
+    }
+    let held = replies_of(dir, member).await?;
+    let opposite = match kind {
+        MembershipRow::Acceptance => MembershipRow::Decline,
+        _ => MembershipRow::Acceptance,
+    };
+    if replies_to(&held, &appointment.attestation_id)
+        .iter()
+        .any(|r| r.attestation_id != row.attestation_id && membership_row(r) == Some(opposite))
+    {
+        return Err(refuse(group, member, RULE_REPLY_CONFLICT));
+    }
+    Ok(())
+}
+
+/// v62.0.0 (wave V1b; CC 4.4.3.12 "two consents") — **has the officer
+/// accepted `appointment` by `t`?** A held federation-tier
+/// `membership:acceptance:v1` attested to the appointment's officer, naming
+/// the appointment (`references_attestation_id`), signed for the officer
+/// (by person), asserted by `t`, and no decline of it by `t`. The
+/// appointment's quorum is the other consent ([`admission`]'s counted rule);
+/// the officer's seat stands only when both hold.
+///
+/// [`admission`]: super::admission
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn officer_accepted_at<F>(
+    dir: &F,
+    appointment: &Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let officer = appointment.attested_key_id.as_str();
+    let held = replies_of(dir, officer).await?;
+    let replies: Vec<&Attestation> = replies_to(&held, &appointment.attestation_id)
+        .into_iter()
+        .filter(|r| r.asserted_at <= t)
+        .collect();
+    if replies
+        .iter()
+        .any(|r| membership_row(r) == Some(MembershipRow::Decline))
+    {
+        return Ok(false);
+    }
+    let person = super::admission::admission_identity_for_writer(dir, officer).await?;
+    for r in replies
+        .iter()
+        .filter(|r| membership_row(r) == Some(MembershipRow::Acceptance))
+    {
+        if super::admission::admission_identity_for_writer(dir, &r.attesting_key_id).await?
+            == person
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// v55.0.0 (CIRISPersist#1053, CC 3.2) — a standing proposal is admitted only
@@ -846,7 +944,7 @@ where
 {
     let mut signers: std::collections::BTreeSet<String> = members.iter().cloned().collect();
     for m in members {
-        for o in dir.list_identity_occurrences_active(m).await? {
+        for o in crate::federation::replication_audience::devices_of(dir, m).await? {
             signers.insert(o.occurrence_key_id);
         }
     }

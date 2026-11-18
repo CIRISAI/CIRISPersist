@@ -1167,7 +1167,7 @@ where
 /// [`KeyPlaneStore::store_planned_key_record`] only stores what the plan
 /// decided.
 #[derive(Debug)]
-pub(crate) enum KeyRecordWrite<'a> {
+pub(crate) enum KeyRecordWrite {
     /// `put_public_key` (a local mint) and the replicated `Insert` arm.
     Put {
         /// The record as offered. v62.0.0: both insert doors run the same
@@ -1205,13 +1205,6 @@ pub(crate) enum KeyRecordWrite<'a> {
         /// The record that verifies.
         record: KeyRecord,
     },
-    /// The authenticated genesis re-anchor (CIRISPersist#490).
-    Reanchor {
-        /// The record the bundle carries.
-        record: KeyRecord,
-        /// The bundle whose quorum authorises it.
-        bundle: &'a super::genesis::GenesisBundle,
-    },
     /// Write back the `additional_scrubs` a pre-v53.1.4 door dropped
     /// (CIRISPersist#995 row 2).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -1248,8 +1241,6 @@ pub(crate) enum RewriteGuard {
         /// That version's `persist_row_hash`.
         prior_hash: String,
     },
-    /// The same pubkey, nothing else (the bundle-authorised re-anchor).
-    SamePubkey,
 }
 
 /// **The plan's verdict for one key-record write**: exactly what the
@@ -1317,14 +1308,6 @@ impl PlannedKeyRecord {
             // An insert that matched nothing is settled by the held row
             // ([`Self::insert_held`]), not here.
             Self::Insert { .. } => None,
-            Self::Rewrite {
-                guard: RewriteGuard::SamePubkey,
-                ..
-            } => (rows != 1).then(|| {
-                Error::Backend(format!(
-                    "reanchor {kid}: expected 1 row updated, got {rows}"
-                ))
-            }),
             _ if rows > 0 => None,
             Self::Rewrite {
                 guard: RewriteGuard::SelfSigned,
@@ -1631,71 +1614,6 @@ async fn plan_key_replace(
     }
 }
 
-/// The genesis re-anchor's decision (CIRISPersist#490): the bundle quorum
-/// re-verified from this node's own roster and pins; the record one the
-/// bundle carries; the adopt-path gates; the held row exists, keeps `node`
-/// (#925) and its Ed25519 pubkey, and the record is strictly newer
-/// (`valid_from`, anti-rollback).
-async fn plan_key_reanchor(
-    dir: &dyn super::FederationDirectory,
-    mut row: KeyRecord,
-    bundle: &super::genesis::GenesisBundle,
-) -> Result<KeyRecordPlan, Error> {
-    super::genesis::verify_bundle_quorum(dir, bundle).await?;
-    if !bundle.serve_nodes.iter().any(|sn| {
-        sn.record.persist_row_hash == row.persist_row_hash
-            && sn.record.key_id == row.key_id
-            && sn.record.registration_envelope == row.registration_envelope
-    }) {
-        return Err(Error::GenesisBundleInvalid {
-            detail: format!(
-                "re-anchor record {} is not carried by the verified bundle",
-                row.key_id
-            ),
-        });
-    }
-    super::admission::lift_envelope_attested_roles(&mut row);
-    super::register::validate_registration_pubkey(&row)?;
-    super::register::check_node_identity_exclusive(&row)?;
-    super::admission::check_canonical_role_admission(dir, &row).await?;
-    super::admission::check_infra_attest_role_admission(dir, &row).await?;
-    super::admission::check_co_steward_role_admission(dir, &row).await?;
-    super::admission::check_privileged_identity_type_admission(dir, &row).await?;
-    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
-    let existing =
-        dir.lookup_public_key(&row.key_id)
-            .await?
-            .ok_or_else(|| Error::GenesisBundleInvalid {
-                detail: format!("re-anchor target {} has no existing row", row.key_id),
-            })?;
-    super::register::check_node_identity_unchanged(&existing, &row)?;
-    if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
-        return Err(Error::GenesisBundleInvalid {
-            detail: format!("re-anchor {}: pubkey change refused", row.key_id),
-        });
-    }
-    // Compared at the substrate's signed-instant resolution
-    // (`truncate_to_substrate_resolution`), on both sides: postgres holds the
-    // anchored instant rounded, so a nanosecond bundle record read as newer
-    // than itself there and re-anchored twice (v60.0.0, found by I1189 on
-    // postgres). The bake door's pre-check compares the same way (I1191).
-    use super::admission::truncate_to_substrate_resolution as at_resolution;
-    if at_resolution(row.valid_from) <= at_resolution(existing.valid_from) {
-        return Err(Error::GenesisBundleInvalid {
-            detail: format!(
-                "re-anchor {}: valid_from not newer than anchored — rollback refused",
-                row.key_id
-            ),
-        });
-    }
-    hex::decode(&row.original_content_hash)
-        .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
-    Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Rewrite {
-        record: row,
-        guard: RewriteGuard::SamePubkey,
-    })))
-}
-
 /// v60.0.0 (CIRISPersist#934 step 3) — **the key-record write doors'
 /// decision**, once for every backend: each door's gates, in the order its
 /// three copies ran them, and the write they lead to. `received_at` is the
@@ -1705,7 +1623,7 @@ async fn plan_key_reanchor(
 /// executor derives it after its write, in the same transaction.
 pub(crate) async fn plan_key_record_write(
     dir: &dyn super::FederationDirectory,
-    write: KeyRecordWrite<'_>,
+    write: KeyRecordWrite,
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<KeyRecordPlan, Error> {
     // Each arm propagates, so the parity scan follows it (#934).
@@ -1733,9 +1651,6 @@ pub(crate) async fn plan_key_record_write(
             )
             .await?
         }
-        KeyRecordWrite::Reanchor { record, bundle } => {
-            plan_key_reanchor(dir, record, bundle).await?
-        }
         #[cfg(any(feature = "postgres", feature = "sqlite"))]
         KeyRecordWrite::RehydrateScrubs { mut record } => {
             record.persist_row_hash = super::types::compute_persist_row_hash(&record)?;
@@ -1747,7 +1662,7 @@ pub(crate) async fn plan_key_record_write(
 /// The door every backend's key-record write is: plan, then store.
 pub(crate) async fn key_record_write_planned<D>(
     dir: &D,
-    write: KeyRecordWrite<'_>,
+    write: KeyRecordWrite,
 ) -> Result<KeyRecordWritten, Error>
 where
     D: KeyPlaneStore,

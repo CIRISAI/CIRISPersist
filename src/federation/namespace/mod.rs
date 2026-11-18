@@ -25,6 +25,9 @@
 
 pub mod cc_manifests;
 pub mod conformance;
+// v62 (CC rc21, CC 3.1) — a key written into a family name is its bare
+// thumbprint segment; the one encoder/decoder and its admission gate.
+pub mod key_segment;
 pub mod matcher;
 pub mod registry;
 pub mod supersets;
@@ -1407,12 +1410,22 @@ pub fn visibility_for(
 /// [`lookup_role_withdrawal`](crate::federation::FederationDirectory::lookup_role_withdrawal)
 /// — the V095/V104 tombstone — and treat a withdrawal as disqualifying unless it
 /// is a rotate-in (`superseded_by == key_id`).
+///
+/// # A seat serves only with an announced owner (v62.0.0, CC rc20 5.4.6)
+///
+/// The canonical leg is
+/// [`seat_serve_standing`](crate::federation::admission::seat_serve_standing):
+/// for an edition-2 key, a seat in the genesis bundle in force AND a live
+/// owner binding carried at `cohort_scope: federation`. The bundle seats a
+/// node with no owner, and CC 5.4.6 says such a node "does not serve under
+/// the seat", so its corpus does not get trust-root reach until its owner
+/// announces it, and loses it again when the announcement is withdrawn.
 pub async fn is_trust_root(
     directory: &dyn crate::federation::FederationDirectory,
     key_id: &str,
 ) -> Result<bool, crate::federation::Error> {
     Ok(
-        crate::federation::admission::is_canonical_effective(directory, key_id).await?
+        crate::federation::admission::seat_serve_standing(directory, key_id).await?
             || crate::federation::admission::is_infra_attest_effective(directory, key_id).await?,
     )
 }

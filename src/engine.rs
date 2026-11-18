@@ -231,15 +231,38 @@ pub enum SignError {
     /// when the engine's local signer is Ed25519-only.
     #[error(transparent)]
     LocalSigner(#[from] crate::signing::LocalSignerError),
+
+    /// v62.0.0 (v62 P8) — the earlier-form hybrid signature (Ed25519 over
+    /// the bytes, ML-DSA-65 over bytes ‖ ed25519_sig) once the earlier-form
+    /// doors are shut: this node signs edition-2 statements only
+    /// ([`Engine::sign_composite`], [`Engine::sign_draft`]).
+    #[error(
+        "earlier_form_object: sign_hybrid produces the earlier form, and the earlier-form doors \
+         are shut; sign a statement (Engine::sign_draft / sign_composite) (CC 2.6.1.12)"
+    )]
+    EarlierFormShut,
 }
 
 /// v6.5.0 (CIRISPersist#183, CEG §8.1.12.7) — one occurrence (app or
 /// agent) being co-admitted at login. The `occurrence_key_id` must
 /// already exist as a `federation_keys` row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SelfAtLoginOccurrence {
     /// The occurrence's signing key — a `federation_keys.key_id`.
     pub occurrence_key_id: String,
+    /// v62.0.0 (v62 P8) — the identity this occurrence binds under. The app:
+    /// `None` is the login identity. The agent: `None` is the agent key
+    /// itself (identity = occurrence, authored by its owner, the login
+    /// identity); an agent key is never bound under a person.
+    pub identity_key_id: Option<String>,
+    /// v62.0.0 (v62 P8) — the occurrence key's own signer, when the caller
+    /// holds it: its voice over the bind is the proof of possession (O1).
+    /// Absent, that voice is returned in [`SelfAtLoginOutcome::bind_drafts`].
+    /// Never serialized.
+    pub occurrence_signer: Option<Arc<crate::signing::LocalSigner>>,
+    /// v62.0.0 (v62 P8) — the bind's transport members and X-Wing keys
+    /// (CC 3.3.6.2), carried in the signed bind.
+    pub transport: Option<crate::federation::edition2::occurrence::BindTransport>,
     /// Closed-set per [`crate::federation::device_class`] —
     /// `phone`/`laptop` for the app, `agent` for the agent.
     pub device_class: String,
@@ -319,6 +342,13 @@ pub struct SelfAtLoginOutcome {
     /// on the key plane. Reported so the caller can see it, as
     /// `self_dek_excluded` reports the same rows for the same reason.
     pub occurrences_local_only: Vec<String>,
+    /// v62.0.0 (v62 P8) — the bind voices still to be signed:
+    /// `(occurrence_key_id, draft)`. The device / agent / owner signs the
+    /// draft's `sig_structure` and submits `Draft::assemble(signature)`
+    /// through [`Engine::put_edition2_statement`].
+    pub bind_drafts: Vec<(String, crate::federation::edition2::emit::Draft)>,
+    /// v62.0.0 (v62 P8) — the identity the agent's occurrence binds under.
+    pub agent_identity_key_id: String,
 }
 
 /// A LIVE egress grant that survived the fail-closed parse + the
@@ -489,7 +519,7 @@ impl Engine {
     /// that declares what it is. `HostStoreProfile::SingleProcess` (a browser
     /// worker over OPFS, a UEFI image) opens a SQLite store with
     /// `locking_mode = EXCLUSIVE` first, WAL, and **no reader pool**, end to
-    /// end through the migrations, the genesis seed and the open legs; no
+    /// end through the migrations and the open legs; no
     /// environment knob or cgroup limit is read. `Native` is `with_signer`.
     /// Postgres ignores the profile. The host's capability answer decides,
     /// never a compile target.
@@ -498,7 +528,7 @@ impl Engine {
         dsn: &str,
         host: crate::store::HostStoreProfile,
     ) -> Result<Self, EngineError> {
-        let backend = build_backend(dsn, true, host).await?;
+        let backend = build_backend(dsn, host).await?;
         // v2.12.0 (#112): preserve the original `LocalSigner` Arc so
         // `Engine::sign_hybrid` can reach `LocalSigner::sign_hybrid`.
         let local_signer = Some(signer.clone());
@@ -531,59 +561,42 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
+        // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
+        // bundles held (never seeded). Never boot-fatal.
+        engine.report_genesis_at_boot().await;
+        // v62.0.0 (JSON-cut slice C) — lib unit tests only: root the test
+        // ceremony's bundle/2 (`Self::install_test_genesis_at_boot`).
+        #[cfg(test)]
+        engine.install_test_genesis_at_boot().await;
         Ok(engine)
     }
 
-    /// v31.0.0 (CIRISPersist#648) — **the pre-genesis constructor**: identical
-    /// to [`with_signer`](Self::with_signer) (connect + run migrations) but it
-    /// **SKIPS the HUMANITY_ACCORD genesis seed** — no baked A1/B1/C1 holder
-    /// rows, no entrenched family row, no canonical.
+    /// v31.0.0 (CIRISPersist#648) — **the pre-genesis constructor**.
     ///
-    /// This is a **supported, default-features** entry point as of 31.0.0. It
-    /// was `with_signer_no_genesis_seed`, fenced behind the `test-genesis-seam`
-    /// cargo feature and absent from every release build, on the reasoning that
-    /// *"a node without the baked trust root is broken"*. 31.0.0 is the release
-    /// that disproves that: it is the binary that RUNS the genesis ceremony
-    /// which produces the root a later cut bakes, so it has to be able to start
-    /// without one. The seam is not test-only any more; it is the boot mode of
-    /// a node that has not had its ceremony yet, and the feature that fenced it
-    /// is removed.
+    /// v62.0.0 (JSON-cut slice C): every production constructor now boots
+    /// pre-genesis. There is no baked genesis to seed: a node roots nothing
+    /// until a `ceg-genesis-bundle/2` arrives at the import door (CC
+    /// 2.6.1.11, CC 5.3.4), and then roots it only under its anchor. In a
+    /// production build this constructor is exactly
+    /// [`with_signer`](Self::with_signer).
+    ///
+    /// It stays, under its name, as the one constructor that NEVER installs a
+    /// genesis, in any build: in lib unit tests the other constructors root
+    /// the test ceremony's bundle/2 at boot
+    /// (`install_test_genesis_at_boot`, `cfg(test)`),
+    /// and this one is "a fresh node".
     ///
     /// # This is not a relaxation
     ///
-    /// An Engine built here reports
-    /// [`GenesisPosture::PreGenesis`](crate::federation::genesis::GenesisPosture::PreGenesis)
-    /// from [`genesis_posture`](Self::genesis_posture), and every gate in
-    /// [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
-    /// refuses with
-    /// [`Error::NoConstitutionalRootYet`](crate::federation::Error::NoConstitutionalRootYet).
-    /// A node with no trust root is a node that trusts nothing — it is NOT a
-    /// node that therefore checks nothing. Absence of a root is not absence of
-    /// a rule.
-    ///
-    /// # What it is still for, unchanged
-    ///
-    /// Downstream integration tests that assemble a *controllable*
-    /// custom-holder `humanity-accord` family (holders they can sign as) still
-    /// use it, and for the same reason: the baked A1/B1/C1 + family would
-    /// otherwise cause a UNIQUE conflict or an unsignable roster. That use is
-    /// now a special case of the general one rather than a fenced exception.
-    ///
-    /// # What has NOT changed
-    ///
-    /// The assemble ceremony remains **idempotent**: an already-entrenched
-    /// family is a no-op, never a replacement, so a node owner cannot overwrite
-    /// the constitutional family with their own holders. Trust roots CO-EXIST —
-    /// a second ceremony ADDS a root, addressed by its own `root_ref` and
-    /// resolved per user — and none of that is a licence to mutate a root that
-    /// already stands. See
-    /// [`seed_accord_family`](crate::federation::genesis::seed_accord_family)
-    /// and [`Error::ConstitutionalFamilyReserved`](crate::federation::Error::ConstitutionalFamilyReserved).
+    /// A node with no bundle in force holds no accord roster and no canonical
+    /// seat: every read that resolves authority to the accord root finds none
+    /// and refuses. A node with no trust root is a node that trusts nothing —
+    /// it is NOT a node that therefore checks nothing.
     pub async fn with_signer_pre_genesis(
         signer: Arc<LocalSigner>,
         dsn: &str,
     ) -> Result<Self, EngineError> {
-        let backend = build_backend(dsn, false, crate::store::HostStoreProfile::Native).await?;
+        let backend = build_backend(dsn, crate::store::HostStoreProfile::Native).await?;
         let local_signer = Some(signer.clone());
         let signer: Arc<dyn HardwareSigner> = Arc::new(LocalSignerHardwareAdapter::new(signer));
         let engine = Engine {
@@ -612,7 +625,119 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
+        // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
+        // bundles held (never seeded). Never boot-fatal.
+        engine.report_genesis_at_boot().await;
         Ok(engine)
+    }
+
+    /// v62.0.0 (JSON-cut slice C) — **a test Engine that holds a root**:
+    /// [`with_signer`](Self::with_signer), then the test ceremony's bundle/2
+    /// installed through the real doors
+    /// ([`fixture_genesis::install_v2`](crate::federation::edition2::fixture_genesis::install_v2)).
+    /// For integration tests and `test-anchor` hosts, where the lib-test boot
+    /// hook does not run. Idempotent where it does.
+    ///
+    /// # Errors
+    /// [`with_signer`](Self::with_signer)'s; [`EngineError::GenesisSeed`]
+    /// with the import door's refusal.
+    #[cfg(all(
+        any(test, feature = "test-anchor"),
+        any(feature = "postgres", feature = "sqlite")
+    ))]
+    pub async fn with_signer_test_genesis(
+        signer: Arc<LocalSigner>,
+        dsn: &str,
+    ) -> Result<Self, EngineError> {
+        let engine = Self::with_signer(signer, dsn).await?;
+        crate::federation::edition2::fixture_genesis::install_v2_engine(&engine)
+            .await
+            .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
+        Ok(engine)
+    }
+
+    /// v62.0.0 (JSON-cut slice C) — **the lib-test boot hook**: every
+    /// constructor but [`with_signer_pre_genesis`](Self::with_signer_pre_genesis)
+    /// ends here under `cfg(test)`, so a unit test's Engine holds
+    /// [`fixture_genesis::bundle_v2`](crate::federation::edition2::fixture_genesis::bundle_v2)
+    /// in force, as the earlier boot held the baked JSON genesis, with no edit
+    /// at the call site. A failed install panics, naming the refusal: a test
+    /// Engine that silently booted without its root would fail later, far
+    /// from the cause.
+    #[cfg(test)]
+    pub(crate) async fn install_test_genesis_at_boot(&self) {
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        crate::federation::edition2::fixture_genesis::install_v2_engine(self)
+            .await
+            .unwrap_or_else(|e| panic!("test_ceremony_v2 install: {e}"));
+    }
+
+    /// v62.0.0 (JSON-cut slice C) — **the boot's genesis read**: the bundles
+    /// this node holds, read through Verify's bundle reader
+    /// ([`genesis_in_force`](crate::federation::edition2::genesis::genesis_in_force)).
+    /// Nothing is seeded. A node holding no Valid bundle boots pre-genesis
+    /// and says so with a structured `posture = "pre_genesis"` warning, the
+    /// line a node-mode host renders as its banner; a read that fails is
+    /// warned the same way, since an unanswered question is not a root.
+    /// Never boot-fatal: a node must come up to receive its bundle.
+    async fn report_genesis_at_boot(&self) {
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        {
+            let dir = self.federation_directory();
+            let held = crate::federation::edition2::genesis::genesis_in_force(dir.as_ref()).await;
+            match held {
+                Ok(state) if state.is_held() => {}
+                Ok(_) => tracing::warn!(
+                    posture = "pre_genesis",
+                    "PRE-GENESIS BOOT: this node holds no ceg-genesis-bundle/2. It roots \
+                     nothing until a bundle arrives at the import door under its anchor; \
+                     every operation that resolves authority to the accord root is refused \
+                     until then."
+                ),
+                Err(e) => tracing::warn!(
+                    posture = "pre_genesis",
+                    error = %e,
+                    "PRE-GENESIS BOOT: the held genesis bundles could not be read; this \
+                     node treats itself as holding no root."
+                ),
+            }
+        }
+    }
+
+    /// v62.0.0 (JSON-cut slice C) — **the bundle/2 import door** on this
+    /// node: one statement list (bundle voices and the rows they name),
+    /// read by Verify's reader under `anchor` for a first bundle (CC 2.6.1.11,
+    /// CC 5.3.4). Replaces the bundle/1 `install_genesis_bundle_roster` and
+    /// `bake_assembled_genesis`. See
+    /// [`put_genesis_bundle`](crate::federation::edition2::genesis::put_genesis_bundle).
+    ///
+    /// # Errors
+    /// The door's refusals.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_genesis_bundle(
+        &self,
+        statements: &[Vec<u8>],
+        anchor: Option<&crate::federation::edition2::genesis::Anchor>,
+    ) -> Result<crate::federation::edition2::genesis::GenesisAdmission, crate::federation::Error>
+    {
+        let dir = self.federation_directory();
+        crate::federation::edition2::genesis::put_genesis_bundle(dir.as_ref(), statements, anchor)
+            .await
+    }
+
+    /// v62.0.0 (JSON-cut slice C) — the genesis state this node holds,
+    /// re-derived from its held bundles on every call
+    /// ([`genesis_in_force`](crate::federation::edition2::genesis::genesis_in_force)).
+    ///
+    /// # Errors
+    /// Directory read failures.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn genesis_in_force(
+        &self,
+    ) -> Result<crate::federation::edition2::genesis::GenesisInForce, crate::federation::Error>
+    {
+        let dir = self.federation_directory();
+        crate::federation::edition2::genesis::genesis_in_force(dir.as_ref()).await
     }
 
     /// Variant accepting raw signer Arcs — matches the issue's
@@ -657,7 +782,7 @@ impl Engine {
         signer: Arc<dyn HardwareSigner>,
         dsn: &str,
     ) -> Result<Self, EngineError> {
-        let backend = build_backend(dsn, true, crate::store::HostStoreProfile::Native).await?;
+        let backend = build_backend(dsn, crate::store::HostStoreProfile::Native).await?;
         let engine = Engine {
             backend,
             signer,
@@ -676,6 +801,13 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
+        // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
+        // bundles held (never seeded). Never boot-fatal.
+        engine.report_genesis_at_boot().await;
+        // v62.0.0 (JSON-cut slice C) — lib unit tests only: root the test
+        // ceremony's bundle/2 (`Self::install_test_genesis_at_boot`).
+        #[cfg(test)]
+        engine.install_test_genesis_at_boot().await;
         Ok(engine)
     }
 
@@ -727,7 +859,7 @@ impl Engine {
             )
             .await?,
         );
-        let backend = build_backend(dsn, true, crate::store::HostStoreProfile::Native).await?;
+        let backend = build_backend(dsn, crate::store::HostStoreProfile::Native).await?;
         let engine = Engine {
             backend,
             // `signer` is the hardware classical itself — same shape as
@@ -750,6 +882,13 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
+        // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
+        // bundles held (never seeded). Never boot-fatal.
+        engine.report_genesis_at_boot().await;
+        // v62.0.0 (JSON-cut slice C) — lib unit tests only: root the test
+        // ceremony's bundle/2 (`Self::install_test_genesis_at_boot`).
+        #[cfg(test)]
+        engine.install_test_genesis_at_boot().await;
         Ok(engine)
     }
 
@@ -1934,11 +2073,49 @@ impl Engine {
         agent_id_hash: &str,
     ) -> Result<crate::store::types::ErasureSummary, crate::store::Error> {
         use crate::store::Backend;
+        // v62.0.0 (v62 P8; CC 4.5.3) — the same authority, a new form: this
+        // node, the PRODUCER of the detection rows its own key signed, states
+        // its rule-1 withdraws of each as an edition-2 statement first; the
+        // door then cites them. Rows another producer signed are refused with
+        // reason until that producer states theirs.
+        if let Ok(signer) = self.composite_signer("dsar_erasure") {
+            self.state_erasure_withdraws(signer, agent_id_hash, None)
+                .await
+                .map_err(|e| crate::store::Error::Backend(format!("erasure withdraws: {e}")))?;
+        }
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => b.delete_traces_for_agent_id_hash(agent_id_hash).await,
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => b.delete_traces_for_agent_id_hash(agent_id_hash).await,
+        }
+    }
+
+    /// v62.0.0 (v62 P8; CC 4.5.3, rule 1) — **`signer`, the producer of the
+    /// `detection:*` rows a DSAR erasure of `agent_id_hash` reaches, states
+    /// its erasure withdraws** as edition-2 statements
+    /// ([`crate::federation::subject_erasure::state_erasure_withdraws`]).
+    /// An external producer signs `subject_erasure::withdraws_draft` instead.
+    ///
+    /// # Errors
+    /// As [`crate::federation::subject_erasure::state_erasure_withdraws`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn state_erasure_withdraws(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        agent_id_hash: &str,
+        signing_key_id: Option<&str>,
+    ) -> Result<crate::federation::subject_erasure::StatedErasure, crate::federation::Error> {
+        use crate::federation::subject_erasure::state_erasure_withdraws as state;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                state(b.as_ref(), signer, agent_id_hash, signing_key_id).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                state(b.as_ref(), signer, agent_id_hash, signing_key_id).await
+            }
         }
     }
 
@@ -2635,12 +2812,50 @@ impl Engine {
         &self,
         message: &[u8],
     ) -> Result<ciris_crypto::HybridSignature, SignError> {
+        // v62.0.0 (v62 P8) — the earlier form, only behind the switch.
+        if crate::federation::edition2::door::earlier_form_doors_shut() {
+            return Err(SignError::EarlierFormShut);
+        }
         let local = self
             .local_signer
             .as_ref()
             .ok_or(SignError::LocalSignerUnavailable)?;
         let sig = local.sign_hybrid(message).await?;
         Ok(sig)
+    }
+
+    /// v62.0.0 (v62 P8; CC 2.6.1) — **this engine's composite signature**
+    /// (ML-DSA-65 ‖ Ed25519, one atomic signature) over `message`, which
+    /// for a statement is its COSE `Sig_structure`. The edition-2 successor
+    /// of [`Self::sign_hybrid`].
+    ///
+    /// # Errors
+    /// [`SignError::LocalSignerUnavailable`] without a local signer;
+    /// [`SignError::LocalSigner`] (`PqcNotConfigured`) without its ML-DSA-65
+    /// half.
+    pub async fn sign_composite(&self, message: &[u8]) -> Result<Vec<u8>, SignError> {
+        let local = self
+            .local_signer
+            .as_ref()
+            .ok_or(SignError::LocalSignerUnavailable)?;
+        Ok(local.sign_composite(message).await?)
+    }
+
+    /// v62.0.0 (v62 P8) — **sign a drafted statement** with this engine's
+    /// composite key: the `COSE_Sign1` statement over the draft's
+    /// `sig_structure` ([`crate::federation::edition2::emit::Draft`]), ready
+    /// for the statement door. The draft must name this engine's key (its
+    /// protected header carries the signer); a draft for another key yields a
+    /// statement the door refuses (`kid_not_of_iss` / signature invalid).
+    ///
+    /// # Errors
+    /// As [`Self::sign_composite`].
+    pub async fn sign_draft(
+        &self,
+        draft: &crate::federation::edition2::emit::Draft,
+    ) -> Result<Vec<u8>, SignError> {
+        let sig = self.sign_composite(&draft.sig_structure).await?;
+        Ok(draft.assemble(sig))
     }
 
     /// v9.3.0 (CIRISPersist#247) — the local signer's **registered
@@ -3071,6 +3286,9 @@ impl Engine {
         community: crate::federation::types::Community,
     ) -> Result<(), crate::federation::Error> {
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        // v62.0.0 (v62 P8) — the earlier form, only behind the switch; the
+        // edition-2 producer is `Self::state_community_founding`.
+        crate::federation::edition2::door::refuse_earlier_form("put_community_self_signed")?;
         let authority_key_id = self
             .local_derived_key_id()
             .await
@@ -3103,6 +3321,100 @@ impl Engine {
         }
     }
 
+    /// v62.0.0 (v62 P8; CC 2.4.1.1, T1's group plane) — **found a community
+    /// on the clean mesh**: its roster version 1 (`group:roster`, `sub` = the
+    /// community key, `edition2::group::roster_payload`) signed by this
+    /// engine's composite key (`sign_row`) and offered through the statement
+    /// door (`put_statement`). `Row` when it landed; `Pending` while members
+    /// the founding roster lists have not voiced it (each voices the same
+    /// payload; `group::roster_payload` gives it to them). Replaces
+    /// [`Self::put_community_self_signed`], which is the earlier form, kept
+    /// behind the switch.
+    ///
+    /// # Errors
+    /// `composite_signing_unavailable`; the group door's refusals.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn state_community_founding(
+        &self,
+        community: crate::federation::types::Community,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, crate::federation::Error>
+    {
+        let sub = community.community_key_id.clone();
+        self.state_group_founding(
+            "state_community_founding",
+            &sub,
+            crate::federation::edition2::group::GroupRecord::Community(community),
+        )
+        .await
+    }
+
+    /// v62.0.0 (v62 P8) — the family twin of [`Self::state_community_founding`].
+    ///
+    /// # Errors
+    /// As [`Self::state_community_founding`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn state_family_founding(
+        &self,
+        family: crate::federation::types::Family,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, crate::federation::Error>
+    {
+        let sub = family.family_key_id.clone();
+        self.state_group_founding(
+            "state_family_founding",
+            &sub,
+            crate::federation::edition2::group::GroupRecord::Family(family),
+        )
+        .await
+    }
+
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn state_group_founding(
+        &self,
+        producer: &str,
+        group_key_id: &str,
+        record: crate::federation::edition2::group::GroupRecord,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, crate::federation::Error>
+    {
+        use crate::federation::edition2::{emit, group, ingest, produce};
+        let signer = self.composite_signer(producer)?;
+        let at_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+        let payload = group::roster_payload(&record, 1, None, at_ms)?;
+        let family = ciris_verify_core::namespace_match::family_id(group::GROUP_ROSTER_PREFIX);
+        let statement = produce::sign_row(signer, group_key_id, "scores", &family, &payload)
+            .await
+            .map_err(|e| emit::produce_error(producer, e))?;
+        ingest::put_statement(
+            &*self.federation_directory(),
+            &statement,
+            None,
+            ingest::INGEST_TIER,
+        )
+        .await
+    }
+
+    /// v62.0.0 (v62 P8; CC 3.4.8) — **state a detection** on the clean mesh,
+    /// signed by its detector's composite key `signer` (the event's
+    /// `signing_key_id`): [`crate::derived::detection_row::state_detection`].
+    /// Returns the node-computed row id. An external detector signs
+    /// [`crate::derived::detection_row::draft_detection`] instead and submits
+    /// through [`Self::put_edition2_statement`].
+    ///
+    /// # Errors
+    /// As [`crate::derived::detection_row::state_detection`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn state_detection(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        event: crate::derived::DetectionEvent,
+    ) -> Result<String, crate::federation::Error> {
+        crate::derived::detection_row::state_detection(
+            &*self.federation_directory(),
+            signer,
+            &event,
+        )
+        .await
+    }
+
     /// v21.0.0 (#502 E4 followup) — the `put_family` twin of
     /// [`Self::put_community_self_signed`].
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -3111,6 +3423,9 @@ impl Engine {
         family: crate::federation::types::Family,
     ) -> Result<(), crate::federation::Error> {
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        // v62.0.0 (v62 P8) — the earlier form, only behind the switch; the
+        // edition-2 producer is `Self::state_family_founding`.
+        crate::federation::edition2::door::refuse_earlier_form("put_family_self_signed")?;
         let authority_key_id = self
             .local_derived_key_id()
             .await
@@ -3316,28 +3631,6 @@ impl Engine {
         Ok(report)
     }
 
-    /// v19.1.0 (CIRISPersist#490) — bake an assembled genesis trust-root
-    /// bundle (the ceremony artifact JSON): quorum-verify against THIS
-    /// node's roster, then land serve nodes (insert / idempotent /
-    /// authenticated re-anchor) + the delegation plane. See
-    /// [`crate::federation::genesis::bake_assembled_genesis`].
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn bake_assembled_genesis(
-        &self,
-        bundle_json: &str,
-    ) -> Result<crate::federation::genesis::GenesisBakeReport, crate::federation::Error> {
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => {
-                crate::federation::genesis::bake_assembled_genesis(&**b, bundle_json).await
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => {
-                crate::federation::genesis::bake_assembled_genesis(&**b, bundle_json).await
-            }
-        }
-    }
-
     /// v57.0.0 (CIRISPersist#988; CC 2.4.2, CLM-silo-projection-rebuildable)
     /// — **the projection gate, live**: rebuild `projection` from the rows on
     /// this node through the same writer, into a scratch table, and compare it
@@ -3358,30 +3651,6 @@ impl Engine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
                 crate::federation::silo_projection::check_projection_rebuild(&**b, projection).await
-            }
-        }
-    }
-
-    /// v53.1.0 — **install a verified genesis bundle on this node** (the import
-    /// door): verify the ceremony outputs against THIS build's accord roster
-    /// (a refusal writes nothing), bake its serve nodes and delegation plane,
-    /// then install its roster records — the accord family's genesis head and
-    /// the `ciris-canonical` birth — through the same function the boot seed
-    /// uses. This node's own genesis posture is not changed. See
-    /// [`crate::federation::genesis::install_genesis_bundle_roster`].
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn install_genesis_bundle_roster(
-        &self,
-        bundle: &crate::federation::genesis::GenesisBundle,
-    ) -> Result<crate::federation::genesis::RosterInstall, crate::federation::Error> {
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => {
-                crate::federation::genesis::install_genesis_bundle_roster(&**b, &**b, bundle).await
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => {
-                crate::federation::genesis::install_genesis_bundle_roster(&**b, &**b, bundle).await
             }
         }
     }
@@ -3431,6 +3700,58 @@ impl Engine {
                 attestation_id: row.attestation_id,
             });
         }
+        // v62.0.0 (v62 P8) — an edition-2 local row crosses on its OWN
+        // statement: the actor signed the row's payload when it was put, a row
+        // id does not depend on the tier, and restating that payload at the
+        // same scope is that very statement. The directory re-admits it
+        // through the edition-2 door against the keys held now and flips the
+        // tier (`crossing::plan_enter_mesh`, `TierPromotionCustody::Statement`).
+        // `actor` is not needed: nothing is signed, and nothing is JCS-signed.
+        if let Some(custody) =
+            crate::federation::TierPromotionCustody::of_statement(&row, crate::host::clock::now())
+        {
+            return dir.enter_mesh(attestation_id, ci, &custody).await;
+        }
+        // v62.0.0 (v62 P3, as ruled: "restate at the crossing") — this node's
+        // own local hard_case row is never signed in the earlier form: its
+        // event is restated as an edition-2 statement at `federation`
+        // (`hard_case::restate_held_hard_case`), admitted through the
+        // statement door. The local row stays local, as the node-local
+        // record; `Crossed` names the STATED row (a different id).
+        let node = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("enter_mesh derive key_id: {e}"))
+        })?;
+        if row.attesting_key_id == node
+            && crate::federation::hard_case::project_hard_case_row(&row).is_some()
+        {
+            let signer = self.composite_signer("enter_mesh")?;
+            if let Some(rid) =
+                crate::federation::hard_case::restate_held_hard_case(&*dir, signer, &row).await?
+            {
+                let stated = dir.get_attestation(&rid).await?.ok_or_else(|| {
+                    crate::federation::Error::Backend(format!(
+                        "enter_mesh: the restated hard_case row {rid} is not held"
+                    ))
+                })?;
+                return Ok(MeshCrossingOutcome::Crossed(
+                    crate::federation::crossing::report(
+                        &stated,
+                        crate::federation::crossing::Custody::ActorSigned,
+                        crate::host::clock::now(),
+                    ),
+                ));
+            }
+        }
+        // v62.0.0 (v62 P8) — the earlier form crosses only while its doors
+        // are open. Once they are shut, an earlier-form local row (unsigned,
+        // or signed over its JCS image at write) is RESTATED: its members as
+        // an edition-2 statement at its scope, signed by its actor's
+        // composite key through `sign_row` and admitted through the statement
+        // door (`put_statement`), exactly as P3 restates a local hard_case.
+        // The local row stays local; `Crossed` names the stated row.
+        if crate::federation::edition2::door::earlier_form_doors_shut() {
+            return self.restate_local_row(&row, actor).await;
+        }
         let Some(custody) = self.custody_for(&row, actor).await? else {
             return Ok(MeshCrossingOutcome::AwaitingActor {
                 age_ms: (crate::host::clock::now() - row.asserted_at).num_milliseconds(),
@@ -3438,6 +3759,97 @@ impl Engine {
             });
         };
         dir.enter_mesh(attestation_id, ci, &custody).await
+    }
+
+    /// v62.0.0 (v62 P8) — **the composite signer of a row's actor**, or
+    /// `Ok(None)` when it is not in hand (the row waits): this engine's own
+    /// composite signer when `attesting_key_id` is this node (its
+    /// identity-ref, or its earlier derived id), else `actor` when it is that
+    /// key; another signer is refused (`CustodyIsNotTheActor`), never
+    /// ignored.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn actor_composite_signer<'a>(
+        &'a self,
+        producer: &str,
+        attestation_id: &str,
+        attesting_key_id: &str,
+        actor: Option<&'a crate::signing::LocalSigner>,
+    ) -> Result<Option<&'a crate::signing::LocalSigner>, crate::federation::Error> {
+        use crate::federation::Error;
+        let node = self
+            .local_derived_key_id()
+            .await
+            .map_err(|e| Error::Backend(format!("{producer} derive key_id: {e}")))?;
+        if attesting_key_id == node {
+            return self.composite_signer(producer).map(Some);
+        }
+        if let Ok(own) = self.composite_signer(producer) {
+            if own.derived_key_id() == attesting_key_id {
+                return Ok(Some(own));
+            }
+        }
+        match actor {
+            Some(a)
+                if a.federation_id().await == attesting_key_id
+                    || a.derived_key_id() == attesting_key_id =>
+            {
+                Ok(Some(a))
+            }
+            Some(a) => Err(Error::CustodyIsNotTheActor {
+                attestation_id: attestation_id.to_owned(),
+                attesting_key_id: attesting_key_id.to_owned(),
+                scrub_key_id: a.federation_id().await,
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// v62.0.0 (v62 P8) — **restate an earlier-form local row** once the
+    /// earlier-form doors are shut: its members ([`crate::federation::crossing::restatement_input`])
+    /// stated by its actor's composite key (`attestation_emit::emit_statement`
+    /// → `edition2::produce::sign_row` → `put_statement`, `Authored`) at the
+    /// row's own scope, at `federation` tier. The local row is left as it
+    /// is. `AwaitingActor` when the actor's signer is not in hand.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn restate_local_row(
+        &self,
+        row: &crate::federation::Attestation,
+        actor: Option<&crate::signing::LocalSigner>,
+    ) -> Result<crate::federation::MeshCrossingOutcome, crate::federation::Error> {
+        use crate::federation::{attestation_emit, crossing, Error, MeshCrossingOutcome};
+        let dir = self.federation_directory();
+        let Some(signer) = self
+            .actor_composite_signer(
+                "enter_mesh",
+                &row.attestation_id,
+                &row.attesting_key_id,
+                actor,
+            )
+            .await?
+        else {
+            return Ok(MeshCrossingOutcome::AwaitingActor {
+                age_ms: (crate::host::clock::now() - row.asserted_at).num_milliseconds(),
+                attestation_id: row.attestation_id.clone(),
+            });
+        };
+        let at =
+            crate::federation::hard_case::statement_instant(&*dir, signer, row.asserted_at).await?;
+        let input = crossing::restatement_input(row, at)?;
+        let emitted = attestation_emit::emit_statement(&*dir, signer, input, None).await?;
+        let stated = dir
+            .get_attestation(&emitted.attestation_id)
+            .await?
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "enter_mesh: the restated row {} is not held",
+                    emitted.attestation_id
+                ))
+            })?;
+        Ok(MeshCrossingOutcome::Crossed(crossing::report(
+            &stated,
+            crossing::Custody::ActorSigned,
+            crate::host::clock::now(),
+        )))
     }
 
     /// v39.0.0 — **widen the audience** of a row in the mesh by a `supersedes`
@@ -3486,6 +3898,16 @@ impl Engine {
         // Cheapest refusal first: no signing for a target that cannot be a
         // widening.
         crossing::check_strictly_wider(&prior, ci.recipient_see.cohort_scope())?;
+        // v62.0.0 (v62 P8) — an edition-2 prior widens by RESTATEMENT (its
+        // payload at the wider audience, signed by its actor through
+        // `sign_row`, admitted through `put_statement`); and once the
+        // earlier-form doors are shut, nothing below (a JCS `supersedes`
+        // signed over `stamp_and_canonicalize`) runs at all.
+        if crate::federation::edition2::emit::carried_statement(&prior).is_some()
+            || crate::federation::edition2::door::earlier_form_doors_shut()
+        {
+            return self.widen_by_restatement(&prior, ci, actor, strip).await;
+        }
         let node = self
             .local_derived_key_id()
             .await
@@ -3535,6 +3957,52 @@ impl Engine {
         .await
     }
 
+    /// v62.0.0 (v62 P8; CC 4.4.3.3.1 / 8.1.5 on the clean mesh) — **widen an
+    /// edition-2 row by restating it** at `ci.recipient_see`
+    /// ([`crate::federation::crossing::restate_at_audience`]): the prior's
+    /// row type, family, subject and payload, with the new placement and the
+    /// `strip` members removed, signed by the prior's actor
+    /// (`edition2::produce::sign_row`), read back through the edition-2 door
+    /// (`attestation_emit::mapped_row`), held to the shape rule
+    /// ([`crate::federation::crossing::check_restated_widening`]) and the nine
+    /// axes, and admitted through the statement door (`put_statement`,
+    /// `Authored`). The prior is untouched. The restatement is a row of its
+    /// own, so it reaches a peer outside the prior's audience: a peer never
+    /// needs the prior. The same restatement again is `AlreadyWidened`.
+    ///
+    /// A prior that carries no statement, with the earlier-form doors shut,
+    /// is refused `earlier_form_object`: there is nothing to restate.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn widen_by_restatement(
+        &self,
+        prior: &crate::federation::Attestation,
+        ci: &crate::federation::ContextualIntegrity,
+        actor: Option<&crate::signing::LocalSigner>,
+        strip: &[String],
+    ) -> Result<crate::federation::MeshCrossingOutcome, crate::federation::Error> {
+        use crate::federation::edition2::emit;
+        use crate::federation::{crossing, MeshCrossingOutcome};
+        let dir = self.federation_directory();
+        if emit::carried_statement(prior).is_none() {
+            crate::federation::edition2::door::refuse_earlier_form("widen_audience")?;
+        }
+        let Some(signer) = self
+            .actor_composite_signer(
+                "widen_audience",
+                &prior.attestation_id,
+                &prior.attesting_key_id,
+                actor,
+            )
+            .await?
+        else {
+            return Ok(MeshCrossingOutcome::AwaitingActor {
+                age_ms: (crate::host::clock::now() - prior.asserted_at).num_milliseconds(),
+                attestation_id: prior.attestation_id.clone(),
+            });
+        };
+        crossing::widen_by_restatement(&*dir, prior, ci, signer, strip).await
+    }
+
     /// **The one place that decides who signs a tier crossing.** See the table
     /// on [`Self::enter_mesh`]. `Ok(None)` is "the actor is not in hand" — the
     /// row waits. A signer that is in hand but is NOT the attester is refused
@@ -3551,6 +4019,17 @@ impl Engine {
         };
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
+        // v62.0.0 (v62 P8) — the earlier-form custody (a JCS re-offer, a JCS
+        // co-scrub, a JCS actor signature) exists only behind the
+        // earlier-form switch, and never for an edition-2 row, which crosses
+        // on its own statement (`Self::enter_mesh`).
+        crate::federation::edition2::door::refuse_earlier_form("enter_mesh")?;
+        if crate::federation::edition2::emit::carried_statement(row).is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "custody_for: {} is an edition-2 row; it crosses on its own statement",
+                row.attestation_id
+            )));
+        }
         let node = self
             .local_derived_key_id()
             .await
@@ -3737,9 +4216,12 @@ impl Engine {
             }
         };
         match self.enter_mesh(&row.attestation_id, &ci, None).await {
-            Ok(MeshCrossingOutcome::Crossed(_)) => {
+            // v62.0.0 (v62 P3) — a crossing that STATED a new row (a local
+            // hard_case restated at `federation`) leaves the local row
+            // local: there is nothing of it to widen.
+            Ok(MeshCrossingOutcome::Crossed(crossed)) => {
                 report.promoted += 1;
-                true
+                crossed.attestation_id == row.attestation_id
             }
             Ok(MeshCrossingOutcome::AlreadyInMesh { .. })
             | Ok(MeshCrossingOutcome::AlreadyWidened { .. }) => true,
@@ -4023,6 +4505,30 @@ impl Engine {
         self.emit_attestation(signer, input).await
     }
 
+    /// v62.0.0 (v62 P3, JSON-cut slice B) — **record a `hard_case:*` event
+    /// on the clean mesh**: the event stated as an edition-2 statement signed
+    /// by THIS engine's composite key and admitted through the statement door
+    /// ([`crate::federation::hard_case::state_hard_case`]). Returns the row id
+    /// (hex). The statement's `asserted_at` is the event's `emitted_at`, so a
+    /// re-record of one observation is the same row.
+    ///
+    /// The backend's `record_hard_case` door is unchanged: it writes the
+    /// node-local, in-transaction record an act commits with (it holds no
+    /// signer).
+    ///
+    /// # Errors
+    /// `composite_signing_unavailable` for a classical-only engine; the
+    /// attribution refusal; the door's and the gates' refusals.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn record_hard_case(
+        &self,
+        event: crate::federation::hard_case::HardCaseEvent,
+    ) -> Result<String, crate::federation::Error> {
+        let signer = self.composite_signer("record_hard_case")?;
+        crate::federation::hard_case::state_hard_case(&*self.federation_directory(), signer, event)
+            .await
+    }
+
     /// v30.0.0 (CIRISPersist#601 item 3 / #596 item 3) — **canonicalize, sign
     /// and assemble a federation-tier row, and do NOT store it.**
     ///
@@ -4169,11 +4675,12 @@ impl Engine {
     /// (`"responsible_for"`) builds an **owner-binding** via
     /// [`owner_binding_delegates_to_envelope`](crate::federation::owner_binding_delegates_to_envelope)
     /// — the single-valued `delegates_to(user → node)` that names the node's one
-    /// responsible steward and is admitted through the single-owner gate
-    /// ([`check_single_node_owner_admission`](crate::federation::admission::check_single_node_owner_admission)):
-    /// a second DISTINCT owner is rejected. `None` (the default) builds the
-    /// general multi-parent `delegates_to` and is untouched by the gate. Any
-    /// other purpose value is treated as a general delegation.
+    /// responsible steward. v62.0.0 (kernel pass 2, C557): no gate refuses a
+    /// second DISTINCT owner; the kernel's owner seat
+    /// ([`owner_of`](crate::federation::admission::owner_of)) counts only the
+    /// bindings the node cosigned and reads two counted owners as unowned.
+    /// `None` (the default) builds the general multi-parent `delegates_to`.
+    /// Any other purpose value is treated as a general delegation.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     ///
     /// v60.0.0 (CIRISPersist#1048, CC 2.4, CIRISConstitution#163) — `term` is
@@ -4195,8 +4702,8 @@ impl Engine {
             .is_some_and(|p| p == crate::federation::types::owner_binding::PURPOSE);
         let mut envelope = match delegation_purpose {
             // The owner-binding sub-relation (CC 3.2): single-valued ownership,
-            // gated by check_single_node_owner_admission. `sub_delegation` is
-            // ignored (an owner-binding is a leaf, never a deputization).
+            // read by the kernel's owner seat. `sub_delegation` is ignored (an
+            // owner-binding is a leaf, never a deputization).
             Some(p) if p == crate::federation::types::owner_binding::PURPOSE => {
                 crate::federation::owner_binding_delegates_to_envelope(delegate_key_id, &scopes)
             }
@@ -4275,10 +4782,10 @@ impl Engine {
     /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — pass
     /// `delegation_purpose = Some(`[`owner_binding::PURPOSE`](crate::federation::types::owner_binding::PURPOSE)`)`
     /// to make this steward-binding the node's single-valued **owner-binding**
-    /// (`infra:*`-only scope IS the owner-binding shape). It is then subject to
-    /// the single-owner admission gate (a second distinct owner rejects) and
-    /// resolvable via [`owner_of`](Self::owner_of). `None` (default) is a plain
-    /// steward-binding.
+    /// (`infra:*`-only scope IS the owner-binding shape), resolvable via
+    /// [`owner_of`](Self::owner_of). v62.0.0 (kernel pass 2): a second distinct
+    /// owner's binding is held, not refused; two counted owners read as
+    /// unowned. `None` (default) is a plain steward-binding.
     ///
     /// [`is_steward_bound`]: crate::federation::admission::is_steward_bound
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -6189,13 +6696,27 @@ impl Engine {
     /// `DO UPDATE` carries `valid_until`, so a republish with `None` REPLACES
     /// a stored expiry with none; a caller healing a row onto the plane passes
     /// the expiry the row already carries.
+    ///
+    /// v62.0.0 (v62 P8; O1's bind, CC 3.3.6) — an edition-2
+    /// `identity:occurrence` bind: this node's key states its OWN voice; the
+    /// AUTHOR (the identity, or an agent identity's owner) signs with
+    /// `author_signer`, or its voice comes back as `author_draft` for the
+    /// owner's pen (submit the signed statement through
+    /// [`Self::put_edition2_statement`]). Never authored by the node alone for
+    /// another identity; the self pair (`identity_key_id` = this node) lands on
+    /// its one statement. See
+    /// [`crate::federation::key_grant::publish_self_occurrence_with_local_signer`].
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn publish_self_occurrence(
         &self,
         identity_key_id: &str,
         device_class: &str,
         valid_until: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<crate::federation::SignedIdentityOccurrence, crate::federation::Error> {
+        author_signer: Option<&crate::signing::LocalSigner>,
+    ) -> Result<
+        crate::federation::edition2::occurrence::OccurrenceBindOutcome,
+        crate::federation::Error,
+    > {
         let local = self.local_signer.as_ref().ok_or_else(|| {
             crate::federation::Error::InvalidArgument(
                 "publish_self_occurrence requires a LocalSigner to hybrid-sign the occurrence \
@@ -6225,6 +6746,7 @@ impl Engine {
                     identity_key_id,
                     device_class,
                     valid_until,
+                    author_signer,
                 )
                 .await
             }
@@ -6236,6 +6758,7 @@ impl Engine {
                     identity_key_id,
                     device_class,
                     valid_until,
+                    author_signer,
                 )
                 .await
             }
@@ -8015,57 +8538,133 @@ impl Engine {
         // names it.
         let mut occurrences_published = Vec::new();
         let mut occurrences_local_only = Vec::new();
-        for occ in [&input.app, &input.agent] {
-            match (&input.identity_signer, &occ.encryption_pubkeys) {
-                (Some(signer), Some(enc)) => {
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(b) => {
-                            crate::federation::key_grant::publish_signed_content_only_occurrence(
-                                b.as_ref(),
-                                signer,
-                                &input.identity_key_id,
-                                &occ.occurrence_key_id,
-                                &occ.device_class,
-                                occ.hardware_attestation.as_deref(),
-                                enc.clone(),
-                                None,
-                            )
-                            .await?
-                        }
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(b) => {
-                            crate::federation::key_grant::publish_signed_content_only_occurrence(
-                                b.as_ref(),
-                                signer,
-                                &input.identity_key_id,
-                                &occ.occurrence_key_id,
-                                &occ.device_class,
-                                occ.hardware_attestation.as_deref(),
-                                enc.clone(),
-                                None,
-                            )
-                            .await?
-                        }
-                    };
-                    occurrences_published.push(occ.occurrence_key_id.clone());
-                }
-                _ => {
-                    let row = IdentityOccurrence {
-                        identity_key_id: input.identity_key_id.clone(),
+        // v62.0.0 (v62 P8; O1's bind, CC 3.3.6) — each occurrence is an
+        // edition-2 `identity:occurrence` bind: the occurrence key's OWN voice
+        // (its `occurrence_signer`) and the AUTHOR's (the login identity's
+        // `identity_signer`), each stated through `sign_row` → `put_statement`
+        // when its signer is in hand and returned in `bind_drafts` when not.
+        //
+        // - The app binds under the login identity, which authors it.
+        // - The AGENT binds under its OWN identity (`agent.identity_key_id`,
+        //   else the agent key itself), authored by its owner, the login
+        //   identity (an agent key is no person's occurrence:
+        //   `occurrence_binds_machine_to_person`). Its owner binding is stated
+        //   first when both pens are in hand and none is held.
+        //
+        // A bind that did not land (a voice still drafted, or no
+        // `identity_signer`) is staged trusted-local, as before.
+        let at_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+        let agent_identity = input
+            .agent
+            .identity_key_id
+            .clone()
+            .unwrap_or_else(|| input.agent.occurrence_key_id.clone());
+        if let (Some(owner), Some(agent_signer)) =
+            (&input.identity_signer, &input.agent.occurrence_signer)
+        {
+            if agent_identity == input.agent.occurrence_key_id
+                && crate::federation::admission::agent_owner_of(&*directory, &agent_identity, at_ms)
+                    .await?
+                    .is_none()
+            {
+                crate::federation::edition2::occurrence::state_agent_owner_binding(
+                    &*directory,
+                    owner,
+                    agent_signer,
+                    at_ms,
+                )
+                .await?;
+            }
+        }
+        let mut bind_drafts = Vec::new();
+        let app_identity = input
+            .app
+            .identity_key_id
+            .clone()
+            .unwrap_or_else(|| input.identity_key_id.clone());
+        for (occ, identity) in [
+            (&input.app, app_identity),
+            (&input.agent, agent_identity.clone()),
+        ] {
+            use crate::federation::edition2::occurrence::{bind_author, publish_bind, BindTerms};
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            let decode = |what: &str, b64: &str| {
+                B64.decode(b64).map_err(|e| {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "self_at_login: {what} is not base64: {e}"
+                    ))
+                })
+            };
+            // An earlier-form key id (not an identity-ref) cannot be bound on
+            // the clean mesh: it is staged local, as a row without a pen is.
+            let bindable = crate::federation::edition2::ingest::kid_of_identity_ref(&identity)
+                .is_some()
+                && crate::federation::edition2::ingest::kid_of_identity_ref(&occ.occurrence_key_id)
+                    .is_some();
+            let landed = match &input.identity_signer {
+                Some(signer) if bindable => {
+                    let terms = BindTerms {
+                        author: bind_author(&*directory, &identity, at_ms).await?,
+                        identity_key_id: identity.clone(),
                         occurrence_key_id: occ.occurrence_key_id.clone(),
                         device_class: occ.device_class.clone(),
-                        hardware_attestation: occ.hardware_attestation.clone(),
-                        asserted_at: now,
-                        valid_until: None,
-                        encryption_pubkeys: occ.encryption_pubkeys.clone(),
-                        transport_binding: None,
-                        persist_row_hash: String::new(),
+                        asserted_at_ms: at_ms,
+                        valid_until_ms: None,
+                        hardware_attestation: occ
+                            .hardware_attestation
+                            .as_deref()
+                            .map(|h| decode("hardware_attestation", h))
+                            .transpose()?,
+                        encryption_pubkeys: match &occ.encryption_pubkeys {
+                            Some(e) => Some((
+                                decode("encryption_pubkeys.x25519", &e.x25519_base64)?,
+                                decode("encryption_pubkeys.ml_kem_768", &e.ml_kem_768_base64)?,
+                            )),
+                            None => None,
+                        },
+                        transport: occ.transport.clone(),
+                        // CC rc21: `refs.head`, the identity's current
+                        // self-roster head.
+                        head: crate::federation::edition2::occurrence::self_roster_head(
+                            &*directory,
+                            &identity,
+                        )
+                        .await?,
+                        further_heads: Vec::new(),
                     };
-                    directory.put_identity_occurrence_local(row).await?;
-                    occurrences_local_only.push(occ.occurrence_key_id.clone());
+                    let author_signer =
+                        (signer.federation_id().await == terms.author).then_some(signer.as_ref());
+                    let out = publish_bind(
+                        &*directory,
+                        occ.occurrence_signer.as_deref(),
+                        author_signer,
+                        &terms,
+                    )
+                    .await?;
+                    for d in [out.own_draft, out.author_draft].into_iter().flatten() {
+                        bind_drafts.push((occ.occurrence_key_id.clone(), d));
+                    }
+                    out.landed
                 }
+                _ => false,
+            };
+            if landed {
+                occurrences_published.push(occ.occurrence_key_id.clone());
+                continue;
             }
+            let row = IdentityOccurrence {
+                identity_key_id: identity.clone(),
+                occurrence_key_id: occ.occurrence_key_id.clone(),
+                device_class: occ.device_class.clone(),
+                hardware_attestation: occ.hardware_attestation.clone(),
+                asserted_at: now,
+                valid_until: None,
+                encryption_pubkeys: occ.encryption_pubkeys.clone(),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            };
+            directory.put_identity_occurrence_local(row).await?;
+            occurrences_local_only.push(occ.occurrence_key_id.clone());
         }
 
         // (2) Self-DEK cascade to both newcomers (§8.1.12.4). Composes
@@ -8264,6 +8863,8 @@ impl Engine {
         }
 
         Ok(SelfAtLoginOutcome {
+            bind_drafts,
+            agent_identity_key_id: agent_identity,
             partnership_grant_id: grant_id,
             partnership_accept_id: accept_id,
             delegation_id,
@@ -9336,8 +9937,9 @@ impl Engine {
     /// [`steward_bindings_of`](Self::steward_bindings_of) /
     /// [`delegations_to`](Self::delegations_to) readers, which return every
     /// `delegates_to` granter (cardinality > 1, the anti-pattern CC 3.2
-    /// forbids). A pre-gate ambiguous state (two live owners from before the
-    /// single-owner gate) resolves **fail-closed** with
+    /// forbids). Two counted owners (v62.0.0: both bindings held, each
+    /// cosigned by the node; the kernel's owner seat reads them as unowned)
+    /// resolve **fail-closed** with
     /// [`Error::AmbiguousNodeOwner`](crate::federation::Error::AmbiguousNodeOwner).
     /// See [`admission::owner_of`](crate::federation::admission::owner_of).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -9681,42 +10283,6 @@ impl Engine {
         directory.put_public_key(record).await
     }
 
-    /// v12.2.0 (CIRISPersist#351) — adopt-scrub-**upgrade**: replace this
-    /// node's **self-signed** own-key row with the accord-anchor-**scrubbed**
-    /// record (same `key_id`, same pubkey) so it can root against the seeded
-    /// A1/B1/C1 anchor. The in-place seed's missing primitive:
-    /// `register_federation_key` is `ON CONFLICT DO NOTHING`, so the boot-time
-    /// self-signed row is otherwise sticky and no peer can root it.
-    ///
-    /// Verifies the incoming scrub-signature first (same
-    /// [`verify_key_registration`](crate::federation::verify_key_registration)
-    /// gate as `register_federation_key` — granting-authority resolves the
-    /// scrubber's pubkeys from the directory), THEN applies the backend's
-    /// monotonic gated UPDATE (self-signed → anchored only; pubkey change and
-    /// anchored→self downgrade refused; re-applying the same record is
-    /// idempotent — see [`AdoptScrubOutcome`](crate::federation::register::AdoptScrubOutcome)).
-    /// Fail-secure: a reject never mutates the row.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn adopt_scrub_upgrade(
-        &self,
-        record: crate::federation::SignedKeyRecord,
-    ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
-        let directory = self.federation_directory();
-        crate::federation::verify_key_registration(directory.as_ref(), &record.record).await?;
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => {
-                crate::federation::FederationDirectory::adopt_scrub_upgrade(b.as_ref(), record)
-                    .await
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => {
-                crate::federation::FederationDirectory::adopt_scrub_upgrade(b.as_ref(), record)
-                    .await
-            }
-        }
-    }
-
     /// v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
     /// apply**: the anti-entropy apply the edge replication bridge routes
     /// `apply_key` to instead of raw
@@ -9727,9 +10293,8 @@ impl Engine {
     /// holds a **self-signed** row for auto-upgrades that row in place, so
     /// the genesis-mesh seed becomes pure owned-node replication and stale
     /// self-signed copies on sibling nodes heal — no per-node
-    /// `adopt-scrubbed` endpoint call ([`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade)
-    /// itself is unchanged and remains available; consumers retire the
-    /// endpoint separately).
+    /// `adopt-scrubbed` endpoint call (the Engine's `adopt_scrub_upgrade`
+    /// wrapper is removed in v62.0.0).
     ///
     /// Decision table + gate composition live in the shared
     /// [`plan_replicated_key_apply`](crate::federation::register::plan_replicated_key_apply):
@@ -9744,7 +10309,7 @@ impl Engine {
     /// byte-identical ⇒ `Unchanged`; anything else (downgrade, re-scrub,
     /// pubkey swap, conflicting version) ⇒ `Refused`, row untouched.
     ///
-    /// Unlike [`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade)'s
+    /// Unlike the removed `adopt_scrub_upgrade` wrapper's
     /// Engine-layer verify split, the verification is INSIDE the backend
     /// method (it only binds on the upgrade transition — a fresh insert
     /// keeps `put_public_key`'s as-today semantics), so no caller can reach
@@ -9817,6 +10382,41 @@ impl Engine {
             statement,
             offered_row_id.as_ref(),
             crate::federation::edition2::ingest::INGEST_TIER,
+        )
+        .await
+    }
+
+    /// v62.0.0 (wave G0; CC 2.7.3) — **why a held edition-2 row concludes
+    /// nothing**: its reason token (`edition2::fold::reason`), the refusal
+    /// the gate would have raised, and since when. `None` when the row is
+    /// concluded (its typed row is in its table) or not held here. A
+    /// `put_edition2_statement` that answered `Pending` is held.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn edition2_held_reason(
+        &self,
+        row_id: [u8; 32],
+    ) -> Result<Option<crate::federation::edition2::fold::HeldReason>, crate::federation::Error>
+    {
+        crate::federation::edition2::fold::why_held(
+            self.federation_directory().as_ref(),
+            &crate::federation::edition2::names::RowId(row_id),
+        )
+        .await
+    }
+
+    /// v62.0.0 (wave G0) — the held edition-2 rows that conclude nothing, in
+    /// row-id order after `after`, at most `limit` (clamped to 1000).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn edition2_held_rows(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::edition2::fold::HeldReason>, crate::federation::Error> {
+        let after = after.map(crate::federation::edition2::names::RowId);
+        crate::federation::edition2::fold::held_rows(
+            self.federation_directory().as_ref(),
+            after.as_ref(),
+            limit,
         )
         .await
     }
@@ -10951,76 +11551,22 @@ pub enum EngineMaintenance {
     Sqlite(crate::maintenance::sqlite::SqliteMaintenanceBackend),
 }
 
-/// Build the backend dispatch for an `Engine` from a DSN string.
+/// Build the backend dispatch for an `Engine` from a DSN string: connect,
+/// then run the migrations.
 ///
 /// Factored out so `Engine::with_signer` and any future Engine
 /// constructors share the same URL-sniff + migration shape.
-// `seed_genesis` is consumed inside the postgres / sqlite `if` blocks; in a
-// no-backend build both arms are cfg'd out, so silence the unused-var lint there.
-#[cfg_attr(
-    not(any(feature = "postgres", feature = "sqlite")),
-    allow(unused_variables)
-)]
-/// v31.0.0 (CIRISPersist#648) — **the boot decision: which genesis faults may a
-/// node survive?**
 ///
-/// Exactly one may not. Before this cut every seed failure was fatal, and it had
-/// to be, because the seeder returned an `Err(String)` in which "the accord
-/// holders were never seeded" and "somebody else's pubkey is sitting on A1's
-/// key_id" were the same value. With
-/// [`GenesisFault`](crate::federation::genesis::GenesisFault) splitting them:
-///
-/// - [`Absent`](crate::federation::genesis::GenesisFault::Absent) — a node
-///   before its ceremony. **Boots.** 31.0.0 is the binary that RUNS the
-///   ceremony, so refusing to start without the thing the ceremony produces is
-///   a deadlock. The node comes up in the pre-genesis posture, reports it
-///   (`Engine::genesis_posture`, `NodeState::genesis`), and every gate in
-///   `ROOT_REQUIRING_GATES` refuses.
-/// - [`Unreadable`](crate::federation::genesis::GenesisFault::Unreadable) — the
-///   backend could not answer. **Boots**, and is likewise not entrenched: an
-///   unanswered question is not a yes, so the same gates refuse. A node whose
-///   directory is broken should be able to come up far enough to say so.
-/// - [`Divergent`](crate::federation::genesis::GenesisFault::Divergent) —
-///   **REFUSES.** A constitutional row is present and wrong: a squatted holder
-///   key_id, a family whose entrenched protocol or founder seats were mutated,
-///   a canonical stripped of its role. That is an established root altered
-///   underneath the node, and #648 is about making a MISSING root survivable,
-///   never a TAMPERED one. Roots co-exist and a new ceremony adds one; nothing
-///   here may become a path to overwriting one that already stands.
-///
-/// The warning is `tracing::warn!` with a structured `posture` field rather than
-/// a bare message, because the host renders a banner from it — see
-/// [`GenesisPosture::banner`](crate::federation::genesis::GenesisPosture::banner).
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
-fn classify_genesis_seed(
-    outcome: Result<(), crate::federation::genesis::GenesisFault>,
-) -> Result<(), EngineError> {
-    let Err(fault) = outcome else { return Ok(()) };
-    if fault.refuses_boot() {
-        return Err(EngineError::GenesisSeed(fault.to_string()));
-    }
-    tracing::warn!(
-        posture = "pre_genesis",
-        leg = fault.leg().as_str(),
-        fault = fault.as_str(),
-        detail = fault.detail(),
-        "PRE-GENESIS BOOT: this node holds no constitutional trust root. It can host a \
-         genesis ceremony; until one completes, every operation that resolves authority to \
-         the accord root is REFUSED (federation_no_constitutional_root_yet). Node mode only \
-         — do not run an agent against this node."
-    );
-    Ok(())
-}
-
+/// v62.0.0 (JSON-cut slice C) — **no genesis is seeded here.** A node boots
+/// pre-genesis and roots nothing until a `ceg-genesis-bundle/2` arrives at
+/// the import door (CC 2.6.1.11, CC 5.3.4). The earlier boot seeded the
+/// baked bundle/1 JSON (the accord holders, the family, the canonical
+/// servers) and classified its faults; there is no baked bundle to seed any
+/// more, so there is nothing to classify, and no genesis fault can refuse a
+/// boot. Lib unit tests root `fixture_genesis::bundle_v2` after the
+/// constructor returns (`Engine::install_test_genesis_at_boot`, `cfg(test)`).
 async fn build_backend(
     dsn: &str,
-    // Read only inside the backend `cfg` arms; a build with neither backend
-    // compiled in reaches the `UnrecognizedDsn` tail without consulting it.
-    #[cfg_attr(
-        not(any(feature = "postgres", feature = "sqlite")),
-        allow(unused_variables)
-    )]
-    seed_genesis: bool,
     // Read only by the sqlite arm; postgres has no host profile.
     #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
     host: crate::store::HostStoreProfile,
@@ -11032,40 +11578,6 @@ async fn build_backend(
                 .await
                 .map_err(EngineError::Store)?;
             pg.run_migrations().await.map_err(EngineError::Store)?;
-            // v31.0.0 (CIRISPersist#648) — the genesis seed is ATTEMPTED in
-            // production and no longer fatal when it is merely ABSENT. See
-            // `attempt_genesis_seed` for the classification and why divergence
-            // is still fatal. `seed_genesis == false` is the supported
-            // pre-genesis constructor `Engine::with_signer_pre_genesis`.
-            if seed_genesis {
-                // v12.0.2 (#347) — first-boot-seed the HUMANITY_ACCORD holder
-                // rooting-anchor rows (idempotent). A write failure here is NOT
-                // decided on: `seed_family_and_canonical` opens with
-                // `verify_anchor_seeded`, which is the one place that can tell
-                // "never seeded" from "seeded by somebody else".
-                if let Err(e) = pg
-                    .seed_genesis_accord_holders(
-                        &crate::federation::genesis::effective_accord_holder_records(),
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
-                }
-                // v13.4.1 (#392) — the SHARED seed routine (verify anchor →
-                // family #386 → canonical #390), identical to the pyo3
-                // `PyEngine::new` path so they can't drift.
-                classify_genesis_seed(
-                    crate::federation::genesis::seed_family_and_canonical(&pg).await,
-                )?;
-            }
-            // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
-            // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
-            // REMOVED: a single-anchor founding record is a first-strike
-            // weakness (one captured accord key mints a rogue canonical). Now
-            // that canonical ADD requires ≥2 distinct anchor scrubs (2-of-3),
-            // a fresh node ships with an EMPTY canonical set until the operator
-            // bakes the 2-of-3 replacement. The accord-holder rooting anchor
-            // (A1/B1/C1) above is untouched.
             Ok(BackendDispatch::Postgres(Arc::new(pg)))
         }
         #[cfg(not(feature = "postgres"))]
@@ -11095,33 +11607,6 @@ async fn build_backend(
                     .map_err(EngineError::Store)?
             };
             sq.run_migrations().await.map_err(EngineError::Store)?;
-            // v31.0.0 (CIRISPersist#648) — see the postgres leg: the seed is
-            // attempted, an ABSENT seed leaves a pre-genesis node that boots and
-            // refuses, a DIVERGENT one still refuses to boot.
-            if seed_genesis {
-                // v12.0.2 (#347) — HUMANITY_ACCORD holder anchor rows, then verify.
-                if let Err(e) = sq
-                    .seed_genesis_accord_holders(
-                        &crate::federation::genesis::effective_accord_holder_records(),
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
-                }
-                // v13.4.1 (#392) — shared seed routine (verify anchor → family
-                // #386 → canonical #390); identical to the pyo3 path.
-                classify_genesis_seed(
-                    crate::federation::genesis::seed_family_and_canonical(&sq).await,
-                )?;
-            }
-            // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
-            // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
-            // REMOVED: a single-anchor founding record is a first-strike
-            // weakness (one captured accord key mints a rogue canonical). Now
-            // that canonical ADD requires ≥2 distinct anchor scrubs (2-of-3),
-            // a fresh node ships with an EMPTY canonical set until the operator
-            // bakes the 2-of-3 replacement. The accord-holder rooting anchor
-            // (A1/B1/C1) above is untouched.
             Ok(BackendDispatch::Sqlite(Arc::new(sq)))
         }
         #[cfg(not(feature = "sqlite"))]
@@ -11169,12 +11654,13 @@ pub enum EngineError {
     #[error("local signer: {0}")]
     LocalSigner(#[from] crate::signing::LocalSignerError),
 
-    /// v12.0.2 (CIRISPersist#347) — the HUMANITY_ACCORD holder genesis
-    /// rooting-anchor rows could not be seeded or verified at boot.
-    /// **Fail-secure**: a node that cannot establish its constitutional
-    /// rooting anchor (the pinned accord holders) must not come up — else
-    /// it would silently root nothing (or, worse, honor a divergent anchor).
-    #[error("genesis accord-holder seed: {0}")]
+    /// v62.0.0 (JSON-cut slice C) — a genesis install a constructor was
+    /// asked to make failed. No production constructor installs a genesis
+    /// (a node boots pre-genesis); only
+    /// `Engine::with_signer_test_genesis` (`test-anchor`) raises this, with
+    /// the import door's refusal. (Was the v12.0.2 baked accord-holder
+    /// seed's failure, CIRISPersist#347; that seed is gone.)
+    #[error("genesis install: {0}")]
     GenesisSeed(String),
 }
 
@@ -19527,15 +20013,18 @@ mod tests {
     // ── v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) ──────────────
     // The owner-binding sub-relation over the REAL emit path
     // (`steward_bind(.., Some(owner_binding::PURPOSE))`) + `owner_of`: the
-    // purpose arg round-trips onto the wire, a second DISTINCT owner is
-    // rejected at bind time (idempotent same-owner), and `owner_of` is
-    // purpose-filtered → ≤1 (an unrelated general delegation does not count).
+    // purpose arg round-trips onto the wire, a same-owner refresh is
+    // idempotent, and `owner_of` is purpose-filtered → ≤1 (an unrelated
+    // general delegation does not count). v62.0.0 (kernel pass 2, I2840): a
+    // second DISTINCT owner is no longer refused at bind time; its binding is
+    // held and two counted owners read as unowned (KERNEL_SEAMS B1, C557).
 
     /// #378 (sqlite) — `steward_bind(node, infra, Some("responsible_for"))`
     /// stamps the owner-binding wire shape, `owner_of` resolves the single
-    /// owner, a second distinct owner rejects (`NodeAlreadyOwned`), a
-    /// same-owner refresh is idempotent, a general (non-ownership) delegation
-    /// does NOT count toward `owner_of`, and an unbound node is `None`.
+    /// owner, a same-owner refresh is idempotent, a general (non-ownership)
+    /// delegation does NOT count toward `owner_of`, an unbound node is `None`,
+    /// and (**I2840**) a second distinct owner's cosigned binding is HELD and
+    /// the node then reads as unowned (`AmbiguousNodeOwner`, fail-closed).
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn owner_binding_single_owner_end_to_end_sqlite() {
@@ -19599,35 +20088,6 @@ mod tests {
             "owner_of resolves the single owner",
         );
 
-        // A second, DISTINCT owner is rejected at bind time (no trace).
-        let err = engine
-            .steward_bind(
-                &o2_signer,
-                &node_id,
-                infra.clone(),
-                Some(owner_binding::PURPOSE),
-            )
-            .await
-            .expect_err("a second distinct owner is rejected");
-        assert_eq!(err.kind(), "federation_node_already_owned");
-        match err {
-            crate::federation::Error::NodeAlreadyOwned {
-                ref node_key_id,
-                ref incumbent_owner,
-                ref attempted_owner,
-            } => {
-                assert_eq!(node_key_id, &node_id);
-                assert_eq!(incumbent_owner, &o1);
-                assert_eq!(attempted_owner, &o2);
-            }
-            other => panic!("expected NodeAlreadyOwned, got {other:?}"),
-        }
-        assert_eq!(
-            engine.owner_of(&node_id).await.unwrap(),
-            Some(o1.clone()),
-            "the rejected second owner left the owner unchanged",
-        );
-
         // A refresh by the SAME owner is idempotently admitted.
         engine
             .steward_bind(
@@ -19652,6 +20112,37 @@ mod tests {
             Some(o1.clone()),
             "owner_of ignores the general delegation (purpose-filtered ≤1)",
         );
+
+        // I2840 (kernel pass 2, KERNEL_SEAMS B1 / C557) — a second, DISTINCT
+        // owner's binding is HELD, not refused. The engine is the node, so it
+        // cosigned it: two counted owners read as unowned, fail-closed, never
+        // as the first to arrive.
+        let second = engine
+            .steward_bind(
+                &o2_signer,
+                &node_id,
+                infra.clone(),
+                Some(owner_binding::PURPOSE),
+            )
+            .await
+            .expect("I2840: a second distinct owner's binding is held, not refused");
+        assert!(
+            sq.get_attestation(&second).await.unwrap().is_some(),
+            "I2840: the second binding is stored"
+        );
+        match engine.owner_of(&node_id).await {
+            Err(crate::federation::Error::AmbiguousNodeOwner {
+                ref node_key_id,
+                ref owners,
+            }) => {
+                assert_eq!(node_key_id, &node_id);
+                assert!(
+                    owners.contains(&o1) && owners.contains(&o2),
+                    "I2840: both counted owners are named: {owners:?}"
+                );
+            }
+            other => panic!("I2840: two counted owners read as unowned, got {other:?}"),
+        }
 
         // An unbound node reads as unowned.
         let mut node2 = sweeper_test_key("ob-node2");
@@ -19678,8 +20169,8 @@ mod tests {
     }
 
     /// #378 PG twin of [`owner_binding_single_owner_end_to_end_sqlite`] — the
-    /// same owner-binding / single-owner-gate / purpose-filtered `owner_of`
-    /// arc over the live Postgres gates. Skips when `CIRIS_PERSIST_TEST_PG_URL`
+    /// same owner-binding / purpose-filtered `owner_of` arc, and I2840's held
+    /// second owner, over the live Postgres gates. Skips when `CIRIS_PERSIST_TEST_PG_URL`
     /// is unset.
     #[cfg(feature = "postgres")]
     #[tokio::test]
@@ -19744,19 +20235,6 @@ mod tests {
         );
         assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
 
-        // Second distinct owner rejected; owner unchanged.
-        let err = engine
-            .steward_bind(
-                &o2_signer,
-                &node_id,
-                infra.clone(),
-                Some(owner_binding::PURPOSE),
-            )
-            .await
-            .expect_err("a second distinct owner is rejected");
-        assert_eq!(err.kind(), "federation_node_already_owned");
-        assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
-
         // Same-owner refresh idempotent.
         engine
             .steward_bind(
@@ -19775,6 +20253,30 @@ mod tests {
             .await
             .expect("a plain steward-binding is not an owner-binding");
         assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
+
+        // I2840 (kernel pass 2) — a second distinct owner's binding is held,
+        // not refused; cosigned by the node, two counted owners read as
+        // unowned (fail-closed).
+        let second = engine
+            .steward_bind(
+                &o2_signer,
+                &node_id,
+                infra.clone(),
+                Some(owner_binding::PURPOSE),
+            )
+            .await
+            .expect("I2840: a second distinct owner's binding is held, not refused");
+        assert!(
+            pg.get_attestation(&second).await.unwrap().is_some(),
+            "I2840: the second binding is stored"
+        );
+        match engine.owner_of(&node_id).await {
+            Err(crate::federation::Error::AmbiguousNodeOwner { ref owners, .. }) => assert!(
+                owners.contains(&o1) && owners.contains(&o2),
+                "I2840: both counted owners are named: {owners:?}"
+            ),
+            other => panic!("I2840: two counted owners read as unowned, got {other:?}"),
+        }
 
         // Unbound node → None.
         let mut node2 = sweeper_test_key(&node2_label);
@@ -22046,33 +22548,46 @@ mod tests {
         );
     }
 
+    /// v62.0.0 (v62 P8) — one party of the edition-2 login (the user, the
+    /// app, the agent): an engine over `dsn` with a composite signer from
+    /// `alias`, its key registered (a self-signed `key:record` of `ty`) on
+    /// the shared store. Returns the engine, its identity-ref and its signer.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn e2_login_party(
+        dsn: &str,
+        alias: &str,
+        ty: &str,
+    ) -> (Engine, String, Arc<crate::signing::LocalSigner>) {
+        let signer =
+            crate::federation::self_registration_restart_invariants::bodies::signer(alias, alias);
+        let engine = Engine::with_signer_pre_genesis(signer.clone(), dsn)
+            .await
+            .expect("engine");
+        let id = engine
+            .register_self_federation_key(ty, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{alias} registers: {e}"));
+        (engine, id, signer)
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn self_at_login_lands_full_flow() {
         use crate::federation::types::identity_type;
 
-        let (signer, _steward_alias) = self_login_signer();
-        // v9.3.0 (#247) — the promote path inside self_at_login stamps
-        // `scrub_key_id = signer's DERIVED federation key_id`, which must
-        // exist in federation_keys (FK); seed the steward row under it.
-        let steward_derived = signer.derived_key_id();
-        let engine = Engine::with_signer(signer, "sqlite::memory:")
-            .await
-            .expect("engine");
-
+        // v62.0.0 (v62 P8) — the edition-2 login: the user, the app and the
+        // agent each hold a composite key with a self-signed `key:record` on
+        // the shared store; every pen is in hand, so both O1 binds land.
+        let dir_tmp = tempfile::tempdir().expect("tempdir");
+        let dsn = format!("sqlite:///{}", dir_tmp.path().join("login.db").display());
         let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let app_key = format!("app-{suffix}");
-        let agent_key = format!("agent-{suffix}");
-        self_login_seed_key(&engine, &steward_derived, identity_type::STEWARD).await;
-        // identity_type as a §7.0.1 set: this human is also a WA.
-        let set = identity_type::join_set([identity_type::USER, identity_type::WISE_AUTHORITY]);
-        assert_eq!(set, "user,wise_authority");
-        // v39.0.0 — the identity signs its own delegation, so it is seeded
-        // with REAL pubkeys and its signer is handed to the flow.
-        let (identity_key, identity_signer) =
-            self_login_seed_identity(&engine, &format!("user-{suffix}"), &set).await;
-        self_login_seed_key(&engine, &app_key, identity_type::USER).await;
-        self_login_seed_key(&engine, &agent_key, identity_type::AGENT).await;
+        let tag = &suffix[..8];
+        let (engine, identity_key, identity_signer) =
+            e2_login_party(&dsn, &format!("{tag}-login-user"), identity_type::USER).await;
+        let (_app_engine, app_key, app_signer) =
+            e2_login_party(&dsn, &format!("{tag}-login-app"), identity_type::USER).await;
+        let (_agent_engine, agent_key, agent_signer) =
+            e2_login_party(&dsn, &format!("{tag}-login-agent"), identity_type::AGENT).await;
 
         // Real content-KEM pubkeys so both occurrences are valid DEK
         // wrap targets (not fail-secure-excluded).
@@ -22094,19 +22609,21 @@ mod tests {
             app: SelfAtLoginOccurrence {
                 occurrence_key_id: app_key.clone(),
                 device_class: crate::federation::device_class::PHONE.to_owned(),
-                hardware_attestation: None,
                 encryption_pubkeys: Some(mk_keys()),
                 transport_destinations: vec![("reticulum".to_owned(), "dest-hash-app".to_owned())],
+                occurrence_signer: Some(app_signer),
+                ..SelfAtLoginOccurrence::default()
             },
             agent: SelfAtLoginOccurrence {
                 occurrence_key_id: agent_key.clone(),
                 device_class: crate::federation::device_class::AGENT.to_owned(),
-                hardware_attestation: None,
                 encryption_pubkeys: Some(mk_keys()),
                 transport_destinations: vec![(
                     "websocket".to_owned(),
                     "wss://relay/agent".to_owned(),
                 )],
+                occurrence_signer: Some(agent_signer),
+                ..SelfAtLoginOccurrence::default()
             },
             bilateral_pair_id: pair_id.clone(),
             delegation_scope: None,
@@ -22116,11 +22633,21 @@ mod tests {
 
         // (1) Both occurrences co-admitted under the one identity key.
         let dir = engine.federation_directory();
+        // v62.0.0 (v62 P8, O1) — the app binds under the user; the AGENT
+        // binds under its own identity, authored by the user (its owner).
         let occs = dir
             .list_identity_occurrences_for(&identity_key)
             .await
             .expect("occurrences");
-        assert_eq!(occs.len(), 2, "app + agent co-admitted");
+        assert_eq!(occs.len(), 1, "the app under the user");
+        assert_eq!(occs[0].occurrence_key_id, app_key);
+        let agent_occs = dir
+            .list_identity_occurrences_for(&outcome.agent_identity_key_id)
+            .await
+            .expect("agent occurrences");
+        assert_eq!(agent_occs.len(), 1, "the agent under its own identity");
+        assert!(outcome.bind_drafts.is_empty(), "every pen was in hand");
+        assert_eq!(outcome.occurrences_published.len(), 2, "both binds landed");
 
         // (3) Partnership grant + accept written, distinct ids.
         assert!(!outcome.partnership_grant_id.is_empty());
@@ -22395,63 +22922,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "postgres")]
-    /// Seed a `federation_keys` row on Postgres so the FK + admission
-    /// checks the self-at-login flow runs against are satisfied.
-    /// v39.0.0 — the Postgres twin of `self_login_seed_identity`: an identity
-    /// with REAL pubkeys and its signer, because the delegation is the
-    /// identity's claim and the crossing verifies what it admits.
-    async fn pg_seed_identity(
-        engine: &Engine,
-        label: &str,
-        identity_type: &str,
-    ) -> (String, Arc<crate::signing::LocalSigner>) {
-        let signer = crate::federation::tier_ingest::test_support::local_signer(label);
-        let key_id = signer.derived_key_id();
-        let (ed_pk, mldsa_pk) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(label);
-        let pg = engine.postgres_backend().expect("postgres");
-        let client = pg.checkout().await.expect("pool get");
-        client
-            .execute(
-                "INSERT INTO cirislens.federation_keys (\
-                    key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
-                    identity_type, identity_ref, valid_from, \
-                    registration_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash, admitted_at\
-                 ) VALUES ($1, $3, $4, 'hybrid', $2, $1, \
-                          '2026-01-01T00:00:00Z', '{}'::jsonb, \
-                          '', '', $1, '2026-01-01T00:00:00Z', '0', NOW()) \
-                 ON CONFLICT (key_id) DO NOTHING",
-                &[&key_id, &identity_type, &ed_pk, &mldsa_pk],
-            )
-            .await
-            .expect("seed federation_key");
-        (key_id, signer)
-    }
-
-    #[cfg(feature = "postgres")]
-    async fn pg_seed_key(engine: &Engine, key_id: &str, identity_type: &str) {
-        let pg = engine.postgres_backend().expect("postgres");
-        let client = pg.checkout().await.expect("pool get");
-        client
-            .execute(
-                "INSERT INTO cirislens.federation_keys (\
-                    key_id, pubkey_ed25519_base64, algorithm, \
-                    identity_type, identity_ref, valid_from, \
-                    registration_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash, admitted_at\
-                 ) VALUES ($1, 'AAAA', 'hybrid', $2, $1, \
-                          '2026-01-01T00:00:00Z', '{}'::jsonb, \
-                          '', '', $1, '2026-01-01T00:00:00Z', '0', NOW()) \
-                 ON CONFLICT (key_id) DO NOTHING",
-                &[&key_id, &identity_type],
-            )
-            .await
-            .expect("seed federation_key");
-    }
-
     /// Postgres parity for [`self_at_login_lands_full_flow`]. Skips when
     /// `CIRIS_PERSIST_TEST_PG_URL` is unset. Self-isolating: every key id
     /// + bilateral_pair_id is uuid-suffixed so reruns against a reused PG
@@ -22466,23 +22936,17 @@ mod tests {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
-        let (signer, _steward_alias) = self_login_signer();
-        // v9.3.0 (#247) — seed the steward row under the signer's DERIVED
-        // key_id (the promote scrub_key_id FK target).
-        let steward_derived = signer.derived_key_id();
-        let engine = Engine::with_signer(signer, &dsn)
-            .await
-            .expect("postgres engine");
-
+        // v62.0.0 (v62 P8) — the edition-2 login (see the sqlite twin).
+        let _ = &dsn;
+        let dsn = crate::test_pg::isolated_dsn().unwrap_or(dsn);
         let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let app_key = format!("app-{suffix}");
-        let agent_key = format!("agent-{suffix}");
-        let set = identity_type::join_set([identity_type::USER, identity_type::WISE_AUTHORITY]);
-        pg_seed_key(&engine, &steward_derived, identity_type::STEWARD).await;
-        let (identity_key, identity_signer) =
-            pg_seed_identity(&engine, &format!("user-{suffix}"), &set).await;
-        pg_seed_key(&engine, &app_key, identity_type::USER).await;
-        pg_seed_key(&engine, &agent_key, identity_type::AGENT).await;
+        let tag = &suffix[..8];
+        let (engine, identity_key, identity_signer) =
+            e2_login_party(&dsn, &format!("{tag}-login-user"), identity_type::USER).await;
+        let (_app_engine, app_key, app_signer) =
+            e2_login_party(&dsn, &format!("{tag}-login-app"), identity_type::USER).await;
+        let (_agent_engine, agent_key, agent_signer) =
+            e2_login_party(&dsn, &format!("{tag}-login-agent"), identity_type::AGENT).await;
 
         let mk_keys = || {
             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -22503,19 +22967,21 @@ mod tests {
                 app: SelfAtLoginOccurrence {
                     occurrence_key_id: app_key.clone(),
                     device_class: crate::federation::device_class::LAPTOP.to_owned(),
-                    hardware_attestation: None,
                     encryption_pubkeys: Some(mk_keys()),
                     transport_destinations: vec![(
                         "reticulum".to_owned(),
                         format!("dest-{suffix}"),
                     )],
+                    occurrence_signer: Some(app_signer),
+                    ..SelfAtLoginOccurrence::default()
                 },
                 agent: SelfAtLoginOccurrence {
                     occurrence_key_id: agent_key.clone(),
                     device_class: crate::federation::device_class::AGENT.to_owned(),
-                    hardware_attestation: None,
                     encryption_pubkeys: Some(mk_keys()),
                     transport_destinations: vec![],
+                    occurrence_signer: Some(agent_signer),
+                    ..SelfAtLoginOccurrence::default()
                 },
                 bilateral_pair_id: pair_id,
                 delegation_scope: None,
@@ -22530,13 +22996,23 @@ mod tests {
         assert_eq!(outcome.transport_destinations_registered, 1);
 
         let dir = engine.federation_directory();
+        // v62.0.0 (v62 P8, O1) — the app under the user, the agent under
+        // its own identity.
         assert_eq!(
             dir.list_identity_occurrences_for(&identity_key)
                 .await
                 .expect("occurrences")
                 .len(),
-            2
+            1
         );
+        assert_eq!(
+            dir.list_identity_occurrences_for(&outcome.agent_identity_key_id)
+                .await
+                .expect("agent occurrences")
+                .len(),
+            1
+        );
+        assert_eq!(outcome.occurrences_published.len(), 2);
         let delegation = dir
             .get_attestation(&outcome.delegation_id)
             .await

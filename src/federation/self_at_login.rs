@@ -585,7 +585,7 @@ pub struct TransitKexOtherKeys {
 }
 
 impl TransitKexOtherKeys {
-    fn all(&self) -> impl Iterator<Item = &[u8]> {
+    pub(crate) fn all(&self) -> impl Iterator<Item = &[u8]> {
         self.federation_signing
             .iter()
             .chain(&self.transport_identity)
@@ -1087,7 +1087,7 @@ pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?S
 /// transport key must be separated from at use (the four
 /// [`TransitKexOtherKeys`] groups), shared by [`transit_kex_pair_for`] and
 /// [`transit_xwing_pubkey_for`] so the cross-row rule exists once.
-async fn other_keys_of<D: crate::federation::FederationDirectory + ?Sized>(
+pub(crate) async fn other_keys_of<D: crate::federation::FederationDirectory + ?Sized>(
     dir: &D,
     occurrence_key_id: &str,
     live: &[&SignedTransportDestination],
@@ -1172,6 +1172,17 @@ pub async fn transit_xwing_pubkey_for<D: crate::federation::FederationDirectory 
     dir: &D,
     occurrence_key_id: &str,
 ) -> Result<Option<XWingPublicKey>, crate::federation::Error> {
+    // v62.0.0 (wave W1; CC 3.3.6.2 "A seat's transit key") — a seat of the
+    // genesis bundle in force: its key is the bundle binding's, moved only
+    // by a counted `transport:canonical_rebind`; a binding the seat
+    // publishes itself is not read (`edition2::transport_rebind`).
+    let in_force = crate::federation::edition2::genesis::genesis_in_force(dir).await?;
+    if let Some(seat) = in_force.seat(occurrence_key_id) {
+        let key =
+            crate::federation::edition2::transport_rebind::seat_transit_key(dir, &in_force, seat)
+                .await?;
+        return Ok(XWingPublicKey::from_bytes(&key));
+    }
     let bindings = dir
         .list_signed_transport_destinations_for(occurrence_key_id)
         .await?;
@@ -1194,7 +1205,9 @@ pub async fn transit_xwing_pubkey_for<D: crate::federation::FederationDirectory 
         }
     }
     let Some((key, row)) = found else {
-        return Ok(None);
+        // v62.0.0 (wave O1; E8's finding) — no route-plane key: the
+        // edition-2 bind's, for a node that is not a seat.
+        return super::edition2::occurrence::bind_transit_xwing_for(dir, occurrence_key_id).await;
     };
     if super::transport_rebind::is_seated_serve_node(occurrence_key_id)
         && super::transport_rebind::rebind_held_for(dir, occurrence_key_id)
@@ -1374,8 +1387,8 @@ mod tests {
     #[test]
     fn owner_binding_envelope_carries_ownership_dimension_and_purpose() {
         // #378 (CC 3.2 rc2) — the owner-binding specialization stamps the
-        // ownership dimension + producer-side purpose marker (what the
-        // single-owner gate + owner_of key on), sub_delegation always false.
+        // ownership dimension + producer-side purpose marker (what owner_of
+        // keys on), sub_delegation always false.
         use super::super::types::owner_binding;
         let env = owner_binding_delegates_to_envelope(
             "node-key",

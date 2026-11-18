@@ -417,6 +417,21 @@ pub mod test_support {
         /// caller-passed roster.
         pub fn steward_key_record(&self) -> crate::federation::types::KeyRecord {
             let m = self.member();
+            // v62.0.0 (E0) — under the switch, the steward's edition-2 key
+            // record (its read model) when this identity is the deterministic
+            // key its id seeds; an identity from other seeds keeps the earlier
+            // form (no seed names it).
+            if crate::federation::edition2::fixture_switch::emit_edition2()
+                && m.ed25519_public_key_base64
+                    == crate::federation::tier_ingest::test_support::hybrid_pubkeys(&self.key_id).0
+            {
+                return crate::federation::edition2::fixture_switch::key_row_for_earlier(
+                    &self.key_id,
+                    crate::federation::types::identity_type::STEWARD,
+                    None,
+                    None,
+                );
+            }
             crate::federation::types::KeyRecord {
                 key_id: self.key_id.clone(),
                 pubkey_ed25519_base64: m.ed25519_public_key_base64,
@@ -541,6 +556,22 @@ pub mod test_support {
     ) -> crate::federation::types::KeyRecord {
         use crate::federation::types::ScrubSig;
         use sha2::{Digest, Sha256};
+        // v62.0.0 (E0) — under the switch, the subject's edition-2 key record
+        // (its read model) when the pubkeys are the deterministic ones its id
+        // seeds. The scrubbers' conferral is not carried: canonical standing
+        // is the genesis bundle's `serve_nodes` (RULINGS ruling C). Foreign
+        // pubkeys keep the earlier form (no seed signs for them).
+        if crate::federation::edition2::fixture_switch::emit_edition2()
+            && pubkey_ed25519_base64
+                == crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id).0
+        {
+            return crate::federation::edition2::fixture_switch::key_row_for_earlier(
+                key_id,
+                identity_type,
+                None,
+                None,
+            );
+        }
         // #659 — bind the subject BEFORE the bytes are formed: the accord
         // family must sign a preimage that names the key it confers on.
         let mut envelope = envelope;
@@ -632,6 +663,13 @@ pub mod test_support {
             envelope,
             scrubbers,
         );
+        // v62.0.0 (E0) — an edition-2 record carries no capability roles.
+        if crate::federation::edition2::fixture_switch::emit_edition2()
+            && crate::federation::edition2::projection::edition_of_key_record(&rec)
+                == crate::federation::edition2::projection::EDITION_TWO
+        {
+            return rec;
+        }
         rec.capability_roles = roles;
         rec
     }
@@ -905,6 +943,15 @@ pub mod test_support {
         use crate::federation::types::ScrubSig;
         use sha2::{Digest, Sha256};
         assert!(!scrubbers.is_empty(), "at least one scrubber required");
+        // v62.0.0 (E0) — under the switch an edition-2 record is returned as
+        // it is: a conferral is the genesis bundle's (RULINGS ruling C), never
+        // co-scrubs on a key record.
+        if crate::federation::edition2::fixture_switch::emit_edition2()
+            && crate::federation::edition2::projection::edition_of_key_record(&record)
+                == crate::federation::edition2::projection::EDITION_TWO
+        {
+            return record;
+        }
         // v31.0.0 (CIRISPersist#659) — the SECOND producer of co-scrubbed
         // records, and therefore the second place the subject has to be bound.
         // It runs through the same `bind_subject_into_envelope` the gate checks
@@ -982,6 +1029,14 @@ pub mod test_support {
         key_id: &str,
         identity_type: &str,
     ) -> Result<(), crate::federation::Error> {
+        // v62.0.0 (E0) — under the switch, an edition-2 `key:record`
+        // (`fixture_switch::put_key`): the key's id is `kid(key_id)`. The
+        // hardware evidence is not carried (see E0.md).
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            use crate::federation::edition2::fixture_switch as e2;
+            e2::put_key(directory, key_id, &e2::identity_types_of(identity_type)).await;
+            return Ok(());
+        }
         let (ed_pk, mldsa_pk) =
             crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
         let now = crate::host::clock::now();
@@ -2418,6 +2473,12 @@ pub mod test_support {
     ) -> crate::federation::Attestation {
         let mut row =
             signed_trust_attestation(id, attester, attested, attestation_type, envelope.clone());
+        // v62.0.0 (E0) — under the switch the co-signers are further
+        // statements over the row (`fixture_switch::voices_of(&row,
+        // cosigners)`), put after it; never co-scrubs.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            return row;
+        }
         // v31.0.0 (CIRISPersist#643) — the co-signers sign the SEALED envelope,
         // i.e. the one `signed_trust_attestation` just stamped the typed-column
         // mirror into. Every scrub is over the SAME preimage (#556), and the
@@ -4874,8 +4935,7 @@ pub mod test_support {
     ///
     /// This asserts the round trip after EVERY mutator the backend exposes, so
     /// the property does not care how many write paths get added later. Backends
-    /// that do not implement a mutator (memory has no `adopt_scrub_upgrade`) skip
-    /// that leg and still run the rest.
+    /// that do not implement a mutator skip that leg and still run the rest.
     pub async fn exercise_key_wire_index_follows_every_mutator(
         directory: &dyn crate::federation::FederationDirectory,
         tag: &str,
@@ -4897,31 +4957,8 @@ pub mod test_support {
             .await?;
         assert_advertised_key_ref_is_servable(directory, &node, tag, "put_public_key").await?;
 
-        // (1) adopt_scrub_upgrade — the mutator CIRISServer measured. Live
-        // production code (the admit-node / rooting loop), and the row it
-        // rewrites is the node's OWN, advertised the instant it lands.
-        match directory
-            .adopt_scrub_upgrade(crate::federation::SignedKeyRecord {
-                record: ts::replicated_key_record(
-                    &node,
-                    identity_type::NODE,
-                    &anchor,
-                    &anchor,
-                    "boot",
-                ),
-            })
-            .await
-        {
-            Ok(_) => {
-                assert_advertised_key_ref_is_servable(directory, &node, tag, "adopt_scrub_upgrade")
-                    .await?;
-            }
-            // The trait default — this backend does not implement the upgrade
-            // (memory). Reported, not silently passed.
-            Err(crate::federation::Error::InvalidArgument(detail))
-                if detail.contains("not supported on this backend") => {}
-            Err(e) => return Err(e),
-        }
+        // (1) v62.0.0 (json-cut C5): the `adopt_scrub_upgrade` leg is deleted
+        // with the door; the upgrade is the replicated apply's Upgrade arm.
 
         // (2) set_consent_role — NOT one of the three the issue names, and the
         // reason it is here: `consent_role` is excluded from `persist_row_hash`

@@ -40,7 +40,7 @@ where
     D: FederationDirectory + ?Sized,
 {
     let mut out = dir.active_identities_for_occurrence(k).await?;
-    match super::admission::owner_of(dir, k).await {
+    match super::admission::owner_of_unmarked(dir, k).await {
         Ok(Some(owner)) => {
             // PR #889 review (P1) — a REVOKED occurrence does not get its
             // owner back through the owner binding. An occurrence
@@ -103,6 +103,33 @@ where
     super::admission::nodes_owned_by(dir, p).await
 }
 
+/// v62.0.0 (v62 P5c; CC rc21 3.3.6) — **the human `k` acts for**: the first
+/// identity `k` is an ACTIVE occurrence of
+/// ([`active_identity_for_occurrence`](super::FederationDirectory::active_identity_for_occurrence),
+/// which once the earlier form is shut counts no machine key under a person),
+/// else `k`'s OWNER ([`owner_of`](super::admission::owner_of)): a node or an
+/// agent is never an occurrence of a person, and its human is known only
+/// through its owner binding. `None` when neither (the singleton: `k` is its
+/// own identity). An ambiguous owner is no owner (fail closed).
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn human_of<D>(dir: &D, k: &str) -> Result<Option<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let identity = dir.active_identity_for_occurrence(k).await?;
+    if identity != k {
+        return Ok(Some(identity));
+    }
+    match super::admission::owner_of(dir, k).await {
+        Ok(owner) => Ok(owner),
+        Err(Error::AmbiguousNodeOwner { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// **The active occurrences of a human** — the KEM targets of the
 /// self-collective (CC 3.3.6). Read by the read-side `self` gate
 /// (`scope::build_caller_admission_from_directory`, v46.3.1 / #888) beside
@@ -111,12 +138,13 @@ pub(crate) async fn occurrences_of<D>(dir: &D, identity: &str) -> Result<Vec<Str
 where
     D: FederationDirectory + ?Sized,
 {
-    Ok(dir
-        .list_identity_occurrences_active(identity)
-        .await?
-        .into_iter()
-        .map(|o| o.occurrence_key_id)
-        .collect())
+    Ok(
+        crate::federation::replication_audience::counted_occurrences(dir, identity)
+            .await?
+            .into_iter()
+            .map(|o| o.occurrence_key_id)
+            .collect(),
+    )
 }
 
 /// **Does `signer` speak for `author` on the key plane?** (FSD §4.1) —

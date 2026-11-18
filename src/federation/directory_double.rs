@@ -134,19 +134,9 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 141 delegations, generated. Every one: fault first, then delegate.
+// 172 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
-    async fn adopt_genesis_reanchor(
-        &self,
-        record: SignedKeyRecord,
-        bundle: &genesis::GenesisBundle,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("adopt_genesis_reanchor") {
-            return Err(e);
-        }
-        self.inner.adopt_genesis_reanchor(record, bundle).await
-    }
     async fn apply_replicated_accord_evidence(
         &self,
         evidence: &accord_carriage::AccordQuorumEvidence,
@@ -226,6 +216,18 @@ impl FederationDirectory for FaultInjectingDirectory {
             .clear_active_halt(family_key_id, active_halt_id)
             .await
     }
+    async fn clear_occurrence_projection(
+        &self,
+        identity_key_id: &str,
+        occurrence_key_id: &str,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("clear_occurrence_projection") {
+            return Err(e);
+        }
+        self.inner
+            .clear_occurrence_projection(identity_key_id, occurrence_key_id)
+            .await
+    }
     async fn communities_containing(&self, cell_id: &str) -> Result<Vec<Community>, Error> {
         if let Some(e) = self.faulted("communities_containing") {
             return Err(e);
@@ -270,6 +272,73 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.drop_cosign_rows(quorum_key).await
+    }
+    async fn drop_group_tips(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        persist_row_hashes: &[String],
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("drop_group_tips") {
+            return Err(e);
+        }
+        self.inner
+            .drop_group_tips(cohort, group_key_id, persist_row_hashes)
+            .await
+    }
+    async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, Error> {
+        if let Some(e) = self.faulted("edition2_objects") {
+            return Err(e);
+        }
+        self.inner.edition2_objects(typ).await
+    }
+    async fn edition2_roster_proposal(
+        &self,
+        row_id_hex: &str,
+    ) -> Result<Option<self_roster::SelfRosterReceipt>, Error> {
+        if let Some(e) = self.faulted("edition2_roster_proposal") {
+            return Err(e);
+        }
+        self.inner.edition2_roster_proposal(row_id_hex).await
+    }
+    async fn edition2_rows_naming(
+        &self,
+        named: &edition2::names::RowId,
+        role: &str,
+    ) -> Result<Vec<edition2::names::RowId>, Error> {
+        if let Some(e) = self.faulted("edition2_rows_naming") {
+            return Err(e);
+        }
+        self.inner.edition2_rows_naming(named, role).await
+    }
+    async fn edition2_statements_about(
+        &self,
+        family: &str,
+        sub: &str,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if let Some(e) = self.faulted("edition2_statements_about") {
+            return Err(e);
+        }
+        self.inner.edition2_statements_about(family, sub).await
+    }
+    async fn edition2_statements_since(
+        &self,
+        cursor: Option<&edition2::store::StatementCursor>,
+        limit: u32,
+    ) -> Result<Vec<edition2::store::ServedStatement>, Error> {
+        if let Some(e) = self.faulted("edition2_statements_since") {
+            return Err(e);
+        }
+        self.inner.edition2_statements_since(cursor, limit).await
+    }
+    async fn edition2_voices(
+        &self,
+        row_id: &edition2::names::RowId,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if let Some(e) = self.faulted("edition2_voices") {
+            return Err(e);
+        }
+        self.inner.edition2_voices(row_id).await
     }
     async fn enter_mesh(
         &self,
@@ -337,6 +406,65 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.family_roster_signers(family_key_id).await
+    }
+    async fn fold_any_refolding(&self) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("fold_any_refolding") {
+            return Err(e);
+        }
+        self.inner.fold_any_refolding().await
+    }
+    async fn fold_dependents(
+        &self,
+        read_keys: &[String],
+    ) -> Result<Vec<edition2::names::RowId>, Error> {
+        if let Some(e) = self.faulted("fold_dependents") {
+            return Err(e);
+        }
+        self.inner.fold_dependents(read_keys).await
+    }
+    async fn fold_held(
+        &self,
+        row_id: &edition2::names::RowId,
+    ) -> Result<Option<edition2::fold::HeldReason>, Error> {
+        if let Some(e) = self.faulted("fold_held") {
+            return Err(e);
+        }
+        self.inner.fold_held(row_id).await
+    }
+    async fn fold_held_page(
+        &self,
+        after: Option<&edition2::names::RowId>,
+        limit: u32,
+    ) -> Result<Vec<edition2::fold::HeldReason>, Error> {
+        if let Some(e) = self.faulted("fold_held_page") {
+            return Err(e);
+        }
+        self.inner.fold_held_page(after, limit).await
+    }
+    async fn fold_slot_rows(&self, slot: &str) -> Result<Vec<edition2::names::RowId>, Error> {
+        if let Some(e) = self.faulted("fold_slot_rows") {
+            return Err(e);
+        }
+        self.inner.fold_slot_rows(slot).await
+    }
+    async fn fold_state(
+        &self,
+        row_id: &edition2::names::RowId,
+    ) -> Result<Option<edition2::fold::FoldState>, Error> {
+        if let Some(e) = self.faulted("fold_state") {
+            return Err(e);
+        }
+        self.inner.fold_state(row_id).await
+    }
+    async fn freshness_floor(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+    ) -> Result<Option<types::FreshnessFloor>, Error> {
+        if let Some(e) = self.faulted("freshness_floor") {
+            return Err(e);
+        }
+        self.inner.freshness_floor(target_key_id, target_kind).await
     }
     async fn get_accord_decision(
         &self,
@@ -649,6 +777,16 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_family_membership_widenings_for(family_key_id)
             .await
     }
+    async fn list_group_tips(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::GroupTip>, Error> {
+        if let Some(e) = self.faulted("list_group_tips") {
+            return Err(e);
+        }
+        self.inner.list_group_tips(cohort, group_key_id).await
+    }
     async fn list_group_versions(
         &self,
         cohort: cohort::Cohort,
@@ -814,6 +952,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.list_open_cosign_receipts().await
     }
+    async fn list_open_edition2_roster_proposals(
+        &self,
+        identity_key_id: Option<&str>,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        if let Some(e) = self.faulted("list_open_edition2_roster_proposals") {
+            return Err(e);
+        }
+        self.inner
+            .list_open_edition2_roster_proposals(identity_key_id)
+            .await
+    }
     async fn list_open_self_roster_proposals(
         &self,
         identity_key_id: Option<&str>,
@@ -857,6 +1006,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_scores(caller_occurrence_key_id, filter, cursor, limit)
+            .await
+    }
+    async fn list_settled_edition2_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        if let Some(e) = self.faulted("list_settled_edition2_roster_proposals") {
+            return Err(e);
+        }
+        self.inner
+            .list_settled_edition2_roster_proposals(identity_key_id)
             .await
     }
     async fn list_settled_self_roster_proposals(
@@ -1081,6 +1241,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             .note_cosign_alias(alias_attestation_id, quorum_key, held_attestation_id)
             .await
     }
+    async fn note_edition2_roster_proposal(
+        &self,
+        row_id_hex: &str,
+        identity_key_id: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<self_roster::SelfRosterReceipt, Error> {
+        if let Some(e) = self.faulted("note_edition2_roster_proposal") {
+            return Err(e);
+        }
+        self.inner
+            .note_edition2_roster_proposal(row_id_hex, identity_key_id, received_at)
+            .await
+    }
     async fn note_self_roster_proposal(
         &self,
         proposal_id: &str,
@@ -1293,6 +1466,42 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_community_membership_widening(widening).await
     }
+    async fn put_delivery_receipt_edition2(
+        &self,
+        receipt: stream_receipt::DeliveryReceipt,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_delivery_receipt_edition2") {
+            return Err(e);
+        }
+        self.inner.put_delivery_receipt_edition2(receipt).await
+    }
+    async fn put_edition2_genesis(
+        &self,
+        write: &edition2::genesis::GenesisWrite,
+    ) -> Result<Vec<bool>, Error> {
+        if let Some(e) = self.faulted("put_edition2_genesis") {
+            return Err(e);
+        }
+        self.inner.put_edition2_genesis(write).await
+    }
+    async fn put_edition2_object(
+        &self,
+        object: &edition2::store::HeldObject,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("put_edition2_object") {
+            return Err(e);
+        }
+        self.inner.put_edition2_object(object).await
+    }
+    async fn put_edition2_statement(
+        &self,
+        row: &edition2::door::AdmittedRow,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("put_edition2_statement") {
+            return Err(e);
+        }
+        self.inner.put_edition2_statement(row).await
+    }
     async fn put_family(&self, family: SignedFamily) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_family") {
             return Err(e);
@@ -1319,6 +1528,12 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_family_membership_widening(widening).await
     }
+    async fn put_fold_record(&self, rec: &edition2::fold::FoldRecord) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_fold_record") {
+            return Err(e);
+        }
+        self.inner.put_fold_record(rec).await
+    }
     async fn put_identity_occurrence(
         &self,
         occurrence: SignedIdentityOccurrence,
@@ -1327,6 +1542,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.put_identity_occurrence(occurrence).await
+    }
+    async fn put_identity_occurrence_edition2(
+        &self,
+        bind: edition2::occurrence::OccurrenceBind,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("put_identity_occurrence_edition2") {
+            return Err(e);
+        }
+        self.inner.put_identity_occurrence_edition2(bind).await
     }
     async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_location_proof") {
@@ -1346,6 +1570,20 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_revocation(revocation).await
     }
+    async fn put_touch_claim_local(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+        fresh_as_of: chrono::DateTime<chrono::Utc>,
+        cohort_scope: &str,
+    ) -> Result<freshness::TouchApplyOutcome, Error> {
+        if let Some(e) = self.faulted("put_touch_claim_local") {
+            return Err(e);
+        }
+        self.inner
+            .put_touch_claim_local(target_key_id, target_kind, fresh_as_of, cohort_scope)
+            .await
+    }
     async fn read_group_plane_object(
         &self,
         link: &group_plane::GroupRowLink,
@@ -1354,6 +1592,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.read_group_plane_object(link).await
+    }
+    async fn recheck_attestation(&self, row: &Attestation) -> Result<(), Error> {
+        if let Some(e) = self.faulted("recheck_attestation") {
+            return Err(e);
+        }
+        self.inner.recheck_attestation(row).await
     }
     async fn record_announced_peer(
         &self,
@@ -1395,6 +1639,16 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .resolve_scores(caller_occurrence_key_id, filter, policy, trace)
             .await
+    }
+    async fn retract_projected_trust(
+        &self,
+        key: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("retract_projected_trust") {
+            return Err(e);
+        }
+        self.inner.retract_projected_trust(key, at).await
     }
     async fn revocations_for_subject(
         &self,
@@ -1448,6 +1702,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             .settle_cosign_receipt(quorum_key, outcome, settled_at)
             .await
     }
+    async fn settle_edition2_roster_proposal(
+        &self,
+        row_id_hex: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("settle_edition2_roster_proposal") {
+            return Err(e);
+        }
+        self.inner
+            .settle_edition2_roster_proposal(row_id_hex, outcome, settled_at)
+            .await
+    }
     async fn settle_self_roster_proposal(
         &self,
         proposal_id: &str,
@@ -1478,6 +1745,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.store_lineage_head_cosign(cosign).await
+    }
+    async fn store_projected_trust(&self, row: TrustRow) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("store_projected_trust") {
+            return Err(e);
+        }
+        self.inner.store_projected_trust(row).await
     }
     async fn store_rebound_key_record(
         &self,
@@ -1512,6 +1785,21 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
         self.inner.trust_root_standing_cache()
+    }
+    async fn unconclude_attestation(&self, attestation_id: &str) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("unconclude_attestation") {
+            return Err(e);
+        }
+        self.inner.unconclude_attestation(attestation_id).await
+    }
+    async fn upsert_edition2_key_projection(
+        &self,
+        set: &edition2::projection::ProjectionSet,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("upsert_edition2_key_projection") {
+            return Err(e);
+        }
+        self.inner.upsert_edition2_key_projection(set).await
     }
     async fn vote_window_first_held(
         &self,

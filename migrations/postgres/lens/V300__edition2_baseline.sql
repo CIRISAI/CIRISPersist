@@ -3528,3 +3528,70 @@ CREATE TABLE cirislens.ceg_row_names (
     PRIMARY KEY (row_id, named_row_id, role)
 );
 CREATE INDEX ceg_row_names_named ON cirislens.ceg_row_names (named_row_id, role, row_id);
+
+-- Wave G0 (CC 2.7.3, the fold): every folded row, held or concluded: its
+-- FIRST arrival (replicated or local, tier), its plane and projection slot
+-- (the fold re-folds under exactly that arrival and un-concludes through the
+-- plane), and, while it concludes nothing, why: `reason` a token
+-- (edition2::fold::reason), `detail` the refusal the gate would have raised,
+-- `since_us` THIS node's clock when it was first held for this reason
+-- (node-local, never replicated). A concluded row has `reason` NULL.
+CREATE TABLE cirislens.ceg_fold_state (
+    row_id          bytea NOT NULL PRIMARY KEY CHECK (octet_length(row_id) = 32),
+    family          text NOT NULL,
+    tier            text NOT NULL,
+    replicated      boolean NOT NULL,
+    plane           text NOT NULL,
+    slot            text NOT NULL,
+    reason          text,
+    detail          text,
+    since_us        bigint,
+    CHECK ((reason IS NULL) = (detail IS NULL) AND (reason IS NULL) = (since_us IS NULL))
+);
+CREATE INDEX ceg_fold_state_slot ON cirislens.ceg_fold_state (slot, row_id);
+CREATE INDEX ceg_fold_state_held ON cirislens.ceg_fold_state (reason, row_id);
+
+-- Wave G0: the dependency index. Every input a row's last fold evaluation
+-- read (`row:<hex>`, `key:<id>`, `family:<family>`), held or concluded; a
+-- statement that touches a read key re-folds the rows that read it.
+CREATE TABLE cirislens.ceg_fold_reads (
+    read_key        text NOT NULL,
+    row_id          bytea NOT NULL CHECK (octet_length(row_id) = 32),
+    PRIMARY KEY (read_key, row_id)
+);
+CREATE INDEX ceg_fold_reads_row ON cirislens.ceg_fold_reads (row_id);
+
+-- Kernel pass 2 (v62.0.0, K1, I2812; CC 2.7.8 "Two versions of one head wait
+-- as tips"): a family / community version whose prev_head_digest does not
+-- name the held head is held here beside the head, never refused. The live
+-- row stays the head; a held tip re-offered once the version it names is the
+-- head runs the whole supersede door and leaves this table. snapshot is the
+-- signed wrapper as offered.
+CREATE TABLE cirislens.federation_group_tips (
+    cohort               text NOT NULL
+        CHECK (cohort IN ('family', 'community', 'affiliations')),
+    group_key_id         text NOT NULL,
+    persist_row_hash     text NOT NULL,
+    prev_head_digest     text NOT NULL,
+    snapshot             jsonb NOT NULL,
+    change_authorization jsonb,
+    held_at              timestamp with time zone NOT NULL,
+    PRIMARY KEY (cohort, group_key_id, persist_row_hash)
+);
+
+-- v62.0.0 (wave O1, S1; CC 3.3.6.4): THIS node's receipts of edition-2
+-- self-roster proposals: an identity:occurrence bind awaiting the two paths.
+-- The proposal is the bind's row id (lowercase hex); its statements are in
+-- ceg_statements. No FK: no attestation row backs it. The lone path's window
+-- starts at received_at (this node's first hold).
+CREATE TABLE cirislens.ceg_roster_proposals (
+    row_id          text PRIMARY KEY,
+    identity_key_id text NOT NULL,
+    received_at     timestamp with time zone NOT NULL,
+    settled_at      timestamp with time zone,
+    outcome         text,
+    CHECK ((settled_at IS NULL) = (outcome IS NULL))
+);
+CREATE INDEX ceg_roster_proposals_open
+    ON cirislens.ceg_roster_proposals (identity_key_id, received_at)
+    WHERE settled_at IS NULL;

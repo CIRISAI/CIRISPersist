@@ -33,8 +33,9 @@ use ciris_crypto::composite::CompositePublicKey;
 use ciris_verify_core::cde::{self, Value};
 use ciris_verify_core::edition2::{cose_key, row_ref, Digest32};
 
-use super::ingest::{HASH_DIGEST_MEMBERS, INSTANT_MEMBERS, SCALED_MEMBERS, STATEMENT_MEMBER};
+use super::ingest::{INSTANT_MEMBERS, SCALED_MEMBERS, STATEMENT_MEMBER};
 use super::liveness::statement_parts;
+use super::payloads::{is_digest_member, ref_members};
 use super::produce::ProduceError;
 use crate::federation::Error;
 
@@ -152,20 +153,72 @@ fn digest_of_hex(v: &serde_json::Value) -> Result<Value, ProduceError> {
         ))
 }
 
-/// A hash-digest member: one digest, or (`evidence_refs`) a sorted set.
+/// v62.0.0 (wave P1e) — the row id(s) an earlier member names: one 64-hex
+/// text, or an array of them.
+fn row_ids_of(v: &serde_json::Value) -> Result<Vec<Digest32>, ProduceError> {
+    let one = |x: &serde_json::Value| {
+        x.as_str()
+            .filter(|h| h.len() == 64 && !h.bytes().any(|b| b.is_ascii_uppercase()))
+            .and_then(|h| hex::decode(h).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .ok_or(ProduceError::Payload(
+                "a member naming a row is not a 64-lowercase-hex row id",
+            ))
+    };
+    match v {
+        serde_json::Value::Array(a) => a.iter().map(one).collect(),
+        other => Ok(vec![one(other)?]),
+    }
+}
+
+/// v62.0.0 (wave P1e) — `refs` from role → row ids: an `also:{role}` is a
+/// set under `also`, any other role one row-ref (a set when it names more).
+fn refs_of(
+    roles: &std::collections::BTreeMap<&str, std::collections::BTreeSet<Digest32>>,
+) -> Value {
+    let set = |ids: &std::collections::BTreeSet<Digest32>| {
+        let mut v: Vec<Value> = ids.iter().map(row_ref).collect();
+        v.sort_by_key(cde::encode);
+        Value::Array(v)
+    };
+    let mut top: Vec<(Value, Value)> = Vec::new();
+    let mut also: Vec<(Value, Value)> = Vec::new();
+    for (role, ids) in roles {
+        if let Some(r) = role.strip_prefix("also:") {
+            also.push((text(r), set(ids)));
+        } else if ids.len() == 1 {
+            let only = ids.iter().next().map(row_ref).unwrap_or(Value::Null);
+            top.push((text(role), only));
+        } else {
+            top.push((text(role), set(ids)));
+        }
+    }
+    if !also.is_empty() {
+        top.push((text("also"), sorted_map(also)));
+    }
+    sorted_map(top)
+}
+
+/// A hash-digest member: one digest, or a sequence of them (`evidence_refs`,
+/// CC 2.6.1.4: "payload `evidence_refs`, a sequence"), kept in the order the
+/// envelope gives, so the mapping reads back the same hex array.
 fn digest_member(v: &serde_json::Value) -> Result<Value, ProduceError> {
     match v {
-        serde_json::Value::Array(a) => {
-            let mut d = a.iter().map(digest_of_hex).collect::<Result<Vec<_>, _>>()?;
-            d.sort_by_key(cde::encode);
-            d.dedup();
-            Ok(Value::Array(d))
-        }
+        serde_json::Value::Array(a) => Ok(Value::Array(
+            a.iter().map(digest_of_hex).collect::<Result<Vec<_>, _>>()?,
+        )),
         other => digest_of_hex(other),
     }
 }
 
 /// **The JSON members of a row as its edition-2 payload.**
+///
+/// v62.0.0 (wave P1e) — `family` is the family id the row is stated under
+/// (header -70002): every member [`is_digest_member`] names for it (every
+/// family's `HASH_DIGEST_MEMBERS`, and the family's own digest members:
+/// `content_sha256`, `at_rest_sha256`, `chunk_root`, `unit`,
+/// `build_manifest_hash`, ...) is stated as a hash digest from its 64-hex
+/// text, the inverse of the mapping's projection.
 ///
 /// `envelope` is the row's JSON envelope. Its `row` mirror and any carried
 /// statement ([`STATEMENT_MEMBER`]) are dropped: the statement binds the
@@ -179,6 +232,7 @@ fn digest_member(v: &serde_json::Value) -> Result<Value, ProduceError> {
 /// members; an instant that is not RFC 3339.
 pub fn payload_from_envelope(
     envelope: &serde_json::Value,
+    family: &str,
     asserted_at_ms: u64,
     author: Option<&str>,
     drop: &[&str],
@@ -187,13 +241,29 @@ pub fn payload_from_envelope(
         .as_object()
         .ok_or(ProduceError::Payload("the envelope is not an object"))?;
     let mut m: Vec<(Value, Value)> = Vec::with_capacity(o.len() + 2);
+    // v62.0.0 (wave P1e; CC rc21) — the earlier members that name a row are
+    // stated under their `refs` role (`payloads::REF_MEMBERS`): an
+    // amendment's `authorized_by` / `evidence_refs` under `also.cites`, a
+    // response's `references_attestation_id` under `answers`. Read before
+    // the `drop` list, which names `references_attestation_id` for every
+    // producer.
+    let ref_entries = ref_members(family);
+    let mut roles: std::collections::BTreeMap<&'static str, std::collections::BTreeSet<Digest32>> =
+        std::collections::BTreeMap::new();
     for (k, v) in o {
+        if let Some(entry) = ref_entries.iter().find(|e| e.1 == k.as_str()) {
+            let role: &'static str = entry.0;
+            for id in row_ids_of(v)? {
+                roles.entry(role).or_default().insert(id);
+            }
+            continue;
+        }
         if k == STATEMENT_MEMBER || k == "row" || drop.contains(&k.as_str()) || v.is_null() {
             continue;
         }
         let c = if INSTANT_MEMBERS.contains(&k.as_str()) {
             Value::Uint(ms_of(v)?)
-        } else if HASH_DIGEST_MEMBERS.contains(&k.as_str()) {
+        } else if is_digest_member(family, k) {
             digest_member(v)?
         } else if SCALED_MEMBERS.contains(&k.as_str()) {
             scaled(v.as_f64().ok_or(ProduceError::Payload(
@@ -203,6 +273,14 @@ pub fn payload_from_envelope(
             cbor_of(v)?
         };
         m.push((text(k), c));
+    }
+    if !roles.is_empty() {
+        if m.iter().any(|(k, _)| k.as_text() == Some("refs")) {
+            return Err(ProduceError::Payload(
+                "the envelope states refs and a member that names a row",
+            ));
+        }
+        m.push((text("refs"), refs_of(&roles)));
     }
     if !o.contains_key("asserted_at") {
         m.push((text("asserted_at"), Value::Uint(asserted_at_ms)));
@@ -506,6 +584,7 @@ pub fn draft_from_envelope(
     );
     let mut payload = payload_from_envelope(
         envelope,
+        &family,
         asserted_at_ms,
         authored.then_some(iss),
         &["references_attestation_id"],
@@ -535,8 +614,14 @@ mod tests {
             "ceg_statement": "00",
             "references_attestation_id": "t",
         });
-        let p = payload_from_envelope(&env, 7, Some("me"), &["references_attestation_id"])
-            .expect("I2200: a JSON envelope states as a payload");
+        let p = payload_from_envelope(
+            &env,
+            "consent:state:.state",
+            7,
+            Some("me"),
+            &["references_attestation_id"],
+        )
+        .expect("I2200: a JSON envelope states as a payload");
         assert_eq!(
             p.get_text("asserted_at").and_then(Value::as_u64),
             Some(1_794_996_000_123),
@@ -553,12 +638,12 @@ mod tests {
         // A real outside the scaled members is refused, never rounded.
         let bad = serde_json::json!({"ratio": 0.5});
         assert!(matches!(
-            payload_from_envelope(&bad, 7, None, &[]),
+            payload_from_envelope(&bad, "consent:state:.state", 7, None, &[]),
             Err(ProduceError::Payload(_))
         ));
         // An envelope's own author / asserted_at stand.
         let own = serde_json::json!({"author": "them", "asserted_at": "2026-11-18T10:00:00.000Z"});
-        let p = payload_from_envelope(&own, 7, Some("me"), &[]).unwrap();
+        let p = payload_from_envelope(&own, "consent:state:.state", 7, Some("me"), &[]).unwrap();
         assert_eq!(p.get_text("author"), Some(&text("them")));
         assert_eq!(
             p.get_text("asserted_at").and_then(Value::as_u64),

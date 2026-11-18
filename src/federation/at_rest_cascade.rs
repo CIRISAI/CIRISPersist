@@ -1198,10 +1198,12 @@ pub mod orchestrate {
     {
         match cohort_scope {
             SELF => {
-                let occ = backend
-                    .list_identity_occurrences_active(owner_or_family_key_id)
-                    .await
-                    .map_err(map_dir_err)?;
+                let occ = crate::federation::replication_audience::devices_of(
+                    backend,
+                    owner_or_family_key_id,
+                )
+                .await
+                .map_err(map_dir_err)?;
                 // v53.0.0 (#963) — only the occurrences the owner's allow list
                 // (or class) lets `self` content reach get its key.
                 let occ = keyable(
@@ -1243,10 +1245,12 @@ pub mod orchestrate {
                     .map_err(map_dir_err)?;
                 let mut out = Vec::new();
                 for member in &active {
-                    let occ = backend
-                        .list_identity_occurrences_active(&member.key_id)
-                        .await
-                        .map_err(map_dir_err)?;
+                    let occ = crate::federation::replication_audience::devices_of(
+                        backend,
+                        &member.key_id,
+                    )
+                    .await
+                    .map_err(map_dir_err)?;
                     // v53.0.0 (#963) — the member's allow list for each device.
                     let occ = keyable(
                         backend,
@@ -1947,10 +1951,12 @@ pub mod orchestrate {
         let newcomers: Vec<Newcomer> = keyable(
             backend,
             new_member_identity_key_id,
-            backend
-                .list_identity_occurrences_active(new_member_identity_key_id)
-                .await
-                .map_err(map_dir_err)?,
+            crate::federation::replication_audience::devices_of(
+                backend,
+                new_member_identity_key_id,
+            )
+            .await
+            .map_err(map_dir_err)?,
             crate::federation::replication_audience::OwnerCohort::Group {
                 scope: FAMILY,
                 target: family_key_id,
@@ -1971,8 +1977,7 @@ pub mod orchestrate {
             if m.key_id == new_member_identity_key_id {
                 continue;
             }
-            let occ = backend
-                .list_identity_occurrences_active(&m.key_id)
+            let occ = crate::federation::replication_audience::devices_of(backend, &m.key_id)
                 .await
                 .map_err(map_dir_err)?;
             existing.extend(occ.into_iter().map(|o| o.occurrence_key_id));
@@ -2000,8 +2005,7 @@ pub mod orchestrate {
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        let active = backend
-            .list_identity_occurrences_active(identity_key_id)
+        let active = crate::federation::replication_audience::devices_of(backend, identity_key_id)
             .await
             .map_err(map_dir_err)?;
         let newset: std::collections::HashSet<&str> =
@@ -2069,8 +2073,7 @@ pub mod orchestrate {
         if owner == device {
             return Ok(out);
         }
-        let mine = backend
-            .list_identity_occurrences_active(owner)
+        let mine = crate::federation::replication_audience::devices_of(backend, owner)
             .await
             .map_err(map_dir_err)?;
         let Some(occ) = mine.iter().find(|o| o.occurrence_key_id == device).cloned() else {
@@ -2114,8 +2117,7 @@ pub mod orchestrate {
                 .await
                 .map_err(map_dir_err)?
             {
-                for o in backend
-                    .list_identity_occurrences_active(&m.key_id)
+                for o in crate::federation::replication_audience::devices_of(backend, &m.key_id)
                     .await
                     .map_err(map_dir_err)?
                 {
@@ -2224,6 +2226,11 @@ pub mod orchestrate {
         B: FederationDirectory + BlobStorage + Sync,
     {
         use crate::federation::hard_case;
+        // v62.0.0 (v62 P8) — a removal signed over its JCS image is the
+        // earlier form, only behind the switch: the edition-2 successor is
+        // `rekey_community_member_revoke_voices`.
+        crate::federation::edition2::door::refuse_earlier_form("community_membership_revocation")
+            .map_err(map_dir_err)?;
         // 1. Record the removal (append-only; the roster-minus-effective-
         //    revocations fold stops counting the member from `effective_at`).
         backend
@@ -2269,6 +2276,63 @@ pub mod orchestrate {
         .await
         .map_err(|e| BlobError::Backend(format!("emit membership_removed: {e}")))?;
         Ok(new_epoch)
+    }
+
+    /// v62.0.0 (v62 P8; CC 4.4.3.2.2, T1's counted `membership:removal`) —
+    /// **[`rekey_community_member_revoke`] on the clean mesh**: the removal
+    /// is its `membership:{stage}` removal statements (each roster member's
+    /// voice over one payload, `edition2::group::membership_payload`, drafted
+    /// for an external pen by `edition2::group::removal_draft`), offered in
+    /// order through the statement door. While the voices are short of the
+    /// community's protocol the removal is `Pending`: nothing is bumped and
+    /// `Ok(None)` comes back. Once it lands, this node bumps ITS OWN epoch
+    /// counter for the community (#848) and records the membership-removed
+    /// event (§9): `Ok(Some(new_epoch))`. The proof is the voices, so no
+    /// unauthenticated caller can force a rotation (#502 E4's hole stays
+    /// closed: a voice the door refuses errors before any bump).
+    ///
+    /// # Errors
+    /// The door's refusals of any voice; the epoch bump; the event record.
+    pub async fn rekey_community_member_revoke_voices<B>(
+        backend: &B,
+        community_key_id: &str,
+        minter_key_id: &str,
+        removed_identity_key_id: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+        voices: &[Vec<u8>],
+    ) -> Result<Option<u64>, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        use crate::federation::edition2::ingest::{put_statement, StatementOutcome, INGEST_TIER};
+        use crate::federation::hard_case;
+        let mut landed = false;
+        for v in voices {
+            landed = matches!(
+                put_statement(backend, v, None, INGEST_TIER)
+                    .await
+                    .map_err(map_dir_err)?,
+                StatementOutcome::Row { .. }
+            );
+        }
+        if !landed {
+            return Ok(None);
+        }
+        let new_epoch = backend
+            .community_dek_bump_epoch(community_key_id, minter_key_id)
+            .await?;
+        crate::federation::hard_case::record_observation(
+            backend,
+            hard_case::membership_removed_event(
+                hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
+                community_key_id,
+                removed_identity_key_id,
+                observed_at,
+            ),
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("emit membership_removed: {e}")))?;
+        Ok(Some(new_epoch))
     }
 
     /// Why a device re-wrap could not give the device an epoch the member
@@ -2429,11 +2493,13 @@ pub mod orchestrate {
 
     /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **is `device`
     /// one of `member_key_id`'s devices?** The seal fan-out's own definition
-    /// — an ACTIVE identity occurrence of the member — with the owner-binding
-    /// as the authority on it: `owner_of(device) == member`. A node the
-    /// member owns but does not speak through (infrastructure the member
-    /// operates for others) is not a device of theirs and receives none of
-    /// their history.
+    /// with the owner-binding as the authority on it: `owner_of(device) ==
+    /// member`. v62.0.0 (v62 P5c; CC rc21 3.3.6, CC 6.1.5.3 "every node a
+    /// person owns is one of that person's devices") — the definition is
+    /// [`devices_of`](crate::federation::replication_audience::devices_of): a
+    /// node is never an occurrence of a person, so an owned node is the
+    /// member's device by its binding, and what it receives is its class's and
+    /// allow list's (a server-class node gets no `self` / `family` history).
     /// v53.0.0 (CIRISPersist#963, coordinator ruling) — may `device` (an
     /// occurrence of `member`) hold `community_key_id`'s epoch keys? The ONE
     /// audience rule over the member's newest active row for the device.
@@ -2446,8 +2512,7 @@ pub mod orchestrate {
     where
         B: FederationDirectory + Sync,
     {
-        let Some(occ) = backend
-            .list_identity_occurrences_active(member_key_id)
+        let Some(occ) = crate::federation::replication_audience::devices_of(backend, member_key_id)
             .await?
             .into_iter()
             .filter(|o| o.occurrence_key_id == device)
@@ -2472,19 +2537,30 @@ pub mod orchestrate {
     where
         B: FederationDirectory + Sync,
     {
-        if !backend
+        // The owner relation: `owner_of(device) == member` (the live owner
+        // binding, the device's cosignature required; ambiguous = no owner).
+        match crate::federation::admission::owner_of_unmarked(backend, device).await {
+            Ok(owner) if owner.as_deref() == Some(member_key_id) => {}
+            Ok(_) | Err(crate::federation::Error::AmbiguousNodeOwner { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        // v62.0.0 (v62 P5c; CC rc21 3.3.6, CC 6.1.5.3 "every node a person
+        // owns is one of that person's devices") — once the earlier form is
+        // shut, the owner relation IS the device relation: the `(person,
+        // node)` occurrence row is forbidden, so requiring it would refuse
+        // every device. What the device then receives is its class's and the
+        // owner's allow list's (the door's 4b, the sweep's audience rule).
+        if crate::federation::edition2::door::earlier_form_doors_shut() {
+            return Ok(true);
+        }
+        // The earlier form's rule, read only while its doors are open: the
+        // device must ALSO be an ACTIVE identity occurrence of the member (a
+        // node the member owns but does not speak through is not theirs).
+        Ok(backend
             .list_identity_occurrences_active(member_key_id)
             .await?
             .iter()
-            .any(|o| o.occurrence_key_id == device)
-        {
-            return Ok(false);
-        }
-        match crate::federation::admission::owner_of(backend, device).await {
-            Ok(owner) => Ok(owner.as_deref() == Some(member_key_id)),
-            Err(crate::federation::Error::AmbiguousNodeOwner { .. }) => Ok(false),
-            Err(e) => Err(e),
-        }
+            .any(|o| o.occurrence_key_id == device))
     }
 
     /// v50.0.0 (CIRISPersist#916) — the re-wrap itself, shared by the host's
@@ -2629,10 +2705,13 @@ pub mod orchestrate {
     ///    `device_rekey_owner_mismatch` (an ambiguous owner propagates
     ///    `AmbiguousNodeOwner`, fail-closed);
     /// 2. `authority_key_id` must be that owner — `device_rekey_authority_not_owner`;
-    /// 3. the device must be an ACTIVE identity occurrence of the member (the
-    ///    seal fan-out's definition of a member's device) —
+    /// 3. the device must be the member's device —
     ///    `device_rekey_not_an_occurrence` (retryable: the occurrence may not
-    ///    have replicated yet);
+    ///    have replicated yet). v62.0.0 (v62 P5c): once the earlier form is
+    ///    shut, a node the member OWNS (rule 1's live owner binding) is their
+    ///    device, since the `(person, node)` occurrence is forbidden (CC rc21
+    ///    3.3.6); while the earlier form is open the earlier rule stands (an
+    ///    ACTIVE identity occurrence of the member as well);
     /// 4. the member must be on the room's authorized roster at `as_of`
     ///    (`authorized_community_roster_at`) — `device_rekey_member_not_active`;
     /// 5. the device must resolve valid `encryption_pubkeys` — else
@@ -2679,7 +2758,9 @@ pub mod orchestrate {
                 crate::federation::DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER,
             ));
         }
-        // 3 — a device the member speaks through, not infrastructure they own.
+        // 3 — the member's device: the owner relation once the earlier form
+        // is shut; while it is open, also an active occurrence of the member
+        // (`is_member_device`).
         if !is_member_device(backend, member_key_id, new_occurrence_key_id).await? {
             return Err(refuse(
                 crate::federation::DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE,
@@ -2857,12 +2938,13 @@ pub mod orchestrate {
                 if !devices_of.contains_key(member) {
                     let candidates: Vec<String> = match only {
                         Some((_, d)) => vec![d.to_owned()],
-                        None => backend
-                            .list_identity_occurrences_active(member)
-                            .await?
-                            .into_iter()
-                            .map(|o| o.occurrence_key_id)
-                            .collect(),
+                        None => {
+                            crate::federation::replication_audience::devices_of(backend, member)
+                                .await?
+                                .into_iter()
+                                .map(|o| o.occurrence_key_id)
+                                .collect()
+                        }
                     };
                     let mut devices = Vec::new();
                     for d in candidates {

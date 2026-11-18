@@ -1713,7 +1713,54 @@ pub fn check_namespace_family_registered(namespace: &str) -> Result<(), Error> {
     })
 }
 
+/// v62.0.0 (P4, CC rc20 3.4.7) — **where the emitter's standing for a
+/// reserved family comes from**, for [`DimensionAdmissionPolicy`].
+///
+/// CC rc20 3.4.7: "No key declares itself into a duty. `identity_type` on a
+/// key record is the key's own statement about itself. No admission decision
+/// reads it to open a reserved family." An edition-2 `key:record` is
+/// self-signed and its `identity_type` vocabulary is open (Verify's
+/// `check_key_record` takes any sorted text set), so for a row carrying an
+/// edition-2 statement the type-keyed layers cannot decide standing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmitterStanding {
+    /// The earlier form: the attester's `identity_type`, whose privileged
+    /// members were gated at the earlier-form key doors
+    /// (`check_privileged_identity_type_admission` and its siblings).
+    Declared,
+    /// Edition 2: standing is CONFERRED. The `accord:*` layer and every
+    /// reserved-prefix rule that names a delegation scope are not decided
+    /// here; [`check_reserved_prefix_admission`] decides them on the
+    /// conferral plane CC names (the genesis bundle in force for `accord:*`,
+    /// the scope's delegation from a root this node trusts for the rest).
+    Conferred,
+}
+
 impl DimensionAdmissionPolicy {
+    /// v62.0.0 (P4, I3080) — [`Self::check`] for a row carrying an edition-2
+    /// statement ([`EmitterStanding::Conferred`]): every layer runs except
+    /// the ones that would read `attesting_identity_type` to open a reserved
+    /// family whose duty CC confers elsewhere. Those are re-asked, on their
+    /// conferral plane, by [`check_reserved_prefix_admission`] at tier 4 of
+    /// the same plan.
+    ///
+    /// # Errors
+    /// As [`Self::check`], less [`Error::AccordDimensionRequiresAccordHolder`]
+    /// and the scoped [`Error::ReservedPrefixEmitterMismatch`] arms.
+    pub fn check_conferred(
+        &self,
+        attn_type: &str,
+        dimension: Option<&str>,
+        attesting_identity_type: &str,
+    ) -> Result<(), Error> {
+        self.check_with(
+            attn_type,
+            dimension,
+            attesting_identity_type,
+            EmitterStanding::Conferred,
+        )
+    }
+
     /// Run both layers (the `accord:*` × `accord_holder` rule and
     /// the four-test gate) against an incoming attestation.
     ///
@@ -1739,6 +1786,23 @@ impl DimensionAdmissionPolicy {
         dimension: Option<&str>,
         attesting_identity_type: &str,
     ) -> Result<(), Error> {
+        self.check_with(
+            attn_type,
+            dimension,
+            attesting_identity_type,
+            EmitterStanding::Declared,
+        )
+    }
+
+    /// [`Self::check`] / [`Self::check_conferred`]: one body, the standing
+    /// source named.
+    fn check_with(
+        &self,
+        attn_type: &str,
+        dimension: Option<&str>,
+        attesting_identity_type: &str,
+        standing: EmitterStanding,
+    ) -> Result<(), Error> {
         if attn_type != attestation_type::SCORES {
             // v53.0.0 (CIRISPersist#975, CC 2.4 ask 3) — "the dimension gate
             // follows the dimension, not the row type". A `dimension` on one of
@@ -1758,7 +1822,7 @@ impl DimensionAdmissionPolicy {
             let Some(dim) = dimension.map(str::trim).filter(|d| !d.is_empty()) else {
                 return Ok(());
             };
-            return match self.check_dimension(dim, attesting_identity_type) {
+            return match self.check_dimension(dim, attesting_identity_type, standing) {
                 Ok(()) => Ok(()),
                 Err(e) => match crate::federation::row_type::enforcement() {
                     crate::federation::row_type::RowTypeEnforcement::Enforce => Err(e),
@@ -1779,17 +1843,31 @@ impl DimensionAdmissionPolicy {
                 reason: DimensionRejectionReason::EmptyOrMissingDimension.as_str(),
             });
         }
-        self.check_dimension(dim, attesting_identity_type)
+        self.check_dimension(dim, attesting_identity_type, standing)
     }
 
     /// The dimension tests themselves, over a non-empty `dim` — shared by the
     /// `scores` path and (CC 2.4 ask 3) a composer that carries a dimension.
-    fn check_dimension(&self, dim: &str, attesting_identity_type: &str) -> Result<(), Error> {
+    fn check_dimension(
+        &self,
+        dim: &str,
+        attesting_identity_type: &str,
+        standing: EmitterStanding,
+    ) -> Result<(), Error> {
         // Layer 1 — the `accord:*` × `accord_holder` constitutional
         // rule. FSD-002 §4.1 + §7.1. Checked first because it
         // produces a distinct error variant downstream consumers
         // pattern-match on for the constitutional asymmetry case.
-        if dim.starts_with("accord:") && attesting_identity_type != identity_type::ACCORD_HOLDER {
+        //
+        // v62.0.0 (P4, I3082) — under `EmitterStanding::Conferred` (an
+        // edition-2 row) this layer is not asked: the signer's `accord_holder`
+        // label is its own statement, and the standing is the genesis bundle
+        // in force for the row's `accord_root`, which
+        // `check_reserved_prefix_admission` reads (CC rc20 3.4.7, 3.4.1).
+        if standing == EmitterStanding::Declared
+            && dim.starts_with("accord:")
+            && attesting_identity_type != identity_type::ACCORD_HOLDER
+        {
             return Err(Error::AccordDimensionRequiresAccordHolder {
                 dimension: dim.to_string(),
                 identity_type: attesting_identity_type.to_string(),
@@ -1810,6 +1888,17 @@ impl DimensionAdmissionPolicy {
         // operator owns.
         for rule in &self.reserved_prefix_rules {
             if dim.starts_with(rule.pattern_prefix.as_str()) {
+                // v62.0.0 (P4, I3080) — an edition-2 row's duty under a
+                // rule that names a delegation scope is CONFERRED (CC rc20
+                // 3.4.7: `infra:detect` for `detection:*`, ...), never read
+                // off the signer's own `identity_type`. The first matching
+                // rule governs, so stop here; tier 4's
+                // `check_reserved_prefix_admission` resolves the scope.
+                if standing == EmitterStanding::Conferred
+                    && rule.required_delegation_scope.is_some()
+                {
+                    break;
+                }
                 // CC 3.4.7.1 — `identity_type` is a SET; the gate is
                 // satisfied iff a required role is a MEMBER of the
                 // attester's role-set (not scalar equality). For a
@@ -3234,10 +3323,10 @@ pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), E
 ///   a hash-covered field, and the promoted `persist_row_hash` already covers
 ///   the value the local write resolved. Re-running it would let a
 ///   later-changing delegation silently rewrite a stored row's audit metadata.
-/// - **[`check_single_node_owner_admission`].** Its own doc pins the
-///   precondition: *"The incoming row is NOT yet stored (this runs
-///   pre-insert)"*. At promotion the row IS stored, so the incumbent set it
-///   walks is no longer the set it was written to reason about.
+/// - **[`check_owner_binding_roster_fresh`].** A receipt bound (W) on the
+///   row's first arrival; at promotion the row IS stored, and the owner seat
+///   it reads already counts it. (v62.0.0: it replaced the single-owner gate,
+///   which the kernel's owner seat decides.)
 /// - **The trust-charter gates.** Same class: they classify a row entering the
 ///   corpus, and a promoted row is already in it.
 ///
@@ -3349,6 +3438,8 @@ pub async fn check_promotion_admission(
     // the promotion chokepoint too: a local-tier licence does not cross with a
     // malformed payload, an unsorted or repeated set, or a processor id.
     super::operational::check_licence_payload(row)?;
+    // v62 (CC rc21, CC 3.1) — the key-segment gate at the promotion chokepoint.
+    super::namespace::key_segment::check_dimension_key_segments(&row.attestation_envelope)?;
     check_capacity_consent_admission(directory, row, crate::host::clock::now()).await?;
 
     // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`
@@ -3421,16 +3512,20 @@ pub async fn check_promotion_admission(
     // is cosigned under its protocol; the roster is directory state that can
     // have changed since the local write.
     check_owner_binding_affiliation_admission(directory, row).await?;
+    // v62.0.0 (wave V1b) — an edition-2 owner binding is counted: the
+    // owner's, the bound key's and (naming one) the affiliation's voices.
+    check_owner_binding_counted(directory, row).await?;
+    // v62.0.0 (wave V1b, CC 4.4.3.12) — a counted officer appointment waits
+    // for the affiliation's quorum at the head it names.
+    check_officer_appointment_counted(directory, row).await?;
 
-    // CC 4.1.1 — the cycle-closing `delegates_to` is refused (v54.0.0,
-    // CIRISPersist#1031). Re-run at promotion: the walks read the federation
-    // tier only, so a local edge closes a cycle at the moment it is promoted.
     // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — a term-bearing
     // `delegates_to` carries a bounded term. Re-run here: whether the
     // community an edge names is an affiliation, and its `role_term`, are
     // directory state that can have changed since the local write.
+    // (v62.0.0, kernel pass 2: the v54 cycle gate that ran here is deleted;
+    // the kernel's walk visits a cycle once.)
     check_delegation_term_admission(directory, row).await?;
-    check_delegation_cycle_admission(directory, row, crate::host::clock::now()).await?;
 
     // CC 5.4.6 / CC 3.4.13 Q5 — a minor's owner-binding is never announced
     // (v50.0.0, CIRISPersist#924). Re-run here because "admission MUST refuse
@@ -4659,7 +4754,7 @@ async fn licence_roots_at(
 /// the one shared count), evaluated under `c`'s own `consensus_protocol`
 /// ([`super::consensus::evaluate`], `Direction::Add`: an issuance confers).
 /// The question is asked about the SIGNERS, never about the row's subject.
-async fn community_quorum_cosigned_at(
+pub(crate) async fn community_quorum_cosigned_at(
     directory: &dyn super::FederationDirectory,
     c: &super::Community,
     row: &super::Attestation,
@@ -4670,13 +4765,10 @@ async fn community_quorum_cosigned_at(
     ))
     .await?;
     let keys: Vec<String> = roster.iter().map(|m| m.key_id.clone()).collect();
-    let signers = super::reverse_quorum::count_distinct_roster_scrubs(
-        directory,
-        &row.attestation_envelope,
-        &row.scrubs(),
-        &keys,
-    )
-    .await;
+    // v62.0.0 (wave V1, I3281) — an edition-2 row's cosigners are its
+    // voices (`edition2::voices`); an earlier-form row's scrub set stays
+    // behind the earlier-form switch.
+    let signers = super::edition2::voices::counted_roster_signers(directory, row, &keys).await?;
     if signers.is_empty() {
         return Ok(false);
     }
@@ -4751,8 +4843,16 @@ async fn community_quorum_at_head(
     ) else {
         return Ok(false);
     };
-    let voices =
-        super::cosign::edition2_voices(directory, &super::edition2::names::RowId(row_id)).await?;
+    // v62.0.0 (wave V1b) — every voice of the row: the held ones, the one it
+    // carries and the one the door is offering now (`edition2::voices`), so a
+    // row is counted as its voices arrive, before any of them is kept.
+    let voices: std::collections::BTreeSet<String> = if super::edition2::voices::carried_row_id(row)
+        .is_some()
+    {
+        super::edition2::voices::row_voice_issuers(directory, row).await?
+    } else {
+        super::cosign::edition2_voices(directory, &super::edition2::names::RowId(row_id)).await?
+    };
     let signers: std::collections::BTreeSet<String> = version
         .members
         .iter()
@@ -4782,6 +4882,301 @@ async fn community_quorum_at_head(
         high_water: None,
     })
     .admits())
+}
+
+/// v62.0.0 (wave V1b; CC 4.4.3.12 "two consents", the second ruling) —
+/// **does an officer appointment stand at `t`?** The root-edge test of
+/// [`quorum_licence_reach`], the one place an affiliation officer's standing
+/// is read:
+///
+/// - an edition-2 COUNTED appointment (a `self:delegates_to` with no
+///   `author`, [`is_counted_officer_appointment_row`]): the affiliation's
+///   quorum counted over its roster at the head the edge names
+///   ([`community_quorum_at_head`]; no head, no quorum) AND the officer's own
+///   `membership:acceptance` of it, held by `t`
+///   ([`membership_acceptance::officer_accepted_at`](super::membership_acceptance::officer_accepted_at)).
+///   The two consents are separate rows; the seat stands only when both hold.
+/// - any other edge (an authored one, or the earlier form): cosigned under
+///   the protocol at `t`, as before ([`community_quorum_cosigned_at`]).
+async fn appointment_stands_at(
+    directory: &dyn super::FederationDirectory,
+    c: &super::Community,
+    edge: &super::Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error> {
+    if !is_counted_officer_appointment_row(edge) {
+        return community_quorum_cosigned_at(directory, c, edge, t).await;
+    }
+    Ok(group_act_at(directory, c, edge, t).await?
+        && super::membership_acceptance::officer_accepted_at(directory, edge, t).await?)
+}
+
+/// v62.0.0 (wave V1b; CC 4.4.3.12, CC 2.4.1.1) — **is `row` an act of
+/// `c`'s quorum at `t`?** A COUNTED edition-2 row (statement-carrying, no
+/// `author`: an appointment, or the group's withdrawal of one) is counted over
+/// the roster at the head it names ([`community_quorum_at_head`]; no head, no
+/// act); any other row is cosigned under the protocol at `t`
+/// ([`community_quorum_cosigned_at`]).
+async fn group_act_at(
+    directory: &dyn super::FederationDirectory,
+    c: &super::Community,
+    row: &super::Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error> {
+    if super::edition2::voices::carried_row_id(row).is_none()
+        || row.attestation_envelope.get("author").is_some()
+    {
+        return community_quorum_cosigned_at(directory, c, row, t).await;
+    }
+    let Some(head) = edition2_named_head(row) else {
+        return Ok(false);
+    };
+    community_quorum_at_head(directory, c, row, &head, t).await
+}
+
+/// v62.0.0 (wave V1b) — the plane a counted licence withdrawal's refusals
+/// carry (`malformed_row::LICENCE_WITHDRAWAL_SHORT`,
+/// `malformed_row::LICENCE_WITHDRAWAL_NO_HEAD`).
+pub const LICENCE_WITHDRAWAL_PLANE: &str = "licence_withdrawal";
+
+/// v62.0.0 (wave V1b; CC 2.4.1.1) — **the group a COUNTED act is the act
+/// of**: a statement-carrying row with no `author` (act=group), not itself a
+/// `withdraws`, whose group is named either by a cohort target
+/// ([`envelope_cohort_target`]: an affiliation's officer appointment,
+/// [`is_counted_officer_appointment_row`]) or, for a counted
+/// `licensure:{authority}` row, by the authority its dimension names (a key
+/// authority's bare thumbprint segment read back as its identity-ref,
+/// [`key_segment::identity_ref_of`](super::namespace::key_segment::identity_ref_of)
+/// via [`licensure::authority_of`](crate::federation::licensure::authority_of)).
+/// The bool is `true` for the dimension-named group, which is a group only
+/// when it resolves to a held community (a key authority has no quorum).
+#[must_use]
+pub fn counted_group_of(row: &super::Attestation) -> Option<(String, bool)> {
+    if super::edition2::voices::carried_row_id(row).is_none()
+        || row.attestation_type == attestation_type::WITHDRAWS
+        || row.attestation_envelope.get("author").is_some()
+    {
+        return None;
+    }
+    if let Some(named) = envelope_cohort_target(&row.attestation_envelope)
+        .ok()
+        .flatten()
+    {
+        return Some((named.to_owned(), false));
+    }
+    envelope_dimension(&row.attestation_envelope)
+        .and_then(crate::federation::licensure::authority_of)
+        .map(|a| (a.into_owned(), true))
+}
+
+/// v62.0.0 (wave V1b; CC 2.4.1.1) — is `row` a COUNTED act of a named
+/// group ([`counted_group_of`])?
+#[must_use]
+pub fn is_counted_group_row(row: &super::Attestation) -> bool {
+    counted_group_of(row).is_some()
+}
+
+/// v62.0.0 (wave V1b; CC 4.4.3.12, CC 2.4.1.1) — **the withdrawal of a
+/// counted act is itself counted** at the same group's protocol (`named`:
+/// [`counted_group_of`] — the affiliation an appointment names, or the
+/// authority community a counted licence's dimension names), over the roster
+/// head the withdrawal names (`refs.head`), with the act as its
+/// `refs.target`. The act's own subject's withdrawal is refused first
+/// (CLM-licence-contest). Only the group's counted
+/// withdrawal (a statement-carrying `withdraws` with no `author`) is
+/// admitted: short of the quorum it notes a shortfall, so the door keeps the
+/// voice and answers `Pending`; met, it lands (rule 1 when its first voice
+/// signed the appointment, else 4). Any other `withdraws` of a counted
+/// appointment, a lone member's own included, is refused
+/// (`WithdrawsNotAdmitted`): a group's act is never undone by one key. The
+/// officer's own exit is their `membership:decline`, which ends the seat
+/// ([`membership_acceptance::officer_accepted_at`](super::membership_acceptance::officer_accepted_at)).
+///
+/// # Errors
+///
+/// [`Error::WithdrawsNotAdmitted`]; [`Error::InvalidArgument`] prefixed
+/// [`OFFICER_APPOINTMENT_REFUSED`] (no `refs.head`) or
+/// [`OFFICER_APPOINTMENT_SHORT`] (outside the door's attempt); directory
+/// reads.
+async fn check_counted_withdrawal(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    target: &super::Attestation,
+    named: &str,
+) -> Result<Option<u8>, Error> {
+    // v62.0.0 (wave V1b) — a counted licence's withdrawal carries its own
+    // tokens (`malformed_row::LICENCE_WITHDRAWAL_*`).
+    let licence = envelope_dimension(&target.attestation_envelope)
+        .is_some_and(|d| d.starts_with(crate::federation::licensure::LICENSURE_DIMENSION_PREFIX));
+    let not_admitted = || Error::WithdrawsNotAdmitted {
+        issuer: row.attesting_key_id.clone(),
+        target_attestation_id: target.attestation_id.clone(),
+        beyond_delegation_depth_cap: false,
+    };
+    // CLM-licence-contest (CC 2.4.1.1 rule 0 carve-out) — the act's own
+    // subject never withdraws it, counted or not: a licensee contests by
+    // `reconsideration:{grounds}`, an officer exits by declining.
+    if row.attesting_key_id == target.attested_key_id
+        || target.subject_key_ids.contains(&row.attesting_key_id)
+    {
+        return Err(not_admitted());
+    }
+    if super::edition2::voices::carried_row_id(row).is_none()
+        || row.attestation_envelope.get("author").is_some()
+    {
+        return Err(not_admitted());
+    }
+    let short = match directory.lookup_community(named).await? {
+        None => format!("the group {named:?} (not held yet)"),
+        Some(c) => {
+            let Some(head) = edition2_named_head(row) else {
+                if licence {
+                    return Err(Error::malformed_row(
+                        LICENCE_WITHDRAWAL_PLANE,
+                        super::malformed_row::LICENCE_WITHDRAWAL_NO_HEAD,
+                        format!(
+                            "withdrawal {} of the counted licence {} names no `refs.head`: the \
+                             authority's counted withdrawal is counted over the roster version \
+                             it names (CC 2.4.1.1)",
+                            row.attestation_id, target.attestation_id
+                        ),
+                    ));
+                }
+                return Err(Error::InvalidArgument(format!(
+                    "{OFFICER_APPOINTMENT_REFUSED}: withdrawal {} of appointment {} names no \
+                     `refs.head`: a counted withdrawal is counted over the roster version it \
+                     names (CC 4.4.3.12, CC 2.4.1.1)",
+                    row.attestation_id, target.attestation_id
+                )));
+            };
+            if community_quorum_at_head(directory, &c, row, &head, row.asserted_at).await? {
+                return Ok(Some(if row.attesting_key_id == target.attesting_key_id {
+                    1
+                } else {
+                    4
+                }));
+            }
+            format!(
+                "the group {named:?}'s quorum ({:?}) at the roster head it names",
+                c.consensus_protocol
+            )
+        }
+    };
+    super::edition2::voices::note_short();
+    if licence {
+        return Err(Error::malformed_row(
+            LICENCE_WITHDRAWAL_PLANE,
+            super::malformed_row::LICENCE_WITHDRAWAL_SHORT,
+            format!(
+                "withdrawal {} of the counted licence {} waits for {short} (CC 2.4.1.1)",
+                row.attestation_id, target.attestation_id
+            ),
+        ));
+    }
+    Err(Error::InvalidArgument(format!(
+        "{OFFICER_APPOINTMENT_SHORT}: withdrawal {} of appointment {} waits for {short} (CC \
+         4.4.3.12, CC 2.4.1.1)",
+        row.attestation_id, target.attestation_id
+    )))
+}
+
+/// v62.0.0 (wave V1b; CC 4.4.3.12) — is `row` an affiliation officer
+/// appointment as a COUNTED edition-2 row: a statement-carrying
+/// `delegates_to` that is not an owner binding, carries no `author`, and
+/// names a community ([`envelope_cohort_target`])?
+#[must_use]
+pub fn is_counted_officer_appointment_row(row: &super::Attestation) -> bool {
+    row.attestation_type == attestation_type::DELEGATES_TO
+        && super::edition2::voices::carried_row_id(row).is_some()
+        && !is_owner_binding_envelope(&row.attestation_envelope)
+        && row.attestation_envelope.get("author").is_none()
+        && envelope_cohort_target(&row.attestation_envelope)
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+/// v62.0.0 (wave V1b) — the prefix of [`check_officer_appointment_counted`]'s
+/// shortfall: `officer_appointment_short: …`, an [`Error::InvalidArgument`]
+/// (Python `ValueError`). At the edition-2 door it is never seen: the
+/// appointment waits (`Pending`).
+pub const OFFICER_APPOINTMENT_SHORT: &str = "officer_appointment_short";
+
+/// v62.0.0 (wave V1b) — the prefix of [`check_officer_appointment_counted`]'s
+/// terminal refusal: `officer_appointment_refused: …`, an
+/// [`Error::InvalidArgument`] (Python `ValueError`).
+pub const OFFICER_APPOINTMENT_REFUSED: &str = "officer_appointment_refused";
+
+/// v62.0.0 (wave V1b; CC 4.4.3.12 "two consents", the second ruling) —
+/// **an affiliation's officer appointment is a counted row.** A COUNTED
+/// `self:delegates_to` ([`is_counted_officer_appointment_row`]) lands only
+/// when the affiliation members' voices meet its `consensus_protocol` over
+/// its roster at the head the appointment names (`refs.head`,
+/// [`community_quorum_at_head`]). Short, the gate notes a shortfall, so the
+/// door keeps the voice and answers `Pending` (no typed row); an affiliation
+/// not held yet also waits. Never refused for a shortfall.
+///
+/// Refused (terminal): a counted appointment naming a community that is not
+/// an affiliation, or naming no `refs.head` (counted over no roster version,
+/// it can never land). The officer's consent is NOT a voice here: it is the
+/// officer's own `membership:acceptance` row, read where the seat is read
+/// ([`appointment_stands_at`]). An authored `self:delegates_to` (one key's
+/// own delegation) is untouched.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] prefixed [`OFFICER_APPOINTMENT_SHORT`] (outside
+/// the door's attempt) or [`OFFICER_APPOINTMENT_REFUSED`]; directory reads.
+pub async fn check_officer_appointment_counted(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if !is_counted_officer_appointment_row(row) {
+        return Ok(());
+    }
+    let Some(named) = envelope_cohort_target(&row.attestation_envelope)? else {
+        return Ok(());
+    };
+    let refuse = |detail: String| {
+        Err(Error::InvalidArgument(format!(
+            "{OFFICER_APPOINTMENT_REFUSED}: appointment {} of {} names {named:?}: {detail} \
+             (CC 4.4.3.12)",
+            row.attestation_id, row.attested_key_id
+        )))
+    };
+    let short = match directory.lookup_community(named).await? {
+        None => Some(format!("the affiliation {named:?} (not held yet)")),
+        Some(c) => {
+            if crate::federation::affiliation_config::declared_cohort(&c)?
+                != super::cohort::Cohort::Affiliations
+            {
+                return refuse("it does not declare cohort_scope: affiliations".to_owned());
+            }
+            let Some(head) = edition2_named_head(row) else {
+                return refuse(
+                    "it names no `refs.head`: a counted appointment is counted over the roster \
+                     version it names"
+                        .to_owned(),
+                );
+            };
+            if community_quorum_at_head(directory, &c, row, &head, row.asserted_at).await? {
+                None
+            } else {
+                Some(format!(
+                    "the affiliation {named:?}'s quorum ({:?}) at the roster head it names",
+                    c.consensus_protocol
+                ))
+            }
+        }
+    };
+    let Some(short) = short else {
+        return Ok(());
+    };
+    super::edition2::voices::note_short();
+    Err(Error::InvalidArgument(format!(
+        "{OFFICER_APPOINTMENT_SHORT}: appointment {} of {} waits for {short} (CC 4.4.3.12)",
+        row.attestation_id, row.attested_key_id
+    )))
 }
 
 /// v60.0.0 (CIRISPersist#1036 item 1) — **the `license` walk rooted at a
@@ -4851,13 +5246,13 @@ async fn quorum_licence_reach(
             if crate::federation::precedence::references_attestation_id_from_envelope(
                 &w.attestation_envelope,
             ) == Some(edge.attestation_id.as_str())
-                && community_quorum_cosigned_at(directory, c, w, w.asserted_at).await?
+                && group_act_at(directory, c, w, w.asserted_at).await?
             {
                 retracted = true;
                 break;
             }
         }
-        if !retracted && community_quorum_cosigned_at(directory, c, &edge, t).await? {
+        if !retracted && appointment_stands_at(directory, c, &edge, t).await? {
             roots.push(edge);
         }
     }
@@ -5272,10 +5667,8 @@ pub async fn licences_issued_under(
             }
         }
     }
-    let prefix = format!(
-        "{}{authority_id}",
-        crate::federation::licensure::LICENSURE_DIMENSION_PREFIX
-    );
+    // v62 (CC rc21) — a key authority is its bare segment in the dimension.
+    let prefix = crate::federation::licensure::licensure_stem_of(authority_id);
     let mut out: Vec<super::Attestation> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for issuer in &issuers {
@@ -5291,6 +5684,7 @@ pub async fn licences_issued_under(
             // the authority is the dimension's own segment, read exactly.
             let names_authority = envelope_dimension(&row.attestation_envelope)
                 .and_then(crate::federation::licensure::authority_of)
+                .as_deref()
                 == Some(authority_id);
             if names_authority
                 && seen.insert(row.attestation_id.clone())
@@ -5365,6 +5759,7 @@ pub async fn check_licensure_delegator_is_authority(
     let Some(authority_id) = crate::federation::licensure::authority_of(dimension) else {
         return Ok(());
     };
+    let authority_id: &str = &authority_id;
     // v54.0.0 (Codex round 3 on PR #1050) — resolved BEFORE any shortcut. A
     // community's id can also resolve to a key (an infrastructure community's
     // id IS its substrate key, `is_authorized_infrastructure_community`), and
@@ -5418,13 +5813,17 @@ pub async fn check_licensure_delegator_is_authority(
             .await?;
             if roster.iter().any(|m| m.key_id == row.attesting_key_id) {
                 let keys: Vec<String> = roster.iter().map(|m| m.key_id.clone()).collect();
-                let signers = super::reverse_quorum::count_distinct_roster_scrubs(
-                    directory,
-                    &row.attestation_envelope,
-                    &row.scrubs(),
-                    &keys,
-                )
-                .await;
+                // v62.0.0 (wave V1) — the signers reported are the row's
+                // voices for an edition-2 row (`edition2::voices`).
+                let signers =
+                    super::edition2::voices::counted_roster_signers(directory, row, &keys).await?;
+                // v62.0.0 (wave V1b) — the voices are short: the door keeps
+                // this voice and the row waits for the rest (`Pending`). Only
+                // a row that names its roster head can ever be counted (CC
+                // 2.7.4); one that names none is refused, as before.
+                if edition2_named_head(row).is_some() {
+                    super::edition2::voices::note_short();
+                }
                 return Err(Error::LicensureShortOfAuthorityQuorum {
                     attesting_key_id: row.attesting_key_id.clone(),
                     authority_id: authority_id.to_owned(),
@@ -5488,6 +5887,7 @@ pub async fn check_partner_record_revision(
     else {
         return Ok(());
     };
+    let authority_id: &str = &authority_id;
     let authority = resolve_licensure_authority(directory, authority_id).await?;
     if !licensure_issuance_at(directory, &authority, row, row.asserted_at)
         .await?
@@ -5495,10 +5895,8 @@ pub async fn check_partner_record_revision(
     {
         return Ok(());
     }
-    let prefix = format!(
-        "{}{authority_id}",
-        crate::federation::licensure::LICENSURE_DIMENSION_PREFIX
-    );
+    // v62 (CC rc21) — a key authority is its bare segment in the dimension.
+    let prefix = crate::federation::licensure::licensure_stem_of(authority_id);
     let mut held = Vec::new();
     let mut pages = AttestationQuery::to(&row.attested_key_id, FOLD_PAGE)
         .dimension_prefix(&prefix)
@@ -5511,6 +5909,7 @@ pub async fn check_partner_record_revision(
         if h.attestation_id == row.attestation_id
             || envelope_dimension(&h.attestation_envelope)
                 .and_then(crate::federation::licensure::authority_of)
+                .as_deref()
                 != Some(authority_id)
         {
             continue;
@@ -5625,6 +6024,7 @@ pub async fn check_licence_audience(
     else {
         return Ok(());
     };
+    let authority_id: &str = &authority_id;
     let refuse = |reason: &'static str, detail: String| {
         Err(Error::InvalidArgument(format!(
             "{LICENCE_AUDIENCE_REFUSED}: {reason}: licence {} under {authority_id:?}: {detail} \
@@ -5655,6 +6055,7 @@ pub async fn check_licence_audience(
         };
         if envelope_dimension(&original.attestation_envelope)
             .and_then(crate::federation::licensure::authority_of)
+            .as_deref()
             != Some(authority_id)
             || original.attested_key_id != row.attested_key_id
         {
@@ -5821,11 +6222,12 @@ pub fn check_config_sensitive_leaf_floor(row: &super::Attestation) -> Result<(),
 ///
 /// [`owner_of`] is the CC 3.2 purpose-filtered resolution: the single live
 /// `delegates_to(U → node)` carrying the owner-binding dimension, and at most
-/// one such `U` ([`check_single_node_owner_admission`] is what keeps it
-/// single). [`steward_bindings_of`] is multi-parent **by design** and would
-/// admit any co-steward. The clause says `owner_of`; the two sets are not the
-/// same set, and reading the wider one here would let a co-steward of a node
-/// speak for its configuration — a widening nobody ratified.
+/// one such `U` (v62.0.0: the kernel's owner seat reads two counted owners as
+/// none, [`Error::AmbiguousNodeOwner`]). [`steward_bindings_of`] is
+/// multi-parent **by design** and would admit any co-steward. The clause says
+/// `owner_of`; the two sets are not the same set, and reading the wider one
+/// here would let a co-steward of a node speak for its configuration — a
+/// widening nobody ratified.
 ///
 /// Occurrence→identity resolution ([`admission_identity_for_writer`]) is
 /// deliberately NOT applied either. It would lift a node writer to its OWNER,
@@ -5923,11 +6325,18 @@ pub async fn check_config_self_or_owner_admission<F: super::FederationDirectory 
     // Arm 2 — the subject's single live owner speaking for its instrument.
     // `owner_of` propagates `Error::AmbiguousNodeOwner`; see the doc above for
     // why that is NOT collapsed into the refusal below.
+    // v62.0.0 (wave G0; CC 2.7.3) — the owner seat is read from OTHER rows
+    // (the owner binding and the node's voice over it): an unseated or
+    // ambiguous owner holds the row, which concludes nothing until the
+    // binding lands, and un-concludes when it is withdrawn.
+    // (An ambiguous owner is held by `owner_of` itself: `owner_ambiguous`.)
     let owner = owner_of(directory, &row.attested_key_id).await?;
     if owner.as_deref() == Some(row.attesting_key_id.as_str()) {
         return Ok(());
     }
-    Err(Error::InvalidArgument(format!(
+    Err(super::edition2::fold::hold(
+        super::edition2::fold::reason::OWNER_UNSEATED,
+        Error::InvalidArgument(format!(
         "{dimension} is a SELF-REPORT (CC 3.4.5): attesting_key_id {:?} is neither the attested \
          subject {:?} nor its live owner_of ({}) — a third-party assertion of what a node is \
          running is a rumour, and a peer that can mint one can make a healthy node look like it \
@@ -5938,7 +6347,8 @@ pub async fn check_config_self_or_owner_admission<F: super::FederationDirectory 
             || "the node has no live owner-binding".to_owned(),
             |o| format!("{o:?}")
         ),
-    )))
+    )),
+    ))
 }
 
 /// v25.1.0 (CIRISPersist#569) — the `capacity:*` prefix, named once. The
@@ -6090,7 +6500,7 @@ pub fn consent_gated_family(dimension: &str) -> Option<ConsentGatedFamily> {
     // integrity, log infrastructure, self-reports, and the `rollback_detected:`
     // adversarial detector) per CC 3.4.5's per-family disposition, plus every
     // role-gated abuse-response family outside it (`detection:*` /
-    // `moderation:*` / `slashing:*`, `revocation:peer_admission:v1`).
+    // `moderation:*` / `slashing:*`, `revocation:peer_admission:*`).
     None
 }
 
@@ -6387,7 +6797,7 @@ impl From<ConsentGateRefused> for Error {
 /// - **Families outside [`consent_gated_family`].** CC#46's own scope
 ///   boundary. An abuser never consents to `detection:*` / `moderation:*` /
 ///   `slashing:*`, and a uniform application of this rule would delete the
-///   abuse-response plane. `revocation:peer_admission:v1` (AV-77) is likewise
+///   abuse-response plane. `revocation:peer_admission:*` (AV-77) is likewise
 ///   untouched.
 /// - **CIRISVerify's entire namespace**, per CC 3.4.5's per-family
 ///   disposition: the self-reports and log-infrastructure families have no
@@ -6986,11 +7396,25 @@ where
             k.identity_type == super::types::identity_type::NODE
                 || k.claims_role(super::types::identity_type::NODE)
         });
-    let acts_for = if is_node {
+    // v62.0.0 (v62 P5c; CC rc21 3.3.6) — once the earlier form is shut an
+    // AGENT key, like a node key, acts for a person only through its owner
+    // binding (an agent is never an occurrence of a person), and the
+    // occurrence fold below counts no machine key under a person
+    // (`replication_audience::counted_occurrences`).
+    let is_agent = super::edition2::door::earlier_form_doors_shut()
+        && directory
+            .lookup_public_key(attesting_key_id)
+            .await?
+            .is_some_and(|k| {
+                super::types::identity_type::set_contains(
+                    &k.identity_type,
+                    super::types::identity_type::AGENT,
+                )
+            });
+    let acts_for = if is_node || is_agent {
         owner_of(directory, attesting_key_id).await?.as_deref() == Some(identity_key_id)
     } else {
-        directory
-            .list_identity_occurrences_active(identity_key_id)
+        super::replication_audience::counted_occurrences(directory, identity_key_id)
             .await?
             .iter()
             .any(|o| o.occurrence_key_id == attesting_key_id)
@@ -7358,12 +7782,30 @@ pub fn verify_touch_claim_admission(
     now: chrono::DateTime<chrono::Utc>,
     max_skew: chrono::Duration,
 ) -> Result<(), Error> {
-    let skew = claim.fresh_as_of - now;
+    check_touch_fresh_as_of_skew(claim.fresh_as_of, now, max_skew)
+}
+
+/// v62.0.0 (v62 P5b) — the freshness-floor skew guard over the instant
+/// alone: **reject `fresh_as_of > now + max_skew`**. The one rule both
+/// writes enforce: the earlier-form signed door
+/// ([`verify_touch_claim_admission`]) and the node-local write
+/// (`FederationDirectory::put_touch_claim_local`), so a node's own clock
+/// cannot jump its floor into the future either.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] beyond the tolerance.
+pub fn check_touch_fresh_as_of_skew(
+    fresh_as_of: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    max_skew: chrono::Duration,
+) -> Result<(), Error> {
+    let skew = fresh_as_of - now;
     if skew > max_skew {
         return Err(Error::InvalidArgument(format!(
-            "signed touch_claim: fresh_as_of {} is {}s ahead of now ({}), beyond the {}s skew \
+            "touch_claim: fresh_as_of {} is {}s ahead of now ({}), beyond the {}s skew \
              tolerance — a lying clock cannot jump the freshness floor into the future",
-            claim.fresh_as_of.to_rfc3339(),
+            fresh_as_of.to_rfc3339(),
             skew.num_seconds(),
             now.to_rfc3339(),
             max_skew.num_seconds(),
@@ -11033,7 +11475,7 @@ async fn issuer_owned_the_producer_when(
     target: &super::Attestation,
 ) -> Result<bool, Error> {
     let node = target.attesting_key_id.as_str();
-    match owner_of(directory, node).await {
+    match owner_of_unmarked(directory, node).await {
         Ok(Some(owner)) if owner == issuer => {}
         Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => return Ok(false),
         Err(e) => return Err(e),
@@ -11065,8 +11507,8 @@ pub async fn owner_granters_in_force_at(
 /// v60.0.0 (CIRISPersist#1062) — the owner-bindings over `node` IN FORCE at
 /// `t`, by the rule [`owner_granters_in_force_at`] documents (that fold is
 /// this one's granters).
-pub(crate) async fn owner_bindings_in_force_at(
-    directory: &dyn super::FederationDirectory,
+pub(crate) async fn owner_bindings_in_force_at<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
     node: &str,
     t: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<super::Attestation>, Error> {
@@ -11412,6 +11854,18 @@ pub(crate) async fn check_withdraws_admission_against(
     // v61 (CIRISPersist#991, CC 2.4.1.1) — a group-plane row (a cosigned
     // roster event) is retracted by a cosigned `withdraws` under the same
     // protocol; rules 1-4 do not decide it.
+    // v62.0.0 (wave V1b; CC 4.4.3.12, CC 2.4.1.1) — a counted affiliation
+    // appointment is withdrawn only by the group's counted withdrawal, held
+    // `Pending` until the quorum at the head it names.
+    // v62.0.0 (wave V1b; CC 2.4.1.1, CLM-licence-contest) — and so is a
+    // counted licence, at its authority community's protocol; a licence of
+    // a KEY authority (no community held under the id) is not a group's act
+    // and keeps the rules below.
+    if let Some((group, by_dimension)) = counted_group_of(target) {
+        if !by_dimension || directory.lookup_community(&group).await?.is_some() {
+            return check_counted_withdrawal(directory, row, target, &group).await;
+        }
+    }
     if let Some(rule) =
         crate::federation::group_plane::check_cosigned_withdraws(directory, row, target).await?
     {
@@ -12305,8 +12759,8 @@ pub(crate) async fn live_delegation_granter_instants<F: super::FederationDirecto
         // dimension OR the CC 2.4.1.2 `delegation_purpose: owner_binding`
         // marker (v13.3.0 #378). This is what keeps ownership single-valued
         // WITHOUT constraining act-on-behalf / hierarchy delegations (multi-
-        // parent per CC 4.5.13). Must match `check_single_node_owner_admission`
-        // exactly so the gate and the `owner_of` resolver agree on what an
+        // parent per CC 4.5.13). Must match `is_owner_binding_envelope`
+        // exactly so this fold and the `owner_of` resolver agree on what an
         // owner-binding IS.
         if matches!(
             filter,
@@ -12456,6 +12910,12 @@ async fn user_identity_anchors_of(
             continue;
         };
         if !identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
+            continue;
+        }
+        // v62.0.0 (v62 P5c; CC rc21 3.3.6) — a machine key under a person
+        // is no anchor once the earlier form is shut: an agent's human is
+        // its owner (the owner-binding half of the steward fold).
+        if !super::replication_audience::occurrence_counts(directory, &identity, k).await? {
             continue;
         }
         let active = directory
@@ -12611,6 +13071,9 @@ pub async fn steward_binding_paths_of(
     directory: &dyn super::FederationDirectory,
     k: &str,
 ) -> Result<std::collections::BTreeMap<String, Vec<StewardPath>>, Error> {
+    // v62.0.0 (wave G0; CC 2.7.3) — a fold reading k's stewards read every
+    // row about k (its bindings, its age witnesses, its occurrences).
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(k));
     let mut out: std::collections::BTreeMap<String, Vec<StewardPath>> =
         std::collections::BTreeMap::new();
     // v11.5.0 (CIRISPersist#306) — mirror `is_steward_bound`'s minor gate so
@@ -12751,7 +13214,7 @@ pub async fn nodes_stewarded_by(
 /// The distinct set of **live owner-binding granters** of `node` — the users
 /// `U` with a live `delegates_to(U → node)` carrying the CC 1.13.3.3 / CC 3.2
 /// owner-binding dimension ([`super::types::owner_binding::DIMENSION`]). The raw
-/// set behind [`owner_of`] + [`check_single_node_owner_admission`].
+/// set behind persist's pre-kernel owner fold (the differential's reference).
 ///
 /// Exactly [`live_delegation_granters`] restricted to the ownership dimension —
 /// not a parallel implementation of it. v25.x (CIRISPersist#578) wrote the
@@ -12786,6 +13249,84 @@ pub async fn serve_seat_owner_announced<F: super::FederationDirectory + ?Sized>(
     .is_empty())
 }
 
+/// v62.0.0 (v62 security ruling "A serve-seat node needs an announced owner";
+/// CC rc20 5.4.6, 3.2; ruling C) — **does `key_id` serve under its seat?**
+/// True iff `key_id` is an edition-2 identity-ref, it holds a seat (it is in
+/// `serve_nodes` of every genesis bundle in force,
+/// [`is_canonical_by_bundle`](super::edition2::genesis::is_canonical_by_bundle),
+/// and no canonical withdrawal is recorded for it), AND its owner is
+/// announced ([`serve_seat_owner_announced`]: a live owner binding carried at
+/// `cohort_scope: federation`).
+///
+/// CC 5.4.6: "While no such binding exists the node does not serve under the
+/// seat, refused `serve_seat_owner_unannounced`; nothing in the genesis bundle
+/// or the holders' ceremony carries or seeds the binding, which is the
+/// owner's own row." The genesis bundle seats a node with no owner, so the
+/// seat alone is never serve standing. The test is live (CC 2.7.5): an
+/// announcement made after seating satisfies it, and a withdrawn one stops
+/// satisfying it at once.
+///
+/// The SEAT is unchanged: [`is_canonical`] still answers "is this node
+/// seated", and the readers that must hold a seated node to the stricter
+/// rule whether or not it serves (the mock-trace refusal at ingest) keep
+/// reading it. What an unannounced seat loses is what it would serve with:
+/// the `Canonical` serve tier
+/// ([`resolve_serve_tier`](super::trust_root::resolve_serve_tier)) and
+/// trust-root reach for what it publishes
+/// ([`is_trust_root`](super::namespace::is_trust_root)), both through
+/// [`seat_serve_standing`]. Rows the node signs are admitted as before: a
+/// node's own accountability records (`hard_case:*`, revocations) do not
+/// depend on serve standing.
+///
+/// `false` for an earlier-form key id: an earlier-form canonical holds no
+/// bundle seat (see [`seat_serve_standing`]).
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn serves_under_seat<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    key_id: &str,
+) -> Result<bool, Error> {
+    if !ciris_verify_core::edition2::is_identity_ref(key_id) {
+        return Ok(false);
+    }
+    if !super::edition2::genesis::is_canonical_by_bundle(directory, key_id).await? {
+        return Ok(false);
+    }
+    // The seat as [`is_canonical_effective`] reads it: a quorum-withdrawn
+    // seat (the V095/V104 tombstone) serves nothing, owner or not.
+    if directory
+        .lookup_canonical_withdrawal(key_id)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    serve_seat_owner_announced(directory, key_id).await
+}
+
+/// v62.0.0 (CC rc20 5.4.6) — **the canonical serve standing a reader acts
+/// on**: for an edition-2 key, [`serves_under_seat`] (a seat AND an announced
+/// owner); for an earlier-form key, the earlier conferral read
+/// ([`is_canonical_effective`]), unchanged.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn seat_serve_standing(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+) -> Result<bool, Error> {
+    if ciris_verify_core::edition2::is_identity_ref(key_id) {
+        return serves_under_seat(directory, key_id).await;
+    }
+    // TODO(json-cut): the earlier-form canonical (a co-scrub conferral, no
+    // bundle seat) keeps its pre-v62 reading until the JSON doors close; its
+    // announced-owner question is in FSD/v62_wip/parallel/P5.md.
+    is_canonical_effective(directory, key_id).await
+}
+
 /// v61.1.0 (CIRISPersist#1163, CC 5.4.6) — **is `node_key_id` on the
 /// announced roster, and whose node is it?** The one question the CC 5.4.6
 /// public roster asks of a node: [`serve_seat_owner_announced`] (a live owner
@@ -12812,7 +13353,7 @@ pub async fn announced_owner_state<F: super::FederationDirectory + ?Sized>(
     if !serve_seat_owner_announced(directory, node_key_id).await? {
         return Ok(S::NotAnnounced);
     }
-    match owner_of(directory, node_key_id).await {
+    match owner_of_unmarked(directory, node_key_id).await {
         Ok(Some(owner)) => Ok(S::Announced {
             owner_key_id: owner,
         }),
@@ -12835,6 +13376,9 @@ pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
     node: &str,
     cosign: crate::kernel::owner::Cosign,
 ) -> Result<std::collections::BTreeSet<String>, Error> {
+    // v62.0.0 (wave G0; CC 2.7.3) — a fold reading the owner seat read every
+    // row about the node: one that lands or is withdrawn re-folds it.
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(node));
     let mut edges = Vec::new();
     let mut pages = AttestationQuery::to(node, FOLD_PAGE)
         .types(&[attestation_type::DELEGATES_TO])
@@ -12868,7 +13412,30 @@ pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
     // binding seats its own granter, independently of every other, so
     // filtering the holders by the `user` fact equals presenting only the
     // `user` granters' bindings
-    let view = crate::kernel::owner::owner_rows(node, &rows, &retractions, now, &|_| true, cosign);
+    // v62.0.0 (wave V1, I3283) — an edition-2 owner binding's signatures
+    // are its voices: the node's cosignature is the node's own statement over
+    // the binding (`edition2::voices`).
+    let mut held_voices: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for r in &rows {
+        if r.attestation_type == attestation_type::DELEGATES_TO
+            && is_owner_binding_envelope(&r.attestation_envelope)
+            && super::edition2::voices::carried_row_id(r).is_some()
+        {
+            let issuers = super::edition2::voices::row_voice_issuers(directory, r).await?;
+            held_voices.insert(r.attestation_id.clone(), issuers);
+        }
+    }
+    let view = crate::kernel::owner::owner_rows_with_voices(
+        node,
+        &rows,
+        &retractions,
+        now,
+        &|_| true,
+        cosign,
+        &std::collections::BTreeSet::new(),
+        &held_voices,
+    );
     let mut held = crate::kernel::owner::owner_holders(&view, node).value;
     let mut users = std::collections::BTreeSet::new();
     for g in &held {
@@ -12931,10 +13498,10 @@ pub(crate) async fn owner_of_reference_for_profile<F: super::FederationDirectory
 }
 
 /// The owner fold as persist wrote it before the kernel. v62.0.0: the
-/// differential's reference for [`owner_of`], and still the single-owner
-/// admission gate's incumbent read ([`check_single_node_owner_admission`]),
-/// which refuses a second owner at the door — a breaker the kernel slice
-/// that deletes the door gates moves (KERNEL_SEAMS §2.2).
+/// differential's reference for [`owner_of`] and the bench's pre-kernel arm
+/// only. Kernel pass 2 deleted the single-owner admission gate that also read
+/// it (KERNEL_SEAMS B1); no production path calls it.
+#[cfg(any(test, feature = "test-anchor"))]
 async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,
@@ -13006,6 +13573,116 @@ pub async fn admission_identity_for_writer<F: super::FederationDirectory + ?Size
     Ok(writer.to_owned())
 }
 
+/// v62.0.0 (wave O1; CC 3.2 "Who owns a key", CC 3.3.6; RULINGS
+/// "delegates_to families") — **the owner of an agent identity at `at_ms`**,
+/// the agent-side analogue of [`owner_of`], read from the edition-2
+/// statement store: the held rows of the family
+/// `ownership:{relation}:{target_kind}:{version}` about `agent` (CWT `sub`)
+/// whose `dimension` names the `agent` target kind, each carrying BOTH the
+/// author's statement (`iss` = `author`, a `user` key) and the agent's own
+/// statement as its second voice (`iss` = `sub` = `agent`, signed by the
+/// agent's key, the family's `bound_node` role), asserted by `at_ms` and not
+/// ended by then (`valid_until` / `expires_at`, the half-open record window),
+/// and not retracted by its author (a held `withdraws` / `recants` naming it
+/// by `refs.target`, signed as the author).
+///
+/// `Ok(None)` with no such binding; `Ok(Some(owner))` with exactly one
+/// owner identity; more than one is [`Error::AmbiguousNodeOwner`]
+/// (fail-closed: ownership is single-valued, CC 3.2).
+///
+/// # Errors
+/// As above; directory failures.
+pub async fn agent_owner_of<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    agent: &str,
+    at_ms: u64,
+) -> Result<Option<String>, Error> {
+    use super::edition2::ingest::{kid_of_identity_ref, statement_kid};
+    use super::edition2::liveness::statement_parts;
+    use super::edition2::names::RowId;
+    use super::edition2::occurrence::statement_iss;
+    use ciris_verify_core::cde::Value;
+    let family = ciris_verify_core::namespace_match::family_id(
+        "ownership:{relation}:{target_kind}:{version}",
+    );
+    let Some(agent_kid) = kid_of_identity_ref(agent) else {
+        return Ok(None);
+    };
+    let mut by_row: std::collections::BTreeMap<RowId, Vec<Vec<u8>>> =
+        std::collections::BTreeMap::new();
+    for st in directory.edition2_statements_about(&family, agent).await? {
+        if let Some(id) = RowId::of_statement(&st) {
+            by_row.entry(id).or_default().push(st);
+        }
+    }
+    let mut owners: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (id, voices) in &by_row {
+        let Some((_, payload)) = voices.first().and_then(|v| statement_parts(v)) else {
+            continue;
+        };
+        let names_agent_kind = payload
+            .get_text("dimension")
+            .and_then(Value::as_text)
+            .is_some_and(|d| {
+                let segs: Vec<&str> = d.split(':').collect();
+                segs.len() == 4 && segs[0] == "ownership" && segs[2] == "agent"
+            });
+        let Some(author) = payload
+            .get_text("author")
+            .and_then(Value::as_text)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let from = payload.get_text("asserted_at").and_then(Value::as_u64);
+        let until = payload
+            .get_text("valid_until")
+            .or_else(|| payload.get_text("expires_at"))
+            .and_then(Value::as_u64);
+        let live = from.is_some_and(|f| crate::kernel::key_end::within_record(at_ms, f, until));
+        if !names_agent_kind || !live {
+            continue;
+        }
+        let by_author = voices
+            .iter()
+            .any(|v| statement_iss(v).as_deref() == Some(author.as_str()));
+        let by_agent = voices.iter().any(|v| {
+            statement_iss(v).as_deref() == Some(agent) && statement_kid(v) == Some(agent_kid)
+        });
+        if !by_author || !by_agent || !super::self_roster::is_user_key(directory, &author).await? {
+            continue;
+        }
+        let mut retracted = false;
+        for c in directory.edition2_rows_naming(id, "target").await? {
+            for v in directory.edition2_voices(&c).await? {
+                let composer = statement_parts(&v).is_some_and(|(h, _)| {
+                    h.get_int(-70001).and_then(Value::as_text).is_some_and(|t| {
+                        t == attestation_type::WITHDRAWS || t == attestation_type::RECANTS
+                    })
+                });
+                let at_or_before = statement_parts(&v)
+                    .and_then(|(_, p)| p.get_text("asserted_at").and_then(Value::as_u64))
+                    .is_some_and(|t| t <= at_ms);
+                if composer && at_or_before && statement_iss(&v).as_deref() == Some(author.as_str())
+                {
+                    retracted = true;
+                }
+            }
+        }
+        if !retracted {
+            owners.insert(author);
+        }
+    }
+    match owners.len() {
+        0 => Ok(None),
+        1 => Ok(owners.into_iter().next()),
+        _ => Err(Error::AmbiguousNodeOwner {
+            node_key_id: agent.to_owned(),
+            owners: owners.into_iter().collect(),
+        }),
+    }
+}
+
 /// **CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the single responsible owner
 /// of `node`, or `None` when the node is unowned.** The dimension-precise
 /// ownership projection (a subset of [`steward_bindings_of`] restricted to
@@ -13023,13 +13700,37 @@ pub async fn admission_identity_for_writer<F: super::FederationDirectory + ?Size
 /// or an `additional_scrubs` entry by the node is the cosignature.
 ///
 /// Returns [`Error::AmbiguousNodeOwner`] when the node carries **more than one**
-/// distinct live owner — a pre-gate anomaly the single-owner admission gate
-/// [`check_single_node_owner_admission`] prevents going forward. Consumers
+/// distinct counted owner. v62.0.0 (kernel pass 2, C557): no gate refuses a
+/// second owner's binding any more; two bindings the node cosigned for two
+/// selves are both held, and the seat reads them as **unowned** — this error
+/// is that verdict, fail-closed. Consumers
 /// (CIRISEdge's `SelfOnly` widening, CIRISServer's node switcher) MUST treat the
 /// error as **fail-closed**: an ambiguous owner is not a resolvable `self`
 /// boundary. NEVER silently pick one (unlike the historical
 /// `is_steward_bound(..).next()` on a sorted set).
 pub async fn owner_of<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    node: &str,
+) -> Result<Option<String>, Error> {
+    // v62.0.0 (wave G0; CC 2.7.3) — two counted owners is a fold condition
+    // of every row whose gate reads this seat: inside a fold attempt it holds
+    // that row (`owner_ambiguous`), never refuses it. A reader outside an
+    // attempt still gets the fail-closed error.
+    owner_of_unmarked(directory, node)
+        .await
+        .map_err(|e| match e {
+            Error::AmbiguousNodeOwner { .. } => {
+                super::edition2::fold::hold(super::edition2::fold::reason::OWNER_AMBIGUOUS, e)
+            }
+            other => other,
+        })
+}
+
+/// v62.0.0 (wave G0) — [`owner_of`] WITHOUT marking a fold hold on an
+/// ambiguous owner: for a caller that CATCHES [`Error::AmbiguousNodeOwner`]
+/// and goes on (an ambiguous owner is "no principal" there), so the mark
+/// cannot leak onto an unrelated refusal of the same attempt.
+pub(crate) async fn owner_of_unmarked<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,
 ) -> Result<Option<String>, Error> {
@@ -13064,8 +13765,8 @@ pub async fn owner_of<F: super::FederationDirectory + ?Sized>(
 ///
 /// # The asymmetry is load-bearing
 ///
-/// Node ownership is **single-valued** ([`owner_of`], policed by
-/// [`check_single_node_owner_admission`]); stewardship is **multi-parent by
+/// Node ownership is **single-valued** ([`owner_of`]: the kernel's owner
+/// seat, two counted owners reading as none); stewardship is **multi-parent by
 /// design** ([`steward_bindings_of`]). So the rule is *the node's one owner
 /// must appear SOMEWHERE in the agent's steward set* — deliberately not
 /// "the same human", which would wrongly imply the agent has exactly one
@@ -13182,7 +13883,7 @@ pub async fn nodes_owned_by<F: super::FederationDirectory + ?Sized>(
     }
     let mut out = Vec::new();
     for node in candidates {
-        match owner_of(directory, &node).await {
+        match owner_of_unmarked(directory, &node).await {
             Ok(Some(owner)) if owner == person => out.push(node),
             Ok(_) => {}
             Err(Error::AmbiguousNodeOwner { .. }) => {}
@@ -13192,21 +13893,6 @@ pub async fn nodes_owned_by<F: super::FederationDirectory + ?Sized>(
     Ok(out)
 }
 
-/// **CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the single-owner admission
-/// gate.** The node-target companion to [`check_node_agency_admission`]: a node
-/// has **at most one** responsible steward (the `self` cohort boundary is
-/// undefined otherwise). Rejects a `delegates_to(U → node)` owner-binding when
-/// the node already carries a LIVE owner-binding from a DIFFERENT granter `U'`
-/// ([`Error::NodeAlreadyOwned`]) — the incumbent must first `withdraws` /
-/// `recants` it (or it must lapse). A refresh by the SAME owner is idempotently
-/// admitted; a first owner is admitted.
-///
-/// Keyed on the versioned owner-binding dimension
-/// ([`super::types::owner_binding::DIMENSION`]) so it constrains ONLY the
-/// ownership relation; act-on-behalf / hierarchy `delegates_to` (multi-parent
-/// per CC 4.5.13) are untouched. A no-op for any non-`delegates_to` row or any
-/// `delegates_to` lacking the ownership dimension.
-///
 /// v24.0.0 (CIRISPersist#557) — **the attested subject must be something this
 /// node already knows**: either a registered `federation_keys` row, or a
 /// CONSTITUTIONAL FAMILY it has stored.
@@ -13307,6 +13993,127 @@ where
 /// [`owner_binding_affiliation_reason`]'s tokens.
 pub const OWNER_BINDING_AFFILIATION_REFUSED: &str = "owner_binding_affiliation_refused";
 
+/// v62.0.0 (wave V1b) — the prefix of [`check_owner_binding_counted`]'s
+/// shortfall: `owner_binding_counted_short: …`, an [`Error::InvalidArgument`]
+/// (Python `ValueError`). At the edition-2 door it is never seen: the binding
+/// waits (`Pending`) for the voices it lacks.
+pub const OWNER_BINDING_COUNTED_SHORT: &str = "owner_binding_counted_short";
+
+/// v62.0.0 (wave V1b; CC 3.2 *The first binding*, C557; CC 3.2 "An
+/// organisation's agent" ruling (a), CLM-org-on-the-bond, CC 2.4.1.3) —
+/// **an edition-2 owner binding is a counted row.** It lands only when ALL
+/// of these voices are held (`edition2::voices`: the held ones, the one it
+/// carries and the one the door is offering now):
+///
+/// 1. the owner's own statement (the payload's `author`, one person: the
+///    steward);
+/// 2. the bound key's own statement (the `ownership:*` family's
+///    `bound_node` role: RULINGS "with the node's own statement as the
+///    second voice");
+/// 3. where the binding names an affiliation (`community_id` or an alias,
+///    [`envelope_cohort_target`]; not a node's group-audience re-signing,
+///    `binding_is_group_audience`): the affiliation members' voices counted
+///    over its roster at the head the binding names (`refs.head`), at its
+///    `consensus_protocol` ([`community_quorum_at_head`], the licence's count,
+///    CC 2.4.1.3).
+///
+/// Short of any of them the gate notes a shortfall, so the door keeps the
+/// voice and answers `Pending`: NO typed row is written, and no reader sees a
+/// binding that is not yet the owner's, the node's and the affiliation's. An
+/// affiliation not held yet also waits. Refused (terminal, as before): a
+/// named community that is not an affiliation (`not_an_affiliation`), and a
+/// binding naming an affiliation but no `refs.head` (`not_cosigned_under_protocol`:
+/// counted over no roster version, it can never land). An earlier-form
+/// binding is untouched (its doors are shut;
+/// [`check_owner_binding_affiliation_admission`] keeps its earlier rule).
+///
+/// Verify 23.3.0 refuses an affiliation member's voice `iss_not_in_role`
+/// until rc21's ownership arm is vendored; the edition-2 door admits it
+/// meanwhile (`edition2::door::names_an_affiliation_on_the_bond`).
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] prefixed [`OWNER_BINDING_COUNTED_SHORT`]
+/// (outside the door's attempt) or [`OWNER_BINDING_AFFILIATION_REFUSED`];
+/// directory reads.
+pub async fn check_owner_binding_counted(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::DELEGATES_TO
+        || !is_owner_binding_envelope(&row.attestation_envelope)
+        || super::edition2::voices::carried_row_id(row).is_none()
+    {
+        return Ok(());
+    }
+    let voices = super::edition2::voices::row_voice_issuers(directory, row).await?;
+    let owner = row
+        .attestation_envelope
+        .get("author")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(row.attesting_key_id.as_str());
+    let mut short: Vec<String> = Vec::new();
+    if !voices.contains(owner) {
+        short.push(format!("the owner {owner}'s own statement"));
+    }
+    if !voices.contains(&row.attested_key_id) {
+        short.push(format!(
+            "the bound key {}'s own statement",
+            row.attested_key_id
+        ));
+    }
+    if !binding_is_group_audience(row) {
+        if let Some(named) = envelope_cohort_target(&row.attestation_envelope)? {
+            let refuse = |reason: &'static str, detail: String| {
+                Err(Error::InvalidArgument(format!(
+                    "{OWNER_BINDING_AFFILIATION_REFUSED}: {reason}: owner-binding {} by {} over \
+                     {} names {named:?}: {detail} (CC 3.2 ruling (a), CC 2.4.1.3)",
+                    row.attestation_id, owner, row.attested_key_id
+                )))
+            };
+            match directory.lookup_community(named).await? {
+                None => short.push(format!("the affiliation {named:?} (not held yet)")),
+                Some(c) => {
+                    if crate::federation::affiliation_config::declared_cohort(&c)?
+                        != super::cohort::Cohort::Affiliations
+                    {
+                        return refuse(
+                            owner_binding_affiliation_reason::NOT_AN_AFFILIATION,
+                            "it does not declare cohort_scope: affiliations".to_owned(),
+                        );
+                    }
+                    let Some(head) = edition2_named_head(row) else {
+                        return refuse(
+                            owner_binding_affiliation_reason::NOT_COSIGNED_UNDER_PROTOCOL,
+                            "it names no `refs.head`: a binding counted over the affiliation \
+                             is counted over the roster version it names"
+                                .to_owned(),
+                        );
+                    };
+                    if !community_quorum_at_head(directory, &c, row, &head, row.asserted_at).await?
+                    {
+                        short.push(format!(
+                            "the affiliation {named:?}'s quorum ({:?}) at the roster head it \
+                             names",
+                            c.consensus_protocol
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if short.is_empty() {
+        return Ok(());
+    }
+    super::edition2::voices::note_short();
+    Err(Error::InvalidArgument(format!(
+        "{OWNER_BINDING_COUNTED_SHORT}: owner-binding {} over {} waits for {} (CC 3.2, C557)",
+        row.attestation_id,
+        row.attested_key_id,
+        short.join("; ")
+    )))
+}
+
 /// v60.0.0 (CIRISPersist#1062) — the stable reasons of
 /// [`OWNER_BINDING_AFFILIATION_REFUSED`]. Append-only.
 pub mod owner_binding_affiliation_reason {
@@ -13347,6 +14154,12 @@ pub async fn check_owner_binding_affiliation_admission(
     if row.attestation_type != attestation_type::DELEGATES_TO
         || !is_owner_binding_envelope(&row.attestation_envelope)
     {
+        return Ok(());
+    }
+    // v62.0.0 (wave V1b) — an edition-2 binding is counted by
+    // [`check_owner_binding_counted`] (the affiliation's quorum at the head it
+    // names, CC 3.2 ruling (a)); this is the earlier form's rule.
+    if super::edition2::voices::carried_row_id(row).is_some() {
         return Ok(());
     }
     let Some(named) = envelope_cohort_target(&row.attestation_envelope)? else {
@@ -13448,60 +14261,50 @@ pub async fn affiliation_of_binding(
     Ok(named.into_iter().min())
 }
 
-/// Verify-before-mutation (AV-9): wired into every backend's `put_attestation`
-/// immediately AFTER [`check_user_target_steward_binding_admission`], so a
-/// rejected second-owner emission leaves no trace. Backend-agnostic.
-pub async fn check_single_node_owner_admission(
+/// v62.0.0 (kernel pass 2, KERNEL_SEAMS B1/C557) — **the roster W bound on an
+/// owner-binding.** What is left of the single-owner admission gate once the
+/// kernel's owner seat decides ownership.
+///
+/// The single-owner gate refused a second distinct owner's binding at the
+/// door (`federation_node_already_owned`), so which owner a node had depended
+/// on whether the incumbent's withdrawal arrived first. The kernel's owner
+/// seat ([`owner_of`], [`crate::kernel::owner`]) holds every binding and
+/// counts one only when the node's own key cosigned it (CC 3.2, *The first
+/// binding (MUST)*): exactly one counted owner is the owner; two or more is
+/// unowned ([`Error::AmbiguousNodeOwner`], fail-closed). So the refusal is
+/// gone and nothing is refused and forgotten.
+///
+/// The W bound stays (KERNEL_SEAMS B5, not yet a kernel conclusion): a roster
+/// key restating a binding for the self it stood for at the row's signed
+/// instant, but evicted since, may not sign more than W in the past
+/// ([`check_roster_act_fresh`](super::self_roster::check_roster_act_fresh),
+/// `asserted_at_stale`, CIRISPersist#1049). The stewards it is judged
+/// against are the kernel's owner seat over the node.
+///
+/// Verify-before-mutation (AV-9); backend-agnostic. A no-op for any row that
+/// is not an owner-binding `delegates_to`.
+pub async fn check_owner_binding_roster_fresh(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
 ) -> Result<(), Error> {
-    if row.attestation_type != attestation_type::DELEGATES_TO {
+    if row.attestation_type != attestation_type::DELEGATES_TO
+        || !is_owner_binding_envelope(&row.attestation_envelope)
+    {
         return Ok(());
     }
-    // v13.3.0 (#378): recognize the owner-binding by EITHER the internal
-    // dimension OR the CC 2.4.1.2 `delegation_purpose: owner_binding` marker —
-    // the raw `emit_attestation_self` path carries only the latter, and gating
-    // on the dimension alone let it bypass the single-owner gate.
-    if !is_owner_binding_envelope(&row.attestation_envelope) {
-        return Ok(());
-    }
-    // The incoming row is NOT yet stored (this runs pre-insert), so every
-    // granter here is a pre-existing incumbent. Any incumbent that is NOT the
-    // attesting owner blocks admission — a node cannot accrue a second steward.
-    let incumbents = live_owner_binding_granters(directory, &row.attested_key_id).await?;
-    // v59.0.0 (CIRISPersist#1049 bound on CIRISPersist#1099's predicate) — a
-    // roster key restating the binding does so inside W.
+    let owners = kernel_owner_selves(
+        directory,
+        &row.attested_key_id,
+        crate::kernel::owner::Cosign::Required,
+    )
+    .await?;
     super::self_roster::check_roster_act_fresh(
         directory,
-        &incumbents.iter().cloned().collect::<Vec<_>>(),
+        &owners.into_iter().collect::<Vec<_>>(),
         &row.attesting_key_id,
         row.asserted_at,
     )
-    .await?;
-    for incumbent in incumbents {
-        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the incumbent self, or a
-        // live roster key of it at the row's `asserted_at`, is the same one
-        // steward (THE steward predicate); a key of another self is not.
-        if !super::self_roster::acts_as_steward_at(
-            directory,
-            &incumbent,
-            &row.attesting_key_id,
-            row.asserted_at,
-        )
-        .await?
-        {
-            return Err(Error::NodeAlreadyOwned {
-                node_key_id: row.attested_key_id.clone(),
-                incumbent_owner: incumbent,
-                attempted_owner: row.attesting_key_id.clone(),
-            });
-        }
-    }
-    // v25.x (CIRISPersist#578, CC 3.2 ceremony step 4) — a node that has been
-    // through a reclaim owes its OWN co-signature on the fresh owner-binding.
-    // Hooked here so all three backends inherit it from one chokepoint.
-    super::ownership_reclaim::check_post_reclaim_rebinding_admission(directory, row).await?;
-    Ok(())
+    .await
 }
 
 /// **CIRISPersist#372 (CC 3.4.7.1 set-membership) — the `canonical`-role
@@ -14746,7 +15549,30 @@ pub async fn check_co_steward_role_admission(
 /// Shape: a `scores` row, `attesting_key_id` = the de-admitting node,
 /// `attested_key_id` = the de-admitted key, `score < 0` (the denial), live
 /// unless the node `withdraws` it.
-pub const PEER_DEADMISSION_DIMENSION: &str = "revocation:peer_admission:v1";
+///
+/// v62.0.0 (wave P1e, E3's finding) — the registered shape. The family is
+/// `revocation:{entity_type}:{reason}` (CC 3.1.1), so the dimension names
+/// the entity type (`peer_admission`), a reason leaf and the version; the
+/// earlier `revocation:peer_admission:v1` lacked the reason and CC's matcher
+/// refused it (`missing_version_segment`), so no edition-2 de-admission row
+/// could be stated. CC's registry leaves `{reason}` open (no vocabulary),
+/// and its `reason` codes are the payload's `uint` (CC 2.6.1.10), not a
+/// segment; `deadmitted` names the act, neutrally. Readers match the STEM
+/// ([`PEER_DEADMISSION_STEM`], [`is_peer_deadmission_dimension`]), so any
+/// reason leaf and version, and a row stored under the earlier spelling,
+/// still read as a de-admission.
+pub const PEER_DEADMISSION_DIMENSION: &str = "revocation:peer_admission:deadmitted:v1";
+
+/// v62.0.0 (wave P1e) — the de-admission family stem: `revocation:` with the
+/// `peer_admission` entity type. The gate and the family inventory read it.
+pub const PEER_DEADMISSION_STEM: &str = "revocation:peer_admission:";
+
+/// v62.0.0 (wave P1e) — is `dimension` a peer de-admission (any reason leaf,
+/// any version, the earlier spelling included)?
+#[must_use]
+pub fn is_peer_deadmission_dimension(dimension: &str) -> bool {
+    dimension.starts_with(PEER_DEADMISSION_STEM)
+}
 
 /// v22.0.0 (CIRISPersist#543 / AV-77) — **THE DE-ADMISSION GATE**: refuse
 /// inbound writes authored by a key this node has de-admitted.
@@ -14852,7 +15678,8 @@ pub async fn check_peer_deadmission(
     let de_admitted = mine.iter().any(|a| {
         a.attestation_type == attestation_type::SCORES
             && a.attested_key_id == row.attesting_key_id
-            && envelope_dimension(&a.attestation_envelope) == Some(PEER_DEADMISSION_DIMENSION)
+            && envelope_dimension(&a.attestation_envelope)
+                .is_some_and(is_peer_deadmission_dimension)
             && !dead.contains(&a.attestation_id)
             && a.expires_at.is_none_or(|e| e > now)
     });
@@ -16277,6 +17104,12 @@ where
     }
     for f in founders {
         let Some(rec) = directory.lookup_public_key(f).await? else {
+            // v62.0.0 (wave W1b) — a holder of the genesis bundle in force is
+            // a person (an `accord_holder`, placed by the bundle) whatever
+            // this node's key read model holds.
+            if super::edition2::trust_root_group::is_bundle_holder(directory, f).await? {
+                continue;
+            }
             return Ok(false);
         };
         let set = identity_type::parse_set(&rec.identity_type);
@@ -16324,6 +17157,32 @@ pub async fn infrastructure_rooted_here<F>(
 where
     F: super::FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave W1b; RULINGS "a conformant infrastructure record rooted
+    // in THIS node's trust set", CC 3.2 T3, CC 4.4.3.34) — an edition-2 room
+    // (its record has edition-2 `group:roster` voices) is rooted here when
+    // this node's own trust walk reaches it: the room itself is a root this
+    // node holds rooted, or a root this node holds rooted charters or confers
+    // it (`trust_root::infrastructure_reached_here`). The roots compared are
+    // the ones the chain reaches, never the accord family's name.
+    let Some(held) = directory.lookup_community(community_key_id).await? else {
+        return Ok(false);
+    };
+    if super::edition2::trust_root_group::version_signers(directory, &held)
+        .await?
+        .is_some()
+    {
+        return super::trust_root::infrastructure_reached_here(
+            directory,
+            &held,
+            crate::host::clock::now(),
+        )
+        .await;
+    }
+    // The earlier form's reading, only while its doors are open (CC
+    // 2.6.1.12: nothing carries).
+    if super::edition2::door::earlier_form_doors_shut() {
+        return Ok(false);
+    }
     let Some(root) =
         super::canonical_community::rooted_community_family(directory, community_key_id).await?
     else {
@@ -16911,15 +17770,15 @@ pub async fn check_infrastructure_record_admission(
 ///
 /// # Scope and the infrastructure carve-out
 ///
-/// `cohort_subkind: infrastructure` communities (`ciris-canonical` /
-/// operator governance roots) are **EXEMPT** — a node MAY trust + serve
-/// an infrastructure community with no steward (CC 3.2 "Trust ≠
-/// membership"). The label is honored ONLY when
-/// [`is_authorized_infrastructure_community`] holds (the community's own
-/// key resolves to the `substrate_persist` governance authority, SecReview
-/// F2); a self-labeled infra community whose key is not `substrate_persist`
-/// gets the strict steward-binding treatment. For every other community this
-/// gate runs per roster member.
+/// A **node** member of an authorized infrastructure community
+/// ([`is_authorized_infrastructure_community`]: a conformant infrastructure
+/// record rooted in this node's own trust set, v62.0.0) is **EXEMPT**: a node
+/// MAY trust + serve an infrastructure community with no steward (CC 3.2
+/// "Trust ≠ membership"). An **agent** member is never exempt, in any
+/// community. A merely labelled infrastructure community, and every other
+/// community, gets the strict steward-binding treatment per roster member.
+/// The trust-root door's form, which takes the door's own verdict for the
+/// node exemption, is [`check_trust_root_membership_steward_binding`].
 ///
 /// A member key that does NOT resolve in `federation_keys`, or whose
 /// `identity_type` set contains NEITHER `node` NOR `agent` (e.g. a pure
@@ -16944,6 +17803,42 @@ pub async fn check_community_membership_steward_binding(
     // agent member of any community, infrastructure included, needs its live
     // steward binding ("Authority MUST root in an accountable human").
     let infra = is_authorized_infrastructure_community(directory, community).await?;
+    check_members_steward_bound(directory, community, infra).await
+}
+
+/// v62.0.0 (v62 security ruling "Agents are never exempt"; CC rc20 3.2) —
+/// [`check_community_membership_steward_binding`] at the **trust-root door**
+/// (`community_admit::plan_put_community`, when
+/// [`check_trust_root_at_door`](super::canonical_community::check_trust_root_at_door)
+/// answered `true`). The door has just verified the record as an
+/// infrastructure room chained from an accord birth, and the record may not
+/// be stored yet (so [`is_authorized_infrastructure_community`]'s rooted-here
+/// read, which reads the STORED chain, cannot answer for it). So the door's
+/// verdict stands for the node exemption, and the agent rule still runs.
+///
+/// Until v62 the door skipped the whole gate for a trust-root room, so an
+/// `agent` member with no live steward binding was admitted on such a room's
+/// roster: the one place the "agents are never exempt" rule did not hold.
+///
+/// # Errors
+///
+/// [`Error::UnstewardedCommunityMember`] for the first `agent` member with no
+/// live steward binding; directory read failures.
+pub async fn check_trust_root_membership_steward_binding(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+) -> Result<(), Error> {
+    check_members_steward_bound(directory, community, true).await
+}
+
+/// The per-member walk both forms share: every `node` / `agent` member needs
+/// a live steward binding, except a `node` member when `node_exempt` (the
+/// infrastructure carve-out). An agent is never exempt.
+async fn check_members_steward_bound(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+    node_exempt: bool,
+) -> Result<(), Error> {
     for member in &community.members {
         // Resolve the member's identity_type set. An unresolved member has
         // no node/agent standing this gate can prove — out of scope (and
@@ -16962,8 +17857,13 @@ pub async fn check_community_membership_steward_binding(
         };
         // The carve-out: a NODE member of an authorized infrastructure
         // community trusts and serves without a steward (CC 3.2 "Trust ≠
-        // membership"). Never an agent.
-        if infra && member_role == identity_type::NODE {
+        // membership"). Never an agent: a set that names `agent` beside
+        // `node` (refused at every key door since v62, but a held row may
+        // predate that) is not exempt either.
+        if node_exempt
+            && member_role == identity_type::NODE
+            && !identity_type::set_contains(&rec.identity_type, identity_type::AGENT)
+        {
             continue;
         }
         if !is_steward_bound(directory, &member.key_id).await? {
@@ -18027,6 +18927,37 @@ pub async fn duty_holders_for_federation(
     directory: &dyn super::FederationDirectory,
     _duty: &str,
 ) -> Result<std::collections::HashSet<String>, Error> {
+    // v62.0.0 (wave W1b; CC 2.6.1.11, RULINGS "the clean mesh") — the
+    // accord's holders ARE the holders of the genesis bundle in force (every
+    // tip seats them alike; C1's reader). No bundle held, or a genesis fork
+    // whose tips seat no holder in common: refused, never an empty set.
+    let in_force = super::edition2::genesis::genesis_in_force(directory).await?;
+    if in_force.is_held() {
+        let holders: std::collections::HashSet<String> = in_force
+            .holders()
+            .iter()
+            .map(|h| h.identity_ref.clone())
+            .collect();
+        if holders.is_empty() {
+            return Err(Error::InvalidArgument(
+                "federation-scope duty-holders are the holders of the genesis bundle in force, \
+                 and its tips seat no holder in common (a genesis fork). Returning an empty \
+                 holder set here would read as \"nobody may act\" (CIRISPersist#632)."
+                    .into(),
+            ));
+        }
+        return Ok(holders);
+    }
+    // The earlier form's accord family roster, only while its doors are
+    // open (CC 2.6.1.12: nothing carries).
+    if super::edition2::door::earlier_form_doors_shut() {
+        return Err(Error::InvalidArgument(
+            "federation-scope duty-holders are the holders of the genesis bundle in force, and \
+             this node holds no genesis bundle. Returning an empty holder set here would read \
+             as \"nobody may act\" (CIRISPersist#632)."
+                .into(),
+        ));
+    }
     let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
     let members = directory.active_family_members(family).await.map_err(|e| {
         Error::InvalidArgument(format!(
@@ -18434,7 +19365,7 @@ pub async fn check_reconsideration_admission(
         if let Some(authority_id) = envelope_dimension(&t.attestation_envelope)
             .and_then(crate::federation::licensure::authority_of)
         {
-            holders.extend(licence_authority_set(directory, authority_id).await?);
+            holders.extend(licence_authority_set(directory, &authority_id).await?);
         }
     }
     let is_ruling = row
@@ -18758,196 +19689,13 @@ pub fn grant_chain_instant(row: &super::Attestation) -> chrono::DateTime<chrono:
     row.asserted_at
 }
 
-/// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
-/// is refused at admission.**
-///
-/// **v62.0.0 (slice C) — no longer refused.** The decision answers through the
-/// kernel, whose trust walk visits a cycle once (`ciris_kernel::trust::reaches`,
-/// KERNEL.md 5; CIRISKernel `ADOPTING.md`: "no edge is refused for closing a
-/// cycle"). Every row this gate examines is now admitted and held; the walks'
-/// visited guard reads a cycle once. What follows is the v54 reading, kept as
-/// the differential's reference (test builds). CC 4.1.1's anti-pattern row
-/// ("reject the cycle-closing emission") still reads the v54 way; the kernel's
-/// reading is the one persist adopts (the CC session is told).
-///
-/// CC 4.1.1's anti-pattern table, row "Cycles (A → B → A)": *"Substrate MUST
-/// detect cycles on the `delegates_to` graph and reject the cycle-closing
-/// emission."* Until this gate every walk was visited-guarded
-/// ([`scoped_delegation_reach_at`], `topology::build_delegation_graph`), so a
-/// cycle was TOLERATED at read time, but nothing refused the closing edge and
-/// it was stored.
-///
-/// A no-op for any row that is not a [`attestation_type::DELEGATES_TO`]. For
-/// `delegates_to(A → B)` it asks whether `B` already reaches `A` through live
-/// `delegates_to` edges ([`delegation_path_hops`]), and if so refuses with
-/// [`Error::DelegationCycle`] (`federation_delegation_cycle`).
-///
-/// # Trust-plane edges are not in the cycle graph
-///
-/// The cycle graph is the CAPABILITY graph (CC 4.1.1, as CC confirmed on the
-/// v54.0.0 integration). Two `delegates_to` labels are the trust plane, not a
-/// delegation of capability ([`is_trust_plane_edge`]):
-///
-/// - `trust:accepts:v1`, the node's SUBSCRIPTION to a root (CC 4.2.1: "the
-///   trust edge is the subscription"). It is the user's own leg, and CC 3.2
-///   T3 says no conferral may substitute for it, so it is never a link a
-///   capability flows along: `capability_roots_to_trusted_root` reads it as
-///   the separate user leg, then walks root → … → subject;
-/// - `trust:charter:v1`, the root's charter, self-referential by definition
-///   (CC 3.4.7; a family's is holder → family).
-///
-/// Both are excluded on both sides, which covers both arrival orders: the
-/// gate admits one without a search, and [`delegation_path_hops`] never
-/// traverses one.
-/// The production shape this keeps working is a KEY root's grantee
-/// subscribing to the root that granted it: the root signs
-/// `delegates_to(root → node, [infra:serve])` itself, and the node's own boot
-/// writes `delegates_to(node → root, trust:accepts:v1)` (CIRISServer
-/// `mesh_genesis.rs` `accept_trust_root`; the portable root's canonical).
-/// Under CC 4.1.1 read over every `delegates_to`, that pair is "A → B → A"
-/// and one of the two would be refused at boot. A CAPABILITY edge closing
-/// the same pair is still a cycle and is still refused (CC 4.1.1, 4.2.1;
-/// ruled on the v54.0.0 integration, test 603).
-///
-/// A self-edge (`A == B`) is admitted without a read: it is the root charter,
-/// the constitutional `delegates_to(root → root)` self-declaration
-/// (`trust_root`), not the "A → B → A" anti-pattern, and the walks' visited
-/// guard reads it as a root. CC confirms the reading: a cycle needs at least
-/// two distinct keys (CC 4.1.1; CC 3.2 T1/T3, the root's self-declaration).
-///
-/// # What "live" means here — the walks' own reading
-///
-/// An edge counts unless the walks would skip it: retracted by its granter
-/// (gate (a) of [`scoped_delegation_reach_at`]: a `withdraws`/`recants` by the
-/// granter naming the recipient), retracted by name (gate (b), the #593
-/// clause, via [`retracted_edge_ids`]) by a retraction asserted by `now`,
-/// expired by the first instant its term can open, or carrying a signed
-/// term (`delegation_valid_from` / `delegation_valid_until` / `valid_until`,
-/// #1032) that the walks' lens will refuse at every instant from `now` on
-/// ([`delegation_edge_live_at_or_after`], the lens's own term reading). Scope does NOT
-/// matter: CC names the `delegates_to` graph, not one scope's subgraph, and a
-/// cycle on any scope is still a cycle. A future-dated edge counts — it
-/// exists, and skipping it would let the closing edge in now and the cycle go
-/// live the moment the clock reaches it (fail toward refusal). The same holds
-/// for a term that opens later: its `delegation_valid_from` does not hide it.
-///
-/// # The ceiling
-///
-/// The search follows at most [`MAX_WITHDRAWS_DELEGATION_DEPTH`] hops from
-/// `B`, the absolute ceiling every delegation walk clamps to (the issue's ask
-/// verbatim). A longer path is invisible to every walk this substrate runs,
-/// so a cycle through it cannot change any verdict a walk returns.
-///
-/// # Where it runs
-///
-/// Every backend's `put_attestation` (all tiers), beside the other
-/// `delegates_to` gates, AND [`check_promotion_admission`]: the walks read
-/// the federation tier only, so a local-tier edge closes nothing until it is
-/// promoted, and the graph may have grown since its local write.
-///
-/// v56.0.0 (CIRISPersist#934 step 1) — `received_at` is the receiving node's
-/// clock at the door, an INPUT of the shared attestation plan
-/// (`attestation_admit::PlanInstants`) rather than a clock read inside the
-/// gate. This gate read the clock before the plan existed, so it judges at
-/// the receipt instant still: unchanged behaviour (#934). Where its judgement
-/// belongs at the row's signed instant instead, moving it is #1049's ruling.
-pub async fn check_delegation_cycle_admission<G>(
-    directory: &G,
-    row: &super::Attestation,
-    received_at: chrono::DateTime<chrono::Utc>,
-) -> Result<(), Error>
-where
-    G: super::attestation_query::AttestationQueryExec + ?Sized,
-{
-    if row.attestation_type != attestation_type::DELEGATES_TO {
-        return Ok(());
-    }
-    // A TRUST-PLANE edge (an acceptance or a charter) is not a delegation of
-    // capability: it is not in the cycle graph (see the doc above).
-    if is_trust_plane_edge(row) {
-        return Ok(());
-    }
-    // A self-edge is not the anti-pattern: it is the root charter, the
-    // constitutional `delegates_to(root → root)` self-declaration (CC 3.2 —
-    // `trust_root`), and every walk's visited guard already treats it as a
-    // root. CC 4.1.1's row is "A → B → A", a cycle between distinct keys.
-    if row.attesting_key_id == row.attested_key_id {
-        return Ok(());
-    }
-    // v62.0.0 (slice C) — the kernel's walk visits a cycle once
-    // (`ciris_kernel::trust::reaches`: "a cycle is visited once, since
-    // arriving again at a key with no more budget than before reaches
-    // nothing new"; KERNEL.md 5; CC 4.4.3.34: "Cycles are visited
-    // once"), so no edge is refused for
-    // closing one: the closing edge is held, and every walk reads it once.
-    // The differential witness still computes persist's former reading.
-    #[cfg(test)]
-    {
-        let hops = delegation_path_hops(
-            directory,
-            &row.attested_key_id,
-            &row.attesting_key_id,
-            received_at,
-        )
-        .await?;
-        crate::kernel::differential::cycle_gate(row, hops);
-    }
-    #[cfg(not(test))]
-    let _ = (directory, received_at);
-    Ok(())
-}
-
-/// v54.0.0 (Codex on PR #1050) — does [`check_delegation_cycle_admission`]
-/// examine `row`: a capability `delegates_to` between two distinct keys (not a
-/// trust-plane edge, not a self-edge)? Exactly these rows can close a cycle
-/// AND exactly these rows are the edges a cycle search walks, so they are the
-/// writes every backend serializes with the check.
-///
-/// # Why the check must be serialized with the write
-///
-/// The gate reads the graph, then the door inserts. Two writers submitting
-/// `A → B` and `B → A` can both finish the read before either inserts, and
-/// both are admitted: the cycle the gate exists to refuse. Every backend
-/// therefore holds a write lock from a check that sees the committed graph
-/// through its own insert's commit: an in-process mutex on every backend
-/// (memory, sqlite: one process owns the store), and on postgres also a
-/// transaction-scoped advisory lock, `DELEGATION_CYCLE_LOCK_KEY`, taken in
-/// the insert's own transaction with the check re-run under it, because two
-/// processes share one database.
-///
-/// The lock is ONE key for every gated write, not one per pair: a cycle
-/// `A → B → C → A` is closed by a write whose pair `{C, A}` shares no key with
-/// the concurrent `B → C`, so a pair key would not serialize them. Delegation
-/// writes are rare, so one key costs nothing.
-pub(crate) fn delegation_cycle_gated(row: &super::Attestation) -> bool {
-    row.attestation_type == attestation_type::DELEGATES_TO
-        && !is_trust_plane_edge(row)
-        && row.attesting_key_id != row.attested_key_id
-}
-
-// v54.0.0 (Codex round 2 on PR #1050) — the cycle gate's walk reads.
-// v56.0.0 (CIRISPersist#1001): the walk reads through
-// `AttestationQueryExec`, the typed read's storage half. Every directory
-// answers it; the postgres backend re-runs the gate inside the transaction
-// that holds the delegation advisory lock and answers the SAME statement on
-// that transaction's own client, so no walk read checks out a second pooled
-// client while the lock's transaction holds one (I602).
-/// v54.0.0 (Codex on PR #1050) — the postgres advisory-lock key every
-/// [`delegation_cycle_gated`] write takes in its insert transaction
-/// (`pg_advisory_xact_lock(DELEGATION_CYCLE_LOCK_KEY)`), so a cycle check and
-/// the insert it admits are one step across every process sharing the
-/// database. A fixed 64-bit constant (the ASCII bytes of `"dlgcycle"`),
-/// distinct from every other key this crate takes.
-#[cfg(feature = "postgres")]
-pub(crate) const DELEGATION_CYCLE_LOCK_KEY: i64 = 0x646c_6763_7963_6c65;
-
 /// v54.0.0 (CIRISPersist#1031) — is `row` a TRUST-PLANE edge, a
 /// `delegates_to` whose envelope `dimension` is
 /// [`TRUST_ACCEPTS_DIMENSION`](crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION)
 /// (the subscription) or
 /// [`TRUST_CHARTER_DIMENSION`](crate::federation::trust_root::TRUST_CHARTER_DIMENSION)
-/// (the charter)? Never part of the cycle graph, which is the capability
-/// graph ([`check_delegation_cycle_admission`]).
+/// (the charter)? Never part of the capability graph a delegation walk
+/// follows (CC 4.2.1: the trust edge is the subscription).
 fn is_trust_plane_edge(row: &super::Attestation) -> bool {
     use crate::federation::trust_root::{TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION};
     row.attestation_type == attestation_type::DELEGATES_TO
@@ -18960,10 +19708,17 @@ fn is_trust_plane_edge(row: &super::Attestation) -> bool {
 /// v54.0.0 (CIRISPersist#1031) — the shortest live `delegates_to` path from
 /// `from` to `to`, in hops, within [`MAX_WITHDRAWS_DELEGATION_DEPTH`]; `None`
 /// when there is none. Unscoped, unattenuated: it asks whether the graph
-/// CONNECTS the two keys, not whether a duty flows. Edge liveness is the
-/// reading [`check_delegation_cycle_admission`] documents.
-// v62.0.0 (slice C): the differential's reference and the cycle witnesses'
-// reading of the graph (test builds only).
+/// CONNECTS the two keys, not whether a duty flows. An edge counts unless
+/// the walks would skip it: retracted by its granter (gate (a) of
+/// [`scoped_delegation_reach_at`]), retracted by name (gate (b), the #593
+/// clause) by a retraction asserted by `now`, or carrying a term the walks'
+/// lens refuses at every instant from `now` on
+/// ([`delegation_edge_live_at_or_after`]). Trust-plane edges
+/// ([`is_trust_plane_edge`]) are not walked.
+// v62.0.0 (kernel pass 2): the v54 cycle gate this was the reading of is
+// deleted (the kernel's walk visits a cycle once, CC 4.4.3.34); the cycle
+// witnesses still read the graph a held cycle-closing edge closes through it
+// (test builds only).
 #[cfg(test)]
 pub(crate) async fn delegation_path_hops<G>(
     directory: &G,
@@ -18984,7 +19739,7 @@ where
     // and licence walks at `now` still traverse the edge it names. Counted
     // here, it hid a live `B → A` and admitted the `A → B` closing a cycle
     // those walks follow. Edges themselves are NOT lensed: a future-dated
-    // edge still counts (see `check_delegation_cycle_admission`).
+    // edge still counts: it exists, and the walk reads it once its clock comes.
     let lens = DelegationWalkLens {
         as_of: Some(now),
         ..DelegationWalkLens::default()
@@ -19251,16 +20006,24 @@ pub async fn check_user_target_steward_binding_admission(
             // The adult-incapacity path is the ONLY way to steward-bind an
             // adult. It reasserts `target_is_self_sovereign` when no live
             // incapacity is attested (presumption of capacity).
-            return check_adult_incapacity_binding(directory, row).await;
+            // v62.0.0 (wave G0) — its refusals that read other rows hold.
+            return check_adult_incapacity_binding(directory, row)
+                .await
+                .map_err(steward_binding_fold);
         }
         AgeBand::Unknown => {
-            return Err(Error::UserTargetStewardBindingForbidden {
-                target_key_id: row.attested_key_id.clone(),
-                // Presumption of sovereignty (age axis): not PROVEN a minor,
-                // and not PROVEN an adult (so not eligible for the incapacity
-                // aperture either — that predicate requires age_band == adult).
-                reason: "target_age_unverified",
-            });
+            // v62.0.0 (wave G0; CC 2.7.3) — the age is read from OTHER rows
+            // (a witness's `age_assurance`): unproven, the binding is held
+            // and concludes nothing until a witness proves it.
+            return Err(steward_binding_fold(
+                Error::UserTargetStewardBindingForbidden {
+                    target_key_id: row.attested_key_id.clone(),
+                    // Presumption of sovereignty (age axis): not PROVEN a minor,
+                    // and not PROVEN an adult (so not eligible for the incapacity
+                    // aperture either — that predicate requires age_band == adult).
+                    reason: "target_age_unverified",
+                },
+            ));
         }
     }
     // Target is a proven minor — require the granter is a proven adult user.
@@ -19274,13 +20037,44 @@ pub async fn check_user_target_steward_binding_admission(
         identity_type::set_contains(&granter.identity_type, identity_type::USER)
             && age_band(directory, &row.attesting_key_id).await? == AgeBand::Adult;
     if !granter_is_adult_user {
-        return Err(Error::UserTargetStewardBindingForbidden {
-            target_key_id: row.attested_key_id.clone(),
-            reason: "granter_not_adult_user",
-        });
+        return Err(steward_binding_fold(
+            Error::UserTargetStewardBindingForbidden {
+                target_key_id: row.attested_key_id.clone(),
+                reason: "granter_not_adult_user",
+            },
+        ));
     }
     // Admit the minor-guardianship binding (S == attesting_key_id structural).
     Ok(())
+}
+
+/// v62.0.0 (wave G0; CC 2.7.3) — the steward-binding gate's refusals that
+/// read OTHER rows (an age witness, a capacity verdict, an assessor): each is
+/// a fold condition, so at the edition-2 door the binding is HELD with reason
+/// [`steward_unproven`](super::edition2::fold::reason::STEWARD_UNPROVEN) and
+/// concludes nothing until the witness arrives. The refusals read from the
+/// row alone (`scope_missing`, `scope_touches_protected_domain`, the
+/// `valid_until` shape) stay refusals.
+pub(crate) const STEWARD_BINDING_FOLD_REASONS: &[&str] = &[
+    "target_age_unverified",
+    "granter_not_adult_user",
+    "target_is_self_sovereign",
+    "scope_exceeds_attested_domains",
+    "capacity_reversible_not_excluded",
+    "attester_conflicted",
+];
+
+/// Hold a steward-binding refusal that reads other rows
+/// ([`STEWARD_BINDING_FOLD_REASONS`]); any other error is returned as is.
+fn steward_binding_fold(e: Error) -> Error {
+    match &e {
+        Error::UserTargetStewardBindingForbidden { reason, .. }
+            if STEWARD_BINDING_FOLD_REASONS.contains(reason) =>
+        {
+            super::edition2::fold::hold(super::edition2::fold::reason::STEWARD_UNPROVEN, e)
+        }
+        _ => e,
+    }
 }
 
 /// v11.9.0 (CIRISPersist#309, CC 3.4.12) — the **adult-incapacity
@@ -19566,6 +20360,43 @@ pub fn check_delivery_mode_vocabulary(envelope: &serde_json::Value) -> Result<()
 /// model this door's stamp to do that, and a second spelling of a projection
 /// that drifts is precisely how #643 and #598 each acquired their defect.
 pub fn check_envelope_size_admission(envelope: &serde_json::Value) -> Result<(), Error> {
+    // v62.0.0 (wave P1c) — a row mapped from an edition-2 statement carries
+    // the statement under `ceg_statement`
+    // ([`STATEMENT_MEMBER`](super::edition2::ingest::STATEMENT_MEMBER)), as
+    // hex. Its envelope is DERIVED: a pure function of that statement
+    // (`edition2::ingest::attestation_of`, checked equal by
+    // `verify_carried`), so its size is the statement's, bounded by
+    // construction. The cap is therefore the statement's own bytes, the
+    // edition-2 door's
+    // ([`MAX_STATEMENT_BYTES`](super::edition2::door::MAX_STATEMENT_BYTES)),
+    // and the earlier-form envelope cap is not applied again: counting the
+    // derived envelope refused statements under the door cap (the hex copy
+    // doubled it, and a byte-string member is hex in the projection too). An
+    // envelope with no carried statement (every earlier-form JSON row) is
+    // measured exactly as before.
+    let carried = envelope
+        .as_object()
+        .and_then(|o| o.get(super::edition2::ingest::STATEMENT_MEMBER));
+    // A carried member that is not text is not a carried statement: the
+    // whole envelope is measured, and `verify_carried` names the fault.
+    if let Some(hex) = carried.and_then(serde_json::Value::as_str) {
+        let cap = super::edition2::door::MAX_STATEMENT_BYTES;
+        // Two hex digits per statement byte; an odd length rounds up.
+        let statement_bytes = hex.len().div_ceil(2);
+        if statement_bytes > cap {
+            return Err(Error::EnvelopeTooLarge {
+                bytes: statement_bytes,
+                cap,
+            });
+        }
+        return Ok(());
+    }
+    check_envelope_canonical_size(envelope)
+}
+
+/// The canonical (JCS) size of `envelope` against
+/// [`MAX_ATTESTATION_ENVELOPE_BYTES`].
+fn check_envelope_canonical_size(envelope: &serde_json::Value) -> Result<(), Error> {
     let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope).map_err(|e| {
         Error::malformed_row(
             "attestation",
@@ -19897,7 +20728,26 @@ pub async fn check_reserved_prefix_admission(
     // `infra:attest:assurance` scope — not only the role layer 1b of
     // `DimensionAdmissionPolicy::check` asks. No emitter in any repo writes the
     // dimension shape yet, so nothing held is newly refused.
-    let is_accord = at.starts_with("accord:");
+    //
+    // v62.0.0 (P4, I3080–I3082) — a row carrying an edition-2 statement is
+    // judged on the CONFERRAL plane (CC rc20 3.4.7: "No key declares itself
+    // into a duty"). Tier 2 ran `DimensionAdmissionPolicy::check_conferred`,
+    // which skips the type-keyed `accord:*` layer and every scoped
+    // reserved-prefix rule, so THIS function is where they are asked, for the
+    // dimension shape as well as the type slot:
+    // - `accord:*` in either slot → the signer is a holder of the genesis
+    //   bundle in force for the row's `accord_root`
+    //   (`edition2::standing::holds_accord_standing`);
+    // - a `scores` row's rule is matched on its DIMENSION, whatever it is
+    //   (the earlier form matched only the two assurance ladders there);
+    // - a rule naming a delegation scope is satisfied by the delegation from a
+    //   root this node trusts ALONE; the signer's `identity_type` is not read
+    //   for it.
+    let edition2 = super::edition2::standing::carries_statement(row);
+    let is_accord = at.starts_with("accord:")
+        || (edition2
+            && envelope_dimension(&row.attestation_envelope)
+                .is_some_and(|d| d.starts_with("accord:")));
     // v61.1.0 (CIRISPersist#1174 item 2) — the `hard_case:` family in EITHER
     // form. Persist's own hard_case door writes `scores` + `hard_case:{kind}:v1`
     // (v57), so keying on the type slot alone left that form — the one
@@ -19909,7 +20759,8 @@ pub async fn check_reserved_prefix_admission(
         .then(|| envelope_dimension(&row.attestation_envelope))
         .flatten()
         .filter(|d| {
-            d.starts_with("age_assurance:")
+            edition2
+                || d.starts_with("age_assurance:")
                 || d.starts_with(crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX)
         })
         .unwrap_or(at);
@@ -19928,11 +20779,38 @@ pub async fn check_reserved_prefix_admission(
         .map(|k| k.identity_type)
         .unwrap_or_default();
 
-    if is_accord && got != identity_type::ACCORD_HOLDER {
-        return Err(Error::AccordDimensionRequiresAccordHolder {
-            dimension: at.to_owned(),
-            identity_type: got,
-        });
+    if is_accord {
+        let namespace = if at.starts_with("accord:") {
+            at.to_owned()
+        } else {
+            envelope_dimension(&row.attestation_envelope)
+                .unwrap_or(at)
+                .to_owned()
+        };
+        let holds = if edition2 {
+            // `check_accord_root_binding` above refused an unnamed or
+            // disagreeing root, so a Named root is the only arm left; any
+            // other reading confers nothing (fail closed).
+            match super::trust_root::accord_root_claim(row) {
+                super::trust_root::AccordRootClaim::Named { root_ref, .. } => {
+                    super::edition2::standing::holds_accord_standing(
+                        directory,
+                        &row.attesting_key_id,
+                        &root_ref,
+                    )
+                    .await?
+                }
+                _ => false,
+            }
+        } else {
+            got == identity_type::ACCORD_HOLDER
+        };
+        if !holds {
+            return Err(Error::AccordDimensionRequiresAccordHolder {
+                dimension: namespace,
+                identity_type: got,
+            });
+        }
     }
     if let Some(hard_case_family) = hard_case_family {
         // v61.1.0 (CIRISPersist#1174) — set membership over the family's two
@@ -20069,10 +20947,17 @@ pub async fn check_reserved_prefix_admission(
                 });
             }
         }
-        if !rule
-            .required_identity_types
-            .iter()
-            .any(|t| identity_type::set_contains(&got, t))
+        // v62.0.0 (P4, I3080/I3081) — for an edition-2 row a scoped rule is
+        // decided by the delegation above ALONE: the type is the signer's own
+        // statement and "no admission decision reads it to open a reserved
+        // family" (CC rc20 3.4.7). A rule with no scope (the substrate
+        // self-report families) keeps its label test.
+        let conferred_only = edition2 && rule.required_delegation_scope.is_some();
+        if !conferred_only
+            && !rule
+                .required_identity_types
+                .iter()
+                .any(|t| identity_type::set_contains(&got, t))
         {
             let mut required = rule.required_identity_types.clone();
             required.sort();
@@ -20508,6 +21393,124 @@ mod tests {
                 expect,
                 "scope_covers({held:?}, {wanted:?}) should be {expect} — {why}"
             );
+        }
+    }
+
+    /// **I2964 (v62, CC rc21 CC 3.1; CLM-scope-attenuation)** — a key caveat
+    /// is written with the key's bare segment (one `:`-segment, no colon of
+    /// its own), and `scope_covers` stays DIRECTIONAL over it: the root and
+    /// the parent cover the caveat, the caveat covers its sub-caveat and
+    /// itself; the caveat never covers its parent; another key's caveat is
+    /// not covered, nor is a caveat on a prefix of the segment; and the
+    /// relation is antisymmetric over all of them.
+    #[test]
+    fn i2964_scope_covers_is_directional_over_a_key_segment() {
+        use crate::federation::namespace::key_segment::tests::segment;
+        let (a, b) = (segment('Q'), segment('g'));
+        let parent = "infra:attest:licensure";
+        let caveat_a = format!("{parent}:{a}");
+        let caveat_b = format!("{parent}:{b}");
+        let sub_a = format!("{caveat_a}:board");
+        let cut_a = format!("{parent}:{}", &a[..20]);
+        // CC rc21: a URN (or other non-segment) in the key position matches
+        // no key: the caveat grants nothing beyond itself.
+        let urn_caveat = format!(
+            "{parent}:{}",
+            crate::federation::namespace::key_segment::tests::kid('Q')
+        );
+        for (held, wanted, expect, why) in [
+            (
+                "infra:attest",
+                caveat_a.as_str(),
+                true,
+                "the root covers the caveat",
+            ),
+            (
+                parent,
+                caveat_a.as_str(),
+                true,
+                "the parent covers the caveat",
+            ),
+            (
+                caveat_a.as_str(),
+                caveat_a.as_str(),
+                true,
+                "a caveat covers itself",
+            ),
+            (
+                caveat_a.as_str(),
+                sub_a.as_str(),
+                true,
+                "the caveat covers its sub-caveat",
+            ),
+            (
+                caveat_a.as_str(),
+                parent,
+                false,
+                "a child never covers its parent",
+            ),
+            (caveat_a.as_str(), "infra:attest", false, "nor the root"),
+            (
+                sub_a.as_str(),
+                caveat_a.as_str(),
+                false,
+                "nor its own parent caveat",
+            ),
+            (
+                caveat_a.as_str(),
+                caveat_b.as_str(),
+                false,
+                "another key's caveat",
+            ),
+            (
+                cut_a.as_str(),
+                caveat_a.as_str(),
+                false,
+                "a prefix of the segment",
+            ),
+            (
+                cut_a.as_str(),
+                sub_a.as_str(),
+                false,
+                "a prefix of the segment, deeper",
+            ),
+            (
+                urn_caveat.as_str(),
+                caveat_a.as_str(),
+                false,
+                "a URN caveat grants no key's caveat",
+            ),
+            (
+                urn_caveat.as_str(),
+                sub_a.as_str(),
+                false,
+                "nor its sub-caveat",
+            ),
+            (urn_caveat.as_str(), parent, false, "nor its parent"),
+        ] {
+            assert_eq!(
+                scope_covers(held, wanted),
+                expect,
+                "I2964: scope_covers({held:?}, {wanted:?}) — {why}"
+            );
+        }
+        let tokens = [
+            "infra:attest".to_owned(),
+            parent.to_owned(),
+            caveat_a.clone(),
+            caveat_b,
+            sub_a,
+            cut_a,
+        ];
+        for x in &tokens {
+            for y in &tokens {
+                if x != y && scope_covers(x, y) {
+                    assert!(
+                        !scope_covers(y, x),
+                        "I2964: {x:?} and {y:?} cover each other"
+                    );
+                }
+            }
         }
     }
 
@@ -22752,7 +23755,8 @@ mod tests {
     ///   carry CC's opaque `"reserved (see table)"`, whose enforcement lives in
     ///   purpose-built gates elsewhere in this file, not in a prefix→role table.
     ///   `config:`'s is [`check_config_self_or_owner_admission`] (v38.7.0,
-    ///   #778); `ownership:`'s is [`check_single_node_owner_admission`];
+    ///   #778); `ownership:`'s is the kernel's owner seat ([`owner_of`]) with
+    ///   [`check_owner_binding_roster_fresh`];
     ///   `trace:`'s is [`check_trace_dimension_admission`], and so is
     ///   `trace_summary:`'s (v61.1.0, #1174: until then this line named no
     ///   gate for it, and none existed). Naming them is not
@@ -25784,23 +26788,8 @@ mod canonical_gate_tests {
         backend.run_migrations().await.unwrap();
         run_endtoend(&backend, "e2e-sq").await;
 
-        // adopt_scrub_upgrade path is ALSO gated: a self-signed node cannot be
-        // upgraded to canonical by an under-quorum (single/non-roster) scrub.
-        let up = "mono-adopt-sq";
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: record(up, identity_type::NODE, up),
-            })
-            .await
-            .expect("seed self-signed node for adopt");
-        let mut adopted = record(up, "canonical,node", "notanchor-sq");
-        adopted.pubkey_ed25519_base64 = record(up, identity_type::NODE, up).pubkey_ed25519_base64;
-        let err = backend
-            .adopt_scrub_upgrade(SignedKeyRecord { record: adopted })
-            .await
-            .expect_err("adopt adding canonical without quorum must be REFUSED");
-        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
-        assert!(!is_canonical(&backend, up).await.unwrap());
+        // v62.0.0 (json-cut C5): the `adopt_scrub_upgrade` leg is deleted with
+        // the door.
 
         let canon = backend.list_canonical_servers().await.expect("list");
         assert_eq!(canon.len(), 1, "exactly the one admitted canonical row");

@@ -1,0 +1,279 @@
+//! v62.0.0 (wave W1; CC 3.1.3 `transport:canonical_rebind`, CC 3.3.6.2 "A
+//! seat's transit key", CC 3.4.7, CC 5.3.4) — **the counted re-bind of a
+//! seat's transit key, in edition 2.**
+//!
+//! A seat of the genesis bundle in force takes its X-Wing transit key first
+//! from its binding in the bundle. The key moves only by a
+//! `transport:canonical_rebind` row about the seat, counted by the accord's
+//! holders, or by a later bundle that re-seats the seat on new keys. A
+//! binding the seat publishes itself that carries another key is not
+//! honoured (CC 3.3.6.2: "a node of this form takes a seat's
+//! `transit_xwing_pubkey` from the bundle or from such a re-bind, and a
+//! seat's own binding that carries another key is not honoured").
+//!
+//! # The row
+//!
+//! Family `transport:canonical_rebind` (counted: no `author`; Verify's family
+//! model `"counted"`), row type `scores`, `sub` = the seat's identity-ref.
+//! Payload (`edition2::payloads`): `transit_xwing_pubkey` (bstr, 1216 bytes,
+//! required), `onion_hop_xwing_pubkey` and `transport_destination`
+//! (optional), and `refs.head` (required) naming the genesis bundle in force
+//! the re-bind is counted over (its object id). Every voice is one holder's
+//! statement over the same payload (CC 2.6.1.9).
+//!
+//! # The count (CC ruling, 2026-11-18)
+//!
+//! A STRICT MAJORITY (⌊n/2⌋ + 1) of the holders of the bundle in force, over
+//! the `refs.head` naming that bundle. A later bundle that re-seats the node
+//! with new X-Wing keys is the other path; both stand.
+//!
+//! # The door ([`put_rebind_voice`])
+//!
+//! - No genesis bundle held, or `refs.head` names a bundle this node does not
+//!   hold: the voice WAITS (the retryable unknown-signer error naming
+//!   `ceg-genesis-bundle/2:<hex>`), as the genesis door waits.
+//! - `refs.head` names a held bundle that is not in force (a predecessor of
+//!   the head, a superseded tip): refused `edition2_payload_invalid`.
+//! - `sub` is not a seat of the bundle in force, or the signer is not a holder
+//!   of it at its placed key: refused `reserved_family_unseated` (CC 3.4.7).
+//!   A seat signing its own re-bind is refused by this rule.
+//! - A transit key that is not 1216 bytes: `xwing_pubkey_wrong_length`.
+//! - Otherwise the voice is kept. The row is `Row` once its distinct holder
+//!   voices reach the count ([`required_count`]), `Pending` before.
+//!
+//! # The read ([`seat_transit_key`])
+//!
+//! The seat's binding was seeded by the earliest bundle of the unbroken run
+//! (back from the newest Valid bundle) that seats it with its current
+//! transit key. A re-bind applies when its `refs.head` names a bundle of that
+//! run and its voices reach a strict majority of THAT bundle's holders. The
+//! live key is the latest such re-bind's (by `asserted_at`, then row id), or
+//! else the binding's. A later bundle that re-seats the seat on new keys
+//! starts a new run, so the re-binds over older bundles no longer apply and
+//! the new binding's key is live.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use ciris_verify_core::cde::Value;
+use ciris_verify_core::edition2::genesis::{
+    GenesisPlacement, PlacedHolder, PlacedSeat, XWING_PUBKEY_LEN,
+};
+use ciris_verify_core::edition2::Digest32;
+
+use super::door::{AdmittedRow, PLANE};
+use super::genesis::{genesis_in_force, GenesisInForce, GENESIS_BUNDLE_TYP};
+use super::ingest::StatementOutcome;
+use super::liveness::statement_parts;
+use super::names::{names_of, single, RowId};
+use crate::federation::{malformed_row, Error, FederationDirectory};
+
+/// The family id (header -70002) of a re-bind row.
+pub const REBIND_FAMILY: &str = "transport:canonical_rebind";
+
+/// The row type a re-bind is signed under (an attestation row about the
+/// seat, CC 3.1.3).
+pub const REBIND_ROW_TYPE: &str = "scores";
+
+/// The payload member carrying the new transit key.
+pub const TRANSIT_MEMBER: &str = "transit_xwing_pubkey";
+
+/// The `refs` role naming the bundle a re-bind is counted over.
+pub const HEAD_ROLE: &str = "head";
+
+/// The count a re-bind needs over `holders` holders: a strict majority (CC
+/// ruling).
+#[must_use]
+pub const fn required_count(holders: usize) -> usize {
+    holders / 2 + 1
+}
+
+fn unseated(detail: impl Into<String>) -> Error {
+    Error::malformed_row(PLANE, malformed_row::RESERVED_FAMILY_UNSEATED, detail)
+}
+
+fn invalid(detail: impl Into<String>) -> Error {
+    Error::malformed_row(PLANE, malformed_row::EDITION2_PAYLOAD_INVALID, detail)
+}
+
+/// The signer of a voice, if it is one of `holders` at its placed key: its
+/// identity-ref.
+fn holder_of(holders: &[PlacedHolder], iss: &str, kid: &Digest32) -> Option<String> {
+    holders
+        .iter()
+        .find(|h| h.identity_ref == iss && h.kid == *kid)
+        .map(|h| h.identity_ref.clone())
+}
+
+/// A voice's `iss` and `kid`, read from its protected header.
+fn signer_of(statement: &[u8]) -> Option<(String, Digest32)> {
+    let (protected, _) = statement_parts(statement)?;
+    let iss = protected
+        .get_int(15)?
+        .get_int(1)?
+        .as_text()
+        .map(str::to_owned)?;
+    let kid = <[u8; 32]>::try_from(protected.get_int(4)?.as_bytes()?).ok()?;
+    Some((iss, kid))
+}
+
+/// The distinct `holders` among `voices`.
+fn counted_holders(holders: &[PlacedHolder], voices: &[Vec<u8>]) -> BTreeSet<String> {
+    voices
+        .iter()
+        .filter_map(|v| signer_of(v.as_slice()))
+        .filter_map(|(iss, kid)| holder_of(holders, &iss, &kid))
+        .collect()
+}
+
+/// The transit key a re-bind payload carries, when it is exactly 1216 bytes.
+fn transit_of(payload: &Value) -> Option<[u8; XWING_PUBKEY_LEN]> {
+    payload
+        .get_text(TRANSIT_MEMBER)
+        .and_then(Value::as_bytes)
+        .and_then(|b| <[u8; XWING_PUBKEY_LEN]>::try_from(b).ok())
+}
+
+/// The bundle a re-bind payload's `refs.head` names.
+fn head_of(payload: &Value) -> Option<RowId> {
+    names_of(payload)
+        .ok()
+        .and_then(|names| single(&names, HEAD_ROLE))
+}
+
+fn waiting_on_bundle(head: &RowId) -> Error {
+    Error::unknown_signer(&format!("{GENESIS_BUNDLE_TYP}:{}", head.hex()), PLANE)
+}
+
+/// **The re-bind door**: one voice of a `transport:canonical_rebind` row
+/// (see the module doc).
+///
+/// # Errors
+/// `reserved_family_unseated`, `edition2_payload_invalid`,
+/// `xwing_pubkey_wrong_length`; the retryable unknown-signer wait for a
+/// bundle not held; storage failures.
+pub async fn put_rebind_voice<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(head) = single(&row.names, HEAD_ROLE) else {
+        return Err(invalid(format!(
+            "{REBIND_FAMILY}: `refs.head` names the genesis bundle in force the re-bind is \
+             counted over"
+        )));
+    };
+    let in_force = genesis_in_force(dir).await?;
+    if !in_force.tips().iter().any(|t| t.object_id == head.0) {
+        if in_force.valid.iter().any(|p| p.object_id == head.0) {
+            return Err(invalid(format!(
+                "{REBIND_FAMILY}: `refs.head` names bundle {}, which is not in force: a re-bind \
+                 is counted over the bundle in force",
+                head.hex()
+            )));
+        }
+        return Err(waiting_on_bundle(&head));
+    }
+    if in_force.seat(&row.sub).is_none() {
+        return Err(unseated(format!(
+            "{REBIND_FAMILY}: {} is not a seat of the genesis bundle in force",
+            row.sub
+        )));
+    }
+    if holder_of(in_force.holders(), &row.iss, &row.kid).is_none() {
+        return Err(unseated(format!(
+            "{REBIND_FAMILY}: {} is not a holder of the genesis bundle in force at the key it \
+             signed with; only the accord's holders re-bind a seat (CC 3.4.7)",
+            row.iss
+        )));
+    }
+    if transit_of(&row.payload).is_none() {
+        return Err(Error::malformed_row(
+            PLANE,
+            malformed_row::XWING_PUBKEY_WRONG_LENGTH,
+            format!("{REBIND_FAMILY}: `{TRANSIT_MEMBER}` is not {XWING_PUBKEY_LEN} bytes"),
+        ));
+    }
+    let new = dir.put_edition2_statement(row).await?;
+    let voices = dir.edition2_voices(&row.row_id).await?;
+    let counted = counted_holders(in_force.holders(), &voices);
+    Ok(
+        if counted.len() >= required_count(in_force.holders().len()) {
+            StatementOutcome::Row {
+                row_id: row.row_id,
+                new,
+            }
+        } else {
+            StatementOutcome::Pending {
+                row_id: row.row_id,
+                new,
+            }
+        },
+    )
+}
+
+/// The bundles of the run that seeded the seat's current binding: back from
+/// the newest Valid bundle, every bundle that seats it with its current
+/// transit key, until the first that does not.
+fn seeding_run<'a>(in_force: &'a GenesisInForce, seat: &PlacedSeat) -> Vec<&'a GenesisPlacement> {
+    let mut run = Vec::new();
+    for p in in_force.valid.iter().rev() {
+        match p.seats.iter().find(|s| s.identity_ref == seat.identity_ref) {
+            Some(s) if s.transit_xwing_pubkey == seat.transit_xwing_pubkey => run.push(p),
+            _ => break,
+        }
+    }
+    run
+}
+
+/// **The live transit key of a seat of the bundle in force**: the latest
+/// re-bind counted over a bundle of the seeding run, else the binding's key
+/// (module doc).
+///
+/// # Errors
+/// Directory read failures.
+pub async fn seat_transit_key<F>(
+    dir: &F,
+    in_force: &GenesisInForce,
+    seat: &PlacedSeat,
+) -> Result<[u8; XWING_PUBKEY_LEN], Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let run = seeding_run(in_force, seat);
+    let mut rows: BTreeMap<RowId, Vec<Vec<u8>>> = BTreeMap::new();
+    for st in dir
+        .edition2_statements_about(REBIND_FAMILY, &seat.identity_ref)
+        .await?
+    {
+        if let Some(id) = RowId::of_statement(&st) {
+            rows.entry(id).or_default().push(st);
+        }
+    }
+    let mut best: Option<(u64, RowId, [u8; XWING_PUBKEY_LEN])> = None;
+    for (id, voices) in rows {
+        let Some((_, payload)) = voices.first().and_then(|v| statement_parts(v.as_slice())) else {
+            continue;
+        };
+        let Some(head) = head_of(&payload) else {
+            continue;
+        };
+        let Some(over) = run.iter().find(|p| p.object_id == head.0) else {
+            continue;
+        };
+        if counted_holders(&over.holders, &voices).len() < required_count(over.holders.len()) {
+            continue;
+        }
+        let Some(at) = payload.get_text("asserted_at").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(key) = transit_of(&payload) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(b_at, b_id, _)| (at, id) > (*b_at, *b_id))
+        {
+            best = Some((at, id, key));
+        }
+    }
+    Ok(best.map_or(seat.transit_xwing_pubkey, |(_, _, k)| k))
+}

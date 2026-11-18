@@ -110,8 +110,8 @@ and CIRISServer pins the hash. The order is hashed, so a new kind is always
 **Pins:**
 - `REPLICATION_POLICY_HASH` = `1860451cf166879431dadf433422f6fdb43a911b5c889b0f55ca491262393869`
   (covers every kind's `KindPolicy`: signer, binding, projections, tier, audience).
-- `CONSENT_GRAMMAR_HASH` = `4d473eac6f2bfde1a78b01e9a2ac8442fc9adb5207c7adeb51d509215b79e843`
-  (its `kind_transferability` covers the kind list).
+- `CONSENT_GRAMMAR_HASH` = `fe545f6b7f412d59a67c8b27106368a44714387da9cea81646037483210f30fa`
+  (its `kind_transferability` covers the kind list; v62.0.0 re-pinned for the literal `"self"` cohorts entry).
 
 ### The nineteen kinds, in hashed order
 

@@ -208,6 +208,9 @@ pub(crate) mod engine_bodies {
             identity_signer: Some(o_signer.clone()),
             app: SelfAtLoginOccurrence {
                 occurrence_key_id: n.clone(),
+                identity_key_id: None,
+                occurrence_signer: None,
+                transport: None,
                 device_class: device_class::SERVER.to_owned(),
                 hardware_attestation: None,
                 encryption_pubkeys: Some(app_keys),
@@ -215,6 +218,9 @@ pub(crate) mod engine_bodies {
             },
             agent: SelfAtLoginOccurrence {
                 occurrence_key_id: agent.clone(),
+                identity_key_id: None,
+                occurrence_signer: None,
+                transport: None,
                 device_class: device_class::AGENT.to_owned(),
                 hardware_attestation: None,
                 encryption_pubkeys: Some(fresh_keys()),

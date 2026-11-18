@@ -10,8 +10,10 @@
 //! - **I440** both members are signed, persisted and served: the row hash
 //!   covers them, and every backend returns what was written.
 //! - **I441** a supersede whose `prev_head_digest` is not the held head (empty,
-//!   or another digest) is refused `lineage_prev_head_mismatch`, on the family
-//!   and the community arm; the one naming the held head is admitted.
+//!   or another digest) does not move the head, on the family and the
+//!   community arm; the one naming the held head is admitted. v62.0.0 (kernel
+//!   pass 2, K1; CC 2.7.8): such a version is held as a tip (I2811), no
+//!   longer refused `lineage_prev_head_mismatch`.
 //! - **I442** a quorate charter of a family whose head names no charter
 //!   confers nothing; a version naming it makes the root valid, and that
 //!   version's `prev_head_digest` is the head it replaced.
@@ -118,10 +120,6 @@ pub(crate) mod bodies {
         d.lookup_family(family).await.unwrap().expect("family held")
     }
 
-    fn is_prev_mismatch(e: &Error) -> bool {
-        matches!(e, Error::Conflict(m) if m.contains("lineage_prev_head_mismatch"))
-    }
-
     /// **I440** — the two members are signed, persisted and served.
     pub async fn i440_members_are_signed_and_persisted(d: &dyn FederationDirectory, tag: &str) {
         let (holders, _) = people(d, tag).await;
@@ -197,15 +195,15 @@ pub(crate) mod bodies {
             next.prev_head_digest = prev;
             next.family_name = format!("renamed-{why}");
             next.persist_row_hash = String::new();
-            let e = d
+            let v = d
                 .supersede_family(ts::sign_family(&holders[0], next), None)
                 .await
-                .expect_err("a version naming another predecessor is refused");
-            assert!(is_prev_mismatch(&e), "{tag} I441 family ({why}): {e:?}");
+                .unwrap_or_else(|e| panic!("{tag} I441 family ({why}): held as a tip: {e}"));
+            assert_eq!(v, 1, "{tag} I441 family ({why}): the head's version");
             assert_eq!(
                 head(d, &fam).await,
                 held,
-                "{tag} I441: nothing written ({why})"
+                "{tag} I441: the head did not move ({why})"
             );
         }
         let mut next = held.clone();
@@ -247,11 +245,14 @@ pub(crate) mod bodies {
         let mut next = held.clone();
         next.community_name = "renamed".to_owned();
         next.persist_row_hash = String::new();
-        let e = d
-            .supersede_community(ts::sign_community(&holders[0], next.clone()), None)
+        d.supersede_community(ts::sign_community(&holders[0], next.clone()), None)
             .await
-            .expect_err("a community version naming no predecessor is refused");
-        assert!(is_prev_mismatch(&e), "{tag} I441 community: {e:?}");
+            .unwrap_or_else(|e| panic!("{tag} I441 community: held as a tip: {e}"));
+        assert_eq!(
+            d.lookup_community(&id).await.unwrap().unwrap(),
+            held,
+            "{tag} I441 community: the head did not move"
+        );
         next.prev_head_digest = held.persist_row_hash.clone();
         d.supersede_community(ts::sign_community(&holders[0], next), None)
             .await

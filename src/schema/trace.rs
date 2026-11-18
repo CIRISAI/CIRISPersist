@@ -433,8 +433,19 @@ pub struct CompleteTrace {
 
     /// Base64-encoded Ed25519 signature over the canonical bytes
     /// (TRACE_WIRE_FORMAT.md §8).
+    ///
+    /// v62.0.0 (wave P7) — an earlier-form member. A v62 trace is signed by
+    /// its `trace:complete:v1` statement (the batch event's `statement`), so
+    /// it may omit this member (it reads as empty).
+    #[serde(default)]
     pub signature: String,
     /// Key identifier for verification lookup.
+    ///
+    /// v62.0.0 (wave P7) — may be omitted beside a statement; the ingest
+    /// pipeline then sets it to the statement's verified `iss` (the agent's
+    /// identity-ref), so every downstream reader names the signer the door
+    /// checked.
+    #[serde(default)]
     pub signature_key_id: String,
 
     /// v7.2.0 (CIRISPersist#225) — the producer's ML-DSA-65 half of the

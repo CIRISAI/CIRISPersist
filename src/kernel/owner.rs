@@ -25,8 +25,14 @@
 //! `withdraws` naming the node, not the row) withdraws every binding of that
 //! granter's to the node.
 //!
-//! The genesis-record path of the CC sentence is not presented: no persist
-//! genesis bundle carries an owner binding today (left for the next slice).
+//! **The genesis-record path** (v62.0.0, kernel pass 2, K1, I2818): a
+//! binding the node's genesis record carries counts as the node's consent,
+//! as its cosignature does ([`owner_rows_with_genesis`]: presented with the
+//! node as the conferrer). The caller hands the carried bindings' row ids
+//! in; no persist reader produces them yet — the genesis payload rule (which
+//! member of the node's genesis record carries its first binding) is CC's
+//! and has not landed (`edition2::genesis` module docs) — so the doors call
+//! [`owner_rows`], which carries none (K1 notes).
 
 use super::law::{seat_law, SEAT_OWNER};
 use super::view::{micros, KRow, NoCut, RowId, SeatFields};
@@ -79,7 +85,9 @@ pub enum Cosign {
 }
 
 /// The rows the owner seat of `node` is read from: one offer per binding the
-/// reader's present admits, one withdrawal per winning retraction.
+/// reader's present admits, one withdrawal per winning retraction. No
+/// binding is carried by the node's genesis record
+/// ([`owner_rows_with_genesis`]).
 #[must_use]
 pub fn owner_rows(
     node: &str,
@@ -88,6 +96,66 @@ pub fn owner_rows(
     now: chrono::DateTime<chrono::Utc>,
     is_user: &dyn Fn(&str) -> bool,
     cosign: Cosign,
+) -> Vec<KRow> {
+    owner_rows_with_genesis(
+        node,
+        rows,
+        retractions_about_node,
+        now,
+        is_user,
+        cosign,
+        &BTreeSet::new(),
+    )
+}
+
+/// v62.0.0 (kernel pass 2, K1, I2818) — [`owner_rows`], where
+/// `genesis_carried` holds the row ids of the owner bindings the node's
+/// genesis record carries. CC 3.2, *The first binding (MUST)*: "an
+/// owner-binding counts toward ownership only when the node's own key
+/// cosigned it, or the node's genesis record carries it": a carried binding
+/// is presented as conferred by the node (its signer the node, the owner's
+/// signature the acceptance), whether or not the node cosigned it.
+#[must_use]
+pub fn owner_rows_with_genesis(
+    node: &str,
+    rows: &[Attestation],
+    retractions_about_node: &[Attestation],
+    now: chrono::DateTime<chrono::Utc>,
+    is_user: &dyn Fn(&str) -> bool,
+    cosign: Cosign,
+    genesis_carried: &BTreeSet<RowId>,
+) -> Vec<KRow> {
+    owner_rows_with_voices(
+        node,
+        rows,
+        retractions_about_node,
+        now,
+        is_user,
+        cosign,
+        genesis_carried,
+        &BTreeMap::new(),
+    )
+}
+
+/// v62.0.0 (wave V1, I3283) — [`owner_rows_with_genesis`], where
+/// `held_voices` maps a binding's `attestation_id` to the signers (`iss`) of
+/// its edition-2 VOICES (`edition2::voices::row_voice_issuers`). In edition 2
+/// the node's cosignature on an owner binding is its own statement over the
+/// binding's payload (RULINGS: "with the node's own statement as the second
+/// voice"), held in `ceg_statements`, not an `additional_scrubs` entry: each
+/// held voice joins the binding's verified signatures. Every held voice was
+/// verified at its door.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn owner_rows_with_voices(
+    node: &str,
+    rows: &[Attestation],
+    retractions_about_node: &[Attestation],
+    now: chrono::DateTime<chrono::Utc>,
+    is_user: &dyn Fn(&str) -> bool,
+    cosign: Cosign,
+    genesis_carried: &BTreeSet<RowId>,
+    held_voices: &BTreeMap<String, BTreeSet<String>>,
 ) -> Vec<KRow> {
     // CC 3.2, the ownerless-lock reclaim: a third-party `withdraws` the door
     // admitted only on a verified m-of-n reclaim quorum (rule 5) ends the
@@ -127,8 +195,13 @@ pub fn owner_rows(
         .collect();
     let mut out: Vec<KRow> = Vec::with_capacity(bindings.len());
     for b in &bindings {
-        let voices = verified_voices(b);
-        let node_cosigned = cosign == Cosign::Assumed || voices.contains(node);
+        let mut voices = verified_voices(b);
+        if let Some(held) = held_voices.get(b.attestation_id.as_str()) {
+            voices.extend(held.iter().cloned());
+        }
+        let id = id_of[b.attestation_id.as_str()];
+        let node_cosigned =
+            cosign == Cosign::Assumed || voices.contains(node) || genesis_carried.contains(&id);
         let signer = if node_cosigned {
             node.to_owned()
         } else {
@@ -136,7 +209,7 @@ pub fn owner_rows(
         };
         let cosigners: Vec<String> = voices.into_iter().filter(|k| *k != signer).collect();
         out.push(
-            KRow::new(id_of[b.attestation_id.as_str()], Vec::new(), signer)
+            KRow::new(id, Vec::new(), signer)
                 .at(micros(b.asserted_at))
                 .with_seat(SeatFields {
                     to: vec![b.attesting_key_id.clone()],
@@ -236,11 +309,13 @@ pub fn owner_holders(rows: &[KRow], node: &str) -> Answer<BTreeSet<String>> {
         .filter(|r| r.obj == obj)
         .map(|r| r.offer)
         .collect();
-    Answer {
-        value,
-        rows: read,
-        rule: "seat::Seats::holders/owner",
-    }
+    // v62.0.0 (kernel pass 2, I2810) — the read set: the node's standing
+    // (the seats over its key) and every presented row's citers (a
+    // retraction naming a binding ends it)
+    let reads = std::iter::once(super::DepKey::Standing(node.to_owned()))
+        .chain(rows.iter().map(|r| super::DepKey::Refs(r.id)))
+        .collect();
+    Answer::reading(value, read, reads, "seat::Seats::holders/owner")
 }
 
 #[cfg(test)]
@@ -393,6 +468,40 @@ mod tests {
             owner_holders(&view, "N").value.is_empty(),
             "a binding is live only strictly before its expiry"
         );
+    }
+
+    /// **I2818** — CC 3.2, *The first binding*: a binding the node's genesis
+    /// record carries seats its owner without the node's cosignature; one it
+    /// does not carry still needs it.
+    #[test]
+    fn i2818_a_binding_the_genesis_record_carries_counts() {
+        let now = chrono::Utc::now();
+        let b = binding("b", "O", "N", false);
+        let other = binding("c", "P", "N", false);
+        let carried: BTreeSet<RowId> =
+            std::iter::once(RowId::of_hash(&b.persist_row_hash)).collect();
+        let view = owner_rows_with_genesis(
+            "N",
+            &[b.clone(), other.clone()],
+            &[],
+            now,
+            &|_| true,
+            Cosign::Required,
+            &carried,
+        );
+        let held = owner_holders(&view, "N");
+        assert_eq!(
+            held.value,
+            std::iter::once("O".to_owned()).collect::<BTreeSet<_>>(),
+            "I2818: the carried binding seats O; P's uncosigned one seats nobody"
+        );
+        assert!(
+            held.rows.contains(&RowId::of_hash(&b.persist_row_hash)),
+            "I2818: the answer rests on the carried binding"
+        );
+        // without the genesis record, neither counts
+        let bare = owner_rows("N", &[b, other], &[], now, &|_| true, Cosign::Required);
+        assert!(owner_holders(&bare, "N").value.is_empty(), "I2818");
     }
 
     /// CANARY for the adapter's own-withdrawal filter in [`owner_rows`]

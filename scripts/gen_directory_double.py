@@ -89,6 +89,33 @@ DELEGATED_DEFAULTS = (
     # the trust-root reads ask it for every unlabelled `delegates_to`, so
     # through the double it must reach the backend's held set.
     "trust_direction_held_among",
+    # v62.0.0 (wave P1c) — the edition-2 statement store's leaves: each
+    # defaulted "none held" / a `Backend` refusal, overridden by sqlite and
+    # postgres, composing no trait method. Before this, the double answered
+    # every edition-2 read with the default, so a fault injected on the key
+    # plane (`edition2_statements_about`) was never observed and a witness
+    # counting the door's reads through the double could not fail.
+    # `key_edition` stays out: its default is a composition over
+    # `lookup_public_key`.
+    "edition2_statements_about",
+    "edition2_voices",
+    "edition2_rows_naming",
+    "edition2_objects",
+    "put_edition2_object",
+    "put_edition2_statement",
+    "upsert_edition2_key_projection",
+    "edition2_statements_since",
+    # v62.0.0 (wave G0) — the fold store's reads: defaulted "none held",
+    # overridden by sqlite and postgres, composing no trait method. Through
+    # the double the fold must read the held reasons and the dependency index
+    # it writes (`put_fold_record` is found: `Unsupported`-bodied).
+    "fold_held",
+    "fold_held_page",
+    "fold_dependents",
+    # v4 — the fold state, the slot read and the boot probe.
+    "fold_state",
+    "fold_slot_rows",
+    "fold_any_refolding",
 )
 
 # NOT_DELEGATED — an `Unsupported`-bodied default the double must NOT delegate,

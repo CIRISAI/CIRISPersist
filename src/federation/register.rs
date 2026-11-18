@@ -114,19 +114,6 @@ use super::{Error, FederationDirectory};
 use crate::verify::canonical::ceg_produce_canonicalize;
 use crate::verify::{verify_hybrid, HybridPolicy, VerifyOutcome};
 
-/// Outcome of an [`adopt_scrub_upgrade`](crate::engine::Engine::adopt_scrub_upgrade)
-/// — the self-signed → anchor-scrubbed upgrade of a node's own key row
-/// (CIRISPersist#351).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdoptScrubOutcome {
-    /// The self-signed row was replaced by the anchor-scrubbed record.
-    Upgraded,
-    /// The row already carried this exact anchor-scrubbed record — idempotent
-    /// no-op (re-applying the outbox record on a second boot).
-    AlreadyAdopted,
-}
-
 /// v24.2.0 (CIRISPersist#565) — **WHICH policy branch refused** a replicated
 /// Key-plane apply.
 ///
@@ -395,7 +382,7 @@ pub(crate) fn key_record_conflict(
 /// [`apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record),
 /// the **upgrade-aware replicated Key-plane apply**. Serde tokens are
 /// snake_case strings (`"inserted"` / `"upgraded"` / `"unchanged"` /
-/// `"superseded"` / `"scrubs_rehydrated"`), mirroring [`AdoptScrubOutcome`]'s wire shape;
+/// `"superseded"` / `"scrubs_rehydrated"`), the deleted `AdoptScrubOutcome`'s wire shape;
 /// `Refused` carries its reason as `{"refused":{"reason":"<token>"}}`, the
 /// same shape the sibling route plane's
 /// [`TransportDestinationApplyOutcome`](crate::federation::self_at_login::TransportDestinationApplyOutcome)
@@ -2281,6 +2268,21 @@ pub mod test_support {
         pubkey_ml_dsa_65_base64: Option<&str>,
         signer_key_id: &str,
     ) -> KeyRecord {
+        // v62.0.0 (E0) — under the switch, the subject's own edition-2 key
+        // record (its read model) when the pubkeys are the deterministic ones
+        // its id seeds: a key's record is signed by the key itself (CC
+        // 2.4.1.1), so `signer_key_id` does not sign it. Foreign pubkeys keep
+        // the earlier form (an earlier-form witness).
+        if crate::federation::edition2::fixture_switch::emit_edition2()
+            && pubkey_ed25519_base64 == ts::hybrid_pubkeys(key_id).0
+        {
+            return crate::federation::edition2::fixture_switch::key_row_for_earlier(
+                key_id,
+                identity_type,
+                None,
+                None,
+            );
+        }
         let mut envelope = serde_json::json!({
             "purpose": "federation-peering",
         });
@@ -2650,6 +2652,16 @@ pub mod test_support {
         key_id: &str,
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> KeyRecord {
+        // v62.0.0 (E0) — under the switch, an agent's edition-2 key record
+        // asserted at `scrub_timestamp` (ending within 365 days of it).
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            return crate::federation::edition2::fixture_switch::key_row_for_earlier(
+                key_id,
+                identity_type::AGENT,
+                Some(scrub_timestamp),
+                None,
+            );
+        }
         let (ed_pk, mldsa_pk) = ts::hybrid_pubkeys(key_id);
         let signed_at = truncate_to_micros(scrub_timestamp);
         KeyRecord {

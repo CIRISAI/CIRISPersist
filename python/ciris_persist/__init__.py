@@ -44,9 +44,11 @@ from .ciris_persist import (
     SUPPORTED_SCHEMA_VERSIONS,
     ScoringFactorStream,
     Transient,
+    Waiting,
     __version__,
     accord_threshold_for,
     dimension_rejection_is_retryable,
+    earlier_form_doors_shut,
     engine_teardown_wait,
     engine_teardowns_in_flight,
     key_grant_refusal_is_retryable,
@@ -74,6 +76,9 @@ __all__ = [
     "PoolExhausted",
     "SUPPORTED_SCHEMA_VERSIONS",
     "Transient",
+    # v62.0.0 (CC 2.7) — a federation refusal that says WAIT (a ValueError
+    # subclass; `kind` and `retryable` attributes).
+    "Waiting",
     "__version__",
     # v1.10.1 (CIRISPersist#88) — handle-free process-singleton reset.
     "reset_engine",
@@ -104,6 +109,8 @@ __all__ = [
     "accord_threshold_for",
     "dimension_rejection_is_retryable",
     "key_grant_refusal_is_retryable",
+    # v62.0.0 (JSON-cut slice D) — the earlier-form switch, read-only.
+    "earlier_form_doors_shut",
     # v61.1.0 (CIRISPersist#1235) — read attribution: the caller label this
     # thread's reads are credited to, and its context manager.
     "set_caller_scope",

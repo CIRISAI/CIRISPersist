@@ -287,8 +287,16 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
         Some(at(1_000)),
         "I2000: the composite is complete at signing"
     );
-    let ev = first.attestation_evidence.clone().expect("I2000: evidence");
-    assert_eq!(ev["chain"], serde_json::json!([]), "I2000: evidence shape");
+    // v62.0.0 (wave W1b; CC 4.2.2.1) — a record stating no
+    // attestation_evidence projects none (absent, never an object of nulls).
+    assert!(
+        first
+            .attestation_evidence
+            .as_ref()
+            .is_none_or(serde_json::Value::is_null),
+        "I2000: no evidence stated, none projected: {:?}",
+        first.attestation_evidence
+    );
     let row_before = raw
         .rows("federation_keys", &format!("key_id = {}", sq(&ik)))
         .await;

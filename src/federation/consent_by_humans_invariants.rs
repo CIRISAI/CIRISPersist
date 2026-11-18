@@ -718,6 +718,9 @@ mod run {
             identity_signer: Some(alice_signer),
             app: SelfAtLoginOccurrence {
                 occurrence_key_id: app.clone(),
+                identity_key_id: None,
+                occurrence_signer: None,
+                transport: None,
                 device_class: "phone".into(),
                 hardware_attestation: None,
                 encryption_pubkeys: Some(keys()),
@@ -725,6 +728,9 @@ mod run {
             },
             agent: SelfAtLoginOccurrence {
                 occurrence_key_id: agent.clone(),
+                identity_key_id: None,
+                occurrence_signer: None,
+                transport: None,
                 device_class: "agent".into(),
                 hardware_attestation: None,
                 encryption_pubkeys: Some(keys()),

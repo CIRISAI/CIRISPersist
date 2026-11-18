@@ -709,7 +709,16 @@ where
         // v33.0.0 (#705) — no longer `mut`: the scrub works on a copy now, so
         // nothing mutates the envelope that becomes the stored record. The
         // compiler noticing this is the change being real.
-        let env = BatchEnvelope::from_json(bytes)?;
+        // v62.0.0 (wave P7) — a statement-carrying event's `trace_blob` (the
+        // trace's exact bytes, base64) is decoded and parsed into its `trace`;
+        // `carried[i]` keeps the statement and the bytes as received.
+        #[allow(clippy::type_complexity)]
+        let (rewritten, carried): (Option<Vec<u8>>, Vec<Option<(Vec<u8>, Vec<u8>)>>) =
+            match expand_trace_blobs(bytes)? {
+                Some((r, c)) => (Some(r), c),
+                None => (None, Vec::new()),
+            };
+        let env = BatchEnvelope::from_json(rewritten.as_deref().unwrap_or(bytes))?;
 
         // 2. Verify each CompleteTrace signature. Mission constraint
         //    (MISSION.md §3 anti-pattern #2): verify before any
@@ -722,25 +731,53 @@ where
         //    stays 0 because *persist* verified nothing; the
         //    persisted rows are flagged accordingly (see step 6).
         let mut signatures_verified = 0usize;
-        match verify_mode {
-            VerifyMode::Full => {
-                for event in &env.events {
-                    match event {
-                        BatchEvent::CompleteTrace { trace, .. } => {
-                            verify_trace_for_admission(
-                                self.backend,
-                                trace,
-                                &body_sha256,
-                                self.canonicalizer,
-                            )
-                            .await?;
-                            signatures_verified += 1;
-                        }
+        // v62.0.0 (wave P7; CC 3.1.5; the rulings "a replicating trace is a
+        // forward-form row" and "the manifest form is the only form") — a
+        // trace carrying its `trace:complete:v1` statement arrives as the
+        // statement plus the trace BLOB's exact bytes (`trace_blob`), already
+        // expanded into the typed envelope above. It is admitted by the
+        // edition-2 statement door in EITHER mode (the door verifies whoever
+        // relayed it) and counts as a verified signature. A trace without one
+        // is the earlier form: verified (VerifyMode::Full) behind the
+        // earlier-form switch, or, under `TrustPreVerified`, kept LOCAL and
+        // never served (`refuse_unsigned_trace_crossing`).
+        //
+        // Every pure check (each statement's content binding, each
+        // earlier-form verify) runs over the whole batch BEFORE the first
+        // statement is offered to the door, which writes the row: a batch with
+        // a malformed event writes nothing. A door refusal of a later
+        // statement leaves the earlier rows admitted (each is a valid row on
+        // its own; a replay finds them held).
+        for (i, event) in env.events.iter().enumerate() {
+            let BatchEvent::CompleteTrace { trace, .. } = event;
+            match carried.get(i).and_then(Option::as_ref) {
+                Some((statement, blob)) => {
+                    check_trace_statement_binding(statement, trace, blob)?;
+                }
+                None => {
+                    if verify_mode == VerifyMode::Full {
+                        verify_trace_for_admission(
+                            self.backend,
+                            trace,
+                            &body_sha256,
+                            self.canonicalizer,
+                        )
+                        .await?;
+                        signatures_verified += 1;
                     }
                 }
             }
-            VerifyMode::TrustPreVerified => {}
         }
+        let mut statement_signers: Vec<Option<String>> = vec![None; env.events.len()];
+        for (i, event) in env.events.iter().enumerate() {
+            let BatchEvent::CompleteTrace { trace, .. } = event;
+            if let Some((statement, blob)) = carried.get(i).and_then(Option::as_ref) {
+                let iss = admit_trace_statement(self.backend, trace, statement, blob).await?;
+                statement_signers[i] = Some(iss);
+                signatures_verified += 1;
+            }
+        }
+        let env = with_statement_signers(env, &statement_signers);
 
         // 2b. v54.1.0 — refusals on a NAMED ground, before any write.
         //     (CIRISPersist#1046) a trace a steward purge tombstoned is never
@@ -1009,8 +1046,13 @@ where
                             })
                         }
                     };
-                    trace_attestation_inputs
-                        .push(self.build_trace_attestation_input(scrubbed_trace)?);
+                    // v62.0.0 (wave P7) — a trace that arrived with its
+                    // `trace:complete:v1` row has that row as its home
+                    // (admitted in step 2); nothing is minted for it.
+                    if !matches!(statement_signers.get(i), Some(Some(_))) {
+                        trace_attestation_inputs
+                            .push(self.build_trace_attestation_input(scrubbed_trace)?);
+                    }
                     events_to_insert.extend(d.events);
                     llm_calls_to_insert.extend(d.llm_calls);
                 }
@@ -1461,6 +1503,18 @@ pub(crate) fn trace_canonicalizer(schema_version: &str) -> &'static dyn Canonica
 /// also the whole of `Engine.verify_trace`, the dry-run, so the two give one
 /// verdict for one trace because they run one function.
 ///
+/// **v62.0.0 (CC 2.6.1.7, 2.6.1.12) — this is the EARLIER form's door.** A
+/// replicating trace in v62 is a `trace:complete:v1` ROW: one composite
+/// `COSE_Sign1` under the agent's key, carried beside the trace as the
+/// batch event's `statement` and admitted by the edition-2 statement door
+/// ([`admit_trace_statement`]). A trace that arrives without one is the
+/// earlier (bound-hybrid) form and first meets [`refuse_earlier_form_trace`]
+/// (`earlier_form_object` once the doors are shut;
+/// `earlier_form_signer_is_edition2` when a component is named by an
+/// edition-2 key: a composite's halves are never standalone signers), then,
+/// while the doors are open, the steps below. Slice F deletes them with the
+/// switch.
+///
 /// In order: resolve the Ed25519 key by `signature_key_id` through
 /// [`Backend::lookup_public_key`] (a miss is `verify_unknown_key`); choose the
 /// canonicalizer by [`trace_canonicalizer`]; resolve the ML-DSA-65 key from
@@ -1490,6 +1544,9 @@ where
     B: Backend + crate::federation::FederationDirectory + ?Sized,
     D: Canonicalizer + ?Sized,
 {
+    // v62.0.0 (CC 2.6.1.12) — the earlier form, refused by name once the
+    // doors are shut, and never verified against an edition-2 key's halves.
+    refuse_earlier_form_trace(backend, trace).await?;
     let key_id = &trace.signature_key_id;
     // v18.0.0 (#473) — fully-qualified: the pipeline's B is now bound by
     // BOTH `Backend` and `FederationDirectory`, which each expose a
@@ -1675,6 +1732,799 @@ where
         }
     }
 }
+
+/// v62.0.0 — the plane name a trace refusal carries (the `plane` of the
+/// shared earlier-form refusals, [`crate::federation::edition2::door::refuse_earlier_form`]
+/// and [`crate::federation::edition2::projection::refuse_edition2_signer`]).
+pub const TRACE_PLANE: &str = "trace";
+
+/// A federation refusal at the trace door as the ingest error it surfaces
+/// as. A named refusal ([`crate::federation::Error::MalformedRow`]) keeps its
+/// own token (`earlier_form_object`, `kid_not_of_iss`, ...) as
+/// [`IngestError::TraceRefused`]'s `kind`; any other refusal keeps its
+/// `kind()` token (`federation_trace_dimension_invalid`, the retryable
+/// `federation_attester_key_unknown`, ...). Python `ValueError`,
+/// `(kind, detail)`; lens HTTP 422. A directory or backend fault
+/// (`federation_backend`, `federation_ops_proxy_unsupported`) is a store
+/// error (`RuntimeError`, 5xx), never a refusal of the trace.
+fn trace_refusal(e: crate::federation::Error) -> IngestError {
+    match e {
+        crate::federation::Error::MalformedRow {
+            reason, message, ..
+        } => IngestError::TraceRefused {
+            kind: reason,
+            detail: message,
+        },
+        e @ (crate::federation::Error::Backend(_)
+        | crate::federation::Error::Unsupported { .. }) => {
+            IngestError::Store(StoreError::Backend(format!("trace door: {e}")))
+        }
+        other => IngestError::TraceRefused {
+            kind: other.kind(),
+            detail: other.to_string(),
+        },
+    }
+}
+
+/// v62.0.0 (CC 2.6.1.12, RULINGS "composite signatures only") — **the
+/// earlier-form gate of the trace door.** A trace that arrives with no
+/// statement (the bound-hybrid form, or classical-only) is:
+///
+/// 1. refused `earlier_form_object` once the earlier-form doors are shut
+///    ([`crate::federation::edition2::door::refuse_earlier_form`], the one
+///    switch every door reads), before any key read or verify;
+/// 2. while they are open, refused `earlier_form_signer_is_edition2` when
+///    `signature_key_id` or `pqc_key_id` names an edition-2 key: a
+///    composite's components are never checked as standalone signers, and
+///    the projected `federation_keys` row is a read model, never a key an
+///    earlier-form signature verifies under.
+///
+/// # Errors
+/// [`IngestError::TraceRefused`] with the token; a directory fault as
+/// [`IngestError::Store`].
+async fn refuse_earlier_form_trace<B>(backend: &B, trace: &CompleteTrace) -> Result<(), IngestError>
+where
+    B: crate::federation::FederationDirectory + ?Sized,
+{
+    crate::federation::edition2::door::refuse_earlier_form(TRACE_PLANE).map_err(trace_refusal)?;
+    let mut signers: Vec<&str> = vec![trace.signature_key_id.as_str()];
+    if let Some(pqc) = trace.pqc_key_id.as_deref() {
+        signers.push(pqc);
+    }
+    crate::federation::edition2::projection::refuse_edition2_signer(backend, TRACE_PLANE, &signers)
+        .await
+        .map_err(trace_refusal)
+}
+
+/// v62.0.0 (wave P7; CC 3.1.5) — the family id a trace row's header names
+/// (-70002): the registry prefix `trace:{form}:{version}` with each `{name}`
+/// written `.name`. The row's `dimension` (`trace:complete:v1`) resolves to it.
+pub const TRACE_FAMILY_ID: &str = "trace:.form:.version";
+
+/// v62.0.0 — the row type of a trace row (header -70001).
+pub const TRACE_ROW_TYPE: &str = "scores";
+
+/// v62.0.0 — the dimension of the canonical trace leaf.
+pub const TRACE_COMPLETE_DIMENSION: &str = "trace:complete:v1";
+
+/// v62.0.0 — the media type a trace blob is stored under.
+pub const TRACE_BLOB_MEDIA_TYPE: &str = "application/json";
+
+/// v62.0.0 — the earlier form's signature members. A forward trace blob
+/// carries none of them (CC ruling: the row's statement signs the manifest
+/// and `content_hash` binds the blob).
+pub const TRACE_SIGNATURE_MEMBERS: [&str; 5] = [
+    "signature",
+    "signature_key_id",
+    "signature_ml_dsa_65",
+    "pubkey_ml_dsa_65",
+    "pqc_key_id",
+];
+
+/// v62.0.0 — refusal: the batch event's `statement` or `trace_blob` is not
+/// base64; the statement is not a `COSE_Sign1` trace row (header family
+/// `trace:.form:.version`, row type `scores`) or is not admitted as a row; an
+/// event carries a statement without its `trace_blob`, or both a
+/// `trace_blob` and an inline `trace`; or the blob is not a JSON object.
+pub const TRACE_STATEMENT_INVALID: &str = "trace_statement_invalid";
+
+/// v62.0.0 — refusal: the row does not commit to the blob beside it: the
+/// SHA-256 of the blob's bytes AS RECEIVED is not `manifest.content_hash` /
+/// in `evidence_refs`, its length is not `byte_len`, or a payload member
+/// (`dimension`, `trace_id`, `agent_id_hash`, `asserted_at`, `cohort_scope`,
+/// the cohort target, `component_count`, `run_kind`) disagrees with the
+/// blob's trace.
+pub const TRACE_STATEMENT_CONTENT_MISMATCH: &str = "trace_statement_content_mismatch";
+
+/// v62.0.0 — refusal: a forward trace blob carries a signature member of its
+/// own ([`TRACE_SIGNATURE_MEMBERS`]); the row's statement is its only
+/// signature.
+pub const TRACE_BLOB_CARRIES_SIGNATURE: &str = "trace_blob_carries_signature";
+
+/// v62.0.0 (CC ruling, the lead's relay) — refusal: a `trace:*` row with no
+/// edition-2 statement (an unsigned or earlier-form trace kept local-tier by
+/// `VerifyMode::TrustPreVerified` ingest) offered to the mesh. Such a trace
+/// stays local: CC lets a trace keep its own form only while nothing on the
+/// mesh verifies it. Only a trace with its `trace:complete:v1` statement
+/// crosses.
+pub const TRACE_UNSIGNED_LOCAL_ONLY: &str = "trace_unsigned_local_only";
+
+fn trace_statement_refused(kind: &'static str, detail: String) -> IngestError {
+    IngestError::TraceRefused { kind, detail }
+}
+
+/// v62.0.0 — **a producer's convenience, never a reader's step**: the RFC
+/// 8785 JCS of a trace JSON object less [`TRACE_SIGNATURE_MEMBERS`]. It does
+/// NOT scrub: persist's own producer calls it only on the scrubber's output
+/// ([`scrubbed_trace_blob`]). CC leaves the
+/// blob's encoding to the producer; a reader hashes the bytes it receives and
+/// never re-canonicalises, so ingest never calls this.
+///
+/// # Errors
+/// [`TRACE_STATEMENT_INVALID`] when `trace` is not a JSON object; the
+/// canonicalizer's error.
+pub fn canonical_trace_blob(trace: &serde_json::Value) -> Result<Vec<u8>, IngestError> {
+    let Some(obj) = trace.as_object() else {
+        return Err(trace_statement_refused(
+            TRACE_STATEMENT_INVALID,
+            "a trace is a JSON object".to_owned(),
+        ));
+    };
+    let mut content = obj.clone();
+    for member in TRACE_SIGNATURE_MEMBERS {
+        content.remove(member);
+    }
+    crate::verify::canonical::JcsCanonicalizer
+        .canonicalize_value(&serde_json::Value::Object(content))
+        .map_err(IngestError::Verify)
+}
+
+/// Decode a base64 batch member: standard, or URL-safe (padded or not).
+fn decode_b64_member(member: &str, b64: &str) -> Result<Vec<u8>, IngestError> {
+    use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+    let t = b64.trim();
+    BASE64
+        .decode(t)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(t))
+        .or_else(|_| URL_SAFE.decode(t))
+        .map_err(|e| {
+            trace_statement_refused(
+                TRACE_STATEMENT_INVALID,
+                format!("the event's {member} is not base64: {e}"),
+            )
+        })
+}
+
+/// v62.0.0 — a trace blob's bytes parsed as the JSON object they hold,
+/// refused when they carry a signature member.
+///
+/// # Errors
+/// [`TRACE_STATEMENT_INVALID`] for bytes that are no JSON object;
+/// [`TRACE_BLOB_CARRIES_SIGNATURE`].
+pub fn parse_trace_blob(blob: &[u8]) -> Result<serde_json::Value, IngestError> {
+    let v: serde_json::Value = serde_json::from_slice(blob).map_err(|e| {
+        trace_statement_refused(
+            TRACE_STATEMENT_INVALID,
+            format!("the trace blob is not JSON: {e}"),
+        )
+    })?;
+    let Some(obj) = v.as_object() else {
+        return Err(trace_statement_refused(
+            TRACE_STATEMENT_INVALID,
+            "the trace blob is not a JSON object".to_owned(),
+        ));
+    };
+    if let Some(m) = TRACE_SIGNATURE_MEMBERS
+        .iter()
+        .find(|m| obj.contains_key(**m))
+    {
+        return Err(trace_statement_refused(
+            TRACE_BLOB_CARRIES_SIGNATURE,
+            format!(
+                "the trace blob carries {m:?}: a forward trace is signed by its \
+                 trace:complete:v1 statement only"
+            ),
+        ));
+    }
+    Ok(v)
+}
+
+/// v62.0.0 (wave P7) — the statement-carrying events of a raw batch: each
+/// event with a `statement` must carry its `trace_blob` (base64 of the blob's
+/// exact bytes) and no inline `trace`; the blob is parsed and put in place as
+/// the event's `trace`, so the typed envelope parses as before. Returns the
+/// rewritten batch bytes and, per event, `(statement bytes, blob bytes)`.
+/// `None` when no event carries a statement (the batch is untouched).
+///
+/// # Errors
+/// [`TRACE_STATEMENT_INVALID`], [`TRACE_BLOB_CARRIES_SIGNATURE`]; a batch
+/// that is not JSON as [`IngestError::Schema`].
+#[allow(clippy::type_complexity)]
+fn expand_trace_blobs(
+    bytes: &[u8],
+) -> Result<Option<(Vec<u8>, Vec<Option<(Vec<u8>, Vec<u8>)>>)>, IngestError> {
+    let mentions = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    if !mentions(b"\"statement\"") && !mentions(b"\"trace_blob\"") {
+        return Ok(None);
+    }
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| IngestError::Schema(e.into()))?;
+    let Some(events) = raw
+        .get_mut("events")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(None);
+    };
+    let mut carried = Vec::with_capacity(events.len());
+    let mut any = false;
+    for (i, event) in events.iter_mut().enumerate() {
+        let Some(obj) = event.as_object_mut() else {
+            carried.push(None);
+            continue;
+        };
+        let statement = obj.get("statement").and_then(serde_json::Value::as_str);
+        let blob = obj.get("trace_blob").and_then(serde_json::Value::as_str);
+        match (statement, blob) {
+            (None, None) => carried.push(None),
+            (None, Some(_)) => {
+                return Err(trace_statement_refused(
+                    TRACE_STATEMENT_INVALID,
+                    format!("event {i} carries a trace_blob but no statement"),
+                ))
+            }
+            (Some(_), None) => {
+                return Err(trace_statement_refused(
+                    TRACE_STATEMENT_INVALID,
+                    format!(
+                        "event {i} carries a statement but no trace_blob: a trace row's \
+                         content travels as the blob's exact bytes"
+                    ),
+                ))
+            }
+            (Some(st), Some(b)) => {
+                if obj.contains_key("trace") {
+                    return Err(trace_statement_refused(
+                        TRACE_STATEMENT_INVALID,
+                        format!("event {i} carries both a trace_blob and an inline trace"),
+                    ));
+                }
+                let statement = decode_b64_member("statement", st)?;
+                let blob = decode_b64_member("trace_blob", b)?;
+                let trace = parse_trace_blob(&blob)?;
+                obj.remove("trace_blob");
+                obj.insert("trace".to_owned(), trace);
+                carried.push(Some((statement, blob)));
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return Ok(None);
+    }
+    let rewritten = serde_json::to_vec(&raw).map_err(|e| IngestError::Schema(e.into()))?;
+    Ok(Some((rewritten, carried)))
+}
+
+/// v62.0.0 (wave P7) — **the content binding**, pure (no key read, no
+/// verify; the statement door verifies the same bytes next): the statement
+/// is a trace row whose payload commits to `blob`, the trace blob's bytes
+/// EXACTLY as received (`trace` is their parse). Returns the statement's
+/// `iss` (the agent's identity-ref), which the door then checks the signing
+/// key against (the key-of-issuer check).
+///
+/// # Errors
+/// [`TRACE_STATEMENT_INVALID`] for a statement that is no trace row;
+/// [`TRACE_STATEMENT_CONTENT_MISMATCH`] naming the first member that
+/// disagrees.
+pub fn check_trace_statement_binding(
+    statement: &[u8],
+    trace: &CompleteTrace,
+    blob: &[u8],
+) -> Result<String, IngestError> {
+    use ciris_verify_core::cde::Value;
+    let invalid = |why: &str| trace_statement_refused(TRACE_STATEMENT_INVALID, why.to_owned());
+    let mismatch = |member: &str, detail: String| {
+        trace_statement_refused(
+            TRACE_STATEMENT_CONTENT_MISMATCH,
+            format!("trace_id={} {member}: {detail}", trace.trace_id),
+        )
+    };
+    let (protected, payload) = crate::federation::edition2::liveness::statement_parts(statement)
+        .ok_or_else(|| {
+            invalid("the statement is not a COSE_Sign1 with a decodable header and payload")
+        })?;
+    if protected.get_int(-70002).and_then(Value::as_text) != Some(TRACE_FAMILY_ID) {
+        return Err(invalid(
+            "the statement's family (-70002) is not trace:.form:.version",
+        ));
+    }
+    if protected.get_int(-70001).and_then(Value::as_text) != Some(TRACE_ROW_TYPE) {
+        return Err(invalid("the statement's row type (-70001) is not scores"));
+    }
+    let iss = protected
+        .get_int(15)
+        .and_then(|claims| claims.get_int(1))
+        .and_then(Value::as_text)
+        .ok_or_else(|| invalid("the statement carries no iss"))?
+        .to_owned();
+    let text = |member: &str| payload.get_text(member).and_then(Value::as_text);
+
+    if text("dimension") != Some(TRACE_COMPLETE_DIMENSION) {
+        return Err(mismatch(
+            "dimension",
+            format!("{:?}, not {TRACE_COMPLETE_DIMENSION}", text("dimension")),
+        ));
+    }
+    if text("trace_id") != Some(trace.trace_id.as_str()) {
+        return Err(mismatch("trace_id", format!("{:?}", text("trace_id"))));
+    }
+    if text("agent_id_hash") != Some(trace.agent_id_hash.as_str()) {
+        return Err(mismatch(
+            "agent_id_hash",
+            format!("{:?} vs {}", text("agent_id_hash"), trace.agent_id_hash),
+        ));
+    }
+    let completed_ms = u64::try_from(trace.completed_at.parsed().timestamp_millis()).ok();
+    let asserted_at = payload.get_text("asserted_at").and_then(Value::as_u64);
+    if asserted_at.is_none() || asserted_at != completed_ms {
+        return Err(mismatch(
+            "asserted_at",
+            format!(
+                "{asserted_at:?} is not completed_at {} in ms",
+                trace.completed_at.wire()
+            ),
+        ));
+    }
+    let scope = text("cohort_scope").unwrap_or("federation");
+    if scope != trace.cohort_scope {
+        return Err(mismatch(
+            "cohort_scope",
+            format!("{scope} vs the trace's {}", trace.cohort_scope),
+        ));
+    }
+    let target = text("community_id").or_else(|| text("family_id"));
+    if target != trace.cohort_target_id.as_deref() {
+        return Err(mismatch(
+            "community_id/family_id",
+            format!(
+                "{target:?} vs cohort_target_id {:?}",
+                trace.cohort_target_id
+            ),
+        ));
+    }
+
+    // The bytes as received: hashed, never re-canonicalised (CC ruling).
+    let digest: [u8; 32] = Sha256::digest(blob).into();
+    let Some(manifest) = payload.get_text("manifest") else {
+        return Err(mismatch("manifest", "absent".to_owned()));
+    };
+    let m_text = |member: &str| manifest.get_text(member).and_then(Value::as_text);
+    let m_uint = |member: &str| manifest.get_text(member).and_then(Value::as_u64);
+    if m_text("schema") != Some("trace_manifest:v1") {
+        return Err(mismatch(
+            "manifest.schema",
+            format!("{:?}", m_text("schema")),
+        ));
+    }
+    let want_hash = format!("sha256:{}", hex::encode(digest));
+    if m_text("content_hash") != Some(want_hash.as_str()) {
+        return Err(mismatch(
+            "manifest.content_hash",
+            format!(
+                "{:?}; the blob's bytes hash to {want_hash}",
+                m_text("content_hash")
+            ),
+        ));
+    }
+    if m_uint("byte_len") != u64::try_from(blob.len()).ok() {
+        return Err(mismatch(
+            "manifest.byte_len",
+            format!("{:?} vs {}", m_uint("byte_len"), blob.len()),
+        ));
+    }
+    if m_uint("component_count") != u64::try_from(trace.components.len()).ok() {
+        return Err(mismatch(
+            "manifest.component_count",
+            format!(
+                "{:?} vs {}",
+                m_uint("component_count"),
+                trace.components.len()
+            ),
+        ));
+    }
+    if m_text("run_kind") != trace.signed_run_kind() {
+        return Err(mismatch(
+            "manifest.run_kind",
+            format!("{:?} vs {:?}", m_text("run_kind"), trace.signed_run_kind()),
+        ));
+    }
+    let names_content = payload
+        .get_text("evidence_refs")
+        .and_then(Value::as_array)
+        .is_some_and(|refs| {
+            refs.iter().any(|r| match r.as_array() {
+                Some([alg, d]) => {
+                    alg.as_i64() == Some(-16) && d.as_bytes() == Some(digest.as_slice())
+                }
+                _ => false,
+            })
+        });
+    if !names_content {
+        return Err(mismatch(
+            "evidence_refs",
+            format!("no [-16, {}] entry", hex::encode(digest)),
+        ));
+    }
+    Ok(iss)
+}
+
+/// v62.0.0 (wave P7; CC 2.6.1, 3.1.5; the ruling "a replicating trace is a
+/// forward-form row", the manifest form only) — **admit a trace's
+/// `trace:complete:v1` row and keep its blob.**
+///
+/// 1. the content binding ([`check_trace_statement_binding`], pure);
+/// 2. **the edition-2 statement door**
+///    ([`crate::federation::edition2::ingest::put_statement`], tier
+///    `federation`): Verify's reader (the composite signature under the key
+///    `kid` names; the key-of-issuer check, `kid_not_of_iss`), the key plane's
+///    liveness at the row's own `asserted_at`, and every attestation gate
+///    (`federation_trace_dimension_invalid`: the self-emission rule and the
+///    manifest shape; `trace_run_kind_mock`; the closed payload list of
+///    `trace:{form}:{version}`);
+/// 3. only a `Row` (new or held) or a further `Voice` of the held row is
+///    accepted;
+/// 4. the blob's bytes, exactly as received, go to the blob plane under
+///    their SHA-256 (the digest the row's `evidence_refs` names), through
+///    [`Backend::store_trace_blob`].
+///
+/// No component signature is checked and no earlier-form directory is read.
+/// Returns the row's `iss`.
+///
+/// # Errors
+/// [`TRACE_STATEMENT_INVALID`], [`TRACE_STATEMENT_CONTENT_MISMATCH`], the
+/// door's refusals ([`trace_refusal`]); a blob-plane failure as
+/// [`IngestError::Store`].
+pub(crate) async fn admit_trace_statement<B>(
+    backend: &B,
+    trace: &CompleteTrace,
+    statement: &[u8],
+    blob: &[u8],
+) -> Result<String, IngestError>
+where
+    B: Backend + crate::federation::FederationDirectory + ?Sized,
+{
+    use crate::federation::edition2::ingest::{put_statement, StatementOutcome, INGEST_TIER};
+    let iss = check_trace_statement_binding(statement, trace, blob)?;
+    let outcome = Box::pin(put_statement(backend, statement, None, INGEST_TIER))
+        .await
+        .map_err(trace_refusal)?;
+    match outcome {
+        StatementOutcome::Row { .. } | StatementOutcome::Voice { .. } => {}
+        StatementOutcome::KeyPlane { .. } | StatementOutcome::Pending { .. } => {
+            return Err(trace_statement_refused(
+                TRACE_STATEMENT_INVALID,
+                format!(
+                    "trace_id={}: the statement was not admitted as a row",
+                    trace.trace_id
+                ),
+            ));
+        }
+    }
+    let digest: [u8; 32] = Sha256::digest(blob).into();
+    backend
+        .store_trace_blob(
+            &digest,
+            blob.to_vec(),
+            &trace.cohort_scope,
+            trace.cohort_target_id.as_deref(),
+            &iss,
+        )
+        .await
+        .map_err(IngestError::Store)?;
+    Ok(iss)
+}
+
+/// v62.0.0 (wave P7) — **the blob-plane write of a trace blob**, shared by
+/// the sqlite and postgres [`Backend::store_trace_blob`] overrides: the bytes
+/// as received, `Inline`, under their SHA-256, at the trace's cohort, through
+/// [`crate::federation::BlobStorage::store_blob_local`] (hash-on-write; the
+/// node's holding claim is the claim emitter's, not this door's).
+///
+/// The floor is `Plaintext`, which the floor admits for the commons and for
+/// a room. A `self` / `family` trace blob must be sealed (BLOB_ENCRYPTION_AT_REST
+/// §11.1), and the sealed write needs this node's community DEK path, which
+/// the ingest pipeline does not hold: it is NOT stored here (a warning names
+/// it). Its row is admitted and names it by digest; the bytes are this
+/// node's `trace_events` projection until the sealed path lands.
+///
+/// # Errors
+/// The blob plane's error, as [`StoreError::Backend`].
+pub(crate) async fn store_trace_blob_on<T>(
+    store: &T,
+    sha256: &[u8; 32],
+    blob: Vec<u8>,
+    cohort_scope: &str,
+    group_key_id: Option<&str>,
+    author_key_id: &str,
+) -> Result<(), StoreError>
+where
+    T: crate::federation::BlobStorage + Sync,
+{
+    use crate::federation::types::cohort_scope::CryptoTier;
+    let floor = crate::federation::StorageFloor::resolved(CryptoTier::Plaintext);
+    if let Err(e) = floor.check_scope(cohort_scope) {
+        tracing::warn!(
+            sha256 = %hex::encode(sha256),
+            cohort_scope,
+            error = %e,
+            "ciris-persist: trace blob not stored on the blob plane (a self/family blob \
+             must be sealed; the sealed trace path is not built)"
+        );
+        return Ok(());
+    }
+    store
+        .store_blob_local(
+            sha256,
+            crate::federation::BlobBody::Inline(blob),
+            Some(TRACE_BLOB_MEDIA_TYPE),
+            cohort_scope,
+            floor,
+            Some(author_key_id),
+            group_key_id,
+        )
+        .await
+        .map_err(|e| StoreError::Backend(format!("trace blob store: {e}")))
+}
+
+/// v62.0.0 (CC ruling: unsigned ⇒ local, never served) — **the crossing gate
+/// for traces**: a `trace:*` / `trace_summary:*` row that carries no edition-2
+/// statement never enters the mesh. `crossing::plan_enter_mesh` asks it
+/// before anything else, so `Engine::enter_mesh` and every backend's
+/// `enter_mesh` refuse such a row by name. A trace crosses only as its
+/// `trace:complete:v1` statement, which is federation-tier from its door.
+///
+/// # Errors
+/// [`TRACE_UNSIGNED_LOCAL_ONLY`] (`federation_malformed_row`, plane `trace`).
+pub fn refuse_unsigned_trace_crossing(
+    row: &crate::federation::types::Attestation,
+) -> Result<(), crate::federation::Error> {
+    let is_trace = row
+        .attestation_envelope
+        .get("dimension")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|d| {
+            d.starts_with(crate::federation::admission::TRACE_DIMENSION_PREFIX)
+                || d.starts_with("trace_summary:")
+        });
+    let carries_statement = row
+        .attestation_envelope
+        .get(crate::federation::edition2::ingest::STATEMENT_MEMBER)
+        .is_some();
+    if is_trace && !carries_statement {
+        return Err(crate::federation::Error::malformed_row(
+            TRACE_PLANE,
+            TRACE_UNSIGNED_LOCAL_ONLY,
+            format!(
+                "row {} is a trace with no trace:complete:v1 statement: it was kept local \
+                 (an unsigned trace stays local while nothing on the mesh verifies it) and \
+                 never crosses; offer the agent-signed statement instead",
+                row.attestation_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// v62.0.0 (wave P7; CC 3.1.5) — **the payload of a trace's
+/// `trace:complete:v1` row** (the manifest form, the only form; P7.md
+/// "Server/lens-core adoption" is its spec). `blob` is the trace blob's
+/// exact bytes (no signature members inside); `trace` their typed parse;
+/// `iss` the signer's identity-ref (also `author` and the one
+/// `subject_key_ids` entry: a trace is self-emitted, CC 3.4.5).
+/// [`check_trace_statement_binding`] accepts exactly what this builds.
+///
+/// # Errors
+/// [`TRACE_STATEMENT_INVALID`] for a `completed_at` before the epoch.
+pub fn trace_row_payload(
+    trace: &CompleteTrace,
+    blob: &[u8],
+    iss: &str,
+) -> Result<ciris_verify_core::cde::Value, IngestError> {
+    use ciris_verify_core::cde::Value;
+    let digest: [u8; 32] = Sha256::digest(blob).into();
+    let asserted_at =
+        u64::try_from(trace.completed_at.parsed().timestamp_millis()).map_err(|_| {
+            trace_statement_refused(
+                TRACE_STATEMENT_INVALID,
+                format!(
+                    "trace_id={}: completed_at is before the epoch",
+                    trace.trace_id
+                ),
+            )
+        })?;
+    let t = |s: &str| Value::Text(s.to_owned());
+    let mut manifest = vec![
+        (t("schema"), t("trace_manifest:v1")),
+        (
+            t("content_hash"),
+            Value::Text(format!("sha256:{}", hex::encode(digest))),
+        ),
+        (
+            t("byte_len"),
+            Value::Uint(u64::try_from(blob.len()).unwrap_or(u64::MAX)),
+        ),
+        (
+            t("component_count"),
+            Value::Uint(u64::try_from(trace.components.len()).unwrap_or(u64::MAX)),
+        ),
+    ];
+    if let Some(kind) = trace.signed_run_kind() {
+        manifest.push((t("run_kind"), t(kind)));
+    }
+    let mut payload = vec![
+        (t("asserted_at"), Value::Uint(asserted_at)),
+        (t("author"), t(iss)),
+        (t("dimension"), t(TRACE_COMPLETE_DIMENSION)),
+        (t("trace_id"), t(&trace.trace_id)),
+        (t("agent_id_hash"), t(&trace.agent_id_hash)),
+        (t("subject_key_ids"), Value::Array(vec![t(iss)])),
+        (
+            t("evidence_refs"),
+            Value::Array(vec![ciris_verify_core::edition2::hash_digest_value(
+                &digest,
+            )]),
+        ),
+        (t("manifest"), Value::Map(manifest)),
+    ];
+    if trace.cohort_scope != "federation" {
+        payload.push((t("cohort_scope"), t(&trace.cohort_scope)));
+    }
+    if let Some(target) = trace.cohort_target_id.as_deref() {
+        let member = if trace.cohort_scope == "family" {
+            "family_id"
+        } else {
+            "community_id"
+        };
+        payload.push((t(member), t(target)));
+    }
+    Ok(Value::Map(payload))
+}
+
+/// v62.0.0 (wave P7) — what [`seal_trace_row`] returns: the row's
+/// `COSE_Sign1` statement and the trace blob it names. Send both as the
+/// batch event's `statement` and `trace_blob` (base64), and store and serve
+/// `trace_blob` exactly as returned: the row binds these bytes, and only
+/// these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedTrace {
+    /// The `trace:complete:v1` row statement.
+    pub statement: Vec<u8>,
+    /// The SCRUBBED trace's bytes (JCS, no signature members).
+    pub trace_blob: Vec<u8>,
+}
+
+/// v62.0.0 (wave P7; "the substrate absorbs complexity") — **the only bytes a
+/// sealed trace blob can hold**: `trace` less [`TRACE_SIGNATURE_MEMBERS`],
+/// run through persist's own scrubber
+/// ([`crate::pipeline::scrub::scrub_trace`]) at `level`, then JCS. Nothing
+/// unscrubbed reaches the hash: the scrubber's output is the only input to
+/// the canonicaliser. A trace that states a `trace_level` other than `level`
+/// is refused, so a trace cannot be sealed under a lighter scrub than its own
+/// label.
+///
+/// # Errors
+/// [`TRACE_STATEMENT_INVALID`] (not an object; a `trace_level` mismatch);
+/// the scrubber's refusal under its own token (`scrub_ner_not_configured`
+/// for `full_traces` without NER, `scrub_year_residue`, ...).
+#[cfg(feature = "scrub")]
+pub fn scrubbed_trace_blob(
+    trace: &serde_json::Value,
+    level: TraceLevel,
+) -> Result<Vec<u8>, IngestError> {
+    let Some(obj) = trace.as_object() else {
+        return Err(trace_statement_refused(
+            TRACE_STATEMENT_INVALID,
+            "a trace is a JSON object".to_owned(),
+        ));
+    };
+    if let Some(stated) = obj.get("trace_level") {
+        if stated.as_str() != Some(level.as_str()) {
+            return Err(trace_statement_refused(
+                TRACE_STATEMENT_INVALID,
+                format!(
+                    "the trace states trace_level {stated}, but is sealed at {}",
+                    level.as_str()
+                ),
+            ));
+        }
+    }
+    let mut content = obj.clone();
+    for member in TRACE_SIGNATURE_MEMBERS {
+        content.remove(member);
+    }
+    let scrubbed = crate::pipeline::scrub::scrub_trace(serde_json::Value::Object(content), level)
+        .map_err(|e| {
+        trace_statement_refused(e.kind(), format!("seal: scrub at {}: {e}", level.as_str()))
+    })?;
+    canonical_trace_blob(&scrubbed.value)
+}
+
+/// v62.0.0 (wave P7) — [`seal_trace_row`] up to the signature, pure: the
+/// scrubbed blob ([`scrubbed_trace_blob`]) and the row payload over it
+/// ([`trace_row_payload`]) for `iss`. A producer that signs elsewhere signs
+/// `payload` as a `scores` row of family [`TRACE_FAMILY_ID`] with `sub` =
+/// `iss`.
+///
+/// # Errors
+/// As [`scrubbed_trace_blob`]; [`IngestError::Schema`] for a scrubbed trace
+/// that is no `CompleteTrace`; [`trace_row_payload`]'s.
+#[cfg(feature = "scrub")]
+pub fn prepare_trace_row(
+    trace: &serde_json::Value,
+    level: TraceLevel,
+    iss: &str,
+) -> Result<(Vec<u8>, ciris_verify_core::cde::Value), IngestError> {
+    let blob = scrubbed_trace_blob(trace, level)?;
+    let parsed: CompleteTrace =
+        serde_json::from_slice(&blob).map_err(|e| IngestError::Schema(e.into()))?;
+    let payload = trace_row_payload(&parsed, &blob, iss)?;
+    Ok((blob, payload))
+}
+
+/// v62.0.0 (wave P7) — **persist's trace producer**: scrub `trace` at
+/// `level` with persist's own scrubber, then seal the SCRUBBED bytes as the
+/// trace's `trace:complete:v1` row, signed once by `signer`'s composite key
+/// ([`crate::federation::edition2::produce::sign_row`]; `iss` = `sub` = the
+/// signer's own identity-ref). It is structurally impossible to seal an
+/// unscrubbed trace through it: the only bytes hashed and returned are the
+/// scrubber's output ([`prepare_trace_row`]).
+///
+/// `iss` is the signer key's own identity-ref: an agent signing with a
+/// rotated key (whose `iss` is its genesis key) is not served here.
+///
+/// # Errors
+/// [`prepare_trace_row`]'s; [`IngestError::Sign`] when the signer has no
+/// composite (no PQC half) or a half fails.
+#[cfg(feature = "scrub")]
+pub async fn seal_trace_row(
+    signer: &crate::signing::LocalSigner,
+    trace: &serde_json::Value,
+    level: TraceLevel,
+) -> Result<SealedTrace, IngestError> {
+    let (_, iss) = crate::federation::edition2::produce::signer_identity(signer)
+        .await
+        .map_err(|e| IngestError::Sign(format!("trace row signer: {e}")))?;
+    let (trace_blob, payload) = prepare_trace_row(trace, level, &iss)?;
+    let statement = crate::federation::edition2::produce::sign_row(
+        signer,
+        &iss,
+        TRACE_ROW_TYPE,
+        TRACE_FAMILY_ID,
+        &payload,
+    )
+    .await
+    .map_err(|e| IngestError::Sign(format!("trace row: {e}")))?;
+    Ok(SealedTrace {
+        statement,
+        trace_blob,
+    })
+}
+
+/// v62.0.0 (wave P7) — the batch with each statement-carrying trace's
+/// `signature_key_id` set to the `iss` its admitted row names (the verified
+/// signer), so step 2b's tombstone check, the write-scope gate and the
+/// projection rows read the signer the door checked.
+fn with_statement_signers(mut env: BatchEnvelope, signers: &[Option<String>]) -> BatchEnvelope {
+    for (event, signer) in env.events.iter_mut().zip(signers) {
+        if let (BatchEvent::CompleteTrace { trace, .. }, Some(iss)) = (event, signer) {
+            trace.signature_key_id.clone_from(iss);
+        }
+    }
+    env
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod trace_statement_invariants;
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {

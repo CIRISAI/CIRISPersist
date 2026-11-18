@@ -513,14 +513,22 @@ pub fn range_for_polarity(label: &str) -> Option<DeclaredRange> {
 /// registers, pins `Refuted` like `key:revocation`: a revocation is asserted,
 /// never scored. Its sibling rc9 row, `transport:canonical_rebind:v1`, is
 /// `positive-only` and pins on neither side.
+///
+/// # v62.0.0 (CC rc20) — two leaves become one row
+///
+/// rc20 folds `accord:lifecycle:active` and `accord:lifecycle:confirmed` into
+/// `accord:lifecycle:{kind}` (`{kind}` ∈ active | confirmed, closed), still
+/// `+1.0 only`, so the census names the one row. rc20's other new rows
+/// (`capacity:{factor}`, `detection:{detector}`: `signed`;
+/// `location_proof:{version}`, `trust:blessing`: `positive-only`) pin on
+/// neither side.
 pub const PINNING_FAMILIES: &[&str] = &[
     "accord:*",
     "accord:invoke:constitutional:{halt_id}",
     "accord:invoke:drill:{drill_id}",
     "accord:invoke:notify:{notify_id}",
     "accord:lifecycle",
-    "accord:lifecycle:active",
-    "accord:lifecycle:confirmed",
+    "accord:lifecycle:{kind}",
     "archive_release:{basis}",
     "identity:occurrence_revocation",
     "key:revocation",
@@ -1670,7 +1678,9 @@ mod tests {
         );
         // The literal is not empty, so the census is a finding and not a
         // formality — and it is not everything, so it discriminates.
-        assert_eq!(PINNING_FAMILIES.len(), 17);
+        // v62.0.0 (CC rc20): 16 — the two lifecycle leaves are one row,
+        // `accord:lifecycle:{kind}`, `+1.0 only` like each leaf was.
+        assert_eq!(PINNING_FAMILIES.len(), 16);
     }
 
     /// **CC 3.4.5's acceptance criterion, stated as it was written**: feasible

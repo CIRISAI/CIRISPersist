@@ -302,7 +302,12 @@ where
     }
     // v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for
     // non-infrastructure community membership.
-    if !trust_root {
+    // v62.0.0 (v62 security ruling "Agents are never exempt") — a trust-root
+    // room no longer skips the gate: the door's verdict exempts its NODE
+    // members, and an agent member still needs its live steward binding.
+    if trust_root {
+        super::admission::check_trust_root_membership_steward_binding(dir, row).await?;
+    } else {
         super::admission::check_community_membership_steward_binding(dir, row).await?;
     }
     // v49.0.0 (CIRISPersist#910.5) — what an occupied id gets.

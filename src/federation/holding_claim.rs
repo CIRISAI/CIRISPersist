@@ -644,7 +644,12 @@ where
         core,
         scope.cohort_scope(),
     );
-    input.expires_at = row.expires_at;
+    // v62.0.0 (wave P1, CC 3.1.3.3) — the edition-2 claim carries no
+    // `expires_at`: a custody payload's map is closed, and the claim is live
+    // [`CUSTODY_LIVE_SECS`] from its signed instant, judged by the fold.
+    // (`holding_claim_row`'s earlier-form row keeps its window until the
+    // earlier-form doors shut.)
+    input.expires_at = None;
     let emitted = super::attestation_emit::emit_statement(backend, local, input, None)
         .await
         .map_err(|e| match e {

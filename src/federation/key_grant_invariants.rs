@@ -3681,11 +3681,17 @@ mod tests {
                     &alice,
                     crate::federation::types::device_class::SERVER,
                     None,
+                    None, // X2 build fix: author_signer (P8)
                 )
                 .await
                 .expect("I75: A publishes its occurrence under alice");
             engine_b
-                .publish_self_occurrence(&bob, crate::federation::types::device_class::SERVER, None)
+                .publish_self_occurrence(
+                    &bob,
+                    crate::federation::types::device_class::SERVER,
+                    None,
+                    None,
+                )
                 .await
                 .expect("I75: B publishes its occurrence under bob");
             // Occurrences cross through the plane and the gated door.
@@ -3776,6 +3782,7 @@ mod tests {
                     "i82-owner",
                     crate::federation::types::device_class::SERVER,
                     None,
+                    None, // X2 build fix: author_signer (P8)
                 )
                 .await
                 .expect_err("I82: a LocalSigner that is not the node's identity is refused");
@@ -3830,27 +3837,13 @@ mod tests {
                     .unwrap();
             let server = crate::federation::types::device_class::SERVER;
 
-            let signed = engine
-                .publish_self_occurrence(&alice, server, Some(until))
+            // X2 build fix: an edition-2 bind (P8) returns the bind's row and
+            // voices, not the earlier signed envelope; the stored row's expiry is
+            // what I91 reads below.
+            let _bind = engine
+                .publish_self_occurrence(&alice, server, Some(until), None)
                 .await
                 .expect("I91: publish with an expiry");
-            assert_eq!(
-                signed.identity_occurrence.valid_until,
-                Some(until_ms),
-                "I91: the typed row carries the expiry at ms precision"
-            );
-            assert_eq!(
-                signed
-                    .signed_envelope
-                    .get("valid_until")
-                    .and_then(|v| v.as_str()),
-                Some(
-                    until_ms
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                        .as_str()
-                ),
-                "I91: the envelope carries the SAME instant"
-            );
             let stored = |s: &std::sync::Arc<SqliteBackend>| {
                 let s = s.clone();
                 let alice = alice.clone();
@@ -3885,7 +3878,7 @@ mod tests {
 
             // Republish WITH the expiry: it stays. This is the heal Edge needs.
             engine
-                .publish_self_occurrence(&alice, server, Some(until_ms))
+                .publish_self_occurrence(&alice, server, Some(until_ms), None)
                 .await
                 .expect("I91: republish with the same expiry");
             assert_eq!(
@@ -3896,7 +3889,7 @@ mod tests {
 
             // And `None` stores NULL — the door does not invent an expiry.
             engine
-                .publish_self_occurrence(&alice, server, None)
+                .publish_self_occurrence(&alice, server, None, None)
                 .await
                 .expect("I91: publish without an expiry");
             assert_eq!(stored(&s).await, None, "I91: None stores NULL");
@@ -3972,6 +3965,9 @@ mod tests {
                     identity_signer: signer,
                     app: SelfAtLoginOccurrence {
                         occurrence_key_id: app_key.clone(),
+                        identity_key_id: None,
+                        occurrence_signer: None,
+                        transport: None,
                         device_class: crate::federation::types::device_class::PHONE.to_owned(),
                         // The producer's Some(..) path: a bound member the
                         // node's own occurrence never exercises.
@@ -3981,6 +3977,9 @@ mod tests {
                     },
                     agent: SelfAtLoginOccurrence {
                         occurrence_key_id: agent_key.clone(),
+                        identity_key_id: None,
+                        occurrence_signer: None,
+                        transport: None,
                         device_class: crate::federation::types::device_class::AGENT.to_owned(),
                         hardware_attestation: None,
                         encryption_pubkeys: Some(mk_keys()),
@@ -4155,6 +4154,9 @@ mod tests {
                     identity_signer: Some(identity_signer),
                     app: SelfAtLoginOccurrence {
                         occurrence_key_id: app_key.clone(),
+                        identity_key_id: None,
+                        occurrence_signer: None,
+                        transport: None,
                         device_class: crate::federation::types::device_class::PHONE.to_owned(),
                         hardware_attestation: None,
                         encryption_pubkeys: Some(keys),
@@ -4162,6 +4164,9 @@ mod tests {
                     },
                     agent: SelfAtLoginOccurrence {
                         occurrence_key_id: agent_key.clone(),
+                        identity_key_id: None,
+                        occurrence_signer: None,
+                        transport: None,
                         device_class: crate::federation::types::device_class::AGENT.to_owned(),
                         hardware_attestation: None,
                         encryption_pubkeys: None, // ← no replicable form
@@ -4236,6 +4241,9 @@ mod tests {
                     identity_signer: Some(foreign),
                     app: SelfAtLoginOccurrence {
                         occurrence_key_id: app_key.clone(),
+                        identity_key_id: None,
+                        occurrence_signer: None,
+                        transport: None,
                         device_class: crate::federation::types::device_class::PHONE.to_owned(),
                         hardware_attestation: None,
                         encryption_pubkeys: None,
@@ -4243,6 +4251,9 @@ mod tests {
                     },
                     agent: SelfAtLoginOccurrence {
                         occurrence_key_id: agent_key.clone(),
+                        identity_key_id: None,
+                        occurrence_signer: None,
+                        transport: None,
                         device_class: crate::federation::types::device_class::AGENT.to_owned(),
                         hardware_attestation: None,
                         encryption_pubkeys: None,

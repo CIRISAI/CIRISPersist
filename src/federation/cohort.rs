@@ -797,6 +797,32 @@ pub struct GroupVersion {
     pub is_current: bool,
 }
 
+/// v62.0.0 (kernel pass 2, I2812; CC 2.7.8 "Two versions of one head wait as
+/// tips") — **a version held as a tip** of a `family` / `community`: an
+/// offered version whose `prev_head_digest` does not name the held head,
+/// held in `federation_group_tips` beside the head rather than refused. The
+/// head ([`GroupVersion::is_current`]) does not move for it; re-offered once
+/// the version it names is the head, it extends through the whole door.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupTip {
+    /// The version-history discriminator (`family` / `community` /
+    /// `affiliations`).
+    pub cohort: String,
+    /// The group's `federation_keys.key_id`.
+    pub group_key_id: String,
+    /// The tip's own `persist_row_hash`.
+    pub persist_row_hash: String,
+    /// The version it names (`prev_head_digest`; empty for none).
+    pub prev_head_digest: String,
+    /// The signed wrapper (`SignedFamily` / `SignedCommunity`), as offered.
+    pub snapshot: serde_json::Value,
+    /// The membership-change justification it carried, or `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_authorization: Option<serde_json::Value>,
+    /// When this node first held it.
+    pub held_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -244,6 +244,13 @@ pub mod carrier {
     /// A `withdraws` row against the pair's `identity:occurrence:v1` row —
     /// for the genesis key's eviction, the self pair `(fedID, fedID)`'s row.
     pub const WITHDRAWS: &str = "withdraws";
+    /// v62.0.0 (wave O1, S1) — an edition-2 `identity:occurrence` bind,
+    /// held in `ceg_statements` (no proposal row is minted).
+    pub const EDITION2_OCCURRENCE: &str = "edition2_occurrence";
+    /// v62.0.0 (wave O1, S1b) — an edition-2
+    /// `identity:occurrence_revocation` (an eviction), held in
+    /// `ceg_statements`.
+    pub const EDITION2_EVICTION: &str = "edition2_eviction";
 }
 
 /// The node's clock for this door: THE purge clock (one clock read per door
@@ -295,17 +302,27 @@ where
 }
 
 /// **The live roster of `identity` now**: the genesis key and every ACTIVE
-/// occurrence (revocations applied, the #421 re-establishment rule) whose key
-/// is user-role.
+/// occurrence (revocations applied, the #421 re-establishment rule; v62.0.0,
+/// within its half-open window) whose key is user-role.
 pub async fn roster_now<D>(dir: &D, identity: &str) -> Result<BTreeSet<String>, Error>
 where
     D: FederationDirectory + ?Sized,
 {
     let mut roster = BTreeSet::new();
-    if !genesis_evicted_at(dir, identity, roster_clock()).await? {
+    let now = roster_clock();
+    if !genesis_evicted_at(dir, identity, now).await? {
         roster.insert(identity.to_owned());
     }
+    // v62.0.0 (wave O1) — an occurrence past its `valid_until` is not a
+    // roster key: its window is half-open (`kernel::key_end::within_record`),
+    // not only its revocation ends it (CC 3.3.6.4: "A roster key's occurrence
+    // MAY state an end").
+    let ms = |t: DateTime<Utc>| u64::try_from(t.timestamp_millis()).unwrap_or(0);
     for o in dir.list_identity_occurrences_active(identity).await? {
+        if !crate::kernel::key_end::within_record(ms(now), ms(o.asserted_at), o.valid_until.map(ms))
+        {
+            continue;
+        }
         if o.occurrence_key_id != identity && is_user_key(dir, &o.occurrence_key_id).await? {
             roster.insert(o.occurrence_key_id);
         }
@@ -385,9 +402,10 @@ pub(crate) fn roster_assertion_live(
 /// ([`grant_is_authored_for`](super::consent_by_humans::grant_is_authored_for),
 /// and through it
 /// [`consent_peers_by_principals`](super::consent_by_humans::consent_peers_by_principals))
-/// and the one-responsible-steward gate
-/// ([`check_single_node_owner_admission`](super::admission::check_single_node_owner_admission),
-/// through [`self_of_at`]) ask this, and nothing else.
+/// and the owner seat ([`owner_of`](super::admission::owner_of), through
+/// [`self_of_at`]) ask this, and nothing else. (v62.0.0: the
+/// one-responsible-steward gate that asked it at the door is deleted; the
+/// kernel's owner seat reads two selves as unowned.)
 pub async fn acts_as_steward_at<D>(
     dir: &D,
     steward: &str,
@@ -456,15 +474,20 @@ where
             }
         }
     }
-    if candidates.is_empty() {
-        return Ok(None);
-    }
     // …that THIS node's door landed (a pre-door one has no landed receipt).
     let landed = [
         landed_outcome(LandingPath::Quorum),
         landed_outcome(LandingPath::Lone),
     ];
-    let mut since: Option<DateTime<Utc>> = None;
+    // v62.0.0 (wave O1; I3640) — the edition-2 eviction: an
+    // `identity:occurrence_revocation` of the pair `(F, F)` proposed by
+    // another roster key, landed through the self-roster door (this node's
+    // receipt settled `lands_*`). Its instant is the revocation's
+    // `asserted_at`.
+    let mut since = genesis_evicted_since_edition2(dir, identity, &landed).await?;
+    if candidates.is_empty() {
+        return Ok(since);
+    }
     for r in dir.list_settled_self_roster_proposals(identity).await? {
         if !r.outcome.as_deref().is_some_and(|o| landed.contains(&o)) {
             continue;
@@ -476,6 +499,58 @@ where
             if let Some(asserted) = candidates.get(&row.attestation_id) {
                 since = Some(since.map_or(*asserted, |s| s.min(*asserted)));
             }
+        }
+    }
+    Ok(since)
+}
+
+/// v62.0.0 (wave O1; I3640) — the earliest `asserted_at` of an edition-2
+/// eviction of `identity`'s genesis key this node's door landed: an
+/// `identity:occurrence_revocation` about the pair `(identity, identity)`,
+/// read as [`Carried::Edition2Eviction`] with a proposer other than the
+/// genesis key, whose receipt settled `lands_quorum` / `lands_lone`.
+async fn genesis_evicted_since_edition2<D>(
+    dir: &D,
+    identity: &str,
+    landed: &[&str],
+) -> Result<Option<DateTime<Utc>>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut rows = BTreeSet::new();
+    for st in dir
+        .edition2_statements_about(
+            super::edition2::occurrence::OCCURRENCE_REVOCATION_FAMILY,
+            identity,
+        )
+        .await?
+    {
+        if let Some(id) = super::edition2::names::RowId::of_statement(&st) {
+            rows.insert(id.hex());
+        }
+    }
+    let mut since: Option<DateTime<Utc>> = None;
+    for id in rows {
+        let Some(Carried::Edition2Eviction {
+            identity_key_id,
+            target_key_id,
+            proposer,
+            asserted_at,
+            ..
+        }) = super::edition2::occurrence::carried_of_bind(dir, &id).await?
+        else {
+            continue;
+        };
+        if identity_key_id != identity || target_key_id != identity || proposer == identity {
+            continue;
+        }
+        let receipt = match dir.edition2_roster_proposal(&id).await {
+            Ok(r) => r,
+            Err(Error::Unsupported { .. }) => None,
+            Err(e) => return Err(e),
+        };
+        if receipt.is_some_and(|r| r.outcome.as_deref().is_some_and(|o| landed.contains(&o))) {
+            since = Some(since.map_or(asserted_at, |s| s.min(asserted_at)));
         }
     }
     Ok(since)
@@ -634,6 +709,45 @@ pub enum Carried {
         /// The key it evicts.
         target_key_id: String,
     },
+    /// v62.0.0 (wave O1, S1) — an addition by an edition-2
+    /// `identity:occurrence` bind: its statements are held in
+    /// `ceg_statements` under `row_id` (the occurrence key's own and at least
+    /// one roster key's author statement). The proposal's id is the row id's
+    /// hex; no JSON proposal row is minted.
+    Edition2Occurrence {
+        /// The bind's row id.
+        row_id: super::edition2::names::RowId,
+        /// The self.
+        identity_key_id: String,
+        /// The key it adds.
+        target_key_id: String,
+        /// The roster key whose author statement proposed it (identity-ref).
+        proposer: String,
+        /// The bind's `asserted_at`.
+        asserted_at: DateTime<Utc>,
+        /// The roster row it names by `refs.head` (CC 3.3.6.4: the
+        /// thresholds count over the roster the proposal names,
+        /// [`roster_at_head`]).
+        head: super::edition2::names::RowId,
+    },
+    /// v62.0.0 (wave O1, S1b) — an eviction by an edition-2
+    /// `identity:occurrence_revocation` (T2's family): its voices are held in
+    /// `ceg_statements` under `row_id`, each a roster key's statement as the
+    /// self. The proposal's id is the row id's hex.
+    Edition2Eviction {
+        /// The revocation's row id.
+        row_id: super::edition2::names::RowId,
+        /// The self.
+        identity_key_id: String,
+        /// The key it evicts.
+        target_key_id: String,
+        /// The roster key of the lowest-id voice (identity-ref).
+        proposer: String,
+        /// The revocation's `asserted_at`.
+        asserted_at: DateTime<Utc>,
+        /// The roster row it names by `refs.head` ([`roster_at_head`]).
+        head: super::edition2::names::RowId,
+    },
 }
 
 impl Carried {
@@ -641,8 +755,8 @@ impl Carried {
     #[must_use]
     pub fn kind(&self) -> ProposalKind {
         match self {
-            Self::Occurrence(_) => ProposalKind::Add,
-            Self::Withdraws { .. } => ProposalKind::Evict,
+            Self::Occurrence(_) | Self::Edition2Occurrence { .. } => ProposalKind::Add,
+            Self::Withdraws { .. } | Self::Edition2Eviction { .. } => ProposalKind::Evict,
         }
     }
 
@@ -653,6 +767,12 @@ impl Carried {
             Self::Occurrence(s) => &s.identity_occurrence.identity_key_id,
             Self::Withdraws {
                 identity_key_id, ..
+            }
+            | Self::Edition2Occurrence {
+                identity_key_id, ..
+            }
+            | Self::Edition2Eviction {
+                identity_key_id, ..
             } => identity_key_id,
         }
     }
@@ -662,7 +782,9 @@ impl Carried {
     pub fn target_key_id(&self) -> &str {
         match self {
             Self::Occurrence(s) => &s.identity_occurrence.occurrence_key_id,
-            Self::Withdraws { target_key_id, .. } => target_key_id,
+            Self::Withdraws { target_key_id, .. }
+            | Self::Edition2Occurrence { target_key_id, .. }
+            | Self::Edition2Eviction { target_key_id, .. } => target_key_id,
         }
     }
 
@@ -672,6 +794,9 @@ impl Carried {
         match self {
             Self::Occurrence(s) => &s.attesting_key_id,
             Self::Withdraws { row, .. } => &row.attesting_key_id,
+            Self::Edition2Occurrence { proposer, .. } | Self::Edition2Eviction { proposer, .. } => {
+                proposer
+            }
         }
     }
 
@@ -681,6 +806,8 @@ impl Carried {
         match self {
             Self::Occurrence(s) => s.identity_occurrence.asserted_at,
             Self::Withdraws { row, .. } => row.asserted_at,
+            Self::Edition2Occurrence { asserted_at, .. }
+            | Self::Edition2Eviction { asserted_at, .. } => *asserted_at,
         }
     }
 
@@ -688,6 +815,8 @@ impl Carried {
         match self {
             Self::Occurrence(_) => carrier::IDENTITY_OCCURRENCE,
             Self::Withdraws { .. } => carrier::WITHDRAWS,
+            Self::Edition2Occurrence { .. } => carrier::EDITION2_OCCURRENCE,
+            Self::Edition2Eviction { .. } => carrier::EDITION2_EVICTION,
         }
     }
 
@@ -703,6 +832,9 @@ impl Carried {
                     o.remove("withdraws_admission_rule");
                 }
                 v
+            }
+            Self::Edition2Occurrence { row_id, .. } | Self::Edition2Eviction { row_id, .. } => {
+                serde_json::json!({ "edition2_row_id": row_id.hex() })
             }
         };
         Ok(serde_json::json!({
@@ -749,6 +881,15 @@ impl Carried {
                     scrub_timestamp: row.scrub_timestamp,
                     pqc_completed_at: row.pqc_completed_at,
                 })
+            }
+            // v62.0.0 (wave O1, S1) — an edition-2 bind mints no proposal
+            // row: its statements are the proposal.
+            Self::Edition2Occurrence { row_id, .. } | Self::Edition2Eviction { row_id, .. } => {
+                Err(Error::InvalidArgument(format!(
+                    "{DIMENSION_PROPOSAL}: the edition-2 bind {} is its own proposal; no row is \
+                 minted for it",
+                    row_id.hex()
+                )))
             }
         }
     }
@@ -885,6 +1026,8 @@ where
     D: FederationDirectory + ?Sized,
 {
     match carried {
+        // Its statements were judged at the edition-2 door.
+        Carried::Edition2Occurrence { .. } | Carried::Edition2Eviction { .. } => Ok(()),
         Carried::Occurrence(s) => super::admission::verify_signed_identity_occurrence(dir, s).await,
         Carried::Withdraws {
             row,
@@ -1038,6 +1181,9 @@ struct Plan {
     /// Open proposals their proposer withdrew (a `withdraws` against the
     /// proposal row): out of the decision, settled `withdrawn` by the executor.
     withdrawn: Vec<String>,
+    /// v62.0.0 (wave O1, S1b) — the same for edition-2 proposals (settled in
+    /// `ceg_roster_proposals`).
+    withdrawn_e2: Vec<String>,
 }
 
 /// The settle outcome of a proposal its proposer withdrew.
@@ -1055,7 +1201,9 @@ where
 {
     let roster = roster_now(dir, identity).await?;
     let mut held: Vec<(Proposal, Carried)> = Vec::new();
-    let receipts = dir.list_open_self_roster_proposals(Some(identity)).await?;
+    let mut receipts = dir.list_open_self_roster_proposals(Some(identity)).await?;
+    // v62.0.0 (wave O1, S1) — and this node's edition-2 receipts.
+    receipts.extend(open_edition2_receipts(dir, Some(identity)).await?);
     // A proposal leaves `pending` when its proposer withdraws its row (CC
     // rc9 `2643ff1`: the self roster's open proposal is cleared by the
     // proposer's withdraws).
@@ -1066,8 +1214,25 @@ where
         dir.list_composers_referencing_any(&ids, None, None).await?
     };
     let mut withdrawn = Vec::new();
+    let mut withdrawn_e2 = Vec::new();
     for receipt in receipts {
         let Some(row) = dir.get_attestation(&receipt.proposal_id).await? else {
+            // v62.0.0 (wave O1, S1) — an edition-2 bind's proposal: no row,
+            // its statements held under the row id.
+            if let Some(carried) =
+                super::edition2::occurrence::carried_of_bind(dir, &receipt.proposal_id).await?
+            {
+                // S1b — the proposer's own edition-2 `withdraws` naming the
+                // row id closes it.
+                if super::edition2::occurrence::proposal_withdrawn(dir, &carried).await? {
+                    withdrawn_e2.push(receipt.proposal_id);
+                    continue;
+                }
+                held.push((
+                    proposal_of(&carried, &receipt.proposal_id, receipt.received_at),
+                    carried,
+                ));
+            }
             continue;
         };
         let carried = match carried_of_row(dir, &row).await {
@@ -1100,14 +1265,50 @@ where
     let rows = answer_rows(dir, identity).await?;
     let mut with_answers = Vec::with_capacity(held.len());
     for (p, c) in held {
-        let a = answers_for(dir, identity, &p, &rows).await?;
+        let mut a = answers_for(dir, identity, &p, &rows).await?;
+        // v62.0.0 (wave O1, S1) — an edition-2 bind's further author
+        // statements (roster keys signing as the self over the same payload)
+        // are assents too.
+        if let Carried::Edition2Occurrence { row_id, .. }
+        | Carried::Edition2Eviction { row_id, .. } = &c
+        {
+            a.approvers.extend(
+                super::edition2::occurrence::author_voice_keys(dir, row_id, identity).await?,
+            );
+        }
         with_answers.push((p, a, c));
     }
-    let refs: Vec<(&Proposal, &Answers)> = with_answers.iter().map(|(p, a, _)| (p, a)).collect();
-    let decided: Vec<(String, TwoPathDecision)> = two_path::decide_all(&roster, &refs, now, policy)
-        .into_iter()
-        .map(|(p, d)| (p.id.clone(), d))
-        .collect();
+    // v62.0.0 (wave O1; CC 3.3.6.4, the CC 2.7 ruling) — an edition-2
+    // proposal counts over the roster AT THE HEAD IT NAMES
+    // ([`roster_at_head`]); the earlier form's over the roster now. One
+    // decision per roster: the earlier form's, and one per named head.
+    let mut decided: Vec<(String, TwoPathDecision)> = Vec::new();
+    let mut by_head: std::collections::BTreeMap<
+        Option<super::edition2::names::RowId>,
+        Vec<(&Proposal, &Answers)>,
+    > = std::collections::BTreeMap::new();
+    for (p, a, c) in &with_answers {
+        by_head.entry(head_of(c)).or_default().push((p, a));
+    }
+    for (head, refs) in by_head {
+        let at_head = match head {
+            None => roster.clone(),
+            Some(h) => match roster_at_head(dir, identity, &h).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // The named head is not held or not landed yet: these
+                    // proposals are not decided this round.
+                    tracing::debug!(head = %h.hex(), error = %e, "self-roster head not readable");
+                    continue;
+                }
+            },
+        };
+        decided.extend(
+            two_path::decide_all(&at_head, &refs, now, policy)
+                .into_iter()
+                .map(|(p, d)| (p.id.clone(), d)),
+        );
+    }
     let mut entries = Vec::with_capacity(decided.len());
     for (id, d) in decided {
         if let Some(pos) = with_answers.iter().position(|(p, _, _)| p.id == id) {
@@ -1119,6 +1320,7 @@ where
         roster,
         entries,
         withdrawn,
+        withdrawn_e2,
     })
 }
 
@@ -1187,6 +1389,13 @@ where
     // occurrences are not a roster.
     if !is_user_key(dir, identity).await? {
         return Ok(false);
+    }
+    // v62.0.0 (wave O1, S1b) — an edition-2 eviction: of a key on the
+    // roster; of the genesis key only when ANOTHER roster key proposes it
+    // (the genesis key revoking the self pair retires its transport
+    // self-occurrence and evicts nothing, CC 3.3.6.4).
+    if let Carried::Edition2Eviction { proposer, .. } = carried {
+        return Ok(roster.contains(target) && !(target == identity && proposer == identity));
     }
     if target == identity {
         // The genesis key's eviction: a `withdraws` of the self pair's
@@ -1297,6 +1506,10 @@ pub async fn gate_withdrawal<D>(
 where
     D: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (wave O1, S1b) — the earlier-form eviction carrier only
+    // behind the switch: an edition-2 eviction is an
+    // `identity:occurrence_revocation` through [`gate_edition2`].
+    super::edition2::door::refuse_earlier_form_row("self_roster", row)?;
     gate(
         dir,
         Carried::Withdraws {
@@ -1306,6 +1519,302 @@ where
         },
     )
     .await
+}
+
+/// v62.0.0 (wave O1, S1; CC 3.3.6.4) — **THE gate for an edition-2 bind**
+/// (`edition2::occurrence::put_occurrence_voice`, on every author
+/// statement): the same two paths as [`gate`], over a proposal whose id is
+/// the bind's row id and whose statements are held in `ceg_statements`.
+///
+/// - `Ok(true)`: not a roster change, or it lands now (the quorum path: the
+///   held author statements and the `objection:assent` answers naming the
+///   row id count; the proposer counted). The door then writes the bind.
+/// - `Ok(false)`: pending. This node's receipt is noted at its first hold
+///   (the window's start, CC 3.3.6.4); the bind lands later by an answer, a
+///   further author statement, or the lone path after `W_self` with no
+///   majority of the others objecting ([`execute_for`] / [`execute_due`],
+///   which land it from its held statements).
+///
+/// # Errors
+/// [`Error::SelfRosterNotLanded`] (`decision` `refused…`) when no answer can
+/// mend it (the proposer is not on the roster); the policy's refusal;
+/// directory failures.
+pub async fn gate_edition2<D>(dir: &D, carried: Carried) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let identity = carried.identity_key_id().to_owned();
+    let (Carried::Edition2Occurrence { row_id, head, .. }
+    | Carried::Edition2Eviction { row_id, head, .. }) = &carried
+    else {
+        return Err(Error::InvalidArgument(
+            "gate_edition2: not an edition-2 proposal".into(),
+        ));
+    };
+    let (id, head) = (row_id.hex(), *head);
+    let now = roster_clock();
+    // Every landing is recorded (a receipt settled `lands_*`): the next
+    // roster row names it as its head, and the genesis key's eviction is
+    // read from it.
+    if !is_user_key(dir, &identity).await? {
+        record_landed(dir, &id, &identity, LandingPath::Quorum, now).await?;
+        return Ok(true);
+    }
+    // CC 3.3.6.4 (the CC 2.7 ruling): counted over the roster the row names.
+    let roster = roster_at_head(dir, &identity, &head).await?;
+    if !is_roster_change(dir, &carried, &roster).await? {
+        record_landed(dir, &id, &identity, LandingPath::Quorum, now).await?;
+        return Ok(true);
+    }
+    let policy = policy()?;
+    let plan = plan(dir, &identity, Some((&carried, &id)), now, &policy).await?;
+    let decision = plan
+        .entries
+        .iter()
+        .find(|(p, ..)| p.id == id)
+        .map(|(.., d)| *d)
+        .ok_or_else(|| Error::Backend(format!("self-roster plan lost proposal {id}")))?;
+    if let TwoPathDecision::Lands { path } = decision {
+        // The landing is recorded whether or not a receipt was held (a
+        // roster change landing on its first offer, too): the genesis key's
+        // eviction is read from it (`genesis_evicted_at`).
+        record_landed(dir, &id, &identity, path, now).await?;
+        return Ok(true);
+    }
+    let refused_for_good = matches!(
+        decision,
+        TwoPathDecision::Refused {
+            reason: TwoPathRefusal::ProposerNotOnRoster
+        } | TwoPathDecision::Cancelled { .. }
+    );
+    if refused_for_good {
+        return Err(Error::SelfRosterNotLanded {
+            identity_key_id: identity,
+            target_key_id: carried.target_key_id().to_owned(),
+            kind: carried.kind().as_str(),
+            proposal_id: id,
+            decision: decision.token(),
+            earliest_lone_at: None,
+            needs: 0,
+        });
+    }
+    dir.note_edition2_roster_proposal(&id, &identity, now)
+        .await?;
+    Ok(false)
+}
+
+/// Record an edition-2 row's landing: this node's receipt, noted (first
+/// seen) and settled `lands_*`.
+async fn record_landed<D>(
+    dir: &D,
+    id: &str,
+    identity: &str,
+    path: LandingPath,
+    now: DateTime<Utc>,
+) -> Result<(), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    dir.note_edition2_roster_proposal(id, identity, now).await?;
+    dir.settle_edition2_roster_proposal(id, landed_outcome(path), now)
+        .await
+}
+
+/// The head an edition-2 proposal names; `None` for the earlier form's.
+fn head_of(c: &Carried) -> Option<super::edition2::names::RowId> {
+    match c {
+        Carried::Edition2Occurrence { head, .. } | Carried::Edition2Eviction { head, .. } => {
+            Some(*head)
+        }
+        Carried::Occurrence(_) | Carried::Withdraws { .. } => None,
+    }
+}
+
+/// How far [`roster_at_head`] follows a chain of roster rows.
+const MAX_ROSTER_CHAIN: usize = 4096;
+
+/// v62.0.0 (wave O1; CC 3.3.6.4, the CC 2.7 ruling) — **the self's roster
+/// at the head a row names**, read from content alone (the same on every
+/// node that holds the chain):
+///
+/// - the chain is followed by `refs.head` from `head` back to its root, the
+///   genesis key's own `key:record` row (every self's first roster row names
+///   it);
+/// - each step is a LANDED (this node's receipt settled `lands_*`) edition-2
+///   `identity:occurrence` bind of `identity` (a `user`-role key joins) or
+///   `identity:occurrence_revocation` of it (the key leaves; the genesis
+///   key too, when another key evicted it);
+/// - folded forward from `{genesis}`; a member whose occurrence has ended by
+///   now (the half-open window) is not counted (as [`roster_now`]).
+///
+/// A head superseded by a later roster row is read as it names (the
+/// kernel's superseded-head rule: the reader decides, the door does not
+/// refuse).
+///
+/// # Errors
+/// The retryable unknown signer naming `row:<hex>` while a row of the chain
+/// is not held or has not landed here (the row waits); a malformed chain
+/// (`edition2_payload_invalid`: a row of another self or family, no
+/// `refs.head`, a root that is not the genesis key's record); directory
+/// failures.
+pub async fn roster_at_head<D>(
+    dir: &D,
+    identity: &str,
+    head: &super::edition2::names::RowId,
+) -> Result<BTreeSet<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::edition2::liveness::{recorded_kid, statement_parts};
+    use super::edition2::occurrence::{OCCURRENCE_FAMILY, OCCURRENCE_REVOCATION_FAMILY};
+    use ciris_verify_core::cde::Value;
+    let bad = |why: String| {
+        Error::malformed_row(
+            "self_roster",
+            super::malformed_row::EDITION2_PAYLOAD_INVALID,
+            format!("the roster chain of {identity}: {why}"),
+        )
+    };
+    let landed = [
+        landed_outcome(LandingPath::Quorum),
+        landed_outcome(LandingPath::Lone),
+    ];
+    let genesis = super::edition2::ingest::kid_of_identity_ref(identity)
+        .ok_or_else(|| bad("the self is not an identity-ref".into()))?;
+    let mut steps: Vec<(bool, String)> = Vec::new();
+    let mut cur = *head;
+    let mut rooted = false;
+    for _ in 0..MAX_ROSTER_CHAIN {
+        let voices = dir.edition2_voices(&cur).await?;
+        let Some((protected, payload)) = voices.first().and_then(|v| statement_parts(v)) else {
+            return Err(Error::unknown_signer(
+                &format!("row:{}", cur.hex()),
+                "self_roster",
+            ));
+        };
+        let family = protected
+            .get_int(-70002)
+            .and_then(Value::as_text)
+            .unwrap_or_default()
+            .to_owned();
+        if family == ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY {
+            if recorded_kid(&voices[0]) != Some(genesis) {
+                return Err(bad(format!(
+                    "its root {} is not the genesis key's own key:record",
+                    cur.hex()
+                )));
+            }
+            rooted = true;
+            break;
+        }
+        let add = family == OCCURRENCE_FAMILY;
+        if !add && family != OCCURRENCE_REVOCATION_FAMILY {
+            return Err(bad(format!("{} is a {family} row", cur.hex())));
+        }
+        let text = |m: &str| payload.get_text(m).and_then(Value::as_text);
+        if text("identity_key_id") != Some(identity) {
+            return Err(bad(format!("{} is another self's row", cur.hex())));
+        }
+        let receipt = match dir.edition2_roster_proposal(&cur.hex()).await {
+            Ok(r) => r,
+            Err(Error::Unsupported { .. }) => None,
+            Err(e) => return Err(e),
+        };
+        if !receipt.is_some_and(|r| r.outcome.as_deref().is_some_and(|o| landed.contains(&o))) {
+            return Err(Error::unknown_signer(
+                &format!("row:{}", cur.hex()),
+                "self_roster",
+            ));
+        }
+        let Some(target) = text("occurrence_key_id") else {
+            return Err(bad(format!("{} names no occurrence", cur.hex())));
+        };
+        steps.push((add, target.to_owned()));
+        let names = super::edition2::names::names_of(&payload)
+            .map_err(|e| bad(format!("{}: refs: {e:?}", cur.hex())))?;
+        let Some(next) = super::edition2::names::single(&names, "head") else {
+            return Err(bad(format!("{} names no refs.head", cur.hex())));
+        };
+        cur = next;
+    }
+    if !rooted {
+        return Err(bad("longer than the chain bound".into()));
+    }
+    let mut roster = BTreeSet::from([identity.to_owned()]);
+    for (add, target) in steps.into_iter().rev() {
+        if add {
+            if target != identity && is_user_key(dir, &target).await? {
+                roster.insert(target);
+            }
+        } else {
+            roster.remove(&target);
+        }
+    }
+    // The end rule (I3043): an occurrence past its `valid_until` is not a
+    // roster key.
+    let ms = |t: DateTime<Utc>| u64::try_from(t.timestamp_millis()).unwrap_or(0);
+    let now = ms(roster_clock());
+    let mut kept = BTreeSet::new();
+    for k in roster {
+        if k == identity {
+            kept.insert(k);
+            continue;
+        }
+        let live = dir
+            .list_identity_occurrences_by_occurrence_key(&k)
+            .await?
+            .iter()
+            .any(|o| {
+                o.identity_key_id == identity
+                    && crate::kernel::key_end::within_record(
+                        now,
+                        ms(o.asserted_at),
+                        o.valid_until.map(ms),
+                    )
+            });
+        if live {
+            kept.insert(k);
+        }
+    }
+    Ok(kept)
+}
+
+/// v62.0.0 (wave O1, S1) — this node's open edition-2 receipts; none from a
+/// directory that keeps no edition-2 store (`Unsupported`).
+async fn open_edition2_receipts<D>(
+    dir: &D,
+    identity: Option<&str>,
+) -> Result<Vec<SelfRosterReceipt>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    match dir.list_open_edition2_roster_proposals(identity).await {
+        Ok(r) => Ok(r),
+        Err(Error::Unsupported { .. }) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Settle a proposal in the ledger that holds it: an edition-2 bind's in
+/// `ceg_roster_proposals`, every other in V199's.
+async fn settle<D>(
+    dir: &D,
+    carried: &Carried,
+    id: &str,
+    outcome: &str,
+    now: DateTime<Utc>,
+) -> Result<(), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    match carried {
+        Carried::Edition2Occurrence { .. } | Carried::Edition2Eviction { .. } => {
+            dir.settle_edition2_roster_proposal(id, outcome, now).await
+        }
+        Carried::Occurrence(_) | Carried::Withdraws { .. } => {
+            dir.settle_self_roster_proposal(id, outcome, now).await
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1365,15 +1874,18 @@ where
             dir.settle_self_roster_proposal(id, WITHDRAWN_OUTCOME, now)
                 .await?;
         }
-        for (p, _, _, d) in &plan.entries {
+        for id in &plan.withdrawn_e2 {
+            dir.settle_edition2_roster_proposal(id, WITHDRAWN_OUTCOME, now)
+                .await?;
+        }
+        for (p, _, c, d) in &plan.entries {
             if matches!(
                 d,
                 TwoPathDecision::Refused {
                     reason: TwoPathRefusal::ProposerNotOnRoster,
                 } | TwoPathDecision::Cancelled { .. }
             ) {
-                dir.settle_self_roster_proposal(&p.id, d.token(), now)
-                    .await?;
+                settle(dir, c, &p.id, d.token(), now).await?;
             }
         }
         let Some((p, _, carried, TwoPathDecision::Lands { path })) = plan
@@ -1384,7 +1896,18 @@ where
             return Ok(landed);
         };
         tried.insert(p.id.clone());
+        let carried_kind = carried.clone();
         let applied = match carried {
+            // v62.0.0 (wave O1, S1) — an edition-2 bind lands from its held
+            // statements.
+            Carried::Edition2Occurrence { row_id, .. } => {
+                super::edition2::occurrence::land_held_bind(dir, &row_id).await
+            }
+            // v62.0.0 (wave O1, S1b) — an edition-2 eviction lands from its
+            // held voices.
+            Carried::Edition2Eviction { row_id, .. } => {
+                super::edition2::occurrence::land_held_eviction(dir, &row_id).await
+            }
             Carried::Occurrence(s) => dir.put_identity_occurrence(s).await,
             Carried::Withdraws { row, .. } => dir
                 .put_attestation(super::SignedAttestation { attestation: row })
@@ -1393,8 +1916,7 @@ where
         };
         match applied {
             Ok(()) => {
-                dir.settle_self_roster_proposal(&p.id, landed_outcome(path), now)
-                    .await?;
+                settle(dir, &carried_kind, &p.id, landed_outcome(path), now).await?;
                 landed += 1;
             }
             Err(e) => {
@@ -1411,12 +1933,19 @@ pub async fn execute_due<D>(dir: &D) -> Result<usize, Error>
 where
     D: FederationDirectory + ?Sized,
 {
-    let selves: BTreeSet<String> = dir
+    let mut selves: BTreeSet<String> = dir
         .list_open_self_roster_proposals(None)
         .await?
         .into_iter()
         .map(|r| r.identity_key_id)
         .collect();
+    // v62.0.0 (wave O1, S1) — the selves with an open edition-2 proposal.
+    selves.extend(
+        open_edition2_receipts(dir, None)
+            .await?
+            .into_iter()
+            .map(|r| r.identity_key_id),
+    );
     let mut landed = 0;
     for identity in selves {
         landed += execute_for(dir, &identity).await?;

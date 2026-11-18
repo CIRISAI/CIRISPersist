@@ -6,10 +6,11 @@
 //!   and the door admits it. A signer with no PQC half refuses by name.
 //! - **I2011 (the codec round trip).** For each family the codec is checked
 //!   on (the evidence `scores` family, `key:revocation`): a statement through
-//!   [`super::codec::row_of`] and back through [`super::codec::statement_of`]
+//!   [`super::fixture_switch::row_of_statement`] and back through
+//!   [`super::fixture_switch::statement_of_family`]
 //!   is the same bytes; an earlier-form-shaped literal row through
 //!   `statement_of` and `row_of` keeps its envelope (less the statement and
-//!   the mirror), its type and its subject. [`super::codec::kid`] is the
+//!   the mirror), its type and its subject. [`super::fixture_switch::kid`] is the
 //!   identity-ref `local_signer` signs as.
 //! - **I2012 (`sign_object`).** An object voice signed with persist's signer
 //!   equals the hand-built voice E2a's genesis witnesses read, byte for byte,
@@ -21,9 +22,11 @@ use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::family::SelectContext;
 use ciris_verify_core::edition2::{sign_row_statement, verify_object_statement, ObjectVerdict};
 
-use super::codec::{key_for, kid as kid_of, row_of, statement_of};
 use super::door::admit_row;
 use super::door_invariants::fixture::{iref, key, key_record, map};
+use super::fixture_switch::{
+    kid as kid_of, row_of_statement, signing_key as key_for, statement_of_family,
+};
 use super::genesis::GENESIS_BUNDLE_TYP;
 use super::ingest::INGEST_TIER;
 use super::liveness::HeldKeys;
@@ -178,13 +181,17 @@ fn i2011_the_codec_round_trips() {
         ),
     ];
     for (st, family) in &cases {
-        let row = row_of(st, &k, INGEST_TIER).unwrap();
+        let row = row_of_statement(st, INGEST_TIER);
         assert_eq!(
-            &statement_of(&row, family, &k),
+            &statement_of_family(&row, "j0-codec", family),
             st,
             "I2011: {family}: statement → row → statement"
         );
-        assert_eq!(super::codec::rid(&row), row.persist_row_hash, "I2011: rid");
+        assert_eq!(
+            super::fixture_switch::rid(&row),
+            row.persist_row_hash,
+            "I2011: rid"
+        );
     }
     // An earlier-form-shaped literal row → statement → row.
     let literal: crate::federation::types::Attestation =
@@ -206,8 +213,8 @@ fn i2011_the_codec_round_trips() {
             "persist_row_hash": "",
         }))
         .unwrap();
-    let st = statement_of(&literal, EVIDENCE_ROWS, &k);
-    let row = row_of(&st, &k, INGEST_TIER).unwrap();
+    let st = statement_of_family(&literal, "j0-codec", EVIDENCE_ROWS);
+    let row = row_of_statement(&st, INGEST_TIER);
     let strip = |a: &crate::federation::types::Attestation| {
         let mut e = a.attestation_envelope.clone();
         let o = e.as_object_mut().unwrap();
@@ -228,7 +235,11 @@ fn i2011_the_codec_round_trips() {
         row.attesting_key_id, me,
         "I2011: the signer signs as itself"
     );
-    assert_eq!(statement_of(&row, EVIDENCE_ROWS, &k), st, "I2011: and back");
+    assert_eq!(
+        statement_of_family(&row, "j0-codec", EVIDENCE_ROWS),
+        st,
+        "I2011: and back"
+    );
 }
 
 #[tokio::test]
@@ -292,7 +303,7 @@ fn i2013_the_kernel_reads_an_edition2_rows_own_id_and_refs() {
         ),
     ]);
     let st = sign_row_statement(&k, &me, &me, "scores", EVIDENCE_ROWS, &payload, vec![]).unwrap();
-    let row = row_of(&st, &k, INGEST_TIER).unwrap();
+    let row = row_of_statement(&st, INGEST_TIER);
     let mut keys = HeldKeys::new();
     keys.insert_record(key_record(&k, &["user"], 0, None));
     let computed = admit_row(&st, &keys, None, SelectContext::default())

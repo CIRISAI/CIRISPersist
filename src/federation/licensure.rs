@@ -113,11 +113,45 @@ impl LicensureStatus {
 ///
 /// A trailing `:v{n}` is part of neither the prefix nor the authority: the
 /// dimension `licensure:acme:v1` is authority `acme`.
+///
+/// v62 (CC rc21, CC 3.1) — a KEY authority is written into the dimension as
+/// its bare thumbprint segment (`licensure:<43 base64url>:v1`) and read back
+/// as the identity-ref it names
+/// ([`key_segment::key_id_of_param`](super::namespace::key_segment::key_id_of_param)),
+/// so the authority this returns compares with key ids (`attesting_key_id`,
+/// `lookup_public_key`, `status_set_for`'s `authority_id`) by equality. An
+/// earlier-form id is returned as itself.
+///
+/// The dimension must RESOLVE to `licensure:{authority_id}` through the
+/// namespace matcher ([`key_segment::bound_key_param`](super::namespace::key_segment::bound_key_param)).
+/// CC rc21: an identity-ref URN written where the authority goes matches no
+/// family, so it names no authority (`None`), never `urn`.
 #[must_use]
-pub fn authority_of(dimension: &str) -> Option<&str> {
-    let rest = dimension.strip_prefix(LICENSURE_DIMENSION_PREFIX)?;
-    let authority = rest.split(':').next().unwrap_or("");
-    (!authority.is_empty()).then_some(authority)
+pub fn authority_of(dimension: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !dimension.starts_with(LICENSURE_DIMENSION_PREFIX) {
+        return None;
+    }
+    let (family, authority) = super::namespace::key_segment::bound_key_param(dimension)?;
+    if family != LICENSURE_FAMILY || authority.is_empty() {
+        return None;
+    }
+    Some(std::borrow::Cow::Owned(
+        super::namespace::key_segment::key_id_of_param(&authority).into_owned(),
+    ))
+}
+
+/// The registry family a licensure dimension resolves to.
+pub const LICENSURE_FAMILY: &str = "licensure:{authority_id}";
+
+/// v62 (CC rc21, CC 3.1) — `licensure:{authority}` for the authority
+/// `authority_id` (a key id): the dimension stem a query or producer writes,
+/// with a key authority as its bare segment. The inverse of [`authority_of`].
+#[must_use]
+pub fn licensure_stem_of(authority_id: &str) -> String {
+    format!(
+        "{LICENSURE_DIMENSION_PREFIX}{}",
+        super::namespace::key_segment::family_param_of(authority_id)
+    )
 }
 
 /// Read the envelope's declared status, if it is in the closed vocabulary.
@@ -280,7 +314,7 @@ pub fn fold_status_set(
         else {
             continue;
         };
-        if authority_of(dimension) != Some(authority_id) {
+        if authority_of(dimension).as_deref() != Some(authority_id) {
             continue;
         }
         // v42.0.0 — a RETRACTION carries no replacement body, so it must not
@@ -537,8 +571,8 @@ mod tests {
 
     #[test]
     fn authority_parsing_814() {
-        assert_eq!(authority_of("licensure:acme"), Some("acme"));
-        assert_eq!(authority_of("licensure:acme:v1"), Some("acme"));
+        assert_eq!(authority_of("licensure:acme").as_deref(), Some("acme"));
+        assert_eq!(authority_of("licensure:acme:v1").as_deref(), Some("acme"));
         assert_eq!(authority_of("licensure:"), None, "empty authority");
         assert_eq!(authority_of("licensure"), None, "not a licensure dimension");
         assert_eq!(
@@ -548,5 +582,56 @@ mod tests {
              capture a different family"
         );
         assert_eq!(authority_of("scores:acme"), None);
+    }
+
+    /// **I2963 (v62, CC rc21 CC 3.1)** — a key authority is written as its
+    /// bare segment and read back as its identity-ref: `authority_of` on
+    /// `licensure:<segment>[:v1]` is the identity-ref (never the segment); a URN
+    /// there names no authority; `licensure_stem_of` writes the segment; the two are
+    /// inverse; and the pure fold matches a v62 kid's rows, not another's.
+    #[test]
+    fn i2963_a_v62_key_authority_is_written_bare_and_read_as_its_ref() {
+        use crate::federation::namespace::key_segment::tests::{kid, segment};
+        let (a, a_seg) = (kid('Q'), segment('Q'));
+        let b = kid('g');
+        assert_eq!(licensure_stem_of(&a), format!("licensure:{a_seg}"));
+        assert_eq!(licensure_stem_of("acme"), "licensure:acme");
+        for d in [
+            format!("licensure:{a_seg}"),
+            format!("licensure:{a_seg}:v1"),
+        ] {
+            assert_eq!(authority_of(&d).as_deref(), Some(a.as_str()), "{d}");
+        }
+        assert_eq!(
+            authority_of(&format!("{}:v1", licensure_stem_of(&a))).as_deref(),
+            Some(a.as_str()),
+            "write then read is the identity"
+        );
+        // CC rc21: a URN written where the authority goes matches no family,
+        // so it names no authority (never `urn`).
+        assert_eq!(authority_of(&format!("licensure:{a}:v1")), None);
+        // An identifier has exactly one spelling: a shape the matcher does
+        // not resolve to `licensure:{authority_id}` names no authority.
+        assert_eq!(authority_of(&format!("licensure:{a_seg}:v1:extra")), None);
+        assert_eq!(authority_of("licensure:acme:v1:extra"), None);
+        // `lic_row` writes `licensure:{x}:v1` verbatim, so the rows are
+        // written with the bare segment, as a producer writes them.
+        let rows = vec![
+            lic_row("a1", &segment('Q'), "issued"),
+            lic_row("b1", &segment('g'), "revoked"),
+        ];
+        assert_eq!(
+            fold_status_set(&rows, &a, chrono::Utc::now()),
+            BTreeSet::from([LicensureStatus::Issued]),
+            "I2963: the fold, asked by key id, reads the authority's own rows"
+        );
+        assert_eq!(
+            fold_status_set(&rows, &b, chrono::Utc::now()),
+            BTreeSet::from([LicensureStatus::Revoked])
+        );
+        assert!(
+            fold_status_set(&rows, &a_seg, chrono::Utc::now()).is_empty(),
+            "I2963: the authority id is the key id, not its segment"
+        );
     }
 }

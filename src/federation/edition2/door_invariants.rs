@@ -54,9 +54,13 @@ pub(crate) mod fixture {
         ciris_verify_core::edition2::row_ref(d)
     }
 
-    /// `[1, [-16, d]]`: an earlier-form name.
+    /// `[1, [-16, d]]`: an edition-1 row-ref (Verify 23.3.0 dropped its
+    /// `edition2::earlier` builder; the shape is built here).
     pub(crate) fn ref1(d: &Digest32) -> Value {
-        ciris_verify_core::edition2::earlier::row_ref(d)
+        Value::Array(vec![
+            Value::Uint(1),
+            ciris_verify_core::edition2::hash_digest_value(d),
+        ])
     }
 
     fn t(s: &str) -> Value {

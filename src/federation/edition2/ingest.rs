@@ -44,7 +44,7 @@ use sha2::Digest as _;
 
 use super::door::{admit_row, AdmittedRow, PLANE};
 use super::liveness::{statement_parts, HeldKeys, Liveness, KEY_REVOCATION_FAMILY};
-use crate::federation::types::{attestation_tier, Attestation, SignedAttestation};
+use crate::federation::types::{attestation_tier, Attestation};
 use crate::federation::{malformed_row, Error, FederationDirectory};
 
 /// The envelope member a mapped row carries its statement under: the
@@ -122,21 +122,14 @@ pub const INSTANT_MEMBERS: &[&str] = &[
 /// The payload's fixed-scale members (CC 2.6.1.5), projected as reals.
 pub const SCALED_MEMBERS: &[&str] = &["score", "confidence", "weight"];
 
-/// v62.0.0 (JSON-cut slice B) — the payload's hash-digest members (CC 2.6.1:
-/// `[-16, bstr .size 32]`, SHA-256), projected as the 64-lowercase-hex text
-/// the earlier gates read: `evidence_refs` is a set of them, the others one.
-// cut-B: moves into edition2::payloads (slice A owns member typing) at the merge.
-pub const HASH_DIGEST_MEMBERS: &[&str] = &["evidence_refs", "carried", "seat_commitment"];
-
-/// A `[-16, bstr32]` hash digest as lowercase hex.
-fn digest_hex(v: &Value) -> Option<String> {
-    match v.as_array()? {
-        [alg, d] if alg.as_i64() == Some(-16) => {
-            d.as_bytes().filter(|b| b.len() == 32).map(hex::encode)
-        }
-        _ => None,
-    }
-}
+/// v62.0.0 (JSON-cut slice B; wave P1) — the payload's hash-digest members
+/// (CC 2.6.1: `[-16, bstr .size 32]`, SHA-256), projected as the
+/// 64-lowercase-hex text the earlier gates read: `evidence_refs` is a
+/// sequence of them, the others one. The list is
+/// [`super::payloads::HASH_DIGEST_MEMBERS`] (slice A owns member typing); it
+/// carries `amendment_digest` (`deferral:response:approved`,
+/// `identity_amendment`), whose hex the identity-amendment gate compares.
+pub use super::payloads::HASH_DIGEST_MEMBERS;
 
 /// How far a chain of key records is followed when loading a signer's keys.
 const MAX_KEY_HOPS: usize = 8;
@@ -159,7 +152,14 @@ where
     F: FederationDirectory + ?Sized,
 {
     match statement_kid(statement) {
-        Some(kid) => held_keys_for_kid(dir, &kid).await,
+        Some(kid) => {
+            let held = held_keys_for_kid(dir, &kid).await?;
+            // v62.0.0 (wave O1, I3020; the rc21 rule) — the key-of-issuer
+            // check's occurrence arm: the signer as a live occurrence of its
+            // `iss` at the statement's instant.
+            let seats = super::occurrence::occurrence_seats_for(dir, statement).await?;
+            Ok(held.with_occurrences(seats))
+        }
         None => Ok(HeldKeys::new()),
     }
 }
@@ -187,6 +187,11 @@ where
             .edition2_statements_about(KEY_RECORD_FAMILY, &subject)
             .await?
         {
+            // v62.0.0 (wave G0 v4) — a key statement the fold holds back
+            // (its row concludes nothing) is not key plane.
+            if super::fold::is_held_back(dir, &st).await? {
+                continue;
+            }
             if let Some(signer) = statement_kid(&st) {
                 if signer != kid {
                     queue.push_back(signer);
@@ -199,7 +204,10 @@ where
             if let Some(target) = record_target(&st) {
                 for rival in dir.edition2_rows_naming(&target, "target").await? {
                     for v in dir.edition2_voices(&rival).await? {
-                        if is_key_record(&v) && !held.holds(&v) {
+                        if is_key_record(&v)
+                            && !held.holds(&v)
+                            && !super::fold::is_held_back(dir, &v).await?
+                        {
                             held.insert_record(v);
                         }
                     }
@@ -211,6 +219,11 @@ where
             .edition2_statements_about(KEY_REVOCATION_FAMILY, &subject)
             .await?
         {
+            // v62.0.0 (wave G0 v4) — a held-back revocation does not count
+            // in liveness until it concludes.
+            if super::fold::is_held_back(dir, &st).await? {
+                continue;
+            }
             if let Some(signer) = statement_kid(&st) {
                 if signer != kid {
                     queue.push_back(signer);
@@ -282,6 +295,15 @@ pub fn json_of(v: &Value) -> serde_json::Value {
     }
 }
 
+/// A fixed6 payload member (CC 2.6.1.5: the value times 10^6, an integer)
+/// as the real the earlier form's gates and the typed columns read.
+fn fixed6_real(payload: &Value, member: &str) -> Option<f64> {
+    let n = payload.get_text(member).and_then(Value::as_i64)?;
+    #[allow(clippy::cast_precision_loss)]
+    let real = n as f64 / 1_000_000.0;
+    Some(real)
+}
+
 fn ms_instant(ms: u64) -> Result<chrono::DateTime<chrono::Utc>, Error> {
     i64::try_from(ms)
         .ok()
@@ -303,7 +325,8 @@ fn ms_instant(ms: u64) -> Result<chrono::DateTime<chrono::Utc>, Error> {
 /// - `attesting_key_id` / `scrub_key_id` are `iss`; `attested_key_id` is
 ///   `sub`; `attestation_type` is the row type.
 /// - `asserted_at` / `scrub_timestamp` come from `asserted_at` (ms), and
-///   `expires_at` from `expires_at`.
+///   `expires_at` from `expires_at`; `weight` from the fixed6 `weight`
+///   (`None` when absent).
 /// - the envelope is the payload's projection ([`json_of`]) plus the
 ///   statement under [`STATEMENT_MEMBER`]. `original_content_hash` is the
 ///   SHA-256 of the envelope's JCS image, as every row's is.
@@ -329,29 +352,27 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
                 );
             }
         }
-        // Hash digests (`[-16, h'…']`) read back as the hex the gates read.
-        for member in HASH_DIGEST_MEMBERS {
-            match row.payload.get_text(member) {
-                Some(Value::Array(a)) if *member == "evidence_refs" => {
-                    let hexes: Option<Vec<String>> = a.iter().map(digest_hex).collect();
-                    if let Some(h) = hexes {
-                        o.insert((*member).to_owned(), serde_json::json!(h));
+        // v62.0.0 (wave P1e, E10's finding) — hash digests (`[-16, h'..']`)
+        // read back as the 64-lowercase-hex text every earlier-form reader
+        // reads (`steward_purge`'s `evidence_refs`, the blob bindings, ...):
+        // one digest as its hex, a sequence of them as an array of hex. The
+        // members are every family's `HASH_DIGEST_MEMBERS` and the family's
+        // own digest members (`payloads::is_digest_member`), so the mapping
+        // has one list, the door's.
+        if let Some(members) = row.payload.as_map() {
+            for (k, v) in members {
+                let Some(k) = k.as_text() else { continue };
+                if super::payloads::is_digest_member(&row.family, k) {
+                    if let Some(j) = super::payloads::digest_json(v) {
+                        o.insert(k.to_owned(), j);
                     }
                 }
-                Some(v) => {
-                    if let Some(h) = digest_hex(v) {
-                        o.insert((*member).to_owned(), serde_json::Value::String(h));
-                    }
-                }
-                None => {}
             }
         }
         // Scores, confidences and weights are integers at the fixed scale of
         // 10^6 (CC 2.6.1.5); the earlier form's gates read the real value.
         for member in SCALED_MEMBERS {
-            if let Some(n) = row.payload.get_text(member).and_then(Value::as_i64) {
-                #[allow(clippy::cast_precision_loss)]
-                let real = n as f64 / 1_000_000.0;
+            if let Some(real) = fixed6_real(&row.payload, member) {
                 o.insert((*member).to_owned(), serde_json::json!(real));
             }
         }
@@ -365,6 +386,38 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
                 serde_json::Value::String(target.hex()),
             );
         }
+        // v62.0.0 (wave P1e; CC rc21) — the members that name a row live under
+        // a `refs` role (`payloads::REF_MEMBERS`): the earlier gates read
+        // each back as its earlier member, the node-computed row id(s) as
+        // lowercase hex (an amendment's `authorized_by` / `evidence_refs`
+        // from `refs.also.cites`; a deferral response's
+        // `references_attestation_id` from `refs.answers`).
+        for (role, member, shape) in super::payloads::ref_members(&row.family) {
+            let ids: Vec<String> = row
+                .names
+                .iter()
+                .filter(|n| n.role == role)
+                .map(|n| n.row.hex())
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let v = match shape {
+                super::payloads::RefShape::One if ids.len() == 1 => {
+                    serde_json::Value::String(ids[0].clone())
+                }
+                // A set where one row is expected is left unprojected: the
+                // door refuses it (the family's prose rule), and nothing
+                // reads a guessed one.
+                super::payloads::RefShape::One => continue,
+                super::payloads::RefShape::Many => serde_json::json!(ids),
+            };
+            o.insert(member.to_owned(), v);
+        }
+        // v62.0.0 (wave T2) — a typed plane's row reads back under the
+        // earlier envelope's member names its JSON door's gates read
+        // (`edition2::typed::project_envelope`); every other row is untouched.
+        super::typed::project_envelope(row, o);
         o.insert(
             STATEMENT_MEMBER.to_owned(),
             serde_json::Value::String(hex::encode(&row.bytes)),
@@ -419,6 +472,12 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
     }
     let mut a: Attestation = serde_json::from_value(v)
         .map_err(|e| Error::InvalidArgument(format!("edition-2 mapping: {e}")))?;
+    // v62.0.0 (wave P1c, E1's finding) — the typed `weight` column is the
+    // payload's fixed6 `weight` (CC 2.6.1.5), as the envelope's real; `None`
+    // when the payload carries none. Before this every edition-2 row stored
+    // NULL, and the weighted folds (`topology`, `trust_scoring`:
+    // `weight.unwrap_or(1.0)`) read every edge at 1.0.
+    a.weight = fixed6_real(&row.payload, "weight");
     // The earlier form's `row` mirror (CIRISPersist#643) is what its gates
     // read to bind the columns. An edition-2 statement binds them itself: its
     // protected header and payload ARE the row (CC 2.6.1.1, "no mirror of the
@@ -433,6 +492,11 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
     });
     if !a.subject_key_ids.is_empty() {
         mirror["subject_key_ids"] = serde_json::json!(a.subject_key_ids);
+    }
+    // The mirror binds `weight` both ways (absent ⇔ column `None`,
+    // `admission`'s mirror gate, compared numerically).
+    if let Some(w) = a.weight {
+        mirror["weight"] = serde_json::json!(w);
     }
     if let Some(o) = a.attestation_envelope.as_object_mut() {
         o.insert("row".to_owned(), mirror);
@@ -488,40 +552,181 @@ where
         return Ok(None);
     };
     let bytes = bytes?;
+    // v62.0.0 (wave P1c, AV-76) — the pure gates before the key-plane read.
+    super::door::pure_statement_gates(&bytes, &HeldKeys::new())?;
+    // v62.0.0 (wave O1; CC 4.2.6) — a recovery key signs no row: refused
+    // after the pure gates, before any key lookup.
+    Box::pin(super::recovery_signer::refuse_recovery_key_signer(
+        dir, &bytes,
+    ))
+    .await?;
     let keys = held_keys_for(dir, &bytes).await?;
-    let offered: Option<Digest32> = hex::decode(&row.attestation_id)
-        .ok()
-        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
-    let Some(offered) = offered else {
-        return Err(Error::malformed_row(
-            PLANE,
-            malformed_row::EDITION2_ROW_ID_MISMATCH,
-            format!(
-                "a row carrying an edition-2 statement is stored under its row id, not `{}`",
-                row.attestation_id
-            ),
-        ));
-    };
+    let offered = offered_row_id(row)?;
     let admitted = admit_row(&bytes, &keys, Some(&offered), SelectContext::default())?;
+    require_admission_signer_is_person(&keys, &admitted)?;
     let expected = attestation_of(&admitted, &row.tier)?;
+    require_projection(&expected, row)?;
+    Ok(Some(admitted))
+}
+
+/// v62.0.0 (wave P1e; CC rc21 CC 2.7.11) — every signer of an
+/// `admission:unit` row is a person: the signing key's live record (at the
+/// row's instant) holds `user` or `accord_holder` in its `identity_type`.
+/// Otherwise the statement is refused `admission_issuer_not_person` (an
+/// authored row is Invalid; on a counted row this voice alone is refused).
+/// A no-op for every other family. Read after Verify's verdict, over the
+/// held key plane the door already loaded.
+///
+/// # Errors
+/// `admission_issuer_not_person`.
+pub fn require_admission_signer_is_person(keys: &HeldKeys, row: &AdmittedRow) -> Result<(), Error> {
+    if row.family != super::payloads::ADMISSION_UNIT_FAMILY {
+        return Ok(());
+    }
+    let person = match keys.liveness(&row.kid, row.asserted_at_ms) {
+        Liveness::Live(r) => r
+            .identity_type
+            .iter()
+            .any(|t| t == "user" || t == "accord_holder"),
+        _ => false,
+    };
+    if person {
+        return Ok(());
+    }
+    Err(Error::malformed_row(
+        super::payloads::PLANE,
+        malformed_row::ADMISSION_ISSUER_NOT_PERSON,
+        format!(
+            "admission:unit: the signer {} is not a person's key (identity_type holds neither \
+             user nor accord_holder): no program's key admits a unit (CC 2.7.11)",
+            row.iss
+        ),
+    ))
+}
+
+/// The row id a carrying row is stored under: 32 bytes of lowercase hex.
+fn offered_row_id(row: &Attestation) -> Result<Digest32, Error> {
+    hex::decode(&row.attestation_id)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| {
+            Error::malformed_row(
+                PLANE,
+                malformed_row::EDITION2_ROW_ID_MISMATCH,
+                format!(
+                    "a row carrying an edition-2 statement is stored under its row id, not `{}`",
+                    row.attestation_id
+                ),
+            )
+        })
+}
+
+/// `row` is exactly `expected`, the projection of the statement it carries:
+/// every typed column the mapping writes, and the envelope.
+fn require_projection(expected: &Attestation, row: &Attestation) -> Result<(), Error> {
     let same = expected.attestation_id == row.attestation_id
         && expected.attesting_key_id == row.attesting_key_id
         && expected.attested_key_id == row.attested_key_id
         && expected.attestation_type == row.attestation_type
         && expected.asserted_at == row.asserted_at
-        && same_envelope(&expected.attestation_envelope, &row.attestation_envelope)
-        && expected.subject_key_ids == row.subject_key_ids;
-    if !same {
+        && expected.subject_key_ids == row.subject_key_ids
+        // v62.0.0 (wave P1c) — the weight column is the statement's too.
+        && expected.weight == row.weight
+        // Last: the one comparison whose cost scales with the envelope.
+        && same_envelope(&expected.attestation_envelope, &row.attestation_envelope);
+    if same {
+        return Ok(());
+    }
+    Err(Error::malformed_row(
+        PLANE,
+        malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+        format!(
+            "row {} is not the projection of the edition-2 statement it carries",
+            row.attestation_id
+        ),
+    ))
+}
+
+/// v62.0.0 (wave P1c) — **the carried-projection pre-check**, a pure
+/// function of the row: no directory read, no signature check, and no
+/// canonicalization of the offered envelope. For a row carrying an edition-2
+/// statement (`ceg_statement`), the row must be exactly what that statement
+/// derives ([`attestation_of`]); otherwise it is refused as
+/// [`verify_carried`] refuses it (`typed_diverges_from_envelope`,
+/// `edition2_row_id_mismatch`, or the door's pure statement gates). `Ok`
+/// for a row that carries none (an earlier-form row).
+///
+/// The attestation door runs it FIRST (`attestation_admit::plan_put_attestation`):
+/// a carrying row's envelope is not size-capped as an earlier-form envelope
+/// is (it is the statement's projection, bounded by the statement's cap), so
+/// a forged envelope beside a small valid statement must be refused before
+/// any gate pays for it. The derivation reads only the statement's bytes,
+/// already capped by the pure gates. [`verify_carried`] still runs at tier 3
+/// and checks the statement's signature and key; this is not a verdict.
+///
+/// # Errors
+/// As above.
+pub fn check_carried_projection(row: &Attestation) -> Result<(), Error> {
+    let Some(bytes) = carried_bytes(row) else {
+        return Ok(());
+    };
+    let bytes = bytes?;
+    super::door::pure_statement_gates(&bytes, &HeldKeys::new())?;
+    let derived = unverified_row(&bytes).ok_or_else(|| {
+        Error::malformed_row(
+            PLANE,
+            malformed_row::EDITION2_STATEMENT_INVALID,
+            "the carried statement has no row header (type, family, iss, sub) or payload",
+        )
+    })?;
+    let offered = offered_row_id(row)?;
+    if offered != derived.row_id.0 {
         return Err(Error::malformed_row(
             PLANE,
-            malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            malformed_row::EDITION2_ROW_ID_MISMATCH,
             format!(
-                "row {} is not the projection of the edition-2 statement it carries",
-                row.attestation_id
+                "row {} carries a statement whose row id is {}",
+                row.attestation_id,
+                derived.row_id.hex()
             ),
         ));
     }
-    Ok(Some(admitted))
+    let expected = attestation_of(&derived, &row.tier)?;
+    require_projection(&expected, row)
+}
+
+/// The statement's row as its header and payload state it, UNVERIFIED: the
+/// inputs [`attestation_of`] reads, for [`check_carried_projection`]'s
+/// equality check only (never stored, never a verdict). `statement_id` and
+/// `role` are not read by the mapping and are left empty.
+fn unverified_row(bytes: &[u8]) -> Option<AdmittedRow> {
+    let (protected, payload) = statement_parts(bytes)?;
+    let text = |v: Option<&Value>| v.and_then(Value::as_text).map(str::to_owned);
+    let row_type = text(protected.get_int(-70001))?;
+    let family = text(protected.get_int(-70002))?;
+    let claims = protected.get_int(15)?;
+    let iss = text(claims.get_int(1))?;
+    let sub = text(claims.get_int(2))?;
+    let kid = <[u8; 32]>::try_from(protected.get_int(4)?.as_bytes()?).ok()?;
+    let author = text(payload.get_text("author"));
+    let asserted_at_ms = payload.get_text("asserted_at").and_then(Value::as_u64)?;
+    let names = super::names::names_of(&payload).ok()?;
+    let row_id = super::names::RowId::of_statement(bytes)?;
+    Some(AdmittedRow {
+        row_id,
+        statement_id: [0; 32],
+        kid,
+        iss,
+        sub,
+        row_type,
+        family,
+        author,
+        asserted_at_ms,
+        payload,
+        names,
+        role: None,
+        bytes: bytes.to_vec(),
+    })
 }
 
 /// The signer's `identity_type` for a row carrying a statement: from its
@@ -580,6 +785,18 @@ pub enum StatementOutcome {
         /// Was the statement new.
         new: bool,
     },
+    /// v62.0.0 (wave T1, CC 2.6.1.9) — a voice of a COUNTED group row
+    /// (`group:roster`, `membership:{stage}` at `widening` / `removal`),
+    /// kept: the row's voices so far are short of its group's
+    /// `consensus_protocol`, or a founding roster lists a member who has not
+    /// voiced it yet. Nothing is in the typed table yet; a later voice
+    /// re-runs the door over all of them ([`super::group`]). APPENDED.
+    Pending {
+        /// The row id.
+        row_id: super::names::RowId,
+        /// Was the statement new.
+        new: bool,
+    },
 }
 
 /// **The one entry for an edition-2 statement**, local or replicated.
@@ -627,7 +844,21 @@ pub async fn put_statement_with_origin<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    super::door::require_statement_form(bytes)?;
+    // v62.0.0 (wave P1c, AV-76) — the pure gates (form, size, decode, not an
+    // object, no edition-1 name) run BEFORE the first directory read below
+    // (the accord's roster, the signer's key plane): a statement that can
+    // never be admitted buys no read. They need no key; an empty key set
+    // only names a decode fault, which no key changes.
+    super::door::pure_statement_gates(bytes, &HeldKeys::new())?;
+    // v62.0.0 (wave O1; CC 4.2.6) — a recovery key signs no row: refused
+    // finally by its key material, nothing held. A directory read: it runs
+    // AFTER the pure statement gates (P1c's `pure_statement_gates` replaces
+    // the form check above) and BEFORE the halt roster read and every key
+    // lookup.
+    Box::pin(super::recovery_signer::refuse_recovery_key_signer(
+        dir, bytes,
+    ))
+    .await?;
     // v62.0.0 (JSON-cut slice A) — an accord invocation is judged against
     // the holders of the bundle in force for its accord, never the key
     // plane (`edition2::halt`).
@@ -636,7 +867,7 @@ where
         let roster = super::halt::roster_in_force(dir, &accord).await?;
         let out = super::halt::put_invocation(dir, bytes, roster.as_ref()).await?;
         return Ok(StatementOutcome::Row {
-            row_id: super::names::RowId(out.invocation.row_id),
+            row_id: super::names::RowId(*out.invocation.row_id()),
             new: out.new,
         });
     }
@@ -660,10 +891,278 @@ where
     } else {
         admit_row(bytes, &keys, offered_id, SelectContext::default())?
     };
-    // A composer names a held row of its own family (every plane).
-    check_composer_target(dir, &admitted).await?;
+    // v62.0.0 (wave P1e) — an admission row's signer is a person.
+    require_admission_signer_is_person(&keys, &admitted)?;
+    let out = put_admitted_row(dir, &admitted, tier, offered_id.is_some(), origin).await?;
+    // v62.0.0 (wave G0; CC 2.7.3) — the fold: a plane's hold is recorded with
+    // its reason, and every held or concluded row whose fold read what this
+    // statement touches is re-folded, so the concluded set never depends on
+    // arrival order (`edition2::fold`).
+    Box::pin(super::fold::after_statement(dir, &admitted, tier, &out)).await?;
+    Ok(out)
+}
+
+/// v62.0.0 (slice C1; CC ruling (a): "a row is the same row inside a bundle
+/// and alone") — **the store tail of [`put_statement`]** for a row its door
+/// has admitted: the composer target, then the key plane (with its
+/// projection), a further voice, or the row through the attestation gates.
+///
+/// [`put_statement`] admits under the held key plane, then stores through
+/// this. (The genesis door no longer calls it: C1 writes a bundle's named
+/// rows in one transaction, `FederationDirectory::put_edition2_genesis`.)
+///
+/// `replicated` is whether a peer offered the statement under an id (the
+/// replicated door): the group planes' membership door reads it. `origin`
+/// is the mapped row's write origin ([`put_statement_with_origin`]).
+///
+/// # Errors
+/// As [`put_statement`] after admission.
+pub async fn put_admitted_row<F>(
+    dir: &F,
+    admitted: &AdmittedRow,
+    tier: &str,
+    replicated: bool,
+    origin: crate::federation::replication::admission::WriteOrigin,
+) -> Result<StatementOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::fold::{plane, reason, Arrival, Dep};
+    // v62.0.0 (wave G0 v4) — the row is folded under its ORIGINAL arrival:
+    // a later voice, or a re-fold, of a row first held through the
+    // replicated door runs the replicated door's gates (T1), at the tier it
+    // first arrived at.
+    let state = dir.fold_state(&admitted.row_id).await?;
+    let (tier, replicated): (String, bool) = match &state {
+        Some(s) => (s.tier.clone(), s.replicated),
+        None => (tier.to_owned(), replicated),
+    };
+    let was_held = state.as_ref().is_some_and(|s| s.held.is_some());
+    let (plane_name, slot) = fold_plane_of(admitted);
+    let arrival = Arrival {
+        row_id: admitted.row_id,
+        replicated,
+        tier: tier.clone(),
+        plane: plane_name,
+        slot,
+    };
+    super::fold::arriving(arrival, async {
+        // v62.0.0 (wave G0; CC 2.7.3) — EVERY door below (the group planes,
+        // the occurrence door, the typed families, the re-bind, the key
+        // plane, the attestation gates) runs as one fold attempt: a gate that
+        // marks a fold condition (`fold::hold`) holds the row with its
+        // reason, its statement kept and nothing concluded, never refused.
+        // The attestation tail opens its own inner attempt
+        // (`voices::put_counted_row`), which records its own reads.
+        let offered = super::voices::Voice {
+            iss: admitted.iss.clone(),
+            kid: admitted.kid,
+            asserted_at_ms: admitted.asserted_at_ms,
+        };
+        let (out, att) = super::fold::attempt(
+            admitted.row_id,
+            Some(offered),
+            Box::pin(put_admitted_row_doors(
+                dir, admitted, &tier, replicated, origin,
+            )),
+        )
+        .await;
+        let out = match (out, att.held) {
+            (Ok(o), _) => {
+                match &o {
+                    // A plane that answered `Pending` without marking (T1's
+                    // count, O1's, W1's): the count is short.
+                    StatementOutcome::Pending { row_id, .. } => {
+                        if dir.fold_held(row_id).await?.is_none() {
+                            let mut reads = att.reads.clone();
+                            reads.insert(Dep::Row(*row_id).read_key());
+                            super::fold::record(
+                                dir,
+                                *row_id,
+                                &admitted.family,
+                                &tier,
+                                Some((
+                                    reason::COUNT_SHORT.to_owned(),
+                                    "the row's voices are short of its count".to_owned(),
+                                )),
+                                reads,
+                            )
+                            .await?;
+                        }
+                    }
+                    // Concluded on a plane other than the attestation tail
+                    // (which records its own, with its inner reads): the
+                    // conclusion and what it read, so a later input change
+                    // can un-conclude it.
+                    StatementOutcome::Row { row_id, .. }
+                    | StatementOutcome::KeyPlane { row_id, .. }
+                        if plane_name != plane::ATTESTATION =>
+                    {
+                        super::fold::record(
+                            dir,
+                            *row_id,
+                            &admitted.family,
+                            &tier,
+                            None,
+                            att.reads.clone(),
+                        )
+                        .await?;
+                    }
+                    _ => {}
+                }
+                o
+            }
+            (Err(e), Some((r, detail))) => {
+                let new = dir.put_edition2_statement(admitted).await?;
+                let detail = if detail.is_empty() {
+                    e.to_string()
+                } else {
+                    detail
+                };
+                super::fold::record(
+                    dir,
+                    admitted.row_id,
+                    &admitted.family,
+                    &tier,
+                    Some((r, detail)),
+                    att.reads,
+                )
+                .await?;
+                StatementOutcome::Pending {
+                    row_id: admitted.row_id,
+                    new,
+                }
+            }
+            (Err(e), None) => return Err(e),
+        };
+        // The key plane's read model skips held-back statements
+        // (`held_keys_for_kid`): re-derive it once the fold state of a key
+        // statement changed (held now, or held before).
+        if plane_name == plane::KEY && (was_held || matches!(out, StatementOutcome::Pending { .. }))
+        {
+            if let Some(kid) = key_statement_about(admitted) {
+                super::projection::project_key(dir, &kid).await?;
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// The key a key-plane statement is about: a record's own key, a
+/// revocation's subject.
+fn key_statement_about(admitted: &AdmittedRow) -> Option<Digest32> {
+    if admitted.family == KEY_RECORD_FAMILY {
+        super::liveness::recorded_kid(&admitted.bytes)
+    } else {
+        kid_of_identity_ref(&admitted.sub)
+    }
+}
+
+/// v62.0.0 (wave G0 v4) — **the fold plane and projection slot of a row**,
+/// in the same order [`put_admitted_row`] routes it (keep the two in step).
+#[must_use]
+pub fn fold_plane_of(admitted: &AdmittedRow) -> (&'static str, String) {
+    use super::fold::plane;
+    let own = || format!("row:{}", admitted.row_id.hex());
+    if super::group::group_plane_of(&admitted.row_type, &admitted.family, &admitted.payload)
+        .is_some()
+    {
+        return (plane::GROUP, format!("group:{}", admitted.sub));
+    }
+    if admitted.family == super::occurrence::OCCURRENCE_FAMILY {
+        return match super::fold::occurrence_pair(admitted) {
+            Some((identity, occurrence)) => (
+                plane::OCCURRENCE,
+                format!("occurrence:{identity}|{occurrence}"),
+            ),
+            None => (plane::OCCURRENCE, own()),
+        };
+    }
+    if super::typed::is_trust_family(&admitted.family) {
+        return (plane::TRUST, own());
+    }
+    if let Some(p) = super::typed::typed_plane_of(&admitted.row_type, &admitted.family) {
+        use super::typed::TypedPlane;
+        let name = match p {
+            TypedPlane::Takedown if super::typed::is_steward_purge(admitted) => plane::TYPED_FINAL,
+            TypedPlane::Takedown | TypedPlane::Custody | TypedPlane::KeyGrant => {
+                plane::TYPED_ATTESTATION
+            }
+            TypedPlane::OccurrenceRevocation
+            | TypedPlane::Cosign
+            | TypedPlane::Revocation
+            | TypedPlane::DeliveryReceipt => plane::TYPED_FINAL,
+        };
+        return (name, own());
+    }
+    if admitted.family == super::transport_rebind::REBIND_FAMILY {
+        return (plane::REBIND, format!("rebind:{}", admitted.sub));
+    }
     if admitted.family == KEY_RECORD_FAMILY || admitted.family == KEY_REVOCATION_FAMILY {
-        let new = dir.put_edition2_statement(&admitted).await?;
+        return match key_statement_about(admitted) {
+            Some(kid) => (plane::KEY, format!("key:{}", hex::encode(kid))),
+            None => (plane::KEY, own()),
+        };
+    }
+    (plane::ATTESTATION, own())
+}
+
+/// The routing [`put_admitted_row`] runs inside its fold attempt.
+async fn put_admitted_row_doors<F>(
+    dir: &F,
+    admitted: &AdmittedRow,
+    tier: &str,
+    replicated: bool,
+    origin: crate::federation::replication::admission::WriteOrigin,
+) -> Result<StatementOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let bytes: &[u8] = &admitted.bytes;
+    // A composer names a held row of its own family (every plane).
+    check_composer_target(dir, admitted).await?;
+    // v62.0.0 (wave T1) — the group planes: a `group:roster` version or a
+    // counted membership change lands in its typed table through the typed
+    // door, counted over every voice of the row (`edition2::group`).
+    if let Some(plane) =
+        super::group::group_plane_of(&admitted.row_type, &admitted.family, &admitted.payload)
+    {
+        return Box::pin(super::group::put_group_statement(
+            dir, admitted, plane, replicated, tier,
+        ))
+        .await;
+    }
+    // v62.0.0 (wave O1; CC 3.3.6) — an occurrence bind's voices: held, and
+    // the bind written to the occurrence table when it lands
+    // (`edition2::occurrence`), never an attestation row.
+    if admitted.family == super::occurrence::OCCURRENCE_FAMILY {
+        return Box::pin(super::occurrence::put_occurrence_voice(dir, admitted)).await;
+    }
+    // v62.0.0 (wave W1; CC 3.1.3, 3.4.7) — a seat's counted re-bind: held
+    // in the statement store, counted by the holders of the genesis bundle
+    // in force (`edition2::transport_rebind`), never an attestation row.
+    if admitted.family == super::transport_rebind::REBIND_FAMILY {
+        return Box::pin(super::transport_rebind::put_rebind_voice(dir, admitted)).await;
+    }
+    // v62.0.0 (wave T2) — the remaining families with a typed table (an
+    // occurrence revocation, a revocation, a takedown notice, a custody
+    // report, a key grant, a delivery receipt, a cosign state) land there
+    // through the JSON form's own door (`edition2::typed`).
+    // v62.0.0 (wave T2; CC 3.2 T3) — a trust edge (or its composer) keeps
+    // the attestation door and re-derives the v1.3 trust plane's row of the
+    // keys it touches (`edition2::typed::project_trust_for`).
+    if super::typed::is_trust_family(&admitted.family) {
+        return Box::pin(super::typed::put_trust_statement(dir, admitted, tier)).await;
+    }
+    if let Some(plane) = super::typed::typed_plane_of(&admitted.row_type, &admitted.family) {
+        return Box::pin(super::typed::put_typed_statement(
+            dir, admitted, plane, tier,
+        ))
+        .await;
+    }
+    if admitted.family == KEY_RECORD_FAMILY || admitted.family == KEY_REVOCATION_FAMILY {
+        let new = dir.put_edition2_statement(admitted).await?;
         // v62.0.0 (slice J0) — the read models: the key this statement is
         // about, projected into `federation_keys` and its honoured
         // revocations into `federation_revocations`, re-derived from the
@@ -683,22 +1182,11 @@ where
     }
     // A further voice of a row already held (a counted row, CC 2.6.1.9): the
     // row is admitted, and this voice joins its fold under `event_row_id`
-    // (`cosign::edition2_voices`), never a second row.
-    if dir.get_attestation(&admitted.row_id.hex()).await?.is_some() {
-        let new = dir.put_edition2_statement(&admitted).await?;
-        return Ok(StatementOutcome::Voice {
-            row_id: admitted.row_id,
-            new,
-        });
-    }
-    let row = attestation_of(&admitted, tier)?;
-    dir.put_attestation_with_origin(SignedAttestation { attestation: row }, origin)
-        .await?;
-    let new = dir.put_edition2_statement(&admitted).await?;
-    Ok(StatementOutcome::Row {
-        row_id: admitted.row_id,
-        new,
-    })
+    // (`cosign::edition2_voices`), never a second row. v62.0.0 (wave V1b) —
+    // a row not held yet runs the attestation gates counted by ALL its
+    // voices, this one included; a gate that finds them short keeps the
+    // voice and answers `Pending` (`edition2::voices::put_counted_row`).
+    Box::pin(super::voices::put_counted_row(dir, admitted, tier, origin)).await
 }
 
 /// The tier replication and tier ingest deliver at.
@@ -764,7 +1252,8 @@ where
             let new = match &out {
                 StatementOutcome::KeyPlane { new, .. }
                 | StatementOutcome::Voice { new, .. }
-                | StatementOutcome::Row { new, .. } => *new,
+                | StatementOutcome::Row { new, .. }
+                | StatementOutcome::Pending { new, .. } => *new,
             };
             Ok(if new {
                 ReplicatedStatementOutcome::Admitted(out)

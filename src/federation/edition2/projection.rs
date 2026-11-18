@@ -147,21 +147,26 @@ fn instant(ms: u64) -> Result<DateTime<Utc>, Error> {
         })
 }
 
-/// `{hardware_class, pq_custody, chain}` from a key record's payload
-/// `attestation_evidence`: text as itself, the chain's certificates as hex
-/// DER in the order held (leaf first). Absent members are `null` (`[]` for
-/// the chain), so every projected row carries the object.
+/// v62.0.0 (wave W1b; CC 4.2.2.1) — the key record's custody evidence as the
+/// read model carries it: an object with only the members the record states
+/// (`hardware_class` and `pq_custody` as text; `chain` as hex DER, leaf
+/// first, only when non-empty), in the shape the hardware policy parses
+/// (`hardware_attestation::AttestationEvidence::Edition2Custody`). An absent
+/// member is ABSENT, never `null`; a record with no `attestation_evidence`
+/// projects `null` (no evidence).
 #[must_use]
 pub fn attestation_evidence_of(payload: &Value) -> serde_json::Value {
-    let ev = payload.get_text("attestation_evidence");
-    let text = |m: &str| {
-        ev.and_then(|e| e.get_text(m))
-            .and_then(Value::as_text)
-            .map(|t| serde_json::Value::String(t.to_owned()))
-            .unwrap_or(serde_json::Value::Null)
+    let Some(ev) = payload.get_text("attestation_evidence") else {
+        return serde_json::Value::Null;
     };
+    let mut out = serde_json::Map::new();
+    for member in ["hardware_class", "pq_custody"] {
+        if let Some(t) = ev.get_text(member).and_then(Value::as_text) {
+            out.insert(member.to_owned(), serde_json::Value::String(t.to_owned()));
+        }
+    }
     let chain: Vec<serde_json::Value> = ev
-        .and_then(|e| e.get_text("chain"))
+        .get_text("chain")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
@@ -170,11 +175,10 @@ pub fn attestation_evidence_of(payload: &Value) -> serde_json::Value {
                 .collect()
         })
         .unwrap_or_default();
-    serde_json::json!({
-        "hardware_class": text("hardware_class"),
-        "pq_custody": text("pq_custody"),
-        "chain": chain,
-    })
+    if !chain.is_empty() {
+        out.insert("chain".to_owned(), serde_json::Value::Array(chain));
+    }
+    serde_json::Value::Object(out)
 }
 
 /// The record a key's projection names: the one with the greatest end (no

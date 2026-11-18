@@ -4008,7 +4008,7 @@
     "CIRISPersist types.rs#Attestation.attested_key_id/.subject_key_ids (ALREADY typed; precedent in safety/moderation.rs#emit_moderation_event)",
     "proposed: admission-time self-report equality check colocated with the transport:* rule (no existing symbol; must sit as a contrasting sibling to the capacity check so implementers do not invert them)",
     "proposed:CIRISPersist engine.rs#resolve_contribution_group_key (today defaults per engine.rs:2351 unwrap_or_else, collapsing cross-voter grouping into singletons)",
-    "src/federation/admission.rs#check_single_node_owner_admission (CIRISPersist v21.4.0)"
+    "src/federation/admission.rs#owner_of (CIRISPersist v62.0.0: the kernel owner seat; the single-owner gate is deleted)"
    ],
    "enforcement_point": "admission",
    "enforcement_points_all": [
@@ -14133,7 +14133,8 @@
     "path#symbol": "src/federation/consent_grammar.rs#RestrictionOp::StripField",
     "tsv_target": "evidence/cc_impl.tsv",
     "field": "restrictions",
-    "prefix": "attestation:license_validity"
+    "prefix": "attestation:license_validity",
+    "span_excluded": "an enum variant: span_of hashes items only; CC's register cites this pointer verbatim (claims.tsv CLM-nsproc-restrictions-attestation-license-validity), so it stays until CC re-cites RestrictionOp"
    },
    {
     "decimal_id": "3.1.2",
@@ -14300,7 +14301,7 @@
     "claim_id": "CLM-nsproc-attested-key-id-ownership",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#check_single_node_owner_admission",
+    "path#symbol": "src/federation/admission.rs#owner_of",
     "tsv_target": "evidence/cc_impl.tsv",
     "field": "attested_key_id",
     "prefix": "ownership:*",
@@ -14571,7 +14572,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.4.3.8",
+    "decimal_id": "4.4.3.34",
     "claim_id": "CLM-trust-root",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/canonical_community.rs#pin_trust_from_bundle_response",
@@ -14776,7 +14777,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "2.6.1.3",
+    "decimal_id": "8.11.5",
     "claim_id": "CLM-envelope-size",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_envelope_size_admission",
@@ -15008,7 +15009,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "3.4.7",
+    "decimal_id": "3.2",
     "claim_id": "CLM-family-root-charter",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/trust_root.rs#check_family_charter_admission",
@@ -15088,7 +15089,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.2.1.1",
+    "decimal_id": "8.11.29",
     "claim_id": "CLM-accord-invoke-lowercase",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/trust_root.rs#ACCORD_HEARTBEAT_DIMENSION",
@@ -15152,7 +15153,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-authority-triad",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#emitter_resolves_to_authority",
@@ -15160,7 +15161,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-authority-triad",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#row_was_issued_under_authority",
@@ -15168,7 +15169,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-authority-triad",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/topology.rs#build_delegation_graph",
@@ -15176,7 +15177,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-authority-triad",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/key_grant.rs#admit_replicated_key_grant",
@@ -15184,7 +15185,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-licence-authority-object",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#emitter_resolves_to_authority",
@@ -15192,7 +15193,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-licence-authority-object",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#row_was_issued_under_authority",
@@ -15200,7 +15201,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-licence-authority-object",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/licensure.rs#status_set_for",
@@ -15208,7 +15209,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-licence-authority-object",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_licensure_delegator_is_authority",
@@ -15320,7 +15321,7 @@
     "manifest_round": "v55-989"
    },
    {
-    "decimal_id": "5.3.3.2.5",
+    "decimal_id": "5.3.3.7",
     "claim_id": "CLM-one-chunk-seal",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/chunk_dag_cascade.rs#register_stream_epoch_dek",
@@ -15328,7 +15329,7 @@
     "manifest_round": "v55-981"
    },
    {
-    "decimal_id": "5.3.3.2.5",
+    "decimal_id": "5.3.3.7",
     "claim_id": "CLM-one-chunk-seal",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/chunk_dag_cascade.rs#stream_epoch_verdict",
@@ -15336,7 +15337,7 @@
     "manifest_round": "v55-981"
    },
    {
-    "decimal_id": "5.3.3.2.5",
+    "decimal_id": "5.3.3.7",
     "claim_id": "CLM-one-chunk-seal",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/chunk_dag_cascade.rs#holds_this_dek",
@@ -15425,7 +15426,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.4.3.4.3",
+    "decimal_id": "4.4.3.19",
     "claim_id": "CLM-issuance-scope",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_licensure_delegator_is_authority",
@@ -15433,7 +15434,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.4.3.4.3",
+    "decimal_id": "4.4.3.19",
     "claim_id": "CLM-issuance-scope",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/key_grant.rs#admit_replicated_key_grant",
@@ -15441,7 +15442,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.4.3.8",
+    "decimal_id": "4.4.3.34",
     "claim_id": "CLM-trust-root",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/trust_root.rs#check_trust_charter_admission",
@@ -15449,7 +15450,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.4.3.8",
+    "decimal_id": "4.4.3.34",
     "claim_id": "CLM-trust-root",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/trust_root.rs#trust_root_valid",
@@ -15457,7 +15458,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.4.3.8",
+    "decimal_id": "4.4.3.34",
     "claim_id": "CLM-trust-root",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/trust_root.rs#ConferralPlane",
@@ -15465,7 +15466,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.4.3.8",
+    "decimal_id": "4.4.3.34",
     "claim_id": "CLM-trust-root",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/trust_root.rs#resolve_transit_eligibility",
@@ -15654,7 +15655,8 @@
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/replication_audience.rs#occurrence_may_hold_key",
     "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "backfill-1052"
+    "manifest_round": "backfill-1052",
+    "span_excluded": "two declarations (the async free fn and OwnerAudience::occurrence_may_hold_key); CC's register cites the bare name (claims.tsv CLM-audience-claimed-nodes), so it stays until CC re-cites one"
    },
    {
     "decimal_id": "3.2",
@@ -15692,17 +15694,17 @@
     "decimal_id": "4.1.1",
     "claim_id": "CLM-anti-pattern-delegation",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/admission.rs#check_delegation_cycle_admission",
-    "tsv_target": "n/a",
-    "tsv_excluded": "v62.0.0 (slice C, the kernel adapter): persist no longer rejects the cycle-closing delegates_to; the decision answers through ciris-kernel, whose trust walk visits a cycle once (KERNEL.md 5, CC 4.4.3.34). CC 4.1.1's anti-pattern row still says reject; the claim returns when the CC session rules the row.",
-    "manifest_round": "cc-repin-15-1052"
+    "path#symbol": "src/federation/admission.rs#scoped_delegation_reach_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
    },
    {
     "decimal_id": "4.1.1",
     "claim_id": "CLM-self-edge-not-cycle",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_delegation_cycle_admission",
-    "tsv_target": "evidence/cc_impl.tsv",
+    "tsv_target": "n/a",
+    "tsv_excluded": "v62.0.0 (kernel pass 2): the cycle gate is deleted with its lock; the kernel's trust walk visits a cycle once (CC 4.4.3.34), so no self-edge or other edge is judged for closing one. The claim's trust-plane half stays on is_trust_plane_edge.",
     "manifest_round": "cc-repin-15-1052"
    },
    {
@@ -15714,7 +15716,7 @@
     "manifest_round": "cc-repin-15-1052"
    },
    {
-    "decimal_id": "4.4.3.2.8",
+    "decimal_id": "4.4.3.12",
     "claim_id": "CLM-affiliation-config-record",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/affiliation_config.rs#check_community_record",
@@ -15722,7 +15724,7 @@
     "manifest_round": "cc-repin-15-1052"
    },
    {
-    "decimal_id": "4.4.3.2.8",
+    "decimal_id": "4.4.3.12",
     "claim_id": "CLM-affiliation-config-record",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/affiliation_config.rs#declared_cohort",
@@ -15892,7 +15894,7 @@
     "manifest_round": "v61-s2-1157"
    },
    {
-    "decimal_id": "4.4.3.2.8",
+    "decimal_id": "4.4.3.12",
     "claim_id": "CLM-affiliation-one-voice-countersign",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/affiliation_config.rs#check_one_voice_countersign",
@@ -16459,7 +16461,7 @@
     "witness": "I1195 (memory, sqlite, postgres)"
    },
    {
-    "decimal_id": "2.6.1.3",
+    "decimal_id": "8.11.5",
     "claim_id": "CLM-canonical",
     "repo": "CIRISPersist",
     "path#symbol": "src/verify/canonical.rs#JcsCanonicalizer",
@@ -16580,7 +16582,7 @@
     "manifest_round": "cc-rc8-1091"
    },
    {
-    "decimal_id": "4.4.3.2.1",
+    "decimal_id": "4.4.3.4",
     "claim_id": "CLM-community-three",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/community_dek.rs#encrypt_and_cascade_community",
@@ -16588,7 +16590,7 @@
     "manifest_round": "cc-rc8-1091"
    },
    {
-    "decimal_id": "4.4.3.4",
+    "decimal_id": "4.4.3.15",
     "claim_id": "CLM-family-policy",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/at_rest_cascade.rs#resolve_recipients",
@@ -16596,7 +16598,7 @@
     "manifest_round": "cc-rc8-1091"
    },
    {
-    "decimal_id": "4.4.3.4.1",
+    "decimal_id": "4.4.3.16",
     "claim_id": "CLM-cascade",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/at_rest_cascade.rs#encrypt_and_cascade",
@@ -16637,7 +16639,7 @@
     "manifest_round": "cc-rc8-1091"
    },
    {
-    "decimal_id": "5.3.2.4.2",
+    "decimal_id": "5.3.2.6",
     "claim_id": "CLM-local",
     "repo": "CIRISPersist",
     "path#symbol": "src/engine.rs#Engine::enter_mesh",
@@ -16664,7 +16666,7 @@
     "post_cut_rename_from": "CIRISPersist/src/federation/stream_seal.rs#stream_nonce"
    },
    {
-    "decimal_id": "5.3.3.6",
+    "decimal_id": "5.3.3.11",
     "claim_id": "CLM-delivery",
     "repo": "CIRISPersist",
     "path#symbol": "src/store/sqlite.rs#put_delivery_receipt",
@@ -16672,7 +16674,7 @@
     "manifest_round": "cc-rc8-1091"
    },
    {
-    "decimal_id": "5.3.3.7",
+    "decimal_id": "5.3.3.12",
     "claim_id": "CLM-normative",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/stream_sth.rs#log_id_for_stream",
@@ -16768,7 +16770,7 @@
     "manifest_round": "cc-rc8-1091"
    },
    {
-    "decimal_id": "4.4.3.5.4",
+    "decimal_id": "4.4.3.29",
     "claim_id": "CLM-multi-subject",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
@@ -16784,7 +16786,7 @@
     "manifest_round": "cc-rc8-1091"
    },
    {
-    "decimal_id": "5.3.2.4.3",
+    "decimal_id": "5.3.2.7",
     "claim_id": "CLM-two",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/tier_ingest.rs#verify_federation_tier_ingest",
@@ -16792,7 +16794,7 @@
     "manifest_round": "cc-rc8-1091"
    },
    {
-    "decimal_id": "5.3.2.4.3.1",
+    "decimal_id": "5.3.2.8",
     "claim_id": "CLM-admission-pqc",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/tier_ingest.rs#verify_federation_tier_ingest",
@@ -16944,7 +16946,7 @@
     "manifest_round": "cc-rc8-vendor"
    },
    {
-    "decimal_id": "3.3.6.3",
+    "decimal_id": "3.3.6.4",
     "claim_id": "CLM-self-roster-authority",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/self_roster.rs#acts_as_steward_at",
@@ -16952,7 +16954,7 @@
     "manifest_round": "cc-rc9-1099"
    },
    {
-    "decimal_id": "3.3.6.3",
+    "decimal_id": "3.3.6.4",
     "claim_id": "CLM-self-roster-authority",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/consent_by_humans.rs#grant_is_authored_for",
@@ -16960,15 +16962,15 @@
     "manifest_round": "cc-rc9-1099"
    },
    {
-    "decimal_id": "3.3.6.3",
+    "decimal_id": "3.3.6.4",
     "claim_id": "CLM-self-roster-authority",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/admission.rs#check_single_node_owner_admission",
+    "path#symbol": "src/federation/admission.rs#check_owner_binding_roster_fresh",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1099"
    },
    {
-    "decimal_id": "3.3.6.3",
+    "decimal_id": "3.3.6.4",
     "claim_id": "CLM-self-roster-two-paths",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/two_path.rs#decide",
@@ -16976,7 +16978,7 @@
     "manifest_round": "cc-rc9-1099"
    },
    {
-    "decimal_id": "3.3.6.3",
+    "decimal_id": "3.3.6.4",
     "claim_id": "CLM-self-roster-two-paths",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/self_roster.rs#gate",
@@ -17148,7 +17150,7 @@
     "witness": "two_path the_corridor_refuses_each_pole_by_its_token (PolicyCorridor.lean's examples), I1305"
    },
    {
-    "decimal_id": "2.6.1.7",
+    "decimal_id": "8.11.9",
     "claim_id": "CLM-signed-object",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/tier_ingest.rs#check_content_hash",
@@ -17161,7 +17163,7 @@
     "witness": "I1309 (memory, sqlite, postgres): content_hash_mismatch"
    },
    {
-    "decimal_id": "2.6.1.7",
+    "decimal_id": "8.11.9",
     "claim_id": "CLM-signed-object",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_row_mirror_members_closed",
@@ -17170,7 +17172,7 @@
     "witness": "I1310 (memory, sqlite, postgres): envelope_row_member_unknown"
    },
    {
-    "decimal_id": "2.6.1.7",
+    "decimal_id": "8.11.9",
     "claim_id": "CLM-signed-object",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_envelope_member_shapes",
@@ -17195,7 +17197,7 @@
     "manifest_round": "v61-s0"
    },
    {
-    "decimal_id": "2.6.1.7",
+    "decimal_id": "8.11.9",
     "claim_id": "CLM-signed-object",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/mod.rs#validate_subject_key_ids",
@@ -17217,7 +17219,7 @@
     "witness": "I1214, I1215 (sqlite, postgres): the authority named by community_key_id resolves its keys under its consensus_protocol"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-licence-authority-quorum",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_licensure_delegator_is_authority",
@@ -17226,7 +17228,7 @@
     "witness": "I1214, I1215 (sqlite, postgres): a licence under a quorum protocol is a cosigned row; a lone member's appointment roots nothing"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-licence-authority-quorum",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#community_quorum_cosigned_at",
@@ -17235,7 +17237,7 @@
     "witness": "I1215 (sqlite, postgres): the license chain roots at an edge the quorum cosigned"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-licence-judged-at-issuance",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#licence_roots_at",
@@ -17244,7 +17246,7 @@
     "witness": "I1215 (sqlite, postgres), backdated_licence_is_bounded_by_w_1049 (sqlite, postgres): judged at the signed asserted_at; a withdrawal stops future issuance only"
    },
    {
-    "decimal_id": "2.4.1.2.1",
+    "decimal_id": "2.4.1.3",
     "claim_id": "CLM-licence-audience",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_licence_audience",
@@ -17289,7 +17291,7 @@
     "witness": "I1219 (sqlite, postgres)"
    },
    {
-    "decimal_id": "4.4.3.2.8",
+    "decimal_id": "4.4.3.12",
     "claim_id": "CLM-delegation-term",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_delegation_term_admission",
@@ -17325,7 +17327,7 @@
     "witness": "backdated_licence_is_bounded_by_w_1049 (sqlite, postgres): asserted_at_stale on the licence chain"
    },
    {
-    "decimal_id": "2.6.1.1.1",
+    "decimal_id": "8.11.3",
     "claim_id": "CLM-canonicalization-array",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/operational.rs#check_partner_record_sets",
@@ -17352,7 +17354,7 @@
     "witness": "I1366, I1367, I1369 (sqlite, postgres): an admitted reconsideration with outcome reversed, signed under the review duty, lifts the takedown at read and at the write floor; withdrawn or expired, it lifts nothing (CIRISPersist#1113)"
    },
    {
-    "decimal_id": "4.4.3.4.3",
+    "decimal_id": "4.4.3.19",
     "claim_id": "CLM-scope-infra-relay",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/types.rs#delegation_scope::INFRA",
@@ -17361,7 +17363,7 @@
     "witness": "infra_relay_is_appended_and_pinned_by_position (unit): infra:relay is ALL[24] and INFRA[12], appended; I1361 (sqlite, postgres) (CIRISPersist#1119)"
    },
    {
-    "decimal_id": "5.3",
+    "decimal_id": "5.4.6",
     "claim_id": "CLM-serve-seat-announced",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#serve_seat_owner_announced",
@@ -17375,7 +17377,7 @@
     "witness": "I1101 (sqlite, postgres): a node whose owner binding is self-scope only is refused serve_seat_owner_unannounced at the widening; a later announcement seats it and a withdrawn one does not (CIRISPersist#1101)"
    },
    {
-    "decimal_id": "2.6.2",
+    "decimal_id": "8.11.10",
     "claim_id": "CLM-canonicalization",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#signed_instant_form_violation",
@@ -17384,7 +17386,7 @@
     "witness": "I-IFP-2 (unit): the predicate reads every rfc3339-ms member of CC 2.6.1.7; I1494 (sqlite, postgres): CC's refuse_timestamp_form vector is refused envelope_member_invalid; I-IFP-1 (sqlite, postgres): the open-time pass settles a v60 node"
    },
    {
-    "decimal_id": "5.3.2.4.3.1",
+    "decimal_id": "5.3.2.8",
     "claim_id": "CLM-admission-pqc",
     "repo": "CIRISPersist",
     "path#symbol": "src/verify/hybrid.rs#require_strict_policy",
@@ -17398,7 +17400,7 @@
     "witness": "I1568 (unit, trace; sqlite, postgres): the public Rust verify_hybrid, verify_trace_hybrid and verify_hybrid_via_directory refuse every policy but Strict with VerifyError::PolicyViolation (verify_policy_violation) before decode, canonicalization or lookup; I1560, I1561 (sqlite, postgres): Engine.verify_hybrid / verify_hybrid_via_directory / verify_signed_* refuse every policy but strict with verify_policy_violation before decode, lookup or crypto; I1562 (capsule): VerifyHybridViaDirectory refuses every HybridPolicy but Strict; I1563 (wheel). Every caller-facing path asks require_strict_policy; only the two pinned classical-only planes call the crate-private twin verify_hybrid_with_policy"
    },
    {
-    "decimal_id": "5.3.2.4.3.1",
+    "decimal_id": "5.3.2.8",
     "claim_id": "CLM-admission-pqc",
     "repo": "CIRISPersist",
     "path#symbol": "src/audit/merkle_store.rs#require_hybrid_sth",
@@ -17498,6 +17500,195 @@
     "path#symbol": "src/federation/group_plane.rs#apply_group_plane_row",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "4.1.1",
+    "claim_id": "CLM-anti-pattern-delegation",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/kernel/trust.rs#edge_leg",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/ingest.rs#put_statement",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20",
+    "tsv_comment_before": [
+     "",
+     "# v62.0.0 (CC rc20): the edition-2 doors (CC 2.6.1), the halt row (CC 4.2.1.1),",
+     "# genesis bundle/2 and canonical standing (CC 5.3.4), key liveness (CC 3.1.3)."
+    ]
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/ingest.rs#apply_replicated_statement",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/door.rs#admit_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/door.rs#require_statement_form",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/door.rs#refuse_edition_one",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/door.rs#refuse_earlier_form",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/door.rs#require_key_of_iss",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/payloads.rs#check",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/ingest.rs#check_composer_target",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.6.1",
+    "claim_id": "CLM-signed-object-cose-planned",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/store/edition_upgrade.rs#delete_earlier_store",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "4.2.1.1",
+    "claim_id": "CLM-halt-one-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/halt.rs#refusal_error",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "4.2.1.1",
+    "claim_id": "CLM-halt-one-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/halt.rs#roster_in_force",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "4.2.1.1",
+    "claim_id": "CLM-halt-one-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/halt.rs#put_invocation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "4.2.1.1",
+    "claim_id": "CLM-invocation",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/halt.rs#put_invocation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-multi-steward",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/genesis.rs#read_lineage",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-multi-steward",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/genesis.rs#put_genesis_bundle",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-multi-steward",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/genesis.rs#bundles_in_force",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-multi-steward",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/genesis.rs#GenesisInForce::is_canonical",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-bundle-seeds-transit-pairs",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/genesis.rs#GenesisInForce::seat",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/liveness.rs#HeldKeys::liveness",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/projection.rs#key_projection",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "3.4.7.1",
+    "claim_id": "CLM-identity-set",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/types.rs#identity_type::set_contains",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-c4-rc20"
    }
   ],
   "CIRISServer": [
@@ -42801,7 +42992,7 @@
      {
       "field": "attested_key_id (node_key_id at the CIRISServer wire layer)",
       "owner_component": "persist",
-      "processor": "src/federation/admission.rs#check_single_node_owner_admission (CIRISPersist v21.4.0)",
+      "processor": "src/federation/admission.rs#owner_of (CIRISPersist v62.0.0: the kernel owner seat; the single-owner gate is deleted)",
       "enforcement_point": "admission"
      },
      {

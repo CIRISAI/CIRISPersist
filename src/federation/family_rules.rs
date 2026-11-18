@@ -216,6 +216,9 @@ pub struct PersistFamilyRule {
 /// Ordered by gap kind then prefix, so the three populations read as the three
 /// different asks they are.
 pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
+    // v62 (CC 3.1.5 rc21; CIRISServer#1365/#1366) — the rule gains the
+    // approved-text clause: the cited approval's `amendment_digest` must equal
+    // the amendment's.
     // v60.1.0 (CIRISPersist#1120) — CC rc10 (`cadd5a9`, untagged) makes the
     // rule normative and registers `identity_amendment:v1` with it; persist
     // vendors rc9, which has no row, so the gate's rule is pinned here until
@@ -225,12 +228,21 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
         prefix: "identity_amendment:",
         rule: "an identity_amendment:v1 (attester an occurrence of the agent, subject the \
                agent, amendment_digest hex64, authorized_by a uuid cited in evidence_refs) \
-               admits only when the cited deferral:response:approved:v1 is admitted here, is \
+               is in force only when the cited deferral:response:approved:v1 is admitted here, is \
                about the same agent, and its signer held a WA seat at its asserted_at (the \
                agent node's owner, self to self; on a split home, whose owner binds only the \
                node, the user the signing agent key is an occurrence of); \
-               identity_amendment_unauthorized otherwise",
-        enforced_at: &["federation::identity_amendment::check_identity_amendment_admission"],
+               identity_amendment_unauthorized otherwise; and (CC 3.1.5 rc21) only when the \
+               cited response's amendment_digest equals the amendment's, the exact text the \
+               WA approved; amendment_digest_mismatch when the response carries none, an \
+               ill-shaped one, or another. v62 (CC 2.7): the response-decided conditions \
+               never refuse; the amendment is admitted and held, in force only while they \
+               hold (identity_amendment::amendment_standing); the door refuses only the \
+               shape, the citation and the signer",
+        enforced_at: &[
+            "federation::identity_amendment::check_identity_amendment_admission",
+            "federation::identity_amendment::amendment_standing",
+        ],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,
         cc_ask: "none outstanding: CC rc12 registers the row with this rule \
@@ -944,17 +956,9 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
         .chain(std::iter::once(
             admission::PRIVATE_USE_FAMILY_STEM.to_owned(),
         ))
-        // `revocation:peer_admission:v1` is a whole dimension, not a prefix —
-        // the gate compares it for EQUALITY. Recorded as the family prefix so
-        // the inventory reads uniformly.
-        .chain(std::iter::once(
-            admission::PEER_DEADMISSION_DIMENSION
-                .rsplit_once(':')
-                .map_or_else(
-                    || admission::PEER_DEADMISSION_DIMENSION.to_owned(),
-                    |(head, _)| format!("{head}:"),
-                ),
-        ))
+        // v62.0.0 (wave P1e) — the de-admission family stem the gate reads
+        // (`revocation:peer_admission:`, any reason leaf and version).
+        .chain(std::iter::once(admission::PEER_DEADMISSION_STEM.to_owned()))
         .chain(
             crate::federation::invariant::NEWLY_ENFORCED_SELF_EMISSION_PREFIXES
                 .iter()

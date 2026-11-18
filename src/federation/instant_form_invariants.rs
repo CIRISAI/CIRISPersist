@@ -652,7 +652,7 @@ mod tests {
                 Opened { engine, backend }
             }
         };
-        bodies::i_ifp_1_open_settles_a_v60_node(open, &t).await;
+        Box::pin(bodies::i_ifp_1_open_settles_a_v60_node(open, &t)).await;
     }
 
     #[cfg(feature = "postgres")]
@@ -685,7 +685,7 @@ mod tests {
                 Opened { engine, backend }
             }
         };
-        bodies::i_ifp_1_open_settles_a_v60_node(open, &t).await;
+        Box::pin(bodies::i_ifp_1_open_settles_a_v60_node(open, &t)).await;
     }
 }
 

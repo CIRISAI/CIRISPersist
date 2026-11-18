@@ -32,31 +32,19 @@
 //! - **I1187 (the executor's atomic re-assertion)** — a plan made against a
 //!   row that changed before the write stores nothing and is refused with
 //!   the plan's wording, for every write shape: the upgrade's self-signed
-//!   guard, the supersede's anchored-version guard, the re-anchor's pubkey
-//!   guard, the replace's hash guard (and no history row), the hybrid
+//!   guard, the supersede's anchored-version guard, the replace's hash guard (and no history row), the hybrid
 //!   completion's not-yet-complete guard, the scrub rehydrate's empty-set
 //!   guard; an insert over a differing held row is `Conflict`, over an
 //!   identical one, or with `OnHeld::Keep`, it stands.
-//! - **I1189 (the re-anchor's own refusals)** — over the real v2 ceremony
-//!   (holders seeded, the pre-ceremony anchor held, the artifact baked and
-//!   the canonical re-anchored), the door refuses, directly, the same record
-//!   again (`valid_from` not newer: rollback) and a record the bundle does
-//!   not carry; the held record does not move. The bake door pre-checks the
-//!   rollback, so only a direct call reaches the plan's own copy. RED on
-//!   postgres before v60.0.0: the nanosecond bundle instant against the
-//!   microsecond held one read as newer, and the same record re-anchored.
+//! - **I1189** — deleted in v62.0.0 (json-cut C5) with the bundle/1 re-anchor
+//!   door it witnessed.
 //! - **I1190 (the canonical supersede's own decisions)** — over an anchored
 //!   incumbent (the #656 fixture): a byte-identical re-offer settles before
 //!   any verify (`Unchanged`); a successor whose ML-DSA key alone differs is
 //!   the pubkey-change refusal; a successor the supersede policy refuses
 //!   (not canonical-scoped, its signed `valid_from` older) is `Conflict`
 //!   naming the policy; nothing moves.
-//! - **I1191 (the bake door's anti-rollback, sqlite and postgres)** — a held
-//!   anchor that is not the bundle's record but carries its nanosecond
-//!   `valid_from` is refused by the bake door's own check
-//!   (`serve node …: rollback refused`), the held row unmoved. RED on postgres
-//!   before v60.0.0: the rounded held instant read as older, the door handed
-//!   the record to the re-anchor, and only the plan's copy refused it.
+//! - **I1191** — deleted in v62.0.0 (json-cut C5) with the bundle/1 bake door.
 //! - **I1188 (the row step, unit)** — `key_record_row_step` keeps a row the
 //!   pointer already names, replaces any other, and drops the rows of an
 //!   unverifiable or absent record; `PlannedKeyRecord::raced` /
@@ -70,7 +58,6 @@ pub(crate) mod bodies {
     };
     use crate::federation::key_plane_invariants::bodies::{key_row, pop_record};
     use crate::federation::register::test_support::authority_signed_record;
-    use crate::federation::register::AdoptScrubOutcome;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         compute_persist_row_hash, identity_type, KeyRecord, KeyReplacementKind, ScrubSig,
@@ -256,6 +243,17 @@ pub(crate) mod bodies {
         assert!(absent(d, &k3).await, "I1184: a fused seed stores nothing");
     }
 
+    /// The scrub upgrade through the shared plan (v62.0.0, json-cut C5: the
+    /// `adopt_scrub_upgrade` door is deleted; the plan's `ScrubUpgrade` write
+    /// is the replicated `Upgrade` arm's door).
+    async fn scrub_upgrade<B: KeyPlaneStore>(
+        b: &B,
+        r: SignedKeyRecord,
+    ) -> Result<KeyRecordWritten, Error> {
+        key_plane::key_record_write_planned(b, KeyRecordWrite::ScrubUpgrade { record: r.record })
+            .await
+    }
+
     /// I1185 — the scrub upgrade.
     pub(crate) async fn i1185_scrub_upgrade<B: KeyPlaneStore>(b: &B, tag: &str) {
         let d = b.as_dyn_directory();
@@ -283,7 +281,7 @@ pub(crate) mod bodies {
             }),
         ];
         for (what, r) in refusals {
-            match b.adopt_scrub_upgrade(signed(r)).await {
+            match scrub_upgrade(b, signed(r)).await {
                 Err(
                     Error::InvalidArgument(_)
                     | Error::Conflict(_)
@@ -299,18 +297,21 @@ pub(crate) mod bodies {
             );
         }
         assert!(matches!(
-            b.adopt_scrub_upgrade(signed(anchored(
-                &format!("i1185-none-{tag}"),
-                identity_type::USER,
-                &s
-            )))
+            scrub_upgrade(
+                b,
+                signed(anchored(
+                    &format!("i1185-none-{tag}"),
+                    identity_type::USER,
+                    &s
+                ))
+            )
             .await,
             Err(Error::InvalidArgument(_))
         ));
         let up = anchored(&k, identity_type::USER, &s);
         assert_eq!(
-            b.adopt_scrub_upgrade(signed(up.clone())).await.unwrap(),
-            AdoptScrubOutcome::Upgraded,
+            scrub_upgrade(b, signed(up.clone())).await.unwrap(),
+            KeyRecordWritten::Written,
             "I1185: the self-signed row is re-rooted"
         );
         let after = held(d, &k).await;
@@ -323,14 +324,11 @@ pub(crate) mod bodies {
         let row = key_row(d, &k).await.expect("I1185: the row follows");
         assert_eq!(row.scrub_key_id, s, "I1185: the row is the anchored claim");
         assert_eq!(
-            b.adopt_scrub_upgrade(signed(up)).await.unwrap(),
-            AdoptScrubOutcome::AlreadyAdopted,
+            scrub_upgrade(b, signed(up)).await.unwrap(),
+            KeyRecordWritten::Settled,
             "I1185: the same record again settles"
         );
-        match b
-            .adopt_scrub_upgrade(signed(anchored(&k, identity_type::USER, &s2)))
-            .await
-        {
+        match scrub_upgrade(b, signed(anchored(&k, identity_type::USER, &s2))).await {
             Err(Error::Conflict(m)) => assert!(m.contains("already anchored"), "I1185: {m}"),
             o => panic!("I1185: a second anchor is refused, got {o:?}"),
         }
@@ -412,125 +410,6 @@ pub(crate) mod bodies {
              3.4.7.1 / 2.4.1.1 — the set is malformed wherever it arrives)"
         );
         assert!(absent(d, &f).await, "I1186: the fused key is not stored");
-    }
-
-    /// The v2 ceremony's preconditions (the I1189 / I1191 setup): the holder
-    /// roster seeded, the pre-ceremony canonical anchor held (`prior` may
-    /// adjust it first), the constitutional family seeded.
-    async fn v2_ceremony_prerequisites<B: KeyPlaneStore>(b: &B, prior: fn(&mut KeyRecord)) {
-        use crate::federation::genesis;
-        key_plane::seed_genesis_accord_holders_planned(
-            b,
-            &genesis::effective_accord_holder_records(),
-        )
-        .await
-        .expect("the holder roster seeds");
-        let records: Vec<SignedKeyRecord> = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/canonical_seed_pre_ceremony.json"
-        )))
-        .expect("pre-ceremony seed fixture parses");
-        for mut rec in records {
-            prior(&mut rec.record);
-            b.put_public_key(rec).await.expect("the prior anchor");
-        }
-        genesis::seed_accord_family(b)
-            .await
-            .expect("the constitutional family");
-    }
-
-    /// The real v2 ceremony artifact.
-    const GENESIS_V2: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/genesis_v2.json"
-    ));
-
-    /// I1191 — the bake door's own anti-rollback, at substrate resolution.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub(crate) async fn i1191_bake_rollback_at_resolution<B: KeyPlaneStore>(b: &B) {
-        use crate::federation::genesis::bundle;
-        let parsed = bundle::parse_genesis_bundle(GENESIS_V2).unwrap();
-        let sn = parsed.serve_nodes[0].clone();
-        // The held anchor is NOT the bundle's record (another envelope and
-        // scrub set, so `same_record` does not shield it) but its `valid_from`
-        // is the bundle record's own nanosecond instant. sqlite and memory keep
-        // it whole; postgres keeps it rounded below the bundle's.
-        v2_ceremony_prerequisites(b, |r| {
-            r.valid_from = "2026-07-31T13:58:22.147317128Z".parse().unwrap();
-        })
-        .await;
-        assert_eq!(
-            sn.record.valid_from,
-            "2026-07-31T13:58:22.147317128Z"
-                .parse::<chrono::DateTime<chrono::Utc>>()
-                .unwrap(),
-            "I1191 precondition: the bundle record's instant"
-        );
-        let d = b.as_dyn_directory();
-        let before = held(d, &sn.record.key_id).await;
-        assert_ne!(
-            before.persist_row_hash, sn.record.persist_row_hash,
-            "I1191 precondition: not the same record"
-        );
-        match bundle::bake_assembled_genesis(d, GENESIS_V2).await {
-            Err(Error::GenesisBundleInvalid { detail })
-                if detail.starts_with("serve node") && detail.contains("rollback refused") => {}
-            o => panic!(
-                "I1191: the bake door itself refuses a record no newer than the held one at \
-                 substrate resolution, got {o:?}"
-            ),
-        }
-        assert_eq!(
-            held(d, &sn.record.key_id).await,
-            before,
-            "I1191: the held anchor does not move"
-        );
-    }
-
-    /// I1189 — the re-anchor's own refusals.
-    pub(crate) async fn i1189_reanchor_refusals<B: KeyPlaneStore>(b: &B) {
-        use crate::federation::genesis::bundle;
-        let d = b.as_dyn_directory();
-        v2_ceremony_prerequisites(b, |_| {}).await;
-        let artifact = GENESIS_V2;
-        let report = bundle::bake_assembled_genesis(d, artifact)
-            .await
-            .expect("I1189: the real ceremony bakes");
-        assert!(
-            report
-                .serve_nodes
-                .iter()
-                .all(|(_, o)| *o == bundle::BakeItemOutcome::ReAnchored),
-            "I1189 precondition: the canonical is re-anchored: {:?}",
-            report.serve_nodes
-        );
-        let parsed = bundle::parse_genesis_bundle(artifact).unwrap();
-        let sn = parsed.serve_nodes[0].clone();
-        let anchored = held(d, &sn.record.key_id).await;
-        assert_eq!(
-            anchored.registration_envelope, sn.record.registration_envelope,
-            "I1189: the bake re-anchored the bundle's record"
-        );
-        assert_eq!(
-            key_row(d, &sn.record.key_id).await.map(|r| r.scrub_key_id),
-            Some(sn.record.scrub_key_id.clone()),
-            "I1189: and its row follows"
-        );
-        match b.adopt_genesis_reanchor(sn.clone(), &parsed).await {
-            Err(Error::GenesisBundleInvalid { detail }) if detail.contains("rollback refused") => {}
-            o => panic!("I1189: the same record again is a rollback, got {o:?}"),
-        }
-        let mut uncarried = sn.clone();
-        uncarried.record.registration_envelope["i1189"] = serde_json::json!("not in the bundle");
-        match b.adopt_genesis_reanchor(uncarried, &parsed).await {
-            Err(Error::GenesisBundleInvalid { detail }) if detail.contains("not carried") => {}
-            o => panic!("I1189: a record the bundle does not carry is refused, got {o:?}"),
-        }
-        assert_eq!(
-            held(d, &sn.record.key_id).await,
-            anchored,
-            "I1189: the anchored record does not move"
-        );
     }
 
     /// I1190 — the canonical supersede's own decisions.
@@ -627,19 +506,8 @@ pub(crate) mod bodies {
             conflict,
         )
         .await;
-        // The re-anchor's pubkey guard.
-        let mut moved = up.clone();
-        moved.pubkey_ed25519_base64 = held(d, &s).await.pubkey_ed25519_base64;
-        stale(
-            b,
-            "re-anchor over another pubkey",
-            PlannedKeyRecord::Rewrite {
-                record: moved,
-                guard: RewriteGuard::SamePubkey,
-            },
-            |e| matches!(e, Error::Backend(m) if m.contains("expected 1 row")),
-        )
-        .await;
+        // (v62.0.0, json-cut C5: the bundle/1 re-anchor's pubkey guard is
+        // deleted with the re-anchor.)
         // The replace's hash guard.
         stale(
             b,
@@ -909,19 +777,6 @@ mod unit {
             assert!(p.raced(1).is_none(), "I1188: {needle}: one row landed");
             assert!(p.raced(2).is_none(), "I1188: {needle}: rows landed");
         }
-        let reanchor = rewrite(RewriteGuard::SamePubkey);
-        assert!(
-            reanchor.raced(1).is_none(),
-            "I1188: the re-anchor wrote one row"
-        );
-        for n in [0, 2] {
-            match reanchor.raced(n) {
-                Some(Error::Backend(m)) => {
-                    assert!(m.contains(&format!("got {n}")), "I1188: {m}")
-                }
-                o => panic!("I1188: re-anchor {n} rows: Backend, got {o:?}"),
-            }
-        }
         let insert = |on_held| PlannedKeyRecord::Insert {
             record: r.clone(),
             on_held,
@@ -994,12 +849,6 @@ mod backends {
         bodies::i1187_settled(&b, &tag("s")).await;
     }
 
-    #[cfg(feature = "sqlite")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1189_reanchor_refusals_sqlite() {
-        bodies::i1189_reanchor_refusals(&sqlite().await).await;
-    }
-
     // ── postgres ───────────────────────────────────────────────────────
     #[cfg(feature = "postgres")]
     async fn postgres() -> Option<crate::store::postgres::PostgresBackend> {
@@ -1055,14 +904,6 @@ mod backends {
         eprintln!("i1187_executor_guards_postgres: RAN");
     }
 
-    #[cfg(feature = "postgres")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1189_reanchor_refusals_postgres() {
-        let Some(b) = postgres().await else { return };
-        bodies::i1189_reanchor_refusals(&b).await;
-        eprintln!("i1189_reanchor_refusals_postgres: RAN");
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i1190_supersede_sqlite() {
@@ -1075,19 +916,5 @@ mod backends {
         let Some(b) = postgres().await else { return };
         bodies::i1190_supersede(&b, &tag("p")).await;
         eprintln!("i1190_supersede_postgres: RAN");
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1191_bake_rollback_at_resolution_sqlite() {
-        bodies::i1191_bake_rollback_at_resolution(&sqlite().await).await;
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1191_bake_rollback_at_resolution_postgres() {
-        let Some(b) = postgres().await else { return };
-        bodies::i1191_bake_rollback_at_resolution(&b).await;
-        eprintln!("i1191_bake_rollback_at_resolution_postgres: RAN");
     }
 }

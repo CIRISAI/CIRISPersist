@@ -159,6 +159,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_supersede_cohort", Class::Gate),
     ("decode_planned_head", Class::Gate),
     ("store_planned_supersede", Class::Plumbing),
+    // v62.0.0 (kernel pass 2, K1) — the offered signed version encoded for a
+    // held tip's row: an encode failure, no question about the caller.
+    ("signed_json", Class::Plumbing),
     // v61 (CIRISPersist#934, S4b) — the family doors.
     ("put_family_planned", Class::Plan),
     ("put_family_local_planned", Class::Plan),
@@ -236,7 +239,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("insert_known_wire_hash_planned", Class::Plan),
     ("purge_put_execution_planned", Class::Plan),
     ("revoke_trust_planned", Class::Plan),
-    // The peer add's held-row verdict, re-asked by the executor inside its transaction (the `recheck_cycle_under_lock` shape).
+    // The peer add's held-row verdict, re-asked by the executor inside its
+    // transaction (the shape of the v54 cycle re-ask, deleted in v62.0.0).
     ("peer_record_held_verdict", Class::Plan),
     ("refuse_held_peer_conflict", Class::Gate),
     // The stored granter read the revocation's ownership check compares against (a read; the refusal is the plan's).
@@ -295,6 +299,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("put_location_proof_planned", Class::Plan),
     ("withdraw_location_proof_planned", Class::Plan),
     ("put_touch_claim_planned", Class::Plan),
+    // v62.0.0 (v62 P5b) — the node-local touch write (no object, unsigned).
+    ("put_touch_claim_local_planned", Class::Plan),
     ("put_wholeness_witness_planned", Class::Plan),
     // The executors (storage only; compared across backends as the `AccordStore` / `EvidenceStore` traits): each fails only on the store's terms, and reports what it found for the plan to judge (`HeldRow`, a held proof, an advanced floor).
     ("last_accord_proposal_created_at", Class::Plumbing),
@@ -306,6 +312,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("store_planned_location_proof_withdrawal", Class::Plumbing),
     ("rival_location_proof_withdrawal", Class::Plumbing),
     ("store_planned_touch_claim", Class::Plumbing),
+    ("store_planned_touch_claim_local", Class::Plumbing),
     // v58.0.0 (CIRISPersist#991) — the key plane. The revocation door is one
     // shared plan; every key-plane write keeps its row with it in the same
     // transaction (storage, Plumbing: the row is a pure function of the record
@@ -332,7 +339,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("plan_key_scrub_upgrade", Class::Delegates),
     ("plan_key_supersede", Class::Delegates),
     ("plan_key_replace", Class::Delegates),
-    ("plan_key_reanchor", Class::Delegates),
     // Gates: the stored-column shapes (hex content hash, hybrid algorithm),
     // the consent-role token.
     ("check_key_record_columns", Class::Gate),
@@ -561,7 +567,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's shared door
     // and the executor's one re-ask under its lock: each is a SHARED plan.
     ("put_attestation_planned", Class::Plan),
-    ("recheck_cycle_under_lock", Class::Plan),
     // Inside the shared plan: its two same-file halves.
     ("plan_put_attestation", Class::Delegates),
     ("execute_planned", Class::Delegates),
@@ -591,6 +596,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("purge_attestation_planned", Class::Plan),
     ("purge_genesis_delegation_row_planned", Class::Plan),
     ("delete_attestation", Class::Plumbing),
+    // v62.0.0 (wave G0) — `unconclude_attestation` removes a row the fold no
+    // longer concludes: its helper-removed projections first. Storage; it
+    // refuses nothing about the caller's input.
+    ("purge_attestation_projections", Class::Plumbing),
     // v57.0.0 (CIRISPersist#934 step 2) — the community plane's shared doors
     // (`put_community`, `apply_replicated_community`, the three roster
     // doors), their plans (same-file halves), and the executor's storage
@@ -697,6 +706,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("caller_scope_from_directory", Class::Gate),
     ("canonicalize_in_place", Class::Gate),
     ("check", Class::Gate),
+    // v62.0.0 (P4) — the dimension policy for a row carrying an edition-2
+    // statement (`DimensionAdmissionPolicy::check_conferred`): a refusal of
+    // the caller's row, so a Gate like `check`.
+    ("check_conferred", Class::Gate),
     ("check_admissible", Class::Gate),
     ("check_admission_via_envelope", Class::Gate),
     ("check_attested_subject_admission", Class::Gate),
@@ -778,6 +791,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // it names.
     ("check_licensure_delegator_is_authority", Class::Gate),
     ("check_community_membership_steward_binding", Class::Gate),
+    // v62.0.0 (v62 security ruling "Agents are never exempt") — Gate: the
+    // trust-root door's form of the steward-binding gate; refuses an `agent`
+    // member of the caller's record that has no live steward binding.
+    ("check_trust_root_membership_steward_binding", Class::Gate),
     // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — Gates: an infrastructure
     // record must declare quorum:M/N and seat no node-bearing founder; a
     // widening may not seat one. Statements about the caller's row.
@@ -837,10 +854,16 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // descriptor is refused by member. (The holder claim's size gate retired
     // with `holds_bytes` in v55.0.0; the custody parse requires it.)
     ("check_media_source", Class::Gate),
+    // v62 (CC rc21, CC 3.1) — a key in a family name is its bare thumbprint
+    // segment (`namespace::key_segment`).
+    ("check_dimension_key_segments", Class::Gate),
     // v45.0.0 (#871, FSD §5) — the placement rule: a rendition whose
     // original THIS node holds must name the original's `cohort_scope`.
     // One name at the six write doors on every backend.
     ("check_rendition_placement", Class::Gate),
+    // v62.0.0 (wave P1c) — a row carrying an edition-2 statement is exactly
+    // its projection, checked first in the shared plan (pure).
+    ("check_carried_projection", Class::Gate),
     ("check_delivery_mode_vocabulary", Class::Gate),
     ("check_device_class", Class::Gate),
     ("check_encryption_pubkeys", Class::Gate),
@@ -906,13 +929,15 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // CIRISPersist#1098 F4/F5 (CC 2.6.1.1.1, rc12) — a fact about the caller's
     // envelope (an explicit-null member, `witnesses[]` out of set order).
     ("check_envelope_member_shapes", Class::Gate),
-    ("check_single_node_owner_admission", Class::Gate),
+    // v62.0.0 (kernel pass 2, KERNEL_SEAMS B1) — what is left of the deleted
+    // single-owner gate: the roster W bound on an owner-binding's signer, and
+    // the CC 3.2 ceremony step 4 refusal of an uncosigned post-reclaim
+    // rebinding (#578), now asked by the plan directly.
+    ("check_owner_binding_roster_fresh", Class::Gate),
+    ("check_post_reclaim_rebinding_admission", Class::Gate),
     // v50.0.0 (CIRISPersist#924, CC 5.4.6) — a minor's owner-binding is
     // refused at `cohort_scope: federation`.
     ("check_minor_owner_binding_not_announced", Class::Gate),
-    // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — refuses the cycle-closing
-    // `delegates_to` (`federation_delegation_cycle`).
-    ("check_delegation_cycle_admission", Class::Gate),
     // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — refuses a
     // term-bearing `delegates_to` without a bounded term
     // (`federation_delegation_term_required`).
@@ -923,6 +948,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_partner_record_revision", Class::Gate),
     ("check_licence_audience", Class::Gate),
     ("check_owner_binding_affiliation_admission", Class::Gate),
+    // v62.0.0 (wave V1b, CC 3.2 / C557, ruling (a)) — an edition-2 owner
+    // binding is counted (owner, bound key, affiliation quorum); at the
+    // edition-2 door it waits (`Pending`).
+    ("check_owner_binding_counted", Class::Gate),
+    // v62.0.0 (wave V1b, CC 4.4.3.12) — an affiliation's counted officer
+    // appointment; at the edition-2 door it waits (`Pending`).
+    ("check_officer_appointment_counted", Class::Gate),
     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — refuses a community record
     // whose declared cohort or affiliation config is malformed or invalid.
     ("check_community_record", Class::Gate),
@@ -1078,8 +1110,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("lookup_family", Class::Delegates),
     // PR #761 review — occurrence resolution rides the ACTIVE fold: a
     // revoked device falls back to its singleton identity instead of
-    // remaining co-self with its former owner.
-    ("active_identity_for_occurrence", Class::Delegates),
+    // remaining co-self with its former owner. v62.0.0 (v62 P5c) — through
+    // `self_collective::human_of`, which then falls back to the key's OWNER
+    // (a node or agent is never an occurrence of a person).
+    ("human_of", Class::Delegates),
     ("lookup_public_key", Class::Delegates),
     ("map_err", Class::Plumbing),
     // v36.0.0 (CIRISPersist#668) — visible because the cursor family's row
@@ -1124,11 +1158,15 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("route_occupied_family", Class::Gate),
     // v49.0.0 (CIRISPersist#910.5) — inside every backend's supersede
     // transaction: a proof over a version this node does not hold is refused
-    // as stale. Gate.
-    ("check_proof_names_prior", Class::Gate),
+    // as stale. v62.0.0 (kernel pass 2, K1): the proof must name the
+    // version's own prior (the held head for a successor, another for a tip);
+    // a proof contradicting its version is refused. Gate.
+    ("check_proof_names_versions_prior", Class::Gate),
     // v53.0.0 (CC 3.2 T6) — inside every backend's supersede transaction: a
     // version whose signed `prev_head_digest` is not the head this node holds
-    // is refused. Gate.
+    // is refused. v62.0.0 (kernel pass 2, K1): held as a tip instead (CC
+    // 2.7.8); the call still decides which, and refuses nothing else today.
+    // Gate.
     ("check_prev_head_names_held", Class::Gate),
     // v39.0.0 — the whole crossing decision: custody verification, every
     // inherited co-scrub, `check_promotion_admission`, and the nine
@@ -1398,7 +1436,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_trust_grant_authority", Class::Gate),
     ("check_trust_revocation_authority", Class::Gate),
     ("verify_and_prepare_participation", Class::Gate),
-    ("verify_bundle_quorum", Class::Gate),
     ("verify_community_admission", Class::Gate),
     (
         "verify_community_membership_revocation_admission",
@@ -1447,6 +1484,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("verify_stream_sth_signature", Class::Gate),
     ("verify_stream_sth_witnesses", Class::Gate),
     ("verify_touch_claim_admission", Class::Gate),
+    // v62.0.0 (v62 P5b) — Gate: refuses the caller's `fresh_as_of` beyond
+    // the future-skew tolerance (the node-local touch write's guard).
+    ("check_touch_fresh_as_of_skew", Class::Gate),
     // ── v55.0.0 (CIRISPersist#989, #1053) — the one holding claim; public rooms ──
     // v55.0.0 (CIRISPersist#1053, CC 3.2) — Gate: refuses a `community:listing:v1`
     // row off `federation`, malformed, for a non-public room, or by a signer that
@@ -1503,6 +1543,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
 /// exemption someone had to write down is reviewable.
 #[cfg(test)]
 #[derive(Debug)]
+// v62.0.0 (kernel pass 2): the manifest is empty (its one row, the v54 cycle
+// gate's `enter_mesh` re-ask, went with the gate); the type stays so a new
+// divergence has a reviewed place to be written down.
+#[allow(dead_code)]
 pub(crate) struct DeclaredDivergence {
     /// The trait the method belongs to.
     pub trait_name: &'static str,
@@ -1531,19 +1575,9 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
     // shape and seal gates, and every executor re-asks the shape gate on the
     // row it holds inside its write step (`PlannedReseal::sealed_over`;
     // SHARED_DOORS below).
-    DeclaredDivergence {
-        trait_name: "FederationDirectory",
-        method: "enter_mesh",
-        backend: "postgres",
-        expected: &["check_delegation_cycle_admission"],
-        reason: "v54.0.0 (Codex on PR #1050) — the crossing's cycle check runs inside \
-                 `plan_enter_mesh` on every backend. Sqlite takes its in-process delegation \
-                 write lock BEFORE the plan, so the plan's check and the write are one step: one \
-                 process owns the store. Postgres shares its database with other \
-                 processes, so it also takes the delegation advisory lock in the UPDATE's \
-                 transaction and asks the cycle gate AGAIN under it: a writer in another process \
-                 may have committed the reverse edge between the plan and the lock (I597).",
-    },
+    // v62.0.0 (kernel pass 2) — the `enter_mesh` postgres divergence (the
+    // v54 cycle gate re-asked under the advisory lock, I597) is gone with the
+    // gate: the kernel's walk visits a cycle once, so nothing is re-asked.
 ];
 
 #[cfg(test)]
@@ -1763,6 +1797,10 @@ mod tests {
         ),
         (
             "src/federation/evidence_admit.rs",
+            "put_touch_claim_local_planned",
+        ),
+        (
+            "src/federation/evidence_admit.rs",
             "put_wholeness_witness_planned",
         ),
         // v60.0.0 (CIRISPersist#934 step 4) — the consent writes, the #1105
@@ -1795,10 +1833,6 @@ mod tests {
         (
             "src/federation/attestation_admit.rs",
             "put_attestation_planned",
-        ),
-        (
-            "src/federation/attestation_admit.rs",
-            "recheck_cycle_under_lock",
         ),
         (
             "src/federation/attestation_admit.rs",
@@ -1877,7 +1911,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 81] = [
+    const SHARED_DOORS: [(&str, &str, &str); 79] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
         // decoded by the row mapper both doors read through.
         (
@@ -2111,6 +2145,11 @@ mod tests {
         ),
         (
             "FederationDirectory",
+            "put_touch_claim_local",
+            "put_touch_claim_local_planned",
+        ),
+        (
+            "FederationDirectory",
             "put_wholeness_witness",
             "put_wholeness_witness_planned",
         ),
@@ -2184,22 +2223,12 @@ mod tests {
         ),
         (
             "FederationDirectory",
-            "adopt_scrub_upgrade",
-            "key_record_write_planned",
-        ),
-        (
-            "FederationDirectory",
             "store_rebound_key_record",
             "key_record_write_planned",
         ),
         (
             "FederationDirectory",
             "store_invalid_replaced_key_record",
-            "key_record_write_planned",
-        ),
-        (
-            "FederationDirectory",
-            "adopt_genesis_reanchor",
             "key_record_write_planned",
         ),
         (
@@ -2217,12 +2246,6 @@ mod tests {
             "FederationDirectory",
             "put_attestation_with_origin",
             "put_attestation_planned",
-        ),
-        // The executor's one re-ask: the plan's cycle gate under the write lock.
-        (
-            "AttestationStore",
-            "store_planned_attestation",
-            "recheck_cycle_under_lock",
         ),
         (
             "FederationDirectory",
@@ -3457,11 +3480,6 @@ mod tests {
         ),
         (
             "plan_put_attestation",
-            "check_delegation_cycle_admission",
-            Reads::ReceivedAt,
-        ),
-        (
-            "plan_put_attestation",
             "check_trust_charter_admission",
             Reads::ReceivedAt,
         ),
@@ -3488,12 +3506,6 @@ mod tests {
         (
             "plan_put_attestation",
             "first_held_instant",
-            Reads::ReceivedAt,
-        ),
-        // The executor's re-ask under its lock: the same instant as the plan's.
-        (
-            "recheck_cycle_under_lock",
-            "check_delegation_cycle_admission",
             Reads::ReceivedAt,
         ),
         // The local door mints the row's instant from the receipt clock (or the
@@ -3615,7 +3627,7 @@ mod tests {
     ];
 
     /// The plan fns [`PLAN_INSTANTS`] covers: `(file, fn)`.
-    const INSTANT_PLANS: [(&str, &str); 16] = [
+    const INSTANT_PLANS: [(&str, &str); 15] = [
         // v60.0.0 (CIRISPersist#934 step 4) — the consent planners and the
         // reaper's selection: none reads the clock (the trust grant's
         // `trusted_at` is the door's one `received_at`).
@@ -3633,10 +3645,6 @@ mod tests {
         (
             "src/federation/attestation_admit.rs",
             "plan_put_attestation",
-        ),
-        (
-            "src/federation/attestation_admit.rs",
-            "recheck_cycle_under_lock",
         ),
         (
             "src/federation/attestation_admit.rs",

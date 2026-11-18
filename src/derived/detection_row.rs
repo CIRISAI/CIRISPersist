@@ -124,11 +124,14 @@ pub struct DetectionProjection {
     /// The bytes the detector signed; `None` once erased.
     #[serde(with = "opt_b64")]
     pub canonical_bytes: Option<Vec<u8>>,
-    /// Ed25519 signature over `canonical_bytes`.
-    #[serde(with = "crate::federation::serde_bytes_b64")]
+    /// Ed25519 signature over `canonical_bytes`. v62.0.0 (v62 P8): absent
+    /// from an edition-2 row's body, whose statement signature is the
+    /// detector's (its Ed25519 half fills this column on projection).
+    #[serde(with = "crate::federation::serde_bytes_b64", default)]
     pub ed25519_sig: Vec<u8>,
-    /// ML-DSA-65 signature over `canonical_bytes`.
-    #[serde(with = "crate::federation::serde_bytes_b64")]
+    /// ML-DSA-65 signature over `canonical_bytes`. v62.0.0 (v62 P8): as
+    /// `ed25519_sig`, the statement signature's ML-DSA-65 half.
+    #[serde(with = "crate::federation::serde_bytes_b64", default)]
     pub ml_dsa_65_sig: Vec<u8>,
     /// The detector's key (the row's attester).
     pub signing_key_id: String,
@@ -293,14 +296,28 @@ fn detection_body(row: &Attestation) -> Option<DetectionProjection> {
 /// replicates it. A `detection:*` row under any other id (a `supersedes`
 /// widening, a claim the detector emitted under a fresh id) is a claim on the
 /// plane but not the detection's row, and does not project.
+///
+/// v62.0.0 (v62 P8) — an edition-2 row (it carries its statement) is the
+/// detection's own row under its node-computed row id, and its two
+/// signature columns are its statement's composite signature halves
+/// ([`statement_signature_halves`]): the detector signed the row itself.
 #[must_use]
 pub fn project_detection_row(row: &Attestation) -> Option<DetectionProjection> {
     if row.attestation_type != crate::federation::types::attestation_type::SCORES {
         return None;
     }
-    let body = detection_body(row)?;
+    let mut body = detection_body(row)?;
+    let edition2 = statement_signature_halves(row);
+    let own_row = match &edition2 {
+        Some((ml_dsa, ed25519)) => {
+            body.ml_dsa_65_sig = ml_dsa.clone();
+            body.ed25519_sig = ed25519.clone();
+            true
+        }
+        None => row.attestation_id == detection_attestation_id(&body.detection_id),
+    };
     let dimension = row.attestation_envelope.get("dimension")?.as_str()?;
-    (row.attestation_id == detection_attestation_id(&body.detection_id)
+    (own_row
         && dimension == detection_dimension(&body.detector)
         && body.signing_key_id == row.attesting_key_id
         && detection_shape_refusal(&body).is_none())
@@ -330,11 +347,20 @@ pub fn check_detection_body(row: &Attestation) -> Result<(), crate::federation::
         "{dimension}: the `{BODY_MEMBER}` member is not a detection this node can project: {reason}"
     ))
     };
-    let body = detection_body(row).ok_or_else(|| refuse("it does not parse".into()))?;
+    let mut body = detection_body(row).ok_or_else(|| refuse("it does not parse".into()))?;
     // Only the detection's own row (its derived id) is projected; a body
     // under another id is a claim this node holds without projecting it.
-    if row.attestation_id != detection_attestation_id(&body.detection_id) {
-        return Ok(());
+    // v62.0.0 (v62 P8) — an edition-2 row is its own row under its computed
+    // id, its signatures the statement's.
+    match statement_signature_halves(row) {
+        Some((ml_dsa, ed25519)) => {
+            body.ml_dsa_65_sig = ml_dsa;
+            body.ed25519_sig = ed25519;
+        }
+        None if row.attestation_id != detection_attestation_id(&body.detection_id) => {
+            return Ok(());
+        }
+        None => {}
     }
     if dimension != detection_dimension(&body.detector) {
         return Err(refuse(format!(
@@ -355,6 +381,183 @@ pub fn check_detection_body(row: &Attestation) -> Result<(), crate::federation::
         return Err(refuse(reason));
     }
     Ok(())
+}
+
+/// v62.0.0 (v62 P8) — the halves of the composite signature an edition-2
+/// row's carried statement (`ceg_statement`) bears: `(ML-DSA-65 3309 bytes,
+/// Ed25519 64 bytes)`. `None` for an earlier-form row, or a statement that
+/// does not decode.
+#[must_use]
+pub fn statement_signature_halves(row: &Attestation) -> Option<(Vec<u8>, Vec<u8>)> {
+    use ciris_verify_core::cde::{self, Value};
+    let hexed = row
+        .attestation_envelope
+        .get(crate::federation::edition2::ingest::STATEMENT_MEMBER)?
+        .as_str()?;
+    let bytes = hex::decode(hexed).ok()?;
+    let Value::Tag(18, inner) = cde::decode(&bytes).ok()? else {
+        return None;
+    };
+    let sig = inner.as_array()?.get(3)?.as_bytes()?;
+    (sig.len() == ML_DSA_65_SIG_LEN + ED25519_SIG_LEN).then(|| {
+        (
+            sig[..ML_DSA_65_SIG_LEN].to_vec(),
+            sig[ML_DSA_65_SIG_LEN..].to_vec(),
+        )
+    })
+}
+
+/// v62.0.0 (v62 P8; CC 2.6.1.5) — **every real in `v` as a fixed-scale
+/// integer** `round(x × 10^6)`, at any depth; integers, text, booleans and
+/// null unchanged. An edition-2 payload carries no floats, and never a real
+/// as text. A real whose scaled value leaves `i64` saturates (a detection's
+/// scores are bounded far below it).
+#[must_use]
+pub fn fixed_scale_reals(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        J::Number(n) if n.is_f64() => {
+            let x = n.as_f64().unwrap_or(0.0);
+            #[allow(clippy::cast_possible_truncation)]
+            let scaled = (x * 1_000_000.0).round() as i64;
+            J::from(scaled)
+        }
+        J::Array(a) => J::Array(a.into_iter().map(fixed_scale_reals).collect()),
+        J::Object(o) => J::Object(
+            o.into_iter()
+                .map(|(k, v)| (k, fixed_scale_reals(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// v62.0.0 (v62 P8; CC 3.4.8) — **a detection's `detection:{detector}`
+/// statement parts**: `(sub, family, payload)`. `sub` is the detector
+/// (`signing_key_id`, an identity-ref); the payload is `{asserted_at: ts,
+/// dimension: detection:{detector}:v1, detection: <body>}` with `author`
+/// when the family is authored. The body is the [`DetectionProjection`]
+/// WITHOUT its two signature members (the statement's composite signature
+/// is the detector's), every real a FIXED-SCALE integer
+/// ([`fixed_scale_reals`], CC 2.6.1.5: `round(x × 10^6)`). The row id is node-computed; the
+/// earlier [`detection_attestation_id`] is not used.
+///
+/// # Errors
+/// `edition2_payload_invalid` for a detector with no registered family, an
+/// instant before the epoch, or a body that does not encode; the V008
+/// shape (`detection_shape_refusal`, the signatures aside).
+pub fn detection_statement_parts(
+    event: &DetectionEvent,
+) -> Result<(String, String, ciris_verify_core::cde::Value), crate::federation::Error> {
+    use ciris_verify_core::cde::Value;
+    let invalid = |m: String| {
+        crate::federation::Error::InvalidArgument(format!("edition2_payload_invalid: {m}"))
+    };
+    let mut shape = DetectionProjection::from(event);
+    // The statement signs the row; the earlier signature columns are not
+    // payload members, so the shape is asked of the rest.
+    shape.ed25519_sig = vec![0; ED25519_SIG_LEN];
+    shape.ml_dsa_65_sig = vec![0; ML_DSA_65_SIG_LEN];
+    if let Some(reason) = detection_shape_refusal(&shape) {
+        return Err(crate::federation::Error::InvalidArgument(reason));
+    }
+    let dimension = detection_dimension(&event.detector);
+    let family = crate::federation::edition2::emit::family_of_dimension(&dimension)
+        .ok_or_else(|| invalid(format!("{dimension} resolves to no registered family")))?;
+    let mut body = serde_json::to_value(DetectionProjection::from(event))
+        .map_err(|e| invalid(format!("the detection body: {e}")))?;
+    if let Some(o) = body.as_object_mut() {
+        o.remove("ed25519_sig");
+        o.remove("ml_dsa_65_sig");
+        o.remove("erased_at");
+    }
+    let body = fixed_scale_reals(body);
+    let at = u64::try_from(event.ts.timestamp_millis())
+        .map_err(|_| invalid("the detection's instant is before the epoch".into()))?;
+    let text = |s: &str| Value::Text(s.to_owned());
+    let mut m = vec![
+        (text("asserted_at"), Value::Uint(at)),
+        (text("dimension"), text(dimension.as_str())),
+        (
+            text(BODY_MEMBER),
+            crate::federation::edition2::group::cbor_of_json(&body)?,
+        ),
+    ];
+    if crate::federation::edition2::emit::family_is_authored(&family, Some(dimension.as_str())) {
+        m.push((text("author"), text(event.signing_key_id.as_str())));
+    }
+    m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+    Ok((event.signing_key_id.clone(), family, Value::Map(m)))
+}
+
+/// v62.0.0 (v62 P8) — **a detection drafted for its detector's pen** (an
+/// external detector, LensCore): the detector signs `sig_structure` and
+/// submits `Draft::assemble(signature)` through the statement door
+/// (`Engine::put_edition2_statement`).
+///
+/// # Errors
+/// As [`detection_statement_parts`]; a `signing_key_id` that is not an
+/// identity-ref.
+pub fn draft_detection(
+    event: &DetectionEvent,
+) -> Result<crate::federation::edition2::emit::Draft, crate::federation::Error> {
+    let (sub, family, payload) = detection_statement_parts(event)?;
+    let kid = crate::federation::edition2::ingest::kid_of_identity_ref(&sub).ok_or_else(|| {
+        crate::federation::Error::InvalidArgument(format!(
+            "detection: the detector {sub} is not an identity-ref"
+        ))
+    })?;
+    crate::federation::edition2::emit::draft_row(&kid, &sub, &sub, "scores", &family, &payload)
+        .map_err(|e| crate::federation::edition2::emit::produce_error("detection", e))
+}
+
+/// v62.0.0 (v62 P8; CC 3.4.8, CC 4.4.3.34) — **state a detection on the
+/// clean mesh**: [`detection_statement_parts`] signed by the detector's
+/// composite key (`edition2::produce::sign_row`) and admitted through the
+/// statement door (`put_statement`, federation tier). Its standing is the
+/// conferral plane's (`infra:detect` by a delegation from a root this node
+/// trusts, P4), never the key's type. A detection naming a trace a steward
+/// purge tombstoned is refused first. Returns the node-computed row id.
+///
+/// # Errors
+/// `InvalidArgument` for a signer that is not the event's detector;
+/// `composite_signing_unavailable`; the purge refusal; the door's and the
+/// gates' refusals (`ReservedPrefixEmitterMismatch` without the conferral).
+pub async fn state_detection<D>(
+    dir: &D,
+    signer: &crate::signing::LocalSigner,
+    event: &DetectionEvent,
+) -> Result<String, crate::federation::Error>
+where
+    D: crate::federation::FederationDirectory + ?Sized,
+{
+    let iss = signer.federation_id().await;
+    if iss != event.signing_key_id {
+        return Err(crate::federation::Error::InvalidArgument(format!(
+            "detection: the signer {iss} is not the detector {}",
+            event.signing_key_id
+        )));
+    }
+    crate::federation::steward_purge::refuse_if_tombstoned_trace(dir, &event.trace_id).await?;
+    let (sub, family, payload) = detection_statement_parts(event)?;
+    let statement =
+        crate::federation::edition2::produce::sign_row(signer, &sub, "scores", &family, &payload)
+            .await
+            .map_err(|e| crate::federation::edition2::emit::produce_error("detection", e))?;
+    let outcome = crate::federation::edition2::ingest::put_statement(
+        dir,
+        &statement,
+        None,
+        crate::federation::edition2::ingest::INGEST_TIER,
+    )
+    .await?;
+    use crate::federation::edition2::ingest::StatementOutcome as O;
+    Ok(match outcome {
+        O::Row { row_id, .. }
+        | O::Voice { row_id, .. }
+        | O::KeyPlane { row_id, .. }
+        | O::Pending { row_id, .. } => row_id.hex(),
+    })
 }
 
 /// v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — **the projection of a

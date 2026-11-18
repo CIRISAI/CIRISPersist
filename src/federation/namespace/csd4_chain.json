@@ -2,11 +2,11 @@
  "_meta": {
   "source": "tools/build_csd4_chain.py",
   "pins": {
-   "state_table_sha256": "b4f9dc9c9b02b1e42f3565f294c5bdcc184fe23fa789d4f48f5c5f9eb019cb2b",
-   "invariants_sha256": "b49b57478d67c1b692e1b6c6821c251ad0cdc2b62331b4d14f3a94edced33695",
-   "vocabulary_sha256": "c37f6f9651579932835ff700a2ec376a0c5c928545c3ed476362ec4bd4ac0769",
+   "state_table_sha256": "7ae4a6e2be0562e20d292da802478b3a04dcc62b477ddc33477f7625ae50abe4",
+   "invariants_sha256": "36226602dc89d20b030d99ada25a07a5d8fb912cf39aa1aa5e26bd906fac601c",
+   "vocabulary_sha256": "bfe9d48524a103eb0d91a30fd8335fe499831957c0306808d2b5a484b54c3a7a",
    "vocabulary_catalogue_version": 6,
-   "claims_sha256": "17a32001a878241fd46ea50a85a889b1f434a93322b090be1fa5f726af5caa5b",
+   "claims_sha256": "d7b77d478aab2ad4fae9a650b0addef2259fe2756c7c555a2d15abb3ee93b5a2",
    "catalogue": {
     "repo": "CIRISServer",
     "branch": "main",
@@ -21,25 +21,25 @@
     "coherence-ratchet": "0c4edfb",
     "RATCHET": "c89356bd",
     "CIRISAgent": "f0a07995",
-    "CIRISVerify": "7146fa4",
-    "CIRISPersist": "712575df",
-    "CIRISEdge": "e3d597c"
+    "CIRISVerify": "6a09755",
+    "CIRISPersist": "f74d1b2a",
+    "CIRISEdge": "3a6011b9"
    }
   },
   "counts": {
    "atoms": 156,
    "states": 242,
-   "invariants": 216,
-   "claims": 594,
+   "invariants": 232,
+   "claims": 606,
    "entries": 20,
-   "refusal_tokens": 103
+   "refusal_tokens": 107
   },
   "not_here": {
    "trace_step_refusals": "the per-step refused map of each T0–T19 trace is CIRISServer's harness output (packaging/csd4/traces.json vendored in CIRISClient); CC indexes the tokens it names by section under refusal_tokens",
    "card_relations": "the CSD cards' 'stops at rel[k]:…' relation list and its owner-by-repo map are CEWPOS / CIRISClient packaging/csd4 data, not CC's",
    "tag": "these files ride the v1.0-rc9 tag; a repo that vendors tagged CC only vendors them at the tag, or pins the rc9 commit as a test fixture as persist does for governance_policy.json"
   },
-  "chain_sha256": "3b0194fbcc04633c3cd53f4a162527fe29b447d9d0265311fc973f7b8c8279f8"
+  "chain_sha256": "5a1313ea8d67696352799342f17b1b35181cf2e2f2720e4996ce3f81c1285cce"
  },
  "chain": [
   {
@@ -290,6 +290,78 @@
      "kind": "safety",
      "claim_id": "CLM-standing-verdict",
      "verdict": "closes"
+    },
+    {
+     "inv_id": "AB.count",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_ChangeCounted",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; nocount twin fails"
+    },
+    {
+     "inv_id": "AB.ownseat",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_RecoveryOwnSeat",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; otherseat twin fails"
+    },
+    {
+     "inv_id": "AB.spent",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentNeverReturns",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentreturns twin fails"
+    },
+    {
+     "inv_id": "AB.reckey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_RecKeyNeverSeat",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; reckeyseat twin fails"
+    },
+    {
+     "inv_id": "AB.signkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SignKeyCannotRecover",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; anykey twin fails"
+    },
+    {
+     "inv_id": "AB.spentkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentKeyGainsNothing",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentkey twin fails"
+    },
+    {
+     "inv_id": "AB.rotate",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_RotationConsented",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; rotatenovoice twin fails"
+    },
+    {
+     "inv_id": "AB.retired",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_NoRetiredSeat",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; seatretired twin fails"
     }
    ],
    "claims": [
@@ -336,6 +408,18 @@
         "Inv_T7",
         "Inv_RecoverEnabled"
        ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-accord-livequorum",
+     "cc_ref": "4.2.6",
+     "status": "staged",
+     "join": "by_invariant",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISVerify#302"
       }
      ]
     },
@@ -1052,6 +1136,31 @@
        "symbols": [
         "resolve_community"
        ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
       }
      ]
     }
@@ -1123,6 +1232,78 @@
      "kind": "safety",
      "claim_id": "CLM-standing-verdict",
      "verdict": "closes"
+    },
+    {
+     "inv_id": "AB.count",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_ChangeCounted",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; nocount twin fails"
+    },
+    {
+     "inv_id": "AB.ownseat",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_RecoveryOwnSeat",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; otherseat twin fails"
+    },
+    {
+     "inv_id": "AB.spent",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentNeverReturns",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentreturns twin fails"
+    },
+    {
+     "inv_id": "AB.reckey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_RecKeyNeverSeat",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; reckeyseat twin fails"
+    },
+    {
+     "inv_id": "AB.signkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SignKeyCannotRecover",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; anykey twin fails"
+    },
+    {
+     "inv_id": "AB.spentkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentKeyGainsNothing",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentkey twin fails"
+    },
+    {
+     "inv_id": "AB.rotate",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_RotationConsented",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; rotatenovoice twin fails"
+    },
+    {
+     "inv_id": "AB.retired",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_NoRetiredSeat",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; seatretired twin fails"
     }
    ],
    "claims": [
@@ -1169,6 +1350,18 @@
         "Inv_T7",
         "Inv_RecoverEnabled"
        ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-accord-livequorum",
+     "cc_ref": "4.2.6",
+     "status": "staged",
+     "join": "by_invariant",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISVerify#302"
       }
      ]
     },
@@ -1887,6 +2080,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -1948,6 +2166,42 @@
      "kind": "safety",
      "claim_id": "CLM-halt-one-row",
      "verdict": "closes (row mode)"
+    },
+    {
+     "inv_id": "AR.held",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_LatchedHeldEdge",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.bound",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_EdgeAtReceiptIsBound",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.free",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_CutBeforeIsFree",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.exit",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Prop_CutReleasesNothing",
+     "kind": "safety-temporal",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
     },
     {
      "inv_id": "RR.subs",
@@ -2384,6 +2638,34 @@
        "path": "tests/ciris_engine/logic/accord/test_accord_halt_ingress.py",
        "symbols": [
         "test_nothing_on_the_accord_path_can_end_the_process"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-accord-reach",
+     "cc_ref": "4.2.1",
+     "status": "staged",
+     "join": "by_invariant",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#803"
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "replicate_and_maybe_halt"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "ingest_message"
        ]
       }
      ]
@@ -3265,6 +3547,31 @@
        "symbols": [
         "resolve_community"
        ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
       }
      ]
     }
@@ -4063,6 +4370,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -4270,6 +4602,51 @@
      "verdict": "closes"
     },
     {
+     "inv_id": "AR.held",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_LatchedHeldEdge",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.bound",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_EdgeAtReceiptIsBound",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.free",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_CutBeforeIsFree",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.exit",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Prop_CutReleasesNothing",
+     "kind": "safety-temporal",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.instant",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Prop_InstantFixed",
+     "kind": "safety-temporal",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
      "inv_id": "RR.subs",
      "model": "mesh_net",
      "source": "formal/mesh_net/RootReach.tla",
@@ -4304,6 +4681,15 @@
      "kind": "safety-temporal",
      "claim_id": "CLM-halt-one-row",
      "verdict": "closes"
+    },
+    {
+     "inv_id": "AW.holder",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltRow.tla",
+     "symbol": "Inv_HaltFromHolder",
+     "kind": "safety",
+     "claim_id": "CLM-halt-one-row",
+     "verdict": "closes; stranger twin fails"
     },
     {
      "inv_id": "AH.nowin",
@@ -4420,6 +4806,24 @@
      "symbol": "Act_HaltLeavesTheMembersTheirVote",
      "kind": "safety-temporal",
      "claim_id": "CLM-mesh-life (proposed)",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AW.names",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltRow.tla",
+     "symbol": "Inv_LifecycleNamesHalt",
+     "kind": "safety",
+     "claim_id": "CLM-halt-one-row",
+     "verdict": "closes; anytarget twin fails"
+    },
+    {
+     "inv_id": "AW.fuse",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltRow.tla",
+     "symbol": "Inv_LoneBounded",
+     "kind": "safety",
+     "claim_id": "CLM-halt-one-row",
      "verdict": "closes"
     }
    ],
@@ -4756,6 +5160,34 @@
      ]
     },
     {
+     "claim_id": "CLM-accord-reach",
+     "cc_ref": "4.2.1",
+     "status": "staged",
+     "join": "by_invariant",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#803"
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "replicate_and_maybe_halt"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "ingest_message"
+       ]
+      }
+     ]
+    },
+    {
      "claim_id": "CLM-halt-authority",
      "cc_ref": "4.2",
      "status": "established",
@@ -4792,46 +5224,6 @@
        "symbols": [
         "Invocation::canonical_bytes"
        ]
-      }
-     ]
-    },
-    {
-     "claim_id": "CLM-accord-invoke-lowercase",
-     "cc_ref": "4.2.1.1",
-     "status": "staged",
-     "join": "by_section",
-     "evidence": [
-      {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/trust_root.rs",
-       "symbols": [
-        "ACCORD_HEARTBEAT_DIMENSION"
-       ]
-      },
-      {
-       "kind": "staged",
-       "ticket": "CIRISVerify#297"
-      }
-     ]
-    },
-    {
-     "claim_id": "CLM-accord-invoke-cutover",
-     "cc_ref": "4.2.1.1",
-     "status": "staged",
-     "join": "by_section",
-     "evidence": [
-      {
-       "kind": "staged",
-       "ticket": "CIRISVerify#297"
-      },
-      {
-       "kind": "staged",
-       "ticket": "CIRISServer#691"
-      },
-      {
-       "kind": "staged",
-       "ticket": "CIRISAgent#1227"
       }
      ]
     },
@@ -5048,6 +5440,33 @@
      "symbol": "Act_HaltLeavesTheMembersTheirVote",
      "kind": "safety-temporal",
      "claim_id": "CLM-mesh-life (proposed)",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AW.holder",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltRow.tla",
+     "symbol": "Inv_HaltFromHolder",
+     "kind": "safety",
+     "claim_id": "CLM-halt-one-row",
+     "verdict": "closes; stranger twin fails"
+    },
+    {
+     "inv_id": "AW.names",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltRow.tla",
+     "symbol": "Inv_LifecycleNamesHalt",
+     "kind": "safety",
+     "claim_id": "CLM-halt-one-row",
+     "verdict": "closes; anytarget twin fails"
+    },
+    {
+     "inv_id": "AW.fuse",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltRow.tla",
+     "symbol": "Inv_LoneBounded",
+     "kind": "safety",
+     "claim_id": "CLM-halt-one-row",
      "verdict": "closes"
     }
    ],
@@ -5363,6 +5782,51 @@
      "verdict": "closes"
     },
     {
+     "inv_id": "AR.held",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_LatchedHeldEdge",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.bound",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_EdgeAtReceiptIsBound",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.free",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_CutBeforeIsFree",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.exit",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Prop_CutReleasesNothing",
+     "kind": "safety-temporal",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.instant",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Prop_InstantFixed",
+     "kind": "safety-temporal",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
      "inv_id": "RR.subs",
      "model": "mesh_net",
      "source": "formal/mesh_net/RootReach.tla",
@@ -5397,6 +5861,15 @@
      "kind": "safety-temporal",
      "claim_id": "CLM-halt-one-row",
      "verdict": "closes"
+    },
+    {
+     "inv_id": "AW.holder",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltRow.tla",
+     "symbol": "Inv_HaltFromHolder",
+     "kind": "safety",
+     "claim_id": "CLM-halt-one-row",
+     "verdict": "closes; stranger twin fails"
     },
     {
      "inv_id": "AH.nowin",
@@ -5522,6 +5995,24 @@
      "symbol": "Act_HaltLeavesTheMembersTheirVote",
      "kind": "safety-temporal",
      "claim_id": "CLM-mesh-life (proposed)",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AW.names",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltRow.tla",
+     "symbol": "Inv_LifecycleNamesHalt",
+     "kind": "safety",
+     "claim_id": "CLM-halt-one-row",
+     "verdict": "closes; anytarget twin fails"
+    },
+    {
+     "inv_id": "AW.fuse",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltRow.tla",
+     "symbol": "Inv_LoneBounded",
+     "kind": "safety",
+     "claim_id": "CLM-halt-one-row",
      "verdict": "closes"
     }
    ],
@@ -5735,6 +6226,34 @@
      ]
     },
     {
+     "claim_id": "CLM-accord-reach",
+     "cc_ref": "4.2.1",
+     "status": "staged",
+     "join": "by_invariant",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#803"
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "replicate_and_maybe_halt"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "ingest_message"
+       ]
+      }
+     ]
+    },
+    {
      "claim_id": "CLM-maker-asymmetry-declared",
      "cc_ref": "4.5.1",
      "status": "normative",
@@ -5782,46 +6301,6 @@
        "symbols": [
         "Invocation::canonical_bytes"
        ]
-      }
-     ]
-    },
-    {
-     "claim_id": "CLM-accord-invoke-lowercase",
-     "cc_ref": "4.2.1.1",
-     "status": "staged",
-     "join": "by_section",
-     "evidence": [
-      {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/trust_root.rs",
-       "symbols": [
-        "ACCORD_HEARTBEAT_DIMENSION"
-       ]
-      },
-      {
-       "kind": "staged",
-       "ticket": "CIRISVerify#297"
-      }
-     ]
-    },
-    {
-     "claim_id": "CLM-accord-invoke-cutover",
-     "cc_ref": "4.2.1.1",
-     "status": "staged",
-     "join": "by_section",
-     "evidence": [
-      {
-       "kind": "staged",
-       "ticket": "CIRISVerify#297"
-      },
-      {
-       "kind": "staged",
-       "ticket": "CIRISServer#691"
-      },
-      {
-       "kind": "staged",
-       "ticket": "CIRISAgent#1227"
       }
      ]
     },
@@ -5980,7 +6459,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -6164,7 +6643,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -6332,7 +6811,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -6602,7 +7081,7 @@
      "evidence": [
       {
        "kind": "staged",
-       "ticket": "CIRISEdge#940"
+       "ticket": "CIRISEdge#981"
       }
      ]
     },
@@ -6809,7 +7288,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -7079,7 +7558,7 @@
      "evidence": [
       {
        "kind": "staged",
-       "ticket": "CIRISEdge#940"
+       "ticket": "CIRISEdge#981"
       }
      ]
     },
@@ -7966,6 +8445,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -7975,14 +8479,14 @@
   "person.multi_device": {
    "plane": "self",
    "state_predicate": "self.roster_size∈{two,three_or_more}",
-   "cc_ref": "3.3.6.3",
+   "cc_ref": "3.3.6.4",
    "added_in": 1,
    "states": [
     {
      "variable": "key.membership",
      "state": "member",
      "plane": "self",
-     "cc_ref": "3.3.6 3.3.6.3",
+     "cc_ref": "3.3.6 3.3.6.4",
      "enters_by": "quorum path at once or lone path after W_self",
      "signer": "roster majority / silence",
      "model_ref": "self_roster.SelfRoster.tla:member",
@@ -7992,7 +8496,7 @@
      "variable": "self.roster_size",
      "state": "two",
      "plane": "self",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "enters_by": "lone path; theft is a stalemate",
      "signer": "—",
      "model_ref": "self_roster.SelfRoster_combined2_*.cfg",
@@ -8130,7 +8634,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -8291,7 +8795,7 @@
     },
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -8303,7 +8807,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -8335,7 +8839,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -8359,7 +8863,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -8511,6 +9015,42 @@
      "kind": "safety",
      "claim_id": "CLM-halt-one-row",
      "verdict": "closes (row mode)"
+    },
+    {
+     "inv_id": "AR.held",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_LatchedHeldEdge",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.bound",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_EdgeAtReceiptIsBound",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.free",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_CutBeforeIsFree",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.exit",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Prop_CutReleasesNothing",
+     "kind": "safety-temporal",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
     },
     {
      "inv_id": "RR.subs",
@@ -8947,6 +9487,34 @@
        "path": "tests/ciris_engine/logic/accord/test_accord_halt_ingress.py",
        "symbols": [
         "test_nothing_on_the_accord_path_can_end_the_process"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-accord-reach",
+     "cc_ref": "4.2.1",
+     "status": "staged",
+     "join": "by_invariant",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#803"
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "replicate_and_maybe_halt"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "ingest_message"
        ]
       }
      ]
@@ -9830,6 +10398,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -9839,7 +10432,7 @@
   "device.join_requested": {
    "plane": "self",
    "state_predicate": "device.join=requested",
-   "cc_ref": "3.3.6.3",
+   "cc_ref": "3.3.6.4",
    "added_in": 1,
    "states": [
     {
@@ -9856,7 +10449,7 @@
      "variable": "key.membership",
      "state": "proposed_add",
      "plane": "self",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "enters_by": "proposal by a live roster key (held: from two keys the add-device approval is a proposal until another key assents or W_self passes)",
      "signer": "roster key",
      "model_ref": "self_roster.SelfRoster.tla:pending(add)",
@@ -9866,7 +10459,7 @@
      "variable": "device.join",
      "state": "requested",
      "plane": "self",
-     "cc_ref": "3.3.6.3 (FSD/ADD_DEVICE)",
+     "cc_ref": "3.3.6.4 (FSD/ADD_DEVICE)",
      "enters_by": "join request on the first-contact plane",
      "signer": "new device",
      "model_ref": "CIRISServer formal/add_device",
@@ -10013,7 +10606,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -10114,7 +10707,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -10202,7 +10795,7 @@
     },
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -10214,7 +10807,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -10246,7 +10839,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -10276,14 +10869,14 @@
   "device.join_approved": {
    "plane": "self",
    "state_predicate": "device.join=approved",
-   "cc_ref": "3.3.6.3",
+   "cc_ref": "3.3.6.4",
    "added_in": 1,
    "states": [
     {
      "variable": "device.join",
      "state": "approved",
      "plane": "self",
-     "cc_ref": "3.3.6.3 (FSD/ADD_DEVICE)",
+     "cc_ref": "3.3.6.4 (FSD/ADD_DEVICE)",
      "enters_by": "owner's two rows in one approval",
      "signer": "owner (a live roster key)",
      "model_ref": "CIRISServer formal/add_device",
@@ -10294,7 +10887,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -10306,7 +10899,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -10338,7 +10931,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -10362,7 +10955,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -10374,7 +10967,7 @@
     },
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -10405,7 +10998,7 @@
      "variable": "node.occurrence",
      "state": "owned",
      "plane": "node",
-     "cc_ref": "3.3.6 3.3.6.3",
+     "cc_ref": "3.3.6 3.3.6.4",
      "enters_by": "owner approves; occurrence admitted",
      "signer": "owner (a live roster key)",
      "model_ref": "self_roster.SelfRoster.tla:member",
@@ -10415,7 +11008,7 @@
      "variable": "key.membership",
      "state": "member",
      "plane": "self",
-     "cc_ref": "3.3.6 3.3.6.3",
+     "cc_ref": "3.3.6 3.3.6.4",
      "enters_by": "quorum path at once or lone path after W_self",
      "signer": "roster majority / silence",
      "model_ref": "self_roster.SelfRoster.tla:member",
@@ -10572,7 +11165,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -10673,7 +11266,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -10973,7 +11566,7 @@
      "evidence": [
       {
        "kind": "staged",
-       "ticket": "CIRISEdge#940"
+       "ticket": "CIRISEdge#981"
       }
      ]
     },
@@ -11157,6 +11750,42 @@
      "kind": "safety",
      "claim_id": "CLM-halt-one-row",
      "verdict": "closes (row mode)"
+    },
+    {
+     "inv_id": "AR.held",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_LatchedHeldEdge",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.bound",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_EdgeAtReceiptIsBound",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.free",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Inv_CutBeforeIsFree",
+     "kind": "safety",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
+    },
+    {
+     "inv_id": "AR.exit",
+     "model": "accord_halt",
+     "source": "formal/accord_halt/AccordHaltReach.tla",
+     "symbol": "Prop_CutReleasesNothing",
+     "kind": "safety-temporal",
+     "claim_id": "CLM-accord-reach",
+     "verdict": "closes"
     },
     {
      "inv_id": "RR.subs",
@@ -11593,6 +12222,34 @@
        "path": "tests/ciris_engine/logic/accord/test_accord_halt_ingress.py",
        "symbols": [
         "test_nothing_on_the_accord_path_can_end_the_process"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-accord-reach",
+     "cc_ref": "4.2.1",
+     "status": "staged",
+     "join": "by_invariant",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#803"
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "replicate_and_maybe_halt"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISServer",
+       "path": "src/accord.rs",
+       "symbols": [
+        "ingest_message"
        ]
       }
      ]
@@ -12474,6 +13131,31 @@
        "symbols": [
         "resolve_community"
        ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
       }
      ]
     }
@@ -12852,7 +13534,7 @@
      "evidence": [
       {
        "kind": "staged",
-       "ticket": "CIRISEdge#940"
+       "ticket": "CIRISEdge#981"
       }
      ]
     },
@@ -13888,7 +14570,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -13955,6 +14637,19 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-private-room",
+     "cc_ref": "3.1.3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#standing_reads_rows,member_decides_membership,member_decides_who_said,member_decides_count,rows_hide_who_said,rows_hide_membership,person_count_needs_bindings,outsider_hides_membership,outsider_hides_existence,rows_see_a_joining",
+       "object": ""
       }
      ]
     },
@@ -14027,18 +14722,6 @@
        "symbols": [
         "trust_root_cosigners_over"
        ]
-      }
-     ]
-    },
-    {
-     "claim_id": "CLM-purge-digest-preimage",
-     "cc_ref": "3.3.2",
-     "status": "staged",
-     "join": "by_section",
-     "evidence": [
-      {
-       "kind": "staged",
-       "ticket": "CIRISPersist#803"
       }
      ]
     }
@@ -14335,14 +15018,14 @@
   "file.large": {
    "plane": "content",
    "state_predicate": "blob.delivery=chunked",
-   "cc_ref": "2.6.1.3 5.3.3",
+   "cc_ref": "8.11.5 5.3.3",
    "added_in": 1,
    "states": [
     {
      "variable": "blob.delivery",
      "state": "chunked",
      "plane": "content",
-     "cc_ref": "2.6.1.3 5.3.3 5.3.3.6",
+     "cc_ref": "8.11.5 5.3.3 5.3.3.11",
      "enters_by": "above the cap: chunk plane, chunk-DAG, per-device delivery receipts",
      "signer": "producer",
      "model_ref": "mesh_life.MeshLife.tla:Write",
@@ -14353,7 +15036,7 @@
    "claims": [
     {
      "claim_id": "CLM-canonical",
-     "cc_ref": "2.6.1.3",
+     "cc_ref": "8.11.5",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -14369,7 +15052,7 @@
     },
     {
      "claim_id": "CLM-envelope-size",
-     "cc_ref": "2.6.1.3",
+     "cc_ref": "8.11.5",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -14399,14 +15082,14 @@
   "file.custody_received": {
    "plane": "content",
    "state_predicate": "blob.custody=custody_received",
-   "cc_ref": "3.1.3.3 5.3.3.6",
+   "cc_ref": "3.1.3.3 5.3.3.11",
    "added_in": 1,
    "states": [
     {
      "variable": "blob.custody",
      "state": "custody_received",
      "plane": "content",
-     "cc_ref": "3.1.3.3 5.3.3.6",
+     "cc_ref": "3.1.3.3 5.3.3.11",
      "enters_by": "delivery receipt on the author's custody",
      "signer": "holder / author / quorum",
      "model_ref": "mesh_net.MeshNet.tla:claimed",
@@ -15193,14 +15876,14 @@
   "roster.visible": {
    "plane": "self",
    "state_predicate": "contact lists announced devices: key.membership=member ∧ node.announce=announced",
-   "cc_ref": "3.3.6.3 5.4.6",
+   "cc_ref": "3.3.6.4 5.4.6",
    "added_in": 1,
    "states": [
     {
      "variable": "key.membership",
      "state": "member",
      "plane": "self",
-     "cc_ref": "3.3.6 3.3.6.3",
+     "cc_ref": "3.3.6 3.3.6.4",
      "enters_by": "quorum path at once or lone path after W_self",
      "signer": "roster majority / silence",
      "model_ref": "self_roster.SelfRoster.tla:member",
@@ -15338,7 +16021,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -15860,7 +16543,7 @@
     },
     {
      "claim_id": "CLM-affiliation-dissolution",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -16609,6 +17292,31 @@
      ]
     },
     {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
+    },
+    {
      "claim_id": "CLM-family-subject",
      "cc_ref": "3.3.4",
      "status": "established",
@@ -16627,12 +17335,96 @@
     {
      "claim_id": "CLM-cosign-collection-held",
      "cc_ref": "3.3.4",
-     "status": "staged",
+     "status": "established",
      "join": "by_section",
      "evidence": [
       {
-       "kind": "staged",
-       "ticket": "CIRISPersist#1252"
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/mod.rs",
+       "symbols": [
+        "roster_event_verdict"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/cosign.rs",
+       "symbols": [
+        "hold"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/cosign.rs",
+       "symbols": [
+        "quorum_key_of"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/cosign.rs",
+       "symbols": [
+        "signature_row"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/cosign.rs",
+       "symbols": [
+        "admit_row"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/cosign.rs",
+       "symbols": [
+        "execute_for"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/cosign.rs",
+       "symbols": [
+        "may_receive"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/cosign.rs",
+       "symbols": [
+        "check_withdraws_target"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/cosign.rs",
+       "symbols": [
+        "resolve_withdraws_target"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/wire_index.rs",
+       "symbols": [
+        "attestation_wire_hash"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/group_plane.rs",
+       "symbols": [
+        "apply_group_plane_row"
+       ]
       }
      ]
     },
@@ -17067,7 +17859,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -17134,6 +17926,19 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-private-room",
+     "cc_ref": "3.1.3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#standing_reads_rows,member_decides_membership,member_decides_who_said,member_decides_count,rows_hide_who_said,rows_hide_membership,person_count_needs_bindings,outsider_hides_membership,outsider_hides_existence,rows_see_a_joining",
+       "object": ""
       }
      ]
     }
@@ -17662,7 +18467,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -17729,6 +18534,19 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-private-room",
+     "cc_ref": "3.1.3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#standing_reads_rows,member_decides_membership,member_decides_who_said,member_decides_count,rows_hide_who_said,rows_hide_membership,person_count_needs_bindings,outsider_hides_membership,outsider_hides_existence,rows_see_a_joining",
+       "object": ""
       }
      ]
     }
@@ -17962,9 +18780,13 @@
     {
      "claim_id": "CLM-promotion-cohort-standing",
      "cc_ref": "4.5.4",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1259"
+      },
       {
        "kind": "impl",
        "repo": "CIRISPersist",
@@ -18040,7 +18862,7 @@
     },
     {
      "claim_id": "CLM-affiliation-dissolution",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -18789,6 +19611,31 @@
      ]
     },
     {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
+    },
+    {
      "claim_id": "CLM-registry-named",
      "cc_ref": "4.5.4",
      "status": "established",
@@ -19279,7 +20126,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -19346,6 +20193,19 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-private-room",
+     "cc_ref": "3.1.3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#standing_reads_rows,member_decides_membership,member_decides_who_said,member_decides_count,rows_hide_who_said,rows_hide_membership,person_count_needs_bindings,outsider_hides_membership,outsider_hides_existence,rows_see_a_joining",
+       "object": ""
       }
      ]
     }
@@ -19423,9 +20283,13 @@
     {
      "claim_id": "CLM-promotion-cohort-standing",
      "cc_ref": "4.5.4",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1259"
+      },
       {
        "kind": "impl",
        "repo": "CIRISPersist",
@@ -20318,6 +21182,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -21130,6 +22019,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -21139,14 +22053,14 @@
   "authority.licensing": {
    "plane": "authority",
    "state_predicate": "licence.state=held under an affiliated authority",
-   "cc_ref": "2.4.1.2.1 4.4.3.2.8",
+   "cc_ref": "2.4.1.3 4.4.3.12",
    "added_in": 1,
    "states": [
     {
      "variable": "licence.state",
      "state": "held",
      "plane": "authority",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "enters_by": "licensure:{authority_id} row",
      "signer": "the authority",
      "model_ref": "authority_tree.authority_tree.py:licensees",
@@ -21224,7 +22138,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -21248,7 +22162,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -21304,7 +22218,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -21320,8 +22234,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -21354,7 +22268,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -21375,26 +22289,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -21410,7 +22329,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -21442,7 +22361,7 @@
     },
     {
      "claim_id": "CLM-authority-triad",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -21482,7 +22401,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-object",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -21522,7 +22441,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-quorum",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -21550,8 +22469,8 @@
     },
     {
      "claim_id": "CLM-licence-judged-at-issuance",
-     "cc_ref": "2.4.1.2.1",
-     "status": "established",
+     "cc_ref": "2.4.1.3",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -21566,7 +22485,7 @@
     },
     {
      "claim_id": "CLM-licence-audience",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -21592,14 +22511,14 @@
   "delegation.chain": {
    "plane": "authority",
    "state_predicate": "∃ chain: delegation.link=live, length ≥ 2",
-   "cc_ref": "4.4.3.4.3",
+   "cc_ref": "4.4.3.19",
    "added_in": 1,
    "states": [
     {
      "variable": "delegation.link",
      "state": "live",
      "plane": "authority",
-     "cc_ref": "2.4.1.2 4.4.3.2.8",
+     "cc_ref": "2.4.1.2 4.4.3.12",
      "enters_by": "delegates_to admitted at the door (term within ceiling)",
      "signer": "principal",
      "model_ref": "authority_tree.authority_tree.py:links",
@@ -21677,7 +22596,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -21701,7 +22620,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -21757,7 +22676,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -21773,8 +22692,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -21807,7 +22726,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -21828,26 +22747,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -21863,7 +22787,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -21895,7 +22819,7 @@
     },
     {
      "claim_id": "CLM-cohort",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.4.3.19",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -21911,7 +22835,7 @@
     },
     {
      "claim_id": "CLM-consent-stream-is-data-choice",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.4.3.19",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -21927,7 +22851,7 @@
     },
     {
      "claim_id": "CLM-scope-infra-relay",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.4.3.19",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -23130,6 +24054,18 @@
        "kind": "normative-only"
       }
      ]
+    },
+    {
+     "claim_id": "CLM-wa-seat-conferred",
+     "cc_ref": "4.3",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISServer#814"
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -23238,7 +24174,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -23508,7 +24444,7 @@
      "evidence": [
       {
        "kind": "staged",
-       "ticket": "CIRISEdge#940"
+       "ticket": "CIRISEdge#981"
       }
      ]
     },
@@ -24431,6 +25367,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -25201,6 +26162,31 @@
        "symbols": [
         "resolve_community"
        ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
       }
      ]
     }
@@ -25975,6 +26961,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -26035,7 +27046,7 @@
     {
      "claim_id": "CLM-identity-set",
      "cc_ref": "3.4.7.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -26107,7 +27118,7 @@
     {
      "claim_id": "CLM-identity-set",
      "cc_ref": "3.4.7.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -26169,6 +27180,78 @@
      "kind": "safety",
      "claim_id": "CLM-standing-verdict",
      "verdict": "closes"
+    },
+    {
+     "inv_id": "AB.count",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_ChangeCounted",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; nocount twin fails"
+    },
+    {
+     "inv_id": "AB.ownseat",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_RecoveryOwnSeat",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; otherseat twin fails"
+    },
+    {
+     "inv_id": "AB.spent",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentNeverReturns",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentreturns twin fails"
+    },
+    {
+     "inv_id": "AB.reckey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_RecKeyNeverSeat",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; reckeyseat twin fails"
+    },
+    {
+     "inv_id": "AB.signkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SignKeyCannotRecover",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; anykey twin fails"
+    },
+    {
+     "inv_id": "AB.spentkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentKeyGainsNothing",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentkey twin fails"
+    },
+    {
+     "inv_id": "AB.rotate",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_RotationConsented",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; rotatenovoice twin fails"
+    },
+    {
+     "inv_id": "AB.retired",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_NoRetiredSeat",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; seatretired twin fails"
     }
    ],
    "claims": [
@@ -26191,6 +27274,18 @@
         "Inv_T7",
         "Inv_RecoverEnabled"
        ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-accord-livequorum",
+     "cc_ref": "4.2.6",
+     "status": "staged",
+     "join": "by_invariant",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISVerify#302"
       }
      ]
     },
@@ -26909,6 +28004,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": [
@@ -27157,6 +28277,33 @@
      "kind": "theorem (any N)",
      "claim_id": "CLM-accord-livequorum",
      "verdict": "proved"
+    },
+    {
+     "inv_id": "AB.count",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_ChangeCounted",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; nocount twin fails"
+    },
+    {
+     "inv_id": "AB.signkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SignKeyCannotRecover",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; anykey twin fails"
+    },
+    {
+     "inv_id": "AB.spentkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentKeyGainsNothing",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentkey twin fails"
     }
    ],
    "claims": [
@@ -27643,6 +28790,33 @@
      "kind": "theorem (any N)",
      "claim_id": "CLM-accord-livequorum",
      "verdict": "proved"
+    },
+    {
+     "inv_id": "AB.count",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_ChangeCounted",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; nocount twin fails"
+    },
+    {
+     "inv_id": "AB.signkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SignKeyCannotRecover",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; anykey twin fails"
+    },
+    {
+     "inv_id": "AB.spentkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentKeyGainsNothing",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentkey twin fails"
     }
    ],
    "claims": [
@@ -28129,6 +29303,33 @@
      "kind": "theorem (any N)",
      "claim_id": "CLM-accord-livequorum",
      "verdict": "proved"
+    },
+    {
+     "inv_id": "AB.count",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_ChangeCounted",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; nocount twin fails"
+    },
+    {
+     "inv_id": "AB.signkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SignKeyCannotRecover",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; anykey twin fails"
+    },
+    {
+     "inv_id": "AB.spentkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentKeyGainsNothing",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentkey twin fails"
     }
    ],
    "claims": [
@@ -28615,6 +29816,33 @@
      "kind": "theorem (any N)",
      "claim_id": "CLM-accord-livequorum",
      "verdict": "proved"
+    },
+    {
+     "inv_id": "AB.count",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_ChangeCounted",
+     "kind": "safety-action",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; nocount twin fails"
+    },
+    {
+     "inv_id": "AB.signkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SignKeyCannotRecover",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; anykey twin fails"
+    },
+    {
+     "inv_id": "AB.spentkey",
+     "model": "accord_roster",
+     "source": "formal/accord_roster/AccordBundle.tla",
+     "symbol": "Inv_SpentKeyGainsNothing",
+     "kind": "safety",
+     "claim_id": "CLM-accord-livequorum",
+     "verdict": "closes; spentkey twin fails"
     }
    ],
    "claims": [
@@ -28862,14 +30090,14 @@
   "key.holder.owner": {
    "plane": "self",
    "state_predicate": "key.holder=owner",
-   "cc_ref": "3.3.6.3",
+   "cc_ref": "3.3.6.4",
    "added_in": 2,
    "states": [
     {
      "variable": "key.holder",
      "state": "owner",
      "plane": "self",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "enters_by": "—",
      "signer": "—",
      "model_ref": "self_roster.SelfRoster.tla:holder=owner",
@@ -28917,7 +30145,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -28935,7 +30163,7 @@
     },
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -28947,7 +30175,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -28979,7 +30207,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -29003,7 +30231,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -29021,14 +30249,14 @@
   "key.holder.thief": {
    "plane": "self",
    "state_predicate": "key.holder=thief",
-   "cc_ref": "3.3.6.3 1.13.3",
+   "cc_ref": "3.3.6.4 1.13.3",
    "added_in": 2,
    "states": [
     {
      "variable": "key.holder",
      "state": "thief",
      "plane": "self",
-     "cc_ref": "3.3.6.3 1.13.3",
+     "cc_ref": "3.3.6.4 1.13.3",
      "enters_by": "device stolen with authentication",
      "signer": "adversary",
      "model_ref": "self_roster.SelfRoster.tla:holder=thief",
@@ -29076,7 +30304,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -29094,7 +30322,7 @@
     },
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -29106,7 +30334,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -29138,7 +30366,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -29162,7 +30390,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -29180,14 +30408,14 @@
   "key.holder.lost": {
    "plane": "self",
    "state_predicate": "key.holder=lost",
-   "cc_ref": "3.3.6.3",
+   "cc_ref": "3.3.6.4",
    "added_in": 2,
    "states": [
     {
      "variable": "key.holder",
      "state": "lost",
      "plane": "self",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "enters_by": "device lost",
      "signer": "—",
      "model_ref": "self_roster.SelfRoster.tla:holder=lost",
@@ -29235,7 +30463,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -29253,7 +30481,7 @@
     },
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -29265,7 +30493,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -29297,7 +30525,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -29321,7 +30549,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -29339,14 +30567,14 @@
   "key.membership.proposed_evict": {
    "plane": "self",
    "state_predicate": "key.membership=proposed_evict",
-   "cc_ref": "3.3.6.3",
+   "cc_ref": "3.3.6.4",
    "added_in": 2,
    "states": [
     {
      "variable": "key.membership",
      "state": "proposed_evict",
      "plane": "self",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "enters_by": "eviction proposal",
      "signer": "roster key",
      "model_ref": "self_roster.SelfRoster.tla:pending(evict)",
@@ -29484,7 +30712,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -29585,7 +30813,7 @@
     },
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -29597,7 +30825,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -29629,7 +30857,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -29653,7 +30881,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -29671,14 +30899,14 @@
   "key.membership.evicted": {
    "plane": "self",
    "state_predicate": "key.membership=evicted",
-   "cc_ref": "3.3.6 3.3.6.3",
+   "cc_ref": "3.3.6 3.3.6.4",
    "added_in": 2,
    "states": [
     {
      "variable": "key.membership",
      "state": "evicted",
      "plane": "self",
-     "cc_ref": "3.3.6 3.3.6.3",
+     "cc_ref": "3.3.6 3.3.6.4",
      "enters_by": "withdraws against the occurrence row lands",
      "signer": "roster majority / silence",
      "model_ref": "self_roster.SelfRoster.tla:Devices\\member",
@@ -29816,7 +31044,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -29984,14 +31212,14 @@
   "self.roster_size.one": {
    "plane": "self",
    "state_predicate": "self.roster_size=one",
-   "cc_ref": "3.3.6.3",
+   "cc_ref": "3.3.6.4",
    "added_in": 2,
    "states": [
     {
      "variable": "self.roster_size",
      "state": "one",
      "plane": "self",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "enters_by": "genesis only; add is unilateral",
      "signer": "owner",
      "model_ref": "self_roster.SelfRoster_combined1_*.cfg",
@@ -30012,7 +31240,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -30030,7 +31258,7 @@
     },
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -30042,7 +31270,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -30074,7 +31302,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -30098,7 +31326,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -30116,14 +31344,14 @@
   "self.roster_size.three_more": {
    "plane": "self",
    "state_predicate": "self.roster_size=three_or_more",
-   "cc_ref": "3.3.6.3",
+   "cc_ref": "3.3.6.4",
    "added_in": 2,
    "states": [
     {
      "variable": "self.roster_size",
      "state": "three_or_more",
      "plane": "self",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "enters_by": "two paths",
      "signer": "—",
      "model_ref": "self_roster.SelfRoster_combined3_*.cfg",
@@ -30144,7 +31372,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -30162,7 +31390,7 @@
     },
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -30174,7 +31402,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -30206,7 +31434,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -30230,7 +31458,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -31448,7 +32676,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -31515,6 +32743,19 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-private-room",
+     "cc_ref": "3.1.3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#standing_reads_rows,member_decides_membership,member_decides_who_said,member_decides_count,rows_hide_who_said,rows_hide_membership,person_count_needs_bindings,outsider_hides_membership,outsider_hides_existence,rows_see_a_joining",
+       "object": ""
       }
      ]
     }
@@ -31937,7 +33178,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -32004,6 +33245,19 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-private-room",
+     "cc_ref": "3.1.3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#standing_reads_rows,member_decides_membership,member_decides_who_said,member_decides_count,rows_hide_who_said,rows_hide_membership,person_count_needs_bindings,outsider_hides_membership,outsider_hides_existence,rows_see_a_joining",
+       "object": ""
       }
      ]
     }
@@ -32426,7 +33680,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -32493,6 +33747,19 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-private-room",
+     "cc_ref": "3.1.3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#standing_reads_rows,member_decides_membership,member_decides_who_said,member_decides_count,rows_hide_who_said,rows_hide_membership,person_count_needs_bindings,outsider_hides_membership,outsider_hides_existence,rows_see_a_joining",
+       "object": ""
       }
      ]
     }
@@ -32915,7 +34182,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -32982,6 +34249,19 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-private-room",
+     "cc_ref": "3.1.3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#standing_reads_rows,member_decides_membership,member_decides_who_said,member_decides_count,rows_hide_who_said,rows_hide_membership,person_count_needs_bindings,outsider_hides_membership,outsider_hides_existence,rows_see_a_joining",
+       "object": ""
       }
      ]
     }
@@ -33404,7 +34684,7 @@
     {
      "claim_id": "CLM-membership-consent",
      "cc_ref": "3.1.3.2",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -33471,6 +34751,19 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-private-room",
+     "cc_ref": "3.1.3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#standing_reads_rows,member_decides_membership,member_decides_who_said,member_decides_count,rows_hide_who_said,rows_hide_membership,person_count_needs_bindings,outsider_hides_membership,outsider_hides_existence,rows_see_a_joining",
+       "object": ""
       }
      ]
     }
@@ -33547,9 +34840,13 @@
     {
      "claim_id": "CLM-promotion-cohort-standing",
      "cc_ref": "4.5.4",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1259"
+      },
       {
        "kind": "impl",
        "repo": "CIRISPersist",
@@ -33704,9 +35001,13 @@
     {
      "claim_id": "CLM-promotion-cohort-standing",
      "cc_ref": "4.5.4",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1259"
+      },
       {
        "kind": "impl",
        "repo": "CIRISPersist",
@@ -33861,9 +35162,13 @@
     {
      "claim_id": "CLM-promotion-cohort-standing",
      "cc_ref": "4.5.4",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1259"
+      },
       {
        "kind": "impl",
        "repo": "CIRISPersist",
@@ -34009,9 +35314,13 @@
     {
      "claim_id": "CLM-promotion-cohort-standing",
      "cc_ref": "4.5.4",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1259"
+      },
       {
        "kind": "impl",
        "repo": "CIRISPersist",
@@ -34227,7 +35536,7 @@
     {
      "claim_id": "CLM-consent-community-trust",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -34447,7 +35756,7 @@
     {
      "claim_id": "CLM-consent-plane-model",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -34469,7 +35778,7 @@
     {
      "claim_id": "CLM-consent-community-trust-owner-authored",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -34599,7 +35908,7 @@
     {
      "claim_id": "CLM-consent-community-trust",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -34819,7 +36128,7 @@
     {
      "claim_id": "CLM-consent-plane-model",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -34841,7 +36150,7 @@
     {
      "claim_id": "CLM-consent-community-trust-owner-authored",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -34971,7 +36280,7 @@
     {
      "claim_id": "CLM-consent-community-trust",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -35191,7 +36500,7 @@
     {
      "claim_id": "CLM-consent-plane-model",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -35213,7 +36522,7 @@
     {
      "claim_id": "CLM-consent-community-trust-owner-authored",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -35462,7 +36771,7 @@
     {
      "claim_id": "CLM-consent-community-trust",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -35486,7 +36795,7 @@
     {
      "claim_id": "CLM-consent-plane-model",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -35508,7 +36817,7 @@
     {
      "claim_id": "CLM-consent-community-trust-owner-authored",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -35757,7 +37066,7 @@
     {
      "claim_id": "CLM-consent-community-trust",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -35781,7 +37090,7 @@
     {
      "claim_id": "CLM-consent-plane-model",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -35803,7 +37112,7 @@
     {
      "claim_id": "CLM-consent-community-trust-owner-authored",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -36052,7 +37361,7 @@
     {
      "claim_id": "CLM-consent-community-trust",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -36076,7 +37385,7 @@
     {
      "claim_id": "CLM-consent-plane-model",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -36098,7 +37407,7 @@
     {
      "claim_id": "CLM-consent-community-trust-owner-authored",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -36190,7 +37499,7 @@
     {
      "claim_id": "CLM-consent-community-trust",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -36378,7 +37687,7 @@
     {
      "claim_id": "CLM-consent-plane-model",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -36400,7 +37709,7 @@
     {
      "claim_id": "CLM-consent-community-trust-owner-authored",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -36492,7 +37801,7 @@
     {
      "claim_id": "CLM-consent-community-trust",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -36680,7 +37989,7 @@
     {
      "claim_id": "CLM-consent-plane-model",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -36702,7 +38011,7 @@
     {
      "claim_id": "CLM-consent-community-trust-owner-authored",
      "cc_ref": "3.3.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -36809,14 +38118,14 @@
   "row.standing.admitted": {
    "plane": "content",
    "state_predicate": "row.standing=admitted",
-   "cc_ref": "2.1 2.6.1.7",
+   "cc_ref": "2.1 8.11.9",
    "added_in": 2,
    "states": [
     {
      "variable": "row.standing",
      "state": "admitted",
      "plane": "content",
-     "cc_ref": "2.1 2.6.1.7",
+     "cc_ref": "2.1 8.11.9",
      "enters_by": "admission gates pass",
      "signer": "producer",
      "model_ref": "withdraws_admission.WithdrawsAdmission.tla:admitted",
@@ -37226,7 +38535,7 @@
     {
      "claim_id": "CLM-subject-within-audience",
      "cc_ref": "2.1",
-     "status": "established",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -37236,6 +38545,19 @@
        "symbols": [
         "check_cohort_standing_resolved"
        ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-rows",
+     "cc_ref": "2.1",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#party_rows_decided,party_decisions_decided,outside_row_hidden,admit_outside_is_held,admit_inside_is_closed,carriage_not_closed,carriage_closed_under_wait,list_view_shows_arrival_order",
+       "object": ""
       }
      ]
     }
@@ -38735,14 +40057,14 @@
   "delegation.link.withdrawn": {
    "plane": "authority",
    "state_predicate": "delegation.link=withdrawn",
-   "cc_ref": "4.4.3.4.3",
+   "cc_ref": "4.4.3.19",
    "added_in": 2,
    "states": [
     {
      "variable": "delegation.link",
      "state": "withdrawn",
      "plane": "authority",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.4.3.19",
      "enters_by": "withdraws by the principal; cascade",
      "signer": "principal",
      "model_ref": "authority_tree.authority_tree.py:withdraw",
@@ -38820,7 +40142,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -38844,7 +40166,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -38900,7 +40222,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -38916,8 +40238,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -38950,7 +40272,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -38971,26 +40293,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -39006,7 +40333,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -39038,7 +40365,7 @@
     },
     {
      "claim_id": "CLM-cohort",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.4.3.19",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -39054,7 +40381,7 @@
     },
     {
      "claim_id": "CLM-consent-stream-is-data-choice",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.4.3.19",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -39070,7 +40397,7 @@
     },
     {
      "claim_id": "CLM-scope-infra-relay",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.4.3.19",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -39092,14 +40419,14 @@
   "delegation.link.expired": {
    "plane": "authority",
    "state_predicate": "delegation.link=expired",
-   "cc_ref": "4.4.3.2.8",
+   "cc_ref": "4.4.3.12",
    "added_in": 2,
    "states": [
     {
      "variable": "delegation.link",
      "state": "expired",
      "plane": "authority",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "enters_by": "delegation_valid_until passed (a withdrawal)",
      "signer": "principal",
      "model_ref": "authority_tree.authority_tree.py:I10",
@@ -39177,7 +40504,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -39201,7 +40528,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -39257,7 +40584,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -39273,8 +40600,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -39307,7 +40634,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -39328,26 +40655,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -39363,7 +40695,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -39395,7 +40727,7 @@
     },
     {
      "claim_id": "CLM-affiliations",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -39419,7 +40751,7 @@
     },
     {
      "claim_id": "CLM-affiliation-config-record",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -39443,7 +40775,7 @@
     },
     {
      "claim_id": "CLM-affiliation-one-voice-countersign",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -39459,7 +40791,7 @@
     },
     {
      "claim_id": "CLM-affiliation-public-face",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -39471,7 +40803,7 @@
     },
     {
      "claim_id": "CLM-affiliation-dissolution",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -39574,7 +40906,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -39598,7 +40930,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -39654,7 +40986,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -39670,8 +41002,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -39704,7 +41036,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -39725,26 +41057,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -39760,7 +41097,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -39859,18 +41196,6 @@
        "symbols": [
         "trust_root_cosigners_over"
        ]
-      }
-     ]
-    },
-    {
-     "claim_id": "CLM-purge-digest-preimage",
-     "cc_ref": "3.3.2",
-     "status": "staged",
-     "join": "by_section",
-     "evidence": [
-      {
-       "kind": "staged",
-       "ticket": "CIRISPersist#803"
       }
      ]
     }
@@ -44631,46 +45956,6 @@
      ]
     },
     {
-     "claim_id": "CLM-accord-invoke-lowercase",
-     "cc_ref": "4.2.1.1",
-     "status": "staged",
-     "join": "by_section",
-     "evidence": [
-      {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/trust_root.rs",
-       "symbols": [
-        "ACCORD_HEARTBEAT_DIMENSION"
-       ]
-      },
-      {
-       "kind": "staged",
-       "ticket": "CIRISVerify#297"
-      }
-     ]
-    },
-    {
-     "claim_id": "CLM-accord-invoke-cutover",
-     "cc_ref": "4.2.1.1",
-     "status": "staged",
-     "join": "by_section",
-     "evidence": [
-      {
-       "kind": "staged",
-       "ticket": "CIRISVerify#297"
-      },
-      {
-       "kind": "staged",
-       "ticket": "CIRISServer#691"
-      },
-      {
-       "kind": "staged",
-       "ticket": "CIRISAgent#1227"
-      }
-     ]
-    },
-    {
      "claim_id": "CLM-halt-one-row",
      "cc_ref": "4.2.1.1",
      "status": "established",
@@ -44943,14 +46228,14 @@
   "key.membership.proposed_add": {
    "plane": "self",
    "state_predicate": "key.membership=proposed_add",
-   "cc_ref": "3.3.6.3",
+   "cc_ref": "3.3.6.4",
    "added_in": 3,
    "states": [
     {
      "variable": "key.membership",
      "state": "proposed_add",
      "plane": "self",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "enters_by": "proposal by a live roster key (held: from two keys the add-device approval is a proposal until another key assents or W_self passes)",
      "signer": "roster key",
      "model_ref": "self_roster.SelfRoster.tla:pending(add)",
@@ -45088,7 +46373,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -45189,7 +46474,7 @@
     },
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -45201,7 +46486,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -45233,7 +46518,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -45257,7 +46542,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -45932,6 +47217,18 @@
        "kind": "normative-only"
       }
      ]
+    },
+    {
+     "claim_id": "CLM-wa-seat-conferred",
+     "cc_ref": "4.3",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISServer#814"
+      }
+     ]
     }
    ],
    "promised_by": []
@@ -45973,6 +47270,18 @@
      "evidence": [
       {
        "kind": "normative-only"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-wa-seat-conferred",
+     "cc_ref": "4.3",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISServer#814"
       }
      ]
     }
@@ -46202,14 +47511,14 @@
   "affiliation.charter.declared": {
    "plane": "governance",
    "state_predicate": "affiliation.charter=declared",
-   "cc_ref": "4.4.3.2.8",
+   "cc_ref": "4.4.3.12",
    "added_in": 6,
    "states": [
     {
      "variable": "affiliation.charter",
      "state": "declared",
      "plane": "governance",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "enters_by": "the community record with declared_cohort: affiliations and its config members, at creation",
      "signer": "founding key / officers under consensus_protocol",
      "model_ref": "mesh_life.MeshLife.tla:Found",
@@ -46230,7 +47539,7 @@
    "claims": [
     {
      "claim_id": "CLM-affiliation-dissolution",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -46242,7 +47551,7 @@
     },
     {
      "claim_id": "CLM-affiliations",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -46266,7 +47575,7 @@
     },
     {
      "claim_id": "CLM-affiliation-config-record",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -46290,7 +47599,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -46322,7 +47631,7 @@
     },
     {
      "claim_id": "CLM-affiliation-one-voice-countersign",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -46338,7 +47647,7 @@
     },
     {
      "claim_id": "CLM-affiliation-public-face",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -46354,14 +47663,14 @@
   "affiliation.charter.superseded": {
    "plane": "governance",
    "state_predicate": "affiliation.charter=superseded",
-   "cc_ref": "4.4.3.2.8",
+   "cc_ref": "4.4.3.12",
    "added_in": 6,
    "states": [
     {
      "variable": "affiliation.charter",
      "state": "superseded",
      "plane": "governance",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "enters_by": "supersedes of the affiliation config record",
      "signer": "officers under consensus_protocol",
      "model_ref": "mesh_life.MeshLife.tla:CharterSuperseded",
@@ -46382,7 +47691,7 @@
    "claims": [
     {
      "claim_id": "CLM-affiliation-dissolution",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -46394,7 +47703,7 @@
     },
     {
      "claim_id": "CLM-affiliations",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -46418,7 +47727,7 @@
     },
     {
      "claim_id": "CLM-affiliation-config-record",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -46442,7 +47751,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -46474,7 +47783,7 @@
     },
     {
      "claim_id": "CLM-affiliation-one-voice-countersign",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -46490,7 +47799,7 @@
     },
     {
      "claim_id": "CLM-affiliation-public-face",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -46506,14 +47815,14 @@
   "licence.issued": {
    "plane": "authority",
    "state_predicate": "licence.state=held",
-   "cc_ref": "2.4.1.2.1 4.4.3.2.8",
+   "cc_ref": "2.4.1.3 4.4.3.12",
    "added_in": 6,
    "states": [
     {
      "variable": "licence.state",
      "state": "held",
      "plane": "authority",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "enters_by": "licensure:{authority_id} row",
      "signer": "the authority",
      "model_ref": "authority_tree.authority_tree.py:licensees",
@@ -46591,7 +47900,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -46615,7 +47924,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -46671,7 +47980,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -46687,8 +47996,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -46721,7 +48030,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -46742,26 +48051,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -46777,7 +48091,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -46809,7 +48123,7 @@
     },
     {
      "claim_id": "CLM-authority-triad",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -46849,7 +48163,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-object",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -46889,7 +48203,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-quorum",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -46917,8 +48231,8 @@
     },
     {
      "claim_id": "CLM-licence-judged-at-issuance",
-     "cc_ref": "2.4.1.2.1",
-     "status": "established",
+     "cc_ref": "2.4.1.3",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -46933,7 +48247,7 @@
     },
     {
      "claim_id": "CLM-licence-audience",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -46957,14 +48271,14 @@
   "licence.status.suspended": {
    "plane": "authority",
    "state_predicate": "licence.state=suspended",
-   "cc_ref": "2.4.1.2.1",
+   "cc_ref": "2.4.1.3",
    "added_in": 6,
    "states": [
     {
      "variable": "licence.state",
      "state": "suspended",
      "plane": "authority",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "enters_by": "bounded revocation:* by the authority",
      "signer": "the authority",
      "model_ref": "—",
@@ -47042,7 +48356,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -47066,7 +48380,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -47122,7 +48436,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -47138,8 +48452,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -47172,7 +48486,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -47193,26 +48507,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -47228,7 +48547,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -47260,7 +48579,7 @@
     },
     {
      "claim_id": "CLM-authority-triad",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -47300,7 +48619,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-object",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -47340,7 +48659,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-quorum",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -47368,8 +48687,8 @@
     },
     {
      "claim_id": "CLM-licence-judged-at-issuance",
-     "cc_ref": "2.4.1.2.1",
-     "status": "established",
+     "cc_ref": "2.4.1.3",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -47384,7 +48703,7 @@
     },
     {
      "claim_id": "CLM-licence-audience",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -47408,14 +48727,14 @@
   "licence.status.revoked": {
    "plane": "authority",
    "state_predicate": "licence.state=revoked",
-   "cc_ref": "2.4.1.2.1 4.4.3.2.8",
+   "cc_ref": "2.4.1.3 4.4.3.12",
    "added_in": 6,
    "states": [
     {
      "variable": "licence.state",
      "state": "revoked",
      "plane": "authority",
-     "cc_ref": "2.4.1.2.1 4.4.3.2.8",
+     "cc_ref": "2.4.1.3 4.4.3.12",
      "enters_by": "revocation:* by the authority",
      "signer": "the authority",
      "model_ref": "—",
@@ -47493,7 +48812,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -47517,7 +48836,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -47573,7 +48892,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -47589,8 +48908,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -47623,7 +48942,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -47644,26 +48963,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -47679,7 +49003,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -47711,7 +49035,7 @@
     },
     {
      "claim_id": "CLM-authority-triad",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -47751,7 +49075,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-object",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -47791,7 +49115,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-quorum",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -47819,8 +49143,8 @@
     },
     {
      "claim_id": "CLM-licence-judged-at-issuance",
-     "cc_ref": "2.4.1.2.1",
-     "status": "established",
+     "cc_ref": "2.4.1.3",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -47835,7 +49159,7 @@
     },
     {
      "claim_id": "CLM-licence-audience",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -47859,14 +49183,14 @@
   "licence.honoured": {
    "plane": "authority",
    "state_predicate": "licence.reader=honoured",
-   "cc_ref": "4.4.3.8 2.4.1.2.1",
+   "cc_ref": "4.4.3.34 2.4.1.3",
    "added_in": 6,
    "states": [
     {
      "variable": "licence.reader",
      "state": "honoured",
      "plane": "authority",
-     "cc_ref": "4.4.3.8 2.4.1.2.1",
+     "cc_ref": "4.4.3.34 2.4.1.3",
      "enters_by": "reader's own trust walk reaches the issuer for the class and the charter declares it",
      "signer": "reader (local verdict, unsigned)",
      "model_ref": "trust_set.TrustSet.lean:verdict_is_the_capped_walk",
@@ -47877,7 +49201,7 @@
    "claims": [
     {
      "claim_id": "CLM-trust-root",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -47921,7 +49245,7 @@
     },
     {
      "claim_id": "CLM-trust-set-members",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -47937,14 +49261,14 @@
   "licence.not_trusted": {
    "plane": "authority",
    "state_predicate": "licence.reader=not_trusted",
-   "cc_ref": "4.4.3.8 4.4.3.2.8",
+   "cc_ref": "4.4.3.34 4.4.3.12",
    "added_in": 6,
    "states": [
     {
      "variable": "licence.reader",
      "state": "not_trusted",
      "plane": "authority",
-     "cc_ref": "4.4.3.8 4.4.3.2.8",
+     "cc_ref": "4.4.3.34 4.4.3.12",
      "enters_by": "no entry reaches the issuer for the class, or the class is outside the charter (licence_class_not_trusted)",
      "signer": "reader (local verdict, unsigned)",
      "model_ref": "trust_set.TrustSet.lean:empty_set_honours_nothing",
@@ -47955,7 +49279,7 @@
    "claims": [
     {
      "claim_id": "CLM-trust-root",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -47999,7 +49323,7 @@
     },
     {
      "claim_id": "CLM-trust-set-members",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -48015,14 +49339,14 @@
   "recognition.outbound": {
    "plane": "node",
    "state_predicate": "recognition.state=outbound",
-   "cc_ref": "4.4.3.8 4.4.3.2.8",
+   "cc_ref": "4.4.3.34 4.4.3.12",
    "added_in": 6,
    "states": [
     {
      "variable": "recognition.state",
      "state": "outbound",
      "plane": "node",
-     "cc_ref": "4.4.3.8 4.4.3.2.8",
+     "cc_ref": "4.4.3.34 4.4.3.12",
      "enters_by": "this reader's delegates_to(reader → authority) bearing trust:accepts:v1 with trust_classes / trust_depth",
      "signer": "reader",
      "model_ref": "trust_set.TrustSet.lean:reaches_needs_an_edge_from",
@@ -48033,7 +49357,7 @@
    "claims": [
     {
      "claim_id": "CLM-trust-root",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -48077,7 +49401,7 @@
     },
     {
      "claim_id": "CLM-trust-set-members",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -48093,14 +49417,14 @@
   "recognition.inbound": {
    "plane": "node",
    "state_predicate": "recognition.state=inbound",
-   "cc_ref": "4.4.3.8 4.4.3.2.8",
+   "cc_ref": "4.4.3.34 4.4.3.12",
    "added_in": 6,
    "states": [
     {
      "variable": "recognition.state",
      "state": "inbound",
      "plane": "node",
-     "cc_ref": "4.4.3.8 4.4.3.2.8",
+     "cc_ref": "4.4.3.34 4.4.3.12",
      "enters_by": "another reader's delegates_to(reader → this authority) bearing trust:accepts:v1",
      "signer": "the other reader",
      "model_ref": "trust_set.TrustSet.lean:no_trust_without_my_edge",
@@ -48111,7 +49435,7 @@
    "claims": [
     {
      "claim_id": "CLM-trust-root",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -48155,7 +49479,7 @@
     },
     {
      "claim_id": "CLM-trust-set-members",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -48171,14 +49495,14 @@
   "delegation.scope.license": {
    "plane": "authority",
    "state_predicate": "delegation.scope=license",
-   "cc_ref": "4.4.3.4.3.1 2.4.1.2.1",
+   "cc_ref": "4.4.3.20 2.4.1.3",
    "added_in": 6,
    "states": [
     {
      "variable": "delegation.scope",
      "state": "license",
      "plane": "authority",
-     "cc_ref": "4.4.3.4.3.1 2.4.1.2.1",
+     "cc_ref": "4.4.3.19 2.4.1.3",
      "enters_by": "delegates_to with scope license admitted; delegator holds licence authority for the authority_id",
      "signer": "principal",
      "model_ref": "authority_tree.authority_tree.py:issue_licence",
@@ -48188,8 +49512,8 @@
    "invariants": [],
    "claims": [
     {
-     "claim_id": "CLM-canonicalization-signing",
-     "cc_ref": "4.4.3.4.3.1",
+     "claim_id": "CLM-cohort",
+     "cc_ref": "4.4.3.19",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -48198,7 +49522,73 @@
        "repo": "CIRISVerify",
        "path": "src/ciris-verify-core/src/self_at_login.rs",
        "symbols": [
-        "sign_partnership_grant"
+        "perform_self_at_login"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-consent-stream-is-data-choice",
+     "cc_ref": "4.4.3.19",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "impl",
+       "repo": "CIRISAgent",
+       "path": "ciris_engine/logic/services/governance/consent/service.py",
+       "symbols": [
+        "ConsentService.grant_consent"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-issuance-scope",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/admission.rs",
+       "symbols": [
+        "check_licensure_delegator_is_authority"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/key_grant.rs",
+       "symbols": [
+        "admit_replicated_key_grant"
+       ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/authority_tree/authority_tree.py",
+       "symbols": [
+        "I4",
+        "I5",
+        "I6"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-scope-infra-relay",
+     "cc_ref": "4.4.3.19",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/types.rs",
+       "symbols": [
+        "delegation_scope::INFRA"
        ]
       }
      ]
@@ -48209,14 +49599,14 @@
   "delegation.scope.grant": {
    "plane": "authority",
    "state_predicate": "delegation.scope=grant",
-   "cc_ref": "4.4.3.4.3.1 2.4.1.2.1",
+   "cc_ref": "4.4.3.20 2.4.1.3",
    "added_in": 6,
    "states": [
     {
      "variable": "delegation.scope",
      "state": "grant",
      "plane": "authority",
-     "cc_ref": "4.4.3.4.3.1 2.4.1.2.1",
+     "cc_ref": "4.4.3.19 2.4.1.3",
      "enters_by": "delegates_to with scope grant admitted; delegator owns, stewards or holds a grant-scoped delegation over the asset",
      "signer": "principal",
      "model_ref": "authority_tree.authority_tree.py:issue_grant",
@@ -48226,8 +49616,8 @@
    "invariants": [],
    "claims": [
     {
-     "claim_id": "CLM-canonicalization-signing",
-     "cc_ref": "4.4.3.4.3.1",
+     "claim_id": "CLM-cohort",
+     "cc_ref": "4.4.3.19",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -48236,7 +49626,73 @@
        "repo": "CIRISVerify",
        "path": "src/ciris-verify-core/src/self_at_login.rs",
        "symbols": [
-        "sign_partnership_grant"
+        "perform_self_at_login"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-consent-stream-is-data-choice",
+     "cc_ref": "4.4.3.19",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "impl",
+       "repo": "CIRISAgent",
+       "path": "ciris_engine/logic/services/governance/consent/service.py",
+       "symbols": [
+        "ConsentService.grant_consent"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-issuance-scope",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/admission.rs",
+       "symbols": [
+        "check_licensure_delegator_is_authority"
+       ]
+      },
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/key_grant.rs",
+       "symbols": [
+        "admit_replicated_key_grant"
+       ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/authority_tree/authority_tree.py",
+       "symbols": [
+        "I4",
+        "I5",
+        "I6"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-scope-infra-relay",
+     "cc_ref": "4.4.3.19",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/types.rs",
+       "symbols": [
+        "delegation_scope::INFRA"
        ]
       }
      ]
@@ -48247,14 +49703,14 @@
   "delegation.refused": {
    "plane": "authority",
    "state_predicate": "delegation.link=refused",
-   "cc_ref": "4.4.3.4.3.1 2.4.1.2.1",
+   "cc_ref": "4.4.3.20 2.4.1.3",
    "added_in": 6,
    "states": [
     {
      "variable": "delegation.link",
      "state": "refused",
      "plane": "authority",
-     "cc_ref": "4.4.3.4.3.1 2.4.1.2.1",
+     "cc_ref": "4.4.3.19 2.4.1.3",
      "enters_by": "enforced admission: delegator lacks the underlying authority; refused, not unweighted",
      "signer": "substrate at the door",
      "model_ref": "—",
@@ -48332,7 +49788,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -48356,7 +49812,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -48412,7 +49868,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -48428,8 +49884,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -48462,7 +49918,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -48483,26 +49939,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -48518,7 +49979,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -48549,8 +50010,8 @@
      ]
     },
     {
-     "claim_id": "CLM-canonicalization-signing",
-     "cc_ref": "4.4.3.4.3.1",
+     "claim_id": "CLM-cohort",
+     "cc_ref": "4.4.3.19",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -48559,7 +50020,39 @@
        "repo": "CIRISVerify",
        "path": "src/ciris-verify-core/src/self_at_login.rs",
        "symbols": [
-        "sign_partnership_grant"
+        "perform_self_at_login"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-consent-stream-is-data-choice",
+     "cc_ref": "4.4.3.19",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "impl",
+       "repo": "CIRISAgent",
+       "path": "ciris_engine/logic/services/governance/consent/service.py",
+       "symbols": [
+        "ConsentService.grant_consent"
+       ]
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-scope-infra-relay",
+     "cc_ref": "4.4.3.19",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "impl",
+       "repo": "CIRISPersist",
+       "path": "src/federation/types.rs",
+       "symbols": [
+        "delegation_scope::INFRA"
        ]
       }
      ]
@@ -48570,14 +50063,14 @@
   "grant.axis.content": {
    "plane": "authority",
    "state_predicate": "grant.axis=content",
-   "cc_ref": "5.1 2.4.1.2.1",
+   "cc_ref": "5.1 2.4.1.3",
    "added_in": 6,
    "states": [
     {
      "variable": "grant.axis",
      "state": "content",
      "plane": "authority",
-     "cc_ref": "5.1 2.4.1.2.1",
+     "cc_ref": "5.1 2.4.1.3",
      "enters_by": "key_grant:{axis}:v1 keyed on (content_sha256, recipient_key_id)",
      "signer": "owner / steward / grant-scoped delegate",
      "model_ref": "authority_tree.authority_tree.py:issue_grant",
@@ -48643,14 +50136,14 @@
   "grant.onward_refused": {
    "plane": "authority",
    "state_predicate": "grant.state=onward_refused",
-   "cc_ref": "2.4.1.2.1 4.4.3.4.3.1",
+   "cc_ref": "2.4.1.3 4.4.3.20",
    "added_in": 6,
    "states": [
     {
      "variable": "grant.state",
      "state": "onward_refused",
      "plane": "authority",
-     "cc_ref": "2.4.1.2.1 4.4.3.4.3.1",
+     "cc_ref": "2.4.1.3 4.4.3.19",
      "enters_by": "key_grant whose issuer holds the DEK but neither the asset nor a grant-scoped delegation; refused at admission",
      "signer": "substrate at the door",
      "model_ref": "—",
@@ -48728,7 +50221,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -48752,7 +50245,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -48808,7 +50301,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -48824,8 +50317,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -48858,7 +50351,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -48879,26 +50372,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -48914,7 +50412,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -48946,7 +50444,7 @@
     },
     {
      "claim_id": "CLM-authority-triad",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -48986,7 +50484,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-object",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -49026,7 +50524,7 @@
     },
     {
      "claim_id": "CLM-licence-authority-quorum",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -49054,8 +50552,8 @@
     },
     {
      "claim_id": "CLM-licence-judged-at-issuance",
-     "cc_ref": "2.4.1.2.1",
-     "status": "established",
+     "cc_ref": "2.4.1.3",
+     "status": "staged",
      "join": "by_section",
      "evidence": [
       {
@@ -49070,7 +50568,7 @@
     },
     {
      "claim_id": "CLM-licence-audience",
-     "cc_ref": "2.4.1.2.1",
+     "cc_ref": "2.4.1.3",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -49094,7 +50592,7 @@
   "grant.ended_by_rotation": {
    "plane": "authority",
    "state_predicate": "grant.state=rotated",
-   "cc_ref": "5.1 2.4.1.2.1",
+   "cc_ref": "5.1 2.4.1.3",
    "added_in": 6,
    "states": [
     {
@@ -49179,7 +50677,7 @@
      "symbol": "I8",
      "kind": "enumerated (every reachable state)",
      "claim_id": "CLM-anti-pattern-delegation",
-     "verdict": "0 violations; I10 dye test fails by design"
+     "verdict": "0 violations; plants --plant-revisit and --plant-refuse-cycle fail by design"
     },
     {
      "inv_id": "AT.I9",
@@ -49203,7 +50701,7 @@
    "claims": [
     {
      "claim_id": "CLM-delegation-attenuation",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -49259,7 +50757,7 @@
     },
     {
      "claim_id": "CLM-delegation-cascade",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -49275,8 +50773,8 @@
     },
     {
      "claim_id": "CLM-issuance-scope",
-     "cc_ref": "4.4.3.4.3",
-     "status": "established",
+     "cc_ref": "4.4.3.19",
+     "status": "staged",
      "join": "by_invariant",
      "evidence": [
       {
@@ -49309,7 +50807,7 @@
     },
     {
      "claim_id": "CLM-sub-delegation-requirement",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "4.5.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -49330,26 +50828,31 @@
      "join": "by_invariant",
      "evidence": [
       {
-       "kind": "impl",
-       "repo": "CIRISPersist",
-       "path": "src/federation/admission.rs",
-       "symbols": [
-        "check_delegation_cycle_admission"
-       ]
-      },
-      {
        "kind": "test",
        "repo": "CIRISConstitution",
        "path": "formal/authority_tree/authority_tree.py",
        "symbols": [
         "I8"
        ]
+      },
+      {
+       "kind": "test",
+       "repo": "CIRISConstitution",
+       "path": "formal/causal_kernel/witnesses.py",
+       "symbols": [
+        "t1_ans"
+       ]
+      },
+      {
+       "kind": "lean",
+       "repo": "@formal/trust_set/TrustSet.lean#reaches_mono_budget,verdict_is_the_capped_walk",
+       "object": ""
       }
      ]
     },
     {
      "claim_id": "CLM-delegation-determinism",
-     "cc_ref": "4.4.3.4.3",
+     "cc_ref": "2.7.5",
      "status": "established",
      "join": "by_invariant",
      "evidence": [
@@ -49365,7 +50868,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_invariant",
      "evidence": [
@@ -49466,18 +50969,6 @@
        ]
       }
      ]
-    },
-    {
-     "claim_id": "CLM-purge-digest-preimage",
-     "cc_ref": "3.3.2",
-     "status": "staged",
-     "join": "by_section",
-     "evidence": [
-      {
-       "kind": "staged",
-       "ticket": "CIRISPersist#803"
-      }
-     ]
     }
    ],
    "promised_by": []
@@ -49485,14 +50976,14 @@
   "key.successor_committed": {
    "plane": "self",
    "state_predicate": "key.succession=committed",
-   "cc_ref": "3.2 3.3.6.3",
+   "cc_ref": "3.2 3.3.6.4",
    "added_in": 6,
    "states": [
     {
      "variable": "key.succession",
      "state": "committed",
      "plane": "self",
-     "cc_ref": "3.2 3.3.6.3",
+     "cc_ref": "3.2 3.3.6.4",
      "enters_by": "pre-rotation commitment SHA-256(JCS([...])) over the successor keys' public key material",
      "signer": "key holder",
      "model_ref": "mesh_life.MeshLife.tla:KeyRotates",
@@ -50238,6 +51729,31 @@
        ]
       }
      ]
+    },
+    {
+     "claim_id": "CLM-acceptance-is-owners",
+     "cc_ref": "3.2",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1257"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-audience-view-public-roster",
+     "cc_ref": "3.2",
+     "status": "established",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "lean",
+       "repo": "@formal/audience_view/AudienceView.lean#public_roster_decides_membership,stranger_decides_announced,stranger_never_learns_owned_route,stranger_never_learns_contacts,stranger_never_learns_scoped,stranger_never_learns_sealed_occurrence,stranger_closed_hold,stranger_not_closed_binding",
+       "object": ""
+      }
+     ]
     }
    ],
    "promised_by": []
@@ -50245,14 +51761,14 @@
   "key.rotated": {
    "plane": "self",
    "state_predicate": "key.succession=rotated",
-   "cc_ref": "3.3.6.3 5.1",
+   "cc_ref": "3.3.6.4 5.1",
    "added_in": 6,
    "states": [
     {
      "variable": "key.succession",
      "state": "rotated",
      "plane": "self",
-     "cc_ref": "3.3.6.3 5.1",
+     "cc_ref": "3.3.6.4 5.1",
      "enters_by": "the committed successor key joins the roster and signs; the old key stops",
      "signer": "key holder (old and successor)",
      "model_ref": "mesh_life.MeshLife.tla:KeyRotates",
@@ -50263,7 +51779,7 @@
    "claims": [
     {
      "claim_id": "CLM-self-roster-key-id",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -50275,7 +51791,7 @@
     },
     {
      "claim_id": "CLM-self-roster-authority",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -50307,7 +51823,7 @@
     },
     {
      "claim_id": "CLM-self-roster-two-paths",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -50331,7 +51847,7 @@
     },
     {
      "claim_id": "CLM-self-roster-one-key-per-node",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -50343,7 +51859,7 @@
     },
     {
      "claim_id": "CLM-self-roster-model",
-     "cc_ref": "3.3.6.3",
+     "cc_ref": "3.3.6.4",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -50365,14 +51881,14 @@
   "key.escrowed": {
    "plane": "self",
    "state_predicate": "key.escrow=escrowed",
-   "cc_ref": "4.4.3.2.8 3.3.6.3",
+   "cc_ref": "4.4.3.12 3.3.6.4",
    "added_in": 6,
    "states": [
     {
      "variable": "key.escrow",
      "state": "escrowed",
      "plane": "self",
-     "cc_ref": "4.4.3.2.8 3.3.6.3",
+     "cc_ref": "4.4.3.12 3.3.6.4",
      "enters_by": "archive_custody custodian holds the per-epoch archive key apart from the live roster",
      "signer": "affiliation officers / custodian",
      "model_ref": "mesh_life.MeshLife.tla:KeyEscrowed",
@@ -50383,7 +51899,7 @@
    "claims": [
     {
      "claim_id": "CLM-affiliations",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -50407,7 +51923,7 @@
     },
     {
      "claim_id": "CLM-affiliation-config-record",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -50431,7 +51947,7 @@
     },
     {
      "claim_id": "CLM-delegation-term",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -50463,7 +51979,7 @@
     },
     {
      "claim_id": "CLM-affiliation-one-voice-countersign",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "established",
      "join": "by_section",
      "evidence": [
@@ -50479,7 +51995,7 @@
     },
     {
      "claim_id": "CLM-affiliation-public-face",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -50491,7 +52007,7 @@
     },
     {
      "claim_id": "CLM-affiliation-dissolution",
-     "cc_ref": "4.4.3.2.8",
+     "cc_ref": "4.4.3.12",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -50507,14 +52023,14 @@
   "trust.entry.licensor": {
    "plane": "node",
    "state_predicate": "trust.entry=licensor",
-   "cc_ref": "4.4.3.8",
+   "cc_ref": "4.4.3.34",
    "added_in": 6,
    "states": [
     {
      "variable": "trust.entry",
      "state": "licensor",
      "plane": "node",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "enters_by": "delegates_to(reader → authority) bearing trust:accepts:v1, trust_classes absent",
      "signer": "reader",
      "model_ref": "trust_set.TrustSet.lean:licensor_of_licensor_at_depth_one",
@@ -50525,7 +52041,7 @@
    "claims": [
     {
      "claim_id": "CLM-trust-root",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -50569,7 +52085,7 @@
     },
     {
      "claim_id": "CLM-trust-set-members",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -50585,14 +52101,14 @@
   "trust.entry.root_removed": {
    "plane": "node",
    "state_predicate": "trust.entry=root_removed",
-   "cc_ref": "4.4.3.8",
+   "cc_ref": "4.4.3.34",
    "added_in": 6,
    "states": [
     {
      "variable": "trust.entry",
      "state": "root_removed",
      "plane": "node",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "enters_by": "the reader withdraws the shipped root's acceptance edge",
      "signer": "reader",
      "model_ref": "trust_set.TrustSet.lean:root_removed_board_stands",
@@ -50603,7 +52119,7 @@
    "claims": [
     {
      "claim_id": "CLM-trust-root",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -50647,7 +52163,7 @@
     },
     {
      "claim_id": "CLM-trust-set-members",
-     "cc_ref": "4.4.3.8",
+     "cc_ref": "4.4.3.34",
      "status": "staged",
      "join": "by_section",
      "evidence": [
@@ -50762,6 +52278,18 @@
        "ticket": "CIRISPersist#991"
       }
      ]
+    },
+    {
+     "claim_id": "CLM-goal-group-vote",
+     "cc_ref": "3.1.9.7",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1256"
+      }
+     ]
     }
    ],
    "promised_by": []
@@ -50866,6 +52394,18 @@
       {
        "kind": "staged",
        "ticket": "CIRISPersist#991"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-goal-group-vote",
+     "cc_ref": "3.1.9.7",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1256"
       }
      ]
     }
@@ -50974,6 +52514,18 @@
        "ticket": "CIRISPersist#991"
       }
      ]
+    },
+    {
+     "claim_id": "CLM-goal-group-vote",
+     "cc_ref": "3.1.9.7",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1256"
+      }
+     ]
     }
    ],
    "promised_by": []
@@ -51078,6 +52630,18 @@
       {
        "kind": "staged",
        "ticket": "CIRISPersist#991"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-goal-group-vote",
+     "cc_ref": "3.1.9.7",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1256"
       }
      ]
     }
@@ -51186,6 +52750,18 @@
        "ticket": "CIRISPersist#991"
       }
      ]
+    },
+    {
+     "claim_id": "CLM-goal-group-vote",
+     "cc_ref": "3.1.9.7",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1256"
+      }
+     ]
     }
    ],
    "promised_by": []
@@ -51193,14 +52769,14 @@
   "goal.recanted": {
    "plane": "goal",
    "state_predicate": "goal.state=recanted",
-   "cc_ref": "3.1.9.7 2.4.1.3",
+   "cc_ref": "3.1.9.7 2.4.1.4",
    "added_in": 6,
    "states": [
     {
      "variable": "goal.state",
      "state": "recanted",
      "plane": "goal",
-     "cc_ref": "3.1.9.7 2.4.1.3",
+     "cc_ref": "3.1.9.7 2.4.1.4",
      "enters_by": "declarer's recants",
      "signer": "declarer",
      "model_ref": "—",
@@ -51292,6 +52868,18 @@
        "ticket": "CIRISPersist#991"
       }
      ]
+    },
+    {
+     "claim_id": "CLM-goal-group-vote",
+     "cc_ref": "3.1.9.7",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1256"
+      }
+     ]
     }
    ],
    "promised_by": []
@@ -51380,6 +52968,18 @@
        "ticket": "CIRISPersist#991"
       }
      ]
+    },
+    {
+     "claim_id": "CLM-goal-group-vote",
+     "cc_ref": "3.1.9.7",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1256"
+      }
+     ]
     }
    ],
    "promised_by": []
@@ -51466,6 +53066,18 @@
       {
        "kind": "staged",
        "ticket": "CIRISPersist#991"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-goal-group-vote",
+     "cc_ref": "3.1.9.7",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1256"
       }
      ]
     }
@@ -51563,6 +53175,18 @@
       {
        "kind": "staged",
        "ticket": "CIRISPersist#991"
+      }
+     ]
+    },
+    {
+     "claim_id": "CLM-goal-group-vote",
+     "cc_ref": "3.1.9.7",
+     "status": "staged",
+     "join": "by_section",
+     "evidence": [
+      {
+       "kind": "staged",
+       "ticket": "CIRISPersist#1256"
       }
      ]
     }
@@ -52160,7 +53784,11 @@
  },
  "refusal_tokens": {
   "access_control_model": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
+  },
+  "accord_holder": {
+   "2.4.1.1": "after_refusal",
+   "2.6.1.7": "after_refusal"
   },
   "accountable_root": {
    "4.5.5": "bold"
@@ -52172,35 +53800,32 @@
    "3.1.3": "after_refusal"
   },
   "archive_custody": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "asserted_at_stale": {
-   "2.6.7": "bold",
-   "3.1.3": "after_refusal",
-   "3.3.4": "after_refusal"
+   "2.6.7": "bold"
   },
   "attestation_type_unregistered": {
    "2.4": "after_refusal",
    "5.3.6.1": "after_refusal"
   },
   "authority_id": {
-   "2.4.1.2.1": "bold",
-   "4.4.3.4": "after_refusal"
+   "2.4.1.3": "bold"
   },
   "av_call_frame_forged": {
-   "5.3.3.2": "after_refusal"
+   "5.3.3.5": "after_refusal"
   },
   "av_call_frame_unbound": {
-   "5.3.3.2": "after_refusal"
+   "5.3.3.5": "after_refusal"
   },
   "av_chunk_trailer_invalid": {
-   "5.3.3.2": "after_refusal"
+   "5.3.3.5": "after_refusal"
   },
   "av_chunk_trailer_missing": {
-   "5.3.3.2": "after_refusal"
+   "5.3.3.5": "after_refusal"
   },
   "av_chunk_unbound": {
-   "5.3.3.2": "after_refusal"
+   "5.3.3.5": "after_refusal"
   },
   "axiomatic_intent": {
    "4.5.1.1": "bold"
@@ -52215,16 +53840,15 @@
    "3.1.3": "after_refusal"
   },
   "breach_notification": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
+  },
+  "bundle_fingerprint": {
+   "8.11.24": "bold"
   },
   "canonical_binding": {
    "2.3.2.2": "bold"
   },
   "census_composite_below_k": {
-   "6.1.9": "after_refusal"
-  },
-  "census_expected_active_mismatch": {
-   "3.1.3": "after_refusal",
    "6.1.9": "after_refusal"
   },
   "census_partial_period_closed": {
@@ -52235,7 +53859,7 @@
    "6.1.9": "after_refusal"
   },
   "chain_of_custody": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "charter_digest": {
    "3.2": "bold"
@@ -52244,104 +53868,129 @@
    "4.5.1.1": "bold"
   },
   "classification_scheme": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "data_subject_access_grant": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
-  "delegates_to": {
-   "2.1": "after_refusal"
+  "deferral_response_unlicensed": {
+   "3.1.9.3": "after_refusal"
+  },
+  "deferral_response_unseated": {
+   "3.1.9.3": "after_refusal"
   },
   "delegation_term_required": {
    "2.4.1": "after_refusal",
-   "4.4.3.2": "after_refusal"
+   "4.4.3.12": "after_refusal"
   },
   "designated_officials": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "device_class": {
    "3.3.7": "bold"
   },
   "disclosure_accounting": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "disclosure_posture": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "envelope_member_missing": {
-   "2.6.1.7": "after_refusal"
+   "8.11.9": "after_refusal"
   },
   "envelope_member_null": {
-   "2.6.1.1": "after_refusal"
+   "2.6.1.2": "after_refusal",
+   "8.11.3": "after_refusal"
   },
   "erasure_policy": {
-   "4.4.3.2": "bold",
+   "4.4.3.12": "bold",
    "4.5.3": "after_refusal"
-  },
-  "evidence_reference_unresolved": {
-   "3.1.5.5": "after_refusal"
   },
   "federation_addressed_not_recipient": {
    "3.1.3": "after_refusal",
    "6.1.9": "after_refusal"
   },
   "federation_community_consensus_protocol_violation": {
-   "4.4.3.2": "after_refusal",
+   "4.4.3.6": "after_refusal",
    "4.5.13": "after_refusal"
   },
   "federation_malformed_row": {
-   "2.6.1.1": "after_refusal",
-   "2.6.1.7": "after_refusal",
+   "2.6.1.2": "after_refusal",
    "3.1.9.7": "after_refusal",
    "5.3.6.1": "after_refusal",
-   "6.1.1": "after_refusal"
+   "6.1.1": "after_refusal",
+   "8.11.3": "after_refusal",
+   "8.11.9": "after_refusal"
   },
   "federation_rendezvous_key_not_an_identity": {
    "3.1.4": "after_refusal"
   },
   "federation_set_semantics_unsorted": {
-   "2.6.1.1": "bold",
-   "2.6.1.7": "after_refusal",
-   "5.3.6.1": "after_refusal"
+   "2.6.1.2": "after_refusal",
+   "8.11.3": "bold",
+   "8.11.9": "after_refusal"
   },
   "federation_trace_dimension_invalid": {
    "3.4.5": "after_refusal"
   },
   "federation_withdraws_not_admitted": {
-   "2.6.1.7": "after_refusal"
+   "2.4.1.1": "after_refusal",
+   "8.11.9": "after_refusal"
   },
   "fold_source_count_exceeded": {
-   "6.1.2.1": "after_refusal"
+   "6.1.2.3": "after_refusal"
   },
   "goal_meta_alignment_malformed": {
    "3.1.9.7": "after_refusal"
   },
-  "identity_amendment_unauthorized": {
-   "3.1.5": "after_refusal"
+  "iat_mismatch": {
+   "2.6.1.11": "after_refusal"
+  },
+  "iat_missing": {
+   "2.6.1.11": "after_refusal"
+  },
+  "identity_amendment": {
+   "8.10": "bold"
   },
   "internal_normative_regime": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "is_named_moderator": {
    "4.5.5": "bold"
   },
+  "kat_outfox_xwing_v1": {
+   "5.4.6": "after_refusal"
+  },
+  "kat_split_and_seed_forms_agree": {
+   "5.4.6": "after_refusal"
+  },
   "key_grant": {
-   "2.4.1.2.1": "after_refusal"
+   "2.4.1.3": "after_refusal"
+  },
+  "key_record_bad_attestation_evidence": {
+   "4.2.2.1": "after_refusal"
+  },
+  "key_record_bad_pq_custody": {
+   "4.2.2.1": "after_refusal"
+  },
+  "key_record_out_of_window": {
+   "2.4.1.1": "after_refusal",
+   "2.6.1.7": "after_refusal"
   },
   "lawful_access": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "legal_hold": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "licence_class_not_trusted": {
-   "4.4.3.8": "after_refusal"
+   "4.4.3.34": "after_refusal"
   },
   "licence_issuer_not_trusted": {
-   "4.4.3.8": "after_refusal"
+   "4.4.3.34": "after_refusal"
   },
   "licensure_delegator_not_authority": {
-   "2.4.1.2.1": "bold"
+   "2.4.1.3": "bold"
   },
   "location_proof": {
    "4.5.9.1": "after_refusal"
@@ -52350,19 +53999,19 @@
    "3.1.2.1": "bold"
   },
   "mass_commitment": {
-   "6.1.2.1": "bold"
+   "6.1.2.3": "bold"
   },
   "member_attributes": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "member_commitment": {
-   "6.1.2.1": "after_refusal"
+   "6.1.2.2": "after_refusal"
   },
   "mesh_config": {
    "4.2.1.4": "after_refusal"
   },
   "minor_data_handling": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "missing_version_segment": {
    "3.1.7": "bold"
@@ -52374,7 +54023,9 @@
    "3.1.7": "bold"
   },
   "namespace_family_unregistered": {
-   "3.1.3": "after_refusal"
+   "3.1.3": "after_refusal",
+   "3.1.7": "after_refusal",
+   "3.4.11": "after_refusal"
   },
   "namespace_private_use_not_federatable": {
    "3.1.7": "bold"
@@ -52388,41 +54039,35 @@
   "onion_hop_x25519_reuse": {
    "3.3.6.2": "after_refusal"
   },
-  "owner_abandonment_window": {
-   "3.2": "bold"
-  },
-  "owner_of": {
-   "3.2": "after_refusal"
+  "preserve_response": {
+   "8.10": "bold"
   },
   "prev_head_digest": {
    "3.2": "bold"
   },
+  "purge_retraction_inadmissible": {
+   "4.5.3": "after_refusal"
+  },
   "purge_selection_count_mismatch": {
    "3.3.2": "after_refusal"
-  },
-  "purge_tombstoned": {
-   "4.5.3": "after_refusal"
   },
   "purge_unauthorised": {
    "2.4.1.1": "after_refusal"
   },
   "received_at": {
-   "5.3.3.6": "after_refusal"
+   "5.3.3.11": "after_refusal"
   },
   "retention_policy": {
-   "4.4.3.2": "bold"
+   "4.4.3.12": "bold"
   },
   "retention_priority": {
    "6.1.3": "bold"
   },
-  "revocation_envelope": {
-   "2.6.1.1": "after_refusal"
-  },
   "revoked_after": {
-   "2.4.1.1": "after_refusal"
+   "8.11.13": "after_refusal"
   },
   "revoked_key_sha256_ed25519_raw": {
-   "2.4.1.1": "bold"
+   "8.11.13": "bold"
   },
   "run_kind": {
    "3.1.5": "bold"
@@ -52433,16 +54078,10 @@
   },
   "sealed_descriptor": {
    "3.3.13": "bold",
-   "5.3.2.6": "after_refusal"
+   "5.3.2.12": "after_refusal"
   },
   "serve_seat_owner_unannounced": {
    "5.4.6": "after_refusal"
-  },
-  "serve_transit_pair_rotation_before_rebind": {
-   "3.1.3": "after_refusal"
-  },
-  "serve_transport_destinations": {
-   "5.3.4": "bold"
   },
   "session_claim_out_of_window": {
    "3.1.3.1": "after_refusal"
@@ -52450,8 +54089,17 @@
   "signed_at": {
    "5.3.1": "after_refusal"
   },
-  "subject_outside_audience": {
-   "2.1": "after_refusal"
+  "statement_invalid": {
+   "2.6.1.11": "after_refusal"
+  },
+  "statement_kid_not_iss": {
+   "2.6.1.11": "after_refusal"
+  },
+  "statement_no_role": {
+   "2.6.1.11": "after_refusal"
+  },
+  "statement_not_genesis_bundle": {
+   "2.6.1.11": "after_refusal"
   },
   "trace_field_shape_violation": {
    "3.1.5": "after_refusal"
@@ -52459,26 +54107,17 @@
   "trace_run_kind_mock": {
    "3.1.5": "after_refusal"
   },
-  "transit_kex_pubkeys": {
-   "3.3.6.2": "after_refusal"
-  },
-  "transport_rebind_without_holder_quorum": {
-   "3.1.3": "after_refusal"
-  },
   "trust_accepts_classes_malformed": {
-   "4.4.3.8": "after_refusal"
+   "4.4.3.34": "after_refusal"
   },
   "trust_accepts_depth_out_of_range": {
-   "4.4.3.8": "after_refusal"
-  },
-  "trust_root_head_stale": {
-   "3.2": "after_refusal"
+   "4.4.3.34": "after_refusal"
   },
   "trust_root_head_unnamed": {
    "3.2": "after_refusal"
   },
   "typed_diverges_from_envelope": {
-   "2.6.1.7": "after_refusal"
+   "8.11.9": "after_refusal"
   },
   "under_13": {
    "3.1.2": "after_refusal",
