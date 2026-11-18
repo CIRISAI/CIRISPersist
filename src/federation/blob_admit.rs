@@ -607,6 +607,8 @@ pub(crate) async fn put_delivery_receipt_planned<D: BlobFloorStore>(
     dir: &D,
     receipt: super::stream_receipt::DeliveryReceipt,
 ) -> Result<(), BlobError> {
+    super::edition2::door::refuse_earlier_form("delivery_receipt")
+        .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
     // Step 1: the subscriber's hybrid signature. Necessary, NOT sufficient.
     super::stream_receipt::verify_receipt_signature(dir, &receipt).await?;
     let k_i64 = i64::try_from(receipt.k)

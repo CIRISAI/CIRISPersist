@@ -271,6 +271,7 @@ pub async fn admit_replicated_accord_evidence(
     directory: &dyn FederationDirectory,
     evidence: &AccordQuorumEvidence,
 ) -> Result<AccordEvidenceAdmission, Error> {
+    super::edition2::door::refuse_earlier_form("accord_evidence")?;
     admit_replicated_accord_evidence_over_roster(
         directory,
         evidence,

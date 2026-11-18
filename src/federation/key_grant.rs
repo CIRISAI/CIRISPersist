@@ -2764,6 +2764,7 @@ pub async fn admit_replicated_key_grant<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
+    super::edition2::door::refuse_earlier_form("key_grant")?;
     use crate::federation::attestation_apply::AttestationRefusalReason;
 
     let row = signed.attestation;

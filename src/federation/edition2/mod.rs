@@ -42,6 +42,8 @@ pub(crate) mod codec;
 #[cfg(test)]
 mod door_invariants;
 #[cfg(test)]
+mod earlier_form_refusal_invariants;
+#[cfg(test)]
 mod genesis_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod genesis_store_invariants;

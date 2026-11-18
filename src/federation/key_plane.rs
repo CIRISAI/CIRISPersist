@@ -1142,6 +1142,7 @@ pub(crate) async fn put_revocation_planned<D>(
 where
     D: KeyPlaneStore,
 {
+    super::edition2::door::refuse_earlier_form("revocation")?;
     // A byte-identical re-offer of a held revocation settles before any verify
     // (the #672 rule): the whole record, not its id — a relay's re-pasted
     // column under a held id must still meet the binding gate.
@@ -1828,6 +1829,7 @@ pub(crate) async fn key_record_write_planned<D>(
 where
     D: KeyPlaneStore,
 {
+    super::edition2::door::refuse_earlier_form("key_record")?;
     match plan_key_record_write(dir, write, crate::host::clock::now()).await? {
         KeyRecordPlan::Settled => Ok(KeyRecordWritten::Settled),
         KeyRecordPlan::Write(planned) => {
@@ -1875,6 +1877,7 @@ pub(crate) async fn apply_replicated_key_record_planned<D>(
 where
     D: KeyPlaneStore,
 {
+    super::edition2::door::refuse_earlier_form("key_record")?;
     use super::register::{KeyRefusalReason, ReplicatedKeyOutcome as O, ReplicatedKeyPlan as P};
     const RACED: O = O::Refused {
         reason: KeyRefusalReason::StoreConflict,

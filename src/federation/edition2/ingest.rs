@@ -526,3 +526,80 @@ where
 
 /// The tier replication and tier ingest deliver at.
 pub const INGEST_TIER: &str = attestation_tier::FEDERATION;
+
+/// v62.0.0 (JSON-cut slice A) — what [`apply_replicated_statement`] did with
+/// one statement a peer offered. A `Refused` is a policy outcome that
+/// ADVANCES the replication cursor (the lost-race `StoreConflict`, fail
+/// closed, safe to re-offer); a waiting statement is never an outcome: it is
+/// the retryable `federation_attester_key_unknown` error, and the cursor
+/// stays where it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicatedStatementOutcome {
+    /// The statement was new here and is kept ([`StatementOutcome`] says
+    /// where).
+    Admitted(StatementOutcome),
+    /// This node already held the statement byte for byte: nothing changed.
+    Unchanged(StatementOutcome),
+    /// The statement was not kept and the store is untouched.
+    Refused {
+        /// Which branch refused.
+        reason: crate::federation::attestation_apply::AttestationRefusalReason,
+    },
+}
+
+impl ReplicatedStatementOutcome {
+    /// Does this outcome advance the sender's cursor? Every outcome does;
+    /// only an `Err` (a statement waiting on a key, a backend failure) holds
+    /// it. Spelled out for the replication loop.
+    #[must_use]
+    pub const fn advances_cursor(&self) -> bool {
+        true
+    }
+}
+
+/// v62.0.0 (JSON-cut slice A) — **the replicated statement door**: one
+/// edition-2 statement as a peer delivered it, under the id the peer offered
+/// it as (`offered_id`), at tier `federation` ([`INGEST_TIER`]), through
+/// [`put_statement`] and so through every gate the local door runs.
+///
+/// - an id the bytes do not name is `row_id_mismatch` (terminal);
+/// - a statement whose signer's key record is not held waits:
+///   `federation_attester_key_unknown`, retryable, and the cursor must NOT
+///   advance past it;
+/// - a key conflict the plan did not see (a duplicate key in the store, a
+///   key-record conflict) is `Refused { StoreConflict }`: fail closed, the
+///   held rows untouched, safe to re-offer;
+/// - every other gate refusal keeps its typed [`Error`].
+///
+/// # Errors
+/// As above.
+pub async fn apply_replicated_statement<F>(
+    dir: &F,
+    bytes: &[u8],
+    offered_id: &Digest32,
+) -> Result<ReplicatedStatementOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use crate::federation::attestation_apply::AttestationRefusalReason;
+    match put_statement(dir, bytes, Some(offered_id), INGEST_TIER).await {
+        Ok(out) => {
+            let new = match &out {
+                StatementOutcome::KeyPlane { new, .. }
+                | StatementOutcome::Voice { new, .. }
+                | StatementOutcome::Row { new, .. } => *new,
+            };
+            Ok(if new {
+                ReplicatedStatementOutcome::Admitted(out)
+            } else {
+                ReplicatedStatementOutcome::Unchanged(out)
+            })
+        }
+        Err(Error::Conflict(_) | Error::KeyRecordConflict { .. }) => {
+            Ok(ReplicatedStatementOutcome::Refused {
+                reason: AttestationRefusalReason::StoreConflict,
+            })
+        }
+        Err(e) => Err(e),
+    }
+}

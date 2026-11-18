@@ -422,6 +422,7 @@ pub(crate) async fn apply_planned<D>(
 where
     D: super::FederationDirectory + ?Sized,
 {
+    super::edition2::door::refuse_earlier_form_row("attestation", &attestation.attestation)?;
     use super::precedence;
     use ReplicatedAttestationOutcome as Outcome;
     use ReplicatedAttestationPlan as Plan;

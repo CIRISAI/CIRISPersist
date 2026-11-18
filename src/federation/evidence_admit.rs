@@ -121,6 +121,7 @@ pub(crate) async fn put_location_proof_planned<D: EvidenceStore>(
     dir: &D,
     proof: SignedLocationProof,
 ) -> Result<(), Error> {
+    super::edition2::door::refuse_earlier_form("location_proof")?;
     // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
     // before any verification.
     if super::replication_policy::settle_if_held(
@@ -213,6 +214,7 @@ pub(crate) async fn put_touch_claim_planned<D: EvidenceStore>(
     dir: &D,
     claim: &SignedTouchClaim,
 ) -> Result<TouchApplyOutcome, Error> {
+    super::edition2::door::refuse_earlier_form("touch_claim")?;
     // v21.6.0 (#519 item 2a-iii) — verify-before-mutation: the full hybrid
     // admission gate, THEN the future-skew guard, THEN the monotonic-max
     // merge.

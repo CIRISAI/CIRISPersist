@@ -2638,6 +2638,7 @@ pub async fn apply_replicated_purge<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    super::edition2::door::refuse_earlier_form("purge")?;
     let now = purge_clock();
     let (terms, _signers) = authorise_at(directory, &bundle.notice, now).await?;
     let mut records = Vec::with_capacity(bundle.record_ids.len());

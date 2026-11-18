@@ -83,6 +83,7 @@ pub(crate) async fn put_family_planned<D: FamilyStore>(
     dir: &D,
     family: SignedFamily,
 ) -> Result<(), Error> {
+    super::edition2::door::refuse_earlier_form("family")?;
     // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any other
     // admission step.
     super::verify_family_admission(dir, &family).await?;
@@ -127,6 +128,7 @@ pub(crate) async fn put_family_membership_revocation_planned<D: FamilyStore>(
     dir: &D,
     mut revocation: SignedFamilyMembershipRevocation,
 ) -> Result<(), Error> {
+    super::edition2::door::refuse_earlier_form("family")?;
     // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship first.
     super::verify_family_membership_revocation_admission(dir, &revocation).await?;
     let offered = GroupSigned::FamilyRevocation(revocation.clone());
@@ -185,6 +187,7 @@ pub(crate) async fn put_family_membership_widening_planned<D: FamilyStore>(
     dir: &D,
     mut widening: SignedFamilyMembershipWidening,
 ) -> Result<(), Error> {
+    super::edition2::door::refuse_earlier_form("family")?;
     super::verify_family_membership_widening_admission(dir, &widening).await?;
     let offered = GroupSigned::FamilyWidening(widening.clone());
     let row = &widening.family_membership_widening;

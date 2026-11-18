@@ -90,6 +90,7 @@ pub(crate) async fn put_accord_proposal_planned<D: AccordStore>(
     proposal: AccordProposal,
     authority_signature: Option<serde_json::Value>,
 ) -> Result<(), Error> {
+    super::edition2::door::refuse_earlier_form("accord_quorum")?;
     let received_at = crate::host::clock::now();
     let last = dir.last_accord_proposal_created_at().await?;
     let created_at = super::types::monotonic_admission_instant(received_at, last);
@@ -108,6 +109,7 @@ pub(crate) async fn put_accord_participation_planned<D: AccordStore>(
     participation: AccordParticipation,
     standing_roster: &[ThresholdMember],
 ) -> Result<(), Error> {
+    super::edition2::door::refuse_earlier_form("accord_quorum")?;
     // The proposal MUST exist: verify-before-mutation needs it to verify the
     // participation's binding.
     let stored = dir
@@ -145,6 +147,7 @@ pub(crate) async fn put_accord_decision_planned<D: AccordStore>(
     dir: &D,
     decision: AccordDecision,
 ) -> Result<(), Error> {
+    super::edition2::door::refuse_earlier_form("accord_quorum")?;
     let received_at = crate::host::clock::now();
     let prep = accord_quorum::prepare_decision(&decision, received_at)?;
     let digest = prep.proposal_digest.clone();

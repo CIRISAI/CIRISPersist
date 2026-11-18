@@ -155,6 +155,7 @@ pub(crate) async fn put_community_planned<D>(
 where
     D: CommunityStore,
 {
+    super::edition2::door::refuse_earlier_form("community")?;
     // Test-only (PR #921 review, F3): a rival write that won the race lands
     // here, after any read the caller made and before this write's own gates
     // and reads.
@@ -219,6 +220,7 @@ pub(crate) async fn apply_replicated_community_planned<D>(
 where
     D: CommunityStore,
 {
+    super::edition2::door::refuse_earlier_form("community")?;
     // v61 (CIRISPersist#1148) — the put-time audience precondition, as on the
     // attestation plane: a record this node may not receive is refused by
     // name before any door runs.
@@ -320,6 +322,7 @@ pub(crate) async fn put_community_membership_revocation_planned<D>(
 where
     D: CommunityStore,
 {
+    super::edition2::door::refuse_earlier_form("community")?;
     // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door, and
     // the row's signed instant.
     let instants = PlanInstants {
@@ -526,6 +529,7 @@ pub(crate) async fn put_community_membership_widening_planned<D>(
 where
     D: CommunityStore,
 {
+    super::edition2::door::refuse_earlier_form("community")?;
     // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door, and
     // the row's signed instant.
     let instants = PlanInstants {

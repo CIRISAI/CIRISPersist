@@ -255,6 +255,7 @@ pub(crate) async fn grant_trust_planned<D>(dir: &D, signed: SignedTrustGrant) ->
 where
     D: ConsentStore + FederationDirectory,
 {
+    super::edition2::door::refuse_earlier_form("trust_grant")?;
     let row = plan_grant_trust(dir, signed, crate::host::clock::now()).await?;
     let key = row.key.clone();
     if dir.store_planned_trust_grant(row).await? {
@@ -277,6 +278,7 @@ pub(crate) async fn revoke_trust_planned<D>(
 where
     D: ConsentStore + FederationDirectory,
 {
+    super::edition2::door::refuse_earlier_form("trust_grant")?;
     if revocation.key.is_empty() {
         return Err(Error::InvalidArgument("key must be non-empty".into()));
     }

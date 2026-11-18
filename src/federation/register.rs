@@ -551,6 +551,7 @@ pub(crate) async fn plan_replicated_key_apply(
     directory: &dyn FederationDirectory,
     record: &KeyRecord,
 ) -> Result<ReplicatedKeyPlan, Error> {
+    super::edition2::door::refuse_earlier_form("key_record")?;
     let Some(existing) = directory.lookup_public_key(&record.key_id).await? else {
         return Ok(ReplicatedKeyPlan::Insert);
     };

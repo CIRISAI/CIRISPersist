@@ -347,3 +347,79 @@ pub fn raw_payload(bytes: &[u8]) -> Option<Vec<u8>> {
     };
     inner.as_array()?.get(2)?.as_bytes().map(<[u8]>::to_vec)
 }
+
+/// v62.0.0 (JSON-cut slice A; CC 2.6.1.12, rc20 "nothing carries, clean
+/// mesh") — **THE switch that shuts the earlier-form doors.** While it is
+/// `false` every JSON door admits as before; slice F flips it to `true`, in
+/// this one place, and every door wired to [`refuse_earlier_form`] refuses
+/// an earlier-form object by name ([`token::EARLIER_FORM_OBJECT`]).
+pub const EARLIER_FORM_DOORS_SHUT: bool = false;
+
+#[cfg(test)]
+tokio::task_local! {
+    /// A test forces the switch on for the future it scopes
+    /// ([`with_earlier_form_doors_shut`]), so a witness can assert each
+    /// door's refusal before F flips [`EARLIER_FORM_DOORS_SHUT`].
+    static FORCE_SHUT: bool;
+}
+
+/// Is the earlier form shut at this node's doors?
+#[must_use]
+pub fn earlier_form_doors_shut() -> bool {
+    #[cfg(test)]
+    if FORCE_SHUT.try_with(|f| *f).unwrap_or(false) {
+        return true;
+    }
+    EARLIER_FORM_DOORS_SHUT
+}
+
+/// Test only: run `fut` with the switch forced on.
+#[cfg(test)]
+pub(crate) async fn with_earlier_form_doors_shut<T>(
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    FORCE_SHUT.scope(true, fut).await
+}
+
+/// **The one shared refusal every earlier-form door calls** (v62.0.0,
+/// JSON-cut slice A). `plane` names the door. It is inert until
+/// [`EARLIER_FORM_DOORS_SHUT`] is `true`; then it refuses
+/// [`token::EARLIER_FORM_OBJECT`] (`federation_malformed_row`, Python
+/// `ValueError`), before any parse or verify of the object.
+///
+/// # Errors
+/// [`token::EARLIER_FORM_OBJECT`] once the doors are shut.
+pub fn refuse_earlier_form(plane: &'static str) -> Result<(), Error> {
+    if earlier_form_doors_shut() {
+        return Err(Error::malformed_row(
+            plane,
+            token::EARLIER_FORM_OBJECT,
+            format!(
+                "an object of the earlier form (a JSON object signed over its JCS image, CC 8.11) \
+                 at the `{plane}` door: a node of this form reads this form only; offer the \
+                 edition-2 statement (CC 2.6.1.12)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// [`refuse_earlier_form`] for a row at the attestation plane: a row that
+/// carries its edition-2 statement (`ceg_statement`) is the edition-2 door's
+/// mapping, never an earlier-form object, and passes.
+///
+/// # Errors
+/// As [`refuse_earlier_form`].
+pub fn refuse_earlier_form_row(
+    plane: &'static str,
+    row: &crate::federation::types::Attestation,
+) -> Result<(), Error> {
+    if row
+        .attestation_envelope
+        .get(super::ingest::STATEMENT_MEMBER)
+        .is_some()
+    {
+        return Ok(());
+    }
+    refuse_earlier_form(plane)
+}

@@ -164,6 +164,7 @@ pub(crate) async fn put_signed_transport_destination_planned<D: TransportStore>(
     dir: &D,
     signed: &SignedTransportDestination,
 ) -> Result<Outcome, Error> {
+    super::edition2::door::refuse_earlier_form("transport_destination")?;
     // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
     // before any verification.
     if super::replication_policy::settle_if_held(

@@ -125,6 +125,7 @@ pub(crate) async fn put_identity_occurrence_planned<D: OccurrenceStore>(
     dir: &D,
     occurrence: SignedIdentityOccurrence,
 ) -> Result<(), Error> {
+    super::edition2::door::refuse_earlier_form("identity_occurrence")?;
     // v14.0.0 (CIRISPersist#418) — the hybrid signature over the exact
     // producer envelope, the signer's authority and §5.6.8.8.2 C4 key
     // separation, BEFORE any write. One gate for HTTP and the wire.

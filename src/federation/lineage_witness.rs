@@ -166,6 +166,7 @@ pub async fn admit_lineage_head_cosign<F>(
 where
     F: crate::federation::FederationDirectory + ?Sized,
 {
+    super::edition2::door::refuse_earlier_form("lineage_head_cosign")?;
     let refused = |reason: LineageCosignRefusal| Ok(LineageCosignOutcome::Refused { reason });
     // 0. shape
     let hex64 = |s: &str| {

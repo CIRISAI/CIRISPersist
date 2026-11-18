@@ -435,6 +435,7 @@ pub(crate) async fn put_attestation_planned<D>(
 where
     D: AttestationStore,
 {
+    super::edition2::door::refuse_earlier_form_row("attestation", &attestation.attestation)?;
     // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row goes to its
     // family's door: proof of possession, not resolve-the-attester; the
     // object's own signature, not one over the row's envelope.
