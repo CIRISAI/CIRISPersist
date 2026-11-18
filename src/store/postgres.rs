@@ -11184,9 +11184,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v62.0.0 (JSON-cut slice B) — the statement-id wire index.
         if kind == crate::federation::edition2::store::STATEMENT_KIND {
             let after = after_content_hash.and_then(crate::federation::edition2::store::id_of_hex);
-            return self
-                .edition2_statement_ids_since(after.as_ref(), limit)
-                .await;
+            return crate::federation::edition2::store::served_statement_ids_since(
+                self,
+                after.as_ref(),
+                limit,
+            )
+            .await;
         }
         let after = after_content_hash.unwrap_or("");
         let lim = i64::from(limit);

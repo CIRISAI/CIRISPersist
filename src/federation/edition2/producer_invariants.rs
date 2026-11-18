@@ -48,21 +48,23 @@ pub(crate) mod bodies {
         to: &Engine,
         cursor: &mut Option<StatementCursor>,
     ) -> Vec<Vec<u8>> {
+        // Served to B as B (the filtered listing: the serve rule plus B's
+        // audience), never read out of A's store.
+        let requester = to.local_derived_key_id().await.ok();
         let mut out = Vec::new();
         loop {
             let page = from
-                .federation_directory()
-                .edition2_statements_since(cursor.as_ref(), 100)
+                .edition2_statements_served_to(cursor.as_ref(), 100, requester.as_deref())
                 .await
                 .expect("A serves its statements");
-            if page.is_empty() {
+            if page.next.is_none() {
                 return out;
             }
-            for served in page {
+            *cursor = page.next;
+            for served in page.statements {
                 to.put_edition2_statement(&served.bytes, None)
                     .await
                     .unwrap_or_else(|e| panic!("B admits A's statement: {e}"));
-                *cursor = Some(served.cursor);
                 out.push(served.bytes);
             }
         }
@@ -503,6 +505,153 @@ pub(crate) mod serving_bodies {
     }
 }
 
+/// I2210 — the serve filter: a private (`self`) row is served to its author
+/// and not to a stranger, nor to an anonymous read; a commons row is served
+/// to all; the key plane is public. The room arm is the receiver-side
+/// audience test with the requester as the party (`is_audience_of`).
+pub(crate) mod filter_bodies {
+    use super::bodies::node;
+    use crate::federation::edition2::serve::servable_to;
+    use crate::federation::edition2::store::{ROW_KIND, STATEMENT_KIND};
+    use crate::federation::types::{cohort_scope, identity_type};
+
+    fn input(scope: &str) -> crate::federation::EmitAttestationInput {
+        crate::federation::EmitAttestationInput::with_envelope(
+            "scores",
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+                "dimension": "observation:reachability:v1",
+                "score": 0.25,
+            }))
+            .unwrap(),
+            scope,
+        )
+    }
+
+    pub(crate) async fn i2210_the_serve_filter(dsn: &str, tag: &str) {
+        let a = node(dsn, &format!("{tag}-2210-a")).await;
+        let me = a
+            .register_self_federation_key(identity_type::USER, None, None)
+            .await
+            .unwrap();
+        let stranger =
+            "urn:ietf:params:oauth:ckt:sha-256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let private = a
+            .emit_attestation_self(input(cohort_scope::SELF))
+            .await
+            .expect("I2210: a private (self) row is admitted");
+        let commons = a
+            .emit_attestation_self(input(cohort_scope::FEDERATION))
+            .await
+            .unwrap();
+        let dir = a.federation_directory();
+        let st = |rid: String| {
+            let dir = dir.clone();
+            async move {
+                let row = dir.get_attestation(&rid).await.unwrap().unwrap();
+                crate::federation::edition2::emit::carried_statement(&row).unwrap()
+            }
+        };
+        let (p, c) = (st(private.clone()).await, st(commons.clone()).await);
+        assert!(
+            servable_to(&*dir, &p, Some(&me)).await.unwrap(),
+            "I2210: to its author"
+        );
+        assert!(
+            !servable_to(&*dir, &p, Some(stranger)).await.unwrap(),
+            "I2210: not to a stranger"
+        );
+        assert!(
+            !servable_to(&*dir, &p, None).await.unwrap(),
+            "I2210: not anonymously"
+        );
+        for r in [Some(stranger), Some(me.as_str()), None] {
+            assert!(
+                servable_to(&*dir, &c, r).await.unwrap(),
+                "I2210: commons to {r:?}"
+            );
+        }
+        // The listing and the point reads apply it.
+        let listed = |r: Option<String>| {
+            let a = &a;
+            async move {
+                a.edition2_statements_served_to(None, 1000, r.as_deref())
+                    .await
+                    .unwrap()
+                    .statements
+                    .into_iter()
+                    .map(|s| s.bytes)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let to_me = listed(Some(me.clone())).await;
+        let to_stranger = listed(Some(stranger.to_owned())).await;
+        assert!(
+            to_me.contains(&p) && to_me.contains(&c),
+            "I2210: the author is served both"
+        );
+        assert!(
+            !to_stranger.contains(&p),
+            "I2210: the stranger is not served the private row"
+        );
+        assert!(to_stranger.contains(&c));
+        assert!(
+            to_stranger.iter().any(
+                |s| crate::federation::edition2::emit::family_of_statement(s)
+                    .is_some_and(|(f, _)| f == "key:record")
+            ),
+            "I2210: the key plane is public"
+        );
+        assert_eq!(
+            dir.lookup_signed_record_by_content_hash(ROW_KIND, &private)
+                .await
+                .unwrap(),
+            None,
+            "I2210: the anonymous point read withholds the private row"
+        );
+        assert_eq!(
+            dir.lookup_signed_record_by_content_hash(ROW_KIND, &commons)
+                .await
+                .unwrap(),
+            Some(c.clone())
+        );
+        let ids = dir
+            .list_wire_hashes_since(STATEMENT_KIND, None, 1000)
+            .await
+            .unwrap();
+        let mut served = Vec::new();
+        for id in &ids {
+            served.push(
+                dir.lookup_signed_record_by_content_hash(STATEMENT_KIND, id)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(
+            !served.contains(&Some(p.clone())),
+            "I2210: the wire index withholds it"
+        );
+        assert!(served.contains(&Some(c)));
+    }
+
+    #[test]
+    fn i2210_the_room_arm_is_membership() {
+        use crate::federation::replication::hold::is_audience_of;
+        let members: std::collections::HashSet<String> = ["room-1".to_owned()].into();
+        assert!(is_audience_of(
+            cohort_scope::COMMUNITY,
+            Some("room-1"),
+            false,
+            &members
+        ));
+        assert!(!is_audience_of(
+            cohort_scope::COMMUNITY,
+            Some("room-1"),
+            false,
+            &std::collections::HashSet::new()
+        ));
+    }
+}
+
 /// I2208 — the hash-digest round trip, and the holding claim as a statement.
 pub(crate) mod digest_bodies {
     use super::bodies::{deliver, node, served};
@@ -743,5 +892,22 @@ mod tests {
             return;
         };
         super::serving_bodies::i2209_served_by_statement_and_row_id(&a, &tag()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i2210_sqlite() {
+        let d = tempfile::tempdir().unwrap();
+        super::filter_bodies::i2210_the_serve_filter(&sqlite_dsn(&d, "a"), &tag()).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i2210_postgres() {
+        let Some(a) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i2210 postgres: SKIPPED");
+            return;
+        };
+        super::filter_bodies::i2210_the_serve_filter(&a, &tag()).await;
     }
 }

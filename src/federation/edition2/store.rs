@@ -630,7 +630,8 @@ where
             let Some(id) = id_of_hex(id_hex) else {
                 return Ok(Some(None));
             };
-            Ok(Some(dir.edition2_statement(&id).await?))
+            let held = dir.edition2_statement(&id).await?;
+            Ok(Some(served_anonymously(dir, held).await?))
         }
         ROW_KIND => {
             let Some(id) = id_of_hex(id_hex) else {
@@ -639,20 +640,67 @@ where
             // The statement that admitted the row (its mapped row carries
             // it); a key-plane row, which maps to no typed row, is served by
             // its first voice.
-            if let Some(row) = dir.get_attestation(id_hex).await? {
-                if let Some(st) = super::emit::carried_statement(&row) {
-                    return Ok(Some(Some(st)));
-                }
-            }
-            Ok(Some(
-                dir.edition2_voices(&super::names::RowId(id))
+            let held = match dir.get_attestation(id_hex).await? {
+                Some(row) => super::emit::carried_statement(&row),
+                None => None,
+            };
+            let held = match held {
+                Some(st) => Some(st),
+                None => dir
+                    .edition2_voices(&super::names::RowId(id))
                     .await?
                     .into_iter()
                     .next(),
-            ))
+            };
+            Ok(Some(served_anonymously(dir, held).await?))
         }
         _ => Ok(None),
     }
+}
+
+/// The point read and the wire index are anonymous (no requester is named
+/// at this surface): a statement is served only when an anonymous read may
+/// be served it ([`super::serve::servable_to`] with no requester: the
+/// commons, the key plane and signed objects).
+async fn served_anonymously<F>(
+    dir: &F,
+    held: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    match held {
+        Some(st) if super::serve::servable_to(dir, &st, None).await? => Ok(Some(st)),
+        _ => Ok(None),
+    }
+}
+
+/// **The statement-id wire index, filtered**: [`FederationDirectory::edition2_statement_ids_since`]
+/// with each id kept only when an anonymous read may be served its statement.
+///
+/// [`FederationDirectory::edition2_statement_ids_since`]: crate::federation::FederationDirectory::edition2_statement_ids_since
+///
+/// # Errors
+/// Directory reads.
+pub async fn served_statement_ids_since<F>(
+    dir: &F,
+    after: Option<&[u8; 32]>,
+    limit: u32,
+) -> Result<Vec<String>, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    let mut out = Vec::new();
+    for id in dir.edition2_statement_ids_since(after, limit).await? {
+        let Some(raw) = id_of_hex(&id) else { continue };
+        if served_anonymously(dir, dir.edition2_statement(&raw).await?)
+            .await?
+            .is_some()
+        {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// sqlite: one held statement by its statement id.

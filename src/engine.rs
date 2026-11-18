@@ -9765,6 +9765,30 @@ impl Engine {
         })
     }
 
+    /// v62.0.0 (JSON-cut slice B) — the edition-2 serve listing a REQUESTER
+    /// may be handed: [`statements_served_to`], the JSON listing's serve rule
+    /// (tier, row type, purge plane) plus the requester's audience
+    /// ("never serve what the requester is not party to"). `requester` is
+    /// the identity the transport authenticated; `None` serves the commons
+    /// only. Hosts serve through this, never the raw store listing.
+    ///
+    /// [`statements_served_to`]: crate::federation::edition2::serve::statements_served_to
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn edition2_statements_served_to(
+        &self,
+        cursor: Option<&crate::federation::edition2::store::StatementCursor>,
+        limit: u32,
+        requester: Option<&str>,
+    ) -> Result<crate::federation::edition2::serve::ServedPage, crate::federation::Error> {
+        crate::federation::edition2::serve::statements_served_to(
+            self.federation_directory().as_ref(),
+            cursor,
+            limit,
+            requester,
+        )
+        .await
+    }
+
     /// v62.0.0 (slice E2a, CIRISPersist#1274; CC 2.6.1, 2.6.1.12) — **the
     /// edition-2 statement door**, local or replicated: one `COSE_Sign1`
     /// statement as received. It runs the edition-2 door, which:

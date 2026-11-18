@@ -36,6 +36,7 @@ pub mod liveness;
 pub mod names;
 pub mod produce;
 pub mod projection;
+pub mod serve;
 pub mod store;
 
 #[cfg(test)]
