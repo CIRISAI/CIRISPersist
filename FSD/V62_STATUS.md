@@ -122,7 +122,40 @@ Both shutdown slices were stopped at spin-down. Neither compiles yet, so the pre
 
 The 61.4 removal-floor work-in-progress (commits after v61.4.0 on `w614-lts-floor`). It is unreviewed and was never merged; re-target it to the kernel model before using it.
 
-## Remaining to the v62 tag: plan, order and checkpoints
+## Parallel write wave (2026-11-18): current state, read this first
+
+The plan below was replaced by a **no-build parallel wave**. Up to 20+ agents write code without compiling, and a single integration lane builds. The machine allows ONE heavy build at a time, coordinated through the CIRISServer session; ask it for a slot first.
+
+- **The rules every agent follows:** `FSD/v62_wip/parallel/CONTRACT.md`.
+- **Deliverables:** every agent's patch, notes and API files are in `FSD/v62_wip/parallel/` (`<ID>.patch`, `<ID>.md`, `<ID>.api.md`).
+- **Bases:**
+  - slice A committed: `v62-cut-a@23c0d30a`;
+  - slice B committed: `v62-cut-b@4deb020f`;
+  - the integration tree is built by X2's scripts (`X2-integrate.sh`, `X2-fixes.sh`, `X2-resolve.py`) on top of A and B (worktree `/home/emoore/CIRISPersist-wx2`). Patches named `*-cutb*` apply after B.
+- **Production patches:**
+  - genesis bundle/2, boot and the Verify pin: C1–C5;
+  - host surfaces: D1–D3;
+  - test codec: E0;
+  - kernel pass 2: K1, K2;
+  - payloads and the door: P1e (cumulative), P2/P2b/P2c, P3, P4, P5/P5b/P5c, P6, P7 (composite traces), P8 (remaining re-signing paths and producers);
+  - typed projections: T1, T2;
+  - occurrences: O1;
+  - counted voices / Pending: V1 (V1-onX2);
+  - trust root: W1/W1b;
+  - shutting the earlier form: F0 (F0-onX1 and F0-switch at CP2 only).
+- **Test fixture flip:** E1–E13, each owning files, with held tests wrapped in `with_earlier_form_async`.
+- **CC 2.7 migration (Eric: all of it in v62):** the door refuses only on the statement's own bytes and the signer's key plane. Every other-row condition is held and concludes nothing, with a reason. G0 is the architect (mechanism); G1–G3 audit every gate; a conversion fan-out follows.
+- **Verify:** v62 pins Verify 23.3.1, re-vendored at CC's non-release tag `v1.0-rc21-wire`. All `TODO(verify-rc21)` door overrides MUST be removed at that re-pin, before the tag.
+- **Rulings made today:** in the memory log `project_final_refactor_fsd.md`, and in the agents' `.md` notes. The key ones:
+  - a key embedded in a family name is its bare thumbprint;
+  - key-record coverage is half-open, and `valid_until_not_after_asserted_at` is refused;
+  - an occurrence binds its own identity, with the person/machine exclusion on every door;
+  - a trust grant is `trust:accepts:v1`;
+  - an affiliation owner binding and an officer appointment are counted voices;
+  - a replicating trace is composite;
+  - an amendment is held, not refused.
+
+## Remaining to the v62 tag: plan, order and checkpoints (SUPERSEDED in part by the wave above)
 
 Durations are effort estimates for one agent working on a cold build, not dates. Two cargo builds at a time is the machine limit that set the parallelism.
 
