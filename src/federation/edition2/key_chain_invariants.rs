@@ -14,9 +14,13 @@
 //! - A predecessor record that does not cover the rotation's instant hands
 //!   on nothing.
 //! - Two rotations of one predecessor record, neither naming the other,
-//!   hand on nothing.
+//!   hand on nothing; a "rival" whose named record does not cover its
+//!   instant is no rival and blocks nothing.
 //! - A `key:record` about a key that only ANOTHER key signed never makes it
 //!   a key of the signer's identity.
+//! - A key the accord's genesis bundle in force seats for a holder is that
+//!   holder's (a recovery has no rotation record); with no bundle held it
+//!   waits; seated for one holder, it is not another's.
 //! - A `key:revocation` is honoured only when its signer's key is of the
 //!   `iss` whose standing is asked.
 //! - The same at the store door (`put_statement`), on sqlite and postgres.
@@ -30,7 +34,7 @@ use ciris_verify_core::edition2::{cose_key, sign_row_statement};
 
 use super::door::admit_row;
 use super::door_invariants::fixture::*;
-use super::liveness::{ChainMissing, HeldKeys, KeyOf, Liveness, RevokerStanding};
+use super::liveness::{BundleSeats, ChainMissing, HeldKeys, KeyOf, Liveness, RevokerStanding};
 use super::names::RowId;
 use crate::federation::{malformed_row, Error};
 
@@ -296,6 +300,44 @@ fn i2101_two_rotations_of_one_record_hand_on_nothing() {
 }
 
 #[test]
+fn i2101_a_rival_that_its_named_record_does_not_cover_blocks_nothing() {
+    let (g, n, m) = (key(124), key(125), key(126));
+    // g's first node record covers [0, 1_500]; a second covers [1_600, ...].
+    let first = key_record(&g, &["node"], 0, Some(1_500));
+    let second = key_record(&g, &["node"], 1_600, Some(1_600 + 1_000_000));
+    let t = rid(&first);
+    let mut held = HeldKeys::new();
+    for st in [
+        first,
+        second,
+        // The rotation to n at 1_000, inside `first`.
+        record_under(&n, &n, &iref(&g), 1_000, Some(&t)),
+        record_under(&g, &n, &iref(&g), 1_000, Some(&t)),
+    ] {
+        held.insert_record(st);
+    }
+    assert_eq!(
+        held.key_of(&kid(&n), &kid(&g)),
+        KeyOf::Yes,
+        "I2101 rotation"
+    );
+    // A "rival" at 2_000 names `first`, which does not cover 2_000 (g's
+    // statement is valid then only through `second`): no rival.
+    held.insert_record(record_under(&m, &m, &iref(&g), 2_000, Some(&t)));
+    held.insert_record(record_under(&g, &m, &iref(&g), 2_000, Some(&t)));
+    assert_eq!(
+        held.key_of(&kid(&n), &kid(&g)),
+        KeyOf::Yes,
+        "I2101 a rival outside its named record blocks nothing"
+    );
+    assert_ne!(
+        held.key_of(&kid(&m), &kid(&g)),
+        KeyOf::Yes,
+        "I2101 nor is it a rotation"
+    );
+}
+
+#[test]
 fn i2101_a_record_signed_by_another_key_attaches_nothing() {
     let (a, c) = (key(87), key(88));
     // C signs a record of A's key under C's identity; A never signs it.
@@ -313,6 +355,61 @@ fn i2101_a_record_signed_by_another_key_attaches_nothing() {
     held.insert_record(key_record(&a, &["user"], 0, None));
     assert_eq!(verdict(&held, &row_as(&a, &iref(&a), 5_000)), "valid");
     let v = verdict(&held, &row_as(&a, &iref(&c), 5_000));
+    assert!(is_reason(&v, malformed_row::KID_NOT_OF_ISS), "I2101 {v}");
+}
+
+#[test]
+fn i2101_a_key_the_bundle_seats_for_a_holder_is_the_holders() {
+    let (x, y, recovered) = (key(120), key(121), key(122));
+    let holder = |k: &CompositeSigningKey| key_record(k, &["accord_holder"], 0, None);
+    let base = || {
+        let mut h = HeldKeys::new();
+        for st in [
+            holder(&x),
+            holder(&y),
+            key_record(&recovered, &["accord_holder"], 0, None),
+        ] {
+            h.insert_record(st);
+        }
+        h
+    };
+    // The bundle in force seats `recovered` for X (a recovery: no rotation
+    // record links it to X's genesis key).
+    let held = base().with_seats(BundleSeats::held([
+        (iref(&x), kid(&recovered)),
+        (iref(&y), kid(&y)),
+    ]));
+    assert_eq!(
+        held.key_of(&kid(&recovered), &kid(&x)),
+        KeyOf::Yes,
+        "I2101 seat"
+    );
+    assert_eq!(
+        verdict(&held, &row_as(&recovered, &iref(&x), 5_000)),
+        "valid",
+        "I2101 a seated key signs as its holder"
+    );
+    let v = verdict(&held, &row_as(&recovered, &iref(&y), 5_000));
+    assert!(
+        is_reason(&v, malformed_row::KID_NOT_OF_ISS),
+        "I2101 seated for X, signing as Y: {v}"
+    );
+    // No bundle held: a key signing as a holder's identity waits on it.
+    let held = base().with_seats(BundleSeats::not_held());
+    assert_eq!(
+        held.key_of(&kid(&recovered), &kid(&x)),
+        KeyOf::Waiting(vec![ChainMissing::Bundle]),
+        "I2101 bundle not held"
+    );
+    assert_eq!(
+        verdict(&held, &row_as(&recovered, &iref(&x), 5_000)),
+        "waiting"
+    );
+    // ...but not as an identity that holds no accord seat.
+    let plain = key(123);
+    let mut held = base();
+    held.insert_record(key_record(&plain, &["user"], 0, None));
+    let v = verdict(&held, &row_as(&recovered, &iref(&plain), 5_000));
     assert!(is_reason(&v, malformed_row::KID_NOT_OF_ISS), "I2101 {v}");
 }
 

@@ -15,7 +15,7 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
   - an instant (RFC 3339 text) becomes `uint (ms)` (CC 2.6.2);
   - a key id becomes an `identity-ref` (CC 2.6.1.1);
   - a reference to a held row (`persist_row_hash`, `attestation_id`, a `*_digest`) becomes a `row-ref` under `refs`, computed by the node (CC 2.6.1.3);
-  - a SHA-256 digest carried as hex becomes `bstr .size 32`;
+  - a SHA-256 digest carried as hex becomes a hash digest, `[-16, bstr .size 32]` (the form Verify's door reads; the earlier gates' 64-hex strings are its projection);
   - a set (`[* …]`) is sorted by each element's deterministic encoding and has no duplicates;
   - `persist_row_hash`, `original_content_hash`, the `scrub_*` members, `scrub_key_id`, `scrub_timestamp`, `pqc_completed_at` and `observed_region` are gone: the row id and the statements replace them.
 - **`bool`** (`consensus_protocol_entrenched`) is the one member outside uint / bstr / tstr / identity-ref / row-ref. Absent reads as `false`.
@@ -150,12 +150,12 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
 |---|---|---|---|
 | `legal_basis` | `tstr` | required | legal_basis (also the {basis} leaf) |
 | `claimant` | `identity-ref` | required | claimant_key_id |
-| `content_sha256` | `bstr .size 32` | required | content_sha256 (the selection digest) |
+| `content_sha256` | `hash-digest [-16, bstr .size 32]` | required | content_sha256 (the selection digest) |
 | `content_holders` | `[* identity-ref]` | required | content_holder_key_ids |
 | `claim_text` | `tstr` | required | claim_text |
 | `good_faith_statement` | `tstr` | required | good_faith_statement |
 | `jurisdiction` | `tstr` | required | jurisdiction |
-| `evidence_refs` | `[* bstr .size 32]` | optional | evidence_refs (the dry-run ledger digests) |
+| `evidence_refs` | `[* hash-digest]` | optional | evidence_refs (the dry-run ledger digests) |
 | `selection_counts` | `map` | optional | selection_counts |
 | `expires_at` | `uint (ms)` | optional | expires_at |
 
@@ -173,7 +173,7 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
 | member | CBOR type | presence | maps from |
 |---|---|---|---|
 | `custody_state` | `tstr` | required | custody_state: "here" \| "none" |
-| `evidence_refs` | `[* bstr .size 32]` | required | evidence_refs (blob sha256) |
+| `evidence_refs` | `[* hash-digest]` | required | evidence_refs (blob sha256) |
 | `size` | `uint` | required when `custody_state` is `here` | size |
 | `cohort` | `identity-ref` | required | community_id / family_key_id |
 | `expires_at` | `uint (ms)` | required | the row's expires_at (asserted_at + 72 h) |
@@ -196,7 +196,7 @@ Co-signatures now counted voices: none (the author's statement alone).
 | `community_id` | `tstr` | optional | community_id |
 | `minter` | `identity-ref` | required when `axis` is `epoch` | minter_key_id |
 | `epoch` | `uint` | optional | epoch (epoch and stream axes) |
-| `at_rest_sha256` | `bstr .size 32` | required when `axis` is `content` | at_rest_sha256 |
+| `at_rest_sha256` | `hash-digest [-16, bstr .size 32]` | required when `axis` is `content` | at_rest_sha256 |
 | `owner` | `identity-ref` | optional | owner_key_id (content and stream axes) |
 | `stream_id` | `tstr` | required when `axis` is `stream` | stream_id |
 | `cohort` | `identity-ref` | optional | the cohort target (community_id / family_key_id) |
@@ -215,7 +215,7 @@ Co-signatures now counted voices: none (the author's statement alone).
 | `stream_id` | `tstr` | required | stream_id (also the {stream_id} leaf) |
 | `epoch` | `uint` | required | epoch |
 | `k` | `uint` | required | k (the chunk index acknowledged) |
-| `chunk_root` | `bstr .size 32` | required | chunk_root |
+| `chunk_root` | `hash-digest [-16, bstr .size 32]` | required | chunk_root |
 
 | earlier-form co-signature (not a payload member) | now |
 |---|---|

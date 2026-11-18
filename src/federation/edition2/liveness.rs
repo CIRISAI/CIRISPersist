@@ -50,8 +50,16 @@
 //!    the rotation's instant;
 //! 5. no rival rotation of the predecessor is held (another key's record
 //!    naming the same predecessor record, carrying the predecessor's
-//!    statement under the same `iss`): two rotations that do not name each
-//!    other hand on nothing (CC 2.4.1.1, CC 2.7.7).
+//!    statement under the same `iss`, and that record covering the rival's
+//!    instant, the same test as the rotation path): two rotations that do
+//!    not name each other hand on nothing (CC 2.4.1.1, CC 2.7.7).
+//!
+//!
+//! **The seat arm** (CC 3.1.3, CC-READING(next-edition)): a key the
+//! accord's genesis bundle in force seats for `iss` is a key of `iss` (a
+//! recovery replaces a holder's key with no rotation record). With no
+//! bundle held, a key signing as an accord holder's identity that the chain
+//! does not reach waits on the bundle ([`ChainMissing::Bundle`]).
 //!
 //! A missing link waits ([`KeyOf::Waiting`]): the predecessor's statement
 //! (its key), or the named record ([`ChainMissing::Record`]). A record of a
@@ -132,6 +140,7 @@ pub struct HeldKeys {
     records: BTreeMap<Digest32, Vec<Vec<u8>>>,
     revocations: Vec<Vec<u8>>,
     standing: Arc<dyn RevokerStanding>,
+    seats: BundleSeats,
 }
 
 impl Default for HeldKeys {
@@ -186,7 +195,16 @@ impl HeldKeys {
             records: BTreeMap::new(),
             revocations: Vec::new(),
             standing: Arc::new(SelfOnly),
+            seats: BundleSeats::default(),
         }
+    }
+
+    /// With the seats of the accord's genesis bundle in force
+    /// ([`BundleSeats`]), for the key-of-iss check's seat arm.
+    #[must_use]
+    pub fn with_seats(mut self, seats: BundleSeats) -> Self {
+        self.seats = seats;
+        self
     }
 
     /// With an owner / roster answer for revocations.
@@ -228,6 +246,7 @@ impl HeldKeys {
             records: self.records.clone(),
             revocations: Vec::new(),
             standing: Arc::clone(&self.standing),
+            seats: self.seats.clone(),
         }
     }
 
@@ -347,9 +366,7 @@ impl HeldKeys {
         if depth > MAX_DEPTH {
             return KeyOf::No;
         }
-        let Some(statements) = self.records.get(kid) else {
-            return KeyOf::No;
-        };
+        let statements = self.records.get(kid).map_or(&[][..], Vec::as_slice);
         let iss_ref = identity_ref(iss);
         let rows = self.record_voices(kid, statements, depth);
         let mut missing: Vec<ChainMissing> = Vec::new();
@@ -387,27 +404,24 @@ impl HeldKeys {
                 let p = pred.row.kid;
                 // (4) the named record is a held record of the predecessor
                 // covering the rotation's instant.
-                let named = self.records.get(&p).map(|sts| {
+                let window = self.records.get(&p).map(|sts| {
                     self.record_voices(&p, sts, depth + 1)
                         .get(&target)
                         .and_then(|vs| vs.first())
-                        .map(|v| {
-                            v.record.asserted_at <= own.row.asserted_at
-                                && v.record
-                                    .valid_until
-                                    .is_none_or(|u| own.row.asserted_at <= u)
-                        })
+                        .map(|v| (v.record.asserted_at, v.record.valid_until))
                 });
-                match named {
-                    Some(Some(true)) => {}
-                    Some(Some(false)) => continue,
+                let window = match window {
+                    Some(Some(w)) => w,
                     _ => {
                         missing.push(ChainMissing::Record(target));
                         continue;
                     }
+                };
+                if !covers(window, own.row.asserted_at) {
+                    continue;
                 }
                 // (5) no rival rotation of the predecessor.
-                if self.rival_rotation(kid, &p, &iss_ref, &target, row_id, depth) {
+                if self.rival_rotation(kid, &p, &iss_ref, &target, window, row_id, depth) {
                     continue;
                 }
                 // (3) recursively: the predecessor is a key of `iss`.
@@ -418,6 +432,16 @@ impl HeldKeys {
                 }
             }
         }
+        // The seat arm: a key the accord's bundle in force seats for `iss`.
+        match self.seats.seat(&iss_ref, kid) {
+            Seat::Seated => return KeyOf::Yes,
+            Seat::NotSeated => {}
+            Seat::BundleNotHeld => {
+                if missing.is_empty() && self.is_accord_holder(iss, depth) {
+                    missing.push(ChainMissing::Bundle);
+                }
+            }
+        }
         if missing.is_empty() {
             KeyOf::No
         } else {
@@ -425,6 +449,15 @@ impl HeldKeys {
             missing.dedup();
             KeyOf::Waiting(missing)
         }
+    }
+
+    /// Does a valid record of the genesis key `iss` name the role
+    /// `accord_holder`? Only an accord holder's seat moves by a bundle.
+    fn is_accord_holder(&self, iss: &Digest32, depth: usize) -> bool {
+        self.judged(iss, depth + 1).is_ok_and(|v| {
+            v.iter()
+                .any(|r| r.record.identity_type.iter().any(|t| t == "accord_holder"))
+        })
     }
 
     /// The valid voices over records of `kid` (payload `key` is `kid`),
@@ -475,13 +508,16 @@ impl HeldKeys {
 
     /// Is another key's record, other than `row`, a rotation from the same
     /// predecessor record `target` under `iss`: its own statement and the
-    /// predecessor `pred`'s, both under `iss`, naming `target`?
+    /// predecessor `pred`'s, both under `iss`, naming `target`, with
+    /// `target`'s `window` covering its instant?
+    #[allow(clippy::too_many_arguments)]
     fn rival_rotation(
         &self,
         kid: &Digest32,
         pred: &Digest32,
         iss: &str,
         target: &Digest32,
+        window: (u64, Option<u64>),
         row: &Digest32,
         depth: usize,
     ) -> bool {
@@ -499,12 +535,17 @@ impl HeldKeys {
                                 .and_then(|n| single(&n, "target"))
                                 .is_some_and(|t| t.0 == *target)
                         };
-                        voices
+                        // A rival counts only as the rotation path would:
+                        // it names the predecessor's valid record, and
+                        // that record covers the rival's instant.
+                        voices.iter().any(|v| {
+                            v.row.kid == *k
+                                && v.row.iss == iss
+                                && named(v)
+                                && covers(window, v.row.asserted_at)
+                        }) && voices
                             .iter()
-                            .any(|v| v.row.kid == *k && v.row.iss == iss && named(v))
-                            && voices
-                                .iter()
-                                .any(|v| v.row.kid == *pred && v.row.iss == iss)
+                            .any(|v| v.row.kid == *pred && v.row.iss == iss)
                     })
             })
     }
@@ -590,6 +631,11 @@ pub struct ValidRecord {
     pub statement: Vec<u8>,
 }
 
+/// Does a record's `[asserted_at, valid_until]` window cover `at`?
+fn covers((from, until): (u64, Option<u64>), at: u64) -> bool {
+    from <= at && until.is_none_or(|u| at <= u)
+}
+
 /// One verified voice over a record row of a key.
 struct Voice {
     record: KeyRecord,
@@ -606,6 +652,62 @@ pub enum ChainMissing {
     Kid(Digest32),
     /// The predecessor's record the rotation names, by row id: not held.
     Record(Digest32),
+    /// The accord's genesis bundle in force, which seats holders' keys:
+    /// none held. Persist's own; Verify's bundle reader answers seats.
+    Bundle,
+}
+
+/// The keys the accord's genesis bundle in force seats, by holder
+/// identity-ref (v62.0.0, JSON-cut slice A, I2101's seat arm).
+///
+/// The seats are the keys the bundle IN FORCE places for each seat, never
+/// an earlier bundle's: a holder or serve node re-seated at a new key by a
+/// later bundle is read at that key only.
+///
+/// TODO(verify-bundle-reader): slice C fills this from Verify's bundle
+/// placement (`bundles_in_force`). Until then the store door holds
+/// [`BundleSeats::not_held`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BundleSeats(Option<BTreeMap<String, std::collections::BTreeSet<Digest32>>>);
+
+/// What [`BundleSeats`] says of one key for one identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seat {
+    /// The bundle in force seats the key for the identity.
+    Seated,
+    /// A bundle is held, and does not.
+    NotSeated,
+    /// No bundle is held.
+    BundleNotHeld,
+}
+
+impl BundleSeats {
+    /// No bundle held (pre-genesis, or not yet read).
+    #[must_use]
+    pub fn not_held() -> Self {
+        BundleSeats(None)
+    }
+
+    /// The seats of a held bundle: each holder identity-ref and the key(s)
+    /// it seats for it.
+    #[must_use]
+    pub fn held(seats: impl IntoIterator<Item = (String, Digest32)>) -> Self {
+        let mut m: BTreeMap<String, std::collections::BTreeSet<Digest32>> = BTreeMap::new();
+        for (holder, kid) in seats {
+            m.entry(holder).or_default().insert(kid);
+        }
+        BundleSeats(Some(m))
+    }
+
+    /// Is `kid` seated for `holder`?
+    #[must_use]
+    pub fn seat(&self, holder: &str, kid: &Digest32) -> Seat {
+        match &self.0 {
+            None => Seat::BundleNotHeld,
+            Some(m) if m.get(holder).is_some_and(|ks| ks.contains(kid)) => Seat::Seated,
+            Some(_) => Seat::NotSeated,
+        }
+    }
 }
 
 /// Whether a key is a key of an identity ([`HeldKeys::key_of`]).

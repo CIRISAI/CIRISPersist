@@ -363,6 +363,7 @@ fn chain_waiting(missing: &[ChainMissing]) -> Error {
         |m| match m {
             ChainMissing::Kid(k) => identity_ref(k),
             ChainMissing::Record(r) => format!("row:{}", hex::encode(r)),
+            ChainMissing::Bundle => "ceg-genesis-bundle/2".to_owned(),
         },
     );
     Error::unknown_signer(&named, PLANE)

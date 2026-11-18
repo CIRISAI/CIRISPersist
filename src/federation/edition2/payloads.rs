@@ -23,7 +23,8 @@
 //! - a key id is an identity-ref (CC 2.6.1.1);
 //! - a reference to a held row (`persist_row_hash`, `attestation_id`) is an
 //!   edition-2 `row-ref` under `refs`, computed by the node (CC 2.6.1.3);
-//! - a SHA-256 digest carried as hex is a 32-byte bstr;
+//! - a SHA-256 digest carried as hex is a hash digest, `[-16, bstr .size
+//!   32]`;
 //! - `persist_row_hash`, `original_content_hash`, the scrub members and
 //!   `pqc_completed_at` are gone: the row id and the statements replace them.
 
@@ -44,7 +45,8 @@ pub enum Ty {
     Uint,
     /// bstr.
     Bstr,
-    /// bstr of 32 bytes (a SHA-256 digest).
+    /// A hash digest, `[-16, bstr .size 32]` (SHA-256, the COSE algorithm
+    /// id -16), as Verify's door reads a digest member.
     Digest,
     /// tstr.
     Tstr,
@@ -56,7 +58,8 @@ pub enum Ty {
     Map,
     /// array of identity-refs, sorted by encoding, unique.
     IdentityRefs,
-    /// array of 32-byte bstr digests, sorted by encoding, unique.
+    /// array of hash digests (`[-16, bstr .size 32]`), sorted by encoding,
+    /// unique.
     Digests,
     /// array of roster members ([`ROSTER_MEMBER`]), sorted by `key`.
     RosterMembers,
@@ -70,13 +73,13 @@ impl Ty {
             Ty::Ms => "uint (ms)",
             Ty::Uint => "uint",
             Ty::Bstr => "bstr",
-            Ty::Digest => "bstr .size 32",
+            Ty::Digest => "hash-digest [-16, bstr .size 32]",
             Ty::Tstr => "tstr",
             Ty::IdentityRef => "identity-ref",
             Ty::Bool => "bool",
             Ty::Map => "map",
             Ty::IdentityRefs => "[* identity-ref]",
-            Ty::Digests => "[* bstr .size 32]",
+            Ty::Digests => "[* hash-digest]",
             Ty::RosterMembers => "[* roster-member]",
         }
     }
@@ -86,7 +89,12 @@ impl Ty {
             v.as_text()
                 .is_some_and(ciris_verify_core::edition2::is_identity_ref)
         };
-        let digest = |v: &Value| v.as_bytes().is_some_and(|b| b.len() == 32);
+        let digest = |v: &Value| match v.as_array() {
+            Some([alg, b]) => {
+                alg.as_i64() == Some(-16) && b.as_bytes().is_some_and(|b| b.len() == 32)
+            }
+            _ => false,
+        };
         let sorted_unique = |a: &[Value]| {
             let enc: Vec<Vec<u8>> = a.iter().map(ciris_verify_core::cde::encode).collect();
             enc.windows(2).all(|w| w[0] < w[1])
