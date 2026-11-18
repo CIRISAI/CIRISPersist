@@ -13695,6 +13695,23 @@ pub mod malformed_row {
     /// member of the wrong type, or a member the family does not carry. The
     /// message names the member.
     pub const EDITION2_PAYLOAD_INVALID: &str = "edition2_payload_invalid";
+    /// v62.0.0 (JSON-cut slice A; CC 4.2.1.1) — an accord invocation whose
+    /// key is an accord holder's placed key, but whose `iss` is not that
+    /// holder (`federation::edition2::halt`). The halt reader's token.
+    pub const ISS_NOT_HOLDER: &str = "iss_not_holder";
+    /// v62.0.0 (JSON-cut slice A; CC 4.2.1.1) — an accord invocation the
+    /// halt reader refuses for its own shape; the message carries the
+    /// reader's token (`refused:member:nonce`, `refused:other_accord`, ...).
+    pub const ACCORD_INVOCATION_INVALID: &str = "accord_invocation_invalid";
+    /// v62.0.0 (JSON-cut slice A; CC 4.2.1.1, the store's duty) — an accord
+    /// invocation repeating the `invocation_id` or `nonce` of a held
+    /// invocation of the same accord within that one's `valid_until`.
+    pub const ACCORD_INVOCATION_REPLAYED: &str = "accord_invocation_replayed";
+    /// v62.0.0 (JSON-cut slice A; CC-READING(next-edition)) — a composer row
+    /// (`withdraws`, `recants`, `supersedes`) whose family (-70002) is not
+    /// the family of the row its `refs.target` names: a composer carries
+    /// its target's family.
+    pub const COMPOSER_FAMILY_MISMATCH: &str = "composer_family_mismatch";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -13739,6 +13756,10 @@ pub mod malformed_row {
         EARLIER_FORM_SIGNER_IS_EDITION2,
         KID_NOT_OF_ISS,
         EDITION2_PAYLOAD_INVALID,
+        ISS_NOT_HOLDER,
+        ACCORD_INVOCATION_INVALID,
+        ACCORD_INVOCATION_REPLAYED,
+        COMPOSER_FAMILY_MISMATCH,
     ];
 }
 

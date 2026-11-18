@@ -17,6 +17,7 @@
 //! | one rule set, two codecs: the statement mapped onto persist's typed row and its gates | [`ingest`] |
 //! | the read models: an edition-2 key and its honoured revocations projected into `federation_keys` / `federation_revocations`; the cross-form refusal | [`projection`] |
 //! | producing: an edition-2 row or object signed with persist's own composite signer | [`produce`] |
+//! | the accord's halt and invocation door (one holder's statement latches; dedup by invocation_id / nonce) | [`halt`] |
 //! | the payload members of each mapped family (the source of `docs/EDITION2_PAYLOADS.md`) | [`payloads`] |
 //!
 //! **The rule this module keeps (CC 2.6.1.12).** A node of this form reads and
@@ -31,6 +32,7 @@ pub mod door;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_switch;
 pub mod genesis;
+pub mod halt;
 pub mod ingest;
 pub mod liveness;
 pub mod names;
@@ -41,6 +43,8 @@ pub mod store;
 
 #[cfg(test)]
 pub(crate) mod codec;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod composer_invariants;
 #[cfg(test)]
 mod door_invariants;
 #[cfg(test)]
@@ -49,6 +53,8 @@ mod earlier_form_refusal_invariants;
 mod genesis_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod genesis_store_invariants;
+#[cfg(test)]
+mod halt_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod ingest_invariants;
 #[cfg(test)]

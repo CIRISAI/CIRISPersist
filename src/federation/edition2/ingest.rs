@@ -51,6 +51,65 @@ use crate::federation::{malformed_row, Error, FederationDirectory};
 /// statement's bytes as received, lowercase hex (CC 2.6.3).
 pub const STATEMENT_MEMBER: &str = "ceg_statement";
 
+/// The envelope member the earlier gates read a composer's target from.
+pub const REFERENCES_MEMBER: &str = "references_attestation_id";
+
+/// The composer row types (CC 2.4.1.1): each names its target by
+/// `refs.target` and carries the target's family.
+pub const COMPOSER_ROW_TYPES: [&str; 3] = ["withdraws", "recants", "supersedes"];
+
+/// v62.0.0 (JSON-cut slice A, I2105) — **a composer's target.** A
+/// `withdraws` / `recants` / `supersedes` row names its target by
+/// `refs.target`. The target must be held (else the retryable
+/// `WithdrawsTargetUnheld`: an ordering gap), and the composer must carry
+/// the target's family (else `composer_family_mismatch`;
+/// CC-READING(next-edition)). The target's family is read from its own
+/// held statement.
+///
+/// # Errors
+/// As above; directory failures.
+pub async fn check_composer_target<F>(dir: &F, row: &AdmittedRow) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if !COMPOSER_ROW_TYPES.contains(&row.row_type.as_str()) {
+        return Ok(());
+    }
+    let Some(target) = super::names::single(&row.names, "target") else {
+        // Verify's reader requires the composer's target; nothing to bind.
+        return Ok(());
+    };
+    let held = dir.edition2_voices(&target).await?;
+    let family = held.iter().find_map(|st| {
+        statement_parts(st).and_then(|(h, _)| {
+            h.get_int(-70002)
+                .and_then(Value::as_text)
+                .map(str::to_owned)
+        })
+    });
+    let Some(family) = family else {
+        return Err(Error::WithdrawsTargetUnheld {
+            attestation_id: row.row_id.hex(),
+            target_attestation_id: target.hex(),
+        });
+    };
+    if family != row.family {
+        return Err(Error::malformed_row(
+            PLANE,
+            malformed_row::COMPOSER_FAMILY_MISMATCH,
+            format!(
+                "the {} row {} carries family `{}`, but its target {} is of `{family}`: a \
+                 composer carries its target's family",
+                row.row_type,
+                row.row_id.hex(),
+                row.family,
+                target.hex()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The payload's instant members (CC 2.6.2), projected as RFC 3339 text.
 pub const INSTANT_MEMBERS: &[&str] = &[
     "asserted_at",
@@ -262,6 +321,16 @@ pub fn attestation_of(row: &AdmittedRow, tier: &str) -> Result<Attestation, Erro
                 let real = n as f64 / 1_000_000.0;
                 o.insert((*member).to_owned(), serde_json::json!(real));
             }
+        }
+        // v62.0.0 (JSON-cut slice A) — the row a composer (or any row)
+        // names by `refs.target` is the earlier gates'
+        // `references_attestation_id`: the node-computed row id, never a
+        // peer's string.
+        if let Some(target) = super::names::single(&row.names, "target") {
+            o.insert(
+                REFERENCES_MEMBER.to_owned(),
+                serde_json::Value::String(target.hex()),
+            );
         }
         o.insert(
             STATEMENT_MEMBER.to_owned(),
@@ -490,6 +559,18 @@ where
     F: FederationDirectory + ?Sized,
 {
     super::door::require_statement_form(bytes)?;
+    // v62.0.0 (JSON-cut slice A) — an accord invocation is judged against
+    // the holders of the bundle in force for its accord, never the key
+    // plane (`edition2::halt`).
+    if super::halt::is_invocation(bytes) {
+        let accord = super::halt::named_accord_root(bytes).unwrap_or_default();
+        let roster = super::halt::roster_in_force(dir, &accord).await?;
+        let out = super::halt::put_invocation(dir, bytes, roster.as_ref()).await?;
+        return Ok(StatementOutcome::Row {
+            row_id: super::names::RowId(out.invocation.row_id),
+            new: out.new,
+        });
+    }
     let mut keys = held_keys_for(dir, bytes).await?;
     // v62.0.0 (slice J0) — a key-plane statement already held was judged when
     // it arrived. Its re-put is read over the records alone, so a revoke-all
@@ -510,6 +591,8 @@ where
     } else {
         admit_row(bytes, &keys, offered_id, SelectContext::default())?
     };
+    // A composer names a held row of its own family (every plane).
+    check_composer_target(dir, &admitted).await?;
     if admitted.family == KEY_RECORD_FAMILY || admitted.family == KEY_REVOCATION_FAMILY {
         let new = dir.put_edition2_statement(&admitted).await?;
         // v62.0.0 (slice J0) — the read models: the key this statement is
