@@ -300,6 +300,7 @@ pub fn admit_row(
 
     // Step 5: the key record's end rule.
     if row.family == KEY_RECORD_FAMILY {
+        check_identity_set_exclusive(&row.sub, &row.payload)?;
         if let Err(e) = check_key_record(&row.payload) {
             return Err(key_record_refusal(&row.sub, &row.payload, &e));
         }
@@ -367,6 +368,50 @@ fn chain_waiting(missing: &[ChainMissing]) -> Error {
         },
     );
     Error::unknown_signer(&named, PLANE)
+}
+
+/// The roles of a `key:record` payload's `identity_type` (text members).
+fn identity_roles(payload: &Value) -> Vec<String> {
+    payload
+        .get_text("identity_type")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_text)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// v62.0.0 (JSON-cut slice A; CC 2.4.1.1, CC 4.5.8) — **the identity-set
+/// exclusion on an edition-2 `key:record`**, the same rule the earlier
+/// doors keep (`register::check_node_identity_exclusive`): `node` never
+/// cohabits with `agent` or `user` ([`Error::NodeIdentityNotExclusive`]),
+/// and `user` / `accord_holder` never with `node` / `agent`
+/// ([`Error::IdentitySetMixesPersonAndMachine`]). Verify's end rule refuses
+/// only a person-with-machine mix; `node` with `agent` is persist's.
+///
+/// # Errors
+/// As above.
+pub fn check_identity_set_exclusive(sub: &str, payload: &Value) -> Result<(), Error> {
+    use crate::federation::types::identity_type as it;
+    let roles = identity_roles(payload);
+    let has = |t: &str| roles.iter().any(|r| r == t);
+    let joined = || roles.join(",");
+    if has(it::NODE) && (has(it::AGENT) || has(it::USER)) {
+        return Err(Error::NodeIdentityNotExclusive {
+            key_id: sub.to_owned(),
+            identity_type: joined(),
+        });
+    }
+    if (has(it::USER) || has(it::ACCORD_HOLDER)) && (has(it::NODE) || has(it::AGENT)) {
+        return Err(Error::IdentitySetMixesPersonAndMachine {
+            key_id: sub.to_owned(),
+            identity_type: joined(),
+        });
+    }
+    Ok(())
 }
 
 /// The refusal for a `key:record` payload that breaks its rule.

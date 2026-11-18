@@ -121,7 +121,6 @@ pub(crate) async fn put_location_proof_planned<D: EvidenceStore>(
     dir: &D,
     proof: SignedLocationProof,
 ) -> Result<(), Error> {
-    super::edition2::door::refuse_earlier_form("location_proof")?;
     // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
     // before any verification.
     if super::replication_policy::settle_if_held(
@@ -133,6 +132,9 @@ pub(crate) async fn put_location_proof_planned<D: EvidenceStore>(
     {
         return Ok(());
     }
+    // v62.0.0 (JSON-cut slice A) — after the held settle (I235), the
+    // earlier-form refusal.
+    super::edition2::door::refuse_earlier_form("location_proof")?;
     // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
     // other admission step.
     super::verify_location_proof_admission(dir, &proof).await?;

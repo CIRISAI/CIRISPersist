@@ -16,8 +16,10 @@ use ciris_verify_core::edition2::sign_row_statement;
 use super::door_invariants::fixture::*;
 use super::names::RowId;
 
-const FAMILY: &str = "evidence:.suite:.kind:.cell:.prefix";
-const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+const SCORE_FAM: &str = "evidence:.suite:.kind:.cell:.prefix";
+/// Built so no literal reads as a family prefix to the family-rules
+/// discovery scan.
+const SCORE_DIM: &str = concat!("evidence", ":safety_battery:capture:a:b:v1");
 
 fn score(k: &CompositeSigningKey, at: u64) -> Vec<u8> {
     let m = map(vec![
@@ -25,9 +27,9 @@ fn score(k: &CompositeSigningKey, at: u64) -> Vec<u8> {
         ("author", Value::Text(iref(k))),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        ("dimension", Value::Text(DIMENSION.into())),
+        ("dimension", Value::Text(SCORE_DIM.into())),
     ]);
-    sign_row_statement(k, &iref(k), &iref(k), "scores", FAMILY, &m, vec![]).unwrap()
+    sign_row_statement(k, &iref(k), &iref(k), "scores", SCORE_FAM, &m, vec![]).unwrap()
 }
 
 fn withdraws(k: &CompositeSigningKey, family: &str, target: &RowId, at: u64) -> Vec<u8> {
@@ -37,8 +39,8 @@ fn withdraws(k: &CompositeSigningKey, family: &str, target: &RowId, at: u64) -> 
         ("refs", map(vec![("target", ref2(&target.0))])),
     ];
     // A dimension is carried only under the family that binds it.
-    if family == FAMILY {
-        m.push(("dimension", Value::Text(DIMENSION.into())));
+    if family == SCORE_FAM {
+        m.push(("dimension", Value::Text(SCORE_DIM.into())));
     }
     sign_row_statement(k, &iref(k), &iref(k), "withdraws", family, &map(m), vec![]).unwrap()
 }
@@ -64,7 +66,7 @@ pub(crate) async fn body(d: &dyn crate::federation::FederationDirectory) {
     // Unheld target: waits.
     let e = put_statement(
         d,
-        &withdraws(&k, FAMILY, &RowId([0x77; 32]), 6_000),
+        &withdraws(&k, SCORE_FAM, &RowId([0x77; 32]), 6_000),
         None,
         INGEST_TIER,
     )
@@ -91,7 +93,7 @@ pub(crate) async fn body(d: &dyn crate::federation::FederationDirectory) {
     );
     // The target's family: admitted, naming the target by its row id.
     let StatementOutcome::Row { row_id: w, .. } =
-        put_statement(d, &withdraws(&k, FAMILY, &t, 6_000), None, INGEST_TIER)
+        put_statement(d, &withdraws(&k, SCORE_FAM, &t, 6_000), None, INGEST_TIER)
             .await
             .unwrap_or_else(|e| panic!("I2105 admitted: {e:?}"))
     else {

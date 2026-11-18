@@ -164,7 +164,6 @@ pub(crate) async fn put_signed_transport_destination_planned<D: TransportStore>(
     dir: &D,
     signed: &SignedTransportDestination,
 ) -> Result<Outcome, Error> {
-    super::edition2::door::refuse_earlier_form("transport_destination")?;
     // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
     // before any verification.
     if super::replication_policy::settle_if_held(
@@ -176,6 +175,9 @@ pub(crate) async fn put_signed_transport_destination_planned<D: TransportStore>(
     {
         return Ok(Outcome::Unchanged);
     }
+    // v62.0.0 (JSON-cut slice A) — after the held settle (I235), the
+    // earlier-form refusal.
+    super::edition2::door::refuse_earlier_form("transport_destination")?;
     // #443 — the admission gate BEFORE any write: hybrid 1-of-1 over
     // JCS(signed_envelope) against the pinned key of attesting_key_id, typed
     // projection ≡ envelope, signer_acts_for.

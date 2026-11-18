@@ -326,6 +326,11 @@ impl HeldKeys {
                     if row.family != KEY_RECORD_FAMILY {
                         continue;
                     }
+                    // v62.0.0 (slice A) — a set breaking the identity-set
+                    // exclusion gives no liveness.
+                    if super::door::check_identity_set_exclusive(&row.sub, &row.payload).is_err() {
+                        continue;
+                    }
                     match check_key_record(&row.payload) {
                         Ok(rec) if rec.kid == *kid => valid.push(ValidRecord {
                             record: rec,
@@ -481,6 +486,9 @@ impl HeldKeys {
             };
             if let Verdict::Valid(row) = verify_row_statement(st, &scoped) {
                 if row.family != KEY_RECORD_FAMILY {
+                    continue;
+                }
+                if super::door::check_identity_set_exclusive(&row.sub, &row.payload).is_err() {
                     continue;
                 }
                 if let Ok(rec) = check_key_record(&row.payload) {

@@ -1142,13 +1142,15 @@ pub(crate) async fn put_revocation_planned<D>(
 where
     D: KeyPlaneStore,
 {
-    super::edition2::door::refuse_earlier_form("revocation")?;
     // A byte-identical re-offer of a held revocation settles before any verify
     // (the #672 rule): the whole record, not its id — a relay's re-pasted
     // column under a held id must still meet the binding gate.
     if is_held_revocation(dir, &revocation.revocation).await? {
         return Ok(());
     }
+    // v62.0.0 (JSON-cut slice A) — after the held settle (I235), the
+    // earlier-form refusal.
+    super::edition2::door::refuse_earlier_form("revocation")?;
     let planned =
         plan_put_revocation(dir, revocation.revocation, crate::host::clock::now()).await?;
     dir.store_planned_revocation(planned).await

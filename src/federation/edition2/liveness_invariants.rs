@@ -118,6 +118,45 @@ fn i1905_only_an_edition2_record_makes_a_key_live() {
     ));
 }
 
+/// **I2106** (v62.0.0, JSON-cut slice A; CC 2.4.1.1): the identity-set
+/// exclusion at the edition-2 key door, as the earlier doors keep it.
+/// `node` with `agent` (which Verify's end rule admits) is
+/// `federation_node_identity_not_exclusive`, and such a record makes no key
+/// live; `accord_holder` with `agent` is the typed person-with-machine
+/// refusal; other co-locations stand.
+#[test]
+fn i2106_node_never_cohabits_with_agent() {
+    let k = key(23);
+    let held = holding(&[&k]);
+    let kind = |st: Vec<u8>| match admit_row(&st, &held, None, SelectContext::default()) {
+        Ok(_) => "ok".to_owned(),
+        Err(e) => e.kind().to_owned(),
+    };
+    assert_eq!(
+        kind(key_record(&k, &["agent", "node"], 0, Some(YEAR_MS))),
+        "federation_node_identity_not_exclusive",
+        "I2106 node + agent"
+    );
+    assert_eq!(
+        kind(key_record(&k, &["accord_holder", "agent"], 0, None)),
+        "federation_identity_set_mixes_person_and_machine",
+        "I2106 holder + agent"
+    );
+    assert_eq!(
+        kind(key_record(&k, &["canonical", "node"], 0, Some(YEAR_MS))),
+        "ok",
+        "I2106 other co-locations stand"
+    );
+    let j = key(24);
+    let mut h = HeldKeys::new();
+    h.insert_record(key_record(&j, &["agent", "node"], 0, Some(YEAR_MS)))
+        .unwrap();
+    assert!(
+        !matches!(h.liveness(&kid(&j), 10), Liveness::Live(_)),
+        "I2106 no liveness"
+    );
+}
+
 #[test]
 fn i1905_the_end_rule_at_the_door() {
     let k = key(21);
@@ -158,10 +197,17 @@ fn i1905_the_end_rule_at_the_door() {
         "ok",
         "I1905 holder"
     );
+    // v62.0.0 (slice A, I2106): the earlier doors' token for `node` with
+    // `user` (CC 2.4.1.1), before Verify's mixed-roles reading.
     assert_eq!(
         refusal(key_record(&k, &["node", "user"], 0, Some(1))),
-        "mixed",
+        "federation_node_identity_not_exclusive",
         "I1905 mixed"
+    );
+    assert_eq!(
+        refusal(key_record(&k, &["agent", "user"], 0, None)),
+        "mixed",
+        "I1905 person with machine"
     );
     // A record that breaks the rule gives no liveness.
     let j = key(22);
