@@ -3777,28 +3777,6 @@ pub struct SignedLocationProof {
     pub scrub_signature_pqc: Option<String>,
 }
 
-/// One hybrid-pending federation row — minimum fields the sweep
-/// needs to recompute the cold-path bound-signature input. Returned
-/// by [`super::FederationDirectory::list_hybrid_pending_keys`] /
-/// `_attestations` / `_revocations` (CIRISPersist#11, v0.3.2).
-///
-/// `id` is the row's primary key (`key_id` for `federation_keys`,
-/// `attestation_id` / `revocation_id` for the others). `envelope` is
-/// the JSONB column the original Ed25519 signature was computed over
-/// — canonical bytes are recomputed via
-/// `PythonJsonDumpsCanonicalizer::canonicalize_value` to feed the
-/// bound-signature input. `classical_sig_b64` is the base64-encoded
-/// Ed25519 signature that PQC will sign over alongside the canonical
-/// bytes per the bound-signature contract.
-#[derive(Debug, Clone, PartialEq)]
-pub struct HybridPendingRow {
-    /// Primary key of the hybrid-pending row.
-    pub id: String,
-    /// JSONB envelope the row's classical signature was computed over.
-    pub envelope: serde_json::Value,
-    /// Base64-encoded Ed25519 signature stored on the row.
-    pub classical_sig_b64: String,
-}
 /// v44.7.0 (CIRISPersist#864, V148) — one replaced registration claim of a
 /// key: the bytes `rebind_key_record` superseded, kept so a rebind is
 /// visibly a rebind and the replaced claim stays auditable. Folds and

@@ -671,7 +671,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_group_versions", ConnClass::Read),
     ("list_hard_case_events", ConnClass::Read),
     ("list_held_fountain_content", ConnClass::Read),
-    ("read_hybrid_pending", ConnClass::Read),
     ("list_identity_occurrence_revocations_for", ConnClass::Read),
     ("list_identity_occurrences_for", ConnClass::Read),
     ("list_installed_storage_budgets", ConnClass::Read),
@@ -943,7 +942,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_open_self_roster_proposals", ConnClass::Read),
     ("list_settled_self_roster_proposals", ConnClass::Read),
     ("settle_self_roster_proposal", ConnClass::Write),
-    ("store_pqc_completion", ConnClass::Write),
     ("store_planned_attestation", ConnClass::Write),
     ("store_planned_reseal", ConnClass::Write),
     // v57.0.0 (CIRISPersist#988 items 2, 3) — the hard_case and detection

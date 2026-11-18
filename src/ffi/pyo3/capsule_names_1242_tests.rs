@@ -45,7 +45,6 @@ fn open_from_python(dsn: &str, alias: &str, dir: &std::path::Path) -> PyEngine {
             None,
             false,
             false,
-            false,
             None,
             None,
             None,

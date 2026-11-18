@@ -165,8 +165,6 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         "list_holders_sized",
         Bound::Schema("one row per holder of ONE blob (the holding claim folded per holder)"),
     ),
-    ("list_hybrid_pending_attestations", Bound::Paged),
-    ("list_hybrid_pending_keys", Bound::Paged),
     (
         "list_identity_occurrence_history_by_occurrence",
         Bound::Open("one occurrence key's append-only assertion history (V161): grows with every renewal"),

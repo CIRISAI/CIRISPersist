@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 145 delegations, generated. Every one: fault first, then delegate.
+// 141 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn adopt_genesis_reanchor(
@@ -167,31 +167,6 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     fn as_dyn_directory(&self) -> &dyn FederationDirectory {
         self
-    }
-    async fn attach_attestation_pqc_signature(
-        &self,
-        attestation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("attach_attestation_pqc_signature") {
-            return Err(e);
-        }
-        self.inner
-            .attach_attestation_pqc_signature(attestation_id, scrub_signature_pqc)
-            .await
-    }
-    async fn attach_key_pqc_signature(
-        &self,
-        key_id: &str,
-        pubkey_ml_dsa_65_base64: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("attach_key_pqc_signature") {
-            return Err(e);
-        }
-        self.inner
-            .attach_key_pqc_signature(key_id, pubkey_ml_dsa_65_base64, scrub_signature_pqc)
-            .await
     }
     async fn attestation_insert_local(
         &self,
@@ -694,21 +669,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_held_fountain_content(publisher_key_id)
             .await
-    }
-    async fn list_hybrid_pending_attestations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error> {
-        if let Some(e) = self.faulted("list_hybrid_pending_attestations") {
-            return Err(e);
-        }
-        self.inner.list_hybrid_pending_attestations(limit).await
-    }
-    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error> {
-        if let Some(e) = self.faulted("list_hybrid_pending_keys") {
-            return Err(e);
-        }
-        self.inner.list_hybrid_pending_keys(limit).await
     }
     async fn list_identity_occurrence_history_by_occurrence(
         &self,

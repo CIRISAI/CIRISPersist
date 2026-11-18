@@ -80,7 +80,6 @@ fn seed_then_open_from_python(
             None,
             false,
             false,
-            false,
             None,
             None,
             None,
