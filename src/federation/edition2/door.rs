@@ -16,6 +16,15 @@
 //!    [`token::STATEMENT_INVALID`] or [`token::FAMILY_INVALID`], and final.
 //!    Waiting is the retryable `federation_attester_key_unknown`, naming the
 //!    deepest missing key.
+//!    Then **the key is of the identity** (v62.0.0, JSON-cut slice A, I2101;
+//!    CC 2.6.1.7, CC-READING(next-edition)). `iss` names the signer's
+//!    identity, the identity-ref of its genesis key; `kid` names the key
+//!    that signed. The key `kid` resolves to must be a key OF `iss`: `iss`
+//!    is `kid`'s own identity-ref, or a held record of `kid` reaches `iss`'s
+//!    genesis record through rotations
+//!    ([`super::liveness::KeyOwnership`]). A key whose records are of
+//!    another identity is refused [`token::KID_NOT_OF_ISS`]; a missing link
+//!    waits (the retryable `federation_attester_key_unknown`, naming it).
 //! 4. **The row id, computed here.** SHA-256 over
 //!    `CDE(["CEG-row/2", type, family, sub, author, payload])`, taken over the
 //!    payload bytes as received. It must equal the reader's own id for the
@@ -36,9 +45,9 @@ use ciris_verify_core::edition2::family::{
     VendoredFamilyModel,
 };
 use ciris_verify_core::edition2::keys::{check_key_record, KeyRecordError, KEY_RECORD_FAMILY};
-use ciris_verify_core::edition2::{identity_ref, Digest32, Invalid, KeyDirectory, MissingKey};
+use ciris_verify_core::edition2::{identity_ref, Digest32, Invalid, MissingKey};
 
-use super::liveness::statement_parts;
+use super::liveness::{statement_parts, ChainMissing, KeyOf, KeyOwnership};
 use super::names::{names_of, Name, NameError, RowId};
 use super::token;
 use crate::federation::Error;
@@ -219,7 +228,7 @@ fn door_context(bytes: &[u8], mut ctx: SelectContext) -> SelectContext {
 /// is `Error::AttesterKeyUnknown` (retryable).
 pub fn admit_row(
     bytes: &[u8],
-    keys: &dyn KeyDirectory,
+    keys: &dyn KeyOwnership,
     offered_id: Option<&Digest32>,
     ctx: SelectContext,
 ) -> Result<AdmittedRow, Error> {
@@ -256,6 +265,8 @@ pub fn admit_row(
         }
         FamilyVerdict::Waiting(missing) => return Err(waiting(&missing)),
     };
+    // Step 3b: the key is of the identity it signs as.
+    require_key_of_iss(keys, &row.kid, &row.iss)?;
 
     // Step 4: the row id, from the bytes as received.
     let payload_bytes = raw_payload(bytes)
@@ -311,6 +322,50 @@ pub fn admit_row(
         role,
         bytes: bytes.to_vec(),
     })
+}
+
+/// Step 3b of the door: `kid` must be a key of `iss` (module docs). Every
+/// place the door resolves a signer calls this after Verify's verdict: rows,
+/// each counted voice, objects, the halt.
+///
+/// # Errors
+/// [`token::KID_NOT_OF_ISS`]; the retryable unknown-signer error naming a
+/// missing link.
+pub fn require_key_of_iss(keys: &dyn KeyOwnership, kid: &Digest32, iss: &str) -> Result<(), Error> {
+    let not_of = || {
+        refuse(
+            token::KID_NOT_OF_ISS,
+            format!(
+                "the signing key {} is not a key of the statement's iss {iss}: no held record of \
+                 the key reaches that identity's genesis key (CC 2.6.1.7)",
+                identity_ref(kid),
+            ),
+        )
+    };
+    let Some(genesis) = super::ingest::kid_of_identity_ref(iss) else {
+        return Err(not_of());
+    };
+    if genesis == *kid {
+        return Ok(());
+    }
+    match keys.key_of(kid, &genesis) {
+        KeyOf::Yes => Ok(()),
+        KeyOf::No => Err(not_of()),
+        KeyOf::Waiting(missing) => Err(chain_waiting(&missing)),
+    }
+}
+
+/// The waiting refusal for a missing key-chain link, naming it: a key by
+/// its identity-ref, a record by `row:<hex>`.
+fn chain_waiting(missing: &[ChainMissing]) -> Error {
+    let named = missing.first().map_or_else(
+        || "<unnamed link>".to_owned(),
+        |m| match m {
+            ChainMissing::Kid(k) => identity_ref(k),
+            ChainMissing::Record(r) => format!("row:{}", hex::encode(r)),
+        },
+    );
+    Error::unknown_signer(&named, PLANE)
 }
 
 /// The refusal for a `key:record` payload that breaks its rule.

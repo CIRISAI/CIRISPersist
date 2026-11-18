@@ -117,6 +117,19 @@ where
                     queue.push_back(signer);
                 }
             }
+            // v62.0.0 (JSON-cut slice A, I2101) — a record naming a
+            // predecessor's record: the other records naming it are loaded
+            // too, so a rival rotation of the same predecessor is seen
+            // (`HeldKeys::key_of`, rule 5).
+            if let Some(target) = record_target(&st) {
+                for rival in dir.edition2_rows_naming(&target, "target").await? {
+                    for v in dir.edition2_voices(&rival).await? {
+                        if is_key_record(&v) && !held.holds(&v) {
+                            held.insert_record(v);
+                        }
+                    }
+                }
+            }
             held.insert_record(st);
         }
         for st in dir
@@ -132,6 +145,18 @@ where
         }
     }
     Ok(held)
+}
+
+/// The record a `key:record` statement names by `refs.target`, if any.
+fn record_target(statement: &[u8]) -> Option<super::names::RowId> {
+    let (_, payload) = statement_parts(statement)?;
+    super::names::single(&super::names::names_of(&payload).ok()?, "target")
+}
+
+/// Is this statement of the family `key:record`?
+fn is_key_record(statement: &[u8]) -> bool {
+    statement_parts(statement)
+        .is_some_and(|(p, _)| p.get_int(-70002).and_then(Value::as_text) == Some(KEY_RECORD_FAMILY))
 }
 
 /// The kid an identity-ref names (RFC 9679 §5.7: the base64url thumbprint

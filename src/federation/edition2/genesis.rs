@@ -40,7 +40,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ciris_verify_core::cde::Value;
-use ciris_verify_core::edition2::{verify_object_statement, Digest32, KeyDirectory, ObjectVerdict};
+use ciris_verify_core::edition2::{verify_object_statement, Digest32, ObjectVerdict};
 
 use super::door::{raw_payload, require_statement_form, AdmittedRow, PLANE};
 use super::liveness::statement_parts;
@@ -148,7 +148,7 @@ pub fn group_by_object(voices: &[Vec<u8>]) -> BTreeMap<RowId, Vec<Vec<u8>>> {
 ///   for this reader. They are not a finding against the bundle.
 pub fn verify_bundle(
     voices: &[Vec<u8>],
-    keys: &dyn KeyDirectory,
+    keys: &dyn super::liveness::KeyOwnership,
     cx: &BundleContext<'_>,
 ) -> Result<VerifiedBundle, Error> {
     // The object: the first voice's payload. Others over other bytes are
@@ -208,6 +208,12 @@ pub fn verify_bundle(
                     ),
                 ));
             }
+        }
+        // A voice counts only under a key of its `iss` (I2101): one whose
+        // key is of another identity, or whose chain waits, is not counted;
+        // the others stand.
+        if super::door::require_key_of_iss(keys, &o.kid, &o.iss).is_err() {
+            continue;
         }
         voiced.insert(o.kid);
         if cx.roster.contains(&o.kid) {

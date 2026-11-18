@@ -3043,6 +3043,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
     }
 
+    async fn edition2_rows_naming(
+        &self,
+        named: &crate::federation::edition2::names::RowId,
+        role: &str,
+    ) -> Result<Vec<crate::federation::edition2::names::RowId>, crate::federation::Error> {
+        let (named, role) = (*named, role.to_owned());
+        self.read(move |conn| {
+            crate::federation::edition2::store::rows_naming_sqlite(conn, &named, &role)
+        })
+        .await
+    }
+
     async fn edition2_voices(
         &self,
         row_id: &crate::federation::edition2::names::RowId,

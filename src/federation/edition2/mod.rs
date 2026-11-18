@@ -50,6 +50,8 @@ mod genesis_store_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod ingest_invariants;
 #[cfg(test)]
+mod key_chain_invariants;
+#[cfg(test)]
 mod liveness_invariants;
 #[cfg(test)]
 mod produce_invariants;
@@ -71,6 +73,6 @@ pub mod token {
         EDITION2_FAMILY_INVALID as FAMILY_INVALID, EDITION2_NOT_A_ROW as NOT_A_ROW,
         EDITION2_ROW_ID_MISMATCH as ROW_ID_MISMATCH,
         EDITION2_ROW_REF_EDITION_1 as ROW_REF_EDITION_1,
-        EDITION2_STATEMENT_INVALID as STATEMENT_INVALID, KEY_RECORD_OUT_OF_WINDOW,
+        EDITION2_STATEMENT_INVALID as STATEMENT_INVALID, KEY_RECORD_OUT_OF_WINDOW, KID_NOT_OF_ISS,
     };
 }

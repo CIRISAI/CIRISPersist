@@ -9463,6 +9463,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(new)
     }
 
+    async fn edition2_rows_naming(
+        &self,
+        named: &crate::federation::edition2::names::RowId,
+        role: &str,
+    ) -> Result<Vec<crate::federation::edition2::names::RowId>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::store::rows_naming_postgres(&client, named, role).await
+    }
+
     async fn edition2_voices(
         &self,
         row_id: &crate::federation::edition2::names::RowId,

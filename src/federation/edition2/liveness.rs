@@ -35,6 +35,34 @@
 //!
 //!   A record that breaks the rule gives no liveness.
 //!
+//! **Whose key it is** (v62.0.0, JSON-cut slice A, I2101; CC 2.6.1.7, CC
+//! 2.4.1.1; the key-chain rule, CC-READING(next-edition)). A statement's
+//! `iss` is the identity-ref of the signer's genesis key. When `kid` is not
+//! that genesis key, [`HeldKeys::key_of`] answers whether it is a key OF
+//! that identity: `Yes` only when ALL of these hold for some held record
+//! row of `kid`:
+//! 1. the key's OWN statement over its `key:record` carries that `iss`;
+//! 2. its `refs.target` names the predecessor's record;
+//! 3. a valid statement by the predecessor key over the SAME row id carries
+//!    the same `iss`, and the predecessor is itself a key of `iss`
+//!    (recursively, to the genesis key);
+//! 4. the named record is held, is a record of the predecessor, and covers
+//!    the rotation's instant;
+//! 5. no rival rotation of the predecessor is held (another key's record
+//!    naming the same predecessor record, carrying the predecessor's
+//!    statement under the same `iss`): two rotations that do not name each
+//!    other hand on nothing (CC 2.4.1.1, CC 2.7.7).
+//!
+//! A missing link waits ([`KeyOf::Waiting`]): the predecessor's statement
+//! (its key), or the named record ([`ChainMissing::Record`]). A record of a
+//! key signed only by other keys never makes it a key of another identity;
+//! it may still make the key live to sign as itself (liveness above).
+//!
+//! TODO(verify-23.3-pin): CIRISVerify 23.3.0 adds `KeyDirectory::key_of`
+//! (`Yes` / `No` / `Waiting`, `MissingKey::Record`). [`KeyOwnership`],
+//! [`KeyOf`] and [`ChainMissing`] are its shape; at the pin they are
+//! replaced by Verify's and [`HeldKeys::key_of`] becomes persist's impl.
+//!
 //! TODO(key_end): when slice C's kernel adapter is merged, this reading is
 //! the kernel's `key_end` conclusion (`well_formed`, `conclude_rule`, `live`,
 //! `ended`, `retained`) over `KeyEndRow`s built from these records. Until
@@ -44,6 +72,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::names::{names_of, single};
 use ciris_crypto::composite::CompositePublicKey;
 use ciris_verify_core::cde::{self, Value};
 use ciris_verify_core::edition2::keys::{check_key_record, KeyRecord, KEY_RECORD_FAMILY};
@@ -301,6 +330,185 @@ impl HeldKeys {
         Ok(valid)
     }
 
+    /// **Is `kid` a key of the identity whose genesis key is `iss`?**
+    /// (v62.0.0, JSON-cut slice A, I2101; module docs, "Whose key it is".)
+    /// The shape of CIRISVerify 23.3.0's `KeyDirectory::key_of`: `iss` is
+    /// the thumbprint inside the statement's `iss`. A key is its own
+    /// genesis key's (`kid == iss`).
+    #[must_use]
+    pub fn key_of(&self, kid: &Digest32, iss: &Digest32) -> KeyOf {
+        self.key_of_at_depth(kid, iss, 0)
+    }
+
+    fn key_of_at_depth(&self, kid: &Digest32, iss: &Digest32, depth: usize) -> KeyOf {
+        if kid == iss {
+            return KeyOf::Yes;
+        }
+        if depth > MAX_DEPTH {
+            return KeyOf::No;
+        }
+        let Some(statements) = self.records.get(kid) else {
+            return KeyOf::No;
+        };
+        let iss_ref = identity_ref(iss);
+        let rows = self.record_voices(kid, statements, depth);
+        let mut missing: Vec<ChainMissing> = Vec::new();
+        for (row_id, voices) in &rows {
+            // (1) the key's own statement, under `iss`.
+            let Some(own) = voices
+                .iter()
+                .find(|v| v.row.kid == *kid && v.row.iss == iss_ref)
+            else {
+                continue;
+            };
+            // (2) it names the predecessor's record.
+            let Some(target) = names_of(&own.row.payload)
+                .ok()
+                .and_then(|n| single(&n, "target"))
+                .map(|r| r.0)
+            else {
+                continue;
+            };
+            // (3) a predecessor's statement over this row, under `iss`.
+            let preds: Vec<&Voice> = voices
+                .iter()
+                .filter(|v| v.row.kid != *kid && v.row.iss == iss_ref)
+                .collect();
+            if preds.is_empty() {
+                // Wait on the key whose record `target` names, when held;
+                // else on the record itself.
+                missing.push(match self.record_owner(&target, depth) {
+                    Some(p) => ChainMissing::Kid(p),
+                    None => ChainMissing::Record(target),
+                });
+                continue;
+            }
+            for pred in preds {
+                let p = pred.row.kid;
+                // (4) the named record is a held record of the predecessor
+                // covering the rotation's instant.
+                let named = self.records.get(&p).map(|sts| {
+                    self.record_voices(&p, sts, depth + 1)
+                        .get(&target)
+                        .and_then(|vs| vs.first())
+                        .map(|v| {
+                            v.record.asserted_at <= own.row.asserted_at
+                                && v.record
+                                    .valid_until
+                                    .is_none_or(|u| own.row.asserted_at <= u)
+                        })
+                });
+                match named {
+                    Some(Some(true)) => {}
+                    Some(Some(false)) => continue,
+                    _ => {
+                        missing.push(ChainMissing::Record(target));
+                        continue;
+                    }
+                }
+                // (5) no rival rotation of the predecessor.
+                if self.rival_rotation(kid, &p, &iss_ref, &target, row_id, depth) {
+                    continue;
+                }
+                // (3) recursively: the predecessor is a key of `iss`.
+                match self.key_of_at_depth(&p, iss, depth + 1) {
+                    KeyOf::Yes => return KeyOf::Yes,
+                    KeyOf::Waiting(m) => missing.extend(m),
+                    KeyOf::No => {}
+                }
+            }
+        }
+        if missing.is_empty() {
+            KeyOf::No
+        } else {
+            missing.sort();
+            missing.dedup();
+            KeyOf::Waiting(missing)
+        }
+    }
+
+    /// The valid voices over records of `kid` (payload `key` is `kid`),
+    /// by row id, verified through this directory one level deeper.
+    fn record_voices(
+        &self,
+        kid: &Digest32,
+        statements: &[Vec<u8>],
+        depth: usize,
+    ) -> BTreeMap<Digest32, Vec<Voice>> {
+        let mut rows: BTreeMap<Digest32, Vec<Voice>> = BTreeMap::new();
+        for st in statements {
+            let own_key = statement_parts(st)
+                .and_then(|(_, p)| check_key_record(&p).ok())
+                .map(|r| r.key);
+            let scoped = Scoped {
+                held: self,
+                depth: depth + 1,
+                own: *kid,
+                own_key,
+            };
+            if let Verdict::Valid(row) = verify_row_statement(st, &scoped) {
+                if row.family != KEY_RECORD_FAMILY {
+                    continue;
+                }
+                if let Ok(rec) = check_key_record(&row.payload) {
+                    if rec.kid == *kid {
+                        rows.entry(row.row_id).or_default().push(Voice {
+                            record: rec,
+                            row: *row,
+                        });
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// The key whose held record has row id `row`, if any.
+    fn record_owner(&self, row: &Digest32, depth: usize) -> Option<Digest32> {
+        self.records.iter().find_map(|(k, sts)| {
+            sts.iter()
+                .any(|st| super::names::RowId::of_statement(st).is_some_and(|r| r.0 == *row))
+                .then_some(*k)
+                .filter(|_| depth <= MAX_DEPTH)
+        })
+    }
+
+    /// Is another key's record, other than `row`, a rotation from the same
+    /// predecessor record `target` under `iss`: its own statement and the
+    /// predecessor `pred`'s, both under `iss`, naming `target`?
+    fn rival_rotation(
+        &self,
+        kid: &Digest32,
+        pred: &Digest32,
+        iss: &str,
+        target: &Digest32,
+        row: &Digest32,
+        depth: usize,
+    ) -> bool {
+        self.records
+            .iter()
+            .filter(|(k, _)| *k != kid && *k != pred)
+            .any(|(k, sts)| {
+                self.record_voices(k, sts, depth + 1)
+                    .iter()
+                    .filter(|(r, _)| *r != row)
+                    .any(|(_, voices)| {
+                        let named = |v: &Voice| {
+                            names_of(&v.row.payload)
+                                .ok()
+                                .and_then(|n| single(&n, "target"))
+                                .is_some_and(|t| t.0 == *target)
+                        };
+                        voices
+                            .iter()
+                            .any(|v| v.row.kid == *k && v.row.iss == iss && named(v))
+                            && voices
+                                .iter()
+                                .any(|v| v.row.kid == *pred && v.row.iss == iss)
+                    })
+            })
+    }
+
     /// Has a revocation by one of the three revokers taken effect for `kid`
     /// by `at`?
     fn revoked(&self, kid: &Digest32, at: u64, depth: usize) -> bool {
@@ -344,6 +552,14 @@ impl HeldKeys {
                 if row.family != KEY_REVOCATION_FAMILY || row.sub != subject {
                     return None;
                 }
+                // The revoker's key must be a key of the `iss` whose standing
+                // is asked (I2101).
+                let of_iss = super::ingest::kid_of_identity_ref(&row.iss).is_some_and(|i| {
+                    matches!(self.key_of_at_depth(&row.kid, &i, depth + 1), KeyOf::Yes)
+                });
+                if !of_iss {
+                    return None;
+                }
                 let by_itself = row.kid == *kid;
                 if !by_itself && !self.standing.may_revoke(&row.iss, &subject) {
                     return None;
@@ -373,6 +589,63 @@ pub struct ValidRecord {
     /// The statement as held.
     pub statement: Vec<u8>,
 }
+
+/// One verified voice over a record row of a key.
+struct Voice {
+    record: KeyRecord,
+    row: ciris_verify_core::edition2::VerifiedRow,
+}
+
+/// What a key-chain link waits on ([`KeyOf::Waiting`]).
+///
+/// TODO(verify-23.3-pin): Verify's `MissingKey` (`Kid`, `Record`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChainMissing {
+    /// A key, by its thumbprint: its statement over the rotation, or its
+    /// own records.
+    Kid(Digest32),
+    /// The predecessor's record the rotation names, by row id: not held.
+    Record(Digest32),
+}
+
+/// Whether a key is a key of an identity ([`HeldKeys::key_of`]).
+///
+/// TODO(verify-23.3-pin): Verify's `KeyOf` (`#[non_exhaustive]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyOf {
+    /// It is: the chain reaches the identity's genesis key.
+    Yes,
+    /// It is not.
+    No,
+    /// A link of the chain is not held.
+    Waiting(Vec<ChainMissing>),
+}
+
+/// **A key directory that also answers whose key a kid is** (v62.0.0, JSON
+/// cut slice A, I2101): the edition-2 door asks it after Verify's verdict
+/// when `kid` is not the `iss` genesis key.
+///
+/// TODO(verify-23.3-pin): this is CIRISVerify 23.3.0's provided
+/// `KeyDirectory::key_of`, with the same default; at the pin it is deleted
+/// and `HeldKeys` implements Verify's method with [`HeldKeys::key_of`].
+pub trait KeyOwnership: KeyDirectory {
+    /// Is `kid` a key of the identity whose genesis key's thumbprint is
+    /// `iss`? Not known: [`KeyOf::No`].
+    fn key_of(&self, kid: &Digest32, iss: &Digest32) -> KeyOf {
+        let _ = (kid, iss);
+        KeyOf::No
+    }
+}
+
+impl KeyOwnership for HeldKeys {
+    fn key_of(&self, kid: &Digest32, iss: &Digest32) -> KeyOf {
+        HeldKeys::key_of(self, kid, iss)
+    }
+}
+
+/// A bare map of keys holds no records: each key is only its own genesis
+/// key's.
+impl KeyOwnership for BTreeMap<Digest32, CompositePublicKey> {}
 
 /// A `key:revocation` the reading honours ([`HeldKeys::honoured_revocations`]).
 #[derive(Clone, Debug)]

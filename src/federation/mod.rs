@@ -3650,6 +3650,18 @@ pub trait FederationDirectory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// v62.0.0 (JSON-cut slice A, CC 2.6.1.3) — the held rows whose signed
+    /// `refs` name `named` under `role` (`target`, `head`, `also:cites`, ...),
+    /// from `ceg_row_names`: node-computed ids only. Empty by default.
+    async fn edition2_rows_naming(
+        &self,
+        named: &edition2::names::RowId,
+        role: &str,
+    ) -> Result<Vec<edition2::names::RowId>, Error> {
+        let _ = (named, role);
+        Ok(Vec::new())
+    }
+
     /// v62.0.0 (slice E2a, CC 2.6.1.11) — every held voice of signed objects
     /// of `typ` (`ceg-genesis-bundle/2`), as received. Empty by default.
     async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, Error> {
@@ -13671,6 +13683,12 @@ pub mod malformed_row {
     /// earlier-form signature no standing
     /// (`federation::edition2::projection`).
     pub const EARLIER_FORM_SIGNER_IS_EDITION2: &str = "earlier_form_signer_is_edition2";
+    /// v62.0.0 (JSON-cut slice A; CC 2.6.1.7, CC-READING(next-edition)) — the
+    /// key a statement's `kid` resolves to is not a key of its `iss`: no
+    /// held record of the key reaches `iss`'s genesis key through rotations
+    /// (`federation::edition2::liveness::KeyOwnership`). The same token
+    /// CIRISVerify's reader uses.
+    pub const KID_NOT_OF_ISS: &str = "kid_not_of_iss";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -13713,6 +13731,7 @@ pub mod malformed_row {
         GENESIS_BUNDLE_SEAT_BINDING,
         GENESIS_BUNDLE_READER_UNAVAILABLE,
         EARLIER_FORM_SIGNER_IS_EDITION2,
+        KID_NOT_OF_ISS,
     ];
 }
 
