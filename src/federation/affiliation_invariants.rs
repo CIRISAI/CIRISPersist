@@ -163,6 +163,35 @@ pub mod bodies {
         }
     }
 
+    /// v62.0.0 (E3b round 3; wave GC5, CC 2.7.3) — a row or version
+    /// addressing a held record under the OTHER cohort is HELD, concluding
+    /// nothing (`affiliation_cohort_mismatch`; `check_group_cohort` marks the
+    /// refusal held): the voice is kept `Pending` and nothing lands. A
+    /// refusal naming the mismatch (a door outside an attempt) is the same
+    /// verdict.
+    fn expect_mismatch_held(
+        r: Result<StatementOutcome, Error>,
+        declared: &str,
+        addressed: &str,
+        what: &str,
+    ) {
+        match r {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            Err(e) => expect_mismatch(Err::<(), _>(e), declared, addressed, what),
+            other => panic!("{what}: expected the mismatch held (Pending), got {other:?}"),
+        }
+    }
+
+    /// [`supersede`], keeping the door's outcome.
+    async fn supersede_outcome(
+        d: &dyn FederationDirectory,
+        next: &Community,
+    ) -> Result<StatementOutcome, Error> {
+        let voices =
+            e2::community_voices_naming_held(d, &signed(next), e2::ms(chrono::Utc::now())).await;
+        e2::put_voices(d, &voices).await
+    }
+
     fn expect_rule(r: Result<impl std::fmt::Debug, Error>, want: &str, what: &str) {
         match r {
             Err(Error::AffiliationConfigInvalid { rule, .. }) => assert_eq!(rule, want, "{what}"),
@@ -205,13 +234,13 @@ pub mod bodies {
         crate::federation::edition2::fixture_switch::row_of(&r, producer)
     }
 
+    /// v62.0.0 (E3b round 3): an edition-2 row goes through the one
+    /// statement door (`put_signed`); its outcome is kept.
     async fn place(
         d: &dyn FederationDirectory,
         r: crate::federation::Attestation,
-    ) -> Result<(), Error> {
-        d.put_attestation(crate::federation::SignedAttestation { attestation: r })
-            .await
-            .map(|_| ())
+    ) -> Result<StatementOutcome, Error> {
+        e2::put_signed(d, &r).await
     }
 
     /// Found the plain community `{tag}-c` and supersede it once, so the
@@ -355,21 +384,31 @@ pub mod bodies {
         // A plain community's version declaring `affiliations`.
         let mut p2 = next_version(d, &plain, "p2").await;
         p2.policy_blob = Some(affiliation_blob(None));
-        expect_mismatch(
-            supersede(d, &p2).await,
+        expect_mismatch_held(
+            supersede_outcome(d, &p2).await,
             "community",
             "affiliations",
             "I593: a plain community's version declaring `affiliations`",
+        );
+        assert_eq!(
+            e2::held_head(d, &e2::kid(&plain)).await.map(|(_, v)| v),
+            Some(1),
+            "I593: the held mismatch does not move the plain community's head"
         );
         // An affiliation's version declaring `community`: the held record
         // decides, not the new version's label.
         let mut relabel = next_version(d, &aff, "relabel").await;
         relabel.policy_blob = None;
-        expect_mismatch(
-            supersede(d, &relabel).await,
+        expect_mismatch_held(
+            supersede_outcome(d, &relabel).await,
             "affiliations",
             "community",
             "I593: an affiliation's version relabelled as a community",
+        );
+        assert_eq!(
+            e2::held_head(d, &e2::kid(&aff)).await.map(|(_, v)| v),
+            Some(1),
+            "I593: the held relabel does not move the affiliation's head"
         );
         // Control: an affiliation's own version admits, and stays one.
         let a2 = next_version(d, &aff, "a2").await;
@@ -388,24 +427,32 @@ pub mod bodies {
         );
 
         // An attestation placed at the wrong cohort_scope.
-        expect_mismatch(
+        expect_mismatch_held(
             place(d, placed_row(&m, cohort_scope::AFFILIATIONS, &plain_id)).await,
             "community",
             "affiliations",
             "I593: an affiliations-scoped row naming a plain community",
         );
-        expect_mismatch(
+        expect_mismatch_held(
             place(d, placed_row(&m, cohort_scope::COMMUNITY, &aff_id)).await,
             "affiliations",
             "community",
             "I593: a community-scoped row naming an affiliation",
         );
-        place(d, placed_row(&m, cohort_scope::AFFILIATIONS, &aff_id))
-            .await
-            .expect("I593: a member's affiliations-scoped row naming the affiliation admits");
-        place(d, placed_row(&m, cohort_scope::COMMUNITY, &plain_id))
-            .await
-            .expect("I593: a member's community-scoped row naming the community admits");
+        assert!(
+            matches!(
+                place(d, placed_row(&m, cohort_scope::AFFILIATIONS, &aff_id)).await,
+                Ok(StatementOutcome::Row { .. })
+            ),
+            "I593: a member's affiliations-scoped row naming the affiliation admits"
+        );
+        assert!(
+            matches!(
+                place(d, placed_row(&m, cohort_scope::COMMUNITY, &plain_id)).await,
+                Ok(StatementOutcome::Row { .. })
+            ),
+            "I593: a member's community-scoped row naming the community admits"
+        );
 
         // Founding: an unknown cohort, and a config on a plain community.
         expect_rule(
@@ -495,11 +542,21 @@ pub mod bodies {
 
     /// `voices` through `to`'s replicated statement door, in order; the
     /// first refusal (`Ok(())` when every voice was kept).
-    async fn first_refusal(to: &dyn FederationDirectory, voices: &[Vec<u8>]) -> Result<(), Error> {
+    /// Each voice through `to`'s replicated statement door; the first
+    /// refusal, else the last voice's outcome as a [`StatementOutcome`]
+    /// (v62.0.0 E3b round 3: a held mismatch is `Admitted(Pending)`).
+    async fn first_refusal(
+        to: &dyn FederationDirectory,
+        voices: &[Vec<u8>],
+    ) -> Result<StatementOutcome, Error> {
+        let mut last = None;
         for v in voices {
-            apply_replicated_statement(to, v, &e2::row_id_of(v).0).await?;
+            last = Some(apply_replicated_statement(to, v, &e2::row_id_of(v).0).await?);
         }
-        Ok(())
+        match last {
+            Some(ReplicatedStatementOutcome::Admitted(o)) => Ok(o),
+            other => panic!("a replicated version was not admitted as a statement: {other:?}"),
+        }
     }
 
     /// **I595** — the replicated amendment path. A amends an affiliation by
@@ -588,11 +645,16 @@ pub mod bodies {
             amended_at,
             &[&ka, &kb],
         );
-        expect_mismatch(
+        expect_mismatch_held(
             first_refusal(b, &relabel_voices).await,
             "affiliations",
             "community",
             "I595: a replicated version relabelling the affiliation",
+        );
+        assert_eq!(
+            e2::held_head(b, &gid).await.map(|(_, v)| v),
+            Some(1),
+            "{tag} I595: the held relabel does not move B's head"
         );
 
         // B applies A's amendment.

@@ -57,7 +57,8 @@ pub mod bodies {
     use crate::federation::licensure::{status_set_for, LicensureStatus};
     use crate::federation::licensure_chain_invariants::bodies::key_id;
     use crate::federation::licensure_chain_invariants::bodies::{
-        base, edge, keys, licence, must_put, must_refuse_as, officer, put,
+        base, edge, held_reason, keys, licence, must_put, must_refuse_as, officer, put,
+        refusal_message,
     };
     use crate::federation::room_roster_authority_invariants::bodies::make_group;
     use crate::federation::tier_ingest::test_support as ts;
@@ -143,6 +144,27 @@ pub mod bodies {
             Ok(a) => panic!("{what}: must be refused, admitted {}", a.attestation_id),
             Err(e) => e.kind().to_owned(),
         }
+    }
+
+    /// v62.0.0 (E2-fix3) — `r` is the `revision` rollback of `submitted`
+    /// below `existing`: refused typed (the earlier form), or HELD
+    /// `partner_record_rollback` with that refusal's text (edition 2; the held
+    /// revision is another row, CC 2.7.3).
+    fn rollback(r: &Result<Attestation, Error>, submitted: u64, existing: u64) -> bool {
+        if let Err(Error::PartnerRecordRollback {
+            submitted: s,
+            existing: e,
+            ..
+        }) = r
+        {
+            return *s == submitted && *e == existing;
+        }
+        held_reason(r).is_some_and(|(reason, detail)| {
+            reason == crate::federation::edition2::fold::reason::gc1::PARTNER_RECORD_ROLLBACK
+                && detail.ends_with(&format!(
+                    "submitted revision {submitted} is below existing {existing}"
+                ))
+        })
     }
 
     async fn not_stored(d: &dyn FederationDirectory, row: &Attestation, what: &str) {
@@ -332,18 +354,15 @@ pub mod bodies {
         };
         must_put(d, &lic(&board, 2, "issued", 30), "I1211 revision 2").await;
         // Lower: refused. Kills: dropping the comparison.
+        // v62.0.0 (E2-fix3; CC 2.7.3, wave GC1) — the held revision is
+        // ANOTHER row, so an edition-2 rollback is HELD
+        // `partner_record_rollback` with the refusal's text; the earlier form
+        // refuses it typed.
         let back = lic(&board, 1, "issued", 20);
-        let e = put(d, &back).await.expect_err("I1211 rollback");
+        let r = put(d, &back).await;
         assert!(
-            matches!(
-                &e,
-                Error::PartnerRecordRollback {
-                    submitted: 1,
-                    existing: 2,
-                    ..
-                }
-            ),
-            "[{tag}] I1211: a lower revision is a rollback: {e:?}"
+            rollback(&r, 1, 2),
+            "[{tag}] I1211: a lower revision is a rollback: {r:?}"
         );
         not_stored(d, &back, "I1211 rollback").await;
         // Equal: admits (a re-emission carries the revision it re-emits).
@@ -386,12 +405,10 @@ pub mod bodies {
         .await;
         // A rollback names the HIGHEST held revision (3 over 2, 2), not the
         // first one read. Kills: the running-maximum test inverted.
-        let e = put(d, &lic(&board, 1, "issued", 0))
-            .await
-            .expect_err("I1211 rollback below 3");
+        let r = put(d, &lic(&board, 1, "issued", 0)).await;
         assert!(
-            matches!(&e, Error::PartnerRecordRollback { existing: 3, .. }),
-            "[{tag}] I1211: the rollback names the highest held revision: {e:?}"
+            rollback(&r, 1, 3),
+            "[{tag}] I1211: the rollback names the highest held revision: {r:?}"
         );
         // Another authority whose id the board's is a prefix of: the prefix
         // read reaches its rows, and the board's own testimony there at
@@ -986,15 +1003,19 @@ pub mod bodies {
             };
             placed(row, scope, &[])
         };
-        let refused = |r: Result<Attestation, Error>, reason: &str, what: &str| match r {
-            Err(Error::InvalidArgument(m)) => assert!(
-                m.starts_with(&format!("{LICENCE_AUDIENCE_REFUSED}: {reason}:")),
-                "[{tag}] {what}: {m}"
-            ),
-            other => panic!(
-                "[{tag}] {what}: expected {LICENCE_AUDIENCE_REFUSED}: {reason}, got {other:?}"
-            ),
-        };
+        // v62.0.0 (E2-fix3; CC 2.7.3) — an arm that reads another row (the
+        // charter) HOLDS the licence with the gate's message; one on the
+        // row's own bytes refuses it. Either way the gate's message is read.
+        let refused =
+            |r: Result<Attestation, Error>, reason: &str, what: &str| match refusal_message(&r) {
+                Some(m) => assert!(
+                    m.starts_with(&format!("{LICENCE_AUDIENCE_REFUSED}: {reason}:")),
+                    "[{tag}] {what}: {m}"
+                ),
+                None => panic!(
+                    "[{tag}] {what}: expected {LICENCE_AUDIENCE_REFUSED}: {reason}, got {r:?}"
+                ),
+            };
         // Declared public: admits at federation.
         must_put(
             d,
@@ -1104,13 +1125,17 @@ pub mod bodies {
             let row = with(row, LICENCE_RE_EMITS_MEMBER, serde_json::json!(target));
             placed(row, scope, subjects)
         };
-        let refused = |r: Result<Attestation, Error>, reason: &str, what: &str| match r {
-            Err(Error::InvalidArgument(m)) => assert!(
-                m.starts_with(&format!("{LICENCE_AUDIENCE_REFUSED}: {reason}:")),
-                "[{tag}] {what}: {m}"
-            ),
-            other => panic!("[{tag}] {what}: expected {reason}, got {other:?}"),
-        };
+        // v62.0.0 (E2-fix3; CC 2.7.3) — an arm that reads another row (the
+        // original a re-emission names) HOLDS the licence with the gate's
+        // message; one on the row's own bytes refuses it.
+        let refused =
+            |r: Result<Attestation, Error>, reason: &str, what: &str| match refusal_message(&r) {
+                Some(m) => assert!(
+                    m.starts_with(&format!("{LICENCE_AUDIENCE_REFUSED}: {reason}:")),
+                    "[{tag}] {what}: {m}"
+                ),
+                None => panic!("[{tag}] {what}: expected {reason}, got {r:?}"),
+            };
         // The re-emission: same licence, same scope, the reader named.
         must_put(
             d,
@@ -1249,20 +1274,32 @@ pub mod bodies {
             "I1218 the licence",
         )
         .await;
+        // v62.0.0 (E2-fix3) — a `revocation:{entity_type}:{reason}` payload
+        // carries its `revoked_at` and `effective_at` (both required, CC
+        // rc21; `edition2::payloads`).
+        let revoked = crate::federation::licensure_chain_invariants::bodies::rfc3339(at);
         let adverse = must_put(
             d,
             &named(with(
                 with(
                     with(
-                        licence(&board, &holder, &board, "issued", None, at),
-                        "dimension",
-                        serde_json::json!("revocation:agent:misconduct:v1"),
+                        with(
+                            with(
+                                licence(&board, &holder, &board, "issued", None, at),
+                                "dimension",
+                                serde_json::json!("revocation:agent:misconduct:v1"),
+                            ),
+                            "score",
+                            serde_json::json!(-1.0),
+                        ),
+                        "status",
+                        serde_json::Value::Null,
                     ),
-                    "score",
-                    serde_json::json!(-1.0),
+                    "revoked_at",
+                    revoked.clone(),
                 ),
-                "status",
-                serde_json::Value::Null,
+                "effective_at",
+                revoked,
             )),
             "I1218 a revocation row about the holder",
         )
@@ -1405,13 +1442,16 @@ pub mod bodies {
         for n in ["n1", "n2", "n3", "n4", "n5"] {
             ts::register_hybrid_key_as(d, &node(n), &node(n), identity_type::NODE).await;
         }
-        let refused = |r: Result<Attestation, Error>, reason: &str, what: &str| match r {
-            Err(Error::InvalidArgument(m)) => assert!(
-                m.starts_with(&format!("{OWNER_BINDING_AFFILIATION_REFUSED}: {reason}:")),
-                "[{tag}] {what}: {m}"
-            ),
-            other => panic!("[{tag}] {what}: expected {reason}, got {other:?}"),
-        };
+        // v62.0.0 (E2-fix3; CC 2.7.3) — held with the gate's message when
+        // the arm reads another row (the affiliation), refused otherwise.
+        let refused =
+            |r: Result<Attestation, Error>, reason: &str, what: &str| match refusal_message(&r) {
+                Some(m) => assert!(
+                    m.starts_with(&format!("{OWNER_BINDING_AFFILIATION_REFUSED}: {reason}:")),
+                    "[{tag}] {what}: {m}"
+                ),
+                None => panic!("[{tag}] {what}: expected {reason}, got {r:?}"),
+            };
         // v62.0.0 (CC ruling (a), V1b): an owner binding naming an affiliation
         // is COUNTED: the owner's statement, the bound key's, and the members'
         // voices at the affiliation's protocol over the `refs.head` it names.

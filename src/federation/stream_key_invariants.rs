@@ -73,7 +73,6 @@ pub(crate) mod bodies {
         key_grant_rows_for, sign_row_unstored,
     };
     use crate::federation::nested_manifest_invariants::bodies::{kem_of, pair, Pair, SetCap};
-    use crate::federation::self_collective_invariants::bodies::bind;
     use crate::federation::types::cohort_scope::{self, CryptoTier};
     use crate::federation::{
         AdoptChunkItem, AdoptDisposition, BlobBody, BlobError, BlobProvenance, BlobStorage,
@@ -558,10 +557,17 @@ pub(crate) mod bodies {
             crate::federation::types::identity_type::NODE,
         )
         .await;
-        bind(
+        // v62.0.0 (E2-fix3; CC rc21 3.3.6, P1.api round 3) — the late NODE is
+        // the owner's device node (`place_device`), never an occurrence of
+        // the person; named by its kid.
+        let late_seed = late;
+        let late = crate::federation::edition2::fixture_switch::kid(&late_seed);
+        crate::federation::key_grant_invariants::two_node::place_device(
             p.sa.as_ref(),
-            &p.owner,
+            &p.owner_seed,
             &late,
+            &late_seed,
+            crate::federation::types::device_class::LAPTOP,
             Some(kem_of(p.sb.as_ref()).await),
         )
         .await;
@@ -938,7 +944,9 @@ pub(crate) mod bodies {
     {
         use crate::federation::tier_ingest::test_support as ts;
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        let dev = ts::local_signer(alias).derived_key_id();
+        // v62.0.0 (E2-fix3): the device's key as the store holds it (its
+        // kid; `register_hybrid_key_as` makes `kid(alias)` live).
+        let dev = crate::federation::edition2::fixture_switch::kid(alias);
         ts::register_hybrid_key_as(
             sa,
             &dev,
@@ -952,8 +960,18 @@ pub(crate) mod bodies {
             x25519_base64: B64.encode(x_pub),
             ml_kem_768_base64: B64.encode(&ml_pub),
         };
-        bind(sa, q, &dev, Some(kem)).await;
-        ts::put_owner_binding(sa, q, &dev).await;
+        // v62.0.0 (E2-fix3; CC rc21 3.3.6, P1.api round 3) — q's device
+        // node (`place_device`: self-occurrence + owner binding), never an
+        // occurrence of the person q.
+        crate::federation::key_grant_invariants::two_node::place_device(
+            sa,
+            q,
+            &dev,
+            alias,
+            crate::federation::types::device_class::LAPTOP,
+            Some(kem),
+        )
+        .await;
         dev
     }
 

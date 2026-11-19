@@ -62,13 +62,11 @@ pub(crate) mod bodies {
     /// `owner` binds `node`: the owner's row, then the node's voice over it.
     async fn bind(d: &dyn FederationDirectory, id: &str, owner: &str, node: &str) {
         let row = ts::owner_binding_attestation(id, owner, node);
-        e2::put_signed(d, &row)
+        // v62.0.0 (E2-fix3; K2.api) — the owner's statement, then the node's
+        // voice, through K2's shared helper (no hand-rolled voice).
+        ts::put_sealed_owner_binding(d, &row, node)
             .await
             .expect("the owner binds the node");
-        let st = e2::carried_statement(&row).expect("a mapped row carries its statement");
-        e2::put_statement(d, &e2::voice_of(&st, node))
-            .await
-            .expect("the node's voice on its owner binding");
     }
 
     /// **I1154** (see the module header).
@@ -77,7 +75,6 @@ pub(crate) mod bodies {
         B: FederationDirectory + crate::store::Backend,
     {
         use crate::federation::community_trust_consent as ctc;
-        use crate::federation::self_roster_invariants::bodies as srb;
         let d: &dyn FederationDirectory = b;
         let s = suffix();
         let (owner, dev, node, agent, stranger) = (
@@ -92,9 +89,26 @@ pub(crate) mod bodies {
         register(d, &node, &[it::NODE]).await;
         register(d, &agent, &[it::AGENT]).await;
         register(d, &stranger, &[it::USER]).await;
-        srb::add(d, &owner, &owner, &dev, srb::ms_now())
-            .await
-            .expect("the owner's second device");
+        // v62.0.0 (E2-fix3; O1) — the owner's second device is an edition-2
+        // `identity:occurrence` bind (the device's own voice and the owner's),
+        // naming the owner's roster head; the earlier signed occurrence
+        // (`self_roster_invariants::bodies::add`) is not an edition-2 row.
+        assert!(
+            matches!(
+                e2::put_bind(
+                    d,
+                    &owner,
+                    &owner,
+                    &dev,
+                    crate::federation::types::device_class::PHONE,
+                    &e2::BindOptions::default(),
+                )
+                .await
+                .expect("the owner's second device"),
+                StatementOutcome::Row { .. }
+            ),
+            "I1154: the owner's second device binds"
+        );
         let put = |a: Attestation| async move { e2::put_signed(d, &a).await };
         bind(d, &format!("ct4-ob-{s}"), &owner, &node).await;
         let node_kid = e2::kid(&node);

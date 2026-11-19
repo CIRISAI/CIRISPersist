@@ -200,7 +200,48 @@ fn row_families() -> &'static Mutex<HashMap<String, String>> {
     FAMILIES.get_or_init(Default::default)
 }
 
+/// v62.0.0 (E0 fix 3) — the literal `attestation_id` a fixture gave an
+/// earlier-shaped row → the id this node computed for it. A fixture that
+/// names a target by the id IT chose (`references_attestation_id: "w-1"`,
+/// a uuid) names the row it sealed under that id: an edition-2 row is named
+/// by its computed id, and this is the codec's record of which one.
+fn row_aliases() -> &'static Mutex<HashMap<String, String>> {
+    static ALIASES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    ALIASES.get_or_init(Default::default)
+}
+
+/// Record a minted statement: its row id's family and, when the literal row
+/// carried an id of its own choosing, that id as an alias of the row id.
+fn remember_row(statement: &[u8], literal_id: &str, family: &str) {
+    if let Some(id) = RowId::of_statement(statement) {
+        let hex = id.hex();
+        row_families()
+            .lock()
+            .expect("family map")
+            .insert(hex.clone(), family.to_owned());
+        if !literal_id.is_empty() && !is_hex64(literal_id) {
+            row_aliases()
+                .lock()
+                .expect("alias map")
+                .insert(literal_id.to_owned(), hex);
+        }
+    }
+}
+
+/// The row id a target name means: a 64-hex row id as is; an id a fixture
+/// chose for a row it sealed, that row's computed id. `None` for a name no
+/// row carries.
+#[must_use]
+pub fn resolve_target(name: &str) -> Option<String> {
+    if is_hex64(name) {
+        return Some(name.to_ascii_lowercase());
+    }
+    row_aliases().lock().expect("alias map").get(name).cloned()
+}
+
 fn key_of_seed_text(seed: &str) -> CompositeSigningKey {
+    let resolved = seed_of(seed);
+    let seed = resolved.as_str();
     // Every identity-ref shares its first 32 bytes
     // (`urn:ietf:params:oauth:ckt:sha-25…`), and a test signer seeds from the
     // first 32 bytes: seeding from a kid would give EVERY key one keypair.
@@ -236,11 +277,13 @@ pub fn signing_key(seed: &str) -> CompositeSigningKey {
     }
     let k = key_of_seed_text(seed);
     let iref = identity_ref(&thumbprint(k.public_key()));
+    // Resolved BEFORE the lock: `seed_of` takes the same map's lock.
+    let text = seed_of(seed);
     seeds()
         .lock()
         .expect("seed map")
         .entry(iref)
-        .or_insert_with(|| seed.to_owned());
+        .or_insert(text);
     k
 }
 
@@ -306,6 +349,20 @@ pub fn seed_of(s: &str) -> String {
     if is_identity_ref(s) {
         if let Some(seed) = seeds().lock().expect("seed map").get(s) {
             return seed.clone();
+        }
+        return s.to_owned();
+    }
+    // v62.0.0 (E0 fix 3) — a seed DERIVED from a kid by suffixing it
+    // (`format!("{kid}-succ-a")`, a fixture naming a successor key after its
+    // predecessor): the minted kid's seed carries the same suffix. Resolved
+    // through the map, never through the string's (shared) first 32 bytes.
+    let iref_len = ciris_verify_core::edition2::IDENTITY_REF_PREFIX.len() + 43;
+    if s.len() > iref_len && s.is_char_boundary(iref_len) {
+        let (head, tail) = s.split_at(iref_len);
+        if is_identity_ref(head) {
+            if let Some(seed) = seeds().lock().expect("seed map").get(head) {
+                return format!("{seed}{tail}");
+            }
         }
     }
     s.to_owned()
@@ -514,7 +571,13 @@ fn cbor_of(v: &serde_json::Value, member: Option<&str>) -> Value {
             } else if let Some(i) = n.as_i64() {
                 int_value(i)
             } else {
-                panic!("fixture_switch: a real outside the fixed-scale members ({member:?}: {n})")
+                // v62.0.0 (E0 fix 3) — a real outside the fixed-scale members is
+                // stated as P1's exact number (an integral one a plain integer,
+                // a non-integral one a normalised tag-4 decimal), as every
+                // producer states it (`emit::payload_from_envelope`).
+                payloads::body_number(n).unwrap_or_else(|e| {
+                    panic!("fixture_switch: a real outside the fixed-scale members ({member:?}: {n}): {e}")
+                })
             }
         }
         J::String(s) => Value::Text(s.clone()),
@@ -644,10 +707,11 @@ fn try_family_of(row: &Attestation) -> Result<String, String> {
             .get(REFERENCES_MEMBER)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        let resolved = resolve_target(target).unwrap_or_else(|| target.to_owned());
         return row_families()
             .lock()
             .expect("family map")
-            .get(target)
+            .get(&resolved)
             .cloned()
             .ok_or_else(|| {
                 format!(
@@ -760,8 +824,8 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
     // `refs.target`: a literal's names its target here.
     if !has_refs {
         if let Some(t) = target.as_ref().and_then(serde_json::Value::as_str) {
-            if is_hex64(t) {
-                let d = <[u8; 32]>::try_from(hex::decode(t).expect("hex").as_slice())
+            if let Some(id) = resolve_target(t) {
+                let d = <[u8; 32]>::try_from(hex::decode(&id).expect("hex").as_slice())
                     .expect("32 bytes");
                 m.push((
                     text("refs"),
@@ -772,8 +836,8 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
                 ));
             } else {
                 panic!(
-                    "fixture_switch: `{REFERENCES_MEMBER}` {t:?} is not a row id: name the target \
-                     by rid(&target)"
+                    "fixture_switch: `{REFERENCES_MEMBER}` {t:?} is not a row id, nor the id a \
+                     fixture gave a row it sealed: name the target by rid(&target)"
                 );
             }
         }
@@ -813,7 +877,75 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
     if !authored_here && !counted(family, dimension.as_deref()) {
         m.push((text("author"), text(signer_iref)));
     }
-    det_map(m)
+    det_map(fold_into_body(m, family, &row.attestation_type))
+}
+
+/// The payload members a row of `family` / `row_type` may state, when the
+/// door closes the list: a composer the common members only
+/// (`payloads::check_composer`); a family `payloads` maps its own members
+/// and the common ones (`payloads::check`). `None` when the list is open (a
+/// family with no list; one whose payload is the event's).
+fn closed_members(family: &str, row_type: &str) -> Option<Vec<&'static str>> {
+    if COMPOSER_ROW_TYPES.contains(&row_type) {
+        return Some(payloads::COMMON.to_vec());
+    }
+    let f = payloads::family_by_id(family)?;
+    if payloads::OVER_THE_EVENT.contains(&f.family) {
+        return None;
+    }
+    let mut out: Vec<&'static str> = f.members.iter().map(|m| m.name).collect();
+    out.extend_from_slice(payloads::COMMON);
+    Some(out)
+}
+
+/// v62.0.0 (E0 fix 3) — **an earlier member a closed payload does not list
+/// goes under `body`** (CC 2.6.1.10: the free-form body of a row), by its own
+/// name, so the row stays one the door admits and stays distinct (an
+/// earlier `id` nonce keeps two otherwise equal rows apart):
+/// - a composer's `withdrawal_reason` (free text) is `body.note`;
+/// - a `reason` that is text (the common `reason` is a uint code) is
+///   `body.note` when no note is stated, else `body.reason`;
+/// - anything else (`id`, `kind`, `scope`, ...) is `body.<name>`.
+///
+/// An open list is left as it is.
+fn fold_into_body(m: Vec<(Value, Value)>, family: &str, row_type: &str) -> Vec<(Value, Value)> {
+    let Some(allowed) = closed_members(family, row_type) else {
+        return m;
+    };
+    let mut kept = Vec::with_capacity(m.len());
+    let mut body: Vec<(Value, Value)> = Vec::new();
+    let mut moved: Vec<(String, Value)> = Vec::new();
+    for (k, v) in m {
+        let name = k.as_text().unwrap_or_default().to_owned();
+        if name == "body" {
+            if let Value::Map(b) = v {
+                body.extend(b);
+            } else {
+                moved.push(("body".to_owned(), v));
+            }
+            continue;
+        }
+        let text_reason = name == "reason" && v.as_u64().is_none();
+        if allowed.contains(&name.as_str()) && !text_reason {
+            kept.push((k, v));
+        } else {
+            moved.push((name, v));
+        }
+    }
+    if moved.is_empty() && body.is_empty() {
+        return kept;
+    }
+    let has_note = |b: &[(Value, Value)]| b.iter().any(|(k, _)| k.as_text() == Some("note"));
+    for (name, v) in moved {
+        let to_note = (name == "withdrawal_reason" || name == "reason")
+            && v.as_text().is_some()
+            && !has_note(&body);
+        let key = if to_note { "note".to_owned() } else { name };
+        body.retain(|(k, _)| k.as_text() != Some(key.as_str()));
+        body.push((text(&key), v));
+    }
+    kept.push((text("body"), det_map(body)));
+    kept
 }
 
 /// **An earlier-form-shaped row as an edition-2 statement**, of
@@ -867,12 +999,7 @@ pub fn counted_statement_of_family(a: &Attestation, seed: &str, family: &str) ->
         vec![],
     )
     .expect("fixture_switch: sign a counted row");
-    if let Some(id) = RowId::of_statement(&st) {
-        row_families()
-            .lock()
-            .expect("family map")
-            .insert(id.hex(), family.clone());
-    }
+    remember_row(&st, &a.attestation_id, &family);
     st
 }
 
@@ -915,12 +1042,7 @@ pub fn statement_of_family(a: &Attestation, seed: &str, family: &str) -> Vec<u8>
         vec![],
     )
     .expect("fixture_switch: sign");
-    if let Some(id) = RowId::of_statement(&st) {
-        row_families()
-            .lock()
-            .expect("family map")
-            .insert(id.hex(), family.to_owned());
-    }
+    remember_row(&st, &a.attestation_id, family);
     st
 }
 
@@ -1157,6 +1279,26 @@ fn default_windows() -> &'static Mutex<HashMap<String, (u64, u64)>> {
     W.get_or_init(Default::default)
 }
 
+/// v62.0.0 (K2 fix3) — identity-refs of keys a fixture put with an EXPLICIT
+/// window (a given `asserted_at` or `valid_until`), whose start
+/// [`key_window_start_ms`] cannot read.
+fn explicit_windows() -> &'static Mutex<std::collections::HashSet<String>> {
+    static N: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    N.get_or_init(Default::default)
+}
+
+/// v62.0.0 (K2 fix3) — remember whether `seed`'s key was last put with an
+/// explicit window.
+fn note_explicit(seed: &str, explicit: bool) {
+    let k = kid(seed);
+    let mut n = explicit_windows().lock().expect("explicit-window set");
+    if explicit {
+        n.insert(k);
+    } else {
+        n.remove(&k);
+    }
+}
+
 /// Remember (`Some`) or forget (`None`: an explicit record) the default
 /// window of `seed`'s key.
 fn note_window(seed: &str, window: Option<(u64, u64)>) {
@@ -1172,22 +1314,49 @@ fn note_window(seed: &str, window: Option<(u64, u64)>) {
     }
 }
 
-/// v62.0.0 (K2, red round 3) — **where `seed`'s key record starts**, POSIX ms:
-/// the start of the default node / agent window [`put_key`] noted for it, or,
-/// when none is noted (the key is not put yet, or was put with explicit
-/// options), the start a DEFAULT node record gets ([`NODE_DEFAULT_BACK_DAYS`]
-/// before today 00:00 UTC). A fixture that signs a row a node key must voice
-/// dates it from here plus a fixed offset, so the row sits at a fixed place
-/// inside the key's own window rather than at a calendar date the window
-/// moves past. There is no pinned fixture clock: the default window is itself
-/// derived from the day the suite runs, and this reads that one derivation.
+/// v62.0.0 (K2, red round 3) — **where `seed`'s key record starts**, POSIX ms.
+/// A fixture that signs a row a node key must voice dates it from here plus a
+/// fixed offset, so the row sits at a fixed place inside the key's own window
+/// rather than at a calendar date the window moves past. There is no pinned
+/// fixture clock: the default window is itself derived from the day the suite
+/// runs, and this reads that one derivation.
+///
+/// - a key [`put_key`] put with its DEFAULT node / agent window: that
+///   window's start;
+/// - a key not put yet (a builder that never stores its row, or one called
+///   before the key is put): the start a default node / agent record gets
+///   today ([`NODE_DEFAULT_BACK_DAYS`] before today 00:00 UTC), which is the
+///   window a default [`put_key`] of it will have.
+///
+/// A key with no end (`user` / `accord_holder`, default options) also reads
+/// the default node start: every instant after its record is inside it.
+///
+/// # Panics
+/// (K2 fix3) A key put with an EXPLICIT window (`put_key_with` with
+/// `asserted_at_ms` / `valid_until_ms`, or `key_row_for_earlier` with an
+/// instant): date the row from that record's own `asserted_at_ms` and
+/// re-seal. Named, never read as a default window the key does not have.
 #[must_use]
 pub fn key_window_start_ms(seed: &str) -> u64 {
-    default_windows()
+    let k = kid(seed);
+    if let Some((from, _)) = default_windows()
         .lock()
         .expect("window map")
-        .get(&kid(seed))
-        .map_or_else(|| default_asserted_at(&["node"]), |(from, _)| *from)
+        .get(&k)
+        .copied()
+    {
+        return from;
+    }
+    assert!(
+        !explicit_windows()
+            .lock()
+            .expect("explicit-window set")
+            .contains(&k),
+        "fixture_switch: key_window_start_ms({seed}): {k} was put with an explicit window \
+         (asserted_at / valid_until given), which this cannot read: date the row from that \
+         record's own asserted_at_ms and re-seal"
+    );
+    default_asserted_at(&["node"])
 }
 
 /// The default window a node / agent key gets with no options.
@@ -1500,12 +1669,7 @@ pub fn statement_of_with_key(a: &Attestation, key: &CompositeSigningKey, family:
         vec![],
     )
     .expect("fixture_switch: sign");
-    if let Some(id) = RowId::of_statement(&st) {
-        row_families()
-            .lock()
-            .expect("family map")
-            .insert(id.hex(), family.to_owned());
-    }
+    remember_row(&st, &a.attestation_id, family);
     st
 }
 
@@ -1639,6 +1803,7 @@ pub fn key_row_for_earlier(
     }
     // The fixed-instant guard follows this key: a default window is
     // remembered, an explicit one forgets any earlier default.
+    note_explicit(key_id, asserted_at.is_some() || valid_until.is_some());
     note_window(
         key_id,
         if asserted_at.is_none() && valid_until.is_none() {
@@ -1882,6 +2047,10 @@ pub async fn put_key_with<D: FederationDirectory + ?Sized>(
         .await
         .unwrap_or_else(|e| panic!("fixture_switch: put_key({seed}): {e}"));
     let default = opts.asserted_at_ms.is_none() && opts.valid_until_ms.is_none() && !opts.no_end;
+    note_explicit(
+        seed,
+        opts.asserted_at_ms.is_some() || opts.valid_until_ms.is_some(),
+    );
     note_window(
         seed,
         if default {
@@ -1982,6 +2151,46 @@ pub async fn land_owner_binding<D: FederationDirectory + ?Sized>(
     check_default_window(&voice);
     put_signed(dir, binding).await?;
     put_statement(dir, &voice).await
+}
+
+/// v62.0.0 (E0 fix 3) — **a counted row with its further voices**: the
+/// statement `row` carries (`put_signed`; a counted row short of its
+/// voices answers `Pending`), then each of `cosigners`' voices over the same
+/// payload ([`voice_of`]), in order. The outcome of the last put.
+///
+/// # Errors
+/// The door's and the gates' refusals, at the first put that refuses.
+pub async fn put_with_voices<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    row: &Attestation,
+    cosigners: &[&str],
+) -> Result<StatementOutcome, Error> {
+    let mut out = put_signed(dir, row).await?;
+    if cosigners.is_empty() {
+        return Ok(out);
+    }
+    let st = carried_statement(row).expect("put_signed checked it carries one");
+    for c in cosigners {
+        out = super::ingest::put_statement(dir, &voice_of(&st, c), None, tier_of(row)).await?;
+    }
+    Ok(out)
+}
+
+/// v62.0.0 (E0 fix 3) — **an owner binding as it lands** (CC 3.2, C557;
+/// `admission::check_owner_binding_counted`): the owner's statement, then
+/// the bound key's own (`row.attested_key_id`, the `bound_node` voice).
+/// An affiliation-naming binding also needs its members' voices: put those
+/// with [`put_with_voices`].
+///
+/// # Errors
+/// As [`put_with_voices`].
+pub async fn put_owner_binding_row<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    row: &Attestation,
+) -> Result<StatementOutcome, Error> {
+    // One owner-binding path: K2's `land_owner_binding` (no second voicing).
+    let node = row.attested_key_id.clone();
+    land_owner_binding(dir, row, &node).await
 }
 
 /// [`statement_of`] put through the store; the row as mapped.
@@ -2551,6 +2760,60 @@ mod tests {
             Some(500_000),
             "I2552: the envelope's own weight"
         );
+    }
+
+    /// **I2554 (round 3: a fixture's own names and members)**: a composer
+    /// naming its target by the literal id the fixture GAVE it names that
+    /// row's computed id and carries its family; the composer's
+    /// `withdrawal_reason` / `id` (members a composer's closed payload does
+    /// not list) ride `body`; a name no sealed row carries is no target.
+    #[test]
+    fn i2554_literal_ids_and_closed_payloads() {
+        let mut target = literal(
+            "evidence:safety_battery:capture:a:b:v1",
+            "2026-01-02T03:04:05Z",
+        );
+        target.attestation_id = "i2554-target".into();
+        let sealed = row_of(&target, "e0-signer");
+        assert_eq!(
+            resolve_target("i2554-target"),
+            Some(rid(&sealed)),
+            "I2554: the alias"
+        );
+        assert_eq!(resolve_target("i2554-never-sealed"), None);
+        let mut w = target.clone();
+        w.attestation_id = "i2554-w".into();
+        w.attestation_type = "withdraws".into();
+        w.attestation_envelope = serde_json::json!({
+            "id": "i2554-w",
+            REFERENCES_MEMBER: "i2554-target",
+            "withdrawal_reason": "retracted",
+        });
+        let st = statement_of(&w, "e0-signer");
+        let (p, payload) = statement_parts(&st).unwrap();
+        assert_eq!(
+            p.get_int(-70002).and_then(Value::as_text),
+            Some("evidence:.suite:.kind:.cell:.prefix"),
+            "I2554: the target's family"
+        );
+        let body = payload.get_text("body").expect("I2554: a body");
+        assert_eq!(
+            body.get_text("note").and_then(Value::as_text),
+            Some("retracted")
+        );
+        assert_eq!(
+            body.get_text("id").and_then(Value::as_text),
+            Some("i2554-w")
+        );
+        assert!(payload.get_text("withdrawal_reason").is_none());
+        assert!(payload.get_text("id").is_none());
+        let row = row_of_statement(&st, INGEST_TIER);
+        assert_eq!(
+            row.attestation_envelope[REFERENCES_MEMBER],
+            serde_json::json!(rid(&sealed)),
+            "I2554: refs.target is the computed id"
+        );
+        assert_eq!(statement_of(&row, "e0-signer"), st, "I2554: and back");
     }
 
     /// **I2546 (the builders flip)**: with the switch ON, `seal_row` returns

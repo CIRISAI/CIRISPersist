@@ -263,8 +263,10 @@ pub mod bodies {
 
         // (4) A amends again (unanimous now: all three voice) before B holds
         //     the first amendment. Offered first, the second is STALE: its
-        //     `refs.head` names a version B does not hold (retryable), so no
-        //     voice is kept.
+        //     `refs.head` names a version B does not hold. v62.0.0 (E3b round
+        //     3; CC 2.7, ruling 5): the dependency is genuinely missing, so
+        //     the voices WAIT (kept `Pending`, concluding nothing) — or are
+        //     refused retryable; either way B's record does not move.
         let v3 = Content {
             name: "household, renamed twice",
             protocol: consensus_protocol::MAJORITY,
@@ -291,9 +293,11 @@ pub mod bodies {
         assert_eq!(served_v3.len(), 3, "{tag} I178: three voices of v3");
         for (bytes, row) in &served_v3 {
             match apply_replicated_statement(b, bytes, &row.0).await {
-                Err(_) | Ok(ReplicatedStatementOutcome::Refused { .. }) => {}
+                Err(_)
+                | Ok(ReplicatedStatementOutcome::Refused { .. })
+                | Ok(ReplicatedStatementOutcome::Admitted(StatementOutcome::Pending { .. })) => {}
                 other => panic!(
-                    "{tag} I178: a version naming a head B does not hold is not kept: {other:?}"
+                    "{tag} I178: a version naming a head B does not hold does not land: {other:?}"
                 ),
             }
         }
@@ -320,12 +324,17 @@ pub mod bodies {
             "{tag} I178: B applies A's amendment: {:?}",
             out[1]
         );
-        assert_eq!(
-            kind.stored(b, &gid).await,
-            a_v2,
-            "{tag} I178: B holds A's version 2"
-        );
-        assert_eq!(kind.current_version(b, &gid).await, 2, "{tag} I178");
+        // v62.0.0 (E3b round 3): v2's arrival re-folds the v3 voices that
+        // waited on it (CC 2.7), so B may already stand at version 3.
+        let vb = kind.current_version(b, &gid).await;
+        assert!(vb == 2 || vb == 3, "{tag} I178: B moved past v1: {vb}");
+        if vb == 2 {
+            assert_eq!(
+                kind.stored(b, &gid).await,
+                a_v2,
+                "{tag} I178: B holds A's version 2"
+            );
+        }
         let history = b.list_group_versions(kind.cohort(), &gid).await.unwrap();
         assert!(
             history.iter().any(|v| v.version == 1 && !v.is_current),
@@ -353,7 +362,10 @@ pub mod bodies {
                 "{tag} I178: the identical re-delivery: {o:?}"
             );
         }
-        assert_eq!(kind.current_version(b, &gid).await, 2, "{tag} I178");
+        assert!(
+            kind.current_version(b, &gid).await >= 2,
+            "{tag} I178: the re-delivery changes nothing"
+        );
 
         // (6) …and now the second applies too: B converges on version 3,
         //     judged against B's own version 2 (unanimous — all three voice).

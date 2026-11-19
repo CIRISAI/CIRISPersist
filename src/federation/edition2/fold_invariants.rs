@@ -13,6 +13,10 @@
 //! - **I3553** `count_short` is one fold reason: an owner binding voiced by
 //!   its owner alone is held with reason `count_short` (`why_held`), and the
 //!   node's voice concludes it and clears the reason.
+//! - **I3569** (fix7, inside I3554's runners) the FORWARD effect of an
+//!   owner-binding withdrawal: the device's new statements no longer act for
+//!   the owner (`check_signer_acts_for` refuses `SignerDoesNotActFor`), and
+//!   the owner's current roster (`roster_now`) excludes it.
 //! - **I3554** the owner exemplar (`check_config_self_or_owner_admission`),
 //!   binding FIRST: the owner's `config:*` row about its node concludes; the
 //!   owner's withdrawal of the binding UN-concludes it (no typed row, reason
@@ -471,6 +475,12 @@ pub(crate) async fn owner_binding_first_body(d: &dyn FederationDirectory) {
     assert!(concluded(d, &config).await, "I3554: the typed row is held");
     assert_eq!(held_reason(d, &config).await, None, "I3554: no reason");
 
+    // G0-fix7 (I3569) — while the binding stands, the node acts for its
+    // owner (the node arm of `check_signer_acts_for`: its live owner binding).
+    crate::federation::admission::check_signer_acts_for(d, &node_kid, &e2::kid(owner), "edition2")
+        .await
+        .expect("I3569: a bound node acts for its owner");
+
     // The owner withdraws the binding: the seat empties, and the config row,
     // whose fold read it, is re-folded out of its typed table.
     let w = e2::composer_of(attestation_type::WITHDRAWS, &binding, owner);
@@ -500,6 +510,30 @@ pub(crate) async fn owner_binding_first_body(d: &dyn FederationDirectory) {
     assert!(
         !d.edition2_voices(&id_of(&config)).await.unwrap().is_empty(),
         "I3554: its statement is still held"
+    );
+
+    // G0-fix7 (I3569) — the FORWARD effect of the withdrawal: a concluded
+    // (FINAL-plane) bind is history, never standing. The device's NEW
+    // statements no longer act for the owner, and the owner's current roster
+    // does not hold it.
+    let e = crate::federation::admission::check_signer_acts_for(
+        d,
+        &node_kid,
+        &e2::kid(owner),
+        "edition2",
+    )
+    .await
+    .expect_err("I3569: after the withdrawal the node no longer acts for its owner");
+    assert!(
+        matches!(e, Error::SignerDoesNotActFor { .. }),
+        "I3569: refused as not acting for: {e:?}"
+    );
+    assert!(
+        !crate::federation::self_roster::roster_now(d, &e2::kid(owner))
+            .await
+            .unwrap()
+            .contains(&node_kid),
+        "I3569: the owner's current roster excludes the device"
     );
 }
 

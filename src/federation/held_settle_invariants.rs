@@ -45,6 +45,17 @@ pub(crate) mod bodies {
         dimension: &str,
     ) -> crate::federation::Attestation {
         let id = uuid::Uuid::new_v4().to_string();
+        sealed_scores(
+            author,
+            serde_json::json!({
+                "id": id, "dimension": dimension, "score": 1.0, "confidence": 0.9,
+            }),
+        )
+    }
+
+    /// v62 (E3b r3): `author`'s own `scores` row with `envelope`, through
+    /// E0's codec (`row_of`).
+    fn sealed_scores(author: &str, envelope: serde_json::Value) -> crate::federation::Attestation {
         let now = now_micros();
         let row = crate::federation::Attestation {
             attestation_id: String::new(),
@@ -54,9 +65,7 @@ pub(crate) mod bodies {
             weight: None,
             asserted_at: now,
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "id": id, "dimension": dimension, "score": 1.0, "confidence": 0.9,
-            }),
+            attestation_envelope: envelope,
             original_content_hash: String::new(),
             scrub_signature_classical: String::new(),
             scrub_signature_pqc: None,
@@ -118,21 +127,23 @@ pub(crate) mod bodies {
             .unwrap()
             .to_cell(h3o::Resolution::Seven)
             .to_string();
-        dir.put_location_proof(ts::sign_location_proof(
+        // v62 (E3b r3): a location proof is the subject's own
+        // `location_proof:v1` row (CC 3.3.3; `edition2::payloads`), an
+        // Attestation-kind entry; the earlier `put_location_proof` door is
+        // refused once the doors are shut (`refuse_earlier_form`) and its
+        // JSON signer is the seed, never a registered identity-ref.
+        let proof = sealed_scores(
             &author,
-            crate::federation::types::LocationProof {
-                subject_key_id: author.clone(),
-                cell_id: cell,
-                cell_resolution: 7,
-                asserted_at: now,
-                valid_until: None,
-                attestation_evidence: None,
-                withdrawn_at: None,
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] I230 seed location proof: {e}"));
+            serde_json::json!({
+                "dimension": "location_proof:v1",
+                "cell_id": cell,
+                "cell_resolution": 7,
+            }),
+        );
+        crate::federation::edition2::fixture_switch::put_signed(dir, &proof)
+            .await
+            .map(|_| ())
+            .unwrap_or_else(|e| panic!("[{tag}] I230 seed location proof: {e}"));
         // Wave 2 (T1): the family and the community are founded through the
         // edition-2 door: the founding roster's voices (the author's and the
         // listed member's), landing under `kid(fam)` / `kid(comm)`.
@@ -238,7 +249,10 @@ pub(crate) mod bodies {
         // v61 (CIRISPersist#991) — the family and the community are
         // `group:roster:v1` rows: Attestation-kind entries; their framed
         // `Family` / `Community` entries are no longer indexed.
-        for kind in ["Attestation", "LocationProof"] {
+        // v62 (E3b r3): the location proof is an Attestation-kind entry too
+        // (its `location_proof:v1` row).
+        {
+            let kind = "Attestation";
             assert!(
                 mine.iter().any(|(k, _)| k == kind),
                 "[{tag}] I230: no {kind} ref seeded; got {mine:?}"

@@ -257,9 +257,21 @@ pub mod bodies {
         };
         let mut born = family(&fresh, &all, "household");
         born.dissolved_at = Some(t);
+        // v62 (E4 round 3; T1's founding rule): every founder voices the
+        // birth, so the count is met and the record's own shape is judged.
+        let founders: Vec<_> = all.iter().map(|k| e2::signing_key(k)).collect();
+        let founder_refs: Vec<&_> = founders.iter().collect();
         let e = e2::put_voices(
             a,
-            &e2::family_voices(&ts::sign_family(alice, born), 1, None, ms(t)),
+            &e2::roster_voices(
+                &crate::federation::edition2::group::GroupRecord::Family(e2::family_with_kids(
+                    &born,
+                )),
+                1,
+                None,
+                ms(t),
+                &founder_refs,
+            ),
         )
         .await
         .expect_err("a family is never founded dissolved");
@@ -315,7 +327,7 @@ pub mod bodies {
         // A further version, voiced by everyone: refused by name, on A and B.
         let now = chrono::Utc::now();
         for (d, who) in [(a, "A"), (b, "B")] {
-            let e = e2::put_voices(
+            let r = e2::put_voices(
                 d,
                 &version(
                     d,
@@ -326,9 +338,21 @@ pub mod bodies {
                 )
                 .await,
             )
-            .await
-            .expect_err("a dissolved family admits no amendment");
-            assert!(is_dissolved_refusal(&e), "{tag} I282 on {who}: {e:?}");
+            .await;
+            // v62 (E4 round 3; CC 2.7.3): read against the held (dissolved)
+            // head, the amendment is held or refused by name; either way it
+            // concludes nothing.
+            match &r {
+                Ok(StatementOutcome::Pending { .. }) => {}
+                Err(e) => assert!(is_dissolved_refusal(e), "{tag} I282 on {who}: {e:?}"),
+                Ok(other) => {
+                    panic!("{tag} I282 on {who}: a dissolved family admits no amendment: {other:?}")
+                }
+            }
+            assert!(
+                held(d, &w.id).await.dissolved_at.is_some(),
+                "{tag} I282 on {who}: still dissolved"
+            );
         }
         // A membership revocation naming the dissolved family.
         let (head, _) = e2::held_head(a, &w.id).await.expect("held");

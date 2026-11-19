@@ -1279,8 +1279,16 @@ where
         };
         if let (Some(heads), Some(row_id)) = (head_of(&c), e2_row) {
             if let Ok((at_heads, _)) = roster_reading(dir, identity, &heads).await {
+                let exclude = match &c {
+                    Carried::Edition2Eviction { target_key_id, .. } => Some(target_key_id.clone()),
+                    _ => None,
+                };
                 match super::edition2::occurrence::proposer_on_roster(
-                    dir, &row_id, identity, &at_heads,
+                    dir,
+                    &row_id,
+                    identity,
+                    &at_heads,
+                    exclude.as_deref(),
                 )
                 .await?
                 {
@@ -1686,8 +1694,19 @@ where
     // T2's I3187: the proposer is chosen among the voices by keys ON the
     // roster at the named heads; a voice off it is kept and concludes
     // nothing, never a refusal. No such voice yet: the proposal waits.
-    let Some(proposer) =
-        super::edition2::occurrence::proposer_on_roster(dir, &row_id, &identity, &roster).await?
+    // O1 fix 8: an eviction's target never proposes it (`proposer_is_target`).
+    let exclude = match &carried {
+        Carried::Edition2Eviction { target_key_id, .. } => Some(target_key_id.clone()),
+        _ => None,
+    };
+    let Some(proposer) = super::edition2::occurrence::proposer_on_roster(
+        dir,
+        &row_id,
+        &identity,
+        &roster,
+        exclude.as_deref(),
+    )
+    .await?
     else {
         dir.note_edition2_roster_proposal(&id, &identity, now)
             .await?;
@@ -1858,6 +1877,17 @@ where
         return Ok(Ok((RosterStep::Root, Vec::new())));
     }
     let Some(carried) = super::edition2::occurrence::carried_of_bind(dir, &row.hex()).await? else {
+        // O1 fix 5 (I3644/I3645): a roster row held with only its
+        // occurrence key's own voice (its author's has not arrived) is not
+        // readable YET. It WAITS, like an unheld row: the fold re-runs the
+        // reader when the author's voice lands it. Any other family is not a
+        // roster row.
+        let family = protected.get_int(-70002).and_then(Value::as_text);
+        if family == Some(super::edition2::occurrence::OCCURRENCE_FAMILY)
+            || family == Some(super::edition2::occurrence::OCCURRENCE_REVOCATION_FAMILY)
+        {
+            return Ok(Err(RosterLoad::Wait(*row)));
+        }
         return Ok(Err(bad(format!("{} is not a roster row", row.hex()))));
     };
     if carried.identity_key_id() != identity {

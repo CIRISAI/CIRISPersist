@@ -15293,12 +15293,10 @@ impl PyEngine {
             // #837 — the WRITER: the same signer choice `seal_stream_scoped`
             // makes (the LOCAL signer when configured, else the composed
             // one), so the stream's owner and its sealer are one key.
-            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
-                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
-                    local.clone(),
-                )),
-                None => self.signer.clone(),
-            };
+            // v62.0.0 (E6-fix4) — the LocalSigner when configured, else the
+            // composed signer, named by the ONE writer-id helper
+            // (`signing::Writer`) the seal door uses too.
+            let (local, hardware) = (self.local_signer.clone(), self.signer.clone());
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -15307,7 +15305,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             put_blob_chunk_scoped(
                                 backend.as_ref(),
-                                &*signer,
+                                crate::signing::Writer::of(local.as_deref(), &*hardware),
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
@@ -15325,7 +15323,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             put_blob_chunk_scoped(
                                 backend.as_ref(),
-                                &*signer,
+                                crate::signing::Writer::of(local.as_deref(), &*hardware),
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
@@ -15423,12 +15421,10 @@ impl PyEngine {
             );
             // The writer: the signer `put_blob_chunk_scoped` writes under, so
             // the supplied epoch and its chunks have one single sender.
-            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
-                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
-                    local.clone(),
-                )),
-                None => self.signer.clone(),
-            };
+            // v62.0.0 (E6-fix4) — the LocalSigner when configured, else the
+            // composed signer, named by the ONE writer-id helper
+            // (`signing::Writer`) the seal door uses too.
+            let (local, hardware) = (self.local_signer.clone(), self.signer.clone());
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -15437,7 +15433,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             register_stream_epoch_dek(
                                 backend.as_ref(),
-                                &*signer,
+                                crate::signing::Writer::of(local.as_deref(), &*hardware),
                                 &scope,
                                 &group,
                                 &stream,
@@ -15454,7 +15450,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             register_stream_epoch_dek(
                                 backend.as_ref(),
-                                &*signer,
+                                crate::signing::Writer::of(local.as_deref(), &*hardware),
                                 &scope,
                                 &group,
                                 &stream,

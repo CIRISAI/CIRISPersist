@@ -21,6 +21,18 @@ pub mod bodies {
     };
     use crate::federation::{Error, FederationDirectory};
 
+    /// v62 (E4, round 3): a key seed for `name` in the test tagged `tag`.
+    /// A test signer seeds from the FIRST 32 BYTES of its seed, so
+    /// `format!("{tag}-{name}")` with a long tag gives every name ONE key
+    /// (and a room the same id as its members): `members` then repeats a key
+    /// and the roster payload is refused. The tag is folded into a short
+    /// digest after the distinguishing name.
+    pub(crate) fn sd(name: &str, tag: &str) -> String {
+        use sha2::Digest as _;
+        let h = hex::encode(sha2::Sha256::digest(tag.as_bytes()));
+        format!("{name}-{}", &h[..16])
+    }
+
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().expect("rfc3339")
     }
@@ -81,8 +93,8 @@ pub mod bodies {
         policy_blob: Option<serde_json::Value>,
         record_signer: Option<&str>,
     ) -> (String, Vec<String>) {
-        let room = format!("{tag}-room");
-        let keys: Vec<String> = names.iter().map(|n| format!("{tag}-{n}")).collect();
+        let room = sd("room", tag);
+        let keys: Vec<String> = names.iter().map(|n| sd(n, tag)).collect();
         for k in &keys {
             user(d, k).await;
         }
@@ -297,7 +309,7 @@ pub mod bodies {
     /// founder's single signature is the protocol (CC 4.4.3.4.2).
     pub async fn i170_admission_is_the_roster(d: &dyn FederationDirectory, tag: &str) {
         let (room, alice, _bob) = make_room(d, tag, "quorum:1/1").await;
-        let carol = format!("{tag}-carol");
+        let carol = sd("carol", tag);
         user(d, &carol).await;
         assert!(!admitted(d, &carol, &room).await, "{tag} I170: control");
         widen(
@@ -350,7 +362,7 @@ pub mod bodies {
         let refused = |r: Result<StatementOutcome, Error>, want: &str, what: &str| {
             short_or_refused(r, want, &format!("{tag} I171 {what}"));
         };
-        let newcomer = |n: &str| format!("{tag}-{n}");
+        let newcomer = |n: &str| sd(n, tag);
         for n in ["x1", "x2", "x3", "x4", "x5", "x6", "eve"] {
             user(d, &newcomer(n)).await;
         }
@@ -363,7 +375,7 @@ pub mod bodies {
         // `consensus::tests`.)
         let (r, k) = make_group(
             d,
-            &format!("{tag}-fo"),
+            &sd("fo", tag),
             consensus_protocol::FOUNDER_ONLY,
             &["a", "b"],
             1,
@@ -402,7 +414,7 @@ pub mod bodies {
         // majority of three: one refused, two admitted.
         let (r, k) = make_group(
             d,
-            &format!("{tag}-mj"),
+            &sd("mj", tag),
             consensus_protocol::MAJORITY,
             &["a", "b", "c"],
             1,
@@ -444,7 +456,7 @@ pub mod bodies {
         // unanimous of three: two refused, three admitted.
         let (r, k) = make_group(
             d,
-            &format!("{tag}-un"),
+            &sd("un", tag),
             consensus_protocol::UNANIMOUS,
             &["a", "b", "c"],
             1,
@@ -473,7 +485,7 @@ pub mod bodies {
         // quorum:2/5 — absolute M.
         let (r, k) = make_group(
             d,
-            &format!("{tag}-qu"),
+            &sd("qu", tag),
             "quorum:2/5",
             &["a", "b", "c", "d", "e"],
             1,
@@ -495,16 +507,7 @@ pub mod bodies {
         .unwrap_or_else(|e| panic!("{tag} quorum:2/5: 2: {e}"));
 
         // custom:x undeclared — unevaluable, whoever signs.
-        let (r, k) = make_group(
-            d,
-            &format!("{tag}-cu"),
-            "custom:x",
-            &["a", "b"],
-            1,
-            None,
-            None,
-        )
-        .await;
+        let (r, k) = make_group(d, &sd("cu", tag), "custom:x", &["a", "b"], 1, None, None).await;
         refused(
             widen_by(
                 d,
@@ -521,7 +524,7 @@ pub mod bodies {
         user(d, &rec).await;
         let (r, _k) = make_group(
             d,
-            &format!("{tag}-rs"),
+            &sd("rs", tag),
             "quorum:1/1",
             &["a", "b"],
             1,
@@ -552,7 +555,7 @@ pub mod bodies {
             make_group(b, tag, consensus_protocol::MAJORITY, &names, 1, None, None).await;
         assert_eq!(room, room_b);
         let (alice, bob, carol) = (&k[0], &k[1], &k[2]);
-        let dan = format!("{tag}-dan");
+        let dan = sd("dan", tag);
         user(a, &dan).await;
         user(b, &dan).await;
         // v62 (E4, flip wave 2): the same statements reach both nodes in
@@ -648,13 +651,13 @@ pub mod bodies {
             "rubrics": {"votes": {"weights": {"role:founder": 3}, "default_weight": 1, "threshold": 4}},
             "custom": {"council": {"all_of": [{"founder": {}}, {"quorum": 2}]}}
         });
-        let x = format!("{tag}-x");
-        let y = format!("{tag}-y");
+        let x = sd("x", tag);
+        let y = sd("y", tag);
         user(d, &x).await;
         user(d, &y).await;
         let (r, k) = make_group(
             d,
-            &format!("{tag}-w"),
+            &sd("w", tag),
             "weighted:votes",
             &["a", "b", "c"],
             1,
@@ -694,7 +697,7 @@ pub mod bodies {
         .unwrap_or_else(|e| panic!("{tag} I182 weighted: 4 of 4: {e}"));
         let (r, k) = make_group(
             d,
-            &format!("{tag}-c"),
+            &sd("c", tag),
             "custom:council",
             &["a", "b", "c"],
             1,
@@ -901,7 +904,7 @@ pub mod bodies {
             };
             // v62 (E4): each row is its signer's edition-2 statement; its id
             // is the node's.
-            let row = review(plain, &format!("{tag}-plain"));
+            let row = review(plain, &sd("plain", &tag));
             let id = e2::rid(&e2::row_of(&row, plain));
             let err = e2::try_put_row(d, &row, plain)
                 .await
@@ -912,7 +915,7 @@ pub mod bodies {
                 "I1522 {protocol}: {err}"
             );
             assert!(d.get_attestation(&id).await.unwrap().is_none());
-            e2::try_put_row(d, &review(founder, &format!("{tag}-founder")), founder)
+            e2::try_put_row(d, &review(founder, &sd("founder", &tag)), founder)
                 .await
                 .unwrap_or_else(|e| panic!("I1522 {protocol}: the founder reviews: {e}"));
 
@@ -929,7 +932,7 @@ pub mod bodies {
                     }),
                 )
             };
-            e2::try_put_row(d, &edge(founder, modk, &format!("{tag}-appoint")), founder)
+            e2::try_put_row(d, &edge(founder, modk, &sd("appoint", &tag)), founder)
                 .await
                 .unwrap_or_else(|e| panic!("I1522 {protocol}: the appointment: {e}"));
             assert!(

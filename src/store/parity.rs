@@ -195,6 +195,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
     ("put_blob_planned", Class::Plan),
     ("store_blob_local_planned", Class::Plan),
+    // v62.0.0 (E8-fix2) — the sealed-floor announce (I27 / I28), and its
+    // refusal of a plaintext floor.
+    ("announce_held_blob_planned", Class::Plan),
+    ("refuse_plaintext_announce", Class::Gate),
     ("adopt_sealed_blob_planned", Class::Plan),
     ("put_blob_chunks_planned", Class::Plan),
     ("put_dag_manifest_over_held_planned", Class::Plan),
@@ -1647,7 +1651,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 74] = [
+    const SHARED_PLANS: [(&str, &str); 75] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
         (
             "src/federation/transport_admit.rs",
@@ -1694,6 +1698,8 @@ mod tests {
         // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
         ("src/federation/blob_admit.rs", "put_blob_planned"),
         ("src/federation/blob_admit.rs", "store_blob_local_planned"),
+        // v62.0.0 (E8-fix2) — the sealed-floor announce (I27 / I28).
+        ("src/federation/blob_admit.rs", "announce_held_blob_planned"),
         ("src/federation/blob_admit.rs", "adopt_sealed_blob_planned"),
         ("src/federation/blob_admit.rs", "put_blob_chunks_planned"),
         (
@@ -1918,7 +1924,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 79] = [
+    const SHARED_DOORS: [(&str, &str, &str); 80] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
         // decoded by the row mapper both doors read through.
         (
@@ -1982,6 +1988,12 @@ mod tests {
             "BlobStorage",
             "store_blob_local",
             "store_blob_local_planned",
+        ),
+        // v62.0.0 (E8-fix2) — the sealed-floor announce (I27 / I28).
+        (
+            "BlobStorage",
+            "announce_held_blob",
+            "announce_held_blob_planned",
         ),
         (
             "BlobStorage",

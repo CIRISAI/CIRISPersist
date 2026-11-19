@@ -6788,16 +6788,32 @@ impl Engine {
             crate::federation::Error::Backend(format!("publish_self_occurrence: node key: {e}"))
         })?;
         let local_id = local.federation_id().await;
-        // v62.0.0 (E11, round 3) — since cut B `local_derived_key_id` IS the
-        // LocalSigner's identity-ref on a composite engine, so `local_id != me`
-        // alone can never fire. The node's identity is the COMPOSED signer:
-        // the LocalSigner must hold its classical key.
+        // v62.0.0 (E11 round 3, reviewed by P8 fix3) — since cut B
+        // `local_derived_key_id` IS the LocalSigner's identity-ref on a
+        // composite engine, so `local_id != me` alone can never fire. Two
+        // further facts make the LocalSigner this node's:
+        // - its classical half is the COMPOSED signer's key (the earlier
+        //   check's content: the composite identity-ref binds that Ed25519
+        //   half, so an engine composing one classical key and signing with
+        //   another holds two identities). `with_signer`,
+        //   `with_hardware_signer_hybrid` (`from_hardware_parts` over the same
+        //   classical) and an Edge keyring rebuild all satisfy it;
+        // - it is the node key the store already knows (`node_key_id`, set by
+        //   the Engine that opened it): a shared backend opened by another
+        //   identity is not this signer's node.
         let composed = self.signer.public_key().await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "publish_self_occurrence: the composed signer's public key: {e}"
             ))
         })?;
-        if local_id != me || composed.as_slice() != local.ed25519_public_key_bytes().as_slice() {
+        self.ensure_backend_node_key().await;
+        let store_node = crate::federation::FederationDirectory::node_key_id(
+            self.federation_directory().as_ref(),
+        );
+        if local_id != me
+            || composed.as_slice() != local.ed25519_public_key_bytes().as_slice()
+            || store_node.as_deref().is_some_and(|k| k != local_id)
+        {
             return Err(crate::federation::Error::InvalidArgument(format!(
                 "publish_self_occurrence: the LocalSigner ({local_id}) is not this node's identity \
                  ({me}); a node publishes only its own occurrence (BLOB_REPLICATION.md §20.3)",
@@ -7808,12 +7824,14 @@ impl Engine {
         // #837 — the WRITER is this Engine's signer, the same one
         // `seal_stream_scoped` seals under, so the stream's owner and its
         // sealer are one key.
+        // v62.0.0 (E6-fix4) — `Writer::of`: the LocalSigner when held (the
+        // seal door's `announcing_signer`), named by the one writer-id helper.
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 put_blob_chunk_scoped(
                     arc.as_ref(),
-                    &*self.signer,
+                    crate::signing::Writer::of(self.local_signer.as_deref(), &*self.signer),
                     cohort_scope,
                     community_key_id,
                     stream_id,
@@ -7828,7 +7846,7 @@ impl Engine {
             BackendDispatch::Sqlite(arc) => {
                 put_blob_chunk_scoped(
                     arc.as_ref(),
-                    &*self.signer,
+                    crate::signing::Writer::of(self.local_signer.as_deref(), &*self.signer),
                     cohort_scope,
                     community_key_id,
                     stream_id,
@@ -7893,7 +7911,7 @@ impl Engine {
             BackendDispatch::Postgres(arc) => {
                 register_stream_epoch_dek(
                     arc.as_ref(),
-                    &*self.signer,
+                    crate::signing::Writer::of(self.local_signer.as_deref(), &*self.signer),
                     cohort_scope,
                     group_key_id,
                     stream_id,
@@ -7907,7 +7925,7 @@ impl Engine {
             BackendDispatch::Sqlite(arc) => {
                 register_stream_epoch_dek(
                     arc.as_ref(),
-                    &*self.signer,
+                    crate::signing::Writer::of(self.local_signer.as_deref(), &*self.signer),
                     cohort_scope,
                     group_key_id,
                     stream_id,
@@ -13443,10 +13461,14 @@ mod tests {
         );
 
         const SELF: &str = "eng543d-self";
-        engine.set_self_key_id(Some(SELF.to_owned()));
+        // v62.0.0 (E0 fix 3) — the node's own id is its key's identity-ref:
+        // the rows it authors are signed as `kid(SELF)`, and the gate's
+        // self-exemption and fold compare authors to the declared id.
+        let self_id = crate::federation::edition2::fixture_switch::kid(SELF);
+        engine.set_self_key_id(Some(self_id.clone()));
         assert_eq!(
             engine.self_key_id().as_deref(),
-            Some(SELF),
+            Some(self_id.as_str()),
             "AV-77: a host must be able to READ BACK that the gate is live — \
              otherwise it cannot assert at boot that it configured one"
         );
@@ -13946,7 +13968,9 @@ mod tests {
             canonical_bytes: canonical.to_vec(),
             ed25519_sig: vec![1u8; 64],
             ml_dsa_65_sig: vec![2u8; 3309],
-            signing_key_id: "test-detector".to_owned(),
+            // v62 (E3b r3): the detector key is held under its identity-ref
+            // (`register_hybrid_key_as` lands `kid(seed)`), so the row names it so.
+            signing_key_id: crate::federation::edition2::fixture_switch::kid("test-detector"),
             ts,
         }
     }
@@ -15029,57 +15053,11 @@ mod tests {
         assert_eq!(got, BlobBody::External(ext));
     }
 
-    /// Same content + same attesting key + same attestation_id →
-    /// the second call collides on the attestation_id PK. Matches
-    /// the documented `put_blob` semantic for replayed
-    /// attestation_ids (see store/sqlite.rs::put_blob's
-    /// AttestationEmissionFailed("attestation_id collision: ...")).
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn put_blob_signing_replay_same_attestation_id_conflicts_sqlite() {
-        use crate::federation::{BlobBody, BlobError};
-
-        let signer = test_signer();
-        // v9.3.0 (#247) — register + attest under the DERIVED federation
-        // key_id (the holds_bytes scrub_key_id put_blob_signing now writes).
-        let engine = Engine::with_signer(signer, "sqlite::memory:")
-            .await
-            .expect("construct engine");
-        let signer_alias = seed_test_attesting_key(&engine).await;
-
-        let bytes = b"replay-id-collision".to_vec();
-        let sha = sha256_of_bytes(&bytes);
-        let attestation_id = uuid::Uuid::new_v4();
-        let now = chrono::Utc::now();
-
-        engine
-            .put_blob_signing(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                &signer_alias,
-                now,
-                attestation_id,
-            )
-            .await
-            .expect("first call");
-
-        let err = engine
-            .put_blob_signing(
-                &sha,
-                BlobBody::Inline(bytes),
-                None,
-                &signer_alias,
-                now,
-                attestation_id,
-            )
-            .await
-            .expect_err("attestation_id collision");
-        assert!(
-            matches!(err, BlobError::AttestationEmissionFailed(_)),
-            "got {err:?}"
-        );
-    }
+    // v62 (E3b r3): `put_blob_signing_replay_same_attestation_id_conflicts_sqlite`
+    // DELETED — its subject was the earlier form's caller-chosen
+    // `attestation_id` primary-key collision. An edition-2 claim's row id is
+    // node-computed from its statement (`RowId::of_statement`), so the same
+    // claim re-put is the same row (idempotent), never a collision.
 
     /// Same content + same attesting key + DIFFERENT attestation_id
     /// → both calls succeed (each is an independent holder attestation
@@ -15151,9 +15129,15 @@ mod tests {
                 uuid::Uuid::new_v4(),
             )
             .await
-            .expect_err("FK violation");
+            .expect_err("an unregistered signer is refused");
+        // v62 (E3b r3): the claim is now an edition-2 statement, so the
+        // refusal is the statement door's unknown signer (retryable: an
+        // ordering gap, `federation_attester_key_unknown`), surfaced as the
+        // blob door's InvalidArgument; the earlier FK path surfaced it as
+        // AttestationEmissionFailed. Either way nothing is written.
         assert!(
-            matches!(err, BlobError::AttestationEmissionFailed(_)),
+            matches!(&err, BlobError::AttestationEmissionFailed(_))
+                || matches!(&err, BlobError::InvalidArgument(m) if m.contains("is not a registered federation key")),
             "got {err:?}"
         );
 
@@ -16457,7 +16441,13 @@ mod tests {
         let alice = format!("alice-{run}");
         let alice_occ = format!("alice-occ-{run}");
         seed_community(sq.as_ref(), &comm, &[(&alice, &alice_occ)]).await;
+        // E5-fix1 (round 3) — the id the directory keys the room by (its
+        // identity-ref under the switch); the raw seed names no community.
+        let comm = crate::federation::community_dek::lifecycle_support::id_of(&comm);
         inv::join_as_occurrence(sq.as_ref(), &alice, &derived).await;
+        // v62 (E3b r3): the room is held under its identity-ref
+        // (`lifecycle_support::id_of`), so the seal and the provenance name it so.
+        let comm = crate::federation::community_dek::lifecycle_support::id_of(&comm);
         let (env, epoch, sha) =
             inv::sealed_community_envelope(sq.as_ref(), &comm, b"minutes", author).await;
         sq.delete_blob(&sha).await.unwrap();
@@ -16606,8 +16596,15 @@ mod tests {
             "an unregistered node has no serve standing"
         );
         let sq = engine.sqlite_backend().expect("sqlite");
-        let derived = engine.local_derived_key_id().await.unwrap();
-        inv::confer_mesh_server(sq.as_ref(), &derived, "owner-846").await;
+        // v62 (E3b r3): the fixture signs as the server, so it takes the
+        // SEED `test_signer` is built from (never an identity-ref; E0's
+        // seed rule) — whose identity-ref is this engine's derived key.
+        assert_eq!(
+            engine.local_derived_key_id().await.unwrap(),
+            crate::federation::edition2::fixture_switch::kid("test-engine-steward"),
+            "fixture: the engine's key is the seed's"
+        );
+        inv::confer_mesh_server(sq.as_ref(), "test-engine-steward", "owner-846").await;
         assert_eq!(
             engine.hold_breadth().await.unwrap(),
             HoldBreadth::ForCohort,
@@ -16706,7 +16703,15 @@ mod tests {
                 "dimension": "trace:complete:v1",
                 "trace_id": trace_id,
                 "agent_id_hash": "agent-hash-509",
-                "trace": {},
+                // v62 (E3b r3; payloads.rs `trace:{form}:{version}`, CC 3.1.5:
+                // "the manifest form is the only form") — the trace itself
+                // is a blob; the row carries its manifest.
+                "manifest": {
+                    "schema": "trace_manifest:v1",
+                    "content_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "byte_len": 1,
+                    "component_count": 0,
+                },
             }))
             .unwrap(),
             crate::federation::types::cohort_scope::SELF,
@@ -17699,20 +17704,14 @@ mod tests {
     async fn promoted_row_appears_in_visibility_delta_507_509() {
         use crate::federation::FederationDirectory;
 
-        let signer = crate::federation::tier_ingest::test_support::local_signer("node-509v");
-        let derived = signer.federation_id().await;
-        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
-            .await
-            .expect("engine");
-        let sq = engine.sqlite_backend().expect("sqlite").clone();
-        sq.put_live(sweeper_test_key_derived_for(&derived, "node-509v"))
-            .await
-            .expect("seed key");
-
-        let trace_id = sq
-            .attestation_insert_local(build_509_trace_input(&derived, "trace-509v-1"))
-            .await
-            .expect("insert local trace");
+        // v62 (E3b r3; P8): an edition-2 LOCAL row (it crosses in place on its
+        // own statement); the earlier unsigned `attestation_insert_local` row
+        // has no in-place crossing.
+        let (engine, sq, node) = engine_with_registered_node("node-509v").await;
+        let signer = engine
+            .composite_signer("e3b visibility witness")
+            .expect("a composite signer");
+        let trace_id = local_e2_row(&*sq, signer, e2_trace_input(&node, "trace-509v-1")).await;
         // The delta cursor sits exactly AT the row's asserted_at — a
         // strict `>` filter on asserted_at alone would exclude it forever.
         let since = sq
@@ -17725,7 +17724,12 @@ mod tests {
         // Ensure promoted_at lands strictly after the cursor even on
         // coarse clocks, then promote via the (c) hook.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let _grant_id = emit_509_grant(&engine, "peer-509v", &["trace:"]).await;
+        let _grant_id = emit_509_grant(
+            &engine,
+            &crate::federation::edition2::fixture_switch::kid("peer-509v"),
+            &["trace:"],
+        )
+        .await;
         let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
         assert_eq!(
             after.tier,
@@ -17876,170 +17880,12 @@ mod tests {
             .expect("510 grant emits")
     }
 
-    /// A grant carrying a `strip_field` restriction over a member of the
-    /// trace envelope (`agent_id_hash`) promotes the row with that member
-    /// REMOVED, `tier = federation`, `cohort_scope` set to the grant's
-    /// audience, and a scrub signature that verifies over the STRIPPED
-    /// canonical — via the SAME `verify_federation_tier_ingest` recipe
-    /// production's federation-tier ingest gate uses (the row's
-    /// `original_content_hash` / envelope / scrub signature must all
-    /// agree, or that verify call itself fails).
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn promotion_applies_strip_field_510() {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        use crate::federation::FederationDirectory;
-
-        let signer = crate::federation::tier_ingest::test_support::local_signer("node-510strip");
-        let derived = signer.federation_id().await;
-        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
-            .await
-            .expect("engine");
-        let sq = engine.sqlite_backend().expect("sqlite").clone();
-        sq.put_live(sweeper_test_key_derived_for(&derived, "node-510strip"))
-            .await
-            .expect("seed key");
-
-        let trace_id = sq
-            .attestation_insert_local(build_509_trace_input(&derived, "trace-510strip-1"))
-            .await
-            .expect("insert local trace");
-        let before = sq.get_attestation(&trace_id).await.unwrap().expect("row");
-        assert!(
-            before.attestation_envelope.get("agent_id_hash").is_some(),
-            "sanity: the fixture carries agent_id_hash before any strip"
-        );
-
-        let _grant_id = emit_510_grant(
-            &engine,
-            "peer-510strip",
-            serde_json::json!({
-                "grants": "transfer",
-                "attestation_prefixes": ["trace:"],
-                "audience": "federation",
-                "restrictions": [{"op": "strip_field", "path": "/agent_id_hash"}],
-            }),
-        )
-        .await;
-
-        // v39.0.0 — TWO findings, both of which the old path hid.
-        //
-        // 1. The crossing is over the row's OWN bytes, so the local copy keeps
-        //    everything it was written with; a restriction governs what is
-        //    PUBLISHED, which is the widening `supersedes`.
-        // 2. This particular restriction cannot be published at all. Stripping
-        //    `/agent_id_hash` from a `trace:*` row produces an envelope that
-        //    `check_trace_dimension_admission` refuses — and the widening goes
-        //    through `put_attestation`, which asks it. The old
-        //    `promote_attestation_with_transforms` path re-signed and stored
-        //    the stripped bytes WITHOUT re-entering the put door, so it minted
-        //    a federation-tier row that this substrate's own put door (and
-        //    therefore every peer's) refuses: the #649 door-beside-the-door
-        //    class, in the restriction pipeline. The sweep now REFUSES at the
-        //    emitting node and counts the row `skipped`, which is the honest
-        //    end of that sequence.
-        let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
-        assert_eq!(
-            after.tier,
-            crate::federation::types::attestation_tier::FEDERATION,
-            "a strip_field restriction still lets the row cross"
-        );
-        assert_eq!(
-            after.cohort_scope,
-            crate::federation::types::cohort_scope::SELF
-        );
-        assert!(
-            after.attestation_envelope.get("agent_id_hash").is_some(),
-            "the crossed row is byte-identical — the strip is not applied to it: {:?}",
-            after.attestation_envelope
-        );
-        crate::federation::tier_ingest::verify_federation_tier_ingest(&*sq, &after)
-            .await
-            .expect("the crossed row verifies over its own canonical");
-
-        let sup = sq
-            .all_attestations_by(&derived)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|a| {
-                a.attestation_type == crate::federation::types::attestation_type::SUPERSEDES
-                    && crate::federation::precedence::references_attestation_id_from_envelope(
-                        &a.attestation_envelope,
-                    ) == Some(trace_id.as_str())
-            })
-            .count();
-        assert_eq!(
-            sup, 0,
-            "a widening that strips a REQUIRED member of its dimension must not be published"
-        );
-
-        // The refusal is the put door's own, by name, and it names the member
-        // — asked directly so this is a witnessed rule rather than an absence
-        // that any unrelated breakage would also produce.
-        let ci = producer_ci(&after, crate::federation::Audience::Federation);
-        let err = engine
-            .widen_audience(&trace_id, &ci, None, &["/agent_id_hash".to_owned()])
-            .await
-            .expect_err("stripping a required member cannot be published");
-        assert!(
-            matches!(err, crate::federation::Error::TraceDimensionInvalid { .. })
-                && format!("{err}").contains("agent_id_hash"),
-            "the refusal is the trace-dimension gate's, naming the member: {err}"
-        );
-
-        // …and the same restriction on an OPTIONAL member publishes fine, so
-        // this is a rule about required members, not a broken pipeline.
-        let plain_id = sq
-            .attestation_insert_local({
-                let mut input = build_509_trace_input(&derived, "trace-510strip-2");
-                input
-                    .attestation_envelope
-                    .extra
-                    .insert("operator_note".into(), serde_json::json!("strip me"));
-                input
-            })
-            .await
-            .expect("insert second local trace");
-        let plain = sq.get_attestation(&plain_id).await.unwrap().expect("row");
-        let ci = producer_ci(&plain, crate::federation::Audience::SelfOnly);
-        engine.enter_mesh(&plain_id, &ci, None).await.unwrap();
-        let plain = sq.get_attestation(&plain_id).await.unwrap().expect("row");
-        let ci = producer_ci(&plain, crate::federation::Audience::Federation);
-        let out = engine
-            .widen_audience(&plain_id, &ci, None, &["/operator_note".to_owned()])
-            .await
-            .expect("stripping an OPTIONAL member publishes");
-        let crate::federation::MeshCrossingOutcome::Crossed(report) = out else {
-            panic!("expected Crossed, got {out:?}");
-        };
-        let published = sq
-            .get_attestation(&report.attestation_id)
-            .await
-            .unwrap()
-            .expect("the supersedes row");
-        assert!(
-            published
-                .attestation_envelope
-                .get("operator_note")
-                .is_none(),
-            "the JSON POINTER `/operator_note` is applied through the transform algebra, not \
-             string-matched against top-level keys: {:?}",
-            published.attestation_envelope
-        );
-        assert_eq!(
-            published.attestation_envelope[crate::federation::envelope::paths::DIFFERS_IN],
-            serde_json::json!(["cohort_scope", "/operator_note"]),
-            "and the widening DECLARES what it stripped"
-        );
-        assert_eq!(
-            published.attestation_envelope["trace_id"], "trace-510strip-2",
-            "the rest of the body is reused"
-        );
-        crate::federation::tier_ingest::verify_federation_tier_ingest(&*sq, &published)
-            .await
-            .expect("the published row verifies over its own canonical");
-    }
+    // v62 (E3b r3): `promotion_applies_strip_field_510` DELETED. Its subject
+    // was an earlier-form unsigned local row (`attestation_insert_local`)
+    // crossing in place and a JCS `supersedes` widening that declares
+    // `differs_in`; edition 2 crosses only a stated row in place and widens
+    // by restatement (P8). The strip rule on edition-2 rows is
+    // `consent_sweep_widening_honors_strip_restrictions_510`.
 
     /// A grant whose payload `valid_until` is already in the PAST does
     /// not cover anything — the sweep promotes zero rows, the same
@@ -18120,7 +17966,7 @@ mod tests {
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "emit-1", "dimension": "identity_binding:v1",
+                "id": "emit-1", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
@@ -18181,7 +18027,7 @@ mod tests {
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "e527", "dimension": "identity_binding:v1",
+                "id": "e527", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
                 "cohort_scope": "federation",
             }))
@@ -18221,7 +18067,7 @@ mod tests {
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "e527e", "dimension": "identity_binding:v1",
+                "id": "e527e", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
@@ -18273,7 +18119,7 @@ mod tests {
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "emit-pg-1", "dimension": "identity_binding:v1",
+                "id": "emit-pg-1", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
@@ -18341,7 +18187,7 @@ mod tests {
             crate::federation::EmitAttestationInput::with_envelope(
                 SCORES,
                 crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                    "id": "asm-1", "dimension": "identity_binding:v1",
+                    "id": "asm-1", "dimension": "trust:identity_binding:v1",
                     "score": 1.0, "confidence": 0.9,
                 }))
                 .unwrap(),
@@ -18421,7 +18267,7 @@ mod tests {
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "emit-self-1", "dimension": "identity_binding:v1",
+                "id": "emit-self-1", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
@@ -18477,7 +18323,7 @@ mod tests {
         let mut bad = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "emit-self-293", "dimension": "identity_binding:v1",
+                "id": "emit-self-293", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
@@ -18506,7 +18352,7 @@ mod tests {
         let mut ok = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "emit-self-293-ok", "dimension": "identity_binding:v1",
+                "id": "emit-self-293-ok", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
@@ -18546,7 +18392,7 @@ mod tests {
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "emit-self-pg-1", "dimension": "identity_binding:v1",
+                "id": "emit-self-pg-1", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
@@ -18616,7 +18462,7 @@ mod tests {
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "emit-hw-1", "dimension": "identity_binding:v1",
+                "id": "emit-hw-1", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
@@ -18733,7 +18579,7 @@ mod tests {
         let plain = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "id": "emit-w-2", "dimension": "identity_binding:v1",
+                "id": "emit-w-2", "dimension": "trust:identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
@@ -18806,20 +18652,19 @@ mod tests {
             input
         };
 
-        // (a) The node's OWN capacity emit is refused — no bypass for the
-        // local path.
-        let err = engine
+        // (a) The node's OWN capacity emit is not admitted — no bypass for the
+        // local path. v62 (E3b r3; CC 2.7.3, fold reason
+        // `consent_gate_refused`): the consent gate reads the SUBJECT's grants
+        // (other rows), so it HOLDS the emit instead of refusing it — the
+        // producer returns the held row's id, and no row is stored until the
+        // subject's grant lands.
+        let held = engine
             .emit_attestation(&signer, emit(CAPACITY))
             .await
-            .expect_err("#569: this node's own unconsented capacity:* emit must be REFUSED");
+            .expect("#569: the unconsented capacity:* emit's voice is kept (held)");
         assert!(
-            matches!(&err, crate::federation::Error::ConsentGateRefused(r)
-                if r.dimension == CAPACITY
-                    && r.family == crate::federation::ConsentGatedFamily::Capacity
-                    && r.attester_key_id == derived
-                    && r.subject_key_id == subject_id),
-            "#569: the refusal is the typed consent gate, naming this node as the attester: \
-             {err:?}"
+            sq.get_attestation(&held).await.unwrap().is_none(),
+            "#569: this node's own unconsented capacity:* emit is held, never stored"
         );
 
         // (b) THE OTHER HALF — the adversarial detector fires about the SAME
@@ -19066,10 +18911,14 @@ mod tests {
             "node is steward-bound after steward_bind"
         );
 
-        // Negative control: an agency:* scope on the SAME node key is REJECTED
-        // by the node-agency gate (so the moderate-scope tokens we add cannot
-        // be smuggled as agency onto a node).
-        let err = engine
+        // Negative control: an agency:* scope on the SAME node key is NOT
+        // admitted by the node-agency gate (so the moderate-scope tokens we add
+        // cannot be smuggled as agency onto a node). v62 (E3b r3; wave GC1,
+        // CC 2.7.3): the gate reads the RECIPIENT's key record (another row),
+        // so it HOLDS the delegation (`node_agency_forbidden`) instead of
+        // refusing it: the producer returns the held row's id, and no row is
+        // stored.
+        let held = engine
             .grant_delegation(
                 &signer,
                 &node_1,
@@ -19079,8 +18928,11 @@ mod tests {
                 crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
-            .unwrap_err();
-        assert_eq!(err.kind(), "federation_node_agency_forbidden");
+            .expect("the agency delegation's voice is kept (held)");
+        assert!(
+            sq.get_attestation(&held).await.unwrap().is_none(),
+            "an agency:* delegation onto a node key is held, never stored"
+        );
     }
 
     /// v16.0.0 (CIRISPersist#433, CC 3.4.12) — the adult-incapacity
@@ -19116,7 +18968,9 @@ mod tests {
         // conferral now. The node identity is pinned to one this fixture can
         // SIGN as: the accept edge must be signed by the node, and that leg is
         // what makes the check non-circular.
-        sq.set_node_key_id("cap-node-607");
+        sq.set_node_key_id(crate::federation::edition2::fixture_switch::kid(
+            "cap-node-607",
+        ));
         crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
             sq.as_ref(),
             "cap-node-607",
@@ -19330,7 +19184,9 @@ mod tests {
         // non-circular — and this engine's own signer is the WITNESS, whose
         // registered pubkey is not the helper's derived one. The identity is
         // injectable precisely so a host can state it; here the test states it.
-        sq.set_node_key_id("age-node-607");
+        sq.set_node_key_id(crate::federation::edition2::fixture_switch::kid(
+            "age-node-607",
+        ));
         crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
             sq.as_ref(),
             "age-node-607",
@@ -19461,7 +19317,9 @@ mod tests {
         // v30.2.0 (CIRISPersist#607) — the POSTGRES twin needs the same
         // conferral. Missing a twin is this repo's recurring class, so it is
         // done in the same change rather than found by CI later.
-        pg.set_node_key_id("age-node-607-pg");
+        pg.set_node_key_id(crate::federation::edition2::fixture_switch::kid(
+            "age-node-607-pg",
+        ));
         crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
             pg.as_ref(),
             "age-node-607-pg",
@@ -19552,7 +19410,9 @@ mod tests {
         // conferral now. The node identity is pinned to one this fixture can
         // SIGN as: the accept edge must be signed by the node, and that leg is
         // what makes the check non-circular.
-        sq.set_node_key_id("mg-node-607");
+        sq.set_node_key_id(crate::federation::edition2::fixture_switch::kid(
+            "mg-node-607",
+        ));
         crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
             sq.as_ref(),
             "mg-node-607",
@@ -19746,7 +19606,9 @@ mod tests {
         // v30.2.0 (CIRISPersist#607) — the POSTGRES twin needs the conferral
         // too. Fixing sqlite and missing its twin is this repo's recurring
         // class, so both move in the same change.
-        pg.set_node_key_id("mg-node-607-pg");
+        pg.set_node_key_id(crate::federation::edition2::fixture_switch::kid(
+            "mg-node-607-pg",
+        ));
         crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
             pg.as_ref(),
             "mg-node-607-pg",
@@ -20101,6 +19963,33 @@ mod tests {
         let node2 = typed_test_key(&node2_label, crate::federation::types::identity_type::NODE);
         pg.put_live(node2).await.expect("seed node2");
         assert_eq!(engine.owner_of(&node2_label).await.unwrap(), None);
+    }
+
+    /// v62 (E3b r3) — **an approval of a held bind** (CC 3.3.6.4): the
+    /// author statement `statement` restated over the SAME payload, signed by
+    /// `signer_seed`'s key and stated as `iss_seed` (a roster key of the
+    /// identity approves as the identity, the occurrence arm). The shape
+    /// `self_roster_invariants::bodies::occ_voice_on` builds.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn approval_as(statement: &[u8], signer_seed: &str, iss_seed: &str) -> Vec<u8> {
+        use crate::federation::edition2::fixture_switch as e2;
+        use ciris_verify_core::cde::Value;
+        let (protected, payload) =
+            crate::federation::edition2::liveness::statement_parts(statement).expect("a statement");
+        let text = |v: Option<&Value>| v.and_then(Value::as_text).map(str::to_owned);
+        let row_type = text(protected.get_int(-70001)).expect("row type");
+        let family = text(protected.get_int(-70002)).expect("family");
+        let sub = text(protected.get_int(15).and_then(|c| c.get_int(2))).expect("sub");
+        ciris_verify_core::edition2::sign_row_statement(
+            &e2::signing_key(signer_seed),
+            &e2::kid(iss_seed),
+            &sub,
+            &row_type,
+            &family,
+            &payload,
+            vec![],
+        )
+        .expect("an approval signs")
     }
 
     /// #249 — the add_moderator ↔ is_named_moderator round-trip: an
@@ -20472,18 +20361,57 @@ mod tests {
 
         // self cohort: O1's edition-2 occurrence binds through the SAME read
         // API. A person's devices: the identity authors each bind.
-        for occ in [&occ1, &occ2] {
+        // v62 (E3b r3; CC 3.3.6.4, the self-roster door): occ1 is a roster
+        // change of a one-key self, so the identity's voice lands it. occ2
+        // then changes a two-key roster `{ident, occ1}`: the identity's voice
+        // is HELD (`Pending`, short of the strict majority) and occ1's
+        // approval — its own key, stated as the identity (the occurrence arm)
+        // over the same payload — completes it.
+        landed(
+            e2::put_bind(
+                d,
+                &ident,
+                &ident,
+                &occ1,
+                types::device_class::SERVER,
+                &e2::BindOptions::default(),
+            )
+            .await,
+            "bind the first occurrence",
+        );
+        {
+            let mut opts = e2::BindOptions::default();
+            if let Some((h, further)) =
+                crate::federation::edition2::occurrence::current_roster_heads(d, &e2::kid(&ident))
+                    .await
+                    .expect("the identity's roster head")
+            {
+                opts.head = Some(h);
+                opts.further_heads = further;
+            }
+            let voices = e2::occurrence_bind_voices(
+                &ident,
+                &ident,
+                &occ2,
+                types::device_class::SERVER,
+                &opts,
+            );
+            let mut last = None;
+            for v in &voices {
+                last = Some(
+                    e2::put_statement(d, v)
+                        .await
+                        .expect("a voice of occ2's bind is kept"),
+                );
+            }
+            assert!(
+                matches!(last, Some(StatementOutcome::Pending { .. })),
+                "the identity's voice alone is short of a two-key roster: {last:?}"
+            );
+            let approval = approval_as(voices.last().expect("the author's voice"), &occ1, &ident);
             landed(
-                e2::put_bind(
-                    d,
-                    &ident,
-                    &ident,
-                    occ,
-                    types::device_class::SERVER,
-                    &e2::BindOptions::default(),
-                )
-                .await,
-                "bind an occurrence",
+                e2::put_statement(d, &approval).await,
+                "occ1's approval lands occ2's bind",
             );
         }
         let id_ref = e2::kid(&ident);
@@ -20554,6 +20482,7 @@ mod tests {
         // per signer; the door counts the voices at the held head's protocol.
         use crate::federation::cohort::Cohort;
         use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::StatementOutcome;
         use crate::federation::types;
 
         let fam = format!("g2-fam-{s}");
@@ -20612,16 +20541,23 @@ mod tests {
             &fam,
             record(grown, "quorum:3/5"),
         );
-        let err = e2::put_voices(d, &e2::family_voices(&grow, 2, Some(&head), at_ms + 1))
+        // v62 (E3b r3; wave GC6, CC 2.7.3): the member the version lacks a
+        // seat for is a FOLD condition (`check_supersede_adds_no_member` holds
+        // with `membership_supersede_cannot_add`, re-folded when the seat
+        // lands), so the voices are kept `Pending` and the version does not
+        // land: the head stays at v1.
+        let held = e2::put_voices(d, &e2::family_voices(&grow, 2, Some(&head), at_ms + 1))
             .await
-            .expect_err("#955 Q2: a later version never adds a member");
+            .expect("#955 Q2: the voices are kept");
         assert!(
-            matches!(
-                &err,
-                crate::federation::Error::MembershipAcceptanceRefused { rule, .. }
-                    if *rule == crate::federation::membership_acceptance::RULE_SUPERSEDE_CANNOT_ADD
-            ),
-            "{err:?}"
+            matches!(held, StatementOutcome::Pending { .. }),
+            "#955 Q2: a later version never adds a member (held, not landed): {held:?}"
+        );
+        let (still, still_v) = e2::held_head(d, &fam_id).await.expect("v1 still held");
+        assert_eq!(
+            (still, still_v),
+            (head, 1),
+            "#955 Q2: the head did not move"
         );
 
         // Contract 5 -> 3 at quorum:2/3: m0..m2 voice it, three of the prior
@@ -20916,9 +20852,9 @@ mod tests {
         // (a supersede never adds: proposal → acceptance → widening), does
         // NOT land; the live roster is unchanged. Refusal tokens of these
         // fold conditions are not pinned (CC 2.7 makes them held-and-concluded;
-        // the G-wave restates them). The kernel rulings refuse
-        // `reverse_quorum` and `custom:` outright, so a room under either is
-        // never founded (was: founded, then every supersede refused).
+        // the G-wave restates them). The kernel rulings count no change under
+        // `reverse_quorum` or `custom:`: a room under either is founded (its
+        // listed members' voices), and then no change of it lands.
         use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::edition2::group::GroupRecord;
         use crate::federation::edition2::ingest::StatementOutcome;
@@ -21114,17 +21050,23 @@ mod tests {
         );
         assert_eq!(live_len(room).await, 3);
 
-        // v62 kernel rulings: `reverse_quorum` and an undeclared `custom:`
-        // protocol are no membership protocol; a room under either is not
-        // founded.
+        // v62 kernel rulings (consensus.rs `evaluate`): `reverse_quorum`
+        // (CC 3.2, "not a membership rule … it admits no one") and `custom:`
+        // (CC 4.4.3.6 names six arms) count NO change. The record door's
+        // floor is the protocol's FORM (`check_consensus_protocol_form`: both
+        // are canonical forms, open vocabulary), and a founding is landed by
+        // every listed member's voice, not counted under the protocol — so
+        // the room IS founded (E3b r3, read-checked; the wave-3 "not founded"
+        // was BELIEVED and is withdrawn). What the ruling witnesses is that no
+        // change lands under it: a removal voiced by the whole roster stays
+        // out, and the roster is unchanged.
         for (tag, cp) in [("rq", "reverse_quorum:2/5:86400"), ("cu", "custom:council")] {
-            let room = format!("pd-{tag}-room-{s}");
-            let keys: Vec<String> = (0..3).map(|i| k(tag, i)).collect();
-            not_landed(found(room.clone(), keys, 3, 1, cp).await, cp);
-            assert!(
-                d.lookup_community(&e2::kid(&room)).await.unwrap().is_none(),
-                "{cp}: no room"
+            let (room, ks) = setup(tag, 3, 0, 1, cp).await;
+            not_landed(
+                attempt(room.clone(), ks[..2].to_vec(), 1, cp, ks[..3].to_vec()).await,
+                cp,
             );
+            assert_eq!(live_len(room).await, 3, "{cp}: the roster is unchanged");
         }
 
         // The family arm reads the same evaluator: a non-entrenched
@@ -22078,9 +22020,23 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn list_attestations_facade_dispatches_to_backend_sqlite() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+        // v62 (E3b r3): the installed bundle's rows are edition-2 objects, not
+        // attestation rows, so a booted store lists none. The node states one
+        // federation-scope row (the Commons an unauthenticated reader is
+        // admitted to) so the dispatch is witnessed over a non-empty page.
+        let (engine, _sq, _node) = engine_with_registered_node("e3b-list-facade").await;
+        let listed_id = engine
+            .emit_attestation_self(crate::federation::EmitAttestationInput::with_envelope(
+                crate::federation::types::attestation_type::SCORES,
+                crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+                    "dimension": "trust:identity_binding:v1",
+                    "score": 1.0,
+                }))
+                .unwrap(),
+                crate::federation::types::cohort_scope::FEDERATION,
+            ))
             .await
-            .expect("engine");
+            .expect("a federation row to list");
         let page = engine
             .list_attestations(
                 crate::ceg::AttestationFilter::default(),
@@ -22119,8 +22075,8 @@ mod tests {
                 .collect::<std::collections::BTreeSet<String>>()
         };
         assert!(
-            !page.items.is_empty(),
-            "the installed genesis rows are listed"
+            page.items.iter().any(|a| a.attestation_id == listed_id),
+            "the node's federation row is listed"
         );
         assert_eq!(
             ids(&page),
@@ -22273,16 +22229,23 @@ mod tests {
         )
         .await;
 
+        // v62 (E3b r3): the shaped room and its members are held under their
+        // identity-refs (`seed_community_shaped` keys every id by `kid`).
+        use crate::federation::edition2::fixture_switch::kid;
         let res = engine
-            .put_blob_scoped(COMMUNITY, Some(&comm), b"minutes", None, None)
+            .put_blob_scoped(COMMUNITY, Some(&kid(&comm)), b"minutes", None, None)
             .await
             .expect("community write through the Engine door");
         assert_eq!(res.granted, Vec::<String>::new());
-        assert_eq!(res.excluded, vec![bob_phone]);
-        assert_eq!(res.roster.excluded, vec![bob], "bob: a device, none usable");
+        assert_eq!(res.excluded, vec![kid(&bob_phone)]);
+        assert_eq!(
+            res.roster.excluded,
+            vec![kid(&bob)],
+            "bob: a device, none usable"
+        );
         assert_eq!(
             res.roster.absent,
-            vec![alice],
+            vec![kid(&alice)],
             "alice — the author, no occurrence — is named ABSENT through the Engine door"
         );
         assert!(
@@ -22515,7 +22478,10 @@ mod tests {
             let identity_key = identity_key.clone();
             let engine = &engine;
             async move {
-                let occ = e3_login_seed_key(engine, &occ, identity_type::AGENT).await;
+                // v62.0.0 (P1-fix4; CC rc21 3.3.6) — a person's LAPTOP occurrence
+                // is a person's key: a `node` / `agent` key is never an
+                // occurrence of a person (`occurrence_binds_machine_to_person`).
+                let occ = e3_login_seed_key(engine, &occ, identity_type::USER).await;
                 engine
                     .federation_directory()
                     .put_identity_occurrence_local(types::IdentityOccurrence {
@@ -23081,7 +23047,10 @@ mod engine_607_tests {
                 attestation_id: uuid::Uuid::new_v4().to_string(),
                 attesting_key_id: stranger.clone(),
                 attested_key_id: crate::federation::edition2::fixture_switch::kid("probe-victim"),
-                attestation_type: "age_assurance:government:adult:v1".into(),
+                // v62 (E3b r3; CC 2.6.1, #975): an edition-2 row type is one
+                // of five; the age witness is a `scores` row on the
+                // `age_assurance:*` dimension the envelope names.
+                attestation_type: crate::federation::types::attestation_type::SCORES.into(),
                 weight: None,
                 asserted_at: now,
                 expires_at: None,

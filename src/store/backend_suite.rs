@@ -203,6 +203,92 @@ mod tests {
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::{Attestation, FederationDirectory, KeyRecord, SignedKeyRecord};
 
+    /// E5-fix1 (round 3) — **a row the door did not land**, either way it
+    /// can not land: REFUSED (`Err`: a check of the bytes or of the row
+    /// alone) or HELD (`Pending`: v62 G0/GC1, CC 2.7.3 — the gate read OTHER
+    /// rows, so its unmet condition is a fold condition, the statement is
+    /// kept and nothing concludes). Standing ruling 5: the decision tables
+    /// below assert the gate's verdict in whichever form the door gives it.
+    /// A held row's `kind` is the refusal kind of the gate that holds with
+    /// that fold reason (the gate's `fold::hold(reason, err)` pairs them);
+    /// its text is the gate's own refusal text (the hold's detail).
+    #[derive(Debug)]
+    pub(crate) struct NotLanded {
+        kind: String,
+        text: String,
+        refused: Option<crate::federation::Error>,
+    }
+
+    impl NotLanded {
+        pub(crate) async fn of<D: FederationDirectory + ?Sized>(
+            dir: &D,
+            out: Result<
+                crate::federation::edition2::ingest::StatementOutcome,
+                crate::federation::Error,
+            >,
+            what: &str,
+        ) -> Self {
+            use crate::federation::edition2::{fold, fold::reason as r, ingest::StatementOutcome};
+            match out {
+                Err(e) => Self {
+                    kind: e.kind().to_owned(),
+                    text: e.to_string(),
+                    refused: Some(e),
+                },
+                Ok(StatementOutcome::Pending { row_id, .. }) => {
+                    let held = fold::why_held(dir, &row_id)
+                        .await
+                        .expect("why held")
+                        .unwrap_or_else(|| panic!("{what}: Pending, yet no fold reason"));
+                    let kind = match held.reason.as_str() {
+                        x if x == r::gc1::DELEGATED_SCOPE_UNAUTHORIZED => {
+                            "federation_delegated_scope_unauthorized".to_owned()
+                        }
+                        x if x == r::STEWARD_UNPROVEN => {
+                            "federation_user_target_steward_binding_forbidden".to_owned()
+                        }
+                        x if x == r::gc1::RESERVED_PREFIX_EMITTER_MISMATCH => {
+                            "federation_reserved_prefix_emitter_mismatch".to_owned()
+                        }
+                        x if x == r::gc6::CHARTER_SUCCESSOR_UNHELD
+                            || x == r::gc6::CHARTER_RECOVERY_UNBOUND =>
+                        {
+                            "federation_charter_invalid".to_owned()
+                        }
+                        other => format!("held:{other}"),
+                    };
+                    Self {
+                        kind,
+                        text: held.detail,
+                        refused: None,
+                    }
+                }
+                Ok(landed) => panic!("{what}: the row landed: {landed:?}"),
+            }
+        }
+
+        pub(crate) fn kind(&self) -> &str {
+            &self.kind
+        }
+
+        /// The refusal itself, when refused (never for a held row).
+        pub(crate) fn error(&self) -> Option<&crate::federation::Error> {
+            self.refused.as_ref()
+        }
+
+        /// Does the refusal (or hold) name `reason` (`… ({reason}) …`, the
+        /// steward-binding gate's text)?
+        pub(crate) fn reason_is(&self, reason: &str) -> bool {
+            self.text.contains(&format!("({reason})"))
+        }
+    }
+
+    impl std::fmt::Display for NotLanded {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.text)
+        }
+    }
+
     /// v62.0.0 (JSON cut, E5) — `key_id`'s edition-2 `key:record` (seed =
     /// `key_id`), live in the store through the key door; returns the key's
     /// identity-ref, which every later read and assertion names it by. The
@@ -891,12 +977,18 @@ mod tests {
 
         // Only the granter withdraws its own grant.
         let edge_id = row_id_of(&edge);
-        e2::put_statement(
+        // E5-fix1 (round 3) — refused or HELD (the granter is read from the
+        // held edge, another row: CC 2.7.3); either way it does not land.
+        NotLanded::of(
             &backend,
-            &tf::trust_withdraws_statement(&imposter, &subject, &edge_id, at + 1),
+            e2::put_statement(
+                &backend,
+                &tf::trust_withdraws_statement(&imposter, &subject, &edge_id, at + 1),
+            )
+            .await,
+            "a non-granter's withdraws of the edge must refuse",
         )
-        .await
-        .expect_err("a non-granter's withdraws of the edge must refuse");
+        .await;
         assert!(
             backend.lookup_trust(&subject).await.unwrap().is_some(),
             "no refused withdraws may half-land"
@@ -1817,17 +1909,21 @@ mod tests {
         }
 
         // (1) commitment-less charter REFUSES with the typed kind.
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_delegates_to(
-                "rc-bare",
-                "rc-root",
-                "rc-root",
-                serde_json::json!(["infra:serve", "infra:attest"]),
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_delegates_to(
+                    "rc-bare",
+                    "rc-root",
+                    "rc-root",
+                    serde_json::json!(["infra:serve", "infra:attest"]),
+                ),
+            )
+            .await,
+            "(1) charter without pre-rotation commitment must refuse",
         )
-        .await
-        .expect_err("(1) charter without pre-rotation commitment must refuse");
+        .await;
         assert_eq!(err.kind(), "federation_charter_invalid");
 
         // (2) serve-only charter admits (it is a valid delegates_to) but is
@@ -1927,9 +2023,12 @@ mod tests {
         bad.attestation_envelope["successor_keys"] =
             serde_json::json!([e2::kid("rc-root2"), "not-precommitted"]);
         resign_fix(&mut bad);
-        let err = e2::put_signed(&backend, &bad)
-            .await
-            .expect_err("(1b) non-binding successor set must refuse");
+        let err = NotLanded::of(
+            &backend,
+            e2::put_signed(&backend, &bad).await,
+            "(1b) non-binding successor set must refuse",
+        )
+        .await;
         assert_eq!(err.kind(), "federation_charter_invalid");
     }
 
@@ -2220,18 +2319,22 @@ mod tests {
         // the subject naming ITSELF confers no authority (integrity of the
         // signed subject ≠ authority over the action). `subject` is not a
         // moderator of comm-1, so this is refused (was the spoof: admitted).
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "r-self",
-                "subject",
-                "reconsideration:case42:v1",
-                &["subject"],
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "r-self",
+                    "subject",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
         assert!(backend
             .get_attestation(&rid_named("r-self"))
@@ -2254,18 +2357,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "r-deleg",
-                "delegate",
-                "reconsideration:case42:v1",
-                &["subject"],
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "r-deleg",
+                    "delegate",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
         assert!(backend
             .get_attestation(&rid_named("r-deleg"))
@@ -2334,18 +2441,22 @@ mod tests {
             .is_some());
 
         // (c) no authority (rando, claims subject target) → REJECT.
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "r-rando",
-                "rando",
-                "reconsideration:case42:v1",
-                &["subject"],
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "r-rando",
+                    "rando",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
         assert!(backend
             .get_attestation(&rid_named("r-rando"))
@@ -2355,12 +2466,16 @@ mod tests {
 
         // (c2) NOTHING — no subjects, no community → REJECT. THE
         // bypass-closed regression guard: absence is never an admit.
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report("r-nothing", "rando", "reconsideration:case42:v1", &[], None),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report("r-nothing", "rando", "reconsideration:case42:v1", &[], None),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
         assert!(
             backend
@@ -2384,18 +2499,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "r-wrongscope",
-                "modkey",
-                "reconsideration:case42:v1",
-                &["subject"],
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "r-wrongscope",
+                    "modkey",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
         assert!(backend
             .get_attestation(&rid_named("r-wrongscope"))
@@ -2440,18 +2559,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "m-wrongscope",
-                "delegate",
-                "moderation:rogue_action:v1",
-                &["subject"],
-                Some("comm-1"),
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "m-wrongscope",
+                    "delegate",
+                    "moderation:rogue_action:v1",
+                    &["subject"],
+                    Some("comm-1"),
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
 
         // `moderate`-scoped delegation → ADMIT.
@@ -2520,18 +2643,22 @@ mod tests {
             .unwrap();
         }
         // The signer is the too-deep tail key; the root k0 is the subject.
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "r-toodeep",
-                &keys[n - 1],
-                "reconsideration:case42:v1",
-                &["k0"],
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "r-toodeep",
+                    &keys[n - 1],
+                    "reconsideration:case42:v1",
+                    &["k0"],
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
     }
 
@@ -2584,18 +2711,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "g-rep",
-                "leaf",
-                "reconsideration:case42:v1",
-                &["subject"],
-                Some("comm-1"),
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "g-rep",
+                    "leaf",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    Some("comm-1"),
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(
             err.kind(),
             "federation_delegated_scope_unauthorized",
@@ -2624,18 +2755,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "i-rep",
-                "agdel",
-                "reconsideration:case42:v1",
-                &["agentroot"],
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "i-rep",
+                    "agdel",
+                    "reconsideration:case42:v1",
+                    &["agentroot"],
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(
             err.kind(),
             "federation_delegated_scope_unauthorized",
@@ -2700,18 +2835,22 @@ mod tests {
         })
         .await
         .expect("founder withdraws own delegation edge");
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "h-post",
-                "h_leaf",
-                "reconsideration:case42:v1",
-                &["subject"],
-                Some("comm-1"),
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "h-post",
+                    "h_leaf",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    Some("comm-1"),
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(
             err.kind(),
             "federation_delegated_scope_unauthorized",
@@ -2765,18 +2904,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = e2::put_signed(
+        let err = NotLanded::of(
             &backend,
-            &fix_scores_report(
-                "att-rep",
-                "leaf",
-                "reconsideration:case42:v1",
-                &["subject"],
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_scores_report(
+                    "att-rep",
+                    "leaf",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(
             err.kind(),
             "federation_delegated_scope_unauthorized",
@@ -2877,9 +3020,14 @@ mod tests {
             crate::federation::types::attestation_tier::FEDERATION,
             false, // omit subject_key_id / asserted_at
         );
-        let err = e2::put_signed(&backend, &row).await.unwrap_err();
+        let err = NotLanded::of(
+            &backend,
+            e2::put_signed(&backend, &row).await,
+            "the row does not land",
+        )
+        .await;
         assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("subject_key_id")),
+            matches!(err.error(), Some(crate::federation::Error::InvalidArgument(m)) if m.contains("subject_key_id")),
             "missing required field rejected, got {err:?}"
         );
     }
@@ -2905,23 +3053,14 @@ mod tests {
         row.tier = crate::federation::types::attestation_tier::LOCAL.into();
         row.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
         resign_fix(&mut row); // envelope changed → re-sign
-        let mut forged = row.clone();
         e2::put_signed(&backend, &row)
             .await
             .expect("crypto-valid bare subject-side revocation transits at local tier");
-
-        // Forged signature → rejected (no put_attestation bypass of the gate).
-        forged.attestation_id = "bare-rev-forged".into();
-        crate::federation::tier_ingest::test_support::reseal(&mut forged);
-        forged.scrub_signature_classical = "AAAA".into();
-        let err = e2::put_signed(&backend, &forged).await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::federation::Error::FederationTierUnverified { .. }
-            ),
-            "forged bare revocation rejected at put_attestation local tier, got {err:?}"
-        );
+        // E5-fix1 (round 3) — the forged-`scrub_signature_classical` leg is
+        // DELETED (ruling 4): under edition 2 the row's proof is its carried
+        // statement, and a JSON signature column is no proof at all, so
+        // forging it re-offers the same statement (`Voice`, not a refusal).
+        // The statement door's own forged-signature witnesses cover it.
     }
 
     #[tokio::test]
@@ -2949,9 +3088,14 @@ mod tests {
             crate::federation::types::attestation_tier::FEDERATION,
             true,
         );
-        let err = e2::put_signed(&backend, &row).await.unwrap_err();
+        let err = NotLanded::of(
+            &backend,
+            e2::put_signed(&backend, &row).await,
+            "the row does not land",
+        )
+        .await;
         assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("closed set")),
+            matches!(err.error(), Some(crate::federation::Error::InvalidArgument(m)) if m.contains("closed set")),
             "out-of-closed-set stance rejected, got {err:?}"
         );
     }
@@ -3436,9 +3580,12 @@ mod tests {
         seed_second_owner(&backend, "ob-owner2").await;
 
         // First owner-binding (CC marker, no dimension) admits; owner_of resolves.
-        e2::put_signed(
+        // E5-fix1 (round 3; K2.api) — the binding counts with the node's own
+        // voice (CC 3.2 / C557): K2's shared helper puts both.
+        crate::federation::tier_ingest::test_support::put_sealed_owner_binding(
             &backend,
             &fix_owner_binding_cc("ob-cc1", "ob-owner", "ob-node"),
+            "ob-node",
         )
         .await
         .unwrap();
@@ -3448,22 +3595,24 @@ mod tests {
             "owner_of must resolve the CC-marker owner-binding"
         );
 
-        // A second, DIFFERENT owner via the same CC-marker path is REJECTED.
-        let err = e2::put_signed(
+        // E5-fix1 (round 3) — I2841 as its doc states it (kernel B1 / C557):
+        // a second, DIFFERENT owner is never refused for being second. Cosigned
+        // by the node as well, it is a second COUNTED owner, and the owner seat
+        // reads the node as unowned (fail-closed), never as the first arrival.
+        crate::federation::edition2::fixture_switch::land_owner_binding(
             &backend,
             &fix_owner_binding_cc("ob-cc2", "ob-owner2", "ob-node"),
+            "ob-node",
         )
         .await
-        .unwrap_err();
-        assert_eq!(
-            err.kind(),
-            "federation_node_already_owned",
-            "second distinct owner via the CC-marker raw-emit path must be rejected, got {err:?}"
-        );
-        assert_eq!(
-            owner_of(&backend, &e2::kid("ob-node")).await.unwrap(),
-            Some(e2::kid("ob-owner")),
-            "the rejected second binding left no trace"
+        .expect("I2841: a second owner's binding is not refused");
+        let read = owner_of(&backend, &e2::kid("ob-node")).await;
+        assert!(
+            matches!(
+                read,
+                Ok(None) | Err(crate::federation::Error::AmbiguousNodeOwner { .. })
+            ),
+            "I2841: two counted owners read as unowned, got {read:?}"
         );
     }
 
@@ -3488,14 +3637,21 @@ mod tests {
         let mut expired = fix_owner_binding("ob-b1", "ob-owner", "ob-node");
         expired.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
         resign_fix(&mut expired);
-        e2::put_signed(&backend, &expired).await.unwrap();
+        // E5-fix1 (round 3; K2.api) — with the node's own voice; an expired
+        // binding's outcome is not asserted, only the read.
+        crate::federation::edition2::fixture_switch::land_owner_binding(
+            &backend, &expired, "ob-node",
+        )
+        .await
+        .unwrap();
         // Expired → non-live → node reads as unowned.
         assert_eq!(owner_of(&backend, &e2::kid("ob-node")).await.unwrap(), None);
 
         // A different owner may now bind.
-        e2::put_signed(
+        crate::federation::tier_ingest::test_support::put_sealed_owner_binding(
             &backend,
             &fix_owner_binding("ob-b2", "ob-owner2", "ob-node"),
+            "ob-node",
         )
         .await
         .unwrap();
@@ -3781,9 +3937,12 @@ mod tests {
         let mut row = fix_attestation("cap-fed", "cap-k", "cap-k", "cap-k");
         row.attestation_envelope = oversize.clone();
         crate::federation::tier_ingest::test_support::reseal(&mut row);
-        let err = e2::put_signed(&backend, &row)
-            .await
-            .expect_err("oversize federation put must refuse");
+        let err = NotLanded::of(
+            &backend,
+            e2::put_signed(&backend, &row).await,
+            "oversize federation put must refuse",
+        )
+        .await;
         assert_eq!(err.kind(), "federation_envelope_too_large");
 
         // Local-tier funnel: refused at entry (no key seeding needed —
@@ -3871,10 +4030,13 @@ mod tests {
             "sa-subject",
             "age_assurance:government:adult:v1",
         );
-        let err = e2::put_signed(&backend, &att).await.expect_err(
+        let err = NotLanded::of(
+            &backend,
+            e2::put_signed(&backend, &att).await,
             "a self-asserted witness must NOT be able to assert an age rung about a \
                  third party — that is CIRISPersist#607",
-        );
+        )
+        .await;
         let msg = err.to_string();
         assert!(
             msg.contains("infra:attest_assurance"),
@@ -4179,27 +4341,23 @@ mod tests {
         };
 
         // S(adult user) → A(adult user) : REJECTED (target_is_self_sovereign).
-        let e = e2::put_signed(&backend, &deleg("utd-A", "ut-S", "ut-A"))
-            .await
-            .unwrap_err();
+        let e = NotLanded::of(
+            &backend,
+            e2::put_signed(&backend, &deleg("utd-A", "ut-S", "ut-A")).await,
+            "the row does not land",
+        )
+        .await;
         assert_eq!(e.kind(), "federation_user_target_steward_binding_forbidden");
-        match e {
-            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
-                assert_eq!(reason, "target_is_self_sovereign");
-            }
-            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
-        }
+        assert!(e.reason_is("target_is_self_sovereign"), "{e:?}");
 
         // S(adult) → U(no age = Unknown) : REJECTED (target_age_unverified).
-        let e = e2::put_signed(&backend, &deleg("utd-U", "ut-S", "ut-U"))
-            .await
-            .unwrap_err();
-        match e {
-            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
-                assert_eq!(reason, "target_age_unverified");
-            }
-            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
-        }
+        let e = NotLanded::of(
+            &backend,
+            e2::put_signed(&backend, &deleg("utd-U", "ut-S", "ut-U")).await,
+            "the row does not land",
+        )
+        .await;
+        assert!(e.reason_is("target_age_unverified"), "{e:?}");
 
         // S(adult user) → M(witness minor) : ADMITTED (legal guardianship).
         e2::put_signed(&backend, &deleg("utd-M", "ut-S", "ut-M"))
@@ -4240,18 +4398,23 @@ mod tests {
         .unwrap();
 
         // U(unknown-age user) → M(minor) : REJECTED (granter not proven adult).
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_owner_binding_delegates_to("ugd-UM", "ug-U", "ug-M", "ug-U", &[ds::INFRA_SERVE]),
+            e2::put_signed(
+                &backend,
+                &fix_owner_binding_delegates_to(
+                    "ugd-UM",
+                    "ug-U",
+                    "ug-M",
+                    "ug-U",
+                    &[ds::INFRA_SERVE],
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
-        match e {
-            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
-                assert_eq!(reason, "granter_not_adult_user");
-            }
-            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
-        }
+        .await;
+        assert!(e.reason_is("granter_not_adult_user"), "{e:?}");
 
         // U(unknown-age user) → N(node) : the user-target gate is a no-op for a
         // node target (infra:* scope clears the node-agency gate) → ADMITTED.
@@ -4336,17 +4499,21 @@ mod tests {
         // SELF-graduation via the witness prefix: W attests W — REJECTED
         // (attester == attested; CC 3.4.11 "a subject MUST NOT emit on
         // `age_assurance:`"). The witness identity_type does NOT bypass.
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_age_attestation(
-                "wts-w-self",
-                "wts-witness",
-                "wts-witness",
-                "age_assurance:provider:adult:v1",
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_age_attestation(
+                    "wts-w-self",
+                    "wts-witness",
+                    "wts-witness",
+                    "age_assurance:provider:adult:v1",
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(e.kind(), "federation_age_assurance_self_emission_rejected");
         assert_eq!(
             age_band(&backend, &e2::kid("wts-witness")).await.unwrap(),
@@ -4356,17 +4523,21 @@ mod tests {
 
         // Identity gate UNCHANGED: a plain user cross-attesting T's age is
         // still refused (reserved prefix requires a witness emitter).
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_age_attestation(
-                "wts-p-cross",
-                "wts-P",
-                "wts-T",
-                "age_assurance:provider:minor:v1",
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_age_attestation(
+                    "wts-p-cross",
+                    "wts-P",
+                    "wts-T",
+                    "age_assurance:provider:minor:v1",
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
     }
 
@@ -4477,14 +4648,12 @@ mod tests {
         att
     }
 
-    fn assert_forbidden(e: &crate::federation::Error, want: &str) {
+    fn assert_forbidden(e: &NotLanded, want: &str) {
         assert_eq!(e.kind(), "federation_user_target_steward_binding_forbidden");
-        match e {
-            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
-                assert_eq!(*reason, want, "wrong rejection reason");
-            }
-            other => panic!("expected UserTargetStewardBindingForbidden({want}), got {other:?}"),
-        }
+        assert!(
+            e.reason_is(want),
+            "wrong rejection reason, want {want}: {e:?}"
+        );
     }
 
     /// Register `assessor`(witness), `S`(adult user), `A`(adult user); attest
@@ -4559,17 +4728,21 @@ mod tests {
         .expect("witness assessor may attest another's capacity");
 
         // A non-witness (plain user) may NOT emit capacity_assurance.
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_age_attestation(
-                "cap-nonwit",
-                "cap-user",
-                "cap-subj",
-                "capacity_assurance:provider:medical:incapacitated:v1",
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_age_attestation(
+                    "cap-nonwit",
+                    "cap-user",
+                    "cap-subj",
+                    "capacity_assurance:provider:medical:incapacitated:v1",
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
 
         // The SUBJECT must not self-mint their own (in)capacity, even as a
@@ -4581,17 +4754,21 @@ mod tests {
             crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
         )
         .await;
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_age_attestation(
-                "cap-self",
-                "cap-selfwit",
-                "cap-selfwit",
-                "capacity_assurance:provider:financial:incapacitated:v1",
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_age_attestation(
+                    "cap-self",
+                    "cap-selfwit",
+                    "cap-selfwit",
+                    "capacity_assurance:provider:financial:incapacitated:v1",
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_eq!(e.kind(), "federation_capacity_self_emission_rejected");
     }
 
@@ -4610,21 +4787,25 @@ mod tests {
 
         // (0) presumption of capacity — an adult with NO incapacity attested is
         // self-sovereign (the CC 3.2 un-stewardable default reasserts).
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_incapacity_binding(
-                "ai-0",
-                "ai-S",
-                "ai-A",
-                &["financial"],
-                Some("prior_will_proxy"),
-                Some(&future),
-                None,
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_incapacity_binding(
+                    "ai-0",
+                    "ai-S",
+                    "ai-A",
+                    &["financial"],
+                    Some("prior_will_proxy"),
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_forbidden(&e, "target_is_self_sovereign");
 
         // Attest A incapacitated for `financial` + rule out reversible mimics.
@@ -4646,77 +4827,93 @@ mod tests {
         .await;
 
         // (1) missing legitimacy source → naked self-appointment refused.
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_incapacity_binding(
-                "ai-1",
-                "ai-S",
-                "ai-A",
-                &["financial"],
-                None,
-                Some(&future),
-                None,
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_incapacity_binding(
+                    "ai-1",
+                    "ai-S",
+                    "ai-A",
+                    &["financial"],
+                    None,
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_forbidden(&e, "missing_legitimacy_source");
 
         // (2) missing valid_until → no fail-to-liberty expiry.
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_incapacity_binding(
-                "ai-2",
-                "ai-S",
-                "ai-A",
-                &["financial"],
-                Some("prior_will_proxy"),
-                None,
-                None,
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_incapacity_binding(
+                    "ai-2",
+                    "ai-S",
+                    "ai-A",
+                    &["financial"],
+                    Some("prior_will_proxy"),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_forbidden(&e, "missing_valid_until");
 
         // (3) valid_until beyond the T2 review cadence (90d) → rejected.
         let far =
             crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(200));
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_incapacity_binding(
-                "ai-3",
-                "ai-S",
-                "ai-A",
-                &["financial"],
-                Some("prior_will_proxy"),
-                Some(&far),
-                None,
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_incapacity_binding(
+                    "ai-3",
+                    "ai-S",
+                    "ai-A",
+                    &["financial"],
+                    Some("prior_will_proxy"),
+                    Some(&far),
+                    None,
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_forbidden(&e, "valid_until_exceeds_review_cadence");
 
         // (4) scope exceeds the attested-incapacitated domains.
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_incapacity_binding(
-                "ai-4",
-                "ai-S",
-                "ai-A",
-                &["medical"],
-                Some("prior_will_proxy"),
-                Some(&future),
-                None,
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_incapacity_binding(
+                    "ai-4",
+                    "ai-S",
+                    "ai-A",
+                    &["medical"],
+                    Some("prior_will_proxy"),
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_forbidden(&e, "scope_exceeds_attested_domains");
 
         // (5) attested incapacitated but reversible mimics NOT excluded.
@@ -4728,21 +4925,25 @@ mod tests {
             "capacity_assurance:provider:residence:incapacitated:v1",
         )
         .await;
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_incapacity_binding(
-                "ai-5",
-                "ai-S",
-                "ai-A",
-                &["residence"],
-                Some("prior_will_proxy"),
-                Some(&future),
-                None,
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_incapacity_binding(
+                    "ai-5",
+                    "ai-S",
+                    "ai-A",
+                    &["residence"],
+                    Some("prior_will_proxy"),
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_forbidden(&e, "capacity_reversible_not_excluded");
 
         // (6) ADMIT — scope ⊆ attested loss, reversible excluded, prior-will
@@ -4804,21 +5005,25 @@ mod tests {
         .await;
 
         // Standard path (no T1 tier) with only `pending` → rejected.
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_incapacity_binding(
-                "t1-std",
-                "t1-S",
-                "t1-A",
-                &["medical"],
-                Some(legitimacy_source::PRIOR_WILL_PROXY),
-                Some(&soon),
-                None,
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_incapacity_binding(
+                    "t1-std",
+                    "t1-S",
+                    "t1-A",
+                    &["medical"],
+                    Some(legitimacy_source::PRIOR_WILL_PROXY),
+                    Some(&soon),
+                    None,
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_forbidden(&e, "capacity_reversible_not_excluded");
 
         // T1 acute path → admitted.
@@ -4864,21 +5069,25 @@ mod tests {
             "capacity_assurance:reversible_excluded:voting:v1",
         )
         .await;
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_incapacity_binding(
-                "pd-b",
-                "pd-S",
-                "pd-A",
-                &["voting"],
-                Some("wa_due_process_quorum"),
-                Some(&future),
-                None,
-                None,
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_incapacity_binding(
+                    "pd-b",
+                    "pd-S",
+                    "pd-A",
+                    &["voting"],
+                    Some("wa_due_process_quorum"),
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_forbidden(&e, "scope_touches_protected_domain");
     }
 
@@ -4909,21 +5118,25 @@ mod tests {
         )
         .await;
         // petitioner == the assessor → conflicted.
-        let e = e2::put_signed(
+        let e = NotLanded::of(
             &backend,
-            &fix_incapacity_binding(
-                "cf-b",
-                "cf-S",
-                "cf-A",
-                &["financial"],
-                Some("wa_due_process_quorum"),
-                Some(&future),
-                None,
-                Some("cf-assessor"),
-            ),
+            e2::put_signed(
+                &backend,
+                &fix_incapacity_binding(
+                    "cf-b",
+                    "cf-S",
+                    "cf-A",
+                    &["financial"],
+                    Some("wa_due_process_quorum"),
+                    Some(&future),
+                    None,
+                    Some("cf-assessor"),
+                ),
+            )
+            .await,
+            "the row does not land",
         )
-        .await
-        .unwrap_err();
+        .await;
         assert_forbidden(&e, "attester_conflicted");
     }
 

@@ -440,10 +440,8 @@ pub(crate) mod bodies {
             let err = put(d, claim(&format!("i117-{n}-{s}"), size))
                 .await
                 .expect_err(&format!("I117: `{n}` size is refused"));
-            assert!(
-                err.to_string().contains("custody_ack_malformed"),
-                "I117 `{n}`: {err}"
-            );
+            // v62 (E4 round 3; ruling 3): the payload door refuses it under
+            // the core reason (`edition2_payload_invalid`), naming `size`.
             assert!(err.to_string().contains("size"), "I117 `{n}`: {err}");
         }
         put(d, claim(&format!("i117-ok-{s}"), serde_json::json!(12)))
@@ -494,10 +492,16 @@ pub(crate) mod bodies {
                 &w,
                 &signer,
                 &target,
-                serde_json::json!({"references_attestation_id": rid, "withdrawal_reason": "i118"}),
+                // v62 (E4 round 3): a composer carries only the common members
+                // and `refs.target` (P1e); no `withdrawal_reason`.
+                serde_json::json!({"references_attestation_id": rid}),
                 cohort_scope::FEDERATION,
             );
             r.attestation_type = attestation_type::WITHDRAWS.to_owned();
+            // `row` stamps an `id`; a composer carries none (P1e).
+            if let Some(o) = r.attestation_envelope.as_object_mut() {
+                o.remove("id");
+            }
             r
         };
         put_composer(d, withdraw, &rid)
@@ -532,8 +536,9 @@ pub(crate) mod bodies {
         let local = |id: &str, thumb: &str| {
             LocalAttestationInput {
             attestation_id: Some(id.to_owned()),
-            attesting_key_id: signer.clone(),
-            attested_key_id: Some(signer.clone()),
+            // v62 (E4 round 3): keys are named by their identity-ref.
+            attesting_key_id: e2::kid(&signer),
+            attested_key_id: Some(e2::kid(&signer)),
             attestation_type: attestation_type::SCORES.to_owned(),
             weight: None,
             expires_at: None,
@@ -814,81 +819,9 @@ pub(crate) mod bodies {
         assert_eq!(b.list_holders_sized(&esha).await.unwrap()[0].size, elen);
     }
 
-    /// **I119b — the promotion chokepoint refuses the struct, behaviourally.**
-    /// A local row admitted before this cut carries no guarantee; the crossing
-    /// asks the same gate (`check_promotion_admission`, the one function every
-    /// promotion runs through `plan_enter_mesh`). Driven directly, as the
-    /// bootstrap witnesses drive it: a malformed struct is refused by kind, a
-    /// well-formed one is not refused by THIS kind.
-    pub async fn i119b_the_promotion_chokepoint_refuses_the_struct(
-        d: &dyn FederationDirectory,
-        s: &str,
-    ) {
-        use crate::federation::admission::check_promotion_admission;
-        let (signer, target) = (format!("i119b-s-{s}"), format!("i119b-t-{s}"));
-        e2::put_key(d, &signer, &[USER]).await;
-        e2::put_key(d, &target, &[USER]).await;
-        let digest = hex64(&format!("i119b-{s}"));
-        let bad = media_row(
-            &format!("i119b-bad-{s}"),
-            &signer,
-            &target,
-            &digest,
-            serde_json::json!({"digest": digest, "format": "image/png", "safe": true}),
-            cohort_scope::FEDERATION,
-        );
-        let err = check_promotion_admission(d, &bad, None)
-            .await
-            .expect_err("I119b: the chokepoint refuses a malformed struct");
-        assert_eq!(
-            err.kind(),
-            "federation_media_source_invalid",
-            "I119b: {err}"
-        );
-        let good = media_row(
-            &format!("i119b-good-{s}"),
-            &signer,
-            &target,
-            &digest,
-            serde_json::json!({"digest": digest, "size": 7, "format": "image/png"}),
-            cohort_scope::FEDERATION,
-        );
-        if let Err(err) = check_promotion_admission(d, &good, None).await {
-            assert_ne!(
-                err.kind(),
-                "federation_media_source_invalid",
-                "I119b: a well-formed struct is not what the chokepoint refuses: {err}"
-            );
-        }
-        // The holder claim's size, carried to the same site: a holding claim
-        // (`custody:ack:v1` `here`, v55.0.0) without `size` does not cross
-        // either.
-        let sha: [u8; 32] = {
-            use sha2::Digest as _;
-            sha2::Sha256::digest(format!("i119b-bytes-{s}").as_bytes()).into()
-        };
-        let sizeless = row(
-            &format!("i119b-sizeless-{s}"),
-            &signer,
-            &signer,
-            serde_json::json!({
-                "dimension": crate::federation::custody_ack::CUSTODY_ACK_DIMENSION,
-                "custody_state": "here",
-                "evidence_refs": [hex::encode(sha)],
-                "score": 1.0,
-                "confidence": 1.0,
-            }),
-            cohort_scope::FEDERATION,
-        );
-        let err = check_promotion_admission(d, &sizeless, None)
-            .await
-            .expect_err("I119b: the chokepoint refuses a size-less holder claim");
-        assert!(
-            err.to_string().contains("custody_ack_malformed"),
-            "I119b: {err}"
-        );
-        assert!(err.to_string().contains("size"), "I119b: {err}");
-    }
+    // v62 (E4 round 3): I119b DELETED: it drove the promotion chokepoint
+    // with an earlier-form JSON row; an edition-2 row is its statement and
+    // the statement door refuses a malformed media struct (I115).
 
     /// **I117 (blob half) — the two doors' claims carry the stored length,
     /// and it crosses to a peer.**
@@ -1132,12 +1065,6 @@ mod run {
                 async fn i118() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i118_the_rendition_index(&b, &super::suffix()).await
-                }
-                #[tokio::test]
-                async fn i119b() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i119b_the_promotion_chokepoint_refuses_the_struct(&b, &super::suffix())
-                        .await
                 }
                 #[tokio::test]
                 async fn i118c() {

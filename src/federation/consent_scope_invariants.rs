@@ -113,6 +113,25 @@ pub(crate) mod bodies {
         e2::put_signed(d, &a).await.map(|_| ())
     }
 
+    /// E5-fix1 (round 3) — the fold reason a put row is HELD with, `None`
+    /// when it landed. v62 GC1 (CC 2.7.3): the subject's consent is other
+    /// rows, so a score short of it is held `consent_gate_refused` (and
+    /// re-folds when a grant lands), never refused (ruling 5: assert the
+    /// wait).
+    pub(crate) async fn held_reason(d: &dyn FederationDirectory, a: Attestation) -> Option<String> {
+        use crate::federation::edition2::{fold, ingest::StatementOutcome};
+        match e2::put_signed(d, &a).await.expect("the row is offered") {
+            StatementOutcome::Pending { row_id, .. } => Some(
+                fold::why_held(d, &row_id)
+                    .await
+                    .expect("why held")
+                    .expect("a held row carries its reason")
+                    .reason,
+            ),
+            _ => None,
+        }
+    }
+
     /// **I104 — the door refuses a malformed scope token by name, and admits
     /// a well-formed non-canonical kind.**
     pub async fn i104_the_door_refuses_malformed_tokens(d: &dyn FederationDirectory, s: &str) {
@@ -622,10 +641,11 @@ pub(crate) mod bodies {
             ts::reseal(&mut r);
             r
         };
-        let refused = put(d, score("none"))
-            .await
-            .expect_err("I112: no consent, no score");
-        assert_eq!(refused.kind(), "federation_consent_gate_refused");
+        assert_eq!(
+            held_reason(d, score("none")).await.as_deref(),
+            Some(crate::federation::edition2::fold::reason::gc1::CONSENT_GATE_REFUSED),
+            "I112: no consent, no score (held)"
+        );
         // Narrowed to a DIFFERENT family: still refused.
         put(
             d,
@@ -642,10 +662,11 @@ pub(crate) mod bodies {
         )
         .await
         .unwrap();
-        let refused = put(d, score("trust"))
-            .await
-            .expect_err("I112: `analyze:trust` does not cover capacity scoring");
-        assert_eq!(refused.kind(), "federation_consent_gate_refused");
+        assert_eq!(
+            held_reason(d, score("trust")).await.as_deref(),
+            Some(crate::federation::edition2::fold::reason::gc1::CONSENT_GATE_REFUSED),
+            "I112: `analyze:trust` does not cover capacity scoring (held)"
+        );
         // Narrowed to THIS family: admitted.
         put(
             d,
@@ -662,9 +683,11 @@ pub(crate) mod bodies {
         )
         .await
         .unwrap();
-        put(d, score("cap"))
-            .await
-            .expect("I112: `analyze:capacity` covers it");
+        assert_eq!(
+            held_reason(d, score("cap")).await,
+            None,
+            "I112: `analyze:capacity` covers it"
+        );
     }
 }
 
@@ -995,11 +1018,12 @@ mod run {
             report.declined_by_principle, 1,
             "I108: the train grant is still declined, by name"
         );
-        assert_eq!(
-            sq.get_attestation(&row_id).await.unwrap().unwrap().tier,
-            attestation_tier::FEDERATION,
-            "I108: `share` propagates"
-        );
+        // E5-fix1 (round 3) — `share` propagates: the row CROSSES. v62 P8
+        // crosses an edition-2 local row in place (its own statement) and
+        // RESTATES an earlier-form one as a new federation row (the local
+        // row stays local, `Crossed` names the stated row), so the witness is
+        // the sweep's own count, not the local row's tier.
+        assert_eq!(report.promoted, 1, "I108: `share` propagates: {report:?}");
     }
 
     /// **v50.0.0 (CIRISPersist#924 review, MEDIUM-3) — a grant-covered row on
@@ -1052,7 +1076,7 @@ mod run {
             .await
             .unwrap();
         sq.rewrite_dimension_for_test(&old_id, "trace:complete");
-        let new_id = sq
+        let _new_id = sq
             .attestation_insert_local(local("trace:complete:v1", "new"))
             .await
             .unwrap();
@@ -1083,11 +1107,9 @@ mod run {
             attestation_tier::LOCAL,
             "the old-shape row is not promoted"
         );
-        assert_eq!(
-            sq.get_attestation(&new_id).await.unwrap().unwrap().tier,
-            attestation_tier::FEDERATION,
-            "its conformant sibling is"
-        );
+        // E5-fix1 (round 3) — as I108: the conformant sibling CROSSES (in
+        // place, or restated as a new federation row under v62 P8).
+        assert_eq!(report.promoted, 1, "its conformant sibling is: {report:?}");
     }
 
     /// **I109 — the sweep records a lapsed grant as `consent:state:expired`

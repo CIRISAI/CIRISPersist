@@ -385,6 +385,27 @@ pub(crate) mod bodies {
         }
     }
 
+    /// E5-fix1 (round 3) — a group-plane outcome as the refusal-shaped
+    /// answer the I21x bodies assert: a widening the membership gate HOLDS
+    /// (`Pending`: no acceptance yet, an expired proposal, ...) is returned
+    /// as [`held_error`] of its fold reason, never as `Ok`; a landed or
+    /// joined voice is `Ok`.
+    pub(crate) async fn settled<D: FederationDirectory + ?Sized>(
+        d: &D,
+        out: crate::federation::edition2::ingest::StatementOutcome,
+    ) -> Result<(), Error> {
+        use crate::federation::edition2::{fold, ingest::StatementOutcome};
+        match out {
+            StatementOutcome::Pending { row_id, .. } => {
+                let held = fold::why_held(d, &row_id)
+                    .await?
+                    .expect("a held group voice carries its reason");
+                Err(held_error(&held.reason, &held.detail))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The refusal-shaped error of a HELD row: its membership token as
     /// `MembershipAcceptanceRefused` (so `rule_of` reads it), else an
     /// `InvalidArgument` naming the reason and the gate's detail.
@@ -472,7 +493,7 @@ pub(crate) mod bodies {
             let group = crate::federation::edition2::fixture_switch::kid(cid);
             let head = gf::held_head(d, &group).await.map(|(h, _)| h);
             let voices = gf::community_widening_voices(&w, head.as_ref());
-            return gf::put_voices(d, &voices).await.map(|_| ());
+            return settled(d, gf::put_voices(d, &voices).await?).await;
         }
         d.put_community_membership_widening(w).await
     }
@@ -502,7 +523,7 @@ pub(crate) mod bodies {
             let group = crate::federation::edition2::fixture_switch::kid(fid);
             let head = gf::held_head(d, &group).await.map(|(h, _)| h);
             let voices = gf::family_widening_voices(&w, head.as_ref());
-            return gf::put_voices(d, &voices).await.map(|_| ());
+            return settled(d, gf::put_voices(d, &voices).await?).await;
         }
         d.put_family_membership_widening(w).await
     }
@@ -1136,7 +1157,7 @@ pub(crate) mod bodies {
                         Some(&head),
                         e2::ms(Utc::now()),
                     );
-                    gf::put_voices(d, &voices).await.map(|_| ())
+                    settled(d, gf::put_voices(d, &voices).await?).await
                 } else {
                     d.supersede_community(ts::sign_community(&founder, c), None)
                         .await
@@ -1178,9 +1199,19 @@ pub(crate) mod bodies {
         // v62.0.0 (wave 3, E5) — one voice of three is kept `Pending` (T1.api
         // §6: a quorum short does not move the head); the second voice of the
         // same widening completes it.
-        widen_community(d, &cid, &[&a], &k, None, now)
+        // E5-fix1 (round 3) — `settled` answers the held voice as the
+        // refusal-shaped `held count_short` (ruling 5: assert the wait).
+        let e = widen_community(d, &cid, &[&a], &k, None, now)
             .await
-            .expect("I218: one signature of three is held, pending the group");
+            .expect_err("I218: one signature of three is held, pending the group");
+        assert!(
+            matches!(&e, Error::InvalidArgument(m)
+            if m.starts_with(&format!(
+                "held {}",
+                crate::federation::edition2::fold::reason::COUNT_SHORT
+            ))),
+            "I218: {e:?}"
+        );
         assert!(
             !active_in_community(d, &cid, &k).await,
             "I218: accepted, awaiting the group"

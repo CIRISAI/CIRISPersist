@@ -1646,6 +1646,23 @@ pub(crate) mod test_support {
         (e2::kid_digest(seed), e2::kid(seed))
     }
 
+    /// v62.0.0 (E2-fix3; CC 2.7.3) — **the real put door says NO**: it
+    /// refuses `statement`, or HOLDS it on a fold condition (the ceremony
+    /// reads the binding, the finding and the petition, other rows), with the
+    /// fold's reason recorded (`fold::why_held`). Either way it never lands.
+    async fn refused_or_held(dir: &dyn FederationDirectory, statement: &[u8]) -> bool {
+        match e2::put_statement(dir, statement).await {
+            Err(_) => true,
+            Ok(StatementOutcome::Pending { row_id, .. }) => {
+                crate::federation::edition2::fold::why_held(dir, &row_id)
+                    .await
+                    .expect("the fold's record reads")
+                    .is_some()
+            }
+            Ok(_) => false,
+        }
+    }
+
     /// The row a statement maps to (its row id is `attestation_id`).
     fn row_of(statement: &[u8]) -> Attestation {
         e2::row_of_statement(statement, attestation_tier::FEDERATION)
@@ -1925,7 +1942,7 @@ pub(crate) mod test_support {
             "({suffix}) a gated withdraws with no wa_adjudication_ref must be refused BY NAME"
         );
         assert!(
-            e2::put_statement(dir, &bare).await.is_err(),
+            refused_or_held(dir, &bare).await,
             "({suffix}) and the real put gate must refuse it too — the gate is not advisory"
         );
 
@@ -2168,7 +2185,7 @@ pub(crate) mod test_support {
             "({suffix}) a withdraws that names who gets the node next collapses steps 3 and 4"
         );
         assert!(
-            e2::put_statement(dir, &collapsed).await.is_err(),
+            refused_or_held(dir, &collapsed).await,
             "({suffix}) …and the real put gate refuses it, so it never lands"
         );
 

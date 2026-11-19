@@ -174,7 +174,9 @@ pub(crate) mod bodies {
         rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:a3:c:v1", -50).await);
         rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:b:c:v1", -40).await);
         rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:b2:c:v1", -30).await);
-        rows.push(put_scores(d, &a, &a, "evidence:other:x:c:p:v1", -20).await);
+        // v62.0.0 (E0 fix 3) — `other` is not in the closed `{suite}` vocab: the
+        // out-of-prefix row is the `interpret` kind, outside `…:capture:`.
+        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:interpret:x:c:v1", -20).await);
         // A about B and C, one tied with A's config:b2.
         rows.push(put_scores(d, &a, &b, "evidence:safety_battery:capture:a:c:v1", -30).await);
         rows.push(put_scores(d, &a, &b, "evidence:safety_battery:capture:ab:c:v1", -10).await);

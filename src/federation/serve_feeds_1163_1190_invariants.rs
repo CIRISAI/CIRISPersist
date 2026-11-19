@@ -513,8 +513,12 @@ pub(crate) mod bodies {
         .await
         .expect("I1572 the local row is written");
         let table = raw.attestations_table();
+        // v62 (E3b r3): the read's families moved to `need:i1572:` (an
+        // edition-2 dimension is a registered family), so the retyped row's
+        // TYPE must sit under that prefix too, or the family narrowing (a
+        // non-`scores` row matches by type) drops it before the serve filter.
         raw.exec(&format!(
-            "UPDATE {table} SET attestation_type = 'i1572:x:unregistered' \
+            "UPDATE {table} SET attestation_type = 'need:i1572:x:unregistered' \
              WHERE attestation_id = '{unregistered}'"
         ))
         .await;
@@ -734,19 +738,17 @@ pub(crate) mod bodies {
         node: &str,
         binding_id: &str,
     ) -> String {
-        let nonce = uuid::Uuid::new_v4().to_string();
-        let mut w = ts::bare_attestation(
-            &nonce,
-            owner,
-            node,
-            &serde_json::json!({
-                "dimension": owner_binding::DIMENSION,
-                "references_attestation_id": binding_id,
-                "withdrawal_reason": "the owner withdraws the announcement",
-            }),
-        );
-        w.attestation_type = attestation_type::WITHDRAWS.to_owned();
-        let w = ts::seal_row(owner, w);
+        // v62 (E3b r3): an edition-2 `withdraws` is a composer over its
+        // target's family naming the target by row id (`e2::composer_of`).
+        // The earlier free-text `withdrawal_reason` member is not in the
+        // composer payload (the door refuses it), so it is dropped.
+        let _ = node;
+        let target = d
+            .get_attestation(binding_id)
+            .await
+            .expect("read the binding")
+            .unwrap_or_else(|| panic!("I1576 fixture: the binding {binding_id} is held"));
+        let w = e2::composer_of(attestation_type::WITHDRAWS, &target, owner);
         let id = w.attestation_id.clone();
         crate::federation::edition2::fixture_switch::put_signed(d, &w)
             .await

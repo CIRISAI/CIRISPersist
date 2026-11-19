@@ -247,6 +247,10 @@ pub mod bodies {
     /// A `consent:replication:v1` grant by `author` FOR `for_key` — #857's
     /// shape.
     fn replication_grant(id: &str, author: &str, for_key: &str) -> Attestation {
+        // v62 (E3b): `for_key_id` is a payload member the codec carries as
+        // text; the person is named by its identity-ref (the delegation the
+        // door walks is `kid(person) → kid(machine)`).
+        let for_key = e2::kid_or_keep(for_key);
         let payload = serde_json::json!({
             "grants": "replication",
             "attestation_prefixes": ["i591-fixture:"],
@@ -268,6 +272,8 @@ pub mod bodies {
     /// `for_key`, scope `analyze` — the scoped consent shape.
     fn state_grant(id: &str, author: &str, target: &str, for_key: &str) -> Attestation {
         let at = admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        // v62 (E3b): the person by its identity-ref (see `replication_grant`).
+        let for_key = e2::kid_or_keep(for_key);
         row(
             id,
             author,
@@ -483,15 +489,21 @@ pub mod key_grant_arms {
     /// v55.0.0 (#989) — an onward recipient the audience rule admits: a
     /// registered personal device of `identity`, so the row's recipient leg
     /// passes and the arm measures the issuer rule alone.
-    async fn recipient_of<B>(n: &Node<'_, B>, identity: &str, recipient: &str)
+    ///
+    /// v62 (E3b): `recipient` is a SEED; its key lands as `kid(recipient)`,
+    /// which this returns, and the occurrence names both sides by their
+    /// identity-refs (`identity` may be a seed or a ref; the FK is on the
+    /// held key). The caller wraps for, and reads grants of, the returned id.
+    async fn recipient_of<B>(n: &Node<'_, B>, identity: &str, recipient: &str) -> String
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
         ts::register_hybrid_key_as(n.backend, recipient, recipient, USER).await;
+        let recipient = e2::kid(recipient);
         n.backend
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: identity.to_owned(),
-                occurrence_key_id: recipient.to_owned(),
+                identity_key_id: e2::kid_or_keep(identity),
+                occurrence_key_id: recipient.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: chrono::Utc::now(),
@@ -502,6 +514,7 @@ pub mod key_grant_arms {
             })
             .await
             .unwrap();
+        recipient
     }
 
     /// **I591b** — the content axis, one node.
@@ -555,8 +568,7 @@ pub mod key_grant_arms {
             },
             wrap: wrap(recipient),
         };
-        let r1 = format!("{tag}-r1-{run}");
-        recipient_of(a, &owner_k, &r1).await;
+        let r1 = recipient_of(a, &owner_k, &format!("{tag}-r1-{run}")).await;
         let r = admit_replicated_key_grant(
             a.backend,
             sign_row_unstored(&delegate, &set_for(&r1)).await,
@@ -621,8 +633,7 @@ pub mod key_grant_arms {
         );
 
         withdraw(dir, &owner, &owner, &d_key, &edge).await;
-        let r2 = format!("{tag}-r2-{run}");
-        recipient_of(a, &owner_k, &r2).await;
+        let r2 = recipient_of(a, &owner_k, &format!("{tag}-r2-{run}")).await;
         let r = admit_replicated_key_grant(
             a.backend,
             sign_row_unstored(&delegate, &set_for(&r2)).await,
@@ -746,8 +757,7 @@ pub mod key_grant_arms {
                     "{tag} I596b {what}: an over-ceiling edge must be refused"
                 ),
             }
-            let recipient = format!("{tag}-i596-r{i}-{run}");
-            recipient_of(a, &owner_k, &recipient).await;
+            let recipient = recipient_of(a, &owner_k, &format!("{tag}-i596-r{i}-{run}")).await;
             let r = admit_replicated_key_grant(
                 a.backend,
                 sign_row_unstored(&delegate, &set_for(&recipient)).await,
@@ -849,8 +859,7 @@ pub mod key_grant_arms {
             now + chrono::Duration::days(30),
         )
         .await;
-        let r0 = format!("{tag}-i1221-r0-{run}");
-        recipient_of(a, &owner_k, &r0).await;
+        let r0 = recipient_of(a, &owner_k, &format!("{tag}-i1221-r0-{run}")).await;
         admit_replicated_key_grant(
             a.backend,
             sign_row_unstored_at(&delegate, &set_for(&r0), now - chrono::Duration::days(4)).await,
@@ -858,8 +867,7 @@ pub mod key_grant_arms {
         .await
         .unwrap_or_else(|e| panic!("{tag} I1221: an old row whose chain stands: {e}"));
         withdraw(dir, &owner, &owner, &d_key, &edge).await;
-        let r1 = format!("{tag}-i1221-r1-{run}");
-        recipient_of(a, &owner_k, &r1).await;
+        let r1 = recipient_of(a, &owner_k, &format!("{tag}-i1221-r1-{run}")).await;
         let admitted = admit_replicated_key_grant(
             a.backend,
             sign_row_unstored_at(&delegate, &set_for(&r1), now - chrono::Duration::hours(1)).await,
@@ -875,8 +883,7 @@ pub mod key_grant_arms {
                     .is_some(),
             "{tag} I1221: the projection judges at the signed instant too: {admitted:?}"
         );
-        let r2 = format!("{tag}-i1221-r2-{run}");
-        recipient_of(a, &owner_k, &r2).await;
+        let r2 = recipient_of(a, &owner_k, &format!("{tag}-i1221-r2-{run}")).await;
         let e = admit_replicated_key_grant(
             a.backend,
             sign_row_unstored_at(&delegate, &set_for(&r2), now - chrono::Duration::days(4)).await,
@@ -925,6 +932,10 @@ pub mod key_grant_arms {
         let alice = format!("{tag}-alice-{run}");
         let bob = format!("{tag}-bob-{run}");
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        // v62 (E3b): the room and its members are held under their
+        // identity-refs (`seed_community_everywhere` registers the seeds and
+        // voices the roster by `kid`); the DEK planes name them so.
+        let (comm, bob) = (e2::kid(&comm), e2::kid(&bob));
         encrypt_and_cascade_community(a.backend, &comm, b"minutes", None, Some(&a.key))
             .await
             .unwrap_or_else(|e| panic!("{tag} I591c: A seals: {e}"));
@@ -936,8 +947,7 @@ pub mod key_grant_arms {
             axis: honest.axis.clone(),
             wrap: wrap(recipient),
         };
-        let r1 = format!("{tag}-r1-{run}");
-        recipient_of(b, &bob, &r1).await;
+        let r1 = recipient_of(b, &bob, &format!("{tag}-r1-{run}")).await;
         // (1) B's own member occurrence signs A's counter: not the minter.
         let r = admit_replicated_key_grant(
             b.backend,
@@ -995,8 +1005,7 @@ pub mod key_grant_arms {
         );
 
         withdraw(dir, &a.key, a_alias, &b.key, &edge).await;
-        let r2 = format!("{tag}-r2-{run}");
-        recipient_of(b, &bob, &r2).await;
+        let r2 = recipient_of(b, &bob, &format!("{tag}-r2-{run}")).await;
         let r = admit_replicated_key_grant(
             b.backend,
             sign_row_unstored(&b.signer, &set_for(&r2)).await,

@@ -451,9 +451,16 @@ pub(crate) mod bodies {
             }
             // O1's identity-set exclusion may refuse a node key under a
             // person at the node's own voice: also never node-authored.
+            // Matched structurally: the error's Display carries the prose,
+            // not the token.
             Err(e) => assert!(
-                e.to_string().contains("occurrence_binds_machine_to_person"),
-                "I3532: {e}"
+                matches!(
+                    &e,
+                    crate::federation::Error::MalformedRow { reason, .. }
+                        if *reason
+                            == crate::federation::malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON
+                ),
+                "I3532: {e:?}"
             ),
         }
     }
@@ -678,6 +685,9 @@ pub(crate) mod bodies {
                 Value::Text("observation:reachability:v1".into()),
             ),
             (Value::Text("score".into()), Value::Uint(500_000)),
+            // `observation:reachability` is an AUTHORED family: its payload
+            // names its author (the door's `author_column` rule).
+            (Value::Text("author".into()), Value::Text(a_id.clone())),
         ]);
         let draft = crate::federation::edition2::emit::draft_row(
             &kid,

@@ -256,14 +256,17 @@ async fn i1482_occurrence_doors_complete_on_one_connection() {
     let d = &b as &dyn FederationDirectory;
     let tag = suffix();
     let (identity, occ) = (format!("i1482-id-{tag}"), format!("i1482-occ-{tag}"));
+    // v62.0.0 (P1-fix4; CC rc21 3.3.6) — an agent's occurrence binds the
+    // AGENT's own identity (a machine key is never an occurrence of a
+    // person): identity and occurrence are both agent keys.
     let _ = e2::put_key(
         d,
         &identity,
-        &[crate::federation::types::identity_type::USER],
+        &[crate::federation::types::identity_type::AGENT],
     )
     .await;
-    // v61 (CIRISPersist#1122) — a node: an agent's occurrence projects no route.
-    let _ = e2::put_key(d, &occ, &[crate::federation::types::identity_type::NODE]).await;
+    // v61 (CIRISPersist#1122) — an agent's occurrence projects no route.
+    let _ = e2::put_key(d, &occ, &[crate::federation::types::identity_type::AGENT]).await;
     let (identity, occ) = (e2::kid(&identity), e2::kid(&occ));
     let b64 = base64::engine::general_purpose::STANDARD;
     let row = crate::federation::IdentityOccurrence {

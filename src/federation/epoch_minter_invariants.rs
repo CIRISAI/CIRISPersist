@@ -351,8 +351,12 @@ pub(crate) mod bodies {
         );
 
         // A second minter at the same (community, epoch): no guess.
-        let other = format!("em-other-{run}");
-        ts::register_identity_key(b.as_ref(), &other, USER).await;
+        // v62 (E4 round 3): the key is registered from its seed and named by
+        // its identity-ref, the id `federation_keys` holds (the occurrence
+        // below references it).
+        let other_seed = format!("em-other-{run}");
+        ts::register_identity_key(b.as_ref(), &other_seed, USER).await;
+        let other = crate::federation::edition2::fixture_switch::kid(&other_seed);
         b.as_ref()
             .community_dek_put_member_grant(
                 &l.comm,

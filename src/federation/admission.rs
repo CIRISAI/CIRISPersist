@@ -13230,6 +13230,37 @@ async fn steward_edge_filter(
     })
 }
 
+/// v62.0.0 (JSON cut; CC 3.2 "Who owns a key", CC 3.3.6; RULINGS
+/// "delegates_to families"; lead ruling: an agent is never an occurrence of a
+/// person, on every path) — **the human an AGENT is anchored to**: its owner
+/// by the edition-2 agent owner binding ([`agent_owner_of`]: the owner's
+/// statement plus the agent's own voice, live now, not retracted by its
+/// author), when that owner is `user`-role. This is the steward fold's
+/// edition-2 path for an agent. Clause (2)'s login occurrence (the agent as
+/// an occurrence of its human) is refused by the occurrence door once the
+/// earlier form is shut, so without this clause no agent had a human. An
+/// ambiguous owner anchors nobody (fail closed, CC 3.2: ownership is
+/// single-valued). A non-agent key has no agent owner binding: `None`.
+async fn agent_owner_anchor(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+) -> Result<Option<String>, Error> {
+    let now_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+    let owner = match agent_owner_of(directory, k, now_ms).await {
+        Ok(owner) => owner,
+        Err(Error::AmbiguousNodeOwner { .. }) => None,
+        Err(e) => return Err(e),
+    };
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let is_user = directory
+        .lookup_public_key(&owner)
+        .await?
+        .is_some_and(|r| identity_type::set_contains(&r.identity_type, identity_type::USER));
+    Ok(is_user.then_some(owner))
+}
+
 /// v44.6.0 (CIRISPersist#857, `FSD/CONSENT_BY_HUMANS.md` §3) — **the
 /// occurrence half of the steward fold, spelled once**: the `user`-role
 /// identities `k` is an ACTIVE occurrence of.
@@ -13337,6 +13368,10 @@ pub async fn is_steward_bound(
         //     key and check ITS identity_type set for `user`.
         // v44.6.0 (#857) — every row for the key, ACTIVE only, spelled once.
         if !user_identity_anchors_of(directory, k).await?.is_empty() {
+            return Ok(true);
+        }
+        // (2b) v62.0.0 — an agent's human is its OWNER ([`agent_owner_anchor`]).
+        if agent_owner_anchor(directory, k).await?.is_some() {
             return Ok(true);
         }
     }
@@ -13451,6 +13486,11 @@ pub async fn steward_binding_paths_of(
         // v44.6.0 (#857) — every row for the key, ACTIVE only, spelled once.
         for u in user_identity_anchors_of(directory, k).await? {
             out.entry(u).or_default().push(StewardPath::OccurrenceOf);
+        }
+        // (2b) v62.0.0 — an agent's human is its OWNER ([`agent_owner_anchor`]):
+        // the owner binding is a `delegates_to`, so the clause label is that.
+        if let Some(owner) = agent_owner_anchor(directory, k).await? {
+            out.entry(owner).or_default().push(StewardPath::DelegatesTo);
         }
     }
     // (3) each user-role granter U of a LIVE delegates_to(U → k) — with the
@@ -17431,6 +17471,10 @@ pub async fn steward_binding_chain(
             .next()
         {
             return Ok(vec![identity, key_id.to_owned()]);
+        }
+        // (2b) v62.0.0 — an agent's human is its OWNER ([`agent_owner_anchor`]).
+        if let Some(owner) = agent_owner_anchor(directory, key_id).await? {
+            return Ok(vec![owner, key_id.to_owned()]);
         }
     }
     // (3) a LIVE delegates_to(U → k) with U user-role — U → k. Lowest
@@ -25832,18 +25876,18 @@ mod tests {
         // substrate would not accept.
         let binding_id = format!("bind-{tag}-{}", uuid::Uuid::new_v4());
         let binding = ts::owner_binding_attestation(&binding_id, &owner_s, &node_s);
-        e2::put_signed(dir, &binding)
+        // v62 (E4 round 3; K2, C557): the owner's statement and the node's
+        // voice, through K2's helper.
+        let out = e2::land_owner_binding(dir, &binding, &node_s)
             .await
-            .expect("the owner-binding itself must admit");
-        e2::put_statement(
-            dir,
-            &e2::voice_of(
-                &e2::carried_statement(&binding).expect("the binding carries its statement"),
-                &node_s,
+            .expect("the node's voice on its owner-binding must admit");
+        assert!(
+            matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Row { .. }
             ),
-        )
-        .await
-        .expect("the node's voice on its owner-binding must admit");
+            "the owner-binding lands with the node's voice: {out:?}"
+        );
         assert_eq!(
             owner_of(dir, &node).await.unwrap().as_deref(),
             Some(owner.as_str()),
@@ -26653,9 +26697,20 @@ pub(crate) mod r2_test_support {
             {
                 continue;
             }
+            let confers = row.attestation_envelope.get("dimension")
+                == Some(&serde_json::Value::from(TRUST_CONFERS_DIMENSION));
             e2::put_signed(dir, &row)
                 .await
                 .unwrap_or_else(|e| panic!("conferral row must admit: {e}"));
+            // v62 (E4 round 3; CC 2.6.1.9): Verify's `confers` rule asks the
+            // subject for a second voice (`delegate: sub`); without it the
+            // grant is held and confers nothing.
+            if confers {
+                let st = e2::carried_statement(&row).expect("the grant carries its statement");
+                e2::put_statement(dir, &e2::voice_of(&st, to))
+                    .await
+                    .unwrap_or_else(|e| panic!("the subject's voice on the conferral: {e}"));
+            }
         }
     }
 
@@ -26884,7 +26939,10 @@ pub(crate) mod r2_test_support {
                 attestation_id: id.to_owned(),
                 attesting_key_id: author.clone(),
                 attested_key_id: about.to_owned(),
-                attestation_type: dimension.to_owned(),
+                // v62 (E4 round 3): an edition-2 row type is one of the
+                // registered kinds; a hard case is `scores` at its
+                // `hard_case:` dimension (`hard_case::state_hard_case`).
+                attestation_type: attestation_type::SCORES.to_owned(),
                 weight: None,
                 asserted_at: now,
                 expires_at: None,
@@ -27139,13 +27197,14 @@ pub(crate) mod steward_liveness_test_support {
         attested: &str,
         target_attestation_id: &str,
     ) -> Attestation {
-        let id = uuid::Uuid::new_v4().to_string();
+        // v62 (E4 round 3): a composer carries only the common members and
+        // its target (P1e): no `id`. The target is a row id
+        // (`store_row(..).attestation_id`).
         signed_row(
             issuer,
             attested,
             attestation_type::WITHDRAWS,
             serde_json::json!({
-                "id": id,
                 "references_attestation_id": target_attestation_id,
             }),
         )
@@ -27204,6 +27263,57 @@ pub(crate) mod steward_liveness_test_support {
         e2::put_statement(dir, &e2::statement_of_family(row, &seed, &family))
             .await
             .map(|_| ())
+    }
+
+    /// v62 (E4 round 3) — [`store`], answering the row as the node stores
+    /// it: its `attestation_id` is the node-computed row id, the id a later
+    /// composer names and `get_attestation` reads.
+    pub(crate) async fn store_row(
+        dir: &dyn FederationDirectory,
+        row: &Attestation,
+    ) -> Result<Attestation, Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        let tier = if row.tier.is_empty() {
+            crate::federation::edition2::ingest::INGEST_TIER
+        } else {
+            row.tier.as_str()
+        };
+        if let Some(st) = e2::carried_statement(row) {
+            e2::put_signed(dir, row).await?;
+            return e2::try_row_of_statement(&st, tier);
+        }
+        let seed = row.attesting_key_id.clone();
+        let composer = [
+            attestation_type::WITHDRAWS,
+            attestation_type::RECANTS,
+            attestation_type::SUPERSEDES,
+        ]
+        .contains(&row.attestation_type.as_str());
+        if !composer {
+            let stored = e2::try_put_row(dir, row, &seed).await?;
+            // v62 (E4 round 3; K2-fix4, CC 2.7.3): a `delegates_to` waits for
+            // the delegate's voice (the family's second signer, `sub`).
+            if row.attestation_type == attestation_type::DELEGATES_TO {
+                if let Some(st) = e2::carried_statement(&stored) {
+                    e2::put_statement(dir, &e2::voice_of(&st, &row.attested_key_id)).await?;
+                }
+            }
+            return Ok(stored);
+        }
+        let target = match row
+            .attestation_envelope
+            .get("references_attestation_id")
+            .and_then(|v| v.as_str())
+        {
+            Some(t) => dir.get_attestation(t).await?,
+            None => None,
+        };
+        let family = target
+            .as_ref()
+            .map_or_else(|| "self:delegates_to".to_owned(), e2::family_of);
+        let st = e2::statement_of_family(row, &seed, &family);
+        e2::put_statement(dir, &st).await?;
+        e2::try_row_of_statement(&st, tier)
     }
 
     /// **THE BICONDITIONAL.** The three steward-binding readers are three
@@ -27270,7 +27380,7 @@ pub(crate) mod steward_liveness_test_support {
             &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
             &[&node],
         );
-        store(dir, &edge).await.expect("delegates_to admitted");
+        let edge = store_row(dir, &edge).await.expect("delegates_to admitted");
         assert_biconditional(dir, &node, true, "live edge").await;
         assert_eq!(
             steward_bindings_of(dir, &node).await.expect("anchors"),
@@ -27284,7 +27394,7 @@ pub(crate) mod steward_liveness_test_support {
         // The edge's own GRANTER never issued this — exactly the shape the
         // granter-scoped fold cannot see.
         let revocation = withdraws_of(&node, &node, &edge.attestation_id);
-        store(dir, &revocation)
+        let revocation = store_row(dir, &revocation)
             .await
             .expect("a rule-2 withdraws against the delegation must be ADMITTED");
         let stored = dir
@@ -27449,7 +27559,7 @@ pub(crate) mod steward_liveness_test_support {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod moderation_walk_liveness_test_support {
     use super::steward_liveness_test_support::{
-        bare_edge_retraction, register, signed_row, store, withdraws_of,
+        bare_edge_retraction, register, signed_row, store, store_row, withdraws_of,
     };
     use super::*;
     use crate::federation::tier_ingest::test_support::sign_community;
@@ -27632,7 +27742,9 @@ pub(crate) mod moderation_walk_liveness_test_support {
         // founder →(moderate, sub_delegation) deputy →(moderate) leaf.
         let e_fd = moderation_edge(&founder, &deputy, &[duty], &[&deputy], true);
         let e_dl = moderation_edge(&deputy, &leaf, &[duty], &[&leaf], false);
-        store(dir, &e_fd).await.expect("founder -> deputy admitted");
+        let e_fd = store_row(dir, &e_fd)
+            .await
+            .expect("founder -> deputy admitted");
         store(dir, &e_dl).await.expect("deputy -> leaf admitted");
 
         let roster = assert_moderator_agreement(
@@ -27676,7 +27788,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
         // CEG §3.2.3 rule 2. The edge's own granter never issued it — exactly
         // the row the granter-scoped fold cannot see.
         let revocation = withdraws_of(&deputy, &deputy, &e_fd.attestation_id);
-        store(dir, &revocation)
+        let revocation = store_row(dir, &revocation)
             .await
             .expect("a rule-2 withdraws against the delegation must be ADMITTED");
         let stored = dir
@@ -28508,11 +28620,16 @@ pub(crate) mod moderation_walk_liveness_test_support {
                 "delegation_purpose": owner_binding::CC_DELEGATION_PURPOSE,
             }),
         );
-        let err = store(dir, &binding).await.expect_err(
-            "steward-binding an age-unverified adult must STILL be refused — CC 3.2 / CC 1.15.6 \
-             are untouched by CIRISConstitution#87, and if this ever admits the ruling has been \
-             read as a licence rather than a distinction",
-        );
+        // v62 (E4 round 3; CC 2.7, C557): an owner-binding counts the owner's
+        // and the bound key's voices (K2's `land_owner_binding`), so the CC
+        // 3.2 gate, which runs after the count, is reached.
+        let err = e2::land_owner_binding(dir, &e2::row_of(&binding, &owner), &human)
+            .await
+            .expect_err(
+                "steward-binding an age-unverified adult must STILL be refused — CC 3.2 / CC \
+                 1.15.6 are untouched by CIRISConstitution#87, and if this ever admits the \
+                 ruling has been read as a licence rather than a distinction",
+            );
         assert_eq!(
             err.kind(),
             "federation_user_target_steward_binding_forbidden",
@@ -28541,9 +28658,15 @@ pub(crate) mod moderation_walk_liveness_test_support {
                 "delegation_purpose": owner_binding::CC_DELEGATION_PURPOSE,
             }),
         );
-        store(dir, &real)
-            .await
-            .expect("owner-binding a node admits");
+        // v62 (E4 round 3): counted (C557): K2's helper lands the owner's
+        // statement and the bound node's voice.
+        crate::federation::tier_ingest::test_support::put_sealed_owner_binding(
+            dir,
+            &e2::row_of(&real, &owner),
+            &target,
+        )
+        .await
+        .expect("owner-binding a node admits");
         let bound = steward_bindings_of(dir, &target).await.expect("fold");
         assert!(
             bound.contains(&owner),
@@ -29115,10 +29238,18 @@ pub(crate) mod ungated_doors_test_support {
             &e2::composer_of(attestation_type::RECANTS, &edge, &foreign),
         )
         .await;
+        // v62 (E4 round 3; CC 2.7): the authority condition is a fold
+        // condition: the foreign `recants` is HELD (it concludes nothing) or
+        // refused by name, never landed as a row. The live edge below is the
+        // property.
         assert!(
-            r.as_ref()
+            matches!(
+                r,
+                Ok(crate::federation::edition2::ingest::StatementOutcome::Pending { .. })
+            ) || r
+                .as_ref()
                 .is_err_and(|e| e.to_string().contains("recants_not_admitted")),
-            "#984 row 12: a foreign `recants` is refused at the door by name: {r:?}"
+            "#984 row 12: a foreign `recants` is held or refused by name, never a row: {r:?}"
         );
         let granters =
             live_delegation_granters(dir, &recipient, DelegationEdgeFilter::AnyDelegation)

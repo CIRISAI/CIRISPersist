@@ -1014,6 +1014,7 @@ pub mod plane {
     /// from the held, not-held-back key statements.
     pub const KEY: &str = "key";
     /// O1's occurrence binds (one projection per (identity, occurrence)).
+    /// FINAL (G0-fix6): a version of a person's key roster.
     pub const OCCURRENCE: &str = "occurrence";
     /// T1's group planes (roster versions, counted membership changes).
     pub const GROUP: &str = "group";
@@ -1944,30 +1945,6 @@ impl Plane for KeyPlane {
     }
 }
 
-/// O1's occurrence binds: the pair's current-state row leaves; the pair's
-/// concluded binds re-conclude (newest signed wins, the upsert's own rule).
-struct OccurrencePlane;
-
-#[async_trait::async_trait]
-impl Plane for OccurrencePlane {
-    fn name(&self) -> &'static str {
-        plane::OCCURRENCE
-    }
-
-    async fn unconclude(
-        &self,
-        dir: &dyn FederationDirectory,
-        row: &AdmittedRow,
-    ) -> Result<(), Error> {
-        let Some((identity, occurrence)) = occurrence_pair(row) else {
-            return Ok(());
-        };
-        dir.clear_occurrence_projection(&identity, &occurrence)
-            .await
-            .map(|_| ())
-    }
-}
-
 /// A plane whose concluded rows are final (CC 2.7.5).
 struct FinalPlane(&'static str);
 
@@ -1995,7 +1972,14 @@ static ATTESTATION_PLANE: AttestationPlane = AttestationPlane(plane::ATTESTATION
 static TYPED_ATTESTATION_PLANE: AttestationPlane = AttestationPlane(plane::TYPED_ATTESTATION);
 static TRUST_PLANE: TrustPlane = TrustPlane;
 static KEY_PLANE: KeyPlane = KeyPlane;
-static OCCURRENCE_PLANE: OccurrencePlane = OccurrencePlane;
+// G0-fix6 — an occurrence bind is a version of a person's key roster (CC
+// 2.7.8: "A person's keys ... are this one roster"): counted at the head it
+// names and FINAL once concluded. A later eviction or owner change acts
+// forward through a later version and never un-binds it (CC 2.7.5, 2.7.8:
+// "A removal ... changes the members there, not at the old head"; CC 2.7.7:
+// "A row of a removed key counts when the removal has it among its
+// ancestors").
+static OCCURRENCE_PLANE: FinalPlane = FinalPlane(plane::OCCURRENCE);
 static GROUP_PLANE: FinalPlane = FinalPlane(plane::GROUP);
 static REBIND_PLANE: FinalPlane = FinalPlane(plane::REBIND);
 static TYPED_FINAL_PLANE: FinalPlane = FinalPlane(plane::TYPED_FINAL);

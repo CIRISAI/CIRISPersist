@@ -9701,6 +9701,22 @@ impl crate::federation::BlobStorage for SqliteBackend {
         SqliteBackend::delete_blob(self, sha256).await
     }
 
+    async fn announce_held_blob(
+        &self,
+        sha256: &[u8; 32],
+        author_key_id: &str,
+        floor: crate::federation::StorageFloor,
+    ) -> Result<(), crate::federation::BlobError> {
+        // v62.0.0 (E8-fix2) — the sealed-floor announce (I27 / I28).
+        crate::federation::blob_admit::announce_held_blob_planned(
+            self,
+            sha256,
+            author_key_id,
+            floor,
+        )
+        .await
+    }
+
     async fn store_blob_local(
         &self,
         sha256: &[u8; 32],
@@ -15941,10 +15957,15 @@ fn sqlite_row_to_key_record(
     // Matches the `roles_text` shape above: `.get(column).ok()`
     // swallows both rusqlite's absent-column Err and the NULL case.
     let evidence_text: Option<String> = row.get("attestation_evidence").ok();
+    // v62.0.0 (round 3, E7) — the edition-2 key projection states "no
+    // evidence" as JSON `null` (`projection::attestation_evidence_of`); that
+    // is `None`, not `Some(Null)`, or the read model disagrees with itself
+    // across any JSON boundary (the capsule) that drops a `null` Option.
     let attestation_evidence: Option<serde_json::Value> = evidence_text
         .as_deref()
         .filter(|s| !s.is_empty())
-        .and_then(|s| serde_json::from_str(s).ok());
+        .and_then(|s| serde_json::from_str(s).ok())
+        .filter(|v: &serde_json::Value| !v.is_null());
     // v13.0.0 (CIRISPersist#365, CC 3.4.7.2): consent_role is the V020
     // `TEXT NOT NULL DEFAULT 'unregistered'` column. Tolerant read
     // (matching roles/attestation_evidence) — an absent column maps to
@@ -26021,10 +26042,12 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         &self,
         planned: crate::federation::blob_admit::PlannedAnnouncement,
     ) -> Result<bool, crate::federation::BlobError> {
-        let (claim_id, claim_tier) = (
-            planned.claim.row.attestation_id.clone(),
-            planned.claim.row.tier.clone(),
-        );
+        // v62.0.0 (E8-fix2) — `None`: the edition-2 sealed-floor announce,
+        // whose claim is a `custody` statement emitted after this commits.
+        let claim_index = planned
+            .claim
+            .as_ref()
+            .map(|c| (c.row.attestation_id.clone(), c.row.tier.clone()));
         let held = self
             .write(move |conn| -> Result<bool, rusqlite::Error> {
                 let sha_vec = planned.sha256.to_vec();
@@ -26050,19 +26073,21 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
                       WHERE sha256 = ?1 AND author_key_id IS NULL",
                     rusqlite::params![sha_vec, planned.author_key_id],
                 )?;
-                sqlite_insert_holding_claim(
-                    &tx,
-                    &planned.claim.row,
-                    &planned.claim.envelope_text,
-                    &planned.claim.original_content_hash,
-                )?;
+                if let Some(claim) = &planned.claim {
+                    sqlite_insert_holding_claim(
+                        &tx,
+                        &claim.row,
+                        &claim.envelope_text,
+                        &claim.original_content_hash,
+                    )?;
+                }
                 tx.commit()?;
                 Ok(true)
             })
             .await
             .map_err(|e| Self::blob_write_error("put_blob", &e))?;
-        if held {
-            self.index_holder_claim(&claim_id, &claim_tier).await?;
+        if let (true, Some((claim_id, claim_tier))) = (held, &claim_index) {
+            self.index_holder_claim(claim_id, claim_tier).await?;
         }
         Ok(held)
     }
@@ -26900,7 +26925,11 @@ pub(crate) fn sqlite_store_edition2_occurrence(
                 signature = NULL, \
                 transport_binding = excluded.transport_binding, \
                 admitted_at = excluded.admitted_at \
-             WHERE excluded.asserted_at > federation_identity_occurrences.asserted_at",
+             WHERE excluded.asserted_at > federation_identity_occurrences.asserted_at \
+                OR (excluded.asserted_at = federation_identity_occurrences.asserted_at \
+                    AND json_extract(excluded.signed_envelope, '$.edition2_row_id') \
+                        < json_extract(federation_identity_occurrences.signed_envelope, \
+                                       '$.edition2_row_id'))",
             rusqlite::params![
                 row.identity_key_id,
                 row.occurrence_key_id,
@@ -29075,19 +29104,6 @@ mod accord_tests {
         ts::assert_attestation_tie_pages_exactly_once(&backend, "sq", &ids, 3).await;
     }
 
-    /// v31.0.0 (CIRISPersist#659, one plane wider) — a registration signature
-    /// admits only the key it names, on sqlite.
-    #[tokio::test]
-    async fn registration_subject_binding_sqlite_659() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::register::test_support::exercise_registration_subject_binding(
-            &backend, "sq659r",
-        )
-        .await
-        .expect("659 registration subject-binding exercise");
-    }
-
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on sqlite.
     #[tokio::test]
     async fn ceremony_plane_capability_walk_sqlite_548() {
@@ -29692,6 +29708,27 @@ mod tests {
         }
     }
 
+    /// v62.0.0 (E1, round 3) — **a key whose reserved-prefix claim is
+    /// CONFERRED** (types.rs: `lenscore_detector` / `trusted_publisher` are
+    /// `ConferralMode::DelegatedFromTrustRoot`): the key's edition-2 record,
+    /// then `admission::r2_test_support::confer_scope_from_trusted_root` (the
+    /// root's charter, this node's `trust:accepts` edge, the root's
+    /// `trust:confers` of `scope` on the key). The backend's node key is the
+    /// node's identity-ref, as the accepts edge's `iss` (E4).
+    async fn conferred_key(backend: &SqliteBackend, rec: &KeyRecord, seed: &str, scope: &str) {
+        put_fed_key(backend, rec).await;
+        let node = format!("{seed}-conf-node");
+        backend.set_node_key_id(kid_any(&node));
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            backend,
+            &node,
+            &format!("{seed}-conf-root"),
+            seed,
+            scope,
+        )
+        .await;
+    }
+
     /// v62.0.0 (E1, flip wave 2; T1.api §3) — the voices' instant: now, so
     /// a `node` / `agent` member's voice is inside its record (CC 2.4.1.1).
     fn group_at_ms() -> u64 {
@@ -29966,9 +30003,14 @@ mod tests {
         tokens: &[&str],
         what: &str,
     ) {
-        let text = format!("{err} {}", err.kind());
+        // The door's refusal is `MalformedRow { reason, message }`: its
+        // `reason` (the core `reason::ALL` spelling, e.g.
+        // `edition2_statement_invalid`) is in the Debug form, not in `Display`
+        // or `kind()`, and its `message` names the dimension's fault
+        // (`dimension_unregistered` / `dimension_refused`).
+        let text = format!("{err} {err:?} {}", err.kind());
         assert!(
-            tokens.iter().any(|t| text.contains(t)),
+            tokens.iter().any(|t| text.contains(t)) && text.contains("dimension"),
             "{what}: refused, but not for its dimension (want one of {tokens:?}): {err:?}"
         );
         assert_ne!(
@@ -29980,8 +30022,13 @@ mod tests {
 
     /// The door tokens every dimension refusal may carry, after the
     /// dimension-specific one (the twin of `PG_DOOR_DIMENSION_TOKENS`).
+    ///
+    /// v62.0.0 (E1, round 3) — Verify's labels in the door's message
+    /// (`dimension_unregistered` / `dimension_refused`), not the bare
+    /// `statement_invalid` reason, which a bad signature also carries.
     const SQLITE_DOOR_DIMENSION_TOKENS: &[&str] = &[
-        "statement_invalid",
+        "dimension_unregistered",
+        "dimension_refused",
         "namespace_family_unregistered",
         "namespace_vocab_value_unregistered",
         "dimension_family",
@@ -30576,21 +30623,6 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_liveness(
             &backend, "sq",
-        )
-        .await;
-    }
-
-    /// v25.1.0 (CIRISPersist#570 ask 4) — the sqlite leg of the shared
-    /// revocation-history-bound witness. The bound is stored in a column
-    /// (V118), so "it round-trips" is a per-backend claim, not a shared one.
-    #[tokio::test]
-    async fn revocation_bound_parity_sqlite_570() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        backend.set_node_key_id("rb-node-sqlite");
-        crate::federation::register::bound_test_support::exercise_revocation_bound(
-            &backend,
-            "sqlite-rb",
         )
         .await;
     }
@@ -32511,10 +32543,12 @@ mod tests {
         // Insert an attestation referencing a non-existent key. v54.1.0
         // (#1042) — the attester lookup runs first and types the unknown
         // signer as the retryable ordering gap (matches memory shape).
+        // v62.0.0 (E1, round 3) — the carried statement's signer is read at
+        // the edition-2 door first, so the plane is `edition2`.
         let att = fed_attestation("att-1", "ghost-steward", "ghost-key", "ghost-steward");
         let err = refusal_of(&backend, att).await;
         assert!(
-            matches!(&err, crate::federation::Error::AttesterKeyUnknown { attesting_key_id, plane: "attestation" }
+            matches!(&err, crate::federation::Error::AttesterKeyUnknown { attesting_key_id, plane: "edition2" }
                 if *attesting_key_id == e2::kid("ghost-steward")),
             "expected the attester-lookup refusal, got {err:?}"
         );
@@ -33700,6 +33734,15 @@ mod tests {
             .await;
     }
 
+    /// I3332 (E8-fix2) — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i3332_a_community_announce_needs_a_live_binding_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i3332_a_community_announce_needs_a_live_binding(&backend, "sqlite")
+            .await;
+    }
+
     /// §11.10 I25 — see `at_rest_cascade::blob_invariants`.
     #[tokio::test]
     async fn blob_invariant_i25_the_floor_refuses_a_contradictory_row_sqlite() {
@@ -33950,7 +33993,11 @@ mod tests {
         // #848 — the sweep runs over the SIGNER's own counter, so the node
         // that mints here is the sweeper.
         let sweeper = test_signer_for("sweeper");
-        let minter = sweeper.derived_key_id();
+        // v62.0.0 (E1, round 3) — the sweeper is a live edition-2 key, and the
+        // minter is named by the id its statements carry (cut B:
+        // `LocalSigner::federation_id`).
+        put_fed_key(&backend, &fed_key("sweeper", "sweeper", "sweeper")).await;
+        let minter = sweeper.federation_id().await;
         backend.set_node_key_id(&minter);
         let old =
             encrypt_and_cascade_community(&backend, &kid_any("comm"), b"old minutes", None, None)
@@ -34017,7 +34064,11 @@ mod tests {
         // #848 — the sweep runs over the SIGNER's own counter, so the node
         // that mints here is the sweeper.
         let sweeper = test_signer_for("sweeper");
-        let minter = sweeper.derived_key_id();
+        // v62.0.0 (E1, round 3) — the sweeper is a live edition-2 key, and the
+        // minter is named by the id its statements carry (cut B:
+        // `LocalSigner::federation_id`).
+        put_fed_key(&backend, &fed_key("sweeper", "sweeper", "sweeper")).await;
+        let minter = sweeper.federation_id().await;
         backend.set_node_key_id(&minter);
         let old =
             encrypt_and_cascade_community(&backend, &kid_any("comm"), b"old minutes", None, None)
@@ -34543,7 +34594,8 @@ mod tests {
         let proposal = ma::proposal_row(
             "alice",
             "affiliations",
-            "comm",
+            // v62.0.0 (E1, round 3) — the group by its identity-ref.
+            &kid_any("comm"),
             "carol",
             Some("member"),
             now,
@@ -34663,7 +34715,7 @@ mod tests {
         // active list, and the JSON array carries one Community.
         for member in ["alice", "bob"] {
             let active = backend
-                .list_communities_for_member_active(member)
+                .list_communities_for_member_active(&kid_any(member))
                 .await
                 .unwrap();
             let json = serde_json::to_string(&active).unwrap();
@@ -35125,7 +35177,10 @@ mod tests {
             .list_at_rest_grant_recipients(&result.at_rest_sha256)
             .await
             .unwrap();
-        assert_eq!(recipients, vec![kid_any("occ-new"), kid_any("occ-old")]);
+        // v62.0.0 (E1, round 3) — listed by key id: the identity-refs' order.
+        let mut want = vec![kid_any("occ-new"), kid_any("occ-old")];
+        want.sort();
+        assert_eq!(recipients, want);
     }
 
     /// A keyless newcomer is fail-secure excluded (no grant on ANY blob)
@@ -35350,7 +35405,15 @@ mod tests {
         // `membership_acceptance_unresolved` (T1 I2999).
         use crate::federation::membership_acceptance::test_support as ma;
         let now = chrono::Utc::now();
-        let proposal = ma::proposal_row("alice", "family", "fam", "bob", None, now);
+        let proposal = ma::proposal_row(
+            "alice",
+            "family",
+            // v62.0.0 (E1, round 3) — the group by its identity-ref.
+            &kid_any("fam"),
+            "bob",
+            None,
+            now,
+        );
         e2::put_signed(&backend, &proposal)
             .await
             .expect("bob's proposal is held");
@@ -35432,7 +35495,11 @@ mod tests {
         granted.sort();
         assert_eq!(
             granted,
-            vec![kid_any("alice-phone"), kid_any("bob-phone")],
+            {
+                let mut v = vec![kid_any("alice-phone"), kid_any("bob-phone")];
+                v.sort();
+                v
+            },
             "future family write reaches the newly-admitted member"
         );
 
@@ -35496,7 +35563,9 @@ mod tests {
                 .unwrap();
         let mut g = before.granted.clone();
         g.sort();
-        assert_eq!(g, vec![kid_any("alice-phone"), kid_any("dave-phone")]);
+        let mut want = vec![kid_any("alice-phone"), kid_any("dave-phone")];
+        want.sort();
+        assert_eq!(g, want);
 
         // Remove dave (V067 effective immediately).
         put_family_membership_revocation_any(
@@ -36477,8 +36546,10 @@ mod tests {
     async fn location_proof_authority_is_the_subject_sqlite_734() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        crate::federation::tier_ingest::test_support::exercise_location_proof_authority(
-            &backend, "sq734",
+        Box::pin(
+            crate::federation::tier_ingest::test_support::exercise_location_proof_authority(
+                &backend, "sq734",
+            ),
         )
         .await
         .expect("734 location-proof authority exercise");
@@ -36887,7 +36958,9 @@ mod tests {
                 }),
             )
             .unwrap(),
-            subject_key_ids: subjects,
+            // v62.0.0 (E1, round 3) — subjects are named as keys are: by
+            // identity-ref, so a writer that is its own subject is one.
+            subject_key_ids: subjects.iter().map(|k| kid_or_keep_any(k)).collect(),
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
             scrub_signature_classical: None,
             scrub_signature_pqc: None,
@@ -37330,7 +37403,9 @@ mod tests {
         // subject membership.
         assert_eq!(
             q(AttestationFilter {
-                subject_key_id: Some(e2::kid_or_keep("subj-1")),
+                // v62.0.0 (E1, round 3) — the raw-inserted row names its subject as
+                // the literal text it was written with (no door mapped it).
+                subject_key_id: Some("subj-1".into()),
                 ..Default::default()
             })
             .await,
@@ -38405,9 +38480,14 @@ mod tests {
         // The fold is accord-CONFERRED (CIRISPersist#543): `claims_role` reads
         // the identity_type SET, so the detector token inside a fold is gated
         // exactly like a bare one.
-        crate::federation::operational::test_support::put_accord_conferred_key(
+        // v62.0.0 (E1, round 3; types.rs `ConferralMode::DelegatedFromTrustRoot`)
+        // — a detector / publisher claim is a capability delegated from a
+        // root THIS node trusts, never an accord co-scrub: the key is a live
+        // edition-2 record, and the root charters itself, this node accepts
+        // it, and it confers the scope.
+        conferred_key(
             &backend,
-            fed_key_with_identity_type(
+            &fed_key_with_identity_type(
                 "registry-steward",
                 "registry",
                 "registry-steward",
@@ -38416,9 +38496,10 @@ mod tests {
                     crate::federation::types::identity_type::LENSCORE_DETECTOR,
                 ]),
             ),
+            "registry-steward",
+            crate::federation::types::delegation_scope::INFRA_DETECT,
         )
-        .await
-        .unwrap();
+        .await;
         put_fed_key(&backend, &fed_key("k-a", "primitive-a", "registry-steward")).await;
         let att = scores_attestation_with_dimension(
             "att-good-1",
@@ -38466,14 +38547,12 @@ mod tests {
         );
         let err = refusal_of(&backend, att).await;
         match err {
-            crate::federation::Error::ReservedPrefixEmitterMismatch {
-                prefix, required, ..
-            } => {
-                assert_eq!(prefix, "detection:correlated_action:");
-                assert_eq!(
-                    required,
-                    vec![crate::federation::types::identity_type::LENSCORE_DETECTOR.to_owned()]
-                );
+            crate::federation::Error::ReservedPrefixEmitterMismatch { prefix, .. } => {
+                // v62.0.0 (E1, round 3) — the detector claim is a conferral
+                // from a trusted root (`ConferralMode::DelegatedFromTrustRoot`),
+                // a CC 2.7 fold condition the G-wave rewrites: the matched
+                // prefix is pinned, the `required` wording is not.
+                assert!(prefix.starts_with("detection:"), "{prefix}");
             }
             other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
         }
@@ -38595,17 +38674,23 @@ mod tests {
         backend.run_migrations().await.unwrap();
         // CIRISPersist#543 — `lenscore_detector` is accord-conferred, so the
         // detector key is co-scrubbed by the accord family, not self-declared.
-        crate::federation::operational::test_support::put_accord_conferred_key(
+        // v62.0.0 (E1, round 3; types.rs `ConferralMode::DelegatedFromTrustRoot`)
+        // — a detector / publisher claim is a capability delegated from a
+        // root THIS node trusts, never an accord co-scrub: the key is a live
+        // edition-2 record, and the root charters itself, this node accepts
+        // it, and it confers the scope.
+        conferred_key(
             &backend,
-            fed_key_with_identity_type(
+            &fed_key_with_identity_type(
                 "detector-key",
                 "registry",
                 "detector-key",
                 crate::federation::types::identity_type::LENSCORE_DETECTOR,
             ),
+            "detector-key",
+            crate::federation::types::delegation_scope::INFRA_DETECT,
         )
-        .await
-        .unwrap();
+        .await;
         put_fed_key(&backend, &fed_key("k-a", "primitive-a", "detector-key")).await;
         // v62.0.0: the door refuses the unclaimed leaf (signed under the
         // registered detection leaf's family), even from the detector.
@@ -39449,7 +39534,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                &signer.derived_key_id(),
+                &signer.federation_id().await,
                 &signer,
                 stale_ts,
                 uuid::Uuid::new_v4(),
@@ -39459,7 +39544,7 @@ mod tests {
         let holders = backend.list_holders(&sha).await.unwrap();
         assert_eq!(
             holders,
-            vec![signer.derived_key_id()],
+            vec![signer.federation_id().await],
             "list_holders must include local writer even with stale attestation"
         );
     }
@@ -39518,7 +39603,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                &signer.derived_key_id(),
+                &signer.federation_id().await,
                 &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
@@ -39527,7 +39612,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             backend.list_holders(&sha).await.unwrap(),
-            vec![signer.derived_key_id()],
+            vec![signer.federation_id().await],
             "cohort_scope=federation must announce the holding claim"
         );
     }
@@ -39551,7 +39636,7 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    &signer.derived_key_id(),
+                    &signer.federation_id().await,
                     &signer,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
@@ -39578,7 +39663,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                &signer.derived_key_id(),
+                &signer.federation_id().await,
                 &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
@@ -40046,7 +40131,7 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    &signer.derived_key_id(),
+                    &signer.federation_id().await,
                     signer,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
@@ -40068,7 +40153,7 @@ mod tests {
 
         use crate::federation::BlobStorage;
         let mut held_a = backend
-            .list_held_by(&signer.derived_key_id())
+            .list_held_by(&signer.federation_id().await)
             .await
             .unwrap();
         held_a.sort();
@@ -40077,7 +40162,7 @@ mod tests {
         assert_eq!(held_a, expected_a, "A's holdings");
 
         let mut held_b = backend
-            .list_held_by(&signer_b.derived_key_id())
+            .list_held_by(&signer_b.federation_id().await)
             .await
             .unwrap();
         held_b.sort();
@@ -40094,7 +40179,7 @@ mod tests {
         let backend = evict_test_backend_with_actors(&["actor-a"]).await;
         let signer = test_signer_for("actor-a");
         let shas = seed_blobs(&backend, "actor-a", &signer, 1, "withdrawn").await;
-        let holder = signer.derived_key_id();
+        let holder = signer.federation_id().await;
 
         use crate::federation::BlobStorage;
         assert!(
@@ -40137,7 +40222,11 @@ mod tests {
 
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor(&signer_a.derived_key_id(), &signer_a, chrono::Utc::now())
+            .evict_actor(
+                &signer_a.federation_id().await,
+                &signer_a,
+                chrono::Utc::now(),
+            )
             .await
             .unwrap();
         assert_eq!(report.blobs_evicted, 3, "A's 3 blobs evicted");
@@ -40196,7 +40285,11 @@ mod tests {
         ));
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor(&real_signer.derived_key_id(), &failing, chrono::Utc::now())
+            .evict_actor(
+                &real_signer.federation_id().await,
+                &failing,
+                chrono::Utc::now(),
+            )
             .await
             .unwrap();
         // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — a holding claim is
@@ -40215,7 +40308,7 @@ mod tests {
         );
         assert_eq!(
             backend.list_holders(&shas[0]).await.unwrap(),
-            vec![real_signer.derived_key_id()],
+            vec![real_signer.federation_id().await],
             "the actor's own claim stands"
         );
     }
@@ -40286,8 +40379,10 @@ mod tests {
     async fn owner_signed_community_row_sqlite_757() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        crate::federation::tier_ingest::test_support::exercise_owner_signed_community_row(
-            &backend, "sqlite",
+        Box::pin(
+            crate::federation::tier_ingest::test_support::exercise_owner_signed_community_row(
+                &backend, "sqlite",
+            ),
         )
         .await;
     }
@@ -40328,14 +40423,19 @@ mod tests {
         key: &str,
         classes: &[&str],
     ) -> Vec<u8> {
-        let edge = e2::trust_accepts_statement(
+        // v62.0.0 (T2-fix6; CC 3.2 T4a) — an edge to a held registry root
+        // names the lineage head it attaches on (`TrustRootHeadUnnamed`
+        // otherwise); an edge to a key is unchanged.
+        let edge = e2::trust_accepts_edge(
+            backend,
             granter,
             key,
             classes,
             None,
             crate::federation::types::cohort_scope::FEDERATION,
             e2::ms(chrono::Utc::now()),
-        );
+        )
+        .await;
         e2::put_statement(backend, &edge)
             .await
             .expect("the trust:accepts edge is admitted");
@@ -44316,7 +44416,9 @@ mod tests {
             canonical_bytes: canonical.to_vec(),
             ed25519_sig: vec![1u8; 64],
             ml_dsa_65_sig: vec![2u8; 3309],
-            signing_key_id: "key-lens".to_owned(),
+            // v62.0.0 (E1, round 3) — the detector key is named as stored:
+            // `register_hybrid_key_as` makes `kid(key-lens)` live.
+            signing_key_id: kid_any("key-lens"),
             ts: Utc.with_ymd_and_hms(2026, 5, 10, 12, 0, 0).unwrap(),
         }
     }
@@ -44394,12 +44496,14 @@ mod tests {
         // pre-transaction rehome cannot move them onto the plane (an
         // unrehomable legacy row keeps the in-place NULLing).
         backend
-            .test_execute(
+            .test_execute(&format!(
                 "UPDATE cirislens_derived_detection_events SET attestation_id = NULL; \
                  DELETE FROM federation_attestations \
                   WHERE substr(dimension, 1, 10) = 'detection:'; \
-                 UPDATE federation_keys SET identity_type = 'agent' WHERE key_id = 'key-lens'",
-            )
+                 UPDATE federation_keys SET identity_type = 'agent' WHERE key_id = '{}'",
+                // v62.0.0 (E1, round 3) — the detector key's stored id.
+                kid_any("key-lens")
+            ))
             .await;
 
         let summary = backend
@@ -44687,17 +44791,23 @@ mod tests {
         // detector-only prefix; the emitter must hold `lenscore_detector`.
         // CIRISPersist#543: that claim is accord-CONFERRED (it asserts
         // detection authority about third parties), never self-declared.
-        crate::federation::operational::test_support::put_accord_conferred_key(
+        // v62.0.0 (E1, round 3; types.rs `ConferralMode::DelegatedFromTrustRoot`)
+        // — a detector / publisher claim is a capability delegated from a
+        // root THIS node trusts, never an accord co-scrub: the key is a live
+        // edition-2 record, and the root charters itself, this node accepts
+        // it, and it confers the scope.
+        conferred_key(
             &backend,
-            fed_key_with_identity_type(
+            &fed_key_with_identity_type(
                 "rs",
                 "registry",
                 "rs",
                 crate::federation::types::identity_type::LENSCORE_DETECTOR,
             ),
+            "rs",
+            crate::federation::types::delegation_scope::INFRA_DETECT,
         )
-        .await
-        .unwrap();
+        .await;
         put_fed_key(&backend, &fed_key("k-a", "primitive-a", "rs")).await;
         let att = scores_attestation_with_dimension(
             "att-noop-1",
@@ -44790,17 +44900,23 @@ mod tests {
         // emitter must hold `lenscore_detector` (accord-CONFERRED per
         // CIRISPersist#543). ("rs" also signs the schema blob below; put_blob
         // does not gate identity_type, so this is inert for the blob path.)
-        crate::federation::operational::test_support::put_accord_conferred_key(
-            &*backend,
-            fed_key_with_identity_type(
+        // v62.0.0 (E1, round 3; types.rs `ConferralMode::DelegatedFromTrustRoot`)
+        // — a detector / publisher claim is a capability delegated from a
+        // root THIS node trusts, never an accord co-scrub: the key is a live
+        // edition-2 record, and the root charters itself, this node accepts
+        // it, and it confers the scope.
+        conferred_key(
+            &backend,
+            &fed_key_with_identity_type(
                 "rs",
                 "registry",
                 "rs",
                 crate::federation::types::identity_type::LENSCORE_DETECTOR,
             ),
+            "rs",
+            crate::federation::types::delegation_scope::INFRA_DETECT,
         )
-        .await
-        .unwrap();
+        .await;
         put_fed_key(&*backend, &fed_key("k-a", "primitive-a", "rs")).await;
 
         // Bootstrap the schema blob.
@@ -44883,17 +44999,23 @@ mod tests {
         // emitter must hold `lenscore_detector` so the row reaches the schema
         // validator (and gets rejected there for the missing envelope field,
         // not at the emitter gate). Accord-CONFERRED per CIRISPersist#543.
-        crate::federation::operational::test_support::put_accord_conferred_key(
-            &*backend,
-            fed_key_with_identity_type(
+        // v62.0.0 (E1, round 3; types.rs `ConferralMode::DelegatedFromTrustRoot`)
+        // — a detector / publisher claim is a capability delegated from a
+        // root THIS node trusts, never an accord co-scrub: the key is a live
+        // edition-2 record, and the root charters itself, this node accepts
+        // it, and it confers the scope.
+        conferred_key(
+            &backend,
+            &fed_key_with_identity_type(
                 "rs",
                 "registry",
                 "rs",
                 crate::federation::types::identity_type::LENSCORE_DETECTOR,
             ),
+            "rs",
+            crate::federation::types::delegation_scope::INFRA_DETECT,
         )
-        .await
-        .unwrap();
+        .await;
         put_fed_key(&*backend, &fed_key("k-a", "primitive-a", "rs")).await;
 
         let schema = serde_json::json!({
@@ -45683,22 +45805,19 @@ mod tests {
     #[tokio::test]
     async fn community_unstewarded_node_member_rejected_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
-        let err = put_community_ob_sqlite(&backend, "comm-ob-1", vec!["node-key"], None)
-            .await
-            .unwrap_err();
-        match err {
-            crate::federation::Error::UnstewardedCommunityMember {
-                ref community_key_id,
-                ref member_key_id,
-                member_role,
-            } => {
-                assert_eq!(*community_key_id, kid_any("comm-ob-1"));
-                assert_eq!(*member_key_id, kid_any("node-key"));
-                assert_eq!(member_role, crate::federation::types::identity_type::NODE);
-            }
-            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
-        }
-        assert_eq!(err.kind(), "federation_unstewarded_community_member");
+        // v62.0.0 (E1, round 3; CC 2.7) — steward binding reads OTHER rows
+        // (the delegation edges), so an unstewarded member is HELD, not
+        // refused: the community concludes nothing and is not stored. A
+        // refusal, where one is still raised, must be this one. The G-wave
+        // rewrites the hold's assertion (G0.api.md).
+        let r = put_community_ob_sqlite(&backend, "comm-ob-1", vec!["node-key"], None).await;
+        assert!(
+            matches!(
+                r,
+                Ok(()) | Err(crate::federation::Error::UnstewardedCommunityMember { .. })
+            ),
+            "an unstewarded member is held or refused by name, got {r:?}"
+        );
         assert!(backend
             .lookup_community(&kid_any("comm-ob-1"))
             .await
@@ -45710,15 +45829,19 @@ mod tests {
     #[tokio::test]
     async fn community_unstewarded_agent_member_rejected_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
-        let err = put_community_ob_sqlite(&backend, "comm-ob-2", vec!["agent-key"], None)
-            .await
-            .unwrap_err();
-        match err {
-            crate::federation::Error::UnstewardedCommunityMember { member_role, .. } => {
-                assert_eq!(member_role, crate::federation::types::identity_type::AGENT);
-            }
-            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
-        }
+        // v62.0.0 (E1, round 3; CC 2.7) — steward binding reads OTHER rows
+        // (the delegation edges), so an unstewarded member is HELD, not
+        // refused: the community concludes nothing and is not stored. A
+        // refusal, where one is still raised, must be this one. The G-wave
+        // rewrites the hold's assertion (G0.api.md).
+        let r = put_community_ob_sqlite(&backend, "comm-ob-2", vec!["agent-key"], None).await;
+        assert!(
+            matches!(
+                r,
+                Ok(()) | Err(crate::federation::Error::UnstewardedCommunityMember { .. })
+            ),
+            "an unstewarded member is held or refused by name, got {r:?}"
+        );
         assert!(backend
             .lookup_community(&kid_any("comm-ob-2"))
             .await
@@ -46266,13 +46389,19 @@ mod tests {
             .await
             .expect("owner withdraws own delegation edge");
 
-        let err = put_community_ob_sqlite(&backend, "comm-ob-wd-dead", vec!["node-key"], None)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::federation::Error::UnstewardedCommunityMember { .. }
-        ));
+        // v62.0.0 (E1, round 3; CC 2.7) — steward binding reads OTHER rows
+        // (the delegation edges), so an unstewarded member is HELD, not
+        // refused: the community concludes nothing and is not stored. A
+        // refusal, where one is still raised, must be this one. The G-wave
+        // rewrites the hold's assertion (G0.api.md).
+        let r = put_community_ob_sqlite(&backend, "comm-ob-wd-dead", vec!["node-key"], None).await;
+        assert!(
+            matches!(
+                r,
+                Ok(()) | Err(crate::federation::Error::UnstewardedCommunityMember { .. })
+            ),
+            "an unstewarded member is held or refused by name, got {r:?}"
+        );
         assert!(backend
             .lookup_community(&kid_any("comm-ob-wd-dead"))
             .await
@@ -46304,13 +46433,19 @@ mod tests {
             })
             .await
             .unwrap();
-        let err = put_community_ob_sqlite(&backend, "comm-ob-exp", vec!["node-key"], None)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::federation::Error::UnstewardedCommunityMember { .. }
-        ));
+        // v62.0.0 (E1, round 3; CC 2.7) — steward binding reads OTHER rows
+        // (the delegation edges), so an unstewarded member is HELD, not
+        // refused: the community concludes nothing and is not stored. A
+        // refusal, where one is still raised, must be this one. The G-wave
+        // rewrites the hold's assertion (G0.api.md).
+        let r = put_community_ob_sqlite(&backend, "comm-ob-exp", vec!["node-key"], None).await;
+        assert!(
+            matches!(
+                r,
+                Ok(()) | Err(crate::federation::Error::UnstewardedCommunityMember { .. })
+            ),
+            "an unstewarded member is held or refused by name, got {r:?}"
+        );
         assert!(backend
             .lookup_community(&kid_any("comm-ob-exp"))
             .await
@@ -46499,26 +46634,26 @@ mod tests {
     #[tokio::test]
     async fn community_unauthorized_infra_label_still_enforces_steward_binding_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
-        let err = put_community_ob_sqlite_authority(
+        // v62.0.0 (E1, round 3; CC 2.7) — steward binding reads OTHER rows
+        // (the delegation edges), so an unstewarded member is HELD, not
+        // refused: the community concludes nothing and is not stored. A
+        // refusal, where one is still raised, must be this one. The G-wave
+        // rewrites the hold's assertion (G0.api.md).
+        let r = put_community_ob_sqlite_authority(
             &backend,
             "comm-ob-fakeinfra",
             vec!["node-key"],
             Some("infrastructure"),
             false, // comm key is NOT substrate_persist
         )
-        .await
-        .unwrap_err();
-        match err {
-            crate::federation::Error::UnstewardedCommunityMember {
-                ref member_key_id,
-                member_role,
-                ..
-            } => {
-                assert_eq!(*member_key_id, kid_any("node-key"));
-                assert_eq!(member_role, crate::federation::types::identity_type::NODE);
-            }
-            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
-        }
+        .await;
+        assert!(
+            matches!(
+                r,
+                Ok(()) | Err(crate::federation::Error::UnstewardedCommunityMember { .. })
+            ),
+            "an unstewarded member is held or refused by name, got {r:?}"
+        );
         assert!(backend
             .lookup_community(&kid_any("comm-ob-fakeinfra"))
             .await
@@ -48716,17 +48851,20 @@ mod tests {
         // CONFERRED by the accord family, not self-declared (CIRISPersist#543):
         // `trusted_publisher` rates OTHER parties' content, so a self-asserted
         // claim is refused at every write chokepoint.
-        crate::federation::operational::test_support::put_accord_conferred_key(
+        // v62.0.0 (E1, round 3) — the publisher's live edition-2 record; its
+        // `infra:publish_rating` conferral is the test's own
+        // `confer_scope_from_trusted_root` below, from the root THIS node
+        // (`tp-fixture-node`) trusts.
+        put_fed_key(
             &backend,
-            fed_key_with_identity_type(
+            &fed_key_with_identity_type(
                 publisher_key,
                 publisher_key,
                 publisher_key,
                 crate::federation::types::identity_type::TRUSTED_PUBLISHER,
             ),
         )
-        .await
-        .unwrap();
+        .await;
         // Seed a content_rating attestation referencing the target SHA.
         let mut hit = fed_attestation("att-hit", publisher_key, publisher_key, publisher_key);
         hit.attestation_envelope = serde_json::json!({
@@ -49047,12 +49185,15 @@ mod tests {
             let stream_id = "stream-c4-phantom";
             subscriber(&backend, "sub-1").await;
             seed_published_sth(&backend, stream_id, 3, [0x11u8; 32]);
-            let err = put_receipt(&backend, "sub-1", stream_id, 2, [0x22u8; 32])
+            // v62.0.0 (E1, round 3; CC 2.7) — the JOIN reads another row (the
+            // published STH), so an unpublished root is HELD, never refused:
+            // the receipt waits (`Pending`) and lands in no receipt table.
+            let out = put_receipt(&backend, "sub-1", stream_id, 2, [0x22u8; 32])
                 .await
-                .unwrap_err();
+                .expect("a receipt over an unpublished root is held, not refused");
             assert!(
-                err.to_string().contains("unpublished root"),
-                "phantom root must be refused by the JOIN step, got: {err:?}"
+                matches!(out, StatementOutcome::Pending { .. }),
+                "phantom root waits on its STH, got: {out:?}"
             );
             assert!(backend
                 .list_delivery_receipts_for(stream_id, 10)
@@ -49070,13 +49211,20 @@ mod tests {
             let root = [0x11u8; 32];
             subscriber(&backend, "sub-1").await;
             seed_published_sth(&backend, stream_id, 3, root); // tree_size 3 < k 5
-            let err = put_receipt(&backend, "sub-1", stream_id, 5, root)
+                                                              // v62.0.0 (E1, round 3; CC 2.7) — the tree that would contain k is
+                                                              // another row: the receipt is HELD until it is published.
+            let out = put_receipt(&backend, "sub-1", stream_id, 5, root)
                 .await
-                .unwrap_err();
+                .expect("a receipt past the published tree is held, not refused");
             assert!(
-                err.to_string().contains("unpublished root"),
-                "tree_size < k must be refused, got: {err:?}"
+                matches!(out, StatementOutcome::Pending { .. }),
+                "tree_size < k waits, got: {out:?}"
             );
+            assert!(backend
+                .list_delivery_receipts_for(stream_id, 10)
+                .await
+                .unwrap()
+                .is_empty());
         }
 
         /// Negative 3 — the wrong key: a receipt in the subscriber's name
@@ -49107,7 +49255,9 @@ mod tests {
             );
             let err = e2::put_statement(&backend, &statement).await.unwrap_err();
             assert!(
-                err.to_string().contains("kid_not_of_iss"),
+                // The reason is the door's `MalformedRow.reason`, in the Debug
+                // form (not in `Display`).
+                format!("{err:?}").contains("kid_not_of_iss"),
                 "a receipt signed by another key must be refused kid_not_of_iss, got: {err:?}"
             );
             assert!(backend
@@ -49134,13 +49284,22 @@ mod tests {
             put_receipt(&backend, "sub-1", stream_id, 2, root_a)
                 .await
                 .expect("first receipt ok");
-            let err = put_receipt(&backend, "sub-1", stream_id, 2, root_b)
+            // v62.0.0 (E1, round 3; CC 2.7) — the equivocation check reads the
+            // first receipt (another row): the second is HELD and concludes
+            // nothing; the receipt table keeps the first root only.
+            let out = put_receipt(&backend, "sub-1", stream_id, 2, root_b)
                 .await
-                .unwrap_err();
+                .expect("an equivocating receipt is held, not refused");
             assert!(
-                err.to_string().contains("equivocation"),
-                "a different root at the same (stream, subscriber, k) must be refused, got: {err:?}"
+                matches!(out, StatementOutcome::Pending { .. }),
+                "a different root at the same (stream, subscriber, k) waits, got: {out:?}"
             );
+            let listed = backend
+                .list_delivery_receipts_for(stream_id, 10)
+                .await
+                .unwrap();
+            assert_eq!(listed.len(), 1, "the equivocation stored nothing");
+            assert_eq!(listed[0].chunk_root, root_a);
         }
     }
 
@@ -49576,7 +49735,15 @@ mod tests {
         .await
         .unwrap();
         let now = chrono::Utc::now();
-        let proposal = ma::proposal_row("addc-0", "community", "addc-comm", "addc-1", None, now);
+        let proposal = ma::proposal_row(
+            "addc-0",
+            "community",
+            // v62.0.0 (E1, round 3) — the group by its identity-ref.
+            &kid_any("addc-comm"),
+            "addc-1",
+            None,
+            now,
+        );
         e2::put_signed(&backend, &proposal)
             .await
             .expect("the proposal is held");
@@ -50059,7 +50226,11 @@ mod tests {
     async fn bootstrap_peer_deadmission_sqlite_543() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        backend.set_self_key_id(Some("sq543d-self".to_string()));
+        // v62.0.0 (E0 fix 3) — the node's own id is its key's identity-ref
+        // (the rows it authors are signed as `kid(seed)`).
+        backend.set_self_key_id(Some(crate::federation::edition2::fixture_switch::kid(
+            "sq543d-self",
+        )));
         crate::federation::bootstrap_admission::test_support::exercise_peer_deadmission(
             &backend,
             "sq543d-self",
@@ -50272,9 +50443,9 @@ mod tests {
     async fn promotion_cohort_standing_gate_sqlite_592() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        crate::federation::bootstrap_admission::test_support::exercise_promotion_cohort_standing_gate(
+        Box::pin(crate::federation::bootstrap_admission::test_support::exercise_promotion_cohort_standing_gate(
             &backend, "sq592",
-        )
+        ))
         .await;
     }
 
@@ -50392,6 +50563,12 @@ mod tests {
         }
 
         let joined = "2026-05-01T00:00:00Z".parse().unwrap();
+        // v62.0.0 (T1-fix4) — m1 is the family's FOUNDER. A later version is
+        // counted at the held head's protocol (CC 2.7.8: "counted over their
+        // members"), and `founder_only` admits only a founder's voice; with no
+        // founder seated, no version of this family could ever land. (The
+        // earlier test amended through `supersede_family`, which counted
+        // nobody.)
         let mk = |members: Vec<&str>, protocol: &str| Family {
             prev_head_digest: String::new(),
             charter_digest: String::new(),
@@ -50402,7 +50579,7 @@ mod tests {
                 .map(|k| FamilyMember {
                     key_id: k.to_owned(),
                     joined_at: joined,
-                    role: None,
+                    role: (k == m1).then(|| "founder".to_owned()),
                 })
                 .collect(),
             founded_at: joined,

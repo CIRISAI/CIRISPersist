@@ -156,9 +156,35 @@ pub async fn occurrence_revocation_voice<D: crate::federation::FederationDirecto
     } else {
         voices.iter().map(|v| kid_or_keep(v)).collect()
     };
-    let cites = super::typed::eviction_cites(dir, &identity, &voice_keys)
-        .await
-        .expect("typed_fixtures: the voices' key:records and bindings are held");
+    // T2-fix5 — a voice with no binding under the identity (a stranger, a
+    // key the witness means the door to refuse) cites what is held of it:
+    // its key:record. The fixture states the row; the DOOR judges the cites
+    // (`typed::check_eviction_cites`), so a stranger's voice reaches the
+    // door's refusal instead of panicking here.
+    let mut cites = Vec::new();
+    for k in &voice_keys {
+        match super::typed::eviction_cites(dir, &identity, std::slice::from_ref(k)).await {
+            Ok(c) => cites.extend(c),
+            Err(_) => {
+                let record = dir
+                    .edition2_statements_about(
+                        ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY,
+                        k,
+                    )
+                    .await
+                    .expect("typed_fixtures: read the voice's key:records")
+                    .iter()
+                    .filter_map(|st| RowId::of_statement(st))
+                    .next()
+                    .unwrap_or_else(|| {
+                        panic!("typed_fixtures: the voice {k} has no key:record held")
+                    });
+                cites.push(record);
+            }
+        }
+    }
+    cites.sort();
+    cites.dedup();
     let p = occurrence_revocation_payload(
         &r,
         author,
@@ -371,7 +397,12 @@ pub fn cosign_statement(
         None,
         sub,
         COSIGN_PREFIX,
-        &cosign_payload(state, event, asserted_at_ms),
+        &cosign_payload(
+            &identity_ref(&thumbprint(signing_key(signer).public_key())),
+            state,
+            event,
+            asserted_at_ms,
+        ),
     )
 }
 
@@ -425,6 +456,63 @@ pub fn trust_accepts_statement(
         asserted_at_ms,
     );
     typed_statement_as(granter, "delegates_to", key, TRUST_PREFIX, &p)
+}
+
+/// v62.0.0 (T2-fix6; CC 3.2 T4a) — [`trust_accepts_statement`] as THIS
+/// directory's door reads it: an edge to a community root `dir` holds names
+/// the lineage head it attaches on (`attached_head_digest`, the held head's
+/// row hash as bytes, as W1's `fixture_trust_root::put_acceptance` states
+/// it). Without it a new labelled acceptance edge to a held root is
+/// `TrustRootHeadUnnamed`. An edge to a key (no held community) is
+/// [`trust_accepts_statement`] unchanged.
+///
+/// # Panics
+/// A directory read failure, or a held head whose row hash is not hex.
+pub async fn trust_accepts_edge<D: crate::federation::FederationDirectory + ?Sized>(
+    dir: &D,
+    granter: &str,
+    key: &str,
+    classes: &[&str],
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    cohort_scope: &str,
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    let head = dir
+        .lookup_community(&kid_or_keep(key))
+        .await
+        .expect("typed_fixtures: read the root the edge names")
+        .map(|c| {
+            hex::decode(&c.persist_row_hash)
+                .expect("typed_fixtures: the held head's row hash is hex")
+        });
+    let Some(head) = head else {
+        return trust_accepts_statement(
+            granter,
+            key,
+            classes,
+            valid_until,
+            cohort_scope,
+            asserted_at_ms,
+        );
+    };
+    let classes: Vec<String> = classes.iter().map(|c| (*c).to_owned()).collect();
+    let p = trust_accepts_payload(
+        &kid_or_keep(granter),
+        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
+        &classes,
+        valid_until.map(ms),
+        cohort_scope,
+        asserted_at_ms,
+    );
+    let Value::Map(mut m) = p else {
+        unreachable!("trust_accepts_payload is a map")
+    };
+    m.push((
+        Value::Text(crate::federation::envelope::paths::ATTACHED_HEAD_DIGEST.to_owned()),
+        Value::Bytes(head),
+    ));
+    m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+    typed_statement_as(granter, "delegates_to", key, TRUST_PREFIX, &Value::Map(m))
 }
 
 /// `granter`'s `withdraws` of its held edge `edge` to `key`: the edition-2

@@ -30,7 +30,7 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub mod bodies {
     use crate::federation::admission::steward_liveness_test_support::{
-        bare_edge_retraction, register, signed_row, store, withdraws_of,
+        register, signed_row, store,
     };
     use crate::federation::admission::{
         moderation_reach_of, moderation_reach_of_at, DELEGATION_SCOPE_MODERATE, MEMBER_ROLE_FOUNDER,
@@ -169,9 +169,14 @@ pub mod bodies {
         )
         .await;
         tick().await;
+        // v62 (E3b r3): an edition-2 `withdraws` is a composer naming its
+        // target by row id (`fx::composer_of`); the §11.10 bare
+        // edge-retraction (a withdraws carrying only `id`, no target) has no
+        // edition-2 form (`id` is not a member of the composer payload). The
+        // granter's retraction is its withdraws OF the appointment.
         let w = put(
             dir,
-            &bare_edge_retraction(&alice, &mo),
+            &fx::composer_of(attestation_type::WITHDRAWS, &e, &alice),
             "alice withdraws mo",
         )
         .await;
@@ -219,7 +224,7 @@ pub mod bodies {
         tick().await;
         let w2 = put(
             dir,
-            &withdraws_of(&mo2, &mo2, &e2.attestation_id),
+            &fx::composer_of(attestation_type::WITHDRAWS, &e2, &mo2),
             "mo2 resigns",
         )
         .await;
@@ -479,9 +484,11 @@ pub mod bodies {
             "[{tag}] I175: a widening dated before the appointment has no moderator standing: {r:?}"
         );
         tick().await;
+        // v62 (E3b r3): the granter's withdraws OF the appointment (an
+        // edition-2 composer naming its target; see gate (a) above).
         put(
             dir,
-            &bare_edge_retraction(&alice, &mo),
+            &fx::composer_of(attestation_type::WITHDRAWS, &e, &alice),
             "alice withdraws mo",
         )
         .await;

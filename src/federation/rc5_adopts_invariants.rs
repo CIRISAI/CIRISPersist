@@ -18,8 +18,7 @@ pub mod bodies {
     use crate::federation::admission::steward_liveness_test_support::signed_row;
     use crate::federation::admission::{
         self, ReachabilityVerdict, DELEGATION_SCOPE_CONSENT_REVOCATION, DELEGATION_SCOPE_MODERATE,
-        INFRA_RULE_NODE_BEARING_FOUNDER, INFRA_RULE_PROTOCOL_NOT_QUORUM,
-        MAX_MODERATION_DELEGATION_DEPTH,
+        INFRA_RULE_PROTOCOL_NOT_QUORUM, MAX_MODERATION_DELEGATION_DEPTH,
     };
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
@@ -176,6 +175,27 @@ pub mod bodies {
             .map(|_| ())
     }
 
+    /// v62.0.0 (round 3) — [`found`], keeping the door's outcome.
+    async fn found_outcome(
+        d: &dyn FederationDirectory,
+        signed: crate::federation::SignedCommunity,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, Error> {
+        e2::put_voices(d, &e2::community_voices(&signed, 1, None, now_ms())).await
+    }
+
+    /// v62.0.0 (round 3; CC 2.7.3, wave GC1) — the roster row is HELD: kept,
+    /// concluding nothing, re-folded when the founder's key plane or the
+    /// authorized roster changes. GC1 turned the node-bearing-founder and
+    /// stale-N refusals into fold holds
+    /// (`community_consensus_protocol_violation`); the reason tokens are a
+    /// G-wave's to pin.
+    fn held(r: &Result<crate::federation::edition2::ingest::StatementOutcome, Error>) -> bool {
+        matches!(
+            r,
+            Ok(crate::federation::edition2::ingest::StatementOutcome::Pending { .. })
+        )
+    }
+
     fn violation_rule(e: &Error) -> &'static str {
         match e {
             Error::CommunityConsensusProtocolViolation { rule, .. } => rule,
@@ -254,7 +274,7 @@ pub mod bodies {
         // (1) the record door: the key's own set holds `node`.
         let room = format!("root-{tag}");
         authorized_room_key(d, &room).await;
-        let err = found(
+        let r = found_outcome(
             d,
             ts::sign_community(
                 &human,
@@ -265,21 +285,10 @@ pub mod bodies {
                 ),
             ),
         )
-        .await
-        .expect_err("#925: a node key is never an infrastructure founder");
-        assert_eq!(
-            violation_rule(&err),
-            INFRA_RULE_NODE_BEARING_FOUNDER,
-            "{err}"
-        );
-        assert_eq!(
-            err.kind(),
-            "federation_community_consensus_protocol_violation"
-        );
+        .await;
         assert!(
-            err.to_string()
-                .contains("hard_case:community_consensus_protocol_violation"),
-            "the CC 3.4.2 token names the refusal: {err}"
+            held(&r),
+            "#925: a node key is never an infrastructure founder (held): {r:?}"
         );
         assert!(d.lookup_community(&e2::kid(&room)).await.unwrap().is_none());
 
@@ -287,7 +296,7 @@ pub mod bodies {
         // identity it is bound under is `node`.
         let room_b = format!("root-b-{tag}");
         authorized_room_key(d, &room_b).await;
-        let err = found(
+        let r = found_outcome(
             d,
             ts::sign_community(
                 &human,
@@ -298,13 +307,16 @@ pub mod bodies {
                 ),
             ),
         )
-        .await
-        .expect_err("#925: node-bearing through the bind");
-        assert_eq!(
-            violation_rule(&err),
-            INFRA_RULE_NODE_BEARING_FOUNDER,
-            "{err}"
+        .await;
+        assert!(
+            held(&r),
+            "#925: node-bearing through the bind (held): {r:?}"
         );
+        assert!(d
+            .lookup_community(&e2::kid(&room_b))
+            .await
+            .unwrap()
+            .is_none());
 
         // (2) conformant: the install joins as a member.
         found(
@@ -334,23 +346,18 @@ pub mod bodies {
             ),
             &room,
         )
-        .await
-        .expect_err("#925: a supersede cannot seat a node founder");
-        assert_eq!(
-            violation_rule(&err),
-            INFRA_RULE_NODE_BEARING_FOUNDER,
-            "{err}"
+        .await;
+        assert!(
+            held(&err),
+            "#925: a supersede cannot seat a node founder (held): {err:?}"
         );
 
         // (4) the widening: seating another node key as founder (proposal and
         // acceptance held, T1 v3); as a member it is admitted.
-        let err = widen_voiced(d, &room, &[&human], &late, Some("founder"), ago(5))
-            .await
-            .expect_err("#925: a widening cannot seat a node founder");
-        assert_eq!(
-            violation_rule(&err),
-            INFRA_RULE_NODE_BEARING_FOUNDER,
-            "{err}"
+        let r = widen_voiced(d, &room, &[&human], &late, Some("founder"), ago(5)).await;
+        assert!(
+            held(&r),
+            "#925: a widening cannot seat a node founder (held): {r:?}"
         );
         widen_voiced(d, &room, &[&human], &late, Some("member"), ago(4))
             .await
@@ -580,24 +587,18 @@ pub mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: conformant room: {e}"));
-        let err = widen_voiced(d, &room, &[&h1, &h2], &h4, Some("founder"), ago(40))
-            .await
-            .expect_err("adding a founder would leave N stale");
-        assert_eq!(
-            violation_rule(&err),
-            crate::federation::admission::INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
-            "{err}"
+        let r = widen_voiced(d, &room, &[&h1, &h2], &h4, Some("founder"), ago(40)).await;
+        assert!(
+            held(&r),
+            "adding a founder would leave N stale (held): {r:?}"
         );
         widen_voiced(d, &room, &[&h1, &h2], &m, Some("member"), ago(30))
             .await
             .unwrap_or_else(|e| panic!("{tag}: a plain member is admitted: {e}"));
-        let err = remove_voiced(d, &room, &[&h1, &h2], &h3, ago(20))
-            .await
-            .expect_err("other founders removing a founder would leave N stale");
-        assert_eq!(
-            violation_rule(&err),
-            crate::federation::admission::INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
-            "{err}"
+        let r = remove_voiced(d, &room, &[&h1, &h2], &h3, ago(20)).await;
+        assert!(
+            held(&r),
+            "other founders removing a founder would leave N stale (held): {r:?}"
         );
         remove_voiced(d, &room, &[&h3], &h3, ago(10))
             .await

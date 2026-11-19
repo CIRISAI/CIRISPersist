@@ -36,8 +36,12 @@ pub(crate) mod bodies {
         s.parse().unwrap()
     }
 
-    /// Bind `occurrence` (a node key) as an active occurrence of `identity`
-    /// on `d`, with `kem` as its content-KEM keys.
+    /// Bind `occurrence` as an active occurrence of `identity` on `d`, with
+    /// `kem` as its content-KEM keys. v62.0.0 (P1-fix4; CC rc21 3.3.6): a
+    /// person's `occurrence` is a PERSON's key (a phone); a node key binds
+    /// only its own identity (`bind(d, node, node, kem)`, its
+    /// self-occurrence), and belongs to a person by its owner binding
+    /// ([`own`], `key_grant_invariants::two_node::place_device`).
     pub(crate) async fn bind(
         d: &dyn FederationDirectory,
         identity: &str,
@@ -89,13 +93,11 @@ pub(crate) mod bodies {
         node_seed: &str,
     ) {
         let row = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner, node);
-        e2::put_signed(d, &row)
+        // v62.0.0 (E2-fix3; K2.api) — the owner's statement, then the bound
+        // node's voice, through K2's shared helper (no hand-rolled voice).
+        e2::land_owner_binding(d, &row, node_seed)
             .await
             .unwrap_or_else(|e| panic!("{owner} owns {node}: {e}"));
-        let st = e2::carried_statement(&row).expect("a mapped row carries its statement");
-        e2::put_statement(d, &e2::voice_of(&st, node_seed))
-            .await
-            .unwrap_or_else(|e| panic!("{node}'s voice on its owner binding: {e}"));
     }
 
     /// **I137 — the send set includes the self-collective, without a
@@ -117,9 +119,12 @@ pub(crate) mod bodies {
             let _ = e2::put_key(d, k, &[crate::federation::types::identity_type::NODE]).await;
         }
         let (owner, node_a, node_b) = (e2::kid(&owner_s), e2::kid(&node_a_s), e2::kid(&node_b_s));
+        // v62.0.0 (P1-fix4; CC rc21 3.3.6) — a node key is never an
+        // occurrence of a person: the node is the owner's by its OWNER
+        // binding, and states its own class (a personal device) and KEM on
+        // its own SELF-occurrence (`replication_audience::owned_device`).
         bind(d, &node_a, &node_a, None).await;
-        bind(d, &owner, &node_a, None).await;
-        bind(d, &owner, &node_b, None).await;
+        bind(d, &node_b, &node_b, None).await;
         // The nodes are OWNED (a live delegates_to owner binding — every node
         // has exactly one human owner); the phone is an occurrence only: a
         // KEM target, not a replication endpoint (edge §6.1).
@@ -224,9 +229,13 @@ pub(crate) mod bodies {
         for k in [&node_a, &node_b, &member_node] {
             ts::register_identity_key(d, k, crate::federation::types::identity_type::NODE).await;
         }
-        bind(d, &sid(&owner), &sid(&node_a), None).await;
-        bind(d, &sid(&owner), &sid(&node_b), None).await;
-        bind(d, &sid(&member), &sid(&member_node), None).await;
+        // v62.0.0 (P1-fix4; CC rc21 3.3.6) — a node key is never an
+        // occurrence of a person: the node is the owner's by its OWNER
+        // binding, and states its own class (a personal device) and KEM on
+        // its own SELF-occurrence (`replication_audience::owned_device`).
+        bind(d, &sid(&node_a), &sid(&node_a), None).await;
+        bind(d, &sid(&node_b), &sid(&node_b), None).await;
+        bind(d, &sid(&member_node), &sid(&member_node), None).await;
         for (o, n) in [
             (&owner, &node_a),
             (&owner, &node_b),
@@ -504,7 +513,9 @@ pub(crate) mod bodies {
         let owner = e2::kid(&owner_s);
         for n in [&a, &b] {
             ts::register_hybrid_key_as(n.backend, &owner_s, &owner_s, USER).await;
-            bind(n.backend, &owner, &a.key, Some(a.kem.clone())).await;
+            // v62.0.0 (P1-fix4; CC rc21 3.3.6): A's own self-occurrence
+            // (its class and KEM), and the owner's binding of A.
+            bind(n.backend, &a.key, &a.key, Some(a.kem.clone())).await;
             own_seeded(n.backend, &owner_s, &a.key, &alias_a).await;
         }
         let r = engine_a
@@ -520,7 +531,7 @@ pub(crate) mod bodies {
         let sha = r.at_rest_sha256;
         // Now B becomes an occurrence of the owner (on both nodes), AFTER the write.
         for n in [&a, &b] {
-            bind(n.backend, &owner, &b.key, Some(b.kem.clone())).await;
+            bind(n.backend, &b.key, &b.key, Some(b.kem.clone())).await;
             own_seeded(n.backend, &owner_s, &b.key, &alias_b).await;
         }
         assert!(

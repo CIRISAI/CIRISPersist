@@ -1203,6 +1203,7 @@ pub async fn proposer_on_roster<F>(
     row_id: &RowId,
     iss: &str,
     roster: &BTreeSet<String>,
+    exclude: Option<&str>,
 ) -> Result<Option<String>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1214,13 +1215,31 @@ where
         .filter(|v| statement_iss(v).as_deref() == Some(iss))
         .filter_map(|v| {
             let key = identity_ref(&statement_kid(v)?);
-            if !roster.contains(&key) {
+            // O1 fix 8: an eviction's target never proposes it.
+            if !roster.contains(&key) || exclude == Some(key.as_str()) {
                 return None;
             }
             statement_id_of(v).map(|id| (id, key))
         })
         .min_by_key(|(id, _)| *id)
         .map(|(_, k)| k))
+}
+
+/// The key (identity-ref) of the held voice of `voices` signed as `iss`
+/// with the lowest statement id, skipping `exclude`'s.
+fn lowest_voice_key(voices: &[Vec<u8>], iss: &str, exclude: Option<&str>) -> Option<String> {
+    voices
+        .iter()
+        .filter(|v| statement_iss(v).as_deref() == Some(iss))
+        .filter_map(|v| {
+            let key = identity_ref(&statement_kid(v)?);
+            if exclude == Some(key.as_str()) {
+                return None;
+            }
+            statement_id_of(v).map(|id| (id, key))
+        })
+        .min_by_key(|(id, _)| *id)
+        .map(|(_, k)| k)
 }
 
 /// The held statements of the row `row_id`, with its family and payload:
@@ -1302,9 +1321,13 @@ where
     ) else {
         return Ok(None);
     };
-    let Some(proposer) = lowest_voice_as(&voices, &iss)
-        .and_then(|v| statement_kid(v))
-        .map(|k| identity_ref(&k))
+    // O1 fix 8 (E8's I3324/I3325) — an eviction's TARGET never proposes it
+    // (two_path refuses `proposer_is_target`): among the voices, the lowest
+    // statement id of a key other than the target; the target's own only
+    // when it is the sole voice (the genesis key revoking its own pair).
+    let exclude = (family == OCCURRENCE_REVOCATION_FAMILY).then_some(target.as_str());
+    let Some(proposer) =
+        lowest_voice_key(&voices, &iss, exclude).or_else(|| lowest_voice_key(&voices, &iss, None))
     else {
         return Ok(None);
     };

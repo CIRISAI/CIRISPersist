@@ -41,18 +41,6 @@ pub(crate) mod bodies {
         crate::federation::steward_purge::test_clock::set(None);
     }
 
-    /// `signer` signs `device` in as an occurrence of `f`, asserted at `at`.
-    pub(crate) async fn add(
-        d: &dyn FederationDirectory,
-        signer: &str,
-        f: &str,
-        device: &str,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error> {
-        d.put_identity_occurrence(ts::signed_content_only_occurrence(signer, f, device, at).await)
-            .await
-    }
-
     /// v62 (E3): one `identity:occurrence` statement (O1). `signer` (a seed)
     /// signs as `iss`: as the occurrence key itself (`iss == occurrence`, the
     /// own voice, role `occurrence_key`) or as the identity (an approval: the
@@ -178,7 +166,7 @@ pub(crate) mod bodies {
     }
 
     /// v62 (E3): a three-key self `{f, d1, d2}` through O1's door (S1): d1
-    /// lands at one key; d2 is proposed by d1 (a kept voice) and f's approval
+    /// lands at one key; d2 is proposed by d1 (held: `Pending`) and f's approval
     /// completes the strict majority.
     pub(crate) async fn three_e2(d: &dyn FederationDirectory, f: &str, d1: &str, d2: &str) {
         for k in [f, d1, d2] {
@@ -191,7 +179,7 @@ pub(crate) mod bodies {
         let at = ms_now();
         assert!(matches!(
             bind_at(d, f, d2, &[d1], at).await,
-            StatementOutcome::Voice { .. }
+            StatementOutcome::Pending { .. }
         ));
         let landed = e2::put_statement(d, &occ_voice_at(d, f, f, f, d2, at).await)
             .await
@@ -319,17 +307,28 @@ pub(crate) mod bodies {
 
     /// v62 (E3): `author`'s owner binding of `node`, then the node's own
     /// voice, which an owner binding counts (C557).
+    /// v62 (E3b, round 3): both through the EDITION-2 door. The binding is a
+    /// counted row (V1b): the author's statement alone is kept `Pending`
+    /// there, and the node's voice lands it. The JSON door
+    /// (`put_attestation`) answers the same shortfall as the refusal
+    /// `owner_binding_counted_short`, so it cannot carry a counted row.
     pub(crate) async fn put_binding(
         d: &dyn FederationDirectory,
         author: &str,
         node: &str,
     ) -> Result<(), Error> {
-        let row = binding(author, node);
-        let st = e2::carried_statement(&row).expect("an edition-2 owner binding");
-        d.put_attestation(SignedAttestation { attestation: row })
-            .await?;
-        e2::put_statement(d, &e2::voice_of(&st, node)).await?;
-        Ok(())
+        put_binding_row(d, &binding(author, node), node).await
+    }
+
+    /// [`put_binding`] of a built (e.g. re-dated) binding `row` of `node`.
+    pub(crate) async fn put_binding_row(
+        d: &dyn FederationDirectory,
+        row: &Attestation,
+        node: &str,
+    ) -> Result<(), Error> {
+        // K2.api: the shared landing (owner's statement, then the bound
+        // node's voice; asserts Row).
+        ts::put_sealed_owner_binding(d, row, node).await
     }
 
     /// **I1131** — two keys: an addition is a proposal; the other key's
@@ -352,7 +351,7 @@ pub(crate) mod bodies {
         let at = ms_now();
         let short = bind_at(d, &f, &d2, &[&d1], at).await;
         assert!(
-            matches!(short, StatementOutcome::Voice { .. }),
+            matches!(short, StatementOutcome::Pending { .. }),
             "I1131: one voice of two is kept, not landed: {short:?}"
         );
         assert!(
@@ -513,14 +512,17 @@ pub(crate) mod bodies {
         for k in [&f, &d1, &d2] {
             e2::put_key(d, k, &[it::USER]).await;
         }
+        let backdated = ms_now() - chrono::Duration::seconds(2 * sr::W_SELF_SECS);
+        // d1 signs as f at `backdated`: it must be f's key THEN (way (d) of
+        // the key-of-issuer check reads its occurrence live at the
+        // statement's instant), so its bind is asserted just before.
         assert!(matches!(
-            bind(d, &f, &d1, &[&f]).await,
+            bind_at(d, &f, &d1, &[&f], backdated - chrono::Duration::minutes(1)).await,
             StatementOutcome::Row { .. }
         ));
-        let backdated = ms_now() - chrono::Duration::seconds(2 * sr::W_SELF_SECS);
         let held = bind_at(d, &f, &d2, &[&d1], backdated).await;
         assert!(
-            matches!(held, StatementOutcome::Voice { .. }),
+            matches!(held, StatementOutcome::Pending { .. }),
             "I1136: d1's proposal at two keys is a kept voice: {held:?}"
         );
         let me = e2::kid(&f);
@@ -860,11 +862,16 @@ pub(crate) mod bodies {
         // a token: CC 2.7).
         let t3 = ms_now();
         put_st(d, &occ_voice_at(d, &d3, &d3, &f, &d3, t3).await).await;
+        // v62 (CC 2.7.3): its statement is not refused but HELD (the signer
+        // no longer acts for the self: a fold condition), and lands nothing.
+        let by_evicted = e2::put_statement(d, &occ_voice_at(d, &f, &f, &f, &d3, t3).await).await;
         assert!(
-            e2::put_statement(d, &occ_voice_at(d, &f, &f, &f, &d3, t3).await)
-                .await
-                .is_err(),
-            "I1141: an evicted genesis key signs for the self"
+            !matches!(by_evicted, Ok(StatementOutcome::Row { .. })),
+            "I1141: an evicted genesis key signs for the self: {by_evicted:?}"
+        );
+        assert!(
+            !active_e2(d, &f, &d3).await,
+            "I1141: the evicted genesis key's statement binds nothing"
         );
         // {d1, d2}: d1's addition needs d2.
         assert!(!landed(
@@ -974,10 +981,9 @@ pub(crate) mod bodies {
         stale_bind.asserted_at = days(4);
         stale_bind.scrub_timestamp = stale_bind.asserted_at;
         ts::seal_row_in_place(&d1, &mut stale_bind);
-        let e = d
-            .put_attestation(SignedAttestation {
-                attestation: stale_bind,
-            })
+        // v62 (E3b, round 3): through the edition-2 door, where the roster W
+        // bound (`check_owner_binding_roster_fresh`) runs before the count.
+        let e = e2::put_signed(d, &stale_bind)
             .await
             .expect_err("I1142: the evicted d1's backdated owner-binding");
         assert!(
@@ -1041,12 +1047,9 @@ pub(crate) mod bodies {
             &e2::carried_statement(&own).expect("an edition-2 binding"),
             &node,
         );
-        a.put_attestation(SignedAttestation { attestation: own })
+        put_binding_row(a, &own, &node)
             .await
             .expect("I1149: f owns the node");
-        e2::put_statement(a, &node_voice)
-            .await
-            .expect("I1149: the node's voice");
         let mut old = grant(&d1, &peer, &node_k);
         old.asserted_at = days(4);
         old.scrub_timestamp = old.asserted_at;
@@ -1060,11 +1063,13 @@ pub(crate) mod bodies {
         bind.asserted_at = days(4) + chrono::Duration::hours(12);
         bind.scrub_timestamp = bind.asserted_at;
         ts::seal_row_in_place(&d1, &mut bind);
-        a.put_attestation(SignedAttestation {
-            attestation: bind.clone(),
-        })
-        .await
-        .expect("I1149: a live key's owner-binding restatement older than W admits");
+        let bind_voice = e2::voice_of(
+            &e2::carried_statement(&bind).expect("an edition-2 binding"),
+            &node,
+        );
+        put_binding_row(a, &bind, &node)
+            .await
+            .expect("I1149: a live key's owner-binding restatement older than W admits");
 
         // The fresh node: the roster, then A's attestation stream.
         assert!(matches!(
@@ -1076,6 +1081,9 @@ pub(crate) mod bodies {
         e2::put_statement(b, &node_voice)
             .await
             .expect("I1149: the node's voice on B");
+        e2::put_statement(b, &bind_voice)
+            .await
+            .expect("I1149: the node's voice on d1's restatement, on B");
         let mut since = None;
         loop {
             let page = a
@@ -1191,7 +1199,7 @@ pub(crate) mod bodies {
             .await
             .expect("I1307: two keys, the vendored table");
         assert!(
-            matches!(held, StatementOutcome::Voice { .. }),
+            matches!(held, StatementOutcome::Pending { .. }),
             "I1307: held: {held:?}"
         );
         assert_eq!(sr::standing(d, &me).await.unwrap().len(), 1);
@@ -1213,30 +1221,19 @@ pub(crate) mod bodies {
     /// - **I1711 (a fresh node, the whole stream)** — `c` receives `a`'s
     ///   stream in `a`'s order and lands the same roster at once.
     /// - **I1712 (the late joiner, #1159)** — `b` is `d3`'s own device: it
-    ///   holds its own occurrence BEFORE the stream (the pairing flow), so it
-    ///   decided `d3`'s add at one key (`{f}`) and then `d2`'s add at two
-    ///   (`{f, d3}`): pending, which leaves `f` an open proposal ahead of the
-    ///   eviction (`proposer_has_open_proposal`). CC 3.3.6.3: thresholds are
-    ///   counted over the roster "as it stands when the decision is made",
-    ///   and "a landing is a node's own verdict" — so `b`'s interim verdict
-    ///   is its own. The property is that it is BOUNDED: once `b`'s own
-    ///   `W_self` has run, its sweep lands `d2`'s add by the lone path (no
-    ///   objector; an addition asks no silence), then the eviction by quorum,
-    ///   and `b` holds `a`'s roster.
+    ///   holds its own occurrence BEFORE the stream (the pairing flow). v62
+    ///   (the CC 2.7 ruling: a roster row counts over the roster AT THE HEAD
+    ///   IT NAMES, and a row waits for what it names): `f`'s add of `d3`
+    ///   names `a`'s head (`d2`'s bind), which `b` does not hold, so on `b`
+    ///   it WAITS (`Pending`), nothing lands. Fed `a`'s statements, `b`'s
+    ///   fold re-runs it as its head lands, and `b` holds `a`'s roster: no
+    ///   window, no interim verdict of `b`'s own.
     ///
     /// Mutations that turn this red:
-    /// - `decide_all` without the one-open-per-proposer block: `b`'s interim
-    ///   eviction decision is `Pending` (needs 1: `d2`'s assent is void on
-    ///   `{f, d3}`), not `proposer_has_open_proposal` (I1712 interim).
-    /// - the gate judging an addition on the roster at its signed
-    ///   `asserted_at` (the issue's proposed reading): `d2` lands on `b` at
-    ///   once (I1712 interim `!active(d2)`); that reading is the backdating
-    ///   hole I1713 pins shut.
-    /// - a lone path whose window never closes, or one that asks an
-    ///   addition's target for silence it cannot give after arrival: `b`
-    ///   never converges (I1712 final).
-    /// - an executor that stops after its first landing: `b` lands `d2` but
-    ///   not the eviction (I1712 final).
+    /// - the gate counting over the roster NOW instead of at the named head:
+    ///   `d3` lands on `b` at one key (I1712 `Pending`).
+    /// - a waiting row whose head lands is not re-folded: `b` never converges
+    ///   (I1712 final).
     pub(crate) async fn i1710_every_holder_reaches_one_roster(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -1307,34 +1304,30 @@ pub(crate) mod bodies {
             "I1711: a fresh node fed a's statements folds a's roster"
         );
 
-        // I1712 — `b`, d3's own device: its own bind first.
+        // I1712 — `b`, d3's own device: its own bind first. v62 (O1 fix 7;
+        // the CC 2.7 ruling): f's statement names a's roster head (d2's
+        // bind), which b does not hold, so it WAITS on b (held, concluding
+        // nothing): never decided over "b's roster as it stood". Fed a's
+        // statements, b's fold re-runs it as its head lands and b holds a's
+        // roster, with no window and in any order.
         put_st(b, &own_d3).await;
+        let early = put_st(b, &f_d3).await;
         assert!(
-            landed(&put_st(b, &f_d3).await),
-            "I1712: d3's bind landed on b's one-key roster"
+            matches!(early, StatementOutcome::Pending { .. }),
+            "I1712: f's add of d3 waits on b for the head it names: {early:?}"
+        );
+        assert!(
+            !active_e2(b, &f, &d3).await,
+            "I1712: nothing lands on b before its head"
         );
         for st in &log {
             let _ = e2::put_statement(b, st).await;
         }
         sr::execute_for(b, &me).await.expect("execute");
-        // The interim: b's own verdict, decided over b's roster as it stood.
-        assert!(
-            !active_e2(b, &f, &d2).await,
-            "I1712: d2's add was decided on b's two-key roster {{f, d3}}: held, not landed"
-        );
-        assert!(
-            active_e2(b, &f, &d3).await,
-            "I1712: f's open add holds its eviction back on b"
-        );
-        // Bounded: after b's own window, b's sweep converges on a's roster.
-        advance(sr::W_SELF_SECS + 60);
-        let landed_n = sr::execute_due(b).await;
-        reset_clock();
-        landed_n.expect("I1712: the sweep");
         assert_eq!(
             sr::roster_now(b, &me).await.unwrap(),
             want,
-            "I1712: after its window the late joiner holds a's roster"
+            "I1712: the late joiner holds a's roster"
         );
     }
 
@@ -1367,7 +1360,7 @@ pub(crate) mod bodies {
         three_e2(d, &f, &d1, &d2).await;
         let r = bind_at(d, &f, &thief, &[&f], before).await;
         assert!(
-            matches!(r, StatementOutcome::Voice { .. }),
+            matches!(r, StatementOutcome::Pending { .. }),
             "I1713: a backdated add at three keys must be held: {r:?}"
         );
         sr::execute_for(d, &e2::kid(&f)).await.expect("execute");

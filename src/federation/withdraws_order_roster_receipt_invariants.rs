@@ -392,8 +392,12 @@ pub(crate) mod bodies {
             "dimension": dimension,
             "score": crate::federation::namespace::registry::in_class_score(dimension),
             "confidence": 0.9,
-            "community_id": room,
-            "community_key_id": room,
+            // v62 (E3b r3): the room is held under its identity-ref (the
+            // founding roster is keyed by `kid`), so the cohort target names
+            // it by `e2::kid`; a seed resolves to no room
+            // (`MembershipUnresolved`).
+            "community_id": e2::kid(room),
+            "community_key_id": e2::kid(room),
         });
         let mut r = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), by, by, &env);
         r.attestation_type = attestation_type::SCORES.into();
@@ -435,17 +439,26 @@ pub(crate) mod bodies {
     }
 
     async fn put(d: &dyn FederationDirectory, r: &Attestation) -> Result<(), Error> {
-        d.put_attestation(SignedAttestation {
-            attestation: r.clone(),
-        })
-        .await
-        .map(|_| ())?;
         let pending = voices()
             .lock()
             .expect("voices")
             .get(&r.attestation_id)
             .cloned()
             .unwrap_or_default();
+        if pending.is_empty() {
+            d.put_attestation(SignedAttestation {
+                attestation: r.clone(),
+            })
+            .await
+            .map(|_| ())?;
+            return Ok(());
+        }
+        // v62 (E3b r3): a COUNTED row (an owner binding, a cosigned row)
+        // goes through the edition-2 statement door, which keeps its first
+        // voice `Pending` until the rest are held (CC 3.2, C557); the JSON
+        // door answers the same shortfall as a terminal
+        // `owner_binding_counted_short`.
+        e2::put_signed(d, r).await.map(|_| ())?;
         for v in pending {
             e2::put_statement(d, &v).await?;
         }
@@ -739,15 +752,26 @@ pub(crate) mod bodies {
             let mut binding =
                 ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner, &node);
             binding.subject_key_ids = vec![node.clone()];
+            // v62 (E3b r3): now-relative — the node's voice is over the same
+            // payload, and the builder's fixed instant lies outside a node
+            // key's default record window (CC 2.4.1.1).
+            binding.asserted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                (chrono::Utc::now() - chrono::Duration::minutes(5)).timestamp_millis(),
+            )
+            .expect("an instant");
+            binding.scrub_timestamp = binding.asserted_at;
             // v62 (E3): re-sealed by its signer's SEED (`reseal` would sign as
             // the stored identity-ref).
             ts::seal_row_in_place(&owner, &mut binding);
-            // v62 (E3): an owner binding counts the node's own voice (C557).
-            add_voice(&binding, &node);
+            // v62 (E3b r3, K2.api): the binding lands through the shared
+            // `put_sealed_owner_binding` (owner's statement, then the node's
+            // voice, C557); the composer still goes through `put`.
             let w = withdraws(&node, &binding);
             match order {
                 Order::TargetFirst => {
-                    put(d, &binding).await.expect("I1604: the binding lands");
+                    ts::put_sealed_owner_binding(d, &binding, &node)
+                        .await
+                        .expect("I1604: the binding lands");
                     let e = put(d, &w)
                         .await
                         .expect_err("I1604: in order the door refuses it (CC 3.2 ceremony)");
@@ -767,7 +791,9 @@ pub(crate) mod bodies {
                             .is_none(),
                         "I1604: an early withdraws is kept nowhere: {early:?}"
                     );
-                    put(d, &binding).await.expect("I1604: the binding lands");
+                    ts::put_sealed_owner_binding(d, &binding, &node)
+                        .await
+                        .expect("I1604: the binding lands");
                     let e = put(d, &w)
                         .await
                         .expect_err("I1604: re-offered, the door refuses it");

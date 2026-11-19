@@ -1499,6 +1499,12 @@ pub mod test_support {
     /// `pubkey_ml_dsa_65_base64`; a debug_assert pins that invariant.
     pub fn local_signer(key_id: &str) -> std::sync::Arc<crate::signing::LocalSigner> {
         let seed = seed_for(key_id);
+        // v62.0.0 (E0 fix 3) — register this signer's identity-ref (its
+        // `federation_id`) with the fixture map, so a fixture handed the
+        // engine's id (an identity-ref no `kid()` call minted) re-signs as it.
+        if !key_id.starts_with("urn:") {
+            let _ = crate::federation::edition2::fixture_switch::kid(key_id);
+        }
         let ed = ed25519_dalek::SigningKey::from_bytes(&seed);
         let pqc = std::sync::Arc::new(
             ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&seed, key_id)
@@ -2345,6 +2351,26 @@ pub mod test_support {
     /// naming no community at all is still refused, so the fix did not turn
     /// the community placement into a free-for-all.
     pub(crate) async fn exercise_owner_signed_community_row(
+        dir: &dyn crate::federation::FederationDirectory,
+        suffix: &str,
+    ) {
+        // v62.0.0 (E0 fix 5; lead's ruling (a)) — HELD in the earlier form.
+        // The community is seeded through the TYPED plane
+        // (`seed_two_member_community` → `put_community`, members named by
+        // label), which has no edition-2 projection on this base, so an
+        // edition-2 row (signed as `kid(author)`) was asked to prove
+        // membership in a roster that names `author`: "caller's identity is
+        // not a member of any community". Every builder and register helper
+        // polled inside takes the earlier form.
+        Box::pin(
+            crate::federation::edition2::fixture_switch::with_earlier_form_async(
+                owner_signed_community_row_held(dir, suffix),
+            ),
+        )
+        .await;
+    }
+
+    async fn owner_signed_community_row_held(
         dir: &dyn crate::federation::FederationDirectory,
         suffix: &str,
     ) {
@@ -3527,8 +3553,19 @@ pub mod test_support {
         dir.put_attestation(crate::federation::SignedAttestation { attestation: decl })
             .await
             .unwrap_or_else(|e| panic!("({suffix}) self-declared minor: {e}"));
+        // v62.0.0 (E0 fix 4) — a key is read by the id the store holds it
+        // under (its identity-ref under the switch).
+        let id_of = |seed: &str| {
+            if crate::federation::edition2::fixture_switch::emit_edition2() {
+                crate::federation::edition2::fixture_switch::kid(seed)
+            } else {
+                seed.to_owned()
+            }
+        };
         assert_eq!(
-            crate::federation::age::age_band(dir, &minor).await.unwrap(),
+            crate::federation::age::age_band(dir, &id_of(&minor))
+                .await
+                .unwrap(),
             crate::federation::age::AgeBand::Minor
         );
 
@@ -3554,10 +3591,15 @@ pub mod test_support {
 
         // (1) ANNOUNCED — the minor's federation-scope owner-binding refuses,
         // by its own typed reason, and nothing is stored.
-        let err = dir
-            .put_attestation(binding(&minor, &node_a, cohort_scope::FEDERATION))
-            .await
-            .expect_err("a minor's owner-binding at cohort_scope federation must refuse");
+        // v62.0.0 (E0 fix 4) — an owner binding lands counted (owner + node,
+        // K2's `put_sealed_owner_binding`); the refusal is the minor gate's.
+        let err = put_sealed_owner_binding(
+            dir,
+            &binding(&minor, &node_a, cohort_scope::FEDERATION).attestation,
+            &node_a,
+        )
+        .await
+        .expect_err("a minor's owner-binding at cohort_scope federation must refuse");
         assert!(
             matches!(
                 err,
@@ -3568,7 +3610,7 @@ pub mod test_support {
             "({suffix}) CC 5.4.6: refused as the announce of a minor, got {err:?}"
         );
         assert!(
-            crate::federation::admission::owner_of(dir, &node_a)
+            crate::federation::admission::owner_of(dir, &id_of(&node_a))
                 .await
                 .unwrap()
                 .is_none(),
@@ -3579,15 +3621,14 @@ pub mod test_support {
         // node is the minor's.
         let self_binding = binding(&minor, &node_b, cohort_scope::SELF);
         let self_binding_id = self_binding.attestation.attestation_id.clone();
-        dir.put_attestation(self_binding)
+        put_sealed_owner_binding(dir, &self_binding.attestation, &node_b)
             .await
             .unwrap_or_else(|e| panic!("({suffix}) a minor's self-scope owner-binding: {e}"));
         assert_eq!(
-            crate::federation::admission::owner_of(dir, &node_b)
+            crate::federation::admission::owner_of(dir, &id_of(&node_b))
                 .await
-                .unwrap()
-                .as_deref(),
-            Some(minor.as_str())
+                .unwrap(),
+            Some(id_of(&minor))
         );
 
         // (2b) "admission MUST refuse the PROMOTION" — the promote door's own
@@ -3635,14 +3676,18 @@ pub mod test_support {
         // (3) An owner with no age proof announces freely (presumption of
         // sovereignty, CC 1.15.6) — the gate keys on the MINOR band, not on
         // the absence of an adult one — both directly and by widening.
-        dir.put_attestation(binding(&adult, &node_c, cohort_scope::FEDERATION))
-            .await
-            .unwrap_or_else(|e| panic!("({suffix}) an unknown-band owner announces: {e}"));
+        put_sealed_owner_binding(
+            dir,
+            &binding(&adult, &node_c, cohort_scope::FEDERATION).attestation,
+            &node_c,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) an unknown-band owner announces: {e}"));
         let node_d = format!("node-d-924-{suffix}");
         register_hybrid_key(dir, &node_d).await;
         let adult_self = binding(&adult, &node_d, cohort_scope::SELF);
         let adult_self_id = adult_self.attestation.attestation_id.clone();
-        dir.put_attestation(adult_self)
+        put_sealed_owner_binding(dir, &adult_self.attestation, &node_d)
             .await
             .unwrap_or_else(|e| panic!("({suffix}) adult self-scope binding: {e}"));
         let stored = dir.get_attestation(&adult_self_id).await.unwrap().unwrap();
@@ -4282,6 +4327,27 @@ pub mod test_support {
     /// on every key id: [`seed_for`] truncates at 32 bytes, so two ids sharing a
     /// 32-byte prefix are the SAME identity here.
     pub async fn exercise_location_proof_authority<D>(
+        dir: &D,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error>
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        // v62.0.0 (E0 fix 5; lead's ruling (a)) — HELD in the earlier form.
+        // `put_location_proof` is the typed plane: a `SignedLocationProof`
+        // whose authority signature is verified against the earlier key
+        // registered under the label. The edition-2 `location_proof:v1` row
+        // is not admitted at the edition-2 door yet (Verify's family card is
+        // pending; `edition2::gc5_fold_invariants`), so under the switch the
+        // label had no earlier key ("signer subj-… is not a registered
+        // federation key"). Every helper polled inside takes the earlier form.
+        crate::federation::edition2::fixture_switch::with_earlier_form_async(
+            location_proof_authority_held(dir, tag),
+        )
+        .await
+    }
+
+    async fn location_proof_authority_held<D>(
         dir: &D,
         tag: &str,
     ) -> Result<(), crate::federation::Error>

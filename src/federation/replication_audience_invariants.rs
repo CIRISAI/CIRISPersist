@@ -122,13 +122,11 @@ pub(crate) mod bodies {
         binding.asserted_at = ms(Utc::now() - Duration::minutes(5));
         binding.scrub_timestamp = binding.asserted_at;
         ts::seal_row_in_place(owner, &mut binding);
-        e2::put_signed(d, &binding)
+        // K2.api: the shared landing (owner's statement, then the node's
+        // voice; asserts Row).
+        ts::put_sealed_owner_binding(d, &binding, node)
             .await
             .unwrap_or_else(|e| panic!("owner binding {owner} → {node}: {e}"));
-        let st = e2::carried_statement(&binding).expect("a flipped binding carries its statement");
-        e2::put_statement(d, &e2::voice_of(&st, node))
-            .await
-            .unwrap_or_else(|e| panic!("the node's voice on {owner} → {node}: {e}"));
         // P5c (update 1): the owner binding says WHO the human is; WHAT KIND
         // of device the node is comes from its own self-occurrence (O1's
         // edition-2 self pair: identity = occurrence = the node key).
@@ -862,13 +860,16 @@ pub(crate) mod bodies {
         // #989: refers-to delivery is governed by the audience).
         let fam = format!("i397-f-{s}");
         family(d, &fam, &[&owner]).await;
+        // v62.0.0 (E3b round 3): these unsealed rows are read straight by
+        // `may_receive`, so they name the keys by their identity-refs (`kr`),
+        // as the stored rows do.
         let mut row = ts::bare_attestation(
             "i397-row",
-            &sibling,
-            &laptop,
+            &kr(&sibling),
+            &kr(&laptop),
             &serde_json::json!({
                 "dimension": crate::federation::key_grant::KEY_GRANT_CONTENT_DIMENSION,
-                "family_key_id": fam,
+                "family_key_id": kr(&fam),
             }),
         );
         row.attestation_type = crate::federation::types::attestation_type::SCORES.into();
@@ -883,13 +884,13 @@ pub(crate) mod bodies {
         // And a retired SET (rc6) reaches nobody but its signer.
         let mut set = ts::bare_attestation(
             "i397-set",
-            &sibling,
-            &sibling,
-            &serde_json::json!({ "family_key_id": fam }),
+            &kr(&sibling),
+            &kr(&sibling),
+            &serde_json::json!({ "family_key_id": kr(&fam) }),
         );
         set.attestation_type = "key_grant:content:v1".into();
         set.cohort_scope = FAMILY.into();
-        set.subject_key_ids = vec![laptop.clone()];
+        set.subject_key_ids = vec![kr(&laptop)];
         assert!(
             !ra::may_receive(d, &kr(&laptop), &set)
                 .await
@@ -897,7 +898,12 @@ pub(crate) mod bodies {
                 .allowed(),
             "I397 a retired key-grant set is served to nobody"
         );
-        let mut own = ts::bare_attestation("i397-own", &laptop, &laptop, &serde_json::json!({}));
+        let mut own = ts::bare_attestation(
+            "i397-own",
+            &kr(&laptop),
+            &kr(&laptop),
+            &serde_json::json!({}),
+        );
         own.cohort_scope = SELF.into();
         assert_eq!(
             ra::may_receive(d, &kr(&laptop), &own).await.unwrap(),
@@ -999,29 +1005,27 @@ pub(crate) mod bodies {
     }
 
     /// v59.1.1 — the creator's view of a pair-room invitee's node: the
-    /// invitee's announced owner binding `delegates_to(k → node)` and, when
-    /// `unagreed_row`, the invitee's login-ceremony occurrence row
-    /// `{identity: k, occurrence: node}` signed by the identity alone — held
-    /// because it was replicated, never agreed to by the node (#932 H1).
+    /// invitee's announced owner binding `delegates_to(k → node)`.
+    /// v62.0.0 (E3b round 3): the binding carries the node's own voice
+    /// (`owner_of` counts it only then, `owner_binding_counted_short`). The
+    /// earlier `unagreed_row` — an identity-signed `(k, node)` occurrence row —
+    /// is gone: a node is never a person's occurrence in v62
+    /// (`occurrence_binds_machine_to_person`), and a bind offered on the
+    /// author's voice alone is never held.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    async fn invitee_seen_from_the_creator(
-        d: &dyn FederationDirectory,
-        k: &str,
-        node: &str,
-        unagreed_row: bool,
-    ) {
+    async fn invitee_seen_from_the_creator(d: &dyn FederationDirectory, k: &str, node: &str) {
+        use crate::federation::edition2::fixture_switch as e2;
         nodes(d, &[node]).await;
-        put(
-            d,
-            &ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), k, node),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("owner binding {k} → {node}: {e}"));
-        if unagreed_row {
-            d.put_identity_occurrence(ts::signed_content_only_occurrence(k, k, node, ago(2)).await)
-                .await
-                .unwrap_or_else(|e| panic!("the identity's own claim {k} → {node}: {e}"));
-        }
+        let mut binding =
+            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), k, &e2::kid(node));
+        binding.asserted_at = ms(Utc::now() - Duration::minutes(5));
+        binding.scrub_timestamp = binding.asserted_at;
+        ts::seal_row_in_place(k, &mut binding);
+        // K2.api: the shared landing (owner's statement, then the node's
+        // voice; asserts Row).
+        ts::put_sealed_owner_binding(d, &binding, node)
+            .await
+            .unwrap_or_else(|e| panic!("owner binding {k} → {node}: {e}"));
     }
 
     /// A pair-room proposal of `invitee` by `creator` into a fresh room.
@@ -1050,15 +1054,13 @@ pub(crate) mod bodies {
         p
     }
 
-    /// **I1470** (v59.1.1, CIRISServer's shape — live chat) — the creator
-    /// holds the invitee's owner binding and the invitee's identity-signed,
-    /// never-agreed occurrence row for the invitee's node. The row resolves
-    /// nothing (#932 H1) and is no revocation, so the owner binding still
-    /// lifts the node to the invitee: the invitation reaches it. Before the
-    /// fix `principals_of` read "a row exists" as "revoked" and dropped the
-    /// owner — principals = [], the proposal NotInAudience.
+    /// **I1470** (v59.1.1, CIRISServer's shape — live chat; v62.0.0 E3b
+    /// round 3) — the creator holds the invitee's owner binding for the
+    /// invitee's node, and no occurrence row: ownership is the only fact (in
+    /// v62 the only way a person's node is theirs, P5c). The owner binding
+    /// lifts the node to the invitee, so the invitation reaches it.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub(crate) async fn i1470_an_unagreed_occurrence_row_is_not_a_revocation(
+    pub(crate) async fn i1470_an_owner_binding_lifts_the_invitees_node(
         d: &dyn FederationDirectory,
         s: &str,
     ) {
@@ -1070,14 +1072,7 @@ pub(crate) mod bodies {
             format!("i1470-kn-{s}"),
         );
         users(d, &[&k]).await;
-        invitee_seen_from_the_creator(d, &k, &knode, true).await;
-        assert!(
-            d.active_identities_for_occurrence(&kr(&knode))
-                .await
-                .unwrap()
-                .is_empty(),
-            "I1470 precondition — #932 H1: the unagreed row resolves nothing"
-        );
+        invitee_seen_from_the_creator(d, &k, &knode).await;
         assert_eq!(
             crate::federation::admission::owner_of(d, &kr(&knode))
                 .await
@@ -1086,9 +1081,9 @@ pub(crate) mod bodies {
             "I1470 precondition — the owner binding names the invitee"
         );
         assert_eq!(
-            principals_of(d, &knode).await.unwrap(),
+            principals_of(d, &kr(&knode)).await.unwrap(),
             vec![kr(&k)],
-            "I1470 an unagreed occurrence row does not drop the node's owner"
+            "I1470 the owned node's principal is its owner"
         );
         let p = pair_room_proposal(d, &cid, &creator, &k).await;
         assert_eq!(
@@ -1098,162 +1093,13 @@ pub(crate) mod bodies {
         );
         // I1473 (v59.1.1, the second link — CIRISServer live chat): the same
         // node receives the GROUP's record and membership planes as a live
-        // invitee's node, through the same principal fold. Before the fix
-        // `may_receive_group_plane` read `active_identities_for_occurrence`
-        // only, so the joiner never learned it was seated.
+        // invitee's node, through the same principal fold.
         assert_eq!(
             ra::may_receive_group_plane(d, &kr(&knode), COMMUNITY, &kr(&cid), None)
                 .await
                 .unwrap(),
             ra::Verdict::Yes(ra::Reason::Cohort),
             "I1473 the invitee's node receives the room's record and membership planes"
-        );
-    }
-
-    /// **I1471** (v59.1.1, the PR #889 P1 case kept) — the owner REVOKED the
-    /// occurrence; a live owner binding beside the revocation is the lost
-    /// device's shape and does not give the owner back. Agreed or not, the
-    /// revoked node has no principal and the invitation does not reach it.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub(crate) async fn i1471_a_revoked_occurrence_still_drops_the_owner(
-        d: &dyn FederationDirectory,
-        s: &str,
-    ) {
-        use crate::federation::self_collective::principals_of;
-        let (cid, creator, k, agreed, unagreed) = (
-            format!("i1471-c-{s}"),
-            format!("i1471-f-{s}"),
-            format!("i1471-k-{s}"),
-            format!("i1471-an-{s}"),
-            format!("i1471-un-{s}"),
-        );
-        users(d, &[&k]).await;
-        // `agreed`: claimed by k, agreed to by the node — then revoked.
-        invitee_seen_from_the_creator(d, &k, &agreed, true).await;
-        d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(&agreed, &k, &agreed, ago(2)).await,
-        )
-        .await
-        .expect("I1471 the occurrence's agreement is admitted");
-        assert_eq!(
-            principals_of(d, &agreed).await.unwrap(),
-            vec![kr(&k)],
-            "I1471 precondition — the agreed occurrence's principal is its owner"
-        );
-        // `unagreed`: the I1470 shape — then revoked.
-        invitee_seen_from_the_creator(d, &k, &unagreed, true).await;
-        unclaim(d, &k, &agreed).await;
-        unclaim(d, &k, &unagreed).await;
-        let p = pair_room_proposal(d, &cid, &creator, &k).await;
-        for n in [&agreed, &unagreed] {
-            assert_eq!(
-                crate::federation::admission::owner_of(d, &kr(n))
-                    .await
-                    .unwrap(),
-                Some(kr(&k)),
-                "I1471 precondition — the owner binding to {n} is still live"
-            );
-            assert!(
-                principals_of(d, n).await.unwrap().is_empty(),
-                "I1471 a revoked occurrence ({n}) does not get its owner back"
-            );
-            assert!(
-                !ra::may_receive(d, &kr(n), &p).await.unwrap().allowed(),
-                "I1471 the revoked node {n} does not receive the invitation"
-            );
-            assert!(
-                !ra::may_receive_group_plane(d, &kr(n), COMMUNITY, &kr(&cid), None)
-                    .await
-                    .unwrap()
-                    .allowed(),
-                "I1473 the revoked node {n} does not receive the room's membership planes"
-            );
-        }
-    }
-
-    /// **I1472** (v59.1.1) — the owner is KEPT: an agreed, active occurrence;
-    /// a node the owner never bound as an occurrence (KEM-less: ownership is
-    /// the only fact); an unagreed row whose only revocation is of ANOTHER
-    /// device of the owner's, or of this one but not yet effective; an
-    /// occurrence revoked and then re-agreed after the revocation.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub(crate) async fn i1472_a_live_owner_binding_is_kept(d: &dyn FederationDirectory, s: &str) {
-        use crate::federation::self_collective::principals_of;
-        let (cid, creator, k, agreed, kemless, unagreed, other, later) = (
-            format!("i1472-c-{s}"),
-            format!("i1472-f-{s}"),
-            format!("i1472-k-{s}"),
-            format!("i1472-an-{s}"),
-            format!("i1472-kl-{s}"),
-            format!("i1472-un-{s}"),
-            format!("i1472-ot-{s}"),
-            format!("i1472-la-{s}"),
-        );
-        let readded = format!("i1472-ra-{s}");
-        users(d, &[&k]).await;
-        invitee_seen_from_the_creator(d, &k, &agreed, true).await;
-        d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(&agreed, &k, &agreed, ago(2)).await,
-        )
-        .await
-        .expect("I1472 the occurrence's agreement is admitted");
-        assert_eq!(
-            d.active_identities_for_occurrence(&kr(&agreed))
-                .await
-                .unwrap(),
-            vec![kr(&k)],
-            "I1472 precondition — the agreed occurrence resolves"
-        );
-        invitee_seen_from_the_creator(d, &k, &kemless, false).await;
-        invitee_seen_from_the_creator(d, &k, &unagreed, true).await;
-        invitee_seen_from_the_creator(d, &k, &other, true).await;
-        unclaim(d, &k, &other).await;
-        invitee_seen_from_the_creator(d, &k, &later, true).await;
-        d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: k.clone(),
-            occurrence_key_id: later.clone(),
-            revoked_at: ago(1),
-            effective_at: ms(Utc::now() + Duration::days(3)),
-            reason: None,
-            witness_set: vec![kr(&k)],
-            persist_row_hash: String::new(),
-        })
-        .await
-        .expect("I1472 a future-dated revocation is admitted");
-        // `readded`: agreed, revoked, then agreed again after the revocation
-        // (the #421 re-establishment) — the active fold carries the owner.
-        invitee_seen_from_the_creator(d, &k, &readded, true).await;
-        d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(&readded, &k, &readded, ago(2)).await,
-        )
-        .await
-        .expect("I1472 the occurrence's first agreement is admitted");
-        unclaim(d, &k, &readded).await;
-        assert!(
-            principals_of(d, &readded).await.unwrap().is_empty(),
-            "I1472 precondition — revoked, the device has no principal"
-        );
-        d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(&readded, &k, &readded, ms(Utc::now())).await,
-        )
-        .await
-        .expect("I1472 the occurrence's re-agreement is admitted");
-        let p = pair_room_proposal(d, &cid, &creator, &k).await;
-        for n in [&agreed, &kemless, &unagreed, &later, &readded] {
-            assert_eq!(
-                principals_of(d, n).await.unwrap(),
-                vec![kr(&k)],
-                "I1472 {n} keeps its owner as principal"
-            );
-            assert_eq!(
-                ra::may_receive(d, &kr(n), &p).await.unwrap(),
-                ra::Verdict::Yes(ra::Reason::RefersTo),
-                "I1472 {n} receives the invitation"
-            );
-        }
-        assert!(
-            principals_of(d, &other).await.unwrap().is_empty(),
-            "I1472 control — the revoked device itself is dropped"
         );
     }
 
@@ -1367,7 +1213,7 @@ pub(crate) mod bodies {
             .await
             .expect("I398d an affiliations proposal is admitted");
         assert_eq!(
-            mac::live_invitees_of(d, COMMUNITY, &cid, std::slice::from_ref(&founder))
+            mac::live_invitees_of(d, COMMUNITY, &kr(&cid), &[kr(&founder)])
                 .await
                 .unwrap(),
             vec![kr(&k)],
@@ -1479,9 +1325,12 @@ pub(crate) mod bodies {
     ///   FILTERED serve path with A's node (`fnode`) as the requester
     ///   (`statements_served_to`), then A's `apply_replicated_statement`
     ///   (E13's pattern). The binding and the node's voice cross.
-    /// - The proposal and the acceptance are PUSHED where the sender's
-    ///   verdict sends them (`may_receive`, this witness's subject): the
-    ///   author's statement through the receiver's replicated door.
+    /// - The proposal crosses on A's filtered serve path to K's node (T1:
+    ///   a proposal is delivered to its invitee's node). The acceptance is
+    ///   still PUSHED where the sender's verdict sends it (`may_receive`,
+    ///   this witness's subject): `delivered_keys` names no proposer for an
+    ///   answer, and B holds no roster, so B's serve path has no rule that
+    ///   reaches the proposer (a gap for the serve owner, T1).
     /// - B's filtered serve path withholds the acceptance from the
     ///   proposer's node it cannot resolve (the same "no binding" fact as the
     ///   sender's verdict).
@@ -1549,12 +1398,17 @@ pub(crate) mod bodies {
             ra::may_receive(a, &kr(&knode), &p).await.unwrap().allowed(),
             "I398e A sends the proposal to K's node"
         );
-        deliver(
-            b,
-            &pushed(&p),
-            "I398e B admits the proposal (no roster held)",
-        )
-        .await;
+        // v62.0.0 (E3b round 3) — T1's delivered-key rule
+        // (`group_serve::delivered_to_requester`): a proposal is served to
+        // its invitee's node, so the proposal now crosses on A's FILTERED
+        // serve path (requester: K's node), not by a push.
+        let proposal_id = pushed(&p)[0].1;
+        let to_k = served_rows(a, &kr(&knode), &[proposal_id]).await;
+        assert!(
+            !to_k.is_empty(),
+            "I398e A's serve path serves the proposal to K's node"
+        );
+        deliver(b, &to_k, "I398e B admits the proposal (no roster held)").await;
         let acc = ma::reply(&k_k, &k_k, &p, true, now);
         ma::put(b, &acc)
             .await
@@ -1628,6 +1482,40 @@ pub(crate) mod bodies {
         assert!(
             holds(d, &laptop, COMMUNITY, Some(&b), &owner).await,
             "I399 no list: the laptop default (all)"
+        );
+    }
+
+    /// **I2689** (v62.0.0, E3b round 3) — a COMPOSER over a consent grant
+    /// is not a grant. In edition 2 a `withdraws` is stated in its target's
+    /// family, so it carries the grant's dimension and no grant `payload`.
+    /// The closed grant grammar (#510) judges the grant itself and never a
+    /// composer over it, so the withdraws lands. A malformed grant is still
+    /// refused at the same door (sqlite and pg through `dyn_runners`).
+    pub(crate) async fn i2689_a_composer_over_a_grant_is_not_a_grant(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let (owner, laptop) = (format!("i2689-o-{s}"), format!("i2689-l-{s}"));
+        users(d, &[&owner]).await;
+        nodes(d, &[&laptop]).await;
+        claim(d, &owner, &laptop, device_class::LAPTOP).await;
+        let g = grant(&owner, Some(&laptop), Some(serde_json::json!([])));
+        put(d, &g).await.expect("I2689 the grant is admitted");
+        let w = crate::federation::edition2::fixture_switch::composer_of("withdraws", &g, &owner);
+        assert_eq!(
+            crate::federation::admission::envelope_dimension(&w.attestation_envelope),
+            Some(crate::federation::consent_grammar::GRANT_DIMENSION),
+            "I2689 precondition: the composer carries the grant's dimension"
+        );
+        put(d, &w)
+            .await
+            .expect("I2689 a withdraws of a grant is not judged as a grant");
+        let bad = serde_json::json!([{"scope":"family","target":""}]);
+        assert!(
+            try_put_grant(d, &owner, Some(&laptop), Some(bad))
+                .await
+                .is_err(),
+            "I2689 a malformed grant is still refused by the grant grammar"
         );
     }
 }
@@ -2019,6 +1907,7 @@ mod runners {
                 case!(i397_origin_and_refers_to);
                 case!(i398_receiver_agrees_with_the_cohort_view);
                 case!(i399_lists_intersect_until_withdrawn);
+                case!(i2689_a_composer_over_a_grant_is_not_a_grant);
                 $(case!($extra);)*
             }
         };
@@ -2038,9 +1927,7 @@ mod runners {
         [
             i395_live_invitee_receives_the_planes,
             i398b_a_proposal_reaches_the_invitees_nodes,
-            i1470_an_unagreed_occurrence_row_is_not_a_revocation,
-            i1471_a_revoked_occurrence_still_drops_the_owner,
-            i1472_a_live_owner_binding_is_kept,
+            i1470_an_owner_binding_lifts_the_invitees_node,
             i398c_an_answer_returns_to_the_proposers_nodes,
             i398d_affiliations_is_the_rooms_plane
         ]
@@ -2061,9 +1948,7 @@ mod runners {
         [
             i395_live_invitee_receives_the_planes,
             i398b_a_proposal_reaches_the_invitees_nodes,
-            i1470_an_unagreed_occurrence_row_is_not_a_revocation,
-            i1471_a_revoked_occurrence_still_drops_the_owner,
-            i1472_a_live_owner_binding_is_kept,
+            i1470_an_owner_binding_lifts_the_invitees_node,
             i398c_an_answer_returns_to_the_proposers_nodes,
             i398d_affiliations_is_the_rooms_plane
         ]
@@ -2236,9 +2121,8 @@ mod consent_change_runners {
     }
 }
 
-#[cfg(all(test, feature = "sqlite"))]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod codex_978_i505 {
-    use crate::federation::accord_test_support as ops;
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::replication_audience as ra;
     use crate::federation::tier_ingest::test_support as ts;
@@ -2303,9 +2187,15 @@ mod codex_978_i505 {
             ])
             .unwrap(),
         });
-        let charter = ops::co_signed_trust_attestation(&id, &a, &fid, DELEGATES_TO, env, &[&b]);
+        // v62.0.0 (E3b round 3): a co-signed charter is a COUNTED
+        // `trust:charter:v1` row (E0's `counted_row_of`, as roster_head's
+        // `put_charter`): only a counted row has a role for a further voice;
+        // an authored row refuses one `iss_not_in_role`.
+        let mut draft = ts::bare_attestation(&id, &a, &fid, &env);
+        draft.attestation_type = DELEGATES_TO.to_owned();
+        let charter = e2::counted_row_of(&draft, &a);
         // v62 (E3): the row id is node-computed; read it off the row.
-        let charter_id = charter.attestation_id.clone();
+        let charter_id = e2::rid(&charter);
         // The co-signer is a further voice, put after the row.
         let voices =
             crate::federation::edition2::fixture_switch::voices_of(&charter, &[b.as_str()]);
@@ -2342,6 +2232,7 @@ mod codex_978_i505 {
         );
     }
 
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i505_sqlite() {
         use crate::store::Backend as _;
@@ -2350,5 +2241,25 @@ mod codex_978_i505 {
             .unwrap();
         d.run_migrations().await.unwrap();
         public_only_by_the_named_charter(&d, "sqlite").await;
+    }
+
+    /// v62.0.0 (E3b round 3): I505 on postgres (every store test runs on
+    /// both backends). The tag is unique per run: the family id is derived
+    /// from it, and a reused pg database keeps earlier runs' rows.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i505_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let d = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        let tag = format!("pg-{}", uuid::Uuid::new_v4().simple());
+        public_only_by_the_named_charter(&d, &tag).await;
     }
 }

@@ -1681,6 +1681,16 @@ pub enum DirectoryOp {
         /// `identity_key_id`.
         identity_key_id: String,
     },
+    /// v62.0.0 (round 3, O1 fix 5) — [`FederationDirectory::edition2_roster_proposal`]:
+    /// one receipt of the same edition-2 rooting view, by row id. The
+    /// roster fold reads whether a named row LANDED from it
+    /// (`self_roster::roster_at_heads`), as does `genesis_evicted_at`.
+    /// Through the inherited `Unsupported` it read "not landed". Result
+    /// rides `SelfRosterReceipts` (zero or one). APPEND-ONLY (Growth).
+    Edition2RosterProposal {
+        /// The proposal's row id, hex.
+        row_id_hex: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -2506,6 +2516,7 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         | DirectoryOp::WithdrawLocationProof { .. }
         | DirectoryOp::ListLiveConsentGrantsBy { .. }
         | DirectoryOp::ListSettledEdition2RosterProposals { .. }
+        | DirectoryOp::Edition2RosterProposal { .. }
         | DirectoryOp::ListLineageHeadCosignsFor { .. }
         | DirectoryOp::LookupSignedCommunity { .. }
         | DirectoryOp::LookupCanonicalWithdrawal { .. }
@@ -3211,6 +3222,12 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::SelfRosterReceipts(v),
+                Err(e) => op_err(&e),
+            }
+        }
+        DirectoryOp::Edition2RosterProposal { row_id_hex } => {
+            match dir.edition2_roster_proposal(&row_id_hex).await {
+                Ok(r) => DirectoryOpResult::SelfRosterReceipts(r.into_iter().collect()),
                 Err(e) => op_err(&e),
             }
         }
@@ -6768,6 +6785,25 @@ impl FederationDirectory for OpsDirectory {
             )),
         }
     }
+    async fn edition2_roster_proposal(
+        &self,
+        row_id_hex: &str,
+    ) -> Result<Option<crate::federation::self_roster::SelfRosterReceipt>, Error> {
+        // v62.0.0 (round 3, O1 fix 5) — one receipt of the edition-2 rooting
+        // view (the roster fold's "did this row land here").
+        match self
+            .run_op(&DirectoryOp::Edition2RosterProposal {
+                row_id_hex: row_id_hex.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::SelfRosterReceipts(v) => Ok(v.into_iter().next()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
     async fn list_settled_edition2_roster_proposals(
         &self,
         identity_key_id: &str,
@@ -7515,6 +7551,12 @@ mod tests {
             through, direct,
             "I1578: the same feed page through the capsule"
         );
+        // v62.0.0 (round 3, E7) — the feed names keys by identity-ref
+        // (`owner_and_node` returns the seeds it registered).
+        let (owner, node) = (
+            crate::federation::edition2::fixture_switch::kid(&owner),
+            crate::federation::edition2::fixture_switch::kid(&node),
+        );
         assert!(
             through.items.iter().any(|c| c.node_key_id == node
                 && c.state
@@ -7794,9 +7836,11 @@ mod tests {
         // stays 14.
         // v62.0.0 (round 3, L1) — GROWTH: `ListSettledEdition2RosterProposals`
         // APPENDED (the edition-2 rooting view); ABI stays 14.
+        // v62.0.0 (round 3, O1 fix 5) — GROWTH: `Edition2RosterProposal`
+        // APPENDED (one receipt of that view); ABI stays 14.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "c79800d108a1f7fea17690482e41f0c0a127d3f94368793b1dc91be00fd357c9",
+            "649ef35268ab910e86125fcafa756d4dce9e5fea5d9d5d3ec1661fafa8f6d145",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -7904,23 +7948,16 @@ mod tests {
     fn i1201_key_plane_holdings_route_through_the_capsule() {
         let rt = test_runtime();
         let (dir, directory) = test_directory();
-        rt.block_on(async {
-            for k in ["i1201-cap-a", "i1201-cap-b"] {
-                crate::federation::tier_ingest::test_support::register_identity_key(
-                    &*dir,
-                    k,
-                    crate::federation::types::identity_type::NODE,
-                )
-                .await;
-            }
-        });
+        // v62.0.0 (round 3, E7; rule 4) — the fixture's two key rows are
+        // gone: the holdings read walks key records mirrored as ATTESTATION
+        // rows (`key:record:v1` in the attestation index), the earlier-form
+        // key plane. An edition-2 `key:record` is a statement and never such
+        // a row (attestation_apply's I1201 was deleted for the same reason).
+        // What stays is the routing: the op answers exactly what the
+        // directory answers, and a non-key-plane family is refused.
         let direct = rt
             .block_on(dir.list_key_plane_wire_hashes_since("key:record:v1", None, 100))
             .expect("the direct read");
-        assert!(
-            direct.len() >= 2,
-            "I1201: the fixture's key rows: {direct:?}"
-        );
         match run_op(
             &rt,
             &directory,
@@ -8514,6 +8551,11 @@ mod tests {
         rt.block_on(ts::register_hybrid_key(dir.as_ref(), key));
         let msg = b"CIRISPersist#1233 I1562 capsule".to_vec();
         let sig = ts::threshold_sign(key, &msg);
+        // v62.0.0 (round 3, E7) — the key is held by its identity-ref
+        // (`register_hybrid_key` puts `e2::kid(seed)`'s record, the same
+        // pair the seed signs with); the verify door looks that id up.
+        let key_ref = crate::federation::edition2::fixture_switch::kid(key);
+        let key = key_ref.as_str();
         let op = |key_id: &str, pqc: Option<String>, policy: HybridPolicy| {
             DirectoryOp::VerifyHybridViaDirectory {
                 canonical_bytes: msg.clone(),
@@ -8639,7 +8681,9 @@ mod tests {
                 }),
             );
             ts::reseal(&mut row);
-            dir.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            // v62.0.0 (round 3, E7) — through the one entry (a mapped row is
+            // not routed to the statement store by `put_attestation`).
+            crate::federation::edition2::fixture_switch::put_signed(dir.as_ref(), &row)
                 .await
                 .expect("edge");
         });
@@ -8656,8 +8700,11 @@ mod tests {
             match run_op(
                 &rt,
                 &directory,
+                // v62.0.0 (round 3, E7) — the root as the directory keys it
+                // (`register` puts `e2::kid(seed)`'s record); a seed names no
+                // held key, so it read as a root that delegates nothing.
                 &DirectoryOp::BuildDelegationGraph {
-                    from_key: root.into(),
+                    from_key: crate::federation::edition2::fixture_switch::kid(root),
                     max_depth: 0,
                 },
             ) {
@@ -8912,16 +8959,22 @@ mod tests {
             "kex-identity",
             &[crate::federation::types::identity_type::USER],
         ));
+        // v62.0.0 (round 3, E7) — the person's PHONE: a person's key, class
+        // `phone` (P1's person/machine rule, CC 3.3.6: no machine class sits
+        // under a person's identity; the earlier `agent` class did).
         let phone = rt.block_on(crate::federation::edition2::fixture_switch::put_key(
             dir.as_ref(),
             "kex-phone",
-            &[crate::federation::types::identity_type::PRIMITIVE],
+            &[crate::federation::types::identity_type::USER],
         ));
         rt.block_on(
             dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
                 identity_key_id: identity.clone(),
                 occurrence_key_id: phone.clone(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                // v62.0.0 (P1-fix4; CC rc21 3.3.6) — a person's phone, not an
+                // `agent`-class occurrence (an agent's occurrence binds the
+                // agent's own identity).
+                device_class: crate::federation::types::device_class::PHONE.into(),
                 hardware_attestation: None,
                 asserted_at: now - chrono::Duration::hours(1),
                 valid_until: None,
@@ -9291,8 +9344,12 @@ mod tests {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::{NODE, USER};
         let dest = format!("{tag}dest");
-        let owner = format!("{tag}-owner");
-        let nodes = vec![format!("{tag}-node-1"), format!("{tag}-node-2")];
+        // v62.0.0 (E0 fix 4) — THE DISTINGUISHING PART FIRST: a test key
+        // seeds from its first 32 bytes, and the pg tag is a 32-char uuid, so
+        // `{tag}-owner` / `{tag}-node-N` were ONE key (the binding's target
+        // was the `user` owner itself: `target_age_unverified`).
+        let owner = format!("owner-{tag}");
+        let nodes = vec![format!("node-1-{tag}"), format!("node-2-{tag}")];
         rt.block_on(async {
             ts::register_identity_key(dir, &owner, USER).await;
             for (i, n) in nodes.iter().enumerate() {
@@ -9319,7 +9376,7 @@ mod tests {
     fn route_keys_1244(v: &[self_at_login::TransportDestination], tag: &str) -> Vec<String> {
         let mut k: Vec<String> = v
             .iter()
-            .filter(|r| r.occurrence_key_id.starts_with(tag))
+            .filter(|r| r.occurrence_key_id.contains(tag))
             .map(|r| r.occurrence_key_id.clone())
             .collect();
         k.sort();
@@ -9637,7 +9694,11 @@ mod tests {
                 let Some($b) = pg_backend_1244(&$rt) else {
                     return;
                 };
-                let $tag = uuid::Uuid::new_v4().simple().to_string();
+                // v62.0.0 (round 3, E7) — 12 hex, not 32: a test signer
+                // seeds from the FIRST 32 BYTES of its name, so `{tag}-alice`
+                // and `{tag}-bob` under a 32-hex tag were ONE key on pg (the
+                // roster then listed it twice, refused by the payload codec).
+                let $tag = uuid::Uuid::new_v4().simple().to_string()[..12].to_owned();
                 $body
             }
         };
@@ -10296,20 +10357,26 @@ mod tests {
         tag: &str,
     ) {
         use crate::federation::tier_ingest::test_support as ts;
-        let id = format!("{tag}-ident-1770");
+        // v62.0.0 (round 3, E7) — the occurrence is an edition-2
+        // `identity:occurrence` bind (O1's self pair: identity = occurrence =
+        // the user key, its one voice), named by identity-ref; the earlier
+        // signed content-only occurrence door is shut.
+        let seed = format!("ident-1770-{tag}");
+        let id = crate::federation::edition2::fixture_switch::kid(&seed);
         rt.block_on(async {
             ts::register_identity_key(
                 dir.as_ref(),
-                &id,
+                &seed,
                 crate::federation::types::identity_type::USER,
             )
             .await;
-            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-                (chrono::Utc::now() - chrono::Duration::seconds(300)).timestamp_millis(),
-            )
-            .unwrap();
-            dir.put_identity_occurrence(
-                ts::signed_content_only_occurrence(&id, &id, &id, at).await,
+            crate::federation::edition2::fixture_occurrence::put_bind(
+                dir.as_ref(),
+                &seed,
+                &seed,
+                &seed,
+                crate::federation::types::device_class::PHONE,
+                &crate::federation::edition2::fixture_occurrence::BindOptions::default(),
             )
             .await
             .expect("occurrence");
@@ -10455,7 +10522,6 @@ mod tests {
         dir: Arc<dyn FederationDirectory>,
         tag: &str,
     ) {
-        use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
         use crate::federation::room_roster_invariants::bodies::keyless_room_dir;
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type;
@@ -10463,9 +10529,12 @@ mod tests {
         let (t_join, t_leave) = (at("2026-03-01T00:00:00Z"), at("2026-03-02T00:00:00Z"));
         let tg = format!("{tag}-1808");
         let (room, alice, bob) = rt.block_on(keyless_room_dir(dir.as_ref(), &tg));
-        // v62 (round 3) — the name leads: a test signer seeds from the first
-        // 32 bytes, and pg's tag is 32 hex.
-        let carol = format!("carol-{tg}");
+        // v62.0.0 (round 3, E7) — carol by identity-ref, as the room's other
+        // members are (`keyless_room_dir` returns kids); registered by seed.
+        // Role first: a test signer seeds from the first 32 bytes (L1-fix1's
+        // `carol-{tg}` form, which this rebases onto).
+        let carol_seed = format!("carol-{tg}");
+        let carol = crate::federation::edition2::fixture_switch::kid(&carol_seed);
         let widening = ts::sign_community_membership_widening(
             &alice,
             types::CommunityMembershipWidening {
@@ -10489,15 +10558,51 @@ mod tests {
                 persist_row_hash: String::new(),
             },
         );
+        // v62.0.0 (round 3, E7; T1 §3) — the widening and the revocation are
+        // edition-2 voices over the room's held head. The widening follows a
+        // proposal and carol's acceptance (CC 4.4.3: the member consents);
+        // the earlier JSON membership doors are shut.
         rt.block_on(async {
-            ts::register_hybrid_key_as(dir.as_ref(), &carol, &carol, identity_type::USER).await;
+            use crate::federation::edition2::fixture_switch as e2;
+            use crate::federation::membership_acceptance_invariants::bodies::{
+                proposal, put, reply,
+            };
+            ts::register_hybrid_key_as(dir.as_ref(), &carol_seed, &carol_seed, identity_type::USER)
+                .await;
             let d: &dyn FederationDirectory = dir.as_ref();
-            d.put_community_membership_widening_consented(widening)
+            let p = proposal(
+                &alice,
+                crate::federation::types::cohort_scope::COMMUNITY,
+                &room,
+                &carol,
+                None,
+                t_join - chrono::Duration::seconds(3),
+                Some(chrono::Duration::days(7)),
+            );
+            put(d, &p).await.expect("I1808 proposal");
+            put(
+                d,
+                &reply(
+                    &carol,
+                    &carol,
+                    &p,
+                    true,
+                    t_join - chrono::Duration::seconds(2),
+                ),
+            )
+            .await
+            .expect("I1808 carol accepts");
+            let head = e2::held_head(d, &room).await.map(|(h, _)| h);
+            e2::put_voices(d, &e2::community_widening_voices(&widening, head.as_ref()))
                 .await
                 .expect("I1808 widening");
-            d.put_community_membership_revocation(revocation)
-                .await
-                .expect("I1808 revocation");
+            let head = e2::held_head(d, &room).await.map(|(h, _)| h);
+            e2::put_voices(
+                d,
+                &e2::community_revocation_voices(&revocation, head.as_ref()),
+            )
+            .await
+            .expect("I1808 revocation");
         });
         let ws = rt
             .block_on(dir.list_community_membership_widenings_for(&room))
@@ -11246,8 +11351,23 @@ mod tests {
                     })
                 },
             ),
+            (
+                "edition2_roster_proposal",
+                "edition2_roster_proposal",
+                false,
+                DirectoryOp::Edition2RosterProposal {
+                    row_id_hex: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.edition2_roster_proposal("x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
         ];
-        assert_eq!(table.len(), 31, "I1890: one row per routed method");
+        assert_eq!(table.len(), 32, "I1890: one row per routed method");
         let mut red = Vec::new();
         for (method, fault, write, op, call) in table {
             let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -12311,11 +12431,6 @@ mod tests {
             "list_open_edition2_roster_proposals",
             "v62.0.0 (O1) — THIS node's open self-roster proposals, read \
              by its own sweep; node-local, no DirectoryOp carries it",
-        ),
-        (
-            "edition2_roster_proposal",
-            "v62.0.0 (O1) — one of THIS node's held self-roster proposal \
-             receipts, by row id; node-local, no DirectoryOp carries it",
         ),
         (
             "list_group_tips",

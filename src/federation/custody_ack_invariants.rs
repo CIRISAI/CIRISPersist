@@ -12,7 +12,8 @@
 //!   keeps its own verdict.
 //! - **I404** — no report and no receipt: `unknown`.
 //! - **I405** — a third-party report (`attesting` ≠ the device) is refused.
-//! - **I406** — a report placed at a cohort the device is not in is refused;
+//! - **I406** — a report placed at a cohort the device is not in WAITS (held
+//!   `custody_ack_outside_cohort`, v62);
 //!   a member's report at the same cohort is admitted.
 //! - **I407** — malformed is a refusal: `here` without size, `none` with size,
 //!   an unknown state, a missing state, a bad digest, a commons placement
@@ -114,7 +115,21 @@ pub(crate) mod bodies {
             StatementOutcome::Row { row_id, .. } | StatementOutcome::Voice { row_id, .. } => {
                 Ok(row_id.hex())
             }
-            other => panic!("a custody report lands as a row: {other:?}"),
+            other => {
+                // v62.0.0 (T2-fix5) — a held report names its fold reason, so
+                // the red says which dependency it waits on.
+                let held = match &other {
+                    StatementOutcome::Pending { row_id, .. } => d
+                        .fold_state(row_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.held)
+                        .map(|h| format!("{h:?}")),
+                    _ => None,
+                };
+                panic!("a custody report lands as a row: {other:?}, held: {held:?}")
+            }
         }
     }
 
@@ -174,6 +189,15 @@ pub(crate) mod bodies {
                 crate::federation::edition2::ingest::StatementOutcome::Row { .. }
             ),
             "claim {owner} → {k}: the bind lands, {bound:?}"
+        );
+        // v62.0.0 (T2-fix5) — the claim puts the device in its owner's self
+        // audience (CC 3.1.3.3), the custody door's cohort read; asserted
+        // here so a gap in that read reds HERE, not as a held report.
+        assert!(
+            crate::federation::custody_ack::holder_in_cohort(d, &k, cs::SELF, None)
+                .await
+                .unwrap_or_else(|e| panic!("the cohort read for {k}: {e}")),
+            "claim {owner} → {k}: the claimed device is in its owner's self cohort"
         );
         k
     }
@@ -410,8 +434,47 @@ pub(crate) mod bodies {
         );
     }
 
-    /// **I406** — outside the cohort is refused; inside is admitted.
-    pub(crate) async fn i406_a_report_outside_the_cohort_is_refused(
+    /// v62.0.0 (E6-fix4) — the statement door's raw answer for a `Here`
+    /// report by `by` at community `community` (no outcome insisted on).
+    async fn custody_outcome_at_room(
+        d: &dyn FederationDirectory,
+        by: &str,
+        sha: &[u8; 32],
+        community: &str,
+        at: DateTime<Utc>,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::typed;
+        let device = e2::kid_or_keep(by);
+        let at_ms = u64::try_from(at.timestamp_millis()).expect("after the epoch");
+        let target = e2::kid_or_keep(community);
+        let payload = typed::custody_payload(
+            &device,
+            sha,
+            CustodyState::Here,
+            Some(9),
+            cs::COMMUNITY,
+            Some(&target),
+            at_ms,
+        )?;
+        let st = e2::typed_statement(
+            &e2::seed_of(by),
+            None,
+            &device,
+            typed::CUSTODY_PREFIX,
+            &payload,
+        );
+        Box::pin(e2::put_statement(d, &st)).await
+    }
+
+    /// **I406** — outside the cohort WAITS; inside is admitted.
+    ///
+    /// v62.0.0 (E6-fix4, T2's ruling) — the cohort is OTHER rows (the
+    /// roster, the device's claims), so a report placed outside it is HELD
+    /// `custody_ack_outside_cohort` (CC 3.1.3.3; a wait under CC 2.7.3),
+    /// re-folded when the roster changes. It is not a refusal, and it counts
+    /// for nothing while held.
+    pub(crate) async fn i406_a_report_outside_the_cohort_waits(
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
@@ -442,17 +505,25 @@ pub(crate) mod bodies {
         at_room(&a)
             .await
             .expect("I406 a member's report at its community is admitted");
-        let r = at_room(&outsider).await;
-        assert!(
-            r.is_err(),
-            "I406 an outsider's report at the community is refused: {r:?}"
+        let r = custody_outcome_at_room(d, &outsider, &sha, &community, base()).await;
+        let Ok(crate::federation::edition2::ingest::StatementOutcome::Pending { row_id, .. }) = r
+        else {
+            panic!("I406 an outsider's report at the community waits (Pending): {r:?}")
+        };
+        assert_eq!(
+            crate::federation::edition2::fold::why_held(d, &row_id)
+                .await
+                .unwrap()
+                .map(|h| h.reason),
+            Some(crate::federation::edition2::fold::reason::CUSTODY_ACK_OUTSIDE_COHORT.to_owned()),
+            "I406 the outsider's report is held outside its cohort"
         );
         assert_eq!(
             verdict(d, &outsider, &sha, None, base() + Duration::hours(1))
                 .await
                 .state,
             CustodyVerdict::Unknown,
-            "I406 nothing was written for the outsider"
+            "I406 a held report counts for nothing"
         );
     }
 
@@ -1756,7 +1827,7 @@ mod runners {
                 case!(i403_a_receipt_without_a_later_live_report);
                 case!(i404_no_report_is_unknown);
                 case!(i405_a_third_party_report_is_refused);
-                case!(i406_a_report_outside_the_cohort_is_refused);
+                case!(i406_a_report_outside_the_cohort_waits);
                 case!(i407_malformed_is_a_refusal);
                 case!(i408_a_report_never_reaches_an_outsider);
                 case!(i409_nothing_stored_is_a_verdict);

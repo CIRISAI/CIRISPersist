@@ -175,6 +175,20 @@ pub fn parse_custody_ack(row: &Attestation) -> Result<Option<CustodyAck>, Error>
     if super::admission::envelope_dimension(env) != Some(CUSTODY_ACK_DIMENSION) {
         return Ok(None);
     }
+    // v62.0.0 (E8 round 3) — an edition-2 composer carries its TARGET's
+    // family, so the holder's `withdraws` of its own holding claim (CC
+    // 3.1.3.3 rule 4: the sweeper's, `evict_actor`'s, a consumer's after a
+    // content miss) maps onto this dimension. A composer retracts a report;
+    // it is not one, so it is no report, never a malformed one.
+    {
+        use super::types::attestation_type::{RECANTS, SUPERSEDES, WITHDRAWS};
+        if matches!(
+            row.attestation_type.as_str(),
+            WITHDRAWS | RECANTS | SUPERSEDES
+        ) {
+            return Ok(None);
+        }
+    }
     if row.attestation_type != super::types::attestation_type::SCORES {
         return Err(malformed(format!(
             "a custody report is a `scores` row, not {:?}",

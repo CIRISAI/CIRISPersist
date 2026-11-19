@@ -455,6 +455,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_edition2_genesis", ConnClass::Write),
     ("key_edition", ConnClass::Read),
     ("edition2_statements_since", ConnClass::Read),
+    // v62.0.0 (the statement-id serve surface) — point read and id cursor.
+    ("edition2_statement", ConnClass::Read),
+    ("edition2_statement_ids_since", ConnClass::Read),
     // v61 (CIRISPersist#934, S4b) — the group supersede executor.
     ("store_planned_supersede", ConnClass::Write),
     // v61 (CIRISPersist#934, S4b) — the family executor.

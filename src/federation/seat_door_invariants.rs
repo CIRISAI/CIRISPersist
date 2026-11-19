@@ -599,8 +599,10 @@ runners!(postgres, async {
 /// I1807 — the Engine door emits the newcomer's rows.
 async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
     use crate::federation::types::cohort_scope::COMMUNITY;
+    // v62.0.0 (E3b r3): the engine's own key is a NODE (alice OWNS it by
+    // her owner binding, `own_node`); a person's user key is never a node's.
     engine
-        .register_self_federation_key(USER, None, None)
+        .register_self_federation_key(NODE, None, None)
         .await
         .expect("register the engine's own key");
     let key = engine.local_derived_key_id().await.unwrap();
@@ -617,8 +619,9 @@ async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
                     ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
                 },
             };
-            // v62.0.0 (E3b): still held for P8 (the Engine producer); the
-            // engine's key must be a NODE alice owns for this seed.
+            // v62.0.0 (E3b r3): released from the P8 hold (P8's Engine
+            // producer is on the base); the engine's NODE key is alice's by
+            // her owner binding.
             let room = seed(&n, alias, alias).await;
             engine
                 .put_blob_scoped(COMMUNITY, Some(&room.comm), b"minutes", None, None)
@@ -673,34 +676,29 @@ async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn i1807_sqlite() {
-    Box::pin(
-        crate::federation::edition2::fixture_switch::with_earlier_form_async(async {
-            let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-            let e =
-                crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
-                    .await
-                    .unwrap();
-            i1807_engine_door(e, &alias).await;
-        }),
-    )
+    Box::pin(async {
+        let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
+            .await
+            .unwrap();
+        i1807_engine_door(e, &alias).await;
+    })
     .await
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn i1807_postgres() {
-    Box::pin(
-        crate::federation::edition2::fixture_switch::with_earlier_form_async(async {
-            let Some(dsn) = crate::test_pg::isolated_dsn() else {
-                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-                return;
-            };
-            let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-            let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), &dsn)
-                .await
-                .unwrap();
-            i1807_engine_door(e, &alias).await;
-        }),
-    )
+    Box::pin(async {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), &dsn)
+            .await
+            .unwrap();
+        i1807_engine_door(e, &alias).await;
+    })
     .await
 }

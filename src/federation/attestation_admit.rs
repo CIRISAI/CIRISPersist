@@ -997,8 +997,14 @@ where
     // every other dimension (a `withdraws`/`recants` referencing a grant
     // carries its OWN dimension, never GRANT_DIMENSION). Runs BEFORE
     // persist — a rejected grant leaves no trace.
+    // v62.0.0 (E3b round 3) — a COMPOSER is exempt: in edition 2 a
+    // `withdraws` / `recants` / `supersedes` is stated in its TARGET's
+    // family, so it carries the grant's dimension but no grant `payload`;
+    // the closed grammar judges the grant, never the composer over it.
     if crate::federation::admission::envelope_dimension(&row.attestation_envelope)
         == Some(crate::federation::consent_grammar::GRANT_DIMENSION)
+        && !crate::federation::edition2::ingest::COMPOSER_ROW_TYPES
+            .contains(&row.attestation_type.as_str())
     {
         if let Err(reason) =
             crate::federation::consent_grammar::validate_grant_admission(&row.attestation_envelope)

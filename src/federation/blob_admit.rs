@@ -896,8 +896,11 @@ pub(crate) struct PlannedAnnouncement {
     /// A community-DEK token: the row must also be bound (an evicted binding
     /// is an eviction RECORD, not a bound row).
     pub(crate) needs_binding: bool,
-    /// The claim.
-    pub(crate) claim: super::holding_claim::PreparedHoldingClaim,
+    /// The claim, inserted in the same transaction. `None`: the edition-2
+    /// sealed-floor announce ([`announce_held_blob_planned`]), whose claim is
+    /// a `custody` statement the caller emits through the statement door
+    /// after this commits.
+    pub(crate) claim: Option<super::holding_claim::PreparedHoldingClaim>,
 }
 
 /// A chunk DAG the plan admitted: its prepared rows (chunks first, the
@@ -1105,7 +1108,7 @@ pub(crate) async fn put_blob_planned<D: BlobWriteStore>(
                 sha256: *sha256,
                 author_key_id: author,
                 needs_binding: floor.tier() == CryptoTier::CommunityDek,
-                claim,
+                claim: Some(claim),
             })
             .await?;
         return if held {
@@ -1238,6 +1241,69 @@ pub(crate) async fn put_blob_edition2_planned<D: BlobWriteStore>(
         dir.store_planned_blob(planned).await?;
     }
     Ok(())
+}
+
+/// v62.0.0 (E8-fix2) — an announce is of SEALED content a cascade already
+/// stored: a plaintext floor stores its bytes and claims them in one write
+/// (`store_blob_local` + the claim), never through the announce.
+///
+/// # Errors
+/// [`BlobError::InvalidArgument`] for a plaintext floor.
+fn refuse_plaintext_announce(floor: StorageFloor) -> Result<(), BlobError> {
+    if floor.tier() == super::types::cohort_scope::CryptoTier::Plaintext {
+        return Err(BlobError::InvalidArgument(
+            "announce_held_blob: a plaintext floor stores its bytes; only sealed content a \
+             cascade already stored is announced (§11.5 / I28)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// v62.0.0 (E8-fix2; the I27 / I28 regression of d5b39133, cut B) — **the
+/// sealed-floor announce, edition 2**: every backend's
+/// `BlobStorage::announce_held_blob`. §11.5 / I28: an announcement never
+/// stores; I27: a community-DEK announce takes the community's
+/// serialization boundary. In ONE transaction (the backend's
+/// [`BlobWriteStore::store_planned_announcement`], no claim row): re-ask that
+/// the row is held, and for a community-DEK floor that it is bound (an
+/// evicted binding is an eviction record, #833), under the bound community's
+/// lock on postgres (sqlite: the connection mutex, §11.4); name the
+/// announcer as the author of a row the cascade could not attribute. The
+/// claim itself is the caller's edition-2 `custody` statement, emitted after
+/// this commits (`holding_claim::emit_holding_claim`).
+///
+/// # Errors
+/// `NotHeld` (a hold on the row, CC 2.7.3: the cascade's row is another
+/// row) when the row is not held, or a community-DEK row is not bound;
+/// storage faults.
+pub(crate) async fn announce_held_blob_planned<D: BlobWriteStore>(
+    dir: &D,
+    sha256: &[u8; 32],
+    author_key_id: &str,
+    floor: StorageFloor,
+) -> Result<(), BlobError> {
+    use super::types::cohort_scope::CryptoTier;
+    refuse_plaintext_announce(floor)?;
+    let held = dir
+        .store_planned_announcement(PlannedAnnouncement {
+            sha256: *sha256,
+            author_key_id: author_key_id.to_owned(),
+            needs_binding: floor.tier() == CryptoTier::CommunityDek,
+            claim: None,
+        })
+        .await?;
+    if held {
+        Ok(())
+    } else {
+        Err(held_on(
+            super::edition2::fold::reason::BLOB_NOT_HELD,
+            &hex::encode(sha256),
+            BlobError::NotHeld {
+                sha256_hex: hex::encode(sha256),
+            },
+        ))
+    }
 }
 
 /// The door: every backend's `store_blob_local`.

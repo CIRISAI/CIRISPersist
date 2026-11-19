@@ -34,7 +34,7 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub mod bodies {
     use crate::federation::admission::steward_liveness_test_support::{
-        bare_edge_retraction, register, signed_row, store,
+        register, signed_row, store,
     };
     use crate::federation::admission::{
         licences_issued_under, licensure_issuance_at, reachable_under_scope,
@@ -124,6 +124,22 @@ pub mod bodies {
         row.scrub_timestamp = asserted_at;
         reseal(&mut row);
         row
+    }
+
+    /// v62.0.0 (E2-fix3) — the granter's `withdraws` of the `delegates_to`
+    /// row `edge` (the §11.10 edge retraction). Edition 2 has no target-less
+    /// composer (a `withdraws` names its target, `refs.target`), so the
+    /// retraction names the edge row by its row id; the earlier form keeps
+    /// the bare granter → recipient retraction.
+    pub(crate) fn edge_withdrawal(granter: &str, edge: &Attestation) -> Attestation {
+        if e2::emit_edition2() {
+            e2::composer_of(attestation_type::WITHDRAWS, edge, granter)
+        } else {
+            crate::federation::admission::steward_liveness_test_support::bare_edge_retraction(
+                granter,
+                &edge.attested_key_id,
+            )
+        }
     }
 
     /// The adopter's licence row: `scores` on the subject, `licensure:{A}:v1`,
@@ -248,12 +264,20 @@ pub mod bodies {
         if row.attestation_type == attestation_type::DELEGATES_TO
             && crate::federation::admission::is_owner_binding_envelope(&row.attestation_envelope)
         {
-            cosigners.push(e2::seed_of(&row.attested_key_id));
             let named = row
                 .attestation_envelope
                 .get("community_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
+            // v62.0.0 (E2-fix3; K2.api) — a plain owner binding (no
+            // affiliation, no further cosigner) lands through K2's shared
+            // helper: the owner's statement, then the bound key's voice.
+            if named.is_none() && cosigners.is_empty() {
+                let out =
+                    e2::land_owner_binding(dir, &row, &e2::seed_of(&row.attested_key_id)).await?;
+                return Ok((row, Some(out)));
+            }
+            cosigners.push(e2::seed_of(&row.attested_key_id));
             if let Some(community) = named {
                 if row.attestation_envelope.get("refs").is_none() {
                     if let Some((head, _)) = e2::held_head(dir, &community).await {
@@ -308,8 +332,12 @@ pub mod bodies {
                             .get_attestation(&target_id)
                             .await?
                             .expect("the withdrawn appointment is held");
+                        // v62.0.0 (E2-fix3) — nor does the earlier envelope's
+                        // `id`: a composer's payload has no such member (its
+                        // row id is node-computed).
                         if let Some(o) = shape.attestation_envelope.as_object_mut() {
                             o.remove("community_id");
+                            o.remove("id");
                         }
                         e2::row_of_statement(
                             &e2::counted_statement_of_family(
@@ -356,10 +384,62 @@ pub mod bodies {
             // v62.0.0: a counted row short of its protocol is HELD, not
             // stored: no typed row reads back. Reported as a refusal so the
             // `must_refuse*` witnesses see it; the outcome names the hold.
-            None => Err(Error::InvalidArgument(format!(
-                "{PENDING}: {} ({out:?})",
-                row.attestation_id
-            ))),
+            //
+            // v62.0.0 (E2-fix3; CC 2.7.3) — a gate that reads OTHER rows (the
+            // licensure chain, the authority's roster, an earlier revision)
+            // HOLDS the row with its reason instead of refusing it. The fold's
+            // record of why (`fold::why_held`: the reason token and the
+            // gate's refusal text) rides the report, so a witness asserts
+            // the WAIT by the gate's own token; a counted row merely short of
+            // its voices has no fold reason (`why_held` is `None`).
+            None => {
+                let why = match &out {
+                    Some(crate::federation::edition2::ingest::StatementOutcome::Pending {
+                        row_id,
+                        ..
+                    }) => crate::federation::edition2::fold::why_held(dir, row_id)
+                        .await?
+                        .map(|h| format!(" held {}: {}", h.reason, h.detail)),
+                    _ => None,
+                };
+                Err(Error::InvalidArgument(format!(
+                    "{PENDING}: {} ({out:?}){}",
+                    row.attestation_id,
+                    why.unwrap_or_default()
+                )))
+            }
+        }
+    }
+
+    /// v62.0.0 (E2-fix3; CC 2.7.3) — **the fold's hold behind a [`put`]
+    /// result**: `(reason, detail)` when the door HELD the row on a fold
+    /// condition (a gate that reads OTHER rows records its reason token and
+    /// its refusal's text, `fold::why_held`); `None` for anything else.
+    pub(crate) fn held_reason(r: &Result<Attestation, Error>) -> Option<(String, String)> {
+        let Err(Error::InvalidArgument(m)) = r else {
+            return None;
+        };
+        let (_, held) = m.strip_prefix(PENDING)?.split_once(" held ")?;
+        let (reason, detail) = held.split_once(": ")?;
+        Some((reason.to_owned(), detail.to_owned()))
+    }
+
+    /// v62.0.0 (E2-fix3; CC 2.7.3) — **the gate's refusal message behind a
+    /// [`put`] result**: an `InvalidArgument` refusal's message, or, for a row
+    /// the door HELD on a fold condition, the same gate's message as the fold
+    /// recorded it ([`held_reason`]'s detail). `None` for anything else.
+    pub(crate) fn refusal_message(r: &Result<Attestation, Error>) -> Option<String> {
+        if let Some((_, detail)) = held_reason(r) {
+            return Some(
+                detail
+                    .strip_prefix("invalid argument: ")
+                    .unwrap_or(&detail)
+                    .to_owned(),
+            );
+        }
+        match r {
+            Err(Error::InvalidArgument(m)) if !m.starts_with(PENDING) => Some(m.clone()),
+            _ => None,
         }
     }
 
@@ -622,7 +702,7 @@ pub mod bodies {
         // The board withdraws the officer now (the §11.10 edge retraction).
         must_put(
             dir,
-            &bare_edge_retraction(&board, &clerk),
+            &edge_withdrawal(&board, &appointment),
             "the board withdraws the officer",
         )
         .await;
@@ -698,7 +778,7 @@ pub mod bodies {
         .await;
         must_put(
             dir,
-            &bare_edge_retraction(&board, &clerk),
+            &edge_withdrawal(&board, &appointment),
             "the board withdraws the officer",
         )
         .await;
@@ -726,18 +806,33 @@ pub mod bodies {
             Some(&appointment.attestation_id),
             now - Duration::days(4),
         );
-        let err = put(dir, &stale)
-            .await
-            .expect_err("a withdrawn officer's licence dated beyond W must be refused");
-        assert!(
-            matches!(&err, Error::AssertedAtStale { plane, standing_for, .. }
-                if *plane == "licensure" && *standing_for == board),
-            "[{tag}] #1049: refused `asserted_at_stale` on the licensure plane: {err:?}"
-        );
-        assert!(
-            format!("{err}").starts_with("asserted_at_stale:"),
-            "[{tag}] #1049: the Display leads with the token: {err}"
-        );
+        let r = put(dir, &stale).await;
+        // v62.0.0 (E2-fix3; CC 2.7.3) — the officer's standing at receipt is
+        // OTHER rows, so an edition-2 licence beyond W is HELD
+        // `asserted_at_stale` (the refusal's text as the detail); the earlier
+        // form refuses it typed.
+        if let Some((reason, detail)) = held_reason(&r) {
+            assert_eq!(
+                reason,
+                crate::federation::edition2::fold::reason::ASSERTED_AT_STALE,
+                "[{tag}] #1049: held `asserted_at_stale`: {detail}"
+            );
+            assert!(
+                detail.starts_with("asserted_at_stale:"),
+                "[{tag}] #1049: the hold's detail leads with the token: {detail}"
+            );
+        } else {
+            let err = r.expect_err("a withdrawn officer's licence dated beyond W must be refused");
+            assert!(
+                matches!(&err, Error::AssertedAtStale { plane, standing_for, .. }
+                    if *plane == "licensure" && *standing_for == board),
+                "[{tag}] #1049: refused `asserted_at_stale` on the licensure plane: {err:?}"
+            );
+            assert!(
+                format!("{err}").starts_with("asserted_at_stale:"),
+                "[{tag}] #1049: the Display leads with the token: {err}"
+            );
+        }
         assert!(
             dir.get_attestation(&stale.attestation_id)
                 .await
@@ -785,7 +880,9 @@ pub mod bodies {
             consensus_protocol::FOUNDER_ONLY,
             &["alice", "carol", "bob"],
             2,
-            None,
+            // v62 (E4 round 3): `founder_only` above the family only as a
+            // declared affiliation (CC 4.5.13, 4.4.3.2.8).
+            Some(crate::federation::affiliation_invariants::bodies::affiliation_blob(None)),
             None,
         )
         .await;
@@ -921,6 +1018,36 @@ pub mod bodies {
         let err = put(dir, row)
             .await
             .expect_err(&format!("{what}: must be refused at the door"));
+        // v62.0.0 (E2-fix3; CC 2.7.3, wave GC1) — the chain is OTHER rows, so
+        // an edition-2 licence off its chain is HELD with the gate's reason
+        // (`fold::reason::gc1::LICENSURE_DELEGATOR_NOT_AUTHORITY`, the
+        // refusal's text as the detail), not refused: the witness asserts
+        // that wait, by the same reason token, and that nothing is stored.
+        if let Error::InvalidArgument(m) = &err {
+            if m.starts_with(PENDING) {
+                let held = m.split_once(" held ").map_or_else(
+                    || panic!("{what}: expected the licensure hold, got a wait with no fold reason: {m}"),
+                    |(_, h)| h,
+                );
+                assert!(
+                    held.starts_with(&format!(
+                        "{}: {REFUSAL}: {}: ",
+                        crate::federation::edition2::fold::reason::gc1::LICENSURE_DELEGATOR_NOT_AUTHORITY,
+                        reason.as_str()
+                    )),
+                    "{what}: expected the hold `{REFUSAL}: {}`, got {m}",
+                    reason.as_str()
+                );
+                assert!(
+                    dir.get_attestation(&row.attestation_id)
+                        .await
+                        .expect("read")
+                        .is_none(),
+                    "{what}: a held row must not be stored"
+                );
+                return;
+            }
+        }
         let text = format!("{err}");
         assert!(
             text.contains(REFUSAL) && text.contains(reason.as_str()),
@@ -1220,7 +1347,7 @@ pub mod bodies {
         // clerk issued while the chain was live.
         must_put(
             dir,
-            &bare_edge_retraction(&board, &manager),
+            &edge_withdrawal(&board, &hop1),
             "the board withdraws the manager",
         )
         .await;
@@ -1254,7 +1381,9 @@ pub mod bodies {
             consensus_protocol::FOUNDER_ONLY,
             &["alice", "bob"],
             1,
-            None,
+            // v62 (E4 round 3): `founder_only` above the family only as a
+            // declared affiliation (CC 4.5.13, 4.4.3.2.8).
+            Some(crate::federation::affiliation_invariants::bodies::affiliation_blob(None)),
             None,
         )
         .await;
@@ -1525,7 +1654,9 @@ pub mod bodies {
             consensus_protocol::FOUNDER_ONLY,
             &["alice"],
             1,
-            None,
+            // v62 (E4 round 3): `founder_only` above the family only as a
+            // declared affiliation (CC 4.5.13, 4.4.3.2.8).
+            Some(crate::federation::affiliation_invariants::bodies::affiliation_blob(None)),
             None,
         )
         .await;

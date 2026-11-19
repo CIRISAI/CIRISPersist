@@ -86,7 +86,13 @@ pub mod bodies {
         mut envelope: serde_json::Value,
     ) -> crate::federation::Attestation {
         let id = uuid::Uuid::new_v4().to_string();
-        envelope["references_attestation_id"] = serde_json::Value::String(id.clone());
+        // v62 (E3b, round 3): the uniqueness nonce is the payload's `id`
+        // member (as `grant_scope_invariants::put_delegation` carries it).
+        // It was `references_attestation_id`, which edition 2 reads as the
+        // row's `refs.target` (a `delegates_to` names no target row), so the
+        // fixture refused it (`name the target by rid(&target)`). The row's
+        // id is node-computed: read it off the sealed row.
+        envelope["id"] = serde_json::Value::String(id.clone());
         let mut row = ts::bare_attestation(&id, granter, recipient, &envelope);
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         ts::seal_row_in_place(granter, &mut row);
@@ -413,7 +419,9 @@ pub mod bodies {
         let (plain, plain_keys) = make_group(
             d,
             &k("plain"),
-            consensus_protocol::FOUNDER_ONLY,
+            // v62 (E4 round 3): a plain room above the family is never
+            // `founder_only` (CC 4.5.13); one member under `unanimous`.
+            consensus_protocol::UNANIMOUS,
             &["f"],
             1,
             None,
@@ -535,7 +543,9 @@ pub mod bodies {
         let (plain, plain_keys) = make_group(
             d,
             &format!("{tag}-plain"),
-            consensus_protocol::FOUNDER_ONLY,
+            // v62 (E4 round 3): a plain room above the family is never
+            // `founder_only` (CC 4.5.13); one member under `unanimous`.
+            consensus_protocol::UNANIMOUS,
             &["bob"],
             1,
             None,

@@ -866,7 +866,7 @@ async fn custody_cosign_body<D: FederationDirectory + ?Sized>(d: &D) {
         &other,
         &di,
         COSIGN_PREFIX,
-        &cosign_payload("signature", &ghost, t),
+        &cosign_payload(&iref(&other), "signature", &ghost, t),
     );
     let out = put(d, &c)
         .await
@@ -882,7 +882,7 @@ async fn custody_cosign_body<D: FederationDirectory + ?Sized>(d: &D) {
         &other,
         &di,
         COSIGN_PREFIX,
-        &cosign_payload("signature", &rid(&st), t),
+        &cosign_payload(&iref(&other), "signature", &rid(&st), t),
     );
     let out = put(d, &c).await.unwrap();
     assert!(

@@ -74,7 +74,9 @@ pub(crate) mod bodies {
             detection_id: uuid::Uuid::new_v4(),
             trace_id: trace.to_owned(),
             body_sha256: vec![7u8; 32],
-            detector: "cohort_declared_inferred_mismatch".into(),
+            // v62.0.0 (JSON cut, E7) — a detector whose `detection:{detector}`
+            // family is registered (P8's edition-2 producer refuses the rest).
+            detector: "hash_chain_integrity".into(),
             severity: crate::derived::DetectionSeverity::Warning,
             cohort_cell: serde_json::json!({"agent_role": "x"}),
             conformity_variant: crate::derived::ConformityVariant::Numeric,
@@ -91,7 +93,17 @@ pub(crate) mod bodies {
 
     /// v62.0.0 (JSON cut, E7; P8) — the detector seed of `tag`'s detections.
     pub(crate) fn detector_seed(tag: &str) -> String {
-        format!("{tag}-lens")
+        role_seed("lens", tag)
+    }
+
+    /// v62.0.0 (JSON cut, E7) — a test seed for `role` under `tag`, distinct
+    /// in its FIRST 32 BYTES (a test signer seeds from those alone): the role,
+    /// then the tag's unique tail. `{tag}-lens` and `{tag}-root` shared their
+    /// first 32 bytes, so the detector WAS the root, and its confers edge read
+    /// as a self-loop charter.
+    pub(crate) fn role_seed(role: &str, tag: &str) -> String {
+        let tail = &tag[tag.len().saturating_sub(26)..];
+        format!("{role}-{tail}")
     }
 
     /// v62.0.0 (JSON cut, E7; P8) — `det` may state `detection:*`: a key root
@@ -110,7 +122,7 @@ pub(crate) mod bodies {
             .node_key_id()
             .expect("the runner sets this node's key before a detection");
         let node = e2::seed_of(&node_kid);
-        let root = format!("{tag}-root");
+        let root = role_seed("root", tag);
         e2::put_key(b, &root, &[identity_type::NODE]).await;
         let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[format!(
             "{tag}-root-successor"
@@ -793,6 +805,17 @@ pub(crate) mod bodies {
         e2::put_signed(dir, &row).await.map(|_| ())
     }
 
+    /// v62.0.0 (JSON cut, E7; CC 2.7, wave GC1) — the row through the one
+    /// entry is HELD: kept, concluding nothing until its standing arrives
+    /// (`StatementOutcome::Pending`). GC1 turned the reconsideration door's
+    /// refusals into fold holds; the reason tokens are a G-wave's to pin.
+    async fn put_held(dir: &dyn FederationDirectory, row: Attestation) -> bool {
+        matches!(
+            e2::put_signed(dir, &row).await,
+            Ok(crate::federation::edition2::ingest::StatementOutcome::Pending { .. })
+        )
+    }
+
     fn reconsideration(
         id: &str,
         filer: &str,
@@ -857,40 +880,34 @@ pub(crate) mod bodies {
         .await
         .expect("I972: the target's subject files");
         // (2) a stranger naming ITSELF subject: refused (never self-declared).
-        let e = put(
-            dir,
-            reconsideration(
-                &format!("i972-r2-{tag}"),
-                &stranger,
-                &target,
-                serde_json::json!({}),
-                &[&stranger],
-            ),
-        )
-        .await
-        .expect_err("I972: a self-declared subject is no standing");
-        assert_eq!(
-            e.kind(),
-            "federation_delegated_scope_unauthorized",
-            "I972: {e}"
+        assert!(
+            put_held(
+                dir,
+                reconsideration(
+                    &format!("i972-r2-{tag}"),
+                    &stranger,
+                    &target,
+                    serde_json::json!({}),
+                    &[&stranger],
+                ),
+            )
+            .await,
+            "I972: a self-declared subject is no standing: held (CC 2.7, GC1), concluding nothing"
         );
         // (3) the subject RULES: refused — the ruling stays with review-holders.
-        let e = put(
-            dir,
-            reconsideration(
-                &format!("i972-r3-{tag}"),
-                &subject,
-                &target,
-                serde_json::json!({"outcome": "reversed"}),
-                &[],
-            ),
-        )
-        .await
-        .expect_err("I972: the subject cannot rule");
-        assert_eq!(
-            e.kind(),
-            "federation_delegated_scope_unauthorized",
-            "I972: {e}"
+        assert!(
+            put_held(
+                dir,
+                reconsideration(
+                    &format!("i972-r3-{tag}"),
+                    &subject,
+                    &target,
+                    serde_json::json!({"outcome": "reversed"}),
+                    &[],
+                ),
+            )
+            .await,
+            "I972: the subject cannot rule: held (CC 2.7, GC1), concluding nothing"
         );
         // (4) the review-holder rules: admitted.
         put(
@@ -906,40 +923,37 @@ pub(crate) mod bodies {
         .await
         .expect("I972: the review-holder rules");
         // (5) the action's community is the target's.
-        let e = put(
-            dir,
-            reconsideration(
-                &format!("i972-r5-{tag}"),
-                &subject,
-                &target,
-                serde_json::json!({"community_id": e2::kid(&format!("{comm_s}-other"))}),
-                &[],
-            ),
-        )
-        .await
-        .expect_err("I972: a filing naming another community");
         assert!(
-            e.to_string()
-                .contains(crate::federation::admission::RECONSIDERATION_COMMUNITY_MISMATCH),
-            "I972: {e}"
+            put_held(
+                dir,
+                reconsideration(
+                    &format!("i972-r5-{tag}"),
+                    &subject,
+                    &target,
+                    serde_json::json!({"community_id": e2::kid(&format!("{comm_s}-other"))}),
+                    &[],
+                ),
+            )
+            .await,
+            "I972: a filing naming another community: held (CC 2.7, GC1), concluding nothing"
         );
         // (6) a target not held here: the subject arm is empty.
-        let e = put(
-            dir,
-            reconsideration(
-                &format!("i972-r6-{tag}"),
-                &subject,
-                &format!("i972-absent-{tag}"),
-                serde_json::json!({}),
-                &[&subject],
-            ),
-        )
-        .await
-        .expect_err("I972: no held target, no subject standing");
-        assert_eq!(
-            e.kind(),
-            "federation_delegated_scope_unauthorized",
-            "I972: {e}"
+        assert!(
+            put_held(
+                dir,
+                reconsideration(
+                    &format!("i972-r6-{tag}"),
+                    &subject,
+                    // A row id no node holds (the door names targets by row id).
+                    &hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                        format!("i972-absent-{tag}").as_bytes(),
+                    )),
+                    serde_json::json!({}),
+                    &[&subject],
+                ),
+            )
+            .await,
+            "I972: no held target, no subject standing: held (CC 2.7, GC1), concluding nothing"
         );
         // (7) a licence target (v60.0.0, CIRISPersist#1036 item 5): the
         // licensee is the subject that files — its own `withdraws` against
@@ -1010,22 +1024,19 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I973: the filer whose key digests to the subject files");
-        let e = put(
-            dir,
-            reconsideration(
-                &format!("i973-r2-{tag}"),
-                &other,
-                &target,
-                serde_json::json!({}),
-                &[],
-            ),
-        )
-        .await
-        .expect_err("I973: any other filer is refused");
-        assert_eq!(
-            e.kind(),
-            "federation_delegated_scope_unauthorized",
-            "I973: {e}"
+        assert!(
+            put_held(
+                dir,
+                reconsideration(
+                    &format!("i973-r2-{tag}"),
+                    &other,
+                    &target,
+                    serde_json::json!({}),
+                    &[],
+                ),
+            )
+            .await,
+            "I973: any other filer is refused: held (CC 2.7, GC1), concluding nothing"
         );
     }
 }

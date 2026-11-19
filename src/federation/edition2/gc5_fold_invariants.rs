@@ -579,7 +579,7 @@ async fn cosign_non_member_body(d: &dyn FederationDirectory) {
         .await
         .unwrap()
         .expect("I3834: founded");
-    let p = super::typed::cosign_payload("signature", &event, 3_000);
+    let p = super::typed::cosign_payload(&iref(&x), "signature", &event, 3_000);
     let st = ciris_verify_core::edition2::sign_row_statement(
         &x,
         &iref(&x),

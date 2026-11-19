@@ -81,19 +81,14 @@ pub(crate) mod bodies {
         let row =
             ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner_s, &cosigned_s);
         let id = e2::rid(&row);
-        e2::put_signed(d, &row)
-            .await
-            .expect("I1840: the cosigned binding lands");
-        let voice = e2::voice_of(
-            &e2::carried_statement(&row).expect("I1840: the binding carries its statement"),
-            &cosigned_s,
-        );
-        let out = e2::put_statement(d, &voice)
+        // v62 (E4 round 3; K2, C557): the binding is counted: the owner's
+        // statement waits, and the node's voice completes it (`Row`).
+        let out = e2::land_owner_binding(d, &row, &cosigned_s)
             .await
             .expect("I1840: the node's voice lands");
         assert!(
-            matches!(out, StatementOutcome::Voice { .. }),
-            "I1840: the node's cosignature is a further voice of the held binding, not a row: {out:?}"
+            matches!(out, StatementOutcome::Row { .. }),
+            "I1840: the node's cosignature completes the held binding: {out:?}"
         );
         assert!(
             d.get_attestation(&id).await.unwrap().is_some(),
@@ -448,9 +443,17 @@ pub(crate) mod bodies {
         );
         // (a) neither names a held row, so neither is admitted or stored.
         for (row, id, what) in [(&a, &id_a, "A"), (&b, &id_b, "B")] {
+            // v62 (E4 round 3; CC 2.7, ruling 5): a composer whose target is
+            // not held WAITS for it (`Pending`) or is refused; it is never a
+            // row.
+            let out = e2::put_statement(d, &e2::statement_of(row, &user_s)).await;
             assert!(
-                e2::try_put_row(d, row, &user_s).await.is_err(),
-                "I1846: {what} names a row this node does not hold and is not admitted"
+                matches!(
+                    out,
+                    Ok(crate::federation::edition2::ingest::StatementOutcome::Pending { .. })
+                        | Err(_)
+                ),
+                "I1846: {what} names a row this node does not hold and is not admitted: {out:?}"
             );
             assert!(
                 d.get_attestation(id).await.unwrap().is_none(),

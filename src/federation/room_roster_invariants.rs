@@ -23,6 +23,18 @@ pub mod bodies {
     };
     use crate::federation::FederationDirectory;
 
+    /// v62 (E4, round 3): a key seed for `name` in the test tagged `tag`.
+    /// A test signer seeds from the FIRST 32 BYTES of its seed, so
+    /// `format!("{tag}-{name}")` with a long tag gives every name ONE key
+    /// (and a room the same id as its members): `members` then repeats a key
+    /// and the roster payload is refused. The tag is folded into a short
+    /// digest after the distinguishing name.
+    pub(crate) fn sd(name: &str, tag: &str) -> String {
+        use sha2::Digest as _;
+        let h = hex::encode(sha2::Sha256::digest(tag.as_bytes()));
+        format!("{name}-{}", &h[..16])
+    }
+
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().expect("rfc3339")
     }
@@ -34,9 +46,9 @@ pub mod bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        let room = format!("{tag}-room");
-        let alice = format!("{tag}-alice");
-        let bob = format!("{tag}-bob");
+        let room = sd("room", tag);
+        let alice = sd("alice", tag);
+        let bob = sd("bob", tag);
         dek::seed_member(b, &alice, &format!("{alice}-occ")).await;
         dek::seed_member(b, &bob, &format!("{bob}-occ")).await;
         assert!(
@@ -159,9 +171,9 @@ pub mod bodies {
         // The family twin: a keyless family (the doctrine) can revoke a seat.
         // v62 (E4): its holders are `node` keys, so its rows are now-relative
         // (CC 2.4.1.1: a node key's rows lapse with its record).
-        let fam_s = format!("{tag}-fam");
+        let fam_s = sd("fam", tag);
         let fam = e2::kid(&fam_s);
-        let holders: Vec<String> = (0..2).map(|i| format!("{tag}-h{i}")).collect();
+        let holders: Vec<String> = (0..2).map(|i| sd(&format!("h{i}"), tag)).collect();
         for h in &holders {
             e2::put_key(b, h, &[identity_type::NODE]).await;
         }
@@ -336,7 +348,7 @@ pub mod bodies {
         let (room, alice, bob) = keyless_room_dir(a, tag).await;
         let (room_b, _, _) = keyless_room_dir(b, tag).await;
         assert_eq!(room, room_b, "{tag} I164: one room");
-        let carol = e2::kid(&format!("{tag}-carol"));
+        let carol = e2::kid(&sd("carol", tag));
         for d in [a, b] {
             e2::put_key(d, &carol, &[identity_type::USER]).await;
         }
@@ -400,7 +412,7 @@ pub mod bodies {
             // v62 (E4, flip wave 2): carol is an edition-2 key; each event is
             // its signers' `membership:{stage}` voices naming the roster's
             // held version (the widenings with carol's consent held first).
-            let carol = e2::put_key(*d, &format!("{tg}-carol"), &[identity_type::USER]).await;
+            let carol = e2::put_key(*d, &sd("carol", &tg), &[identity_type::USER]).await;
             let events: Vec<(&str, usize)> = match i {
                 0 => vec![("w", 1), ("r", 2), ("w", 3), ("r", 4)],
                 1 => vec![("r", 4), ("w", 3), ("r", 2), ("w", 1)],
@@ -496,7 +508,7 @@ pub mod bodies {
             // seeds the room from a skewed clock must not refuse an earlier
             // mint — I77) — and her revocation at any instant still removes.
             let late = crate::federation::types::CommunityMember {
-                key_id: format!("{tag}-late"),
+                key_id: sd("late", tag),
                 joined_at: t4 + chrono::Duration::days(30),
                 role: None,
             };
@@ -535,9 +547,9 @@ pub mod bodies {
         // v62 (E4, flip wave 2): edition-2 keys, the record as its voices,
         // carol's widening with her consent held first, the leavings as
         // `membership:removal` voices; ids are identity-refs.
-        let room_s = format!("{tag}-room");
-        let alice = e2::kid(&format!("{tag}-alice"));
-        let carol = e2::kid(&format!("{tag}-carol"));
+        let room_s = sd("room", tag);
+        let alice = e2::kid(&sd("alice", tag));
+        let carol = e2::kid(&sd("carol", tag));
         for k in [&alice, &carol] {
             e2::put_key(d, k, &[identity_type::USER]).await;
         }

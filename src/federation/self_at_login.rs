@@ -2812,9 +2812,10 @@ pub(crate) mod test_support {
     ///   x25519 and ed25519, the signer's own Ed25519, `encryption_pubkeys`
     ///   (both halves), and the other X-Wing key (named under the hop key's
     ///   token). The held bind never moves.
-    /// - **I3330** a same-instant re-bind that changes only an X-Wing key
-    ///   displaces nothing (the held bind is still served); the exact replay
-    ///   is idempotent (`Row`, `new = false`).
+    /// - **I3330** two same-instant binds that differ only in an X-Wing key:
+    ///   the LOWER row id holds (CC 3.5.1; nothing ranks by arrival, CC
+    ///   2.7.2), in either arrival order; the exact replay is idempotent
+    ///   (`Row`, `new = false`).
     /// - **I3331** (depends on O1's fix) the resolvers read the bind: a
     ///   non-seat node's `transit_xwing_pubkey_for` and
     ///   `onion_hop_xwing_pubkey_for` answer its held bind's keys.
@@ -3050,25 +3051,56 @@ pub(crate) mod test_support {
             Some(ok.as_slice())
         );
 
-        // I3330 — a same-instant re-bind changing only an X-Wing key is not
-        // the held bind; the exact replay is idempotent.
-        let fork = node_bind(t(40))
-            .with("encryption_pubkeys", encryption(enc_x, &enc_m))
-            .with(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &[0xA3u8; 32]))
-            .with(ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x))
-            .own_voice();
+        // I3330 — two binds of the same node at the same instant that differ
+        // only in an X-Wing key: the LOWER row id holds (CC 3.5.1; nothing
+        // ranks by arrival, CC 2.7.2), whichever arrives first. The exact
+        // replay of a held statement is idempotent.
+        let same_instant = |at: u64, transit_x: [u8; 32]| {
+            node_bind(at)
+                .with("encryption_pubkeys", encryption(enc_x, &enc_m))
+                .with(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &transit_x))
+                .with(ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x))
+                .own_voice()
+        };
+        let lower = |a: &Vec<u8>, b: &Vec<u8>| -> Vec<u8> {
+            if e2::row_id_of(a) < e2::row_id_of(b) {
+                a.clone()
+            } else {
+                b.clone()
+            }
+        };
+        // (a) The held bind first, the fork second.
+        let fork = same_instant(t(40), [0xA3u8; 32]);
         put(dir, &fork)
             .await
             .expect("I3330: the fork is a well-formed bind");
         assert_eq!(
-            served(dir, &relay, &relay).await.as_deref(),
-            Some(ok.as_slice()),
-            "I3330: a same-instant fork displaces nothing"
+            served(dir, &relay, &relay).await,
+            Some(lower(&ok, &fork)),
+            "I3330 (held first): the lower row id holds"
         );
         assert!(
             is_row(&put(dir, &ok).await.expect("I3330: replay"), false),
             "I3330: the exact replay is Row, not new"
         );
+        // (b) The fork first, the other second (a later instant, so both are
+        // newer than (a)).
+        let fork2 = same_instant(t(30), [0xA4u8; 32]);
+        let other2 = same_instant(t(30), t_x);
+        put(dir, &fork2)
+            .await
+            .expect("I3330: the second fork is a well-formed bind");
+        put(dir, &other2)
+            .await
+            .expect("I3330: the second pair's other bind is well-formed");
+        let winner = lower(&fork2, &other2);
+        assert_eq!(
+            served(dir, &relay, &relay).await,
+            Some(winner.clone()),
+            "I3330 (fork first): the lower row id holds, whatever the arrival order"
+        );
+        let winner_transit = payload_bytes(&winner, TRANSIT_XWING_PUBKEY_MEMBER)
+            .expect("I3330: the winner carries the transit key");
 
         // I3331 (depends on O1's fix: the resolvers read edition-2 binds) — a
         // node that is not a seat: its held bind's X-Wing keys resolve, the
@@ -3078,8 +3110,8 @@ pub(crate) mod test_support {
                 .await
                 .unwrap()
                 .map(|k| k.as_bytes().to_vec()),
-            Some([t_m.as_slice(), &t_x[..]].concat()),
-            "I3331: a non-seat's bind transit key resolves"
+            Some(winner_transit),
+            "I3331: a non-seat's held bind's transit key resolves"
         );
         assert_eq!(
             crate::federation::edition2::occurrence::onion_hop_xwing_pubkey_for(dir, &relay_kid)

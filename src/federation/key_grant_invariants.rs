@@ -148,6 +148,65 @@ pub mod two_node {
         }
     }
 
+    /// v62.0.0 (P1-fix4; CC rc21 3.3.6) — **`owner` OWNS `key`**: the owner
+    /// binding row (`owner` a seed), landed by K2's
+    /// `ts::put_sealed_owner_binding` with `key`'s voice (signed by
+    /// `key_seed`, a seed or a seed-known kid, e.g. an engine's alias). The
+    /// CC-correct way for a person to stand behind a machine key (a node or
+    /// an agent), which is never an occurrence of the person. Published in
+    /// P1.api.md.
+    pub async fn own_key(
+        d: &dyn crate::federation::FederationDirectory,
+        owner: &str,
+        key: &str,
+        key_seed: &str,
+    ) {
+        // v62.0.0 (P1-fix5) — ONE voice path and one dating rule: K2's
+        // `put_sealed_owner_binding` (the owner's statement through the
+        // statement door, then the bound key's voice by `key_seed`; it asserts
+        // the binding lands, and the builder dates it inside the bound key's
+        // window). In the earlier form it is `put_attestation`, as before.
+        let row = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner, key);
+        ts::put_sealed_owner_binding(d, &row, key_seed)
+            .await
+            .unwrap_or_else(|e| panic!("{owner} owns {key}: {e}"));
+    }
+
+    /// v62.0.0 (P1-fix4; CC rc21 3.3.6) — **THE shared fixture for "a
+    /// person's device node"** (published in P1.api.md): `owner` (a seed)
+    /// owns the node key `node` ([`own_key`], voiced by `node_seed`), and the
+    /// node states its own class (`device_class`) and content-KEM keys on its
+    /// SELF-occurrence (identity = occurrence = the node, which CC rc21
+    /// allows). This replaces binding a `node` / `agent` key as an occurrence
+    /// of a person, which the door refuses
+    /// (`occurrence_binds_machine_to_person`). The node then receives its
+    /// owner's content by its class (`replication_audience::owned_device`)
+    /// and is a wrap target through `nodes_owned_by`
+    /// (`at_rest_cascade::member_holders`).
+    pub async fn place_device(
+        d: &dyn crate::federation::FederationDirectory,
+        owner: &str,
+        node: &str,
+        node_seed: &str,
+        device_class: &str,
+        kem: Option<EncryptionPubkeys>,
+    ) {
+        d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            identity_key_id: node.to_owned(),
+            occurrence_key_id: node.to_owned(),
+            device_class: device_class.to_owned(),
+            hardware_attestation: None,
+            asserted_at: chrono::Utc::now(),
+            valid_until: None,
+            encryption_pubkeys: kem,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{node}'s self-occurrence: {e}"));
+        own_key(d, owner, node, node_seed).await;
+    }
+
     /// v62.0.0 (E11) — POSIX ms of an instant (`e2::ms`).
     pub fn ms(at: chrono::DateTime<chrono::Utc>) -> u64 {
         e2::ms(at)
@@ -458,7 +517,21 @@ pub mod two_node {
             for (ident, occ) in members {
                 ts::register_hybrid_key_as(n.backend, ident, ident, USER).await;
                 if let Some(o) = occ {
-                    bind_member_device(n.backend, &e2::kid(ident), &o.key, &o.kem).await;
+                    // v62.0.0 (P1-fix4; CC rc21 3.3.6) — a node key is never
+                    // an occurrence of a person: the member OWNS the node
+                    // (owner binding, the node's voice), and the node states
+                    // its class and content-KEM keys on its self-occurrence.
+                    // It is a wrap target through `nodes_owned_by`
+                    // (`at_rest_cascade::member_holders`).
+                    place_device(
+                        n.backend,
+                        ident,
+                        &o.key,
+                        &o.key,
+                        crate::federation::types::device_class::LAPTOP,
+                        Some(o.kem.clone()),
+                    )
+                    .await;
                 }
             }
             // v62.0.0 (T1) — the room is its `group:roster` voices (the

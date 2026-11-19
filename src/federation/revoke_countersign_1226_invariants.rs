@@ -48,7 +48,7 @@ pub(crate) mod bodies {
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::membership_acceptance_invariants::bodies::{
-        found_family, found_room_with_blob, proposal, put, reg, reply,
+        found_family, found_room_with_blob, id_of, proposal, put, reg, reply,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
@@ -159,6 +159,15 @@ pub(crate) mod bodies {
         let k = |x: &str| format!("i1610-{x}-{s}");
         let (f, official, m, n, solo) = (k("f"), k("official"), k("m"), k("n"), k("solo"));
         reg(d, &[&f, &official, &m, &n, &solo]).await;
+        // v62.0.0 (round 3) — named as the directory keys them (E5's `id_of`,
+        // as I1513 does): a seed seated nobody the roster holds.
+        let (f, official, m, n, solo) = (
+            id_of(&f),
+            id_of(&official),
+            id_of(&m),
+            id_of(&n),
+            id_of(&solo),
+        );
         let at = Utc::now() - Duration::hours(1);
         sole_practice(d, &solo, &f, &official, &m, &n, at).await;
 
@@ -244,6 +253,9 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I1616: f's second device");
+        // v62.0.0 (round 3) — named as the directory keys them (E5's `id_of`,
+        // as I1513 does): a seed seated nobody the roster holds.
+        let (f, f2, m, n, solo) = (id_of(&f), id_of(&f2), id_of(&m), id_of(&n), id_of(&solo));
         let at = Utc::now() - Duration::hours(1);
         sole_practice(d, &solo, &f, &f2, &m, &n, at).await;
         let r = remove(d, Cohort::Affiliations, &solo, &[&f, &f2], &m, Utc::now()).await;
@@ -256,6 +268,13 @@ pub(crate) mod bodies {
         // Control: an official who is another person countersigns.
         let (g, official, p, q, other) = (k("g"), k("official"), k("p"), k("q"), k("other"));
         reg(d, &[&g, &official, &p, &q, &other]).await;
+        let (g, official, p, q, other) = (
+            id_of(&g),
+            id_of(&official),
+            id_of(&p),
+            id_of(&q),
+            id_of(&other),
+        );
         sole_practice(d, &other, &g, &official, &p, &q, at).await;
         remove(
             d,
@@ -283,6 +302,15 @@ pub(crate) mod bodies {
         let k = |x: &str| format!("i1617-{x}-{s}");
         let (f, official, m, n, solo) = (k("f"), k("official"), k("m"), k("n"), k("solo"));
         reg(d, &[&f, &official, &m, &n, &solo]).await;
+        // v62.0.0 (round 3) — named as the directory keys them (E5's `id_of`,
+        // as I1513 does): a seed seated nobody the roster holds.
+        let (f, official, m, n, solo) = (
+            id_of(&f),
+            id_of(&official),
+            id_of(&m),
+            id_of(&n),
+            id_of(&solo),
+        );
         let at = Utc::now() - Duration::hours(1);
         sole_practice(d, &solo, &f, &official, &m, &n, at).await;
 
@@ -318,6 +346,9 @@ pub(crate) mod bodies {
         let k = |x: &str| format!("i1615-{x}-{s}");
         let (a, b, u, fam) = (k("a"), k("b"), k("u"), k("fam"));
         reg(d, &[&a, &b, &u, &fam]).await;
+        // v62.0.0 (round 3) — named as the directory keys them (E5's `id_of`,
+        // as I1513 does): a seed seated nobody the roster holds.
+        let (a, b, u, fam) = (id_of(&a), id_of(&b), id_of(&u), id_of(&fam));
         // Every member a founding record lists signs it (CC 3.2, the
         // founding rule), so `u` joins the two founders the way a member
         // does: by a widening both founders sign, after u's consent.

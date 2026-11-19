@@ -14,8 +14,7 @@
 
 pub(crate) mod bodies {
     use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
-    use crate::federation::key_grant_invariants::two_node::{introduce_as, Node};
-    use crate::federation::self_collective_invariants::bodies::bind;
+    use crate::federation::key_grant_invariants::two_node::{introduce_as, place_device, Node};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{self, CryptoTier};
     use crate::federation::types::identity_type::USER;
@@ -80,14 +79,25 @@ pub(crate) mod bodies {
             crate::federation::types::identity_type::NODE,
         )
         .await;
-        let owner = format!("i144-owner-{run}");
+        // v62.0.0 (E2-fix3; CC rc21 3.3.6, P1.api round 3) — each engine is
+        // the owner's device node (`place_device`), never an occurrence of
+        // the person; the owner is named by its kid.
+        let owner_seed = format!("i144-owner-{run}");
         for n in [&a, &b] {
-            ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
-            for dev in [&a, &b] {
-                bind(n.backend, &owner, &dev.key, Some(dev.kem.clone())).await;
-                ts::put_owner_binding(n.backend, &owner, &dev.key).await;
+            ts::register_hybrid_key_as(n.backend, &owner_seed, &owner_seed, USER).await;
+            for (dev, alias) in [(&a, &alias_a), (&b, &alias_b)] {
+                place_device(
+                    n.backend,
+                    &owner_seed,
+                    &dev.key,
+                    alias,
+                    crate::federation::types::device_class::LAPTOP,
+                    Some(dev.kem.clone()),
+                )
+                .await;
             }
         }
+        let owner = crate::federation::edition2::fixture_switch::kid(&owner_seed);
 
         // Two single-chunk streams beside the main one, for the negative
         // cases: a chunk adopted at the right position with the WRONG sha

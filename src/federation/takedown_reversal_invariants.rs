@@ -121,6 +121,18 @@ pub(crate) mod bodies {
             .map(|_| ())
     }
 
+    /// v62.0.0 (round 3; CC 2.7, wave GC1) — the row through the one entry is
+    /// HELD: kept, concluding nothing until its standing arrives
+    /// (`StatementOutcome::Pending`). GC1 turned the reconsideration door's
+    /// refusals (no review duty, another community) into fold holds; the
+    /// reason tokens are a G-wave's to pin.
+    pub(crate) async fn put_held(dir: &dyn FederationDirectory, row: Attestation) -> bool {
+        matches!(
+            crate::federation::edition2::fixture_switch::put_signed(dir, &row).await,
+            Ok(crate::federation::edition2::ingest::StatementOutcome::Pending { .. })
+        )
+    }
+
     // ── I1366 ─────────────────────────────────────────────────────────────
     pub(crate) async fn i1366_a_reversal_lifts_the_withholding_at_read<D>(d: &D, tag: &str)
     where
@@ -151,40 +163,34 @@ pub(crate) mod bodies {
         );
 
         // A stranger rules: no review duty over the content here.
-        let e = put(
-            dir,
-            ruling(
-                &stranger.id,
-                &notice_row,
-                "reversed",
-                cohort_scope::FEDERATION,
-                &comm,
-            ),
-        )
-        .await
-        .expect_err("I1366: a stranger cannot rule");
-        assert_eq!(
-            e.kind(),
-            "federation_delegated_scope_unauthorized",
-            "I1366: {e}"
+        assert!(
+            put_held(
+                dir,
+                ruling(
+                    &stranger.id,
+                    &notice_row,
+                    "reversed",
+                    cohort_scope::FEDERATION,
+                    &comm,
+                ),
+            )
+            .await,
+            "I1366: a stranger cannot rule: held (CC 2.7, GC1), concluding nothing"
         );
         // A ruling naming a community the content is not bound into.
-        let e = put(
-            dir,
-            ruling(
-                &moderator.id,
-                &notice_row,
-                "reversed",
-                cohort_scope::FEDERATION,
-                &format!("{comm}-other"),
-            ),
-        )
-        .await
-        .expect_err("I1366: another community");
         assert!(
-            e.to_string()
-                .contains(crate::federation::admission::RECONSIDERATION_COMMUNITY_MISMATCH),
-            "I1366: {e}"
+            put_held(
+                dir,
+                ruling(
+                    &moderator.id,
+                    &notice_row,
+                    "reversed",
+                    cohort_scope::FEDERATION,
+                    &format!("{comm}-other"),
+                ),
+            )
+            .await,
+            "I1366: another community: held (CC 2.7, GC1), concluding nothing"
         );
         // The content's signed subject FILES (no outcome, naming no
         // community): admitted. The subject cannot RULE: refused.
@@ -199,22 +205,19 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I1366: the content's subject files");
-        let e = put(
-            dir,
-            ruling(
-                &author,
-                &notice_row,
-                "reversed",
-                cohort_scope::FEDERATION,
-                "",
-            ),
-        )
-        .await
-        .expect_err("I1366: the subject cannot rule");
-        assert_eq!(
-            e.kind(),
-            "federation_delegated_scope_unauthorized",
-            "I1366: {e}"
+        assert!(
+            put_held(
+                dir,
+                ruling(
+                    &author,
+                    &notice_row,
+                    "reversed",
+                    cohort_scope::FEDERATION,
+                    "",
+                ),
+            )
+            .await,
+            "I1366: the subject cannot rule: held (CC 2.7, GC1), concluding nothing"
         );
         assert_eq!(withheld().await, Some(r.notice_id.clone()), "I1366: filed");
         // Upheld: admitted, and the bytes stay withheld.

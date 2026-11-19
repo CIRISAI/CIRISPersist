@@ -73,7 +73,8 @@ pub mod bodies {
         })?;
         let env = serde_json::json!({
             "references_attestation_id": target_id,
-            "withdrawal_reason": "CC 2.3",
+            // v62 (E4 round 3): a composer's payload is the common members and
+            // `refs.target` only (P1e); `withdrawal_reason` is not one.
         });
         let mut w = e2::with_earlier_form(|| ts::bare_attestation(id, issuer, issuer, &env));
         w.attestation_type = attestation_type::WITHDRAWS.into();
@@ -490,9 +491,11 @@ pub mod bodies {
         // runner seeds the engine from the label below; the assert pins it.
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(b, "node-tomb").await;
+        // v62 (E4 round 3; cut B): the engine names its local signer by the
+        // signer's federation id (the composite identity-ref).
         assert_eq!(
             engine.local_derived_key_id().await.unwrap(),
-            signer.derived_key_id(),
+            signer.federation_id().await,
             "I153: the runner's engine must be signed by the label this body rebuilds"
         );
         // v62 (E4, wave 4; cut B): the node states its rows (the holding

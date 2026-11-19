@@ -453,12 +453,21 @@ pub(crate) mod dyn_bodies {
                 at,
             ),
         )
-        .await
-        .unwrap_err();
+        .await;
+        // v62 (E4 round 3; CC 2.7.3): the comparison with the held head is a
+        // fold condition: the version is held (or refused by its rule) and
+        // the room stays public.
+        if let Err(e) = &e {
+            assert_eq!(
+                rule_of(e),
+                crate::federation::public_room::PUBLIC_RULE_SUBKIND_CROSSES_PUBLIC,
+                "I712 {e}"
+            );
+        }
+        let (still, _) = e2::held_head(d, &id).await.expect("I712 the room's head");
         assert_eq!(
-            rule_of(&e),
-            crate::federation::public_room::PUBLIC_RULE_SUBKIND_CROSSES_PUBLIC,
-            "I712 {e}"
+            still, head,
+            "I712 the version leaving `public` concludes nothing"
         );
     }
 
@@ -624,16 +633,18 @@ pub(crate) mod dyn_bodies {
         row.attestation_type = crate::federation::types::attestation_type::SCORES.into();
         row.cohort_scope = cs::FEDERATION.into();
         ts::seal_row_in_place(&founder, &mut row);
-        let e = e2::put_signed(d, &row).await.unwrap_err();
+        // v62 (E4 round 3; CC 2.7.3): the wait is a HOLD (`Pending`), and the
+        // held row concludes nothing.
+        let r = e2::put_signed(d, &row).await;
         assert!(
-            e.to_string().contains("held scope_membership_unresolved"),
-            "I724 a listing ahead of its room waits, held: {e}"
+            matches!(
+                r,
+                Ok(crate::federation::edition2::ingest::StatementOutcome::Pending { .. })
+            ),
+            "I724 a listing ahead of its room waits, held: {r:?}"
         );
         assert!(
-            d.get_attestation(&row.attestation_id)
-                .await
-                .unwrap()
-                .is_none(),
+            d.get_attestation(&e2::rid(&row)).await.unwrap().is_none(),
             "I724 it concludes nothing"
         );
         put_room(d, room(&id, &founder, None, open_policy(), OPEN))
@@ -647,7 +658,7 @@ pub(crate) mod dyn_bodies {
                 .await
                 .unwrap()
                 .map(|r| r.attestation_id),
-            Some(row.attestation_id)
+            Some(e2::rid(&row))
         );
     }
 
@@ -766,17 +777,29 @@ pub(crate) mod dyn_bodies {
             listing(d, &founder_alias, cs::FEDERATION, no_mod).await,
             "community_listing_malformed",
         );
-        refused(
+        // v62 (E4 round 3; CC 2.7.3, wave GC6): a condition that reads
+        // OTHER rows (the room, its roster) is a fold condition: the listing
+        // is HELD under its token and concludes nothing, so it is never the
+        // room's live listing (asserted below). The tokens are not pinned.
+        let held = |r: Result<String, Error>, token: &str| match r {
+            Ok(_) => {}
+            Err(e) => assert!(e.to_string().contains(token), "I714 {token}: {e}"),
+        };
+        held(
             listing(d, &founder_alias, cs::FEDERATION, good(&private)).await,
             "community_listing_room_not_public",
         );
+        assert!(
+            live_listing(d, &private).await.unwrap().is_none(),
+            "I714 a private room is never listed"
+        );
         let mut lie = good(&pubroom);
         lie["admission"] = serde_json::json!("invite");
-        refused(
+        held(
             listing(d, &founder_alias, cs::FEDERATION, lie).await,
             "community_listing_malformed",
         );
-        refused(
+        held(
             listing(d, &other_alias, cs::FEDERATION, good(&pubroom)).await,
             "community_listing_signer_not_authorized",
         );
@@ -938,7 +961,13 @@ pub(crate) mod blob_bodies {
             "I715 {c:?}"
         );
         assert_eq!(c.attestation_envelope["size"], bytes.len() as u64);
-        assert!(c.expires_at.is_some(), "I715 the row carries its freshness");
+        // v62 (E4 round 3; CC 3.1.3.3, wave P1): the edition-2 claim carries
+        // no `expires_at` (a custody payload's map is closed); it is live
+        // `CUSTODY_LIVE_SECS` from its signed instant, judged by the fold.
+        assert!(
+            c.expires_at.is_none(),
+            "I715 the freshness is the signed instant's, not a carried expiry"
+        );
         assert!(
             b.all_attestations_by(&n.key)
                 .await
@@ -1887,27 +1916,10 @@ pub(crate) mod blob_bodies {
                 .any(|h| h.attestation_type == legacy_type),
             "I718 reported to the operator"
         );
-        let mut from_peer = b
-            .get_attestation(&claim.attestation_id)
-            .await
-            .unwrap()
-            .unwrap();
-        // A peer's own retired row: its signed mirror names the retired type
-        // and its own id, so the column binding agrees and the row reaches
-        // the row-type slot.
-        from_peer.attestation_id = uuid::Uuid::new_v4().to_string();
-        crate::federation::envelope::RowMirror::stamp_row(&mut from_peer).unwrap();
-        let e = b
-            .apply_replicated_attestation(crate::federation::SignedAttestation {
-                attestation: from_peer,
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(
-            e.kind(),
-            "federation_attestation_type_unregistered",
-            "I718 a retired row from a peer is refused: {e}"
-        );
+        // v62 (E4 round 3): the earlier-form leg (a peer's retired JSON row,
+        // re-stamped under a fresh uuid, offered at the replicated door) is
+        // DELETED: an edition-2 row is its statement, stored under its row
+        // id, so that row cannot be built (ruling 4).
     }
 
     /// **I719** — eviction retracts this node's own claims only.

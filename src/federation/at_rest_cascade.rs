@@ -4260,6 +4260,12 @@ pub mod blob_invariants {
         // signature verifies against the registered key).
         let derived = signer.derived_key_id();
         ts::register_hybrid_key_as(backend, &derived, key_id, USER).await;
+        // E5-fix1 (round 3) — v62 slice B: a composite signer states (and
+        // announces, holds, mints) under its `federation_id` (its key's
+        // identity-ref, `kid(key_id)` here: the key `register_hybrid_key_as`
+        // puts under the switch), never the earlier `derived_key_id`. Read
+        // once so `federation_id_now` (the synchronous preflights) agrees.
+        let _ = signer.federation_id().await;
         signer
     }
 
@@ -4290,7 +4296,7 @@ pub mod blob_invariants {
                 &id,
                 BlobBody::Inline(body.clone()),
                 None,
-                &signer.derived_key_id(),
+                &signer.federation_id().await,
                 &signer,
                 crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
@@ -4356,7 +4362,7 @@ pub mod blob_invariants {
                     &id,
                     BlobBody::Inline(spoofed.clone()),
                     None,
-                    &signer.derived_key_id(),
+                    &signer.federation_id().await,
                     &signer,
                     crate::host::clock::now(),
                     uuid::Uuid::new_v4(),
@@ -4668,7 +4674,7 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
             crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
         );
-        let minter = signer.derived_key_id();
+        let minter = signer.federation_id().await;
 
         let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None, Some(&minter))
             .await
@@ -4679,7 +4685,7 @@ pub mod blob_invariants {
         // (`orchestrate::put_blob_scoped`) announces under and what the sweep
         // looks up. An announcement under an arbitrary attesting key is that
         // key's holder's to retract; the sweep cannot sign for it.
-        let node_derived = signer.derived_key_id();
+        let node_derived = signer.federation_id().await;
         let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
         else {
             panic!("{tag} I9: sealed blob is inline");
@@ -4693,7 +4699,7 @@ pub mod blob_invariants {
                 &sealed.at_rest_sha256,
                 BlobBody::Inline(bytes),
                 None,
-                &signer.derived_key_id(),
+                &signer.federation_id().await,
                 &signer,
                 crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
@@ -4789,7 +4795,7 @@ pub mod blob_invariants {
                 &id,
                 BlobBody::Inline(body.clone()),
                 None,
-                &signer.derived_key_id(),
+                &signer.federation_id().await,
                 &signer,
                 crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
@@ -4806,7 +4812,7 @@ pub mod blob_invariants {
                 .list_holders(&id)
                 .await
                 .unwrap()
-                .contains(&signer.derived_key_id()),
+                .contains(&signer.federation_id().await),
             "{tag} I10: commons-tier infra content announces its holding claim"
         );
     }
@@ -5035,8 +5041,8 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
             crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
         );
-        let minter = signer.derived_key_id();
-        let node_derived = signer.derived_key_id();
+        let minter = signer.federation_id().await;
+        let node_derived = signer.federation_id().await;
         async fn withdraws_by<D: FederationDirectory + Sync>(backend: &D, node: &str) -> usize {
             use crate::federation::attestation_query::test_support::AllAttestations as _;
             backend
@@ -5067,7 +5073,7 @@ pub mod blob_invariants {
                 &sealed.at_rest_sha256,
                 BlobBody::Inline(bytes),
                 None,
-                &signer.derived_key_id(),
+                &signer.federation_id().await,
                 &signer,
                 crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
@@ -5143,7 +5149,7 @@ pub mod blob_invariants {
                 &sealed2.at_rest_sha256,
                 BlobBody::Inline(bytes2),
                 None,
-                &signer.derived_key_id(),
+                &signer.federation_id().await,
                 &signer,
                 crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
@@ -5472,7 +5478,7 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
         );
         let signer = node_signer(backend, &node).await;
-        let minter = signer.derived_key_id();
+        let minter = signer.federation_id().await;
         assert!(matcher.refuse, "{tag} I21b: fixture — a refusing matcher");
         let epoch = backend
             .community_dek_current_epoch(&comm, &minter)
@@ -5517,7 +5523,7 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         assert_ne!(
             derived, node,
             "{tag} I23: fixture — alias and derived id differ"
@@ -5663,8 +5669,8 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
         );
         let signer = node_signer(backend, &node).await;
-        let minter = signer.derived_key_id();
-        let node_derived = signer.derived_key_id();
+        let minter = signer.federation_id().await;
+        let node_derived = signer.federation_id().await;
 
         // The cascade half of the door: sealed, stored, bound.
         let sealed = encrypt_and_cascade_community(backend, &comm, b"raced", None, Some(&minter))
@@ -5705,7 +5711,7 @@ pub mod blob_invariants {
                 &sealed.at_rest_sha256,
                 BlobBody::Inline(bytes),
                 None,
-                &signer.derived_key_id(),
+                &signer.federation_id().await,
                 &signer,
                 crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
@@ -5728,6 +5734,68 @@ pub mod blob_invariants {
                 .unwrap()
                 .contains(&node_derived),
             "{tag} I28: no holder claim for bytes this node does not hold"
+        );
+    }
+
+    // ── I3332 (E8-fix2) ──────────────────────────────────────────────────
+    /// **I3332 — a community-DEK announce needs a LIVE binding, and never
+    /// stores** (§11.5 / I28, #833; the I27 regression of d5b39133, cut B).
+    /// Sealed bytes are held at the community tier but the cascade never
+    /// bound them. The door's announce of them refuses `NotHeld`: no holding
+    /// claim is emitted, and the row is not re-written. Before the fix, the
+    /// sealed floor ran `store_blob_local` (re-storing, with no lock and no
+    /// binding check) and then emitted the claim.
+    pub async fn exercise_i3332_a_community_announce_needs_a_live_binding<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::AT_REST_ENVELOPE_MAGIC;
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        use crate::federation::StorageFloor;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm =
+            crate::federation::edition2::fixture_switch::kid(&format!("{tag}-i3332-comm-{run}"));
+        let signer = node_signer(backend, &format!("{tag}-i3332-node-{run}")).await;
+        let mut body = AT_REST_ENVELOPE_MAGIC.to_vec();
+        body.extend_from_slice(format!("i3332 unbound ciphertext {run}").as_bytes());
+        let id = sha(&body);
+        let floor = || StorageFloor::resolved(CryptoTier::CommunityDek);
+        // Held at the community tier, named to the room, never bound.
+        backend
+            .store_blob_local(
+                &id,
+                BlobBody::Inline(body.clone()),
+                None,
+                COMMUNITY,
+                floor(),
+                Some(&signer.derived_key_id()),
+                Some(&comm),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I3332: precondition, the unbound row: {e}"));
+        assert!(backend.has_blob(&id).await.unwrap(), "{tag} I3332: held");
+        let res = backend
+            .put_blob_signing_at(
+                COMMUNITY,
+                floor(),
+                &id,
+                BlobBody::Inline(body),
+                None,
+                &signer.derived_key_id(),
+                &signer,
+                crate::host::clock::now(),
+                uuid::Uuid::new_v4(),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(res, Err(BlobError::NotHeld { .. })),
+            "{tag} I3332: announcing an UNBOUND community-DEK row must refuse NotHeld (an \
+             announcement needs the cascade's live binding and never stores), got {res:?}"
+        );
+        assert!(
+            backend.list_holders(&id).await.unwrap().is_empty(),
+            "{tag} I3332: no holding claim for an unbound row"
         );
     }
 
@@ -5771,7 +5839,7 @@ pub mod blob_invariants {
         let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
         // #848 — the sweep runs over the signer's own counter: the sweeper
         // is the minter of everything sealed below.
-        let minter = sweeper.derived_key_id();
+        let minter = sweeper.federation_id().await;
 
         let sealed = encrypt_and_cascade_community(backend, &comm, b"minutes", None, Some(&minter))
             .await
@@ -6631,23 +6699,12 @@ pub mod blob_invariants {
         );
         binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         ts::seal_row_in_place(owner_key_id, &mut binding);
-        // v62.0.0 (JSON cut, E5) — a sealed edition-2 row enters through the
-        // one entry (it runs the attestation gates); a held (earlier-form)
-        // caller's row through the JSON door as before.
-        let put =
-            if crate::federation::edition2::fixture_switch::carried_statement(&binding).is_some() {
-                crate::federation::edition2::fixture_switch::put_signed(backend, &binding)
-                    .await
-                    .map(|_| ())
-            } else {
-                backend
-                    .put_attestation(crate::federation::SignedAttestation {
-                        attestation: binding,
-                    })
-                    .await
-                    .map(|_| ())
-            };
-        put.unwrap_or_else(|e| panic!("confer infra:serve on {server_key_id}: {e}"));
+        // E5-fix1 (round 3; K2.api) — the owner's statement and the bound
+        // node's own voice (CC 3.2 / C557: the binding counts with both),
+        // through K2's shared helper; the JSON door when held.
+        ts::put_sealed_owner_binding(backend, &binding, server_key_id)
+            .await
+            .unwrap_or_else(|e| panic!("confer infra:serve on {server_key_id}: {e}"));
     }
 
     /// #846 — a sealed community envelope to adopt: cascades `body` under
@@ -6706,7 +6763,7 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let our = signer.derived_key_id();
+        let our = signer.federation_id().await;
         let family = vec![format!("{tag}-fam-{run}")];
         let peer = format!("{tag}-peer-{run}");
         // A community this node is party to (our key is alice's occurrence).
@@ -6863,7 +6920,7 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let our = signer.derived_key_id();
+        let our = signer.federation_id().await;
         let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
 
@@ -7048,7 +7105,7 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let our = signer.derived_key_id();
+        let our = signer.federation_id().await;
         let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
         let comm = format!("{tag}-comm-{run}");
@@ -7153,11 +7210,11 @@ pub mod blob_invariants {
             let author_signer = node_signer(backend, &author_node).await;
             let author_adapter =
                 crate::signing::LocalSignerHardwareAdapter::new(author_signer.clone());
-            let author = author_signer.derived_key_id();
+            let author = author_signer.federation_id().await;
             let node = format!("{tag}-node-{run}");
             let signer = node_signer(backend, &node).await;
             let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
-            let our = signer.derived_key_id();
+            let our = signer.federation_id().await;
             let family: Vec<String> = Vec::new();
             let comm = format!("{tag}-comm-{run}");
             let alice = format!("{tag}-alice-{run}");
@@ -7281,8 +7338,8 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let minter = signer.derived_key_id();
-        let our = signer.derived_key_id();
+        let minter = signer.federation_id().await;
+        let our = signer.federation_id().await;
         let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
         let ctx = hold_ctx(false, &our, &family);
@@ -7430,7 +7487,7 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let our = signer.derived_key_id();
+        let our = signer.federation_id().await;
         let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
         let ctx = hold_ctx(false, &our, &family);

@@ -109,10 +109,14 @@ pub(crate) mod bodies {
     /// optionally FOR `for_key` (an identity-ref). `id` keeps two grants
     /// distinct rows (the row id is over the payload).
     fn grant(id: &str, author: &str, peer: &str, for_key: Option<&str>) -> Attestation {
+        // v62.0.0 (round 3) — no `label`: the #510 closed consent-transfer
+        // grammar has no such member. Rows stay distinct by their payload (the
+        // peer rides `subject_key_ids`, a payload member); `id` names the call
+        // site only.
+        let _ = id;
         let mut payload = serde_json::json!({
             "grants": "replication",
             "attestation_prefixes": ["i96-fixture:"],
-            "label": id,
         });
         if let Some(f) = for_key {
             payload[cbh::FOR_KEY_ID] = serde_json::Value::String(f.to_owned());
@@ -186,14 +190,12 @@ pub(crate) mod bodies {
         row.attestation_envelope[crate::federation::envelope::paths::ASSERTED_AT] =
             serde_json::Value::String(admission::render_signed_instant(at));
         ts::reseal(&mut row);
-        put(d, row.clone()).await.expect("the owner binding");
-        let voice = e2::voice_of(
-            &e2::carried_statement(&row).expect("the binding carries its statement"),
-            node,
-        );
-        e2::put_statement(d, &voice)
+        // v62.0.0 (round 3; K2.api) — the owner's statement through the
+        // statement door (held `Pending` short of the node's voice), then the
+        // node's voice, which lands it: K2's shared helper.
+        ts::put_sealed_owner_binding(d, &row, node)
             .await
-            .expect("the node's voice on its owner binding");
+            .expect("the owner binding");
     }
 
     async fn put(
@@ -773,10 +775,13 @@ mod run {
         a.self_at_login(SelfAtLoginInput {
             identity_key_id: alice.clone(),
             identity_signer: Some(alice_signer),
+            // v62.0.0 (round 3; P8) — each occurrence key's own pen is in hand,
+            // so its bind lands, and the agent's owner binding (its human, CC
+            // 3.3.6) is stated by the ceremony.
             app: SelfAtLoginOccurrence {
                 occurrence_key_id: app.clone(),
                 identity_key_id: None,
-                occurrence_signer: None,
+                occurrence_signer: Some(ts::local_signer(&app_s)),
                 transport: None,
                 device_class: "phone".into(),
                 hardware_attestation: None,
@@ -786,7 +791,7 @@ mod run {
             agent: SelfAtLoginOccurrence {
                 occurrence_key_id: agent.clone(),
                 identity_key_id: None,
-                occurrence_signer: None,
+                occurrence_signer: Some(ts::local_signer(&agent_s)),
                 transport: None,
                 device_class: "agent".into(),
                 hardware_attestation: None,
@@ -821,6 +826,27 @@ mod run {
             }
         }
         assert_eq!(crossed, 1, "I97: the anchor was on the plane");
+        // v62.0.0 (round 3) — the agent's human is its OWNER binding: its
+        // statements (the owner's and the agent's voice) reach B through B's
+        // statement door, as the mesh delivers them.
+        let ownership = ciris_verify_core::namespace_match::family_id(
+            "ownership:{relation}:{target_kind}:{version}",
+        );
+        let held = sa
+            .edition2_statements_about(&ownership, &agent)
+            .await
+            .unwrap();
+        assert!(!held.is_empty(), "I97: A holds the agent's owner binding");
+        for st in &held {
+            crate::federation::edition2::ingest::put_statement(
+                sb.as_ref(),
+                st,
+                None,
+                crate::federation::edition2::ingest::INGEST_TIER,
+            )
+            .await
+            .expect("I97: B admits the owner binding's voices");
+        }
         assert_eq!(
             crate::federation::admission::steward_bindings_of(sb.as_ref(), &agent)
                 .await
@@ -872,6 +898,13 @@ mod run {
             assert!(
                 !body.contains("lookup_identity_for_occurrence("),
                 "I94 (b): {f} still reads LIMIT 1"
+            );
+            // v62.0.0 (round 3) — and the agent half through the one helper
+            // (an agent is never an occurrence of a person: its human is its
+            // owner).
+            assert!(
+                body.contains("agent_owner_anchor("),
+                "I94 (b): {f} reads an agent's human through agent_owner_anchor"
             );
         }
         assert_eq!(

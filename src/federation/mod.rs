@@ -9827,7 +9827,12 @@ pub trait FederationDirectory: Send + Sync {
             // v62.0.0 (wave GC7) — a targeted scope's refusal reads the
             // roster fold (held); the self / commons arms read only the
             // writer and the row (refused).
-            if plane.is_some() {
+            //
+            // v62.0.0 (E2-fix3; CC 2.7: the door refuses on the statement's
+            // own bytes, and holds only what reads other rows) — a targeted
+            // scope that NAMES NO target reads no roster: there is nothing to
+            // wait for, so it is a refusal of the row's own bytes, not a hold.
+            if plane.is_some() && claimed_target_id.is_some() {
                 edition2::fold::hold(
                     edition2::fold::reason::WRITE_SCOPE_REFUSED,
                     Error::WriteScopeRefused(reason),

@@ -2254,13 +2254,20 @@ impl crate::federation::blob_admit::BlobWriteStore for PostgresBackend {
             )
             .await
             .map_err(|e| BlobError::Backend(format!("announce author: {e}")))?;
-            self.insert_holding_claim_tx(&tx, &planned.claim).await?;
+            // v62.0.0 (E8-fix2) — `None`: the edition-2 sealed-floor
+            // announce, whose claim is a `custody` statement emitted after
+            // this commits.
+            if let Some(claim) = &planned.claim {
+                self.insert_holding_claim_tx(&tx, claim).await?;
+            }
             tx.commit()
                 .await
                 .map_err(|e| BlobError::Backend(format!("commit blob+attestation: {e}")))?;
         }
-        self.index_holder_claim(&planned.claim.row.attestation_id, &planned.claim.row.tier)
-            .await?;
+        if let Some(claim) = &planned.claim {
+            self.index_holder_claim(&claim.row.attestation_id, &claim.row.tier)
+                .await?;
+        }
         Ok(true)
     }
 
@@ -3073,6 +3080,10 @@ impl PostgresBackend {
                     transport_binding = EXCLUDED.transport_binding, \
                     admitted_at = EXCLUDED.admitted_at \
                  WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at \
+                    OR (EXCLUDED.asserted_at = cirislens.federation_identity_occurrences.asserted_at \
+                        AND (EXCLUDED.signed_envelope::jsonb ->> 'edition2_row_id') \
+                            < (cirislens.federation_identity_occurrences.signed_envelope::jsonb \
+                               ->> 'edition2_row_id')) \
                  RETURNING 1) SELECT COUNT(*) FROM up",
                 &[
                     &row.identity_key_id,
@@ -16405,6 +16416,22 @@ impl crate::federation::BlobStorage for PostgresBackend {
         PostgresBackend::delete_blob(self, sha256).await
     }
 
+    async fn announce_held_blob(
+        &self,
+        sha256: &[u8; 32],
+        author_key_id: &str,
+        floor: crate::federation::StorageFloor,
+    ) -> Result<(), crate::federation::BlobError> {
+        // v62.0.0 (E8-fix2) — the sealed-floor announce (I27 / I28).
+        crate::federation::blob_admit::announce_held_blob_planned(
+            self,
+            sha256,
+            author_key_id,
+            floor,
+        )
+        .await
+    }
+
     async fn store_blob_local(
         &self,
         sha256: &[u8; 32],
@@ -21802,10 +21829,14 @@ fn pg_row_to_key_record(
     // Err on missing-column; the outer `.ok().flatten()` collapses
     // both to `None`. Older SELECTs that didn't pull the column
     // (pre-v2.5.0 read paths) just see None.
+    // v62.0.0 (round 3, E7) — the edition-2 key projection binds "no
+    // evidence" as JSONB `null` (`projection::attestation_evidence_of`); that
+    // is `None`, not `Some(Null)` (the sqlite read agrees).
     let attestation_evidence: Option<serde_json::Value> = row
         .try_get::<_, Option<serde_json::Value>>("attestation_evidence")
         .ok()
-        .flatten();
+        .flatten()
+        .filter(|v| !v.is_null());
     // v13.0.0 (CIRISPersist#365, CC 3.4.7.2): consent_role is the V020
     // `TEXT NOT NULL DEFAULT 'unregistered'` column. Tolerant read
     // (matching roles/attestation_evidence above) — a SELECT that didn't
@@ -31011,25 +31042,6 @@ mod tests {
         .await;
     }
 
-    /// v31.0.0 (CIRISPersist#659, one plane wider) — a registration signature
-    /// admits only the key it names, on postgres.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn registration_subject_binding_postgres_659() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        crate::federation::register::test_support::exercise_registration_subject_binding(
-            &backend,
-            &format!("pg659r-{}", uuid::Uuid::new_v4().simple()),
-        )
-        .await
-        .expect("659 registration subject-binding exercise");
-    }
-
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on postgres.
     #[tokio::test]
     #[serial_test::serial(postgres)]
@@ -31260,7 +31272,10 @@ mod tests {
         // registers `self`, `{tag}-abuser` and `{tag}-innocent` as fresh keys.
         let tag = format!("pg543d{}", uuid_like());
         let self_key = format!("{tag}-self");
-        backend.set_self_key_id(Some(self_key.clone()));
+        // v62.0.0 (E0 fix 3) — the node's own id is its key's identity-ref.
+        backend.set_self_key_id(Some(crate::federation::edition2::fixture_switch::kid(
+            &self_key,
+        )));
         crate::federation::bootstrap_admission::test_support::exercise_peer_deadmission(
             &backend, &self_key, &tag,
         )
@@ -31754,6 +31769,19 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let tag = format!("pg{}", uuid_like());
         crate::federation::at_rest_cascade::blob_invariants::exercise_i28_announce_refuses_an_evicted_row(&backend, &tag).await;
+    }
+
+    /// I3332 (E8-fix2) — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i3332_a_community_announce_needs_a_live_binding_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i3332_a_community_announce_needs_a_live_binding(&backend, &tag).await;
     }
 
     /// §11.10 I31 (#833) — see `at_rest_cascade::blob_invariants`.
@@ -32302,9 +32330,9 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
         let tag = format!("pg592{}", uuid_like());
-        crate::federation::bootstrap_admission::test_support::exercise_promotion_cohort_standing_gate(
+        Box::pin(crate::federation::bootstrap_admission::test_support::exercise_promotion_cohort_standing_gate(
             &backend, &tag,
-        )
+        ))
         .await;
     }
 
@@ -32601,24 +32629,6 @@ mod tests {
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, &suffix).await;
     }
 
-    /// v30.8.0 (CIRISPersist#596 item 1) — give `revoker` the `slash` authority
-    /// that revoking SOMEONE ELSE'S key now requires. These fixtures test
-    /// revocation MECHANICS, not who may revoke, so they get the authority they
-    /// would hold in production rather than being narrowed to self-revocations.
-    async fn grant_slash(backend: &PostgresBackend, revoker: &str) {
-        {
-            backend.set_node_key_id("rev-authority-node");
-            crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
-                backend,
-                "rev-authority-node",
-                "rev-authority-root",
-                revoker,
-                crate::federation::admission::DELEGATION_SCOPE_SLASH,
-            )
-            .await;
-        }
-    }
-
     /// v30.8.0 (CIRISConstitution#87) — the POSTGRES leg.
     #[tokio::test]
     #[serial_test::serial(postgres)]
@@ -32773,26 +32783,6 @@ mod tests {
         .await;
     }
 
-    /// v25.1.0 (CIRISPersist#570 ask 4) — the POSTGRES leg of the shared
-    /// revocation-history-bound witness. The bound is a TIMESTAMPTZ column
-    /// here and TEXT on sqlite, so the round-trip claim is per-backend.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn revocation_bound_parity_postgres_570() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        let suffix = uuid_like();
-        backend.set_node_key_id("rb-node-postgres");
-        crate::federation::register::bound_test_support::exercise_revocation_bound(
-            &backend, &suffix,
-        )
-        .await;
-    }
-
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the postgres leg of the shared
     /// backend-parity witness for the three new #509 methods (see
     /// `sqlite::tests::consent_509_backend_methods_parity_sqlite`); both
@@ -32924,6 +32914,18 @@ mod tests {
         assert_eq!(r2.conflicted, 1);
     }
 
+    /// v62.0.0 (E8 round 3) — the id `hard_case::test_support::hold_key_as`
+    /// held `seed`'s key under: its edition-2 identity-ref under the fixture
+    /// switch (`register_hybrid_key_as` puts `kid(seed)`), else the seed.
+    fn detection_key_id(seed: &str) -> String {
+        use crate::federation::edition2::fixture_switch as e2;
+        if e2::emit_edition2() {
+            e2::kid(seed)
+        } else {
+            seed.to_owned()
+        }
+    }
+
     fn uuid_like() -> String {
         // Avoid pulling in the uuid crate for a single test helper.
         let nanos = std::time::SystemTime::now()
@@ -32967,23 +32969,32 @@ mod tests {
         for kid in [&subject, &target] {
             pg_put_key_rec(&backend, &fix_section_i_key(kid, "registry", now0, true)).await;
         }
-        // v31.0.0 (CIRISPersist#598/#656) — see the twin above: the producer
-        // binds both the signed instant and the typed-column mirror, and
-        // therefore states the `attestation_id` it bound.
-        let att_id = backend
-            .attestation_upsert_local(
-                crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
-                    &format!("rev-r-{suffix}"),
-                    &subject,
-                    &target,
-                    vec![subject.clone()],
-                    crate::federation::types::cohort_scope::SELF,
-                    chrono::Utc::now(),
-                    serde_json::json!({ "id": format!("rev-r-{suffix}") }),
-                ),
+        // v62.0.0 (E8 round 3) — the subject's revocation is its edition-2
+        // statement (the earlier transit input was a JSON envelope signed
+        // with the seed's hybrid key, which the edition-2 key plane does not
+        // hold), staged in the local-tier TRANSIT state as the sqlite twin
+        // stages it: admitted, then flipped to `tier = 'local'`, unpromoted.
+        let mut rev = pg_scores_shape(&subject, &target, &subject, "consent:state:revoked:v1");
+        rev.weight = None;
+        rev.attestation_envelope = serde_json::json!({ "dimension": "consent:state:revoked:v1" });
+        rev.subject_key_ids = vec![subject.clone()];
+        pg_resign(&mut rev);
+        let att_id = e2::rid(&rev);
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: rev })
+            .await
+            .expect("the subject's revocation admits");
+        backend
+            .get_client()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE cirislens.federation_attestations \
+                 SET tier = 'local', promoted_at = NULL WHERE attestation_id = $1",
+                &[&att_id],
             )
             .await
-            .expect("transit local-tier revocation admits");
+            .unwrap();
         let revoked_at = backend
             .list_consent_revocations(Some(now0))
             .await
@@ -32996,7 +33007,7 @@ mod tests {
         // Shared test DB → bind assertions to OUR rows only.
         let mine = |rows: Vec<crate::federation::ConsentPromotionOverdueRow>| {
             rows.into_iter()
-                .filter(|r| r.subject_key_id == subject)
+                .filter(|r| r.subject_key_id == pg_id(&subject))
                 .collect::<Vec<_>>()
         };
 
@@ -33020,12 +33031,12 @@ mod tests {
         );
         assert_eq!(rows.len(), 1, "our over-SLA revocation is overdue");
         assert_eq!(rows[0].attestation_id, att_id);
-        assert_eq!(rows[0].target_key_id, target);
+        assert_eq!(rows[0].target_key_id, pg_id(&target));
         assert_eq!(rows[0].tier, attestation_tier::LOCAL);
         let our_flags = |events: Vec<crate::federation::HardCaseEvent>| {
             events
                 .into_iter()
-                .filter(|e| e.subject_key_id.as_deref() == Some(subject.as_str()))
+                .filter(|e| e.subject_key_id.as_deref() == Some(pg_id(&subject).as_str()))
                 .collect::<Vec<_>>()
         };
         let evs = our_flags(
@@ -33116,6 +33127,10 @@ mod tests {
             crate::federation::types::identity_type::LENSCORE_DETECTOR,
         )
         .await;
+        // v62.0.0 (E8 round 3) — under the fixture switch the key is held
+        // as its edition-2 identity-ref, `kid(seed)`: the detection names
+        // THAT id (the seed text names no held key).
+        let det_key = detection_key_id("lens-core-test:1");
 
         use crate::derived::{
             ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity, EventFilter,
@@ -33141,7 +33156,7 @@ mod tests {
             canonical_bytes: b"{\"detection_id\":\"x\"}".to_vec(),
             ed25519_sig: vec![0x01; 64],
             ml_dsa_65_sig: vec![0x02; 3309],
-            signing_key_id: "lens-core-test:1".into(),
+            signing_key_id: det_key.clone(),
             ts: chrono::Utc::now(),
         };
 
@@ -33192,6 +33207,10 @@ mod tests {
             crate::federation::types::identity_type::LENSCORE_DETECTOR,
         )
         .await;
+        // v62.0.0 (E8 round 3) — under the fixture switch the key is held
+        // as its edition-2 identity-ref, `kid(seed)`: the detection names
+        // THAT id (the seed text names no held key).
+        let det_key = detection_key_id("lens-core-test:1");
 
         use crate::derived::{ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity};
         use crate::federation::{hard_case, FederationDirectory, HardCaseFilter};
@@ -33276,7 +33295,7 @@ mod tests {
             canonical_bytes: format!("canon-{trace_id}").into_bytes(),
             ed25519_sig: vec![0x01; 64],
             ml_dsa_65_sig: vec![0x02; 3309],
-            signing_key_id: "lens-core-test:1".into(),
+            signing_key_id: det_key.clone(),
             ts: chrono::Utc::now(),
         };
         backend
@@ -33301,7 +33320,7 @@ mod tests {
                  DELETE FROM cirislens.federation_attestations \
                   WHERE attestation_id IN ('{}', '{}'); \
                  UPDATE cirislens.federation_keys SET identity_type = 'agent' \
-                  WHERE key_id = 'lens-core-test:1'",
+                  WHERE key_id = '{det_key}'",
                 crate::derived::detection_row::detection_attestation_id(&det_a),
                 crate::derived::detection_row::detection_attestation_id(&det_z),
             ))
@@ -33426,6 +33445,9 @@ mod tests {
             crate::federation::types::identity_type::LENSCORE_DETECTOR,
         )
         .await;
+        // v62.0.0 (E8 round 3) — the held key's id (`kid(seed)` under the
+        // fixture switch).
+        let det_key = detection_key_id("test:1");
 
         use crate::derived::{ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity};
         let did = uuid::Uuid::new_v4();
@@ -33443,7 +33465,7 @@ mod tests {
             canonical_bytes: b"original".to_vec(),
             ed25519_sig: vec![0x01; 64],
             ml_dsa_65_sig: vec![0x02; 3309],
-            signing_key_id: "test:1".into(),
+            signing_key_id: det_key.clone(),
             ts: chrono::Utc::now(),
         };
         backend.put_detection_event(event_a.clone()).await.unwrap();
@@ -36079,14 +36101,20 @@ mod tests {
         let alice_p_s = format!("alice-occ-{s}");
         let bob_p_s = format!("bob-occ-{s}");
         // Community members (alice/bob) are user-role humans; the rest agents,
-        // the minter a node.
+        // the minter a node. v62.0.0 (round 3, E8) — the members' occurrence
+        // keys are their own devices, so user-typed: an occurrence never binds
+        // a node or agent key to a person (`occurrence_binds_machine_to_person`,
+        // CC 3.3.6).
         let _ = pg_put_key(
             &backend,
             &minter_s,
             crate::federation::types::identity_type::NODE,
         )
         .await;
-        for kid in [&comm_s, &fakeinfra_s, &alice_p_s, &bob_p_s] {
+        for kid in [&alice_p_s, &bob_p_s] {
+            let _ = pg_put_key(&backend, kid, crate::federation::types::identity_type::USER).await;
+        }
+        for kid in [&comm_s, &fakeinfra_s] {
             let _ = pg_put_key(
                 &backend,
                 kid,
@@ -36094,7 +36122,10 @@ mod tests {
             )
             .await;
         }
-        for kid in [&alice_s, &bob_s] {
+        // v62.0.0 (P1-fix4; CC rc21 3.3.6) — alice's and bob's LAPTOP
+        // occurrences are person keys (a machine key is never an occurrence
+        // of a person).
+        for kid in [&alice_s, &bob_s, &alice_p_s, &bob_p_s] {
             let _ = pg_put_key(&backend, kid, crate::federation::types::identity_type::USER).await;
         }
         let (comm, fakeinfra, minter) = (pg_id(&comm_s), pg_id(&fakeinfra_s), pg_id(&minter_s));
@@ -36456,7 +36487,20 @@ mod tests {
 
         // add carol via the affiliations cohort: alice (a majority of one)
         // proposes, carol accepts, then alice's widening voice lands.
-        let p = proposal_row(&alice, "affiliations", &coop, &carol, Some("member"), now);
+        // v62.0.0 (round 3, E8) — the proposal names the group by the id the
+        // store holds (its kid), as T1's I3004 does: the proposal's
+        // `{family,community}_key_id` is no identity-ref member of its
+        // payload, so the fixture codec carries it as written, and the growth
+        // gate (`check_growth_accepted`) matches the acceptance's group to the
+        // widening's by that text.
+        let p = proposal_row(
+            &alice,
+            "affiliations",
+            &pg_id(&coop),
+            &pg_id(&carol),
+            Some("member"),
+            now,
+        );
         e2::put_signed(&backend, &p).await.expect("the proposal");
         e2::put_signed(&backend, &acceptance_row(&carol, &p, now))
             .await
@@ -36776,7 +36820,13 @@ mod tests {
         );
         // v49.0.0 (#910): alice — the whole of this `unanimous` family — signs
         // the family widening; bob's consent is held first.
-        let p = proposal_row(&alice_s, "family", &fam_s, &bob_s, None, now);
+        // v62.0.0 (round 3, E8) — the proposal names the group by the id the
+        // store holds (its kid), as T1's I3004 does: the proposal's
+        // `{family,community}_key_id` is no identity-ref member of its
+        // payload, so the fixture codec carries it as written, and the growth
+        // gate (`check_growth_accepted`) matches the acceptance's group to the
+        // widening's by that text.
+        let p = proposal_row(&alice_s, "family", &fam, &bob, None, now);
         e2::put_signed(&backend, &p).await.expect("bob's proposal");
         e2::put_signed(&backend, &acceptance_row(&bob_s, &p, now))
             .await
@@ -36881,7 +36931,12 @@ mod tests {
                 &backend,
                 &seed,
                 &[crate::federation::types::identity_type::AGENT],
+                // v62.0.0 (E8 round 3) — the projection's `valid_from` is the
+                // record's `asserted_at` (`projection::key_projection`), so the
+                // stagger rides `asserted_at`: with the default instant all four
+                // tie and the page order falls to the key id.
                 &e2::KeyRecordOptions {
+                    asserted_at_ms: Some(e2::ms(base + chrono::Duration::minutes(i64::from(i)))),
                     valid_from_ms: Some(e2::ms(base + chrono::Duration::minutes(i64::from(i)))),
                     ..Default::default()
                 },
@@ -36954,64 +37009,44 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        use crate::federation::FederationDirectory;
         use crate::read::ReadEngine;
 
-        let identity = format!("agent-§i-rev-{}", uuid_like());
+        // v62.0.0 (E8 round 3) — the revocation is an edition-2
+        // `revocation:{entity_type}:{reason}` statement (T2), landed through
+        // the one door into `federation_revocations`. The earlier fixture
+        // sealed a JSON revocation over a JCS image with the seed's hybrid
+        // key, which an edition-2 key plane does not hold; a key that
+        // revokes ANOTHER key needs a slash conferral, so the read witness
+        // takes the plain case: a held key revoking itself.
         let now = chrono::Utc::now();
-
-        // Need attesting key + revoking key + a target key for the
-        // revocation FK shape.
-        let revoking_id = format!("revoke-§i-{}", uuid_like());
-        let revoked_id = format!("victim-§i-{}", uuid_like());
+        let victim = format!("victim-§i-{}", uuid_like());
         pg_put_key_rec(
             &backend,
-            &fix_section_i_key(&revoking_id, &identity, now, false),
+            &fix_section_i_key(&victim, &victim, now - chrono::Duration::minutes(1), false),
         )
         .await;
-        pg_put_key_rec(
-            &backend,
-            &fix_section_i_key(
-                &revoked_id,
-                &identity,
-                now - chrono::Duration::minutes(1),
-                false,
-            ),
-        )
-        .await;
-
-        // revocation_id column is `::uuid` cast in put_revocation —
-        // must be a valid UUID string, not the uuid_like() hex token.
-        let rev_id = uuid::Uuid::new_v4().to_string();
-        // v31.0.0 (#659) — the typed columns are BOUND INTO the bytes the
-        // scrub signature covers, through the one shared producer.
-        let rev = crate::federation::tier_ingest::test_support::seal_revocation(
-            crate::federation::Revocation {
-                revocation_id: rev_id.clone(),
-                revoked_key_id: Some(revoked_id.clone()),
-                revoked_key_sha256_ed25519_raw:
-                    crate::federation::tier_ingest::test_support::subject_digest_of(&revoked_id),
-                revoking_key_id: revoking_id.clone(),
-                reason: Some("test".into()),
-                revoked_at: now,
-                effective_at: now,
-                revocation_envelope: serde_json::json!({"id": rev_id}),
-                original_content_hash: String::new(),
-                scrub_signature_classical: String::new(),
-                scrub_signature_pqc: None,
-                scrub_key_id: revoking_id.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                observed_region: crate::federation::verify_coord::region::US.into(),
-                revoked_after: None,
-                persist_row_hash: String::new(),
-            },
+        let revoked_id = e2::kid(&victim);
+        let revoking_id = revoked_id.clone();
+        let st = e2::revocation_statement(
+            &victim,
+            &victim,
+            "agent",
+            "compromise",
+            now,
+            now,
+            None,
+            e2::ms(now),
         );
-        grant_slash(&backend, &revoking_id).await;
-        backend
-            .put_revocation(crate::federation::SignedRevocation { revocation: rev })
+        let out = e2::put_statement(&backend, &st)
             .await
-            .unwrap();
+            .expect("the self-revocation lands on the revocation plane");
+        assert!(
+            matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+            ),
+            "the self-revocation is a row: {out:?}"
+        );
 
         let page = backend
             .list_revocations(
@@ -39087,8 +39122,10 @@ mod tests {
             .await
             .unwrap();
         let suffix = uuid_like();
-        crate::federation::tier_ingest::test_support::exercise_owner_signed_community_row(
-            &backend, &suffix,
+        Box::pin(
+            crate::federation::tier_ingest::test_support::exercise_owner_signed_community_row(
+                &backend, &suffix,
+            ),
         )
         .await;
     }
@@ -39112,20 +39149,100 @@ mod tests {
         .await;
     }
 
+    /// v62.0.0 (round 3, E8; T2.api §6) — the granter of a trust edge: a
+    /// live edition-2 key (no end), its id `e2::kid(seed)`. The JSON
+    /// `grant_trust` door is earlier-form (`refuse_earlier_form("trust_grant")`):
+    /// a trust grant IS a `trust:accepts:v1` edge.
     async fn trust_steward(backend: &PostgresBackend) -> String {
-        let kid = format!("trust-steward-{}", uuid_like());
-        // v38/#721: real hybrid pubkeys — the door verifies the granter.
-        crate::federation::tier_ingest::test_support::register_hybrid_key(backend, &kid).await;
-        kid
+        let seed = format!("trust-steward-{}", uuid_like());
+        pg_put_key(
+            backend,
+            &seed,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        seed
     }
 
-    fn signed_grant(grant: crate::federation::TrustGrant) -> crate::federation::SignedTrustGrant {
-        crate::federation::tier_ingest::test_support::signed_trust_grant(grant)
+    /// A trust grant: the granter's `trust:accepts:v1` edge naming `key`
+    /// (seeds), through the statement door; its statement (its row id names
+    /// it for a `withdraws`).
+    async fn pg_put_trust_edge(
+        backend: &PostgresBackend,
+        granter: &str,
+        key: &str,
+        classes: &[&str],
+    ) -> Vec<u8> {
+        let edge = e2::trust_accepts_statement(
+            granter,
+            key,
+            classes,
+            None,
+            crate::federation::types::cohort_scope::FEDERATION,
+            e2::ms(chrono::Utc::now()),
+        );
+        e2::put_statement(backend, &edge)
+            .await
+            .expect("the trust:accepts edge is admitted");
+        edge
     }
 
-    /// Trust shape 1+2+3: round-trip + self-trust reject + Registry-
-    /// without-domains reject (run as one composed test because pg
-    /// runs are serialized and each does its own connect+migrate).
+    /// The granter's `withdraws` of `edge` (the projected row expires).
+    async fn pg_withdraw_trust_edge(
+        backend: &PostgresBackend,
+        granter: &str,
+        key: &str,
+        edge: &[u8],
+    ) -> Vec<u8> {
+        let withdraws = e2::trust_withdraws_statement(
+            granter,
+            key,
+            &e2::row_id_of(edge),
+            e2::ms(chrono::Utc::now()),
+        );
+        e2::put_statement(backend, &withdraws)
+            .await
+            .expect("the granter's withdraws is admitted");
+        withdraws
+    }
+
+    /// A held community `key` (a registry's root): its key, then a founding
+    /// roster through the T1 voices (no members, `quorum:1/1`).
+    async fn pg_put_registry_root(backend: &PostgresBackend, key: &str) {
+        let now = chrono::Utc::now();
+        pg_put_key(
+            backend,
+            key,
+            crate::federation::types::identity_type::PRIMITIVE,
+        )
+        .await;
+        pg_put_community(
+            backend,
+            crate::federation::tier_ingest::test_support::sign_community(
+                key,
+                crate::federation::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
+                    community_key_id: key.to_owned(),
+                    community_name: "registry".into(),
+                    members: Vec::new(),
+                    founded_at: now,
+                    consensus_protocol: "quorum:1/1".into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ),
+        )
+        .await
+        .expect("the registry's community is held");
+    }
+
+    /// Trust shape 1+2+3: round-trip + self-trust + Registry-without-domains
+    /// (run as one composed test because pg runs are serialized and each does
+    /// its own connect+migrate). v62.0.0 (T2.api §6) — the grant is a
+    /// `trust:accepts:v1` edge; `trust_type` is DERIVED (no reciprocal edge:
+    /// `temporary`); a self edge and a Registry edge with no classes are
+    /// admitted as edges but project NO trust row (no refusal is raised).
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn trust_pg_grant_lookup_and_validation() {
@@ -39138,65 +39255,61 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let steward = trust_steward(&backend).await;
-        let key_id = format!("trust-k-{}", uuid_like());
+        let key_seed = format!("trust-k-{}", uuid_like());
         pg_put_key_rec(
             &backend,
-            &fix_section_i_key(&key_id, "primitive", chrono::Utc::now(), false),
+            &fix_section_i_key(&key_seed, "primitive", chrono::Utc::now(), false),
         )
         .await;
+        let key_id = e2::kid(&key_seed);
 
         // Shape 1: round-trip.
-        let grant = crate::federation::TrustGrant {
-            key: key_id.clone(),
-            trust_type: crate::federation::TrustType::Partnered,
-            trust_relationship: crate::federation::TrustRelationship::Direct,
-            trust_domains: None,
-            trusted_by: steward.clone(),
-            expires_at: None,
-        };
-        backend.grant_trust(signed_grant(grant)).await.unwrap();
+        pg_put_trust_edge(&backend, &steward, &key_seed, &[]).await;
         let row = backend.lookup_trust(&key_id).await.unwrap().unwrap();
         assert_eq!(row.key, key_id);
-        assert_eq!(row.trust_type, crate::federation::TrustType::Partnered);
+        assert_eq!(row.trust_type, crate::federation::TrustType::Temporary);
         assert_eq!(
             row.trust_relationship,
             crate::federation::TrustRelationship::Direct
         );
-        assert_eq!(row.trusted_by, steward);
+        assert_eq!(row.trusted_by, e2::kid(&steward));
 
-        // Shape 2: self-trust is rejected at the API surface.
-        let bad_self = crate::federation::TrustGrant {
-            key: key_id.clone(),
-            trust_type: crate::federation::TrustType::Temporary,
-            trust_relationship: crate::federation::TrustRelationship::Direct,
-            trust_domains: None,
-            trusted_by: key_id.clone(),
-            expires_at: None,
-        };
-        let err = backend
-            .grant_trust(signed_grant(bad_self))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+        // Shape 2: a self edge projects no trust row.
+        let self_seed = format!("trust-self-{}", uuid_like());
+        pg_put_key(
+            &backend,
+            &self_seed,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        pg_put_trust_edge(&backend, &self_seed, &self_seed, &[]).await;
+        assert!(
+            backend
+                .lookup_trust(&e2::kid(&self_seed))
+                .await
+                .unwrap()
+                .is_none(),
+            "a self edge projects no trust row"
+        );
 
-        // Shape 3: Registry without domains is rejected at the API
-        // surface (also at the V020 PG CHECK constraint).
-        let bad_registry = crate::federation::TrustGrant {
-            key: key_id.clone(),
-            trust_type: crate::federation::TrustType::Temporary,
-            trust_relationship: crate::federation::TrustRelationship::Registry,
-            trust_domains: None,
-            trusted_by: steward.clone(),
-            expires_at: None,
-        };
-        let err = backend
-            .grant_trust(signed_grant(bad_registry))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+        // Shape 3: a Registry edge (to a held community) with no classes
+        // projects no trust row.
+        let reg = format!("trust-reg-{}", uuid_like());
+        pg_put_registry_root(&backend, &reg).await;
+        pg_put_trust_edge(&backend, &steward, &reg, &[]).await;
+        assert!(
+            backend
+                .lookup_trust(&e2::kid(&reg))
+                .await
+                .unwrap()
+                .is_none(),
+            "a Registry edge with no classes projects no trust row"
+        );
     }
 
-    /// Trust shape 4+6: revoke idempotent + include_expired filter.
+    /// Trust shape 4+6: revoke idempotent + include_expired filter. v62.0.0
+    /// — the revoke is the granter's `withdraws` of the edge (it expires the
+    /// projected row); re-offered it changes nothing.
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn trust_pg_revoke_idempotent_and_filter_expired() {
@@ -39209,40 +39322,26 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let steward = trust_steward(&backend).await;
-        let key_id = format!("trust-revoke-{}", uuid_like());
+        let key_seed = format!("trust-revoke-{}", uuid_like());
         pg_put_key_rec(
             &backend,
-            &fix_section_i_key(&key_id, "primitive", chrono::Utc::now(), false),
+            &fix_section_i_key(&key_seed, "primitive", chrono::Utc::now(), false),
         )
         .await;
-        let grant = crate::federation::TrustGrant {
-            key: key_id.clone(),
-            trust_type: crate::federation::TrustType::Temporary,
-            trust_relationship: crate::federation::TrustRelationship::Direct,
-            trust_domains: None,
-            trusted_by: steward.clone(),
-            expires_at: None,
-        };
-        backend.grant_trust(signed_grant(grant)).await.unwrap();
-        backend
-            .revoke_trust(
-                crate::federation::tier_ingest::test_support::signed_trust_revocation(
-                    &key_id, &steward,
-                ),
-            )
+        let key_id = e2::kid(&key_seed);
+        let edge = pg_put_trust_edge(&backend, &steward, &key_seed, &[]).await;
+        let withdraws = pg_withdraw_trust_edge(&backend, &steward, &key_seed, &edge).await;
+        let first = backend.lookup_trust(&key_id).await.unwrap().unwrap();
+        assert!(first.expires_at.is_some(), "the withdraws expires the row");
+        // Second revoke MUST succeed (idempotent) and change nothing.
+        e2::put_statement(&backend, &withdraws)
             .await
-            .unwrap();
-        // Second revoke MUST succeed (idempotent).
-        backend
-            .revoke_trust(
-                crate::federation::tier_ingest::test_support::signed_trust_revocation(
-                    &key_id, &steward,
-                ),
-            )
-            .await
-            .unwrap();
+            .expect("a re-offered withdraws succeeds without error");
         let row = backend.lookup_trust(&key_id).await.unwrap().unwrap();
-        assert!(row.expires_at.is_some());
+        assert_eq!(
+            row.expires_at, first.expires_at,
+            "the second revoke changed nothing"
+        );
 
         // include_expired=false → row excluded; include_expired=true → included.
         let active = backend
@@ -39261,6 +39360,8 @@ mod tests {
     }
 
     /// Trust shape 5: relationship + domain filter scoped to Registry.
+    /// v62.0.0 — Direct = an edge to a key; Registry = an edge with classes
+    /// to a held community (`trust_classes` are the domains).
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn trust_pg_list_filter_relationship_and_domain() {
@@ -39274,40 +39375,17 @@ mod tests {
 
         let steward = trust_steward(&backend).await;
         let domain = format!("alpha-{}", uuid_like());
-        let k_direct = format!("trust-d-{}", uuid_like());
-        let k_registry = format!("trust-r-{}", uuid_like());
+        let d_seed = format!("trust-d-{}", uuid_like());
+        let r_seed = format!("trust-r-{}", uuid_like());
         pg_put_key_rec(
             &backend,
-            &fix_section_i_key(&k_direct, "primitive", chrono::Utc::now(), false),
+            &fix_section_i_key(&d_seed, "primitive", chrono::Utc::now(), false),
         )
         .await;
-        pg_put_key_rec(
-            &backend,
-            &fix_section_i_key(&k_registry, "primitive", chrono::Utc::now(), false),
-        )
-        .await;
-        backend
-            .grant_trust(signed_grant(crate::federation::TrustGrant {
-                key: k_direct.clone(),
-                trust_type: crate::federation::TrustType::Temporary,
-                trust_relationship: crate::federation::TrustRelationship::Direct,
-                trust_domains: None,
-                trusted_by: steward.clone(),
-                expires_at: None,
-            }))
-            .await
-            .unwrap();
-        backend
-            .grant_trust(signed_grant(crate::federation::TrustGrant {
-                key: k_registry.clone(),
-                trust_type: crate::federation::TrustType::Temporary,
-                trust_relationship: crate::federation::TrustRelationship::Registry,
-                trust_domains: Some(vec![domain.clone()]),
-                trusted_by: steward.clone(),
-                expires_at: None,
-            }))
-            .await
-            .unwrap();
+        pg_put_registry_root(&backend, &r_seed).await;
+        pg_put_trust_edge(&backend, &steward, &d_seed, &[]).await;
+        pg_put_trust_edge(&backend, &steward, &r_seed, &[domain.as_str()]).await;
+        let (k_direct, k_registry) = (e2::kid(&d_seed), e2::kid(&r_seed));
 
         let registry_only = backend
             .list_trusted_keys(crate::federation::TrustFilter {
@@ -40002,8 +40080,18 @@ mod tests {
 
     /// The door tokens every dimension refusal may carry, after the
     /// dimension-specific one.
+    ///
+    /// v62.0.0 (E8 round 3) — Verify's dimension refusals reach persist as
+    /// `edition2_statement_invalid` with Verify's label in the message
+    /// (`door::invalid_label`): `dimension_unregistered`,
+    /// `dimension_refused:<token>`, `dimension_family`. The labels are named
+    /// here, not the bare `statement_invalid`: that token was never in the
+    /// asserted text (a `MalformedRow`'s Display is its message and its
+    /// `kind()` is `federation_malformed_row`), and it would also accept a
+    /// bad signature.
     const PG_DOOR_DIMENSION_TOKENS: &[&str] = &[
-        "statement_invalid",
+        "dimension_unregistered",
+        "dimension_refused",
         "namespace_family_unregistered",
         "namespace_vocab_value_unregistered",
         "dimension_family",
@@ -40430,8 +40518,20 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_community_steward_binding_matrix() {
+        use crate::federation::edition2::ingest::StatementOutcome;
         use crate::federation::types::delegation_scope as ds;
         use crate::federation::FederationDirectory;
+        // v62.0.0 (round 3, E8; CC 2.7.3) — whether a member is steward-bound
+        // is read from OTHER rows (the member's custody edge), so an
+        // unstewarded roster is HELD, concluding nothing (`Pending`), never
+        // refused: it waits for the binding to land. Every "REJECTED" arm
+        // below asserts that wait, and that nothing is stored.
+        let waits = |out: Result<StatementOutcome, crate::federation::Error>, what: &str| {
+            assert!(
+                matches!(out, Ok(StatementOutcome::Pending { .. })),
+                "{what}: an unstewarded roster is held, not landed or refused: {out:?}"
+            );
+        };
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -40542,44 +40642,30 @@ mod tests {
             let _ = pg_put_key(&backend, cid, ity).await;
         }
 
-        // UNSTEWARDED node → REJECTED + not stored.
-        let err = pg_put_community(
-            &backend,
-            put_comm(&comm_unstewarded_node, vec![&node], None),
-        )
-        .await
-        .unwrap_err();
-        match err {
-            crate::federation::Error::UnstewardedCommunityMember {
-                ref community_key_id,
-                ref member_key_id,
-                member_role,
-            } => {
-                assert_eq!(community_key_id, &comm_unstewarded_node);
-                assert_eq!(member_key_id, &node);
-                assert_eq!(member_role, crate::federation::types::identity_type::NODE);
-            }
-            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
-        }
-        assert_eq!(err.kind(), "federation_unstewarded_community_member");
+        // UNSTEWARDED node → HELD (a wait) + not stored.
+        waits(
+            pg_put_community(
+                &backend,
+                put_comm(&comm_unstewarded_node, vec![&node], None),
+            )
+            .await,
+            "unstewarded node",
+        );
         assert!(backend
             .lookup_community(&pg_id(&comm_unstewarded_node))
             .await
             .unwrap()
             .is_none());
 
-        // UNSTEWARDED agent → REJECTED (role reported as agent).
-        let err = pg_put_community(
-            &backend,
-            put_comm(&comm_unstewarded_agent, vec![&agent], None),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::federation::Error::UnstewardedCommunityMember { member_role, .. }
-                if member_role == crate::federation::types::identity_type::AGENT
-        ));
+        // UNSTEWARDED agent → HELD + not stored.
+        waits(
+            pg_put_community(
+                &backend,
+                put_comm(&comm_unstewarded_agent, vec![&agent], None),
+            )
+            .await,
+            "unstewarded agent",
+        );
         assert!(backend
             .lookup_community(&pg_id(&comm_unstewarded_agent))
             .await
@@ -40649,18 +40735,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let err = pg_put_community(
-            &backend,
-            put_comm(&comm_agent_plain, vec![&agent_plain], None),
-        )
-        .await
-        .expect_err("a conferral is not custody — the roster must be refused");
-        assert!(
-            matches!(
-                err,
-                crate::federation::Error::UnstewardedCommunityMember { .. }
-            ),
-            "got {err:?}"
+        waits(
+            pg_put_community(
+                &backend,
+                put_comm(&comm_agent_plain, vec![&agent_plain], None),
+            )
+            .await,
+            "a conferral is not custody",
         );
         assert!(
             backend
@@ -40688,27 +40769,18 @@ mod tests {
         // SecReview F2: an `infrastructure`-LABELED community whose own key
         // is NOT substrate_persist does NOT get the carve-out — steward-binding
         // is STILL enforced, so the UNSTEWARDED node is REJECTED + not stored.
-        let err = pg_put_community(
-            &backend,
-            put_comm(
-                &comm_fakeinfra,
-                vec![&node_unstewarded],
-                Some("infrastructure"),
-            ),
-        )
-        .await
-        .unwrap_err();
-        match err {
-            crate::federation::Error::UnstewardedCommunityMember {
-                ref member_key_id,
-                member_role,
-                ..
-            } => {
-                assert_eq!(member_key_id, &node_unstewarded);
-                assert_eq!(member_role, crate::federation::types::identity_type::NODE);
-            }
-            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
-        }
+        waits(
+            pg_put_community(
+                &backend,
+                put_comm(
+                    &comm_fakeinfra,
+                    vec![&node_unstewarded],
+                    Some("infrastructure"),
+                ),
+            )
+            .await,
+            "a self-labelled infrastructure room",
+        );
         assert!(backend
             .lookup_community(&pg_id(&comm_fakeinfra))
             .await
@@ -40748,13 +40820,10 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: w })
             .await
             .expect("owner withdraws own delegation edge");
-        let err = pg_put_community(&backend, put_comm(&comm_wd_dead, vec![&node_wd], None))
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::federation::Error::UnstewardedCommunityMember { .. }
-        ));
+        waits(
+            pg_put_community(&backend, put_comm(&comm_wd_dead, vec![&node_wd], None)).await,
+            "a withdrawn delegation",
+        );
         assert!(backend
             .lookup_community(&pg_id(&comm_wd_dead))
             .await
@@ -40779,13 +40848,10 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: d_exp })
             .await
             .unwrap();
-        let err = pg_put_community(&backend, put_comm(&comm_exp, vec![&node_exp], None))
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::federation::Error::UnstewardedCommunityMember { .. }
-        ));
+        waits(
+            pg_put_community(&backend, put_comm(&comm_exp, vec![&node_exp], None)).await,
+            "an expired delegation",
+        );
         assert!(backend
             .lookup_community(&pg_id(&comm_exp))
             .await
@@ -41072,11 +41138,13 @@ mod tests {
         let subj = format!("subj-{}", uuid_like());
         let dim = "trust:demo:v1";
         let s1 = pg_put_score(&be, "k1", &subj, dim, 0.5, base, 10).await;
+        // v62.0.0 (E8 round 3) — the codec stores a subject that names no row
+        // as its identity-ref (`kid_or_keep`): the filters below name it so.
         let s2 = pg_put_score(&be, "k2", &subj, dim, 0.6, base, 20).await;
         let _s3 = pg_put_score(&be, "k3", &subj, "trust:other_demo:v1", 0.6, base, 30).await;
         // exact-dimension seek, newest-first
         let f = crate::read::AttestationFilter {
-            subject_key_id: Some(subj.clone()),
+            subject_key_id: Some(pg_id(&subj)),
             dimension_exact: Some(dim.into()),
             ..Default::default()
         };
@@ -41089,7 +41157,7 @@ mod tests {
         assert_eq!(ids, vec![s2.clone(), s1.clone()], "newest-first exact-dim");
         // attester_filter Explicit set membership (`= ANY($n)`)
         let f = crate::read::AttestationFilter {
-            subject_key_id: Some(subj.clone()),
+            subject_key_id: Some(pg_id(&subj)),
             dimension_exact: Some(dim.into()),
             attester_filter: Some(crate::read::AttesterSet::Explicit(vec![e2::kid("k1")])),
             ..Default::default()
@@ -41252,7 +41320,9 @@ mod tests {
         let by_ka = only_ours(
             q(AttestationFilter {
                 dimension_exact: Some(dim.to_owned()),
-                attester_filter: Some(AttesterSet::Explicit(vec![ka.clone()])),
+                // v62.0.0 (E8 round 3) — the stored attester is the
+                // signer's identity-ref, not its seed text.
+                attester_filter: Some(AttesterSet::Explicit(vec![e2::kid(&ka)])),
                 ..Default::default()
             })
             .await,
@@ -41340,7 +41410,10 @@ mod tests {
                 let mut v: Vec<String> = be
                     .list_attestations(
                         crate::read::AttestationFilter {
-                            subject_key_id: Some(subj),
+                            // v62.0.0 (E8 round 3) — the codec stores a
+                            // subject that names no row as its identity-ref
+                            // (`kid_or_keep`), so the filter names that.
+                            subject_key_id: Some(pg_id(&subj)),
                             lifecycle,
                             ..Default::default()
                         },
@@ -41410,7 +41483,8 @@ mod tests {
         )
         .await;
         let f = crate::read::AttestationFilter {
-            subject_key_id: Some(subj),
+            // v62.0.0 (E8 round 3) — the stored subject is its identity-ref.
+            subject_key_id: Some(pg_id(&subj)),
             dimension_exact: Some(dim.into()),
             ..Default::default()
         };
@@ -41763,24 +41837,10 @@ mod tests {
             })
             .await
             .expect("crypto-valid revoked consent_record transits the local tier on PG");
-        let mut forged = mk(
-            crate::federation::types::consent_record::stance::REVOKED,
-            crate::federation::types::attestation_tier::LOCAL,
-        );
-        forged.scrub_signature_classical = "AAAA".into(); // not a valid sig
-        let err = backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: forged,
-            })
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::federation::Error::FederationTierUnverified { .. }
-            ),
-            "forged revoked/local consent_record rejected at admission, got {err:?}"
-        );
+        // (v62.0.0, E8 round 3, as E1 did for the sqlite twin: the forged
+        // leg is gone — it forged the earlier-form `scrub_signature_*`, which
+        // an edition-2 row does not carry; the statement's signature is the
+        // door's, witnessed in `edition2::door_invariants`.)
     }
 
     /// Clause 3 (#146 Ask 6, CEG §5.6.8.14) — canonical_binding widens the
@@ -41880,48 +41940,13 @@ mod tests {
         assert_eq!(got.withdraws_admission_rule, Some(2));
     }
 
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn pg_put_attestation_accepts_accord_dimension_from_accord_holder() {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        use crate::federation::FederationDirectory;
-        let holder = format!("pg-holder-§102-{}", uuid_like());
-        let agent_k = format!("pg-aa-§102-{}", uuid_like());
-        pg_put_key_rec(
-            &backend,
-            &pg_admission_key(
-                &holder,
-                "humanity-accord-1",
-                crate::federation::types::identity_type::ACCORD_HOLDER,
-            ),
-        )
-        .await;
-        pg_put_key_rec(
-            &backend,
-            &pg_admission_key(
-                &agent_k,
-                "primitive-aa",
-                crate::federation::types::identity_type::AGENT,
-            ),
-        )
-        .await;
-        let att = pg_scores_attestation(&holder, &agent_k, &holder, "accord:human_dignity:v1");
-        backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: att })
-            .await
-            .unwrap();
-        let rows = backend
-            .all_attestations_for(&pg_id(&agent_k))
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-    }
+    // v62.0.0 (E8 round 3) — DELETED
+    // `pg_put_attestation_accepts_accord_dimension_from_accord_holder`: it
+    // asserted that a self-declared `accord_holder` LABEL admits an
+    // `accord:*` row, the earlier form. CC rc20 3.4.7: the accord's holders
+    // are fixed by its charter, and the label is never read
+    // (`edition2::standing`, P4). The edition-2 witnesses are I3082 (a label
+    // alone is HELD) and I3084 (a holder the bundle in force places).
 
     #[tokio::test]
     #[serial_test::serial(postgres)]
@@ -42144,23 +42169,13 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
         use crate::federation::FederationDirectory;
-        let steward = format!("pg-good-stw-§102-{}", uuid_like());
         let agent_k = format!("pg-good-agt-§102-{}", uuid_like());
         // CC 3.4.8 (CIRISPersist#366) — `detection:correlated_action:*`
-        // is detector-only. Exercise the SET-membership gate with a
-        // folded `{agent, lenscore_detector}` LensCore-fold key.
-        pg_put_key_rec(
-            &backend,
-            &pg_admission_key(
-                &steward,
-                "registry",
-                &crate::federation::types::identity_type::join_set([
-                    crate::federation::types::identity_type::AGENT,
-                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
-                ]),
-            ),
-        )
-        .await;
+        // is detector-only. v62.0.0 (E8 round 3; CC rc20 3.4.7): the
+        // standing is the delegation `infra:detect` from a root this node
+        // trusts, not a `lenscore_detector` label, so the emitter is a
+        // conferred detector.
+        let steward = pg_confer_detector(&backend, &format!("pg-good-§102-{}", uuid_like())).await;
         pg_put_key_rec(
             &backend,
             &pg_admission_key(
@@ -42220,28 +42235,54 @@ mod tests {
             ),
         )
         .await;
+        // v62.0.0 (E8 round 3; CC rc20 3.4.7, CC 2.7.3) — the standing for a
+        // reserved `detection:*` family is the delegation `infra:detect` from
+        // a root this node trusts: OTHER rows. With this node's identity set
+        // and no such conferral, the row is HELD
+        // `reserved_prefix_emitter_mismatch` (kept, concluding nothing), as
+        // P4's I3080 witnesses for a self-declared detector; the earlier
+        // `required == [lenscore_detector]` label requirement is gone.
+        let node = format!("pg-nondet-node-§366-{}", uuid_like());
+        e2::put_key(&backend, &node, &["node"]).await;
+        backend.set_node_key_id(e2::kid(&node));
         let att = pg_scores_attestation(
             &agent,
             &subj,
             &agent,
             "detection:correlated_action:rights_asymmetry:v1",
         );
-        let err = backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+        let st = e2::statement_of(&att, &agent);
+        let out = e2::put_statement(&backend, &st)
             .await
-            .unwrap_err();
-        match err {
-            crate::federation::Error::ReservedPrefixEmitterMismatch {
-                prefix, required, ..
-            } => {
-                assert_eq!(prefix, "detection:correlated_action:");
-                assert_eq!(
-                    required,
-                    vec![crate::federation::types::identity_type::LENSCORE_DETECTOR.to_owned()]
-                );
-            }
-            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
-        }
+            .expect("a non-detector's detection:* row is kept, held");
+        assert!(
+            matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+            ),
+            "held: {out:?}"
+        );
+        let rid = crate::federation::edition2::names::RowId::of_statement(&st).expect("a row id");
+        let held = crate::federation::edition2::fold::why_held(&backend, &rid)
+            .await
+            .unwrap()
+            .expect("held, and says why");
+        assert_eq!(
+            held.reason,
+            crate::federation::edition2::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH
+        );
+        assert!(
+            held.detail.contains("detection:")
+                && held
+                    .detail
+                    .contains(crate::federation::types::delegation_scope::INFRA_DETECT),
+            "the hold names the prefix and the missing conferral: {}",
+            held.detail
+        );
+        assert!(
+            backend.get_attestation(&rid.hex()).await.unwrap().is_none(),
+            "nothing concluded"
+        );
     }
 
     #[tokio::test]
@@ -42302,6 +42343,68 @@ mod tests {
             .unwrap();
         let rows = backend.all_attestations_for(&pg_id(&subj)).await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    /// v62.0.0 (E8 round 3; CC rc20 3.4.7, P4's I3081) — **a conferred
+    /// detector.** A reserved `detection:*` family is opened by the
+    /// delegation `infra:detect` from a root THIS node trusts, never by the
+    /// signer's own `lenscore_detector` label. So the fixture stands up the
+    /// chain I3081 witnesses, under `tag`-scoped seeds (the pg test DB is
+    /// shared): this backend's node key (`set_node_key_id`), a key root
+    /// chartering itself, the node accepting it, and the root conferring
+    /// `infra:detect` on the detector. Returns the detector's SEED (sign with
+    /// it; its kid is `e2::kid(seed)`).
+    async fn pg_confer_detector(backend: &PostgresBackend, tag: &str) -> String {
+        use crate::federation::trust_root::{
+            TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
+        };
+        use crate::federation::types::attestation_type;
+        let (node, root, det) = (
+            format!("{tag}-node"),
+            format!("{tag}-root"),
+            format!("{tag}-detector"),
+        );
+        e2::put_key(backend, &node, &["node"]).await;
+        e2::put_key(backend, &root, &["node"]).await;
+        // The detector states only `agent`: the duty is the delegation's.
+        e2::put_key(backend, &det, &["agent"]).await;
+        backend.set_node_key_id(e2::kid(&node));
+        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[format!(
+            "{tag}-root-successor"
+        )])
+        .expect("a pre-rotation commitment");
+        for (from, to, envelope) in [
+            (
+                &root,
+                &root,
+                serde_json::json!({
+                    "dimension": TRUST_CHARTER_DIMENSION,
+                    "scope": ["infra:serve", "infra:attest"],
+                    "pre_rotation_commitment": commitment,
+                }),
+            ),
+            (
+                &node,
+                &root,
+                serde_json::json!({"dimension": TRUST_ACCEPTS_DIMENSION, "scope": ["infra:serve"]}),
+            ),
+            (
+                &root,
+                &det,
+                serde_json::json!({
+                    "dimension": TRUST_CONFERS_DIMENSION,
+                    "scope": [crate::federation::types::delegation_scope::INFRA_DETECT],
+                }),
+            ),
+        ] {
+            let mut edge = pg_scores_shape(&e2::kid(from), &e2::kid(to), &e2::kid(from), "-");
+            edge.attestation_type = attestation_type::DELEGATES_TO.into();
+            edge.attestation_envelope = envelope;
+            e2::try_put_row(backend, &edge, from)
+                .await
+                .unwrap_or_else(|e| panic!("the trust edge {from} -> {to} is admitted: {e:?}"));
+        }
+        det
     }
 
     /// The family of the registered detection leaf, the family the door
@@ -42392,20 +42495,13 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let det = format!("pg-det-key-§924-{}", uuid_like());
         let subj = format!("pg-det-sub-§924-{}", uuid_like());
-        // CIRISPersist#543 — `lenscore_detector` is accord-conferred: the
-        // detector key goes through the same conferred route as the sqlite
-        // twin (`put_accord_conferred_key`), never a self-declared record.
-        crate::federation::operational::test_support::put_accord_conferred_key(
-            &backend,
-            e2::key_row(
-                &det,
-                &[crate::federation::types::identity_type::LENSCORE_DETECTOR],
-            ),
-        )
-        .await
-        .unwrap();
+        // CIRISPersist#543 — the detector's standing is conferred, never a
+        // self-declared record. v62.0.0 (E8 round 3; CC rc20 3.4.7): it is
+        // the delegation `infra:detect` from a root this node trusts (the
+        // earlier `put_accord_conferred_key` route registered a JSON key the
+        // edition-2 door does not hold: `federation_attester_key_unknown`).
+        let det = pg_confer_detector(&backend, &format!("pg-det-§924-{}", uuid_like())).await;
         let _ = pg_put_key(
             &backend,
             &subj,
@@ -43145,19 +43241,11 @@ mod tests {
         let backend = std::sync::Arc::new(PostgresBackend::connect(&dsn).await.unwrap());
         backend.run_migrations().await.unwrap();
         use crate::federation::FederationDirectory;
-        let steward = format!("pg-sch-stw-§102-{}", uuid_like());
         let agent_k = format!("pg-sch-agt-§102-{}", uuid_like());
-        // CC 3.4.8 (CIRISPersist#366) — detector-only prefix; the
-        // detection emitter must hold `lenscore_detector`.
-        pg_put_key_rec(
-            &backend,
-            &pg_admission_key(
-                &steward,
-                "registry",
-                crate::federation::types::identity_type::LENSCORE_DETECTOR,
-            ),
-        )
-        .await;
+        // CC 3.4.8 (CIRISPersist#366) — detector-only prefix. v62.0.0 (E8
+        // round 3; CC rc20 3.4.7): the emitter is a conferred detector
+        // (`infra:detect` from a root this node trusts).
+        let steward = pg_confer_detector(&backend, &format!("pg-sch-§102-{}", uuid_like())).await;
         pg_put_key_rec(
             &backend,
             &pg_admission_key(
@@ -43504,39 +43592,26 @@ mod tests {
             .await
             .unwrap();
         // Revocation row — exercise the third row-type's row_hash
-        // surface. `revocation_id` is ::uuid-cast per the project
-        // test-fixtures memory: must be a real UUID.
-        let rev_id = uuid::Uuid::new_v4().to_string();
-        // v21.0.0 (#502 E1) — real hybrid sig by the revoking steward.
-        // v31.0.0 (#659) — over bytes that BIND the typed columns.
-        grant_slash(&backend, &steward).await;
-        backend
-            .put_revocation(crate::federation::SignedRevocation {
-                revocation: crate::federation::tier_ingest::test_support::seal_revocation(
-                    crate::federation::Revocation {
-                        revocation_id: rev_id.clone(),
-                        revoked_key_id: Some(target.clone()),
-                        revoked_key_sha256_ed25519_raw:
-                            crate::federation::tier_ingest::test_support::subject_digest_of(&target),
-                        revoking_key_id: steward.clone(),
-                        reason: Some("test".into()),
-                        revoked_at: chrono::Utc::now(),
-                        effective_at: chrono::Utc::now(),
-                        revocation_envelope: serde_json::json!({"id": rev_id}),
-                        original_content_hash: String::new(),
-                        scrub_signature_classical: String::new(),
-                        scrub_signature_pqc: None,
-                        scrub_key_id: steward.clone(),
-                        scrub_timestamp: chrono::Utc::now(),
-                        pqc_completed_at: None,
-                        observed_region: crate::federation::verify_coord::region::US.into(),
-                        revoked_after: None,
-                        persist_row_hash: String::new(),
-                    },
-                ),
-            })
+        // surface. v62.0.0 (E8 round 3) — an edition-2
+        // `revocation:{entity_type}:{reason}` statement (T2) through the one
+        // door: the earlier fixture sealed a JSON revocation with the
+        // seed's hybrid key, which the edition-2 key plane does not hold. A
+        // revocation of ANOTHER key needs a slash conferral; the row-hash
+        // witness needs only a held revocation, so the target revokes itself.
+        let now = chrono::Utc::now();
+        let st = e2::revocation_statement(
+            &target,
+            &target,
+            "agent",
+            "compromise",
+            now,
+            now,
+            None,
+            e2::ms(now),
+        );
+        e2::put_statement(&backend, &st)
             .await
-            .unwrap();
+            .expect("the self-revocation lands on the revocation plane");
 
         // Keys.
         let k1 = FederationDirectory::lookup_public_key(&backend, &pg_id(&target))
@@ -43683,8 +43758,10 @@ mod tests {
             .unwrap();
         let topo = crate::federation::build_trust_topology(
             &backend,
+            // v62.0.0 (E8 round 3) — the stored keys are the signers'
+            // identity-refs, not their seed text.
             &crate::federation::FederationDirectoryFilter {
-                granter_key: Some(granter.clone()),
+                granter_key: Some(pg_id(&granter)),
                 ..Default::default()
             },
         )
@@ -43692,8 +43769,8 @@ mod tests {
         .unwrap();
         assert_eq!(topo.edges.len(), 1);
         assert_eq!(topo.edges[0].edge_type, crate::federation::EdgeType::Direct);
-        assert_eq!(topo.edges[0].from_key, grantee);
-        assert_eq!(topo.edges[0].to_key, granter);
+        assert_eq!(topo.edges[0].from_key, pg_id(&grantee));
+        assert_eq!(topo.edges[0].to_key, pg_id(&granter));
         assert!((topo.edges[0].weight - 3.0).abs() < 1e-9);
     }
 
@@ -46057,7 +46134,7 @@ mod tests {
         // now matches + withdraws by it, so the FK row + holds_bytes are
         // seeded under the derived id (carrying `host`'s real pubkeys so the
         // ingest gate verifies).
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let cfg = crate::federation::ReplicationConfig {
             // Very tight budget so eviction is forced.
             storage_budget_bytes: 1024,
@@ -46068,46 +46145,13 @@ mod tests {
         let engine = crate::Engine::with_replication_config(signer.clone(), &dsn, cfg)
             .await
             .unwrap();
-        // Seed the federation_keys row for the signer (FK target for
-        // withdraws attestations), keyed by the DERIVED id but carrying
-        // `host`'s real hybrid pubkeys.
         let pg = engine.postgres_backend().expect("pg").clone();
-        {
-            use crate::federation::FederationDirectory;
-            // v62.0.0 NOT flipped (E2.md): the Engine signs under the
-            // earlier-form derived id until slice B makes it `kid(host)`.
-            let (ed_pk, mldsa_pk) =
-                crate::federation::tier_ingest::test_support::hybrid_pubkeys(&host);
-            let now = chrono::Utc::now();
-            let record = crate::federation::KeyRecord {
-                key_id: derived.clone(),
-                pubkey_ed25519_base64: ed_pk,
-                pubkey_ml_dsa_65_base64: mldsa_pk,
-                algorithm: crate::federation::types::algorithm::HYBRID.into(),
-                identity_type: crate::federation::types::identity_type::AGENT.into(),
-                identity_ref: derived.clone(),
-                valid_from: now,
-                valid_until: None,
-                registration_envelope: serde_json::json!({ "id": derived.clone() }),
-                original_content_hash: "deadbeef".into(),
-                scrub_signature_classical: "c2lnbmF0dXJl".into(),
-                scrub_signature_pqc: None,
-                scrub_key_id: derived.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                attestation_evidence: Some(
-                    crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
-                    ),
-                ),
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            };
-            pg.put_public_key(crate::federation::SignedKeyRecord { record })
-                .await
-                .unwrap();
-        }
+        // v62.0.0 (E8 round 3, as E1-fix1 did for the sqlite sweeps) — the
+        // sweeper signs its holding claims and withdraws as an edition-2
+        // statement, so its key is a live edition-2 `key:record`
+        // (`pg_blob_bootstrap_host`); the earlier-form row keyed by the
+        // derived id named no key the statement door reads.
+        pg_blob_bootstrap_host(&pg, &host).await;
         // Seed 5 × 1 KiB blobs via the Engine's put_blob_signing path
         // so each lands a holds_bytes attestation owned by the
         // signer (the derived id).
@@ -46249,9 +46293,10 @@ mod tests {
         // `host` (matches pg_blob_bootstrap_host's registered pubkeys) so
         // the sweeper's federation-tier withdraws verifies at the gate.
         let signer = crate::federation::tier_ingest::test_support::local_signer(&host);
-        // v9.3.0 (#247) — the holder/attester is the signer's DERIVED
-        // federation key_id; the sweeper matches + withdraws by it.
-        let derived = pg_derived_id_for(&host);
+        // v62.0.0 (E8 round 3) — the holder/attester is the id the signer
+        // states rows under: its composite's identity-ref (`federation_id`,
+        // cut B), no longer the earlier `derived_key_id`.
+        let derived = signer.federation_id().await;
         let cfg = crate::federation::ReplicationConfig {
             storage_budget_bytes: 1024,
             steady_state_utilization: 0.5,
@@ -46349,7 +46394,7 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    &signer.derived_key_id(),
+                    &signer.federation_id().await,
                     signer,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
@@ -46381,7 +46426,7 @@ mod tests {
 
         use crate::federation::BlobStorage;
         let mut held_a = backend
-            .list_held_by(&signer_a.derived_key_id())
+            .list_held_by(&signer_a.federation_id().await)
             .await
             .unwrap();
         held_a.sort();
@@ -46390,7 +46435,7 @@ mod tests {
         assert_eq!(held_a, expected_a, "A's holdings");
 
         let mut held_b = backend
-            .list_held_by(&signer_b.derived_key_id())
+            .list_held_by(&signer_b.federation_id().await)
             .await
             .unwrap();
         held_b.sort();
@@ -46417,7 +46462,7 @@ mod tests {
         pg_blob_bootstrap_host(&backend, &actor).await;
         let signer = pg_test_signer_for(&actor);
         let shas = pg_seed_blobs_for_actor(&backend, &actor, &signer, 1, "withdrawn").await;
-        let holder = signer.derived_key_id();
+        let holder = signer.federation_id().await;
 
         // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — the holder retracts
         // its own holding claim; nobody else can.
@@ -46476,7 +46521,11 @@ mod tests {
 
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor(&signer_a.derived_key_id(), &signer_a, chrono::Utc::now())
+            .evict_actor(
+                &signer_a.federation_id().await,
+                &signer_a,
+                chrono::Utc::now(),
+            )
             .await
             .unwrap();
         assert_eq!(report.blobs_evicted, 3, "A's 3 blobs evicted");
@@ -46550,7 +46599,11 @@ mod tests {
         ));
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor(&real_signer.derived_key_id(), &failing, chrono::Utc::now())
+            .evict_actor(
+                &real_signer.federation_id().await,
+                &failing,
+                chrono::Utc::now(),
+            )
             .await
             .unwrap();
         // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — a holding claim is
@@ -46569,7 +46622,7 @@ mod tests {
         );
         assert_eq!(
             backend.list_holders(&shas[0]).await.unwrap(),
-            vec![real_signer.derived_key_id()],
+            vec![real_signer.federation_id().await],
             "the actor's own claim stands"
         );
     }
@@ -46671,6 +46724,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn lookup_trusted_publisher_chain_returns_chain_when_trusted_publisher_attests_pg() {
+        /// The 64-hex content address a nonce names.
+        fn sha_hex_of(nonce: &str) -> String {
+            format!("{nonce:0<64}").chars().take(64).collect()
+        }
         use crate::federation::FederationDirectory;
         use crate::store::backend::Backend;
         let Some(dsn) = pg_dsn() else {
@@ -46683,7 +46740,11 @@ mod tests {
         // conferral against THIS NODE's trust root, so the backend must know who
         // it is. Without this the call returns the typed `NodeIdentityUnset`
         // refusal and the fixture fails on its wiring, not on its property.
-        backend.set_node_key_id("tp-fixture-node-pg");
+        // v62.0.0 (E8 round 3) — the node is named by its key's identity-ref,
+        // the id `confer_scope_from_trusted_root` registers and signs as (the
+        // sqlite twin's `kid_any`): a seed text names no held key, so the
+        // trust walk from it reached nothing.
+        backend.set_node_key_id(e2::kid("tp-fixture-node-pg"));
         // Unique-per-run publisher + att IDs so reruns against the
         // shared PG DB don't pollute (mirrors the existing
         // feedback_hundred_percent_green discipline).
@@ -46691,8 +46752,15 @@ mod tests {
         let publisher_key = format!("pub-{}", &nonce[..16]);
         // PG attestation_id column is UUID; use a fresh UUID here.
         let att_id = uuid::Uuid::new_v4().to_string();
-        let sha_hex = format!("{:0<64}", nonce);
-        let sha_hex = sha_hex.chars().take(64).collect::<String>();
+        let row = fix_content_rating_attestation(
+            &att_id,
+            &publisher_key,
+            "content_rating:mpa:pg13:v1",
+            &sha_hex_of(&nonce),
+        );
+        // An edition-2 row is stored under its row id.
+        let att_id = e2::rid(&row);
+        let sha_hex = sha_hex_of(&nonce);
         // Seed publisher key as trusted_publisher identity_type.
         pg_put_key_rec(
             &backend,
@@ -46704,14 +46772,7 @@ mod tests {
         .await;
         // Seed a content_rating attestation referencing the SHA.
         backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: fix_content_rating_attestation(
-                    &att_id,
-                    &publisher_key,
-                    "content_rating:mpa:pg13:v1",
-                    &sha_hex,
-                ),
-            })
+            .put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
             .unwrap();
         // v30.3.0 (CIRISPersist#611) — holding the `trusted_publisher` identity
@@ -47370,6 +47431,9 @@ mod tests {
             ),
         )
         .await;
+        // v62.0.0 (E8 round 3) — the key is held as its edition-2 identity-ref
+        // (`kid(seed)`); every row and read names THAT id, not the seed text.
+        let occ = pg_id(&occ);
 
         // Upsert twice on the same dimension → one local row (replace).
         backend
@@ -47491,6 +47555,9 @@ mod tests {
             ),
         )
         .await;
+        // v62.0.0 (E8 round 3) — the key is held as its edition-2 identity-ref
+        // (`kid(seed)`); every row and read names THAT id, not the seed text.
+        let occ = pg_id(&occ);
 
         // v30.6.0 (CIRISPersist#622) — `String`, not `uuid::Uuid`: the column is
         // TEXT since V121 and the driver rejects a Uuid against it with
@@ -47672,6 +47739,9 @@ mod tests {
             ),
         )
         .await;
+        // v62.0.0 (E8 round 3) — the key is held as its edition-2 identity-ref
+        // (`kid(seed)`); every row and read names THAT id, not the seed text.
+        let occ = pg_id(&occ);
 
         let seed = |id: String, dim: &'static str| {
             let occ = occ.clone();
@@ -47921,7 +47991,10 @@ mod tests {
         let ids: Vec<_> = active.iter().map(|o| o.occurrence_key_id.clone()).collect();
         assert_eq!(ids, vec![laptop.clone()], "revoked phone excluded on PG");
 
-        // FK violation surfaces as InvalidArgument (local path, same table).
+        // v62.0.0 (E8 round 3; wave GC4, CC 2.7.3) — a revocation naming an
+        // occurrence key this node does not hold WAITS for the link
+        // (`LinkNotHeld`, the SQLSTATE read by `pg_fk_link_unheld`): a missing
+        // parent is a dependency, not a malformed row.
         let err = backend
             .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
                 identity_key_id: root.clone(),
@@ -47935,7 +48008,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("FK")),
+            matches!(err, crate::federation::Error::LinkNotHeld { .. }),
             "got: {err:?}"
         );
     }
@@ -48017,10 +48090,14 @@ mod tests {
         let window = Duration::from_secs(86_400);
         let r1 = backend.run_consent_sla_watch(now, window).await.unwrap();
         assert!(r1.revocations_scanned >= 1, "scan found our revocation");
+        // v62.0.0 (E8 round 3) — an edition-2 row names its subject by the
+        // key's identity-ref (`e2::kid`), so the breach event does too (the
+        // sqlite twin compares `e2::kid` the same way).
+        let (target_kid, subject_kid) = (e2::kid(&target), e2::kid(&subject));
         let mine = |events: Vec<crate::federation::HardCaseEvent>| {
             events
                 .into_iter()
-                .filter(|e| e.target_key_id.as_deref() == Some(target.as_str()))
+                .filter(|e| e.target_key_id.as_deref() == Some(target_kid.as_str()))
                 .collect::<Vec<_>>()
         };
         let breaches = mine(
@@ -48040,7 +48117,7 @@ mod tests {
         );
         assert_eq!(
             breaches[0].subject_key_id.as_deref(),
-            Some(subject.as_str())
+            Some(subject_kid.as_str())
         );
         assert_eq!(breaches[0].detail["sla_days"], 1);
 
@@ -48234,82 +48311,13 @@ mod tests {
         );
     }
 
-    /// SMALLINT `cell_resolution` + BYTEA `attestation_evidence` binding,
-    /// valid res-7 admits, over-precise res-9 refused (§0.8.1).
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn pg_location_proof_round_trip_and_rough_only_gate() {
-        use crate::federation::{FederationDirectory, LocationProof};
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let subj = format!("subj-{}", uuid_like());
-        pg_put_key_rec(
-            &backend,
-            &pg_admission_key(
-                &subj,
-                &subj,
-                crate::federation::types::identity_type::PRIMITIVE,
-            ),
-        )
-        .await;
-
-        let ll = h3o::LatLng::new(37.0, -122.0).unwrap();
-        let cell7 = ll.to_cell(h3o::Resolution::Seven).to_string();
-        backend
-            .put_location_proof(
-                crate::federation::tier_ingest::test_support::sign_location_proof(
-                    &subj,
-                    LocationProof {
-                        subject_key_id: subj.clone(),
-                        cell_id: cell7.clone(),
-                        cell_resolution: 7,
-                        asserted_at: "2026-06-09T00:00:00Z".parse().unwrap(),
-                        valid_until: None,
-                        attestation_evidence: Some(vec![0xDEu8, 0xAD, 0xBE, 0xEF]),
-                        withdrawn_at: None,
-                        persist_row_hash: String::new(),
-                    },
-                ),
-            )
-            .await
-            .unwrap();
-        let rows = backend.list_location_proofs_for(&subj).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].cell_id, cell7);
-        assert_eq!(rows[0].cell_resolution, 7);
-        assert_eq!(
-            rows[0].attestation_evidence.as_deref(),
-            Some(&[0xDEu8, 0xAD, 0xBE, 0xEF][..])
-        );
-
-        let cell9 = ll.to_cell(h3o::Resolution::Nine).to_string();
-        let err = backend
-            .put_location_proof(
-                crate::federation::tier_ingest::test_support::sign_location_proof(
-                    &subj,
-                    LocationProof {
-                        subject_key_id: subj.clone(),
-                        cell_id: cell9,
-                        cell_resolution: 9,
-                        asserted_at: "2026-06-09T01:00:00Z".parse().unwrap(),
-                        valid_until: None,
-                        attestation_evidence: None,
-                        withdrawn_at: None,
-                        persist_row_hash: String::new(),
-                    },
-                ),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("rough-only")),
-            "got: {err:?}"
-        );
-    }
+    // v62.0.0 (E8 round 3) — `pg_location_proof_round_trip_and_rough_only_gate`
+    // is DELETED: it asserted the earlier-form location-proof door (a JSON
+    // `SignedLocationProof` hybrid-signed over its JCS image, read back from
+    // `federation_location_proofs`). Edition 2 carries a location proof as a
+    // `location_proof:v1` scores row in `federation_attestations` (payloads.rs),
+    // which never fills that table, and its rough-only bound is the payload's
+    // `cell_resolution` member.
 
     /// v4.11.0 (#154 Ask 4/5) — live-PG geographic community admission +
     /// `communities_containing` (exercises the JSONB
@@ -48778,11 +48786,17 @@ mod tests {
         // widening at the edition-2 group door — u2's proposal (by the founder
         // u0) and acceptance held as edition-2 rows, then the widening's voice
         // (I3004).
+        // v62.0.0 (round 3, E8) — the proposal names the group by the id the
+        // store holds (its kid), as T1's I3004 does: the proposal's
+        // `{family,community}_key_id` is no identity-ref member of its
+        // payload, so the fixture codec carries it as written, and the growth
+        // gate (`check_growth_accepted`) matches the acceptance's group to the
+        // widening's by that text.
         let p = crate::federation::membership_acceptance::test_support::proposal_row(
             &u0,
             "community",
-            &comm,
-            &u2,
+            &pg_id(&comm),
+            &pg_id(&u2),
             None,
             now,
         );
@@ -49239,8 +49253,10 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
         let tag = format!("pg734{}", &uuid_like()[..8]);
-        crate::federation::tier_ingest::test_support::exercise_location_proof_authority(
-            &backend, &tag,
+        Box::pin(
+            crate::federation::tier_ingest::test_support::exercise_location_proof_authority(
+                &backend, &tag,
+            ),
         )
         .await
         .expect("734 location-proof authority exercise");
@@ -49347,26 +49363,12 @@ mod tests {
         );
     }
 
-    /// v31.0.0 (CIRISPersist#654) — roster growth is AUTHORIZED, on postgres.
-    /// One shared body across memory / sqlite / postgres; see
-    /// [`crate::federation::cohort::test_support::exercise_roster_growth_is_authorized`].
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn roster_growth_is_authorized_postgres_654() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        crate::federation::cohort::test_support::exercise_roster_growth_is_authorized(
-            &backend,
-            // The distinguishing part leads; `seed_for` truncates at 32 bytes.
-            &format!("{}-pg654", uuid::Uuid::new_v4().simple()),
-        )
-        .await
-        .expect("654 roster-growth authorization exercise");
-    }
+    // v62.0.0 (round 3, E8) — `roster_growth_is_authorized_postgres_654`
+    // DELETED: its body (`cohort::test_support::exercise_roster_growth_is_authorized`)
+    // asserts the earlier-form `put_family` / `add_family_member` AdmitSpec
+    // authorship legs (unsigned, signed over another widening), which have no
+    // edition-2 form (a voice is a statement the door verifies; I3004/I2999
+    // witness the edition-2 growth).
 
     // ── v53.1.5 — the two-phase trace listing (I531, postgres) ─────────
 

@@ -17,64 +17,26 @@
 //! v62 (E3): I613 (the earlier key-record plane) and I631 (the earlier
 //! envelope verifier) are deleted with the earlier form; the attestation
 //! legs of I615/I632/I834 run on edition-2 rows.
+//!
+//! v62 (E3b, round 3): I614, I630, I632 and I834 are deleted. Each drives an
+//! earlier-form JSON door (the hybrid-signed `SignedIdentityOccurrence`, the
+//! signed transport destination, the touch claim; each
+//! `refuse_earlier_form(..)` once shut), and I630's revocation leg stands an
+//! agent key as an occurrence of a person, which v62 refuses
+//! (`occurrence_binds_machine_to_person`). The edition-2 occurrence wait (an
+//! author's voice offered alone is the retryable `federation_attester_key_unknown`)
+//! is O1's. I615 remains: the statement door names its own plane
+//! (`edition2::door::PLANE`).
 
 #[cfg(test)]
 pub(crate) mod bodies {
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::identity_type::{AGENT, USER};
     use crate::federation::types::{attestation_tier, attestation_type};
     use crate::federation::{Attestation, Error, FederationDirectory, SignedAttestation};
 
     /// The kind every plane's ordering gap reports.
     const GAP: &str = "federation_attester_key_unknown";
-
-    /// **I614 — the identity_occurrence plane** (the 2026-10-08 fresh-install
-    /// defect). `put_identity_occurrence` is the one door for the wire and the
-    /// HTTP route. A signer this node does not hold reports the gap; a known
-    /// signer with a signature over another envelope is the terminal
-    /// `federation_signature_invalid`; after the signer's Key row lands the
-    /// same row admits.
-    pub async fn i614_occurrence_plane(d: &dyn FederationDirectory, s: &str) {
-        let identity = format!("i614-id-{s}");
-        let occurrence = format!("i614-occ-{s}");
-        let at = chrono::Utc::now();
-        // The occurrence's own Key row is held; only the SIGNER's is missing.
-        ts::register_identity_key(d, &occurrence, AGENT).await;
-        let signed =
-            ts::signed_content_only_occurrence(&identity, &identity, &occurrence, at).await;
-
-        let gap = d
-            .put_identity_occurrence(signed.clone())
-            .await
-            .expect_err("I614: an unknown signer cannot be verified");
-        assert_eq!(gap.kind(), GAP, "I614: {gap}");
-        assert!(
-            matches!(&gap, Error::AttesterKeyUnknown { attesting_key_id, plane: "identity_occurrence" } if *attesting_key_id == identity),
-            "I614: {gap:?}"
-        );
-
-        ts::register_identity_key(d, &identity, USER).await;
-
-        let other_occ = format!("i614-other-{s}");
-        ts::register_identity_key(d, &other_occ, AGENT).await;
-        let other = ts::signed_content_only_occurrence(&identity, &identity, &other_occ, at).await;
-        let mut forged = signed.clone();
-        forged.signature = other.signature;
-        let terminal = d
-            .put_identity_occurrence(forged)
-            .await
-            .expect_err("I614: a signature over another envelope does not verify");
-        assert_eq!(
-            terminal.kind(),
-            "federation_signature_invalid",
-            "I614: {terminal}"
-        );
-
-        d.put_identity_occurrence(signed)
-            .await
-            .expect("I614: the same row admits after the key plane");
-    }
 
     /// A self-scored federation-tier row by `attester`, as the door maps the
     /// attester's edition-2 statement (the erasable witnesses' shape).
@@ -135,7 +97,7 @@ pub(crate) mod bodies {
             .expect_err("I615: an unknown attester cannot be verified");
         assert_eq!(gap.kind(), GAP, "I615: {gap}");
         assert!(
-            matches!(&gap, Error::AttesterKeyUnknown { attesting_key_id, plane: "attestation" } if *attesting_key_id == e2::kid(&attester)),
+            matches!(&gap, Error::AttesterKeyUnknown { attesting_key_id, plane } if *attesting_key_id == e2::kid(&attester) && *plane == crate::federation::edition2::door::PLANE),
             "I615: {gap:?}"
         );
 
@@ -147,250 +109,6 @@ pub(crate) mod bodies {
         crate::federation::edition2::fixture_switch::put_signed(d, &row)
             .await
             .expect("I615: the same row admits after the key plane");
-    }
-
-    /// The kind of the signer-acts-for ordering gap.
-    const NOT_ACTING: &str = "federation_signer_not_acting_for";
-
-    /// Assert `e` is the signer-acts-for gap naming `signer`, `identity` and
-    /// `plane` exactly.
-    fn expect_not_acting(e: &Error, signer: &str, identity: &str, plane: &str, what: &str) {
-        assert_eq!(e.kind(), NOT_ACTING, "{what}: {e}");
-        assert!(
-            matches!(e, Error::SignerDoesNotActFor { attesting_key_id, identity_key_id, plane: p, .. }
-                if attesting_key_id == signer && identity_key_id == identity && *p == plane),
-            "{what}: {e:?}"
-        );
-    }
-
-    /// Land `{identity → occurrence}` as an ACTIVE occurrence (the binding
-    /// whose absence was the gap).
-    async fn bind(d: &dyn FederationDirectory, identity: &str, occurrence: &str) {
-        d.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
-            identity_key_id: identity.to_owned(),
-            occurrence_key_id: occurrence.to_owned(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
-            hardware_attestation: None,
-            asserted_at: chrono::Utc::now() - chrono::Duration::hours(1),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .expect("the binding lands");
-    }
-
-    /// **I630 (#1042 follow-up, CIRISEdge#858) — the signer-acts-for arm is
-    /// the retryable `federation_signer_not_acting_for`, on every door that
-    /// asks it.** A REGISTERED signer whose signature verifies but who is not
-    /// yet an active occurrence of the identity the row is about: on the
-    /// `identity_occurrence`, `identity_occurrence_revocation`,
-    /// `transport_destination` and `touch_claim` doors the refusal names the
-    /// signer, the identity and the door (before: the terminal
-    /// `federation_signature_invalid`). Once the binding lands, the SAME row
-    /// admits.
-    #[allow(clippy::too_many_lines)]
-    pub async fn i630_signer_not_acting_for_is_retryable(d: &dyn FederationDirectory, s: &str) {
-        use crate::federation::freshness::test_support::signed_claim;
-        use crate::federation::self_at_login::test_support::route;
-        use crate::federation::types::{cohort_scope, SignerForm};
-        let k = |n: &str| format!("i630{n}-{s}");
-        let identity = k("id");
-        ts::register_identity_key(d, &identity, USER).await;
-        let at = chrono::Utc::now() - chrono::Duration::minutes(5);
-
-        // identity_occurrence: `so` vouches for `o` before `so` is bound.
-        let (so, o) = (k("so"), k("o"));
-        ts::register_identity_key(d, &so, AGENT).await;
-        ts::register_identity_key(d, &o, AGENT).await;
-        let occ = ts::signed_content_only_occurrence(&so, &identity, &o, at).await;
-        let e = d
-            .put_identity_occurrence(occ.clone())
-            .await
-            .expect_err("I630: an unbound signer cannot vouch yet");
-        expect_not_acting(&e, &so, &identity, "identity_occurrence", "I630 occurrence");
-        bind(d, &identity, &so).await;
-        d.put_identity_occurrence(occ)
-            .await
-            .expect("I630: the same occurrence admits once the signer is bound");
-
-        // identity_occurrence_revocation: `sr` revokes `o` before `sr` is bound.
-        let sr = k("sr");
-        ts::register_identity_key(d, &sr, AGENT).await;
-        // v58.0.0 (CIRISPersist#991, CC 3.3.6) — the revocation is a
-        // `withdraws` on the occurrence's row; the same signer_acts_for rule.
-        let rev = ts::occurrence_withdrawal(d, &sr, &identity, &o, chrono::Utc::now()).await;
-        let e = d
-            .put_attestation(rev.clone())
-            .await
-            .expect_err("I630: an unbound signer cannot revoke yet");
-        // The flipped builder signs as `e2::kid(sr)`.
-        expect_not_acting(
-            &e,
-            &e2::kid(&sr),
-            &identity,
-            "identity_occurrence_withdraws",
-            "I630 revocation",
-        );
-        bind(d, &identity, &sr).await;
-        d.put_attestation(rev)
-            .await
-            .expect("I630: the same revocation admits once the signer is bound");
-
-        // transport_destination: `st` asserts the identity's route.
-        let st = k("st");
-        ts::register_identity_key(d, &st, AGENT).await;
-        let r = route(&identity, "reticulum", "d1", 0, "2026-06-10T00:00:00Z");
-        let signer = ts::hybrid_identity(&st);
-        let (env, sig) = ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
-            signer.as_ref(),
-            serde_json::to_value(&r).unwrap(),
-        )
-        .await
-        .unwrap();
-        let td = crate::federation::self_at_login::SignedTransportDestination {
-            transport_destination: r,
-            attesting_key_id: st.clone(),
-            signed_envelope: env,
-            signature: sig,
-        };
-        let e = d
-            .put_signed_transport_destination(&td)
-            .await
-            .expect_err("I630: an unbound signer cannot assert the route yet");
-        expect_not_acting(&e, &st, &identity, "transport_destination", "I630 route");
-        bind(d, &identity, &st).await;
-        d.put_signed_transport_destination(&td)
-            .await
-            .expect("I630: the same route admits once the signer is bound");
-
-        // touch_claim (SelfTouch): `sc` touches the identity.
-        let sc = k("sc");
-        ts::register_identity_key(d, &sc, AGENT).await;
-        let signer = ts::hybrid_identity(&sc);
-        let claim = signed_claim(
-            signer.as_ref(),
-            &sc,
-            &identity,
-            "occurrence",
-            chrono::Utc::now() - chrono::Duration::minutes(1),
-            SignerForm::SelfTouch,
-            cohort_scope::SELF,
-        )
-        .await;
-        let e = d
-            .put_touch_claim(&claim)
-            .await
-            .expect_err("I630: an unbound signer cannot touch yet");
-        expect_not_acting(&e, &sc, &identity, "touch_claim", "I630 touch");
-        bind(d, &identity, &sc).await;
-        d.put_touch_claim(&claim)
-            .await
-            .expect("I630: the same touch admits once the signer is bound");
-    }
-
-    /// `e` is the terminal `MalformedRow { reason: no_signer }` (v55.0.0,
-    /// CIRISPersist#1055; before, an `InvalidArgument`), never the retryable
-    /// gap.
-    fn expect_malformed(e: &Error, what: &str) {
-        // The key plane refuses an empty `scrub_key_id` before its lookup (its
-        // own pre-existing guard); every other door reaches the lookup's.
-        assert!(
-            matches!(e, Error::MalformedRow { reason: "no_signer", message, .. }
-                if message.contains("names no signer")
-                    || message.contains("scrub_key_id must be non-empty")),
-            "{what}: a row naming no signer is malformed (MalformedRow no_signer, from the \
-             signer lookup's own guard), got {} ({e:?})",
-            e.kind()
-        );
-        assert_eq!(e.kind(), "federation_malformed_row", "{what}");
-    }
-
-    /// `e` is the terminal `MalformedRow` on `plane` for `reason`.
-    fn expect_malformed_as(e: &Error, plane: &str, reason: &str, what: &str) {
-        assert!(
-            matches!(e, Error::MalformedRow { plane: p, reason: r, .. } if *p == plane && *r == reason),
-            "{what}: expected MalformedRow {{ {plane}, {reason} }}, got {} ({e:?})",
-            e.kind()
-        );
-        assert_eq!(e.kind(), "federation_malformed_row", "{what}");
-        assert!(
-            crate::federation::malformed_row::ALL.contains(&reason),
-            "{what}: {reason} is in the closed set"
-        );
-        assert!(
-            !e.to_string().starts_with("invalid argument:"),
-            "{what}: the Display does not read as an InvalidArgument: {e}"
-        );
-    }
-
-    /// **I834 (v55.0.0, CIRISPersist#1055, CIRISEdge's adopt of v54.1) — a
-    /// signed row whose typed columns diverge from its signed envelope is the
-    /// TERMINAL `MalformedRow`, typed apart from a caller's argument error.**
-    /// On the attestation door: a typed `asserted_at` and a typed mirror
-    /// column (`attested_key_id`) moved off the envelope the signature
-    /// covers. On the occurrence door: a typed `device_class` moved off the
-    /// signed envelope (the exact case Edge reported). Each is refused with
-    /// its plane and reason token, and the untouched row admits.
-    pub async fn i834_typed_divergence_is_malformed_row(d: &dyn FederationDirectory, s: &str) {
-        // v62 (E3): the attestation-door legs are deleted. An edition-2
-        // row's typed columns are the door's mapping of its statement, so a
-        // typed column cannot diverge from what was signed; the occurrence
-        // door (still the earlier typed plane) keeps its leg.
-        use crate::federation::malformed_row as why;
-        let identity = format!("i834-id-{s}");
-        let occ = format!("i834-occ-{s}");
-        ts::register_identity_key(d, &identity, USER).await;
-        ts::register_identity_key(d, &occ, AGENT).await;
-        let signed =
-            ts::signed_content_only_occurrence(&identity, &identity, &occ, chrono::Utc::now())
-                .await;
-        let mut moved = signed.clone();
-        moved.identity_occurrence.device_class =
-            if moved.identity_occurrence.device_class == "phone" {
-                "laptop".to_owned()
-            } else {
-                "phone".to_owned()
-            };
-        let e = d
-            .put_identity_occurrence(moved)
-            .await
-            .expect_err("I834: a typed device_class off its signed envelope");
-        expect_malformed_as(
-            &e,
-            "identity_occurrence",
-            why::TYPED_DIVERGES_FROM_ENVELOPE,
-            "I834 device_class",
-        );
-        d.put_identity_occurrence(signed)
-            .await
-            .expect("I834: the untouched occurrence admits");
-    }
-
-    /// **I632 (#1042 follow-up B, CIRISEdge#858) — a row that names NO signer
-    /// is malformed, never the retryable gap.** No Key row can ever land for
-    /// `""`, so an empty signer id reaching a door's signer lookup is a
-    /// terminal `InvalidArgument` (before: `AttesterKeyUnknown { "" }`). Run
-    /// through the key plane (direct and replicated, where it is the terminal
-    /// `unverifiable_signature` outcome), the attestation door, the signed
-    /// occurrence door, and the shared envelope verifier.
-    pub async fn i632_empty_signer_is_malformed(d: &dyn FederationDirectory, s: &str) {
-        // v62 (E3): the key-plane, attestation-door and envelope-verifier
-        // legs are deleted (earlier-form scrub signers; an edition-2
-        // statement always names its signer in its header).
-        // Signed occurrence door: signed by "".
-        let identity = format!("i632-id-{s}");
-        let occ = format!("i632-occ-{s}");
-        ts::register_identity_key(d, &identity, USER).await;
-        ts::register_identity_key(d, &occ, AGENT).await;
-        let signed =
-            ts::signed_content_only_occurrence("", &identity, &occ, chrono::Utc::now()).await;
-        let e = d
-            .put_identity_occurrence(signed)
-            .await
-            .expect_err("I632: an occurrence signed by nobody");
-        expect_malformed(&e, "I632 identity_occurrence");
     }
 }
 
@@ -404,29 +122,9 @@ mod run {
             mod $modname {
                 use super::super::bodies;
                 #[tokio::test]
-                async fn i614_occurrence_plane() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i614_occurrence_plane(&b, &super::suffix()).await
-                }
-                #[tokio::test]
                 async fn i615_signed_envelope_plane() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i615_signed_envelope_plane(&b, &super::suffix()).await
-                }
-                #[tokio::test]
-                async fn i630_signer_not_acting_for_is_retryable() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i630_signer_not_acting_for_is_retryable(&b, &super::suffix()).await
-                }
-                #[tokio::test]
-                async fn i632_empty_signer_is_malformed() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i632_empty_signer_is_malformed(&b, &super::suffix()).await
-                }
-                #[tokio::test]
-                async fn i834_typed_divergence_is_malformed_row() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i834_typed_divergence_is_malformed_row(&b, &super::suffix()).await
                 }
             }
         };

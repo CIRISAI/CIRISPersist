@@ -145,6 +145,27 @@ pub fn typed_plane_of(row_type: &str, family: &str) -> Option<TypedPlane> {
         .map(|(_, plane)| *plane)
 }
 
+/// v62.0.0 (P1-fix4, E3's finding) — [`typed_plane_of`] for an admitted row:
+/// a peer DE-ADMISSION (`revocation:peer_admission:{reason}:v1`) carries the
+/// revocation family but is a `scores` denial about a peer, read by
+/// `admission::check_peer_deadmission` from the attestation plane; it is no
+/// entity revocation, so it rides no typed plane (no `revoked_at` to
+/// project). Every other row as [`typed_plane_of`].
+#[must_use]
+pub fn typed_plane_of_row(row: &AdmittedRow) -> Option<TypedPlane> {
+    let plane = typed_plane_of(&row.row_type, &row.family)?;
+    if plane == TypedPlane::Revocation
+        && row
+            .payload
+            .get_text("dimension")
+            .and_then(Value::as_text)
+            .is_some_and(crate::federation::admission::is_peer_deadmission_dimension)
+    {
+        return None;
+    }
+    Some(plane)
+}
+
 /// v62.0.0 (T2-fix3) — **the selector keys a typed family's authorship cell
 /// reads, from the statement's bytes alone**, for an admit that supplies
 /// none (`door::door_context`; a key already `Some` is kept):
@@ -436,7 +457,7 @@ fn put_digests_hex(row: &AdmittedRow, o: &mut serde_json::Map<String, serde_json
 ///   2), `family_id` → `family_key_id`.
 /// - `delivery_receipt`: `chunk_root` as hex.
 pub fn project_envelope(row: &AdmittedRow, o: &mut serde_json::Map<String, serde_json::Value>) {
-    let Some(plane) = typed_plane_of(&row.row_type, &row.family) else {
+    let Some(plane) = typed_plane_of_row(row) else {
         return;
     };
     match plane {
@@ -1811,10 +1832,17 @@ pub fn delivery_receipt_payload(
 }
 
 /// The payload of a `cosign:{state}` statement naming the event it cosigns.
+///
+/// v62.0.0 (T2-fix5) — `cosign:{state}` is an AUTHORED family (Verify's
+/// family model, `family_authorship.json`; CC 3.1.3's per-leaf rule:
+/// `pending` is the event's primary signer, `signature` the member whose
+/// signature it carries), so the payload carries `author`: the statement's
+/// signer (`iss`). Without it the door refuses `author_column`.
 #[must_use]
-pub fn cosign_payload(state: &str, event: &RowId, asserted_at_ms: u64) -> Value {
+pub fn cosign_payload(author: &str, state: &str, event: &RowId, asserted_at_ms: u64) -> Value {
     det_map(vec![
         ("asserted_at", Value::Uint(asserted_at_ms)),
+        ("author", text(author)),
         ("dimension", text(&format!("cosign:{state}:v1"))),
         ("refs", refs_naming(TARGET_ROLE, event)),
     ])

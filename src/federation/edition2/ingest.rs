@@ -962,6 +962,12 @@ where
         None => (tier.to_owned(), replicated),
     };
     let was_held = state.as_ref().is_some_and(|s| s.held.is_some());
+    // G0-fix6 — a row already CONCLUDED on a FINAL plane never un-concludes,
+    // on ANY path (a re-offered voice, a re-run): a hold its re-run marks is
+    // not recorded, and the row stays concluded (CC 2.7.5).
+    let concluded_final = state
+        .as_ref()
+        .is_some_and(|s| s.held.is_none() && super::fold::plane_for(&s.plane).is_final());
     let (plane_name, slot) = fold_plane_of(admitted);
     let arrival = Arrival {
         row_id: admitted.row_id,
@@ -1008,7 +1014,7 @@ where
                     // there and saw neither). fix2's record overwrote both
                     // with `count_short` and the outer reads.
                     StatementOutcome::Pending { row_id, .. }
-                        if plane_name != plane::ATTESTATION =>
+                        if plane_name != plane::ATTESTATION && !concluded_final =>
                     {
                         super::fold::record_pending(
                             dir,
@@ -1062,6 +1068,15 @@ where
             // plane (a door input): it never holds. A mark set during its
             // route does not keep it; its refusal stands.
             (Err(e), Some(_)) if admitted.family == KEY_RECORD_FAMILY => return Err(e),
+            // G0-fix6 — concluded and FINAL: the voice is kept, nothing is
+            // held (the general form of O1-fix7's `landed_here`).
+            (Err(_), Some(_)) if concluded_final => {
+                let new = dir.put_edition2_statement(admitted).await?;
+                StatementOutcome::Voice {
+                    row_id: admitted.row_id,
+                    new,
+                }
+            }
             (Err(e), Some((r, detail))) => {
                 let new = dir.put_edition2_statement(admitted).await?;
                 let detail = if detail.is_empty() {
@@ -1276,7 +1291,7 @@ pub fn route_of(admitted: &AdmittedRow) -> Route {
     if super::typed::is_trust_family(&admitted.family) {
         return Route::Trust;
     }
-    if let Some(plane) = super::typed::typed_plane_of(&admitted.row_type, &admitted.family) {
+    if let Some(plane) = super::typed::typed_plane_of_row(admitted) {
         return Route::Typed(plane);
     }
     if admitted.family == super::transport_rebind::REBIND_FAMILY {

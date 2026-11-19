@@ -251,7 +251,9 @@ pub(crate) mod bodies {
         B: FederationDirectory + Sync,
     {
         let env = serde_json::json!({
-            "references_attestation_id": target, "withdrawal_reason": "CC 2.3",
+            // v62 (E4 round 3): a composer carries only the common members
+            // and `refs.target` (P1e); no `withdrawal_reason`.
+            "references_attestation_id": target,
         });
         // v62 (E4): a composer carries its TARGET's family (RULINGS,
         // `composer_family_mismatch`), named through `refs.target`.

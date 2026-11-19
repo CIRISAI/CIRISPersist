@@ -49,6 +49,17 @@
 pub mod test_support {
     use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
 
+    /// v62.0.0 (E0 fix 3) — a key as the store names it: under the switch its
+    /// identity-ref (`fixture_switch::kid`), in a test held in the earlier
+    /// form the label itself. What a read keyed by a key id is asked with.
+    fn stored_id(seed: &str) -> String {
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            crate::federation::edition2::fixture_switch::kid(seed)
+        } else {
+            seed.to_owned()
+        }
+    }
+
     /// Build a federation-tier `scores` row REALLY signed by `attester`'s
     /// deterministic hybrid key, carrying `dimension` in its envelope. This is
     /// the shape reputation actually travels in — `attestation_type = scores`
@@ -1514,6 +1525,22 @@ pub mod test_support {
     /// widens to a broad tier. A producer's OWN row widens to `community`. The
     /// same verdict at the same kind for a row born federation-tier.
     pub async fn exercise_promotion_cohort_standing_gate(dir: &dyn FederationDirectory, tag: &str) {
+        // v62.0.0 (E0 fix 4; lead's ruling (a)) — HELD in the earlier form: the
+        // community and family are put through the typed plane
+        // (`put_community` / `put_family` with an earlier-form AdmitSpec
+        // signature), which has no edition-2 projection yet. Mixing it with
+        // edition-2 keys meant the plane's signer was never registered
+        // (`signed_envelope: … not a registered federation key`). Every
+        // builder and register helper polled inside takes the earlier form.
+        Box::pin(
+            crate::federation::edition2::fixture_switch::with_earlier_form_async(
+                promotion_cohort_standing_gate_held(dir, tag),
+            ),
+        )
+        .await;
+    }
+
+    async fn promotion_cohort_standing_gate_held(dir: &dyn FederationDirectory, tag: &str) {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{attestation_tier, cohort_scope, identity_type};
         use crate::federation::{CrossingBasis, MeshCrossingOutcome};
@@ -2539,6 +2566,16 @@ pub mod test_support {
         us: &str,
         tag: &str,
     ) {
+        // v62.0.0 (E0 fix 4; lead's ruling (a)) — HELD in the earlier form, as
+        // [`exercise_promotion_cohort_standing_gate`]: the shared community is
+        // put through the typed plane, which has no edition-2 projection yet.
+        crate::federation::edition2::fixture_switch::with_earlier_form_async(
+            privileged_sync_door_804_held(dir, us, tag),
+        )
+        .await;
+    }
+
+    async fn privileged_sync_door_804_held(dir: &dyn FederationDirectory, us: &str, tag: &str) {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{attestation_tier, cohort_scope, identity_type};
 
@@ -2723,7 +2760,9 @@ pub mod test_support {
         let unsigned_id = dir
             .attestation_insert_local(crate::federation::types::LocalAttestationInput {
                 attestation_id: None,
-                attesting_key_id: actor.clone(),
+                // v62.0.0 (E0 fix 3) — the actor's key is held under its
+                // identity-ref (`put_key`), the id a local row names it by.
+                attesting_key_id: crate::federation::edition2::fixture_switch::kid(&actor),
                 attested_key_id: None,
                 attestation_type: attestation_type::SCORES.to_owned(),
                 weight: Some(1.0),
@@ -3321,8 +3360,8 @@ pub mod test_support {
         .unwrap_or_else(|e| panic!("({tag}) B10-a: the subject's own revocation admits: {e}"));
         assert_eq!(
             dir.resolve_scoped_consent(
-                &attester,
-                &subject,
+                &stored_id(&attester),
+                &stored_id(&subject),
                 analyze,
                 None,
                 crate::host::clock::now()
@@ -3405,8 +3444,8 @@ pub mod test_support {
         // persist still refuses.
         assert_eq!(
             dir.resolve_scoped_consent(
-                &attester,
-                &subject,
+                &stored_id(&attester),
+                &stored_id(&subject),
                 analyze,
                 None,
                 crate::host::clock::now()
@@ -3777,8 +3816,8 @@ pub mod test_support {
                 // Revoked — the mesh split this leg exists to deny.
                 assert_ne!(
                     dir.resolve_scoped_consent(
-                        &attester,
-                        &subject,
+                        &stored_id(&attester),
+                        &stored_id(&subject),
                         analyze,
                         None,
                         crate::host::clock::now()
@@ -3801,8 +3840,8 @@ pub mod test_support {
             }
             verdicts.push(
                 dir.resolve_scoped_consent(
-                    &attester,
-                    &subject,
+                    &stored_id(&attester),
+                    &stored_id(&subject),
                     analyze,
                     None,
                     crate::host::clock::now(),
@@ -3915,8 +3954,8 @@ pub mod test_support {
             (
                 "resolve_scoped_consent",
                 dir.resolve_scoped_consent(
-                    &attester,
-                    &subject,
+                    &stored_id(&attester),
+                    &stored_id(&subject),
                     analyze,
                     None,
                     crate::host::clock::now(),
@@ -3978,8 +4017,8 @@ pub mod test_support {
         .await;
         assert_eq!(
             dir.resolve_scoped_consent(
-                &attester,
-                &subject,
+                &stored_id(&attester),
+                &stored_id(&subject),
                 analyze,
                 None,
                 crate::host::clock::now()
@@ -4029,8 +4068,8 @@ pub mod test_support {
             .await;
             assert_eq!(
                 dir.resolve_scoped_consent(
-                    &attester,
-                    &subject,
+                    &stored_id(&attester),
+                    &stored_id(&subject),
                     analyze,
                     None,
                     crate::host::clock::now()
@@ -4077,8 +4116,8 @@ pub mod test_support {
         .await;
         assert_eq!(
             dir.resolve_scoped_consent(
-                &attester,
-                &subject,
+                &stored_id(&attester),
+                &stored_id(&subject),
                 analyze,
                 None,
                 crate::host::clock::now()
@@ -4125,8 +4164,8 @@ pub mod test_support {
         .await;
         assert_eq!(
             dir.resolve_scoped_consent(
-                &attester,
-                &subject,
+                &stored_id(&attester),
+                &stored_id(&subject),
                 analyze,
                 None,
                 crate::host::clock::now()
@@ -4167,8 +4206,8 @@ pub mod test_support {
         .await;
         assert_eq!(
             dir.resolve_scoped_consent(
-                &attester,
-                &subject,
+                &stored_id(&attester),
+                &stored_id(&subject),
                 analyze,
                 None,
                 crate::host::clock::now()
@@ -4223,8 +4262,8 @@ pub mod test_support {
         .await;
         assert_eq!(
             dir.resolve_scoped_consent(
-                &attester,
-                &subject,
+                &stored_id(&attester),
+                &stored_id(&subject),
                 analyze,
                 None,
                 crate::host::clock::now()
@@ -4290,8 +4329,8 @@ pub mod test_support {
         .await;
         assert_eq!(
             dir.resolve_scoped_consent(
-                &attester,
-                &subject,
+                &stored_id(&attester),
+                &stored_id(&subject),
                 analyze,
                 None,
                 crate::host::clock::now()
@@ -4305,8 +4344,8 @@ pub mod test_support {
         );
         assert_eq!(
             dir.resolve_scoped_consent(
-                &attester,
-                &subject,
+                &stored_id(&attester),
+                &stored_id(&subject),
                 "export",
                 None,
                 crate::host::clock::now()
@@ -4351,64 +4390,10 @@ pub mod test_support {
             crate::host::clock::now(),
         ) - chrono::Duration::seconds(60);
 
-        // (1) 500ns apart — refused on EVERY backend, so no backend can be the
-        // one that reads this pair as a strict order.
-        {
-            let subject = format!("{tag}-598-ns-subject");
-            let attester = format!("{tag}-598-ns-attester");
-            for k in [&subject, &attester] {
-                crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
-            }
-            // `consent_scope_row` truncates, so build the sub-microsecond row
-            // by hand: bump BOTH the column and the signed envelope so the
-            // divergence arm cannot be what refuses it — this arm must fail on
-            // RESOLUTION or it is testing the wrong rule.
-            let mut row = consent_scope_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &subject,
-                &attester,
-                &revoked,
-                &[analyze],
-                base,
-            );
-            let skewed = base + chrono::Duration::nanoseconds(500);
-            row.asserted_at = skewed;
-            let (och, sc, sp) = {
-                let mut env = row.attestation_envelope.clone();
-                env[crate::federation::envelope::paths::ASSERTED_AT] =
-                    serde_json::Value::String(skewed.to_rfc3339());
-                let signed =
-                    crate::federation::tier_ingest::test_support::sign_envelope(&subject, &env);
-                row.attestation_envelope = env;
-                // Deliberately NOT `reseal`: the seal TRUNCATES to the
-                // substrate resolution, which is the very skew this arm exists
-                // to have refused. Re-sealing here truncated the 500ns away and
-                // re-signed, and then the hand-computed signature below was
-                // written back over the re-sealed envelope — so the row was
-                // refused for a FAILED ED25519 VERIFY while the assertion
-                // demanded the resolution rule. The comment above already
-                // forbade this ("build the sub-microsecond row by hand"); the
-                // call contradicted it.
-                signed
-            };
-            row.original_content_hash = och;
-            row.scrub_signature_classical = sc;
-            row.scrub_signature_pqc = sp;
-            let err = dir
-                .put_attestation(SignedAttestation { attestation: row })
-                .await
-                .expect_err(
-                    "({tag}) B10-c: a sub-microsecond consent instant must be REFUSED — \
-                     postgres TIMESTAMPTZ cannot store it, so admitting it makes the fold's \
-                     answer depend on the backend (CIRISPersist#598)",
-                );
-            let msg = format!("{err}");
-            assert!(
-                msg.contains("sub-microsecond"),
-                "({tag}) B10-c: the refusal must name the RESOLUTION rule, not the binding: \
-                 {msg}"
-            );
-        }
+        // v62.0.0 (E0 fix 3) — arm (1), a 500ns-apart earlier-form JSON
+        // instant refused for its RESOLUTION, is DELETED: an edition-2 instant
+        // is a uint of POSIX ms (CC 2.6.2), so a sub-microsecond instant has no
+        // wire form to refuse (earlier-form behaviour, round-3 ruling 4).
 
         // (2) a TRUE tie, fed in both orders. Restriction wins, both times,
         // on every backend.
@@ -4460,8 +4445,8 @@ pub mod test_support {
             }
             assert_eq!(
                 dir.resolve_scoped_consent(
-                    &attester,
-                    &subject,
+                    &stored_id(&attester),
+                    &stored_id(&subject),
                     analyze,
                     None,
                     crate::host::clock::now()

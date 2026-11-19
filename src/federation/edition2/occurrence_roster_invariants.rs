@@ -1114,3 +1114,190 @@ async fn i3645_to_i3648_postgres() {
     b.run_migrations().await.unwrap();
     Box::pin(fork_body(&b)).await;
 }
+
+/// **I3649** (wave O1, the second block; CC 3.3.6.4, ENACT = more than 1/2
+/// of the live roster at the named head, the proposer counted) on one
+/// backend, E0 seeds. At a two-key roster `{a, b}`:
+/// - b's lone statement as `a` adding c is ONE of TWO: held (`Pending`),
+///   c is not bound, the receipt stays open;
+/// - c's own statement is never a roster vote (it is the occurrence key's
+///   voice, not the self's): still held;
+/// - a's statement over the same payload is TWO of TWO: it lands (`Row`),
+///   c is bound.
+pub(crate) async fn majority_body(d: &dyn FederationDirectory) {
+    use super::fixture_occurrence::{put_bind, BindOptions};
+    use super::fixture_switch as e2;
+    for s in ["mj-a", "mj-b", "mj-c"] {
+        e2::put_key(d, s, &["user"]).await;
+    }
+    let ak = e2::kid("mj-a");
+    let at = now_ms() - 3_600_000;
+    let opts = BindOptions {
+        asserted_at_ms: at,
+        ..BindOptions::default()
+    };
+    assert!(matches!(
+        put_bind(d, "mj-a", "mj-a", "mj-b", "laptop", &opts).await,
+        Ok(StatementOutcome::Row { .. })
+    ));
+    let h = head(d, &ak).await;
+    let c = bind_on("mj-a", "mj-c", "laptop", &[h], at + 1);
+    let row = RowId::of_statement(&c[0]).unwrap();
+    assert!(matches!(
+        put(d, &c[0]).await,
+        Ok(StatementOutcome::Voice { .. })
+    ));
+    let one = put(d, &as_identity("mj-b", "mj-a", &c[1])).await;
+    assert!(
+        matches!(one, Ok(StatementOutcome::Pending { .. })),
+        "I3649: one of two is no strict majority: {one:?}"
+    );
+    assert!(
+        !active(d, &ak, &e2::kid("mj-c")).await,
+        "I3649: c is not bound on one of two"
+    );
+    assert!(
+        open(d, &ak).await.contains(&row.hex()),
+        "I3649: the receipt stays open"
+    );
+    // c's own statement offered again: not a vote.
+    let _ = put(d, &c[0]).await;
+    assert!(
+        !active(d, &ak, &e2::kid("mj-c")).await,
+        "I3649: the candidate's own voice is not counted"
+    );
+    let two = put(d, &c[1]).await;
+    assert!(
+        matches!(two, Ok(StatementOutcome::Row { .. })),
+        "I3649: two of two lands: {two:?}"
+    );
+    assert!(active(d, &ak, &e2::kid("mj-c")).await, "I3649: c is bound");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3649_strict_majority_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(majority_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3649_strict_majority_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(majority_body(&b)).await;
+}
+
+/// Put `voices` in order; every one is admitted (a voice or a landing).
+async fn put_all(d: &dyn FederationDirectory, voices: &[Vec<u8>]) {
+    for v in voices {
+        put(d, v).await.expect("a tied bind is admitted");
+    }
+}
+
+/// The `edition2_row_id` of the bind `identity`'s pair with `occurrence`
+/// holds (the signed listing's envelope).
+async fn holding_row(d: &dyn FederationDirectory, identity: &str, occurrence: &str) -> String {
+    d.list_signed_identity_occurrences_for(identity)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.identity_occurrence.occurrence_key_id == occurrence)
+        .and_then(|s| {
+            s.signed_envelope
+                .get("edition2_row_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .expect("the pair is held with its row id")
+}
+
+/// **I3650** (wave O1, the second block; CC 3.5.1, CC 2.7.2; E8's I3330) on
+/// one backend, two fresh directories `d1`, `d2`: two binds of ONE pair at
+/// the SAME signed instant (a node self-pair, `server` vs `embedded`) are
+/// delivered in OPPOSITE orders. Both directories hold the bind with the
+/// LOWER row id: a same-instant tie is broken by the row id, never by
+/// arrival.
+pub(crate) async fn tie_body(d1: &dyn FederationDirectory, d2: &dyn FederationDirectory) {
+    use super::fixture_occurrence::{occurrence_bind_voices, BindOptions};
+    use super::fixture_switch as e2;
+    let seed = "tie-node";
+    for d in [d1, d2] {
+        e2::put_key(d, seed, &["node"]).await;
+    }
+    let nk = e2::kid(seed);
+    let h = head(d1, &nk).await;
+    assert_eq!(h, head(d2, &nk).await, "I3650: one genesis record row");
+    let at = now_ms() - 60_000;
+    let opts = BindOptions {
+        asserted_at_ms: at,
+        head: Some(h),
+        ..BindOptions::default()
+    };
+    let x = occurrence_bind_voices(seed, seed, seed, "server", &opts);
+    let y = occurrence_bind_voices(seed, seed, seed, "embedded", &opts);
+    let (rx, ry) = (
+        RowId::of_statement(&x[0]).unwrap(),
+        RowId::of_statement(&y[0]).unwrap(),
+    );
+    assert_ne!(rx, ry, "I3650: two rows of one pair");
+    let lower = std::cmp::min(rx, ry).hex();
+    put_all(d1, &x).await;
+    put_all(d1, &y).await;
+    put_all(d2, &y).await;
+    put_all(d2, &x).await;
+    assert_eq!(
+        holding_row(d1, &nk, &nk).await,
+        lower,
+        "I3650: in order x, y the lower row id holds"
+    );
+    assert_eq!(
+        holding_row(d2, &nk, &nk).await,
+        lower,
+        "I3650: in order y, x the lower row id holds"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3650_same_instant_tie_sqlite() {
+    use crate::store::Backend as _;
+    let a = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    a.run_migrations().await.unwrap();
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(tie_body(&a, &b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3650_same_instant_tie_postgres() {
+    use crate::store::Backend as _;
+    let (Some(da), Some(db)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+        return;
+    };
+    let a = crate::store::postgres::PostgresBackend::connect(&da)
+        .await
+        .unwrap();
+    a.run_migrations().await.unwrap();
+    let b = crate::store::postgres::PostgresBackend::connect(&db)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(tie_body(&a, &b)).await;
+}

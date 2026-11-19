@@ -265,9 +265,9 @@ pub mod orchestrate {
     /// `chunk_aad(aad, stream_id, seq)` — its position — not to `aad` alone
     /// (#838, §12.10).
     #[allow(clippy::too_many_arguments)]
-    pub async fn put_blob_chunk_scoped<B>(
+    pub async fn put_blob_chunk_scoped<'w, B>(
         backend: &B,
-        signer: &dyn ciris_keyring::HardwareSigner,
+        signer: impl Into<crate::signing::Writer<'w>>,
         cohort_scope: &str,
         community_key_id: Option<&str>,
         stream_id: &str,
@@ -281,12 +281,12 @@ pub mod orchestrate {
     {
         let tier = resolve_write_tier(backend, cohort_scope, community_key_id).await?;
         // #837 (§12.9) — the writer, derived from the signer (never an
-        // alias, I23): the stream's owner on its first append.
-        let owner_key_id = crate::signing::federation_key_id_of(signer)
-            .await
-            .map_err(|e| {
-                BlobError::Backend(format!("put_blob_chunk_scoped: signer key id: {e}"))
-            })?;
+        // alias, I23): the stream's owner on its first append. v62.0.0
+        // (E6-fix4, CC 2.6.1.1) — through the ONE writer-id helper the seal
+        // door uses, so a composite signer is one owner at both doors.
+        let owner_key_id = signer.into().key_id().await.map_err(|e| {
+            BlobError::Backend(format!("put_blob_chunk_scoped: signer key id: {e}"))
+        })?;
         let claim = || StreamClaim {
             community_key_id: community_key_id.map(str::to_owned),
             owner_key_id: Some(owner_key_id.clone()),
@@ -981,9 +981,9 @@ pub mod orchestrate {
     /// the STREAM nonce under the supplied DEK, and read through the same
     /// doors as any stream-keyed chunk.
     #[allow(clippy::too_many_arguments)]
-    pub async fn register_stream_epoch_dek<B>(
+    pub async fn register_stream_epoch_dek<'w, B>(
         backend: &B,
-        signer: &dyn ciris_keyring::HardwareSigner,
+        signer: impl Into<crate::signing::Writer<'w>>,
         cohort_scope: &str,
         group_key_id: &str,
         stream_id: &str,
@@ -1006,11 +1006,10 @@ pub mod orchestrate {
                  plaintext; there is no key to supply (CIRISPersist#981)"
             )));
         }
-        let writer = crate::signing::federation_key_id_of(signer)
-            .await
-            .map_err(|e| {
-                BlobError::Backend(format!("register_stream_epoch_dek: signer key id: {e}"))
-            })?;
+        // v62.0.0 (E6-fix4) — the ONE writer-id helper (the append door's).
+        let writer = signer.into().key_id().await.map_err(|e| {
+            BlobError::Backend(format!("register_stream_epoch_dek: signer key id: {e}"))
+        })?;
         let state = backend.stream_key_state(stream_id).await?;
         if let Some(owner) = state
             .owner_key_id
@@ -1449,7 +1448,12 @@ pub mod orchestrate {
         }
         // §11.2 (6) / I23 / §20.5 — the announcing identity IS the PQC
         // LocalSigner's derived id; hybrid-only, so there is no other.
-        let signer_key_id = local.federation_id().await;
+        // v62.0.0 (E6-fix4) — through the ONE writer-id helper the append
+        // door uses (CC 2.6.1.1: the identity-ref).
+        let signer_key_id = crate::signing::Writer::from(local)
+            .key_id()
+            .await
+            .map_err(|e| BlobError::Backend(format!("seal_stream_scoped: signer key id: {e}")))?;
         // #837 (§12.9 / I41) — the stream's ROW first: a seal by a signer
         // that is not the owner, or at a cohort / community that is not
         // the stream's, is refused before any chunk row is looked at.
@@ -5221,7 +5225,12 @@ pub mod invariants {
             Some(crate::federation::StreamHead {
                 cohort_scope: COMMUNITY.into(),
                 community_key_id: Some(comm.clone()),
-                owner_key_id: Some(crate::signing::federation_key_id_of(&writer).await.unwrap()),
+                owner_key_id: Some(
+                    crate::signing::Writer::from(&writer)
+                        .key_id()
+                        .await
+                        .unwrap()
+                ),
             }),
             "{tag} I37: the listing reports who owns the stream and at what cohort"
         );
@@ -5533,10 +5542,12 @@ pub mod invariants {
             )
             .await;
             let writer_b = crate::signing::LocalSignerHardwareAdapter::new(writer_b_local.clone());
-            let key_a = crate::signing::federation_key_id_of(&writer_a)
+            let key_a = crate::signing::Writer::from(&writer_a)
+                .key_id()
                 .await
                 .unwrap();
-            let key_b = crate::signing::federation_key_id_of(&writer_b)
+            let key_b = crate::signing::Writer::from(&writer_b)
+                .key_id()
                 .await
                 .unwrap();
             assert_ne!(key_a, key_b);
@@ -5932,7 +5943,10 @@ pub mod invariants {
             )
             .await;
             let writer = crate::signing::LocalSignerHardwareAdapter::new(writer_local.clone());
-            let owner = crate::signing::federation_key_id_of(&writer).await.unwrap();
+            let owner = crate::signing::Writer::from(&writer)
+                .key_id()
+                .await
+                .unwrap();
             // #848 — the writer IS the minter (I23): the floor is driven below
             // under the epoch the door minted for this key.
             let minter = owner.clone();
@@ -6330,6 +6344,57 @@ pub mod invariants {
 
 #[cfg(test)]
 mod tests {
+    /// **I2750** (v62.0.0, E6-fix4, CC 2.6.1.1) — **one writer, one id.**
+    /// A composite LocalSigner is the same writer whether a door holds it
+    /// directly (the seal door) or through its `HardwareSigner` adapter (the
+    /// append and DEK doors): `signing::Writer::key_id` names it by its
+    /// identity-ref at both, so its own seal is never "another writer".
+    /// Backend-free; the sqlite and postgres runs of I32–I42 carry it
+    /// through the doors.
+    #[test]
+    fn i2750_a_writer_has_one_id_at_every_door() {
+        // The ML-DSA-65 half overflows the 2 MB test-thread stack in debug
+        // builds: the body runs on a 32 MiB thread with its own runtime (the
+        // `pg_run_big_stack` pattern, store/postgres.rs).
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(i2750_body());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn i2750_body() {
+        use crate::signing::{LocalSignerHardwareAdapter, Writer};
+        let local = crate::federation::tier_ingest::test_support::local_signer("i2750-writer");
+        let adapter = LocalSignerHardwareAdapter::new(local.clone());
+        let kid = local.federation_id().await;
+        assert!(
+            kid.starts_with("urn:ietf:params:oauth:ckt:sha-256:"),
+            "I2750: a composite signer is named by its identity-ref: {kid}"
+        );
+        assert_eq!(Writer::from(&*local).key_id().await.unwrap(), kid);
+        assert_eq!(Writer::from(&adapter).key_id().await.unwrap(), kid);
+        assert_eq!(
+            Writer::of(Some(&*local), &adapter).key_id().await.unwrap(),
+            kid,
+            "I2750: an engine with a LocalSigner writes as it"
+        );
+        // A bare hardware writer (no LocalSigner behind it) keeps the
+        // derived id: it can append, but never seal (§20.5 hybrid-only).
+        let bare: &dyn ciris_keyring::HardwareSigner = &adapter;
+        assert_eq!(
+            Writer::from(bare).key_id().await.unwrap(),
+            local.derived_key_id()
+        );
+    }
+
     /// #838 (§12.10) — **the chunk AAD's bytes are pinned.** Domain label,
     /// u64-BE length-prefixed caller data (absent ⇒ 0), u64-BE
     /// length-prefixed stream id, u64-BE seq. A change here changes what

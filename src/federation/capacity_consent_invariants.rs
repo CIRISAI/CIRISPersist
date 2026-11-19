@@ -17,7 +17,7 @@ pub(crate) mod bodies {
     use crate::federation::hard_case::ConsentState;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{AGENT, NODE, USER};
-    use crate::federation::{Attestation, FederationDirectory, IdentityOccurrence};
+    use crate::federation::{Attestation, FederationDirectory};
 
     /// The parties of one case: the canonical (attester, a node), the agent
     /// (subject), its steward (a user-role key the agent is an occurrence
@@ -40,21 +40,20 @@ pub(crate) mod bodies {
             steward: e2::put_key(d, &format!("i548-steward-{tag}"), &[USER]).await,
             sibling: e2::put_key(d, &format!("i548-sib-{tag}"), &[AGENT]).await,
         };
+        // v62.0.0 (P1-fix4; CC rc21 3.3.6) — an agent key is never an
+        // occurrence of a person ("an agent's occurrence binds the agent's own
+        // identity"): the steward stands behind each agent by its OWNER
+        // binding (the ownership marker `steward_bindings_of` counts), voiced
+        // by the agent.
+        let steward_seed = format!("i548-steward-{tag}");
         for machine in [&p.agent, &p.sibling] {
-            d.put_identity_occurrence_local(IdentityOccurrence {
-                identity_key_id: p.steward.clone(),
-                occurrence_key_id: machine.clone(),
-                device_class: "agent".to_owned(),
-                hardware_attestation: None,
-                // v62.0.0 (E5) — the fixtures' base instant (now-relative).
-                asserted_at: base(),
-                valid_until: None,
-                encryption_pubkeys: None,
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
-            .await
-            .expect("occurrence row");
+            crate::federation::key_grant_invariants::two_node::own_key(
+                d,
+                &steward_seed,
+                machine,
+                machine,
+            )
+            .await;
         }
         assert_eq!(
             crate::federation::admission::steward_bindings_of(d, &p.agent)

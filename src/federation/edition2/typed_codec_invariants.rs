@@ -19,6 +19,9 @@
 //!   door checks; its reason is the `{reason}` leaf.
 //! - **I3147** a revocation states `refs.head` and `refs.further_heads` (a
 //!   set) as names.
+//! - **I3148** a cosign states its `author` (an authored family): the typed
+//!   writer and the emit recipe both; without it the door refuses
+//!   `author_column`.
 //! - **I3146** an occurrence revocation reads back; an `occurrence_key_id`
 //!   that is not the row's `sub` is `edition2_payload_invalid`.
 
@@ -330,7 +333,9 @@ fn i3146_an_occurrence_revocation_reads_back() {
         Some(3),
         &super::names::RowId([3; 32]),
         &[],
-        &[],
+        // CC rc21 7f94be1 — an eviction cites its voices' keys (P1-fix2:
+        // `refs.also.cites` is required); the door checks the shape only.
+        &[super::names::RowId([4; 32])],
         3_000,
     )
     .unwrap();
@@ -406,5 +411,62 @@ fn i3147_a_revocation_names_its_head_and_further_heads() {
             .iter()
             .all(|n| n.role != "further_heads"),
         "I3147 no further_heads when none is merged"
+    );
+}
+
+/// I3148 (T2-fix6) — `cosign:{state}` is an AUTHORED family (Verify's
+/// vendored model), so every producer states `author`: the typed writer
+/// (`typed::cosign_payload`) and the production emit recipe
+/// (`attestation_emit::produce_row`, which asks `emit::family_is_authored`
+/// and passes the signer to `payload_from_envelope`). A cosign the typed
+/// writer states is admitted by the door (no `author_column`); one with the
+/// member removed is refused `author_column`.
+#[test]
+fn i3148_a_cosign_states_its_author() {
+    use super::names::RowId;
+    use super::typed::{cosign_payload, COSIGN_PREFIX};
+    let fam = family_id(COSIGN_PREFIX);
+    for leaf in ["cosign:pending:v1", "cosign:signature:v1"] {
+        assert!(
+            super::emit::family_is_authored(&fam, Some(leaf)),
+            "I3148 {leaf} is authored, so the emit recipe states `author`"
+        );
+    }
+    let signer = key(76);
+    let event = RowId([6; 32]);
+    let group = iref(&key(77));
+    let p = cosign_payload(&iref(&signer), "signature", &event, 4_000);
+    assert_eq!(
+        p.get_text("author").and_then(Value::as_text),
+        Some(iref(&signer).as_str()),
+        "I3148 the author is the signer"
+    );
+    let st = sign_row_statement(&signer, &iref(&signer), &group, "scores", &fam, &p, vec![])
+        .expect("sign");
+    admit_row(&st, &holding(&[&signer]), None, SelectContext::default())
+        .expect("I3148 an authored cosign is admitted");
+    let Value::Map(m) = p else {
+        unreachable!("a payload map")
+    };
+    let bare = Value::Map(
+        m.into_iter()
+            .filter(|(k, _)| k.as_text() != Some("author"))
+            .collect(),
+    );
+    let st = sign_row_statement(
+        &signer,
+        &iref(&signer),
+        &group,
+        "scores",
+        &fam,
+        &bare,
+        vec![],
+    )
+    .expect("sign");
+    let e = admit_row(&st, &holding(&[&signer]), None, SelectContext::default())
+        .expect_err("I3148 an unauthored cosign is refused");
+    assert!(
+        format!("{e:?}").contains("author_column"),
+        "I3148 author_column: {e:?}"
     );
 }

@@ -150,14 +150,17 @@ async fn receive_root<D: FederationDirectory + ?Sized>(a: &D, b: &D, r: &RootedT
     super::fixture_trust_root::put_acceptance(b, r, &e2::signing_key(B_NODE), &e2::kid(B_NODE))
         .await
         .expect("B's own acceptance edge");
+    // T2-fix5 — the verdict is printed: `NotRooted` names which half of the
+    // read failed (the chain, B's own acceptance edge, or the charter).
+    let standing = crate::federation::canonical_community::stored_standing(b, &r.root)
+        .await
+        .unwrap();
     assert!(
         matches!(
-            crate::federation::canonical_community::stored_standing(b, &r.root)
-                .await
-                .unwrap(),
+            standing,
             crate::federation::canonical_community::StoredStanding::Rooted(_)
         ),
-        "B reads A's root as rooted"
+        "B reads A's root as rooted: {standing:?}"
     );
 }
 

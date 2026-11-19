@@ -93,10 +93,14 @@ pub(crate) mod bodies {
         // v62.0.0 (JSON cut, E7; P8) — widening an edition-2 row is a
         // RESTATEMENT at the wider audience signed by the prior's actor (a
         // new row id), not a `supersedes`.
+        // v62.0.0 (round 3) — the room as it is held: by its identity-ref
+        // (`gf::community_voices` keys it so). A seed named a room nobody
+        // holds, so the placement waited (`Pending`) and was never stored.
+        // `kid(kid(x)) == kid(x)`: a caller already passing the kid is kept.
         let ci = ts::describe_for(
             prior,
             Audience::Community {
-                community_key_id: room.to_owned(),
+                community_key_id: e2::kid(room),
             },
             CrossingBasis::ProducerAuthority,
         );

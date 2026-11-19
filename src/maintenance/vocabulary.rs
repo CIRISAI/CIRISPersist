@@ -1023,7 +1023,12 @@ mod sweep_tests {
             attestation_type::SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": id,
-                "dimension": "identity_binding:v1",
+                // v62 (E3b r3): a REGISTERED family the payload table does
+                // not map, so its envelope members stay open and the probe's
+                // `payload` object rides as a member (CC 2.6.1.3);
+                // `identity_binding:v1` resolves to no registered family
+                // (CC 3.1.7) and the edition-2 door refuses it.
+                "dimension": "need:identity:handle:v1",
                 "score": 1.0,
                 "confidence": 0.9,
                 "payload": {"wrap_algorithm": wrap_algorithm, "sibling": wrap_algorithm},

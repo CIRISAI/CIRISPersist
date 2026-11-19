@@ -923,6 +923,72 @@ pub async fn federation_key_id_of(
     ))
 }
 
+/// v62.0.0 (E6-fix4) — **a stream's writer, and its ONE writer id.**
+///
+/// The chunk-DAG doors record a stream's owner at its first append
+/// (`put_blob_chunk_scoped`, `register_stream_epoch_dek`) and check it at the
+/// seal (`seal_stream_scoped`, I41). The append door used to name the writer
+/// by [`federation_key_id_of`] over a `HardwareSigner` (the earlier derived
+/// id), while the seal door named it by [`LocalSigner::federation_id`] (the
+/// composite key's identity-ref). So one composite signer had two ids and its
+/// own seal was refused "belongs to another writer".
+///
+/// The rule (CC 2.6.1.1, edition 2: an identity IS its key's identity-ref,
+/// the `kid` / `iss` of every statement it signs): a writer that holds a
+/// [`LocalSigner`] is named by [`LocalSigner::federation_id`], at every door.
+/// Only a writer with no LocalSigner (a classical-only hardware signer, which
+/// cannot seal or announce: §20.5 hybrid-only) keeps the derived id.
+#[derive(Clone, Copy)]
+pub enum Writer<'a> {
+    /// A LocalSigner: named by its identity-ref (its derived id when it has
+    /// no PQC half, the same value [`federation_key_id_of`] gives).
+    Local(&'a LocalSigner),
+    /// A hardware signer with no LocalSigner behind it.
+    Hardware(&'a (dyn HardwareSigner + 'a)),
+}
+
+impl<'a> Writer<'a> {
+    /// The writer an engine appends and seals as: its LocalSigner when it
+    /// holds one, else its composed hardware signer. The same choice the
+    /// seal door's `announcing_signer` makes.
+    #[must_use]
+    pub fn of(local: Option<&'a LocalSigner>, hardware: &'a (dyn HardwareSigner + 'a)) -> Self {
+        match local {
+            Some(l) => Self::Local(l),
+            None => Self::Hardware(hardware),
+        }
+    }
+
+    /// **The writer id**: the one derivation every chunk-DAG door uses.
+    ///
+    /// # Errors
+    /// [`federation_key_id_of`]'s, for a hardware writer.
+    pub async fn key_id(&self) -> Result<String, crate::engine::SignError> {
+        match self {
+            Self::Local(l) => Ok(l.federation_id().await),
+            Self::Hardware(h) => federation_key_id_of(*h).await,
+        }
+    }
+}
+
+impl<'a> From<&'a LocalSigner> for Writer<'a> {
+    fn from(l: &'a LocalSigner) -> Self {
+        Self::Local(l)
+    }
+}
+
+impl<'a> From<&'a LocalSignerHardwareAdapter> for Writer<'a> {
+    fn from(a: &'a LocalSignerHardwareAdapter) -> Self {
+        Self::Local(&a.inner)
+    }
+}
+
+impl<'a, 'b: 'a> From<&'a (dyn HardwareSigner + 'b)> for Writer<'a> {
+    fn from(h: &'a (dyn HardwareSigner + 'b)) -> Self {
+        Self::Hardware(h)
+    }
+}
+
 /// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.3) — a [`LocalSigner`] as
 /// verify-core's [`SelfSigner`](ciris_verify_core::self_at_login::SelfSigner),
 /// so the node can produce the occurrence-plane envelopes

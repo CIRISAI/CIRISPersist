@@ -1811,6 +1811,26 @@ pub trait BlobStorage: Send + Sync {
         group_key_id: Option<&str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// v62.0.0 (E8-fix2; the I27 / I28 regression of d5b39133) — **the
+    /// sealed-floor announce of a row a cascade already stored**: §11.5 / I28,
+    /// it never stores; I27, a community-DEK announce takes the community's
+    /// serialization boundary. One transaction re-asks that the row is held
+    /// (and, for `CommunityDek`, bound), under the bound community's lock,
+    /// and names `author_key_id` on a row the cascade could not attribute.
+    /// The holding claim is the caller's edition-2 `custody` statement,
+    /// emitted after this returns
+    /// ([`put_blob_signing_at`](Self::put_blob_signing_at)).
+    ///
+    /// # Errors
+    /// [`BlobError::NotHeld`] when the row is not held (or a community-DEK row
+    /// is not bound); storage faults.
+    fn announce_held_blob(
+        &self,
+        sha256: &[u8; 32],
+        author_key_id: &str,
+        floor: StorageFloor,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
     /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4; CIRISPersist#863
     /// ask 1) — **the LocalOnly plaintext door**: store commons bytes this
     /// node verified itself, announcing nothing.
@@ -2924,16 +2944,28 @@ pub trait BlobStorage: Send + Sync {
                     local.federation_id().await
                 )));
             }
-            self.store_blob_local(
-                sha256,
-                body,
-                media_type,
-                cohort_scope,
-                floor,
-                Some(author_key_id),
-                group_key_id,
-            )
-            .await?;
+            if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
+                self.store_blob_local(
+                    sha256,
+                    body,
+                    media_type,
+                    cohort_scope,
+                    floor,
+                    Some(author_key_id),
+                    group_key_id,
+                )
+                .await?;
+            } else {
+                // v62.0.0 (E8-fix2) — a sealed floor ANNOUNCES the row a
+                // cascade already stored (§11.5 / I28: an announcement never
+                // stores) under the community's serialization boundary (I27),
+                // as `put_blob_planned` does. d5b39133 (cut B) routed it
+                // through `store_blob_local`, which re-stored the bytes, took
+                // no lock and did not ask for the binding.
+                let _ = (body, media_type);
+                self.announce_held_blob(sha256, author_key_id, floor)
+                    .await?;
+            }
             crate::federation::holding_claim::emit_holding_claim(self, local, sha256, now)
                 .await
                 .map(|_| ())

@@ -896,7 +896,13 @@ pub(crate) mod bodies {
         use crate::federation::community_dek::orchestrate::sweep_rotated_epochs;
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let signer = ts::local_signer(&format!("em-a-{run}"));
-        assert_eq!(signer.derived_key_id(), l.node_a, "fixture: A's signer");
+        // v62 (E3b r3): A's key is its identity-ref (cut B `federation_id`),
+        // the id the ladder names; `derived_key_id` is the earlier fingerprint.
+        assert_eq!(
+            signer.federation_id().await,
+            l.node_a,
+            "fixture: A's signer"
+        );
         let old_stream = format!("i757-old-{run}");
         write_room(&l, &old_stream, 3, 0).await;
         assert_eq!(

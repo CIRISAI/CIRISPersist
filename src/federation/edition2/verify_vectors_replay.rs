@@ -758,10 +758,18 @@ fn i4023_an_integer_keyed_occurrence_binds_nothing() {
 ///   record is not held never lands (no revocation is recorded for A), so it
 ///   evicts nothing.
 ///
-/// The cases' occurrence voices are not replayed here: the vector signs the
-/// occurrence key's own voice with `iss` = the identity, where persist's
-/// door and CC's rc21 cell (`second_signers [{role: occurrence, member:
-/// occurrence_key_id}]`) read that voice with `iss` = the occurrence key.
+/// **A stated divergence** (`eviction_signer_not_held`'s occurrence): the
+/// Verify 23.3.1 vector signs the occurrence key's own voice (proof of possession)
+/// with `iss` = the IDENTITY (`oD.by(D, A)`). CC rc21 90d537b
+/// (`identity:occurrence` `second_signers [{role: occurrence, member:
+/// occurrence_key_id}]`) has that voice signed as ITSELF, `iss` = the
+/// occurrence key, and so does persist's door. CIRISVerify has ruled persist
+/// right: 23.3.2 regenerates `key_of_iss_v2.json` and adds a "possession
+/// signed as the identity is not admitted" case. So here the vector's
+/// occurrence does NOT bind (nothing in the occurrence table for the
+/// device), and the device signing as the identity is `kid_not_of_iss`
+/// where the Verify 23.3.1 file says `valid`. Re-pin at 23.3.2 and this half
+/// replays as the file says.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn i4022_body(d: &dyn crate::federation::FederationDirectory) {
     use super::ingest::{held_keys_for, put_statement, INGEST_TIER};
@@ -815,6 +823,47 @@ pub(crate) async fn i4022_body(d: &dyn crate::federation::FederationDirectory) {
         // recA is held already; recD is new. Re-offering is idempotent.
         put(r).await.expect("I4022: a held record");
     }
+    // The stated divergence (doc above): the vector's occurrence, its
+    // possession voice signed as the identity, binds nothing at persist's
+    // door.
+    let occurrences = hexes(&c, "occurrences_hex");
+    assert_eq!(
+        occurrences.len(),
+        2,
+        "I4022: the identity's and the device's"
+    );
+    let d_ref = super::liveness::statement_parts(&occurrences[0])
+        .and_then(|(protected, _)| {
+            protected
+                .get_int(15)?
+                .get_int(2)?
+                .as_text()
+                .map(str::to_owned)
+        })
+        .expect("I4022: the occurrence's sub, the device");
+    for st in &occurrences {
+        let r = put(st.clone()).await;
+        assert!(
+            !matches!(r, Ok(super::ingest::StatementOutcome::Row { .. })),
+            "I4022: a possession voice signed as the identity lands nothing: {r:?}"
+        );
+    }
+    assert!(
+        d.list_identity_occurrences_by_occurrence_key(&d_ref)
+            .await
+            .unwrap()
+            .is_empty(),
+        "I4022: the vector's occurrence binds nothing (CC rc21 90d537b; Verify 23.3.2)"
+    );
+    let st = hx(&c["statement_hex"]);
+    assert_eq!(c["expect"], "valid", "I4022: the v23.3.1 file's answer");
+    let held = held_keys_for(d, &st).await.unwrap();
+    assert_eq!(
+        reader_label(&verify_row_statement(&st, &held)),
+        concat!("invalid", ":kid_not_of_iss"),
+        "I4022 eviction_signer_not_held: the stated divergence (the file says valid; \
+         Verify 23.3.2 regenerates it)"
+    );
     let evictions = hexes(&c, "evictions_hex");
     assert_eq!(evictions.len(), 1, "I4022: one eviction");
     let e = put(evictions[0].clone()).await;

@@ -33,8 +33,7 @@
 
 pub(crate) mod bodies {
     use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
-    use crate::federation::key_grant_invariants::two_node::{introduce_as, Node};
-    use crate::federation::self_collective_invariants::bodies::bind;
+    use crate::federation::key_grant_invariants::two_node::{introduce_as, place_device, Node};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{self, CryptoTier};
     use crate::federation::types::identity_type::{NODE, USER};
@@ -68,6 +67,9 @@ pub(crate) mod bodies {
         pub(crate) key_a: String,
         pub(crate) key_b: String,
         pub(crate) owner: String,
+        /// v62.0.0 (E2-fix3) — the seed `owner` (its kid) was derived from,
+        /// for a fixture that signs as the owner.
+        pub(crate) owner_seed: String,
     }
 
     pub(crate) async fn pair<B>(
@@ -106,14 +108,27 @@ pub(crate) mod bodies {
             kem: kem_of(sb.as_ref()).await,
         };
         introduce_as(&[&na, &nb], &[&alias_a, &alias_b], NODE).await;
-        let owner = format!("{tag}-owner-{run}");
+        // v62.0.0 (E2-fix3; CC rc21 3.3.6, P1.api round 3) — an engine is
+        // never an occurrence of the person: each is the owner's device node
+        // (`place_device`: its self-occurrence with its class and KEM keys,
+        // and the owner binding voiced by its alias). The owner is named by
+        // its kid, as the store holds it.
+        let owner_seed = format!("{tag}-owner-{run}");
         for n in [&na, &nb] {
-            ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
-            for dev in [&na, &nb] {
-                bind(n.backend, &owner, &dev.key, Some(dev.kem.clone())).await;
-                ts::put_owner_binding(n.backend, &owner, &dev.key).await;
+            ts::register_hybrid_key_as(n.backend, &owner_seed, &owner_seed, USER).await;
+            for (dev, alias) in [(&na, &alias_a), (&nb, &alias_b)] {
+                place_device(
+                    n.backend,
+                    &owner_seed,
+                    &dev.key,
+                    alias,
+                    crate::federation::types::device_class::LAPTOP,
+                    Some(dev.kem.clone()),
+                )
+                .await;
             }
         }
+        let owner = crate::federation::edition2::fixture_switch::kid(&owner_seed);
         let (key_a, key_b) = (na.key.clone(), nb.key.clone());
         Pair {
             a,
@@ -123,6 +138,7 @@ pub(crate) mod bodies {
             key_a,
             key_b,
             owner,
+            owner_seed,
         }
     }
 

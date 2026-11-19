@@ -120,12 +120,12 @@ pub mod bodies {
     /// An owner binding `owner → node`, put with the node's own voice
     /// (edition 2, C557: a binding counts only with the node's statement).
     async fn put_owner_binding(d: &dyn FederationDirectory, owner: &str, node: &str) {
+        // K2.api: the shared landing (owner's statement, then the node's
+        // voice, C557; asserts Row).
         let b = ts::owner_binding_attestation("", owner, node);
-        let st = e2::carried_statement(&b).expect("a flipped binding carries its statement");
-        put(d, b).await;
-        e2::put_statement(d, &e2::voice_of(&st, node))
+        ts::put_sealed_owner_binding(d, &b, node)
             .await
-            .unwrap_or_else(|e| panic!("put the node's voice: {e}"));
+            .unwrap_or_else(|e| panic!("the owner binding {owner} → {node}: {e}"));
     }
 
     pub(crate) async fn put(d: &dyn FederationDirectory, a: Attestation) {
@@ -356,7 +356,14 @@ mod run {
         use crate::federation::types::attestation_tier;
         use crate::federation::types::identity_type::{NODE, USER};
         let s = super::run::suffix();
-        let signer = ts::local_signer(&format!("i168-node-{s}"));
+        let node_alias = format!("i168-node-{s}");
+        // v62 (E3b, round 3): mint the alias's identity-ref first. The
+        // engine's derived id IS `kid(alias)` (cut B), and a fixture that
+        // later signs for it resolves the seed through `seed_of`, which knows
+        // only the kids this process minted (`seed_for`'s never-from-kid
+        // guard panicked on the unminted ref).
+        let _ = crate::federation::edition2::fixture_switch::kid(&node_alias);
+        let signer = ts::local_signer(&node_alias);
         let engine = crate::Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("engine");

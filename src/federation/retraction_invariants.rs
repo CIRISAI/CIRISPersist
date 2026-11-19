@@ -78,6 +78,25 @@ pub(crate) mod bodies {
         e2::put_signed(d, &a).await.map(|_| ())
     }
 
+    /// v62.0.0 (E2-fix3; CC 2.7.3) — **what the door said NO with**: a
+    /// refusal's text, or, when the door HELD the row on a fold condition (a
+    /// composer's entitlement is read from its TARGET, another row), the
+    /// fold's reason token and its detail (`fold::why_held`). `None` when the
+    /// row landed, or waits with no fold reason.
+    async fn refused_or_held(d: &dyn FederationDirectory, a: Attestation) -> Option<String> {
+        use crate::federation::edition2::ingest::StatementOutcome;
+        match e2::put_signed(d, &a).await {
+            Err(e) => Some(e.to_string()),
+            Ok(StatementOutcome::Pending { row_id, .. }) => {
+                crate::federation::edition2::fold::why_held(d, &row_id)
+                    .await
+                    .expect("the fold's record reads")
+                    .map(|h| format!("{}: {}", h.reason, h.detail))
+            }
+            Ok(_) => None,
+        }
+    }
+
     /// Is `target` retired by the fold over `rows`?
     fn retired(rows: &[Attestation], target: &str) -> bool {
         let refs: Vec<&Attestation> = rows.iter().collect();
@@ -139,11 +158,12 @@ pub(crate) mod bodies {
         // A third party's withdraws of the carrier: refused at the door by
         // name.
         let third_w = composer(&third, attestation_type::WITHDRAWS, &claim);
-        let r = put(d, third_w.clone()).await;
+        // v62.0.0 (E2-fix3): the claim is another row, so the door HOLDS the
+        // withdraws with the reason (CC 2.7.3), concluding nothing.
+        let r = refused_or_held(d, third_w.clone()).await;
         assert!(
-            r.as_ref().is_err_and(|e| e
-                .to_string()
-                .contains("custody_ack_withdraws_not_the_holder")),
+            r.as_ref()
+                .is_some_and(|t| t.contains("custody_ack_withdraws_not_the_holder")),
             "I791 a third party's withdraws of a carrier is refused by name: {r:?}"
         );
         // …and inert in the fold even when offered directly (out of order).
@@ -183,10 +203,13 @@ pub(crate) mod bodies {
             .expect("I516 the row about the subject");
         // (a) the subject's recants: refused at the door by name…
         let s_recants = composer(&subject, attestation_type::RECANTS, &t1_row);
-        let r = put(d, s_recants.clone()).await;
+        // v62.0.0 (E2-fix3): the entitlement is read from the target (another
+        // row), so the door HOLDS it `withdraws_not_admitted` with the
+        // `recants_not_admitted` text as its detail (CC 2.7.3).
+        let r = refused_or_held(d, s_recants.clone()).await;
         assert!(
             r.as_ref()
-                .is_err_and(|e| e.to_string().contains("recants_not_admitted")),
+                .is_some_and(|t| t.contains("recants_not_admitted")),
             "I516 (a) a subject's recants is refused by name: {r:?}"
         );
         // …and, offered to the fold directly (out of order), retires nothing.
