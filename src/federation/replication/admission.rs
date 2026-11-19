@@ -2685,8 +2685,15 @@ pub mod gate_order_test_support {
                 "global",
                 u64::from(2 * n) + i as u64,
             );
-            reserved.attestation_envelope["dimension"] =
-                serde_json::json!(format!("{prefix}reserved_probe:v1"));
+            // v62.0.0 (E0 fix 2) — a REGISTERED leaf of each reserved stem:
+            // the edition-2 door refuses an unregistered `accord:` leaf
+            // (`namespace_family_unregistered`) before any quota or gate.
+            let probe = match *prefix {
+                "accord:" => "accord:human_dignity:v1",
+                "objection:" => "objection:raised:v1",
+                other => panic!("#575: no registered probe leaf for reserved stem `{other}`"),
+            };
+            reserved.attestation_envelope["dimension"] = serde_json::json!(probe);
             let err = offer(dir, &reserved, &seed)
                 .await
                 .expect_err("still an invalid cohort_scope");
@@ -3599,9 +3606,11 @@ mod tests {
                 "`{ordinary}` must not reach the reserve"
             );
         }
+        // v62.0.0 (E0 fix 2) — `classify` is a pure read of the envelope; the
+        // row is not sealed (edition 2 has no dimension-less `scores` row to
+        // seal, and the other rows here are unsealed too).
         let mut no_dimension = row_with("x");
         no_dimension.attestation_envelope = serde_json::json!({});
-        crate::federation::tier_ingest::test_support::reseal(&mut no_dimension);
         assert_eq!(
             PeerWriteQuota::classify(&no_dimension),
             WriteAdmissionClass::Ordinary

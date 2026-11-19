@@ -4532,6 +4532,18 @@ pub fn check_dimension_case_rule(row: &super::Attestation) -> Result<(), Error> 
     else {
         return Ok(());
     };
+    // v62.0.0 (R1c; CC v1.0-rc21-wire) — the registry now pins a key-bearing
+    // placeholder (`licensure:{authority_id}`,
+    // `moderation_track_record:{community_key_id}`) to a bare thumbprint. An
+    // earlier-form key id there is the key-segment gate's to refuse, once the
+    // earlier-form doors are shut
+    // (`namespace::key_segment::check_dimension_key_segments`); until then
+    // it is still a key id, as before the re-vendor.
+    if !crate::federation::edition2::door::EARLIER_FORM_DOORS_SHUT
+        && crate::federation::namespace::key_segment::only_the_key_pattern_refuses(dimension)
+    {
+        return Ok(());
+    }
     let family = m.family.unwrap_or("<no row: a malformed form of none>");
     Err(Error::InvalidArgument(format!(
         "{refusal}: dimension {dimension:?} does not conform to its family {family:?} under CC \
@@ -24460,6 +24472,15 @@ mod tests {
         // gate is `cosign::admit_row` (and `cosign::read_row`'s canonical-row
         // rule); the audience is `cosign::may_receive`.
         "cosign:",
+        // rc21 re-vendor (v62.0.0 R1c, CC 3.1.3 / CC 2.7.11) — reserved
+        // `substrate-self-report` (CC 3.4.3), and the rule CC 2.7.11 states is
+        // "every signer is a person": no program's key admits a unit, which no
+        // prefix → identity-type rule expresses (a person may be `user` or
+        // `accord_holder`, and the row may be counted). It is an edition-2
+        // family (wire `admission:unit:v1`); the gates are the door's pure
+        // rules (`edition2::payloads::check_admission_unit`) and
+        // `edition2::ingest::require_admission_signer_is_person`.
+        "admission:unit",
     ];
 
     /// Manifest-reserved families persist has **no gate for yet** — a different

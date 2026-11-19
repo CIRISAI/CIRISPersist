@@ -1,10 +1,12 @@
 //! **The CC manifests persist vendors beside the namespace registry, pinned
-//! at the CIRISConstitution `v1.0-rc20` tag.**
+//! at the CIRISConstitution `v1.0-rc21-wire` tag.**
 //!
 //! [`registry`](super::registry) carries the namespace registry and its match
 //! vectors; this module carries the other five CC `manifests/` files persist
-//! reads, copied byte for byte with `git show v1.0-rc20:manifests/<file>` at
-//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`d4bd2a6b`; v62.0.0, from rc18 `646df978`):
+//! reads, copied byte for byte with `git show v1.0-rc21-wire:manifests/<file>` at
+//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`e6fd7c60`; v62.0.0 R1c, from
+//! rc20 `d4bd2a6b`, which came from rc18 `646df978`). At rc21-wire only
+//! `csd4_chain.json` moved of these five (and `WIRE_VOCABULARY.md`'s pin):
 //!
 //! | file | CC | read by |
 //! |---|---|---|
@@ -46,7 +48,7 @@ pub const VENDORED_GOVERNANCE_POLICY_VECTORS_FILE_SHA256: &str =
 
 /// SHA-256 of the vendored `csd4_chain.json` FILE bytes.
 pub const VENDORED_CSD4_CHAIN_FILE_SHA256: &str =
-    "a291ec5ff8fc46bcfa9e3ebca1d45c073251222e7dcb67ed62d901c7a6df9ae1";
+    "1251358980418a1f09d9c1c3b3f41c6f3de0d20ddc68852026b57809a7d90c44";
 
 /// SHA-256 of the vendored `topology_vocabulary.json` FILE bytes. The chain's
 /// `_meta.pins.vocabulary_sha256` and CIRISServer's catalogue pin
@@ -67,7 +69,7 @@ pub const VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256: &str =
 /// stays where it is. This is the tag's file hash, so a re-vendor sees the
 /// document move; I1302 checks it against the CC checkout.
 pub const VENDORED_WIRE_VOCABULARY_FILE_SHA256: &str =
-    "a0b2b4257463ddcb0115fcdeb8079faadf5b48e83216a42b24ce8280cd7b0dfe";
+    "06a64d70bde9edb97b533cbea3e2ba04834175befac43541e8ef22d7d4564361";
 
 /// The five files, `(file under src/federation/namespace/, pinned sha256)`,
 /// in the order `scripts/check_vendored_cc.sh` compares them.
@@ -125,7 +127,7 @@ mod tests {
     //! **I1300–I1302, I1308** — every vendored CC byte is the pinned byte,
     //! the pin is the tag's, and the refusal tokens at the pin.
     use super::super::registry::{
-        VENDORED_CC_COMMIT, VENDORED_CC_VERSION, VENDORED_REGISTRY_FILE_SHA256,
+        VENDORED_CC_COMMIT, VENDORED_CC_TAG, VENDORED_REGISTRY_FILE_SHA256,
         VENDORED_VECTORS_FILE_SHA256,
     };
     use super::*;
@@ -341,7 +343,7 @@ mod tests {
     }
 
     /// **I1302** — the pins are the tag's bytes: when a CIRISConstitution
-    /// checkout carrying `v<VENDORED_CC_VERSION>` is present, the tag names
+    /// checkout carrying [`VENDORED_CC_TAG`] is present, the tag names
     /// [`VENDORED_CC_COMMIT`] and every pinned file equals `git show
     /// <tag>:<path>` byte for byte. Without the checkout (or the tag) it skips,
     /// saying so: CI has no CC checkout, and `scripts/check_vendored_cc.sh`
@@ -354,7 +356,7 @@ mod tests {
             );
             return;
         };
-        let tag = format!("v{VENDORED_CC_VERSION}");
+        let tag = VENDORED_CC_TAG;
         let Some(commit) = git(&repo, &["rev-parse", &format!("{tag}^{{commit}}")]) else {
             eprintln!("I1302: {repo:?} carries no tag {tag} — SKIPPED (fetch the tags to run it)");
             return;

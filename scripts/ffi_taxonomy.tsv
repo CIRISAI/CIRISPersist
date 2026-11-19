@@ -306,6 +306,9 @@ Engine	emit_key_grant	deontic
 Engine	emit_pending_key_grants	deontic
 Engine	edition2_statements_since	empirical	
 Engine	edition2_held_reason	empirical	
+# v62.0.0 (P10; CC 2.7.11) — the receipt leg is DEONTIC: a wrong answer runs
+# admitted code no trusted Transparency Service registered.
+Engine	admission_unit_runnable	deontic	
 Engine	edition2_held_rows	empirical	
 Engine	licences_issued_under_json	deontic	
 Engine	licensure_status_set	deontic	

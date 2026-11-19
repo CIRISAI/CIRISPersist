@@ -151,19 +151,30 @@ pub(crate) mod bodies {
             &[it::USER],
         )
         .await;
-        d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-            identity_key_id: owner.clone(),
-            occurrence_key_id: k.clone(),
-            device_class: crate::federation::types::device_class::LAPTOP.to_owned(),
-            hardware_attestation: None,
-            asserted_at: Utc::now() - Duration::days(30),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
+        // v62.0.0 (T2-fix2) — the claim is an edition-2 `identity:occurrence`
+        // bind through the occurrence door (`e2::put_bind`: the device's own
+        // voice, then the owner's). An earlier-form local occurrence row the
+        // device never agreed to resolves no principal once the earlier form
+        // is shut (`self_collective::principals_of`, P5c), so the device was
+        // in no `self` cohort and every report was HELD
+        // (`custody_ack_outside_cohort`), answering `Pending`.
+        let bound = crate::federation::edition2::fixture_switch::put_bind(
+            d,
+            &owner,
+            &owner,
+            &k,
+            crate::federation::types::device_class::LAPTOP,
+            &crate::federation::edition2::fixture_switch::BindOptions::default(),
+        )
         .await
         .unwrap_or_else(|e| panic!("claim {owner} → {k}: {e}"));
+        assert!(
+            matches!(
+                bound,
+                crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+            ),
+            "claim {owner} → {k}: the bind lands, {bound:?}"
+        );
         k
     }
 

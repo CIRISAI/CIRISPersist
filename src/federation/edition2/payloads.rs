@@ -398,6 +398,7 @@ pub const FAMILIES: &[FamilyPayload] = &[
         refs: &[
             RefRole { role: "head", presence: R, from: "the last landed self-roster row of the identity (CC 2.7 rulings item 2); the first bind of a new identity names the genesis key's own key:record row" },
             RefRole { role: "further_heads", presence: O, from: "the other self-roster tips this row merges, as group:roster's" },
+            RefRole { role: "also:cites", presence: R, from: "the key:record of each voice, and that key's occurrence binding when it has one (CC rc21 7f94be1); REQUIRED: the per-voice coverage is T2's door" },
         ],
         voices: &[
             Voice { from: "FramedOccurrenceRevocation.signature (TransportBindingSignature) under attesting_key_id", becomes: "the revoker's statement (the statement's signer)" },

@@ -24,6 +24,15 @@
 //!   effect) is admitted but not counted at the head after the eviction;
 //!   the same revocation naming the pre-eviction head is VOID
 //!   (`void_superseded`).
+//! - **I3188** (CC rc21 7f94be1) an eviction with no `refs.also.cites`, or
+//!   whose cites miss the voice's own key:record and binding, is
+//!   `edition2_payload_invalid` and not kept.
+//! - **I3189** a cited row this node does not hold: the eviction WAITS
+//!   (`Pending`, kept), nothing is revoked.
+//! - **I3190** with every voice's key record and binding cited, the counted
+//!   eviction lands.
+//! - **I3191** served from a cursor just before it, the eviction's page
+//!   carries every cited row's statements: they travel with it (CC 2.7.5).
 //! - **I3153** a revocation of a key by itself lands in
 //!   `federation_revocations` (`revocations_for_subject`), through
 //!   `put_revocation`.
@@ -50,8 +59,8 @@
 //!   standing.
 //! - **I3165** a cosign statement is kept beside its event in
 //!   `ceg_statements` only (`Voice`), never in `federation_attestations`.
-//! - **I3166** a cosign of an event not held waits
-//!   (`federation_withdraws_target_unheld`).
+//! - **I3166** a cosign of an event not held WAITS: kept and `Pending`
+//!   (a fold hold, `link_unheld`), never refused.
 //! - **I3167** a `steward_purge` notice is kept, voice by voice, `Pending`,
 //!   never as an attestation row.
 //! - **I3168** a `dmca512` notice passes the notice shape on its projected
@@ -207,22 +216,39 @@ async fn is_revoked<D: FederationDirectory + ?Sized>(d: &D, identity: &str, occ:
         .any(|r| r.occurrence_key_id == occ)
 }
 
+/// The cites an eviction voiced by `keys` states (CC rc21 7f94be1): each
+/// key's `key:record` and binding (`typed::eviction_cites`).
+async fn cites_of<D: FederationDirectory + ?Sized>(
+    d: &D,
+    identity: &str,
+    keys: &[&String],
+) -> Vec<RowId> {
+    let keys: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
+    super::typed::eviction_cites(d, identity, &keys)
+        .await
+        .expect("the voices' key records and bindings are held")
+}
+
 async fn occurrence_revocation_body<D: FederationDirectory + ?Sized>(d: &D) {
     let (alice, phone, mallory) = (key(110), key(111), key(112));
     register(d, &[&alice, &phone, &mallory]).await;
     let h1 = bind(d, &alice, &phone).await;
     let (a, ph) = (iref(&alice), iref(&phone));
     let t = now_ms();
+    // The revocation takes effect a second after its voices are signed, so
+    // phone's voice (signed at `t`) is the live key's: a re-put of it after
+    // the landing is the held statement again, not a revoked key's.
     let rev = IdentityOccurrenceRevocation {
         identity_key_id: a.clone(),
         occurrence_key_id: ph.clone(),
         revoked_at: at(t),
-        effective_at: at(t),
+        effective_at: at(t + 1_000),
         reason: None,
         witness_set: vec![],
         persist_row_hash: String::new(),
     };
-    let p = occurrence_revocation_payload(&rev, None, None, &h1, &[], t).unwrap();
+    let cites = cites_of(d, &a, &[&a, &ph]).await;
+    let p = occurrence_revocation_payload(&rev, None, None, &h1, &[], &cites, t).unwrap();
 
     // I3152 — a stranger's voice.
     let stranger = sign_as(&mallory, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p);
@@ -239,6 +265,7 @@ async fn occurrence_revocation_body<D: FederationDirectory + ?Sized>(d: &D) {
         None,
         &h1,
         &[],
+        &cites,
         t,
     )
     .unwrap();
@@ -342,7 +369,9 @@ async fn named_head_body<D: FederationDirectory + ?Sized>(d: &D) {
     // H2 this node has landed: the row is VOID here. Every voice is kept and
     // answers Pending, nothing is revoked (not even with all three of the
     // roster's keys voicing it), and the receipt settles `void_superseded`.
-    let p = occurrence_revocation_payload(&rev(ph.as_str()), None, None, &h1, &[], t).unwrap();
+    let cites = cites_of(d, &a, &[&a, &ph, &iref(&tablet)]).await;
+    let p =
+        occurrence_revocation_payload(&rev(ph.as_str()), None, None, &h1, &[], &cites, t).unwrap();
     let mut row = None;
     for v in [&alice, &tablet, &phone] {
         let st = sign_as(v, &a, &ph, OCCURRENCE_REVOCATION_PREFIX, &p);
@@ -422,7 +451,8 @@ async fn waiting_head_body<D: FederationDirectory + ?Sized>(d: &D) {
         witness_set: vec![],
         persist_row_hash: String::new(),
     };
-    let p = occurrence_revocation_payload(&rev, None, None, &h2, &[], t).unwrap();
+    let cites = cites_of(d, &c, &[&c, &ph]).await;
+    let p = occurrence_revocation_payload(&rev, None, None, &h2, &[], &cites, t).unwrap();
     let voices = [
         sign(&carol, &ph, OCCURRENCE_REVOCATION_PREFIX, &p),
         sign_as(&phone, &c, &ph, OCCURRENCE_REVOCATION_PREFIX, &p),
@@ -459,6 +489,124 @@ async fn waiting_head_body<D: FederationDirectory + ?Sized>(d: &D) {
     );
 }
 
+/// I3188–I3191 (CC rc21 7f94be1): an eviction cites its voices' keys; the
+/// cited rows travel with it.
+async fn eviction_cites_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (dave, phone) = (key(240), key(241));
+    register(d, &[&dave, &phone]).await;
+    let (dv, ph) = (iref(&dave), iref(&phone));
+    let h1 = bind(d, &dave, &phone).await;
+    let t = now_ms();
+    let rev = IdentityOccurrenceRevocation {
+        identity_key_id: dv.clone(),
+        occurrence_key_id: ph.clone(),
+        revoked_at: at(t),
+        effective_at: at(t + 1_000),
+        reason: None,
+        witness_set: vec![],
+        persist_row_hash: String::new(),
+    };
+    let payload = |cites: &[RowId], at_ms: u64| {
+        occurrence_revocation_payload(&rev, None, None, &h1, &[], cites, at_ms).unwrap()
+    };
+
+    // I3188 — no cite: Invalid at the door, not kept.
+    let st = sign(
+        &dave,
+        &ph,
+        OCCURRENCE_REVOCATION_PREFIX,
+        &payload(&[] as &[RowId], t),
+    );
+    let e = put(d, &st).await.unwrap_err();
+    assert_eq!(
+        reason(&e),
+        malformed_row::EDITION2_PAYLOAD_INVALID,
+        "I3188 no cites"
+    );
+    assert!(!kept(d, &st).await, "I3188 not kept");
+    // A voice whose own key:record (and binding) is not among the cites:
+    // Invalid, not kept.
+    let only_dave = cites_of(d, &dv, &[&dv]).await;
+    let st = sign_as(
+        &phone,
+        &dv,
+        &ph,
+        OCCURRENCE_REVOCATION_PREFIX,
+        &payload(only_dave.as_slice(), t + 1),
+    );
+    let e = put(d, &st).await.unwrap_err();
+    assert_eq!(
+        reason(&e),
+        malformed_row::EDITION2_PAYLOAD_INVALID,
+        "I3188 the voice's key is not cited"
+    );
+    assert!(!kept(d, &st).await, "I3188 not kept");
+
+    // I3189 — a cited row this node does not hold: the eviction WAITS.
+    let mut with_ghost = cites_of(d, &dv, &[&dv, &ph]).await;
+    with_ghost.push(RowId([5; 32]));
+    let st = sign(
+        &dave,
+        &ph,
+        OCCURRENCE_REVOCATION_PREFIX,
+        &payload(with_ghost.as_slice(), t + 2),
+    );
+    let out = put(d, &st)
+        .await
+        .expect("I3189 an unheld cite is never a refusal");
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I3189 it waits for the cited row: {out:?}"
+    );
+    assert!(kept(d, &st).await, "I3189 kept while it waits");
+    assert!(!is_revoked(d, &dv, &ph).await, "I3189 nothing lands");
+
+    // I3190 — the full set: dave's voice (1 of 2) waits on the count; phone's
+    // (as dave) lands it.
+    let full = cites_of(d, &dv, &[&dv, &ph]).await;
+    let p = payload(full.as_slice(), t + 3);
+    let v_dave = sign(&dave, &ph, OCCURRENCE_REVOCATION_PREFIX, &p);
+    let out = put(d, &v_dave).await.unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I3190 one of two: {out:?}"
+    );
+    let out = put(
+        d,
+        &sign_as(&phone, &dv, &ph, OCCURRENCE_REVOCATION_PREFIX, &p),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(out, StatementOutcome::Row { .. }),
+        "I3190 the cited, counted eviction lands: {out:?}"
+    );
+    assert!(is_revoked(d, &dv, &ph).await, "I3190 revoked");
+
+    // I3191 — served from a cursor just before the eviction, the page also
+    // carries every cited row's statements (they were admitted earlier, so
+    // only their travelling with it puts them in the page).
+    let all = d.edition2_statements_since(None, 1_000).await.unwrap();
+    let pos = all
+        .iter()
+        .position(|s| s.bytes == v_dave)
+        .expect("the eviction is held");
+    assert!(pos > 0, "the cited rows were admitted before the eviction");
+    let cursor = all[pos - 1].cursor;
+    let page = super::serve::statements_served_to(d, Some(&cursor), 1_000, None)
+        .await
+        .unwrap();
+    for c in &full {
+        for st in d.edition2_voices(c).await.unwrap() {
+            assert!(
+                page.statements.iter().any(|s| s.bytes == st),
+                "I3191 the cited row {} travels with the eviction",
+                c.hex()
+            );
+        }
+    }
+}
+
 /// I3187 (CC's ruling on refs.head; CC 2.7.8): an evicted key's voice is
 /// not counted at the head after its eviction, and a revocation naming the
 /// pre-eviction head is VOID once this node has landed its successor.
@@ -479,8 +627,17 @@ async fn evicted_voice_body<D: FederationDirectory + ?Sized>(d: &D) {
         persist_row_hash: String::new(),
     };
     // H3: phone evicted (named H2; bob + tablet are 2 of 3).
-    let evict =
-        occurrence_revocation_payload(&rev(ph.as_str(), t1), None, None, &h2, &[], t1).unwrap();
+    let evict_cites = cites_of(d, &b, &[&b, &tb]).await;
+    let evict = occurrence_revocation_payload(
+        &rev(ph.as_str(), t1),
+        None,
+        None,
+        &h2,
+        &[],
+        &evict_cites,
+        t1,
+    )
+    .unwrap();
     put(d, &sign(&bob, &ph, OCCURRENCE_REVOCATION_PREFIX, &evict))
         .await
         .unwrap();
@@ -500,7 +657,17 @@ async fn evicted_voice_body<D: FederationDirectory + ?Sized>(d: &D) {
     // counted. bob alone is 1 of 2.
     let h3 = rid(&sign(&bob, &ph, OCCURRENCE_REVOCATION_PREFIX, &evict));
     let t0 = t1 - 5_000;
-    let p = occurrence_revocation_payload(&rev(tb.as_str(), t0), None, None, &h3, &[], t0).unwrap();
+    let tablet_cites = cites_of(d, &b, &[&b, &ph, &tb]).await;
+    let p = occurrence_revocation_payload(
+        &rev(tb.as_str(), t0),
+        None,
+        None,
+        &h3,
+        &[],
+        &tablet_cites,
+        t0,
+    )
+    .unwrap();
     for v in [&phone, &bob] {
         let out = put(d, &sign_as(v, &b, &tb, OCCURRENCE_REVOCATION_PREFIX, &p))
             .await
@@ -524,9 +691,16 @@ async fn evicted_voice_body<D: FederationDirectory + ?Sized>(d: &D) {
 
     // The same revocation naming the superseded H2 is VOID (CC 2.7.8): even
     // bob + tablet do not land it; it is kept and settled void_superseded.
-    let stale =
-        occurrence_revocation_payload(&rev(tb.as_str(), t0 + 1), None, None, &h2, &[], t0 + 1)
-            .unwrap();
+    let stale = occurrence_revocation_payload(
+        &rev(tb.as_str(), t0 + 1),
+        None,
+        None,
+        &h2,
+        &[],
+        &evict_cites,
+        t0 + 1,
+    )
+    .unwrap();
     let mut row = None;
     for v in [&bob, &tablet] {
         let st = sign_as(v, &b, &tb, OCCURRENCE_REVOCATION_PREFIX, &stale);
@@ -685,7 +859,8 @@ async fn custody_cosign_body<D: FederationDirectory + ?Sized>(d: &D) {
     assert_eq!(ack.blob_sha256_hex, hex::encode(blob), "I3157");
     assert_eq!(ack.size, Some(4096), "I3157");
 
-    // I3166 — a cosign of an event not held waits.
+    // I3166 — a cosign of an event not held WAITS (CC 2.7.3): kept,
+    // `Pending`, never refused.
     let ghost = RowId([7; 32]);
     let c = sign(
         &other,
@@ -693,12 +868,14 @@ async fn custody_cosign_body<D: FederationDirectory + ?Sized>(d: &D) {
         COSIGN_PREFIX,
         &cosign_payload("signature", &ghost, t),
     );
-    assert_eq!(
-        put(d, &c).await.unwrap_err().kind(),
-        "federation_withdraws_target_unheld",
-        "I3166"
+    let out = put(d, &c)
+        .await
+        .expect("I3166 a row naming an unheld row is never refused");
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I3166 it waits for the event: {out:?}"
     );
-    assert!(!kept(d, &c).await, "I3166 not kept");
+    assert!(kept(d, &c).await, "I3166 kept while it waits");
 
     // I3165 — a cosign is kept beside its event only.
     let c = sign(
@@ -1668,4 +1845,19 @@ async fn i3186_waiting_head_postgres() {
         return;
     };
     Box::pin(waiting_head_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3188_i3191_eviction_cites_sqlite() {
+    Box::pin(eviction_cites_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3188_i3191_eviction_cites_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(eviction_cites_body(&b)).await;
 }

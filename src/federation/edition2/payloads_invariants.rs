@@ -121,6 +121,16 @@
 //!   (`json_number_of_decimal`, and `ingest::json_of` / `attestation_of`),
 //!   the inverse of `body_number`; the free-form bodies are `body` on every
 //!   family and `hard_case:{kind}`'s `hard_case`.
+//! - **I4001** (CC rc21 7f94be1) — an `identity:occurrence_revocation`
+//!   REQUIRES `refs.also.cites` (each voice's key:record, plus its
+//!   occurrence binding when it has one): without it, refused
+//!   `edition2_payload_invalid`; whether every voice is covered is T2's door.
+//! - **I4002** (CC rc21 397100e, CC 3.3.11) — a chat REPLY and a chat
+//!   REACTION (a sealed `chat:reaction`) name their message in
+//!   `refs.answers`: the payload check admits it on the chat family
+//!   (`chat:*`, an unmapped family whose `refs` roles are open; only the
+//!   `also` roles are closed), and at the door (sqlite, postgres) such a
+//!   statement passes the pure gates and reaches the directory.
 //! - **I2919** (wave P1d) — the list is enforced AT THE DOOR: for each mapped
 //!   family, a statement whose payload breaks its list (an unknown member, a
 //!   missing required one, a wrong type, a closed leaf) is refused
@@ -1168,8 +1178,24 @@ fn occurrence_revocation() -> Value {
         ("occurrence_key_id", txt(&id(131))),
         ("revoked_at", ms(1_000)),
         ("effective_at", ms(1_000)),
-        ("refs", refs(vec![("head", ref2(&[0x9e; 32]))])),
+        // CC rc21 7f94be1: the key:record of each voice (and its occurrence
+        // binding, when it has one) under refs.also.cites.
+        (
+            "refs",
+            refs(vec![
+                ("head", ref2(&[0x9e; 32])),
+                ("also", map(vec![("cites", voice_cites())])),
+            ]),
+        ),
     ])
+}
+
+/// The rows an occurrence revocation's voices are cited by: a voice's
+/// key:record and its occurrence binding (a set, sorted by encoding).
+fn voice_cites() -> Value {
+    let mut v = vec![ref2(&[0x9c; 32]), ref2(&[0x9d; 32])];
+    v.sort_by_key(ciris_verify_core::cde::encode);
+    Value::Array(v)
 }
 
 fn revocation() -> Value {
@@ -1911,6 +1937,68 @@ mod door {
         b.run_migrations().await.unwrap();
         Box::pin(body(Arc::new(b))).await;
     }
+
+    /// I4002: a chat reply and a chat reaction naming their message in
+    /// `refs.answers` pass the door's pure gates (no refusal before the
+    /// first directory read, which the all-erroring double answers).
+    async fn chat_body(inner: Arc<dyn FederationDirectory>) {
+        let dir = no_reads(inner);
+        for (what, p) in [("reply", chat_reply()), ("reaction", chat_reaction())] {
+            let e = put_statement(&dir, &signed("chat:*", &p), None, INGEST_TIER)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                e.kind(),
+                "federation_backend",
+                "I4002 a chat {what} with refs.answers passes the payload check: {e:?}"
+            );
+        }
+        // Still the closed `also` roles on chat: an unregistered one is refused.
+        let bad_also = with(
+            &chat_reply(),
+            vec![(
+                "refs",
+                refs(vec![
+                    ("answers", ref2(&[0xa7; 32])),
+                    ("also", map(vec![("thread", ref_set(0xa8))])),
+                ]),
+            )],
+            &[],
+        );
+        let e = put_statement(&dir, &signed("chat:*", &bad_also), None, INGEST_TIER)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            reason(&e),
+            malformed_row::EDITION2_PAYLOAD_INVALID,
+            "I4002 the also roles stay closed on chat: {e:?}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i4002_a_chat_answer_passes_the_door_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(chat_body(Arc::new(b))).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i4002_a_chat_answer_passes_the_door_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(chat_body(Arc::new(b))).await;
+    }
 }
 
 /// I2920: the occurrence revocation uses the occurrence record's own names.
@@ -2323,9 +2411,12 @@ fn i3993_occurrence_rows_name_their_roster_head() {
                 &base,
                 vec![(
                     "refs",
+                    // `also.cites` rides too: the revocation requires it, the
+                    // occurrence allows it.
                     refs(vec![
                         ("head", ref2(&[0x9e; 32])),
                         ("further_heads", Value::Array(tips)),
+                        ("also", map(vec![("cites", voice_cites())])),
                     ]),
                 )],
                 &[],
@@ -2589,4 +2680,92 @@ fn i3999_a_decimal_reads_back_exactly() {
         "hard_case"
     ));
     assert!(!is_body_member(&family_id("hard_case:{kind}"), "score"));
+}
+
+/// I4001: an eviction cites its voices' key records.
+#[test]
+fn i4001_an_occurrence_revocation_cites_its_voices() {
+    let fam = "identity:occurrence_revocation";
+    ok(
+        fam,
+        &occurrence_revocation(),
+        "I4001 head + the voices' cites",
+    );
+    let uncited = with(
+        &occurrence_revocation(),
+        vec![("refs", refs(vec![("head", ref2(&[0x9e; 32]))]))],
+        &[],
+    );
+    bad(fam, &uncited, "I4001 refs.also.cites is required");
+    let one = with(
+        &occurrence_revocation(),
+        vec![(
+            "refs",
+            refs(vec![
+                ("head", ref2(&[0x9e; 32])),
+                (
+                    "also",
+                    map(vec![("cites", Value::Array(vec![ref2(&[0x9c; 32])]))]),
+                ),
+            ]),
+        )],
+        &[],
+    );
+    ok(fam, &one, "I4001 one voice, no binding: one cite");
+    // The occurrence itself is unchanged: also.cites stays optional there.
+    ok(
+        "identity:occurrence",
+        &occurrence(),
+        "I4001 an occurrence needs no cites",
+    );
+}
+
+// ---- chat answers (I4002) -------------------------------------------------
+
+/// A chat reply: a message naming the message it answers in `refs.answers`.
+fn chat_reply() -> Value {
+    map(vec![
+        ("asserted_at", ms(1_000)),
+        ("author", txt(&id(250))),
+        ("dimension", txt("chat:message:v1")),
+        ("body", map(vec![("note", txt("agreed"))])),
+        ("refs", refs(vec![("answers", ref2(&[0xa7; 32]))])),
+    ])
+}
+
+/// A chat reaction (sealed, withdrawn by its author): it names its message
+/// in `refs.answers`.
+fn chat_reaction() -> Value {
+    map(vec![
+        ("asserted_at", ms(1_100)),
+        ("author", txt(&id(250))),
+        ("dimension", txt("chat:reaction:v1")),
+        ("body", map(vec![("note", txt("+1"))])),
+        ("refs", refs(vec![("answers", ref2(&[0xa7; 32]))])),
+    ])
+}
+
+/// I4002: refs.answers on the chat family.
+#[test]
+fn i4002_a_chat_reply_and_reaction_name_their_message() {
+    use super::payloads::check_by_id;
+    use ciris_verify_core::namespace_match::family_id;
+    let chat = family_id("chat:*");
+    for (what, p) in [("reply", chat_reply()), ("reaction", chat_reaction())] {
+        check_by_id(&chat, "scores", &p)
+            .unwrap_or_else(|e| panic!("I4002 a chat {what} with refs.answers: {e}"));
+        let names = super::names::names_of(&p).unwrap();
+        assert_eq!(
+            super::names::single(&names, "answers").map(|r| r.0),
+            Some([0xa7; 32]),
+            "I4002 the {what} names its message"
+        );
+    }
+    // A reaction's withdrawal is a composer by its author: the composer rule.
+    let withdraws = map(vec![
+        ("asserted_at", ms(1_200)),
+        ("author", txt(&id(250))),
+        ("refs", refs(vec![("target", ref2(&[0xa9; 32]))])),
+    ]);
+    check_by_id(&chat, "withdraws", &withdraws).expect("I4002 the author withdraws a reaction");
 }

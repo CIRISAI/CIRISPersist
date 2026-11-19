@@ -6665,16 +6665,28 @@ impl Engine {
         let me = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("emit_key_grant: node key: {e}"))
         })?;
-        use crate::federation::key_grant::emit_key_grant_axis_with;
-        let emit_one = |input| self.emit_attestation_self(input);
+        use crate::federation::key_grant::{emit_key_grant_axis_with, state_key_grant_row};
+        // v62.0.0 (v62 P8 triage 2) — each row stated in its family's payload
+        // by this Engine's composite key (`state_key_grant_row`).
+        let signer = self
+            .composite_signer("emit_key_grant")
+            .map_err(|e| crate::federation::BlobError::AttestationEmissionFailed(e.to_string()))?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
-                emit_key_grant_axis_with(arc.as_ref(), &me, axis, emit_one).await
+                let b = arc.as_ref();
+                emit_key_grant_axis_with(b, &me, axis, |row, at_ms| async move {
+                    state_key_grant_row(b, signer, &row, at_ms).await
+                })
+                .await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
-                emit_key_grant_axis_with(arc.as_ref(), &me, axis, emit_one).await
+                let b = arc.as_ref();
+                emit_key_grant_axis_with(b, &me, axis, |row, at_ms| async move {
+                    state_key_grant_row(b, signer, &row, at_ms).await
+                })
+                .await
             }
         }
         // A community with no live moderator may not federate at all
@@ -10530,6 +10542,36 @@ impl Engine {
             cursor,
             limit,
             requester,
+        )
+        .await
+    }
+
+    /// v62.0.0 (P10; CC rc21 2.7.11) — **the receipt leg of running admitted
+    /// code**: may the unit the `admission:unit` row `row_id` admits run, as
+    /// far as its SCITT receipt goes? `Runnable` when a COSE receipt (RFC
+    /// 9942, the statement's unprotected `receipts` parameter, label 394)
+    /// held on a voice of the row verifies and comes from a Transparency
+    /// Service THIS host trusts: a live `trust:accepts` edge of the host
+    /// OWNER, at `self` scope, with the class `transparency` names it (a CEG
+    /// identity-ref or a COSE_Key, the edge's `service_key`). Otherwise the unit waits
+    /// (`admission_receipt_missing`: `none`, `unverifiable`,
+    /// `untrusted_service`); `NotHeld` (`admission_none`, `no_row`) when no
+    /// such row is held. Read now, nothing stored. The lease, standing,
+    /// withdrawal and halt legs are the host's
+    /// ([`receipts`](crate::federation::edition2::receipts)).
+    ///
+    /// # Errors
+    /// Directory read failures.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn admission_unit_runnable(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<crate::federation::edition2::receipts::AdmissionReceipt, crate::federation::Error>
+    {
+        crate::federation::edition2::receipts::admission_unit_runnable(
+            self.federation_directory().as_ref(),
+            row_id,
+            crate::host::clock::now(),
         )
         .await
     }
@@ -15124,7 +15166,7 @@ mod tests {
         use crate::federation::admission::{DelegationTermBounds, DELEGATION_VALID_UNTIL_FIELD};
         use crate::federation::FederationDirectory;
         let signer = crate::federation::tier_ingest::test_support::local_signer("i1233-granter");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -15286,7 +15328,7 @@ mod tests {
         // holds_bytes attestations are emitted under that derived id. The
         // sweeper now matches + withdraws by the derived id, so seed the
         // FK row + the holds_bytes under it (not the bare alias).
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_replication_config(signer, "sqlite::memory:", cfg)
             .await
             .expect("construct engine");
@@ -15353,8 +15395,9 @@ mod tests {
         let rec = typed_test_key(pubkey_label, identity_type);
         assert_eq!(
             rec.key_id, derived_key_id,
-            "v62: the signer's derived id is its key's identity-ref ({pubkey_label}); \
-             this holds once the producer slice makes `derived_key_id()` the identity-ref"
+            "v62: the signer's id is its key's identity-ref ({pubkey_label}); callers pass \
+             `LocalSigner::federation_id()` (cut B: the id its statements carry), never the \
+             earlier `derived_key_id()`"
         );
         rec
     }
@@ -15466,7 +15509,7 @@ mod tests {
         // Confirm withdraws rows exist in federation_attestations.
         // v9.3.0 (#247) — the sweeper attests withdraws under the DERIVED
         // federation key_id, so query by that, not the bare alias.
-        let derived = test_signer().derived_key_id();
+        let derived = test_signer().federation_id().await;
         let directory = engine.federation_directory();
         let atts = directory.all_attestations_by(&derived).await.unwrap();
         let withdraws_count = atts
@@ -15497,7 +15540,7 @@ mod tests {
         let sq = engine.sqlite_backend().expect("sqlite");
         // Confirm every blob has the local signer (its DERIVED federation
         // key_id, #247) as holder before the sweep.
-        let derived = test_signer().derived_key_id();
+        let derived = test_signer().federation_id().await;
         for sha in &shas {
             let holders = sq.list_holders(sha).await.unwrap();
             assert_eq!(holders, vec![derived.clone()]);
@@ -15867,7 +15910,7 @@ mod tests {
         n: usize,
     ) -> Vec<[u8; 32]> {
         use crate::federation::BlobBody;
-        let derived = test_signer().derived_key_id();
+        let derived = test_signer().federation_id().await;
         let mut shas = Vec::with_capacity(n);
         for i in 0..n {
             let bytes = vec![fill_base + i as u8; 1024];
@@ -16088,7 +16131,7 @@ mod tests {
     #[cfg(feature = "postgres")]
     async fn sweeper_engine_pg(cfg: crate::federation::ReplicationConfig, dsn: &str) -> Engine {
         let signer = test_signer();
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_replication_config(signer, dsn, cfg)
             .await
             .expect("construct postgres engine");
@@ -16268,7 +16311,7 @@ mod tests {
 
         // LOCAL write (attester == local signer's DERIVED id, #247) still
         // succeeds.
-        let local_id = test_signer().derived_key_id();
+        let local_id = test_signer().federation_id().await;
         let (sha_c, body_c) = blob_for(3);
         engine
             .put_blob_signing(
@@ -17648,7 +17691,7 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("node-509v");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -17839,7 +17882,7 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("node-510strip");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -17998,7 +18041,7 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("node-510exp");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -18053,7 +18096,7 @@ mod tests {
         // Real deterministic hybrid keypair so the federation-tier ingest
         // gate (`put_attestation`) verifies the emitted scrub signature.
         let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-client");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         assert_ne!(derived, "ciris-client", "alias ≠ derived");
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
@@ -18116,7 +18159,7 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("c527");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -18157,7 +18200,7 @@ mod tests {
         use crate::federation::types::attestation_type::SCORES;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("c527e");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -18204,7 +18247,7 @@ mod tests {
         // ingest gate verifies the emitted scrub signature.
         let label = format!("emit-{}", uuid::Uuid::new_v4().simple());
         let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         assert_ne!(derived, label, "alias ≠ derived");
 
         let engine = Engine::with_signer(signer.clone(), &dsn)
@@ -18276,7 +18319,7 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-asm");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -18350,7 +18393,7 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-self");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -18411,7 +18454,7 @@ mod tests {
         use crate::federation::types::attestation_type::SCORES;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-self");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -18482,7 +18525,7 @@ mod tests {
         };
         let label = format!("emit-self-{}", uuid::Uuid::new_v4().simple());
         let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), &dsn)
             .await
             .expect("pg engine");
@@ -18602,7 +18645,7 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-weight");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -18721,7 +18764,7 @@ mod tests {
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-569");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -18920,7 +18963,7 @@ mod tests {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::FederationDirectory;
         let signer = crate::federation::tier_ingest::test_support::local_signer("granter");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -18972,7 +19015,7 @@ mod tests {
         use crate::federation::types::delegation_scope;
         use crate::federation::FederationDirectory;
         let signer = crate::federation::tier_ingest::test_support::local_signer("owner");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -19047,8 +19090,8 @@ mod tests {
 
         let s_signer = crate::federation::tier_ingest::test_support::local_signer("guardian-S");
         let w_signer = crate::federation::tier_ingest::test_support::local_signer("cap-witness");
-        let s = s_signer.derived_key_id();
-        let w = w_signer.derived_key_id();
+        let s = s_signer.federation_id().await;
+        let w = w_signer.federation_id().await;
         let engine = Engine::with_signer(s_signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -19256,8 +19299,8 @@ mod tests {
 
         let w_signer = crate::federation::tier_ingest::test_support::local_signer("age-witness");
         let t_signer = crate::federation::tier_ingest::test_support::local_signer("age-subject");
-        let w = w_signer.derived_key_id();
-        let t = t_signer.derived_key_id();
+        let w = w_signer.federation_id().await;
+        let t = t_signer.federation_id().await;
         let engine = Engine::with_signer(w_signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -19393,8 +19436,8 @@ mod tests {
         let t_label = format!("age-t-{run}");
         let w_signer = crate::federation::tier_ingest::test_support::local_signer(&w_label);
         let t_signer = crate::federation::tier_ingest::test_support::local_signer(&t_label);
-        let w = w_signer.derived_key_id();
-        let t = t_signer.derived_key_id();
+        let w = w_signer.federation_id().await;
+        let t = t_signer.federation_id().await;
         let engine = Engine::with_signer(w_signer.clone(), &dsn)
             .await
             .expect("pg engine");
@@ -19486,8 +19529,8 @@ mod tests {
 
         let w_signer = crate::federation::tier_ingest::test_support::local_signer("mg-witness");
         let s_signer = crate::federation::tier_ingest::test_support::local_signer("mg-steward");
-        let w = w_signer.derived_key_id();
-        let s = s_signer.derived_key_id();
+        let w = w_signer.federation_id().await;
+        let s = s_signer.federation_id().await;
         let engine = Engine::with_signer(w_signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -19681,8 +19724,8 @@ mod tests {
         let ward = format!("mg-ward-{run}");
         let w_signer = crate::federation::tier_ingest::test_support::local_signer(&w_label);
         let s_signer = crate::federation::tier_ingest::test_support::local_signer(&s_label);
-        let w = w_signer.derived_key_id();
-        let s = s_signer.derived_key_id();
+        let w = w_signer.federation_id().await;
+        let s = s_signer.federation_id().await;
         let engine = Engine::with_signer(w_signer.clone(), &dsn)
             .await
             .expect("pg engine");
@@ -19794,14 +19837,14 @@ mod tests {
 
         let o1_signer = crate::federation::tier_ingest::test_support::local_signer("ob-owner1");
         let o2_signer = crate::federation::tier_ingest::test_support::local_signer("ob-owner2");
-        let o1 = o1_signer.derived_key_id();
-        let o2 = o2_signer.derived_key_id();
+        let o1 = o1_signer.federation_id().await;
+        let o2 = o2_signer.federation_id().await;
         // v62.0.0 (slice C, CC 3.2 *The first binding (MUST)*): "an
         // owner-binding counts toward ownership only when the node's own key
         // cosigned it". The engine IS the node, so the binding it stores for
         // itself carries its co-scrub (`grant_delegation`).
         let node_signer = crate::federation::tier_ingest::test_support::local_signer("ob-node");
-        let node_id = node_signer.derived_key_id();
+        let node_id = node_signer.federation_id().await;
         let engine = Engine::with_signer(node_signer, "sqlite::memory:")
             .await
             .expect("engine");
@@ -19954,12 +19997,12 @@ mod tests {
         let node2_label = format!("ob-node2-{run}");
         let o1_signer = crate::federation::tier_ingest::test_support::local_signer(&o1_label);
         let o2_signer = crate::federation::tier_ingest::test_support::local_signer(&o2_label);
-        let o1 = o1_signer.derived_key_id();
-        let o2 = o2_signer.derived_key_id();
+        let o1 = o1_signer.federation_id().await;
+        let o2 = o2_signer.federation_id().await;
         // v62.0.0 (slice C, CC 3.2 *The first binding (MUST)*): the engine IS
         // the node, so the binding it stores for itself carries its co-scrub.
         let node_signer = crate::federation::tier_ingest::test_support::local_signer(&node_label);
-        let node_id = node_signer.derived_key_id();
+        let node_id = node_signer.federation_id().await;
         let engine = Engine::with_signer(node_signer, &dsn)
             .await
             .expect("pg engine");
@@ -20062,7 +20105,7 @@ mod tests {
         use crate::federation::admission::is_named_moderator;
         use crate::federation::types::delegation_scope::SCOPE_MODERATE;
         let signer = crate::federation::tier_ingest::test_support::local_signer("founder");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -21702,7 +21745,7 @@ mod tests {
     async fn file_moderation_stores_moderation_scores_sqlite() {
         use crate::federation::FederationDirectory;
         let signer = crate::federation::tier_ingest::test_support::local_signer("founder");
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("engine");
@@ -21746,7 +21789,7 @@ mod tests {
         };
         let label = format!("founder-{}", uuid::Uuid::new_v4().simple());
         let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), &dsn)
             .await
             .expect("pg engine");
@@ -21804,7 +21847,7 @@ mod tests {
         };
         let label = format!("founder-{}", uuid::Uuid::new_v4().simple());
         let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer.clone(), &dsn)
             .await
             .expect("pg engine");
@@ -22200,7 +22243,7 @@ mod tests {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let alias = format!("eng843-{run}");
         let signer = ts::local_signer(&alias);
-        let derived = signer.derived_key_id();
+        let derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("engine");
@@ -22427,7 +22470,7 @@ mod tests {
         use crate::federation::BlobStorage;
 
         let (signer, _alias) = self_login_signer();
-        let _steward_derived = signer.derived_key_id();
+        let _steward_derived = signer.federation_id().await;
         let engine = Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("engine");

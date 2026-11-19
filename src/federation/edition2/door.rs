@@ -51,8 +51,7 @@
 
 use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::family::{
-    select::Act, verify_row_in_family_with, FamilyFault, FamilyVerdict, SelectContext,
-    VendoredFamilyModel,
+    select::Act, verify_row_in_family_with, FamilyFault, FamilyVerdict, SelectContext, WithVendored,
 };
 use ciris_verify_core::edition2::keys::{check_key_record, KeyRecordError, KEY_RECORD_FAMILY};
 use ciris_verify_core::edition2::{
@@ -147,6 +146,9 @@ pub fn invalid_label(i: &Invalid) -> String {
         Invalid::DimensionRefused { token } => format!("dimension_refused:{token}"),
         Invalid::DimensionUnregistered => "dimension_unregistered".into(),
         Invalid::KidNotOfIss => "kid_not_of_iss".into(),
+        // v62.0.0 (R1; CIRISVerify 23.3.1, CC 2.6.1.8 step 4) — Verify's own
+        // token for a span that covers no instant.
+        Invalid::ValidUntilNotAfterAssertedAt => "valid_until_not_after_asserted_at".into(),
         other => format!("{other:?}"),
     }
 }
@@ -174,6 +176,18 @@ fn waiting(missing: &[MissingKey]) -> Error {
         .map(|m| match m {
             MissingKey::Kid(k) | MissingKey::CoveringRecord { kid: k, .. } => identity_ref(k),
             MissingKey::Record(r) => format!("row:{}", hex::encode(r)),
+            // v62.0.0 (R1; CIRISVerify 23.3.1, CC 2.6.1.9) — a voice of a
+            // held row that is not held: the statement by `kid` over `row`.
+            // Named by the key whose statement is missing, as a key is.
+            MissingKey::Voice { kid, .. } => identity_ref(kid),
+            // v62.0.0 (R1; CIRISVerify 23.3.1, CC 2.6.1.7 way (c)) — the
+            // bundle in force a seat waits on, by its object id (the halt
+            // door's spelling, `halt::waiting_error`).
+            MissingKey::Bundle(b) => format!(
+                "{}:{}",
+                ciris_verify_core::edition2::genesis::GENESIS_BUNDLE_TYP,
+                hex::encode(b)
+            ),
             other => format!("{other:?}"),
         })
         .unwrap_or_else(|| "<unnamed key>".to_owned());
@@ -243,6 +257,14 @@ fn door_context(bytes: &[u8], mut ctx: SelectContext) -> SelectContext {
             }
         });
     }
+    // v62.0.0 (T2-fix3) — the keys a typed family's authorship cell reads,
+    // from the bytes, for every admit that supplies none: a re-admission of
+    // a held statement (the fold's re-fold, a voice fold, the fixtures'
+    // `admit`) reaches the same verdict it was admitted under. A caller
+    // with the directory supplies the true context first
+    // (`typed::family_context`, the put door), and only keys left `None`
+    // are filled here.
+    super::typed::fill_context_from_bytes(bytes, &mut ctx);
     ctx
 }
 
@@ -364,12 +386,16 @@ pub fn admit_row(
     };
 
     let ctx = door_context(bytes, ctx);
-    // v62.0.0 (wave O1; CC 3.3.6, the rc21 reading) — CC's vendored model,
-    // with the occurrence key's own voice on `identity:occurrence`.
-    let model = super::occurrence::WithOccurrenceRole(&VendoredFamilyModel);
+    // v62.0.0 (wave O1; R1b, CIRISVerify 23.3.1) — persist's own cells first
+    // (`occurrence::PersistCells`: the occurrence key's own voice on
+    // `identity:occurrence`, CC rc21 90d537b; drop at 23.3.2), then CC's
+    // vendored model (`WithVendored`).
+    let model = WithVendored(&super::occurrence::PersistCells);
     let (row, role) = match verify_row_in_family_with(bytes, keys, &model, &ctx) {
         FamilyVerdict::Valid { row, role } => (row, role),
-        // Verify's own key-of-issuer check (23.3.0), through `keys.key_of`.
+        // Verify's own key-of-issuer check (23.3.0), through `keys.key_of`
+        // (23.3.1: `keys.key_of_at` at the statement's instant; persist's
+        // directories keep the provided default, which answers `key_of`).
         FamilyVerdict::Invalid(Invalid::KidNotOfIss) => {
             let kid = protected
                 .get_int(4)
@@ -383,19 +409,38 @@ pub fn admit_row(
                 .to_owned();
             return Err(kid_not_of_iss(kid.as_ref(), &iss));
         }
+        // v62.0.0 (R1; CIRISVerify 23.3.1, CC 2.6.1.8 step 4) — Verify's
+        // reader now refuses a span that covers no instant itself. The pure
+        // gate ([`check_valid_until_after_asserted_at`]) refuses it first at
+        // this door; a caller that reaches Verify's verdict without the pure
+        // gate gets persist's token, not `edition2_statement_invalid`.
+        FamilyVerdict::Invalid(Invalid::ValidUntilNotAfterAssertedAt) => {
+            return Err(refuse(
+                crate::federation::malformed_row::VALID_UNTIL_NOT_AFTER_ASSERTED_AT,
+                "valid_until is not after asserted_at: the window [asserted_at, \
+                 valid_until) covers no instant (CC 2.6.1.8 step 4)",
+            ));
+        }
         FamilyVerdict::Invalid(i) => {
             return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
         }
-        // v62.0.0 (wave V1b; CC 3.2 "An organisation's agent", ruling (a),
-        // CLM-org-on-the-bond) — an owner binding that names an affiliation
-        // is COUNTED over the affiliation's roster (CC 2.4.1.3): a member's
-        // voice over it is a counted voice, which rc21's family model admits
-        // and Verify 23.3.0 still refuses `iss_not_in_role`. Persist must not
-        // refuse what the ruled model admits: the statement itself must be
-        // Valid, and persist's counted rule
+        // v62.0.0 (wave V1b; R1b) — CC's COUNT cell for an owner binding
+        // (CIRISConstitution v1.0-rc21-wire `formal/derivation/count_text.tsv`
+        // rows 44–45, `ownership:{relation}:{target_kind}:{version}`:
+        // `act=group & group=affiliations` → `cosigned_act@subject_group`,
+        // else `none`; CC 3.2): a binding that names an affiliation is cosigned under that
+        // affiliation's protocol, so the members' voices are the count and the
+        // steward stays the author; CC 2.6.1.3 accepts a voice of the count on
+        // an authored row. CIRISVerify 23.3.1 applies only the authorship and
+        // `second_signers` cells, so it reads a member's voice
+        // `iss_not_in_role`, and a `FamilyModel` cannot state this cell for it
+        // (`RoleParty` is `Sub` or a payload member naming `iss`; a roster
+        // member is neither). So the count voice is admitted here: the
+        // statement itself must be Valid, and persist's counted rule
         // (`admission::check_owner_binding_counted`) counts only the roster at
-        // the head the binding names. TODO(verify-rc21): drop this arm when
-        // Verify vendors the ownership arm.
+        // the head the binding names. This arm implements CC's count cell; it
+        // is not an override of a ruled model (ruled 2026-11-18). Drop when
+        // Verify applies count cells.
         FamilyVerdict::FamilyInvalid(FamilyFault::IssNotInRole)
             if names_an_affiliation_on_the_bond(bytes) =>
         {
@@ -407,27 +452,13 @@ pub fn admit_row(
                 Verdict::Waiting { missing } => return Err(waiting(&missing)),
             }
         }
-        // v62.0.0 (wave V1b; CC 4.4.3.12 "two consents", the second ruling)
-        // — an affiliation's officer appointment is a `self:delegates_to`
-        // COUNTED over the affiliation's roster (act=group, no `author`,
-        // `refs.head`). rc21's family model gains the act=group arm, as
-        // `licensure` has; Verify 23.3.0 still reads `self:delegates_to` as
-        // authored and refuses an author-less one `author_column`. Persist
-        // must not refuse what the ruled model admits: the statement itself
-        // must be Valid, and the counted rule
-        // (`admission::check_officer_appointment_counted`) counts it.
-        // TODO(verify-rc21): drop this arm when Verify vendors it.
-        FamilyVerdict::FamilyInvalid(FamilyFault::AuthorColumn)
-            if is_counted_officer_appointment(bytes) =>
-        {
-            match verify_row_statement(bytes, keys) {
-                Verdict::Valid(row) => (row, None),
-                Verdict::Invalid(i) => {
-                    return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
-                }
-                Verdict::Waiting { missing } => return Err(waiting(&missing)),
-            }
-        }
+        // v62.0.0 (R1; CIRISVerify 23.3.1, CC 4.4.3.12 "two consents") —
+        // an affiliation's officer appointment (a `self:delegates_to` with no
+        // `author`) reads counted under rc21-wire's vendored arm
+        // `act=group => counted` ([`door_context`] derives `act` from
+        // `author`), so Verify's verdict is `Valid { role: None }` and the
+        // persist-side `author_column` override is gone. The counted rule
+        // (`admission::check_officer_appointment_counted`) still counts it.
         FamilyVerdict::FamilyInvalid(f) => {
             return Err(refuse(token::FAMILY_INVALID, fault_label(&f)));
         }
@@ -496,7 +527,9 @@ pub fn admit_row(
 
 /// v62.0.0 (wave V1b) — the role a member of the affiliation an owner
 /// binding names fills when it voices the binding (CC 3.2 ruling (a)).
-/// TODO(verify-rc21): Verify's own role name when it vendors the arm.
+/// CC's count cell names the door `cosigned_act@subject_group`; this role
+/// name is persist's (drop with the arm in `admit_row` when Verify applies
+/// count cells).
 pub const AFFILIATION_MEMBER_ROLE: &str = "affiliation_member";
 
 /// v62.0.0 (wave V1b) — is `bytes` an owner binding (`ownership:*`) whose
@@ -523,37 +556,6 @@ pub fn names_an_affiliation_on_the_bond(bytes: &[u8]) -> bool {
 /// The family of a `delegates_to` that is not an owner binding or another
 /// purpose-specific family (RULINGS, *delegates_to families*).
 pub const SELF_DELEGATES_TO_FAMILY_PREFIX: &str = "self:delegates_to";
-
-/// v62.0.0 (wave V1b; CC 4.4.3.12) — is `bytes` an affiliation's officer
-/// appointment as a COUNTED row: a `self:delegates_to` statement (exactly
-/// that family, not `self:delegates_to:agent_occurrence`) whose payload has
-/// no `author` and names a community (`community_id` or an alias), or the
-/// group's counted `withdraws` of one (no `author`)? Read from
-/// the bytes only; whether the community is an affiliation, its roster and
-/// the quorum are the counted rule's
-/// (`admission::check_officer_appointment_counted`).
-#[must_use]
-pub fn is_counted_officer_appointment(bytes: &[u8]) -> bool {
-    let Some((protected, payload)) = statement_parts(bytes) else {
-        return false;
-    };
-    let family = protected
-        .get_int(-70002)
-        .and_then(Value::as_text)
-        .and_then(ciris_verify_core::namespace_match::prefix_of_family_id);
-    // v62.0.0 (wave V1b; CC 2.4.1.1) — the group's counted withdrawal of
-    // one carries the appointment's family and names it by `refs.target`,
-    // not the community: the counted rule finds the community on the
-    // target (`admission::check_counted_withdrawal`).
-    let counted_withdrawal = protected.get_int(-70001).and_then(Value::as_text)
-        == Some(crate::federation::types::attestation_type::WITHDRAWS);
-    family == Some(SELF_DELEGATES_TO_FAMILY_PREFIX)
-        && payload.get_text("author").is_none()
-        && (counted_withdrawal
-            || crate::federation::admission::COHORT_TARGET_ENVELOPE_FIELDS
-                .iter()
-                .any(|f| payload.get_text(f).and_then(Value::as_text).is_some()))
-}
 
 /// Step 3b of the door: `kid` must be a key of `iss` (module docs). Every
 /// place the door resolves a signer calls this after Verify's verdict: rows,

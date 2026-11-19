@@ -24,7 +24,7 @@
 - `identity_amendment` gains `refs.prev`, the link it follows (the profile scope; the link with no `prev` is the base);
 - `deferral:response:approved` gains `call_fingerprint` (the action scope), beside `amendment_digest`.
 - **rc21 member homes:** an `identity_amendment`'s approval stands under `refs.also.cites` (exactly one; no `authorized_by` member, no `evidence_refs`). A `deferral:response:*` names its request under `refs.answers` (never `refs.target`) and carries `deferral_id` (REQUIRED: it correlates on it) and never `reason_digest`. A `deferral:request` REQUIRES `deferral_id` and `reason_digest` (FINAL, CC ruling). Both route by `community_id`, the pair room (a two-person community record); there is no `room` member (FINAL, CC). No payload carries Server's envelope uuid `id`: the row id is computed.
-- **The self-roster head (CC 2.7 rulings item 2):** `identity:occurrence` and `identity:occurrence_revocation` REQUIRE `refs.head`, the identity's last landed self-roster row (a new identity's first bind names its genesis key's own `key:record` row), and take an optional `refs.further_heads`.
+- **The self-roster head (CC 2.7 rulings item 2):** `identity:occurrence` and `identity:occurrence_revocation` REQUIRE `refs.head`, the identity's last landed self-roster row (a new identity's first bind names its genesis key's own `key:record` row), and take an optional `refs.further_heads`. An `identity:occurrence_revocation` also REQUIRES `refs.also.cites`: the `key:record` of each voice, plus that key's occurrence binding when it has one (CC rc21 7f94be1). The per-voice coverage is T2's door; the list checks only that the cites are present.
 
 The action review record is node-local (carried in the trace) and is no row, so it has no table here.
 
@@ -172,6 +172,7 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 | `witness_set` | `[* identity-ref]` | optional | witness_set |
 | `refs.head` | `row-ref` | required | the last landed self-roster row of the identity (CC 2.7 rulings item 2); the first bind of a new identity names the genesis key's own key:record row |
 | `refs.further_heads` | `row-ref` | optional | the other self-roster tips this row merges, as group:roster's |
+| `refs.also.cites` | `row-ref` | required | the key:record of each voice, and that key's occurrence binding when it has one (CC rc21 7f94be1); REQUIRED: the per-voice coverage is T2's door |
 
 | earlier-form co-signature (not a payload member) | now |
 |---|---|

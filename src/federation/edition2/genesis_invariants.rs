@@ -1,9 +1,10 @@
 //! **I2300–I2304**: the genesis bundle/2 reader in persist, pure (no store),
-//! against CIRISVerify 23.3.0's own known answers (vendored at
-//! `tests/vectors/verify_v23/genesis/`, SHA-256 pinned).
+//! against CIRISVerify 23.3.1's own known answers (vendored at
+//! `tests/vectors/verify_v23/genesis/`, SHA-256 pinned; v62.0.0 R1 moved
+//! bundles v2 to v3 and reseat v1 to v2, CC v1.0-rc21-wire e6fd7c6).
 //!
-//! - I2300: the vendored files are Verify 23.3.0's, byte for byte.
-//! - I2301: every case of `genesis_bundles_v2.json` read through
+//! - I2300: the vendored files are Verify 23.3.1's, byte for byte.
+//! - I2301: every case of `genesis_bundles_v3.json` read through
 //!   [`read_lineage`] gives Verify's verdict for each offered object, with a
 //!   case's predecessor chain HELD (each held first bundle rooted by its own
 //!   object id, as the store re-reads it) and its anchor rooting only what
@@ -20,10 +21,12 @@
 //! - I2302: on the fork cases, the genesis in force ([`GenesisInForce`])
 //!   reports Verify's forks, head, and the tips' common holders and seats.
 //! - I2303: persist's tokens are Verify's.
-//! - I2304: `genesis_reseat_v1.json` read the same way: a seat re-seated at a
+//! - I2304: `genesis_reseat_v2.json` read the same way: a seat re-seated at a
 //!   new key keeps its identity-ref and canonical standing, at the new key and
 //!   its X-Wing keys; a binding not signed by the key the bundle places for
-//!   the seat is `genesis_bundle_row_invalid` (`row_signer`).
+//!   the seat is `genesis_bundle_row_invalid` (`row_signer`); a binding whose
+//!   `identity_key_id` / `occurrence_key_id` name the new key, not the seat,
+//!   is `genesis_bundle_row_invalid` (`row_invalid`).
 
 use std::collections::BTreeMap;
 
@@ -86,7 +89,7 @@ pub(crate) fn voice_over(k: &CompositeSigningKey, payload: &Value, iat: Option<u
     ))
 }
 
-/// CIRISVerify 23.3.0's genesis vectors, as vendored, and the readers of
+/// CIRISVerify 23.3.1's genesis vectors, as vendored, and the readers of
 /// their case lists (shared with the store witnesses, I2310–I2318).
 pub(crate) mod vectors {
     use std::collections::BTreeMap;
@@ -103,80 +106,86 @@ pub(crate) mod vectors {
         };
     }
 
-    /// `genesis_bundles_v2.json` (the case list).
-    pub(crate) const V2: &str = vendored!("genesis_bundles_v2.json");
-    /// The statements of `genesis_bundles_v2.json`, split as Verify splits them.
+    /// `genesis_bundles_v3.json` (the case list). v62.0.0 (R1): Verify
+    /// 23.3.1 replays v3 (CC v1.0-rc21-wire e6fd7c6: a seat's binding is the
+    /// seat's own `identity:occurrence`); v2's valid bundles no longer verify,
+    /// so v2 is no longer vendored. The const keeps its name (`V2`, the
+    /// bundle/2 case list) for the store witnesses that read it.
+    pub(crate) const V2: &str = vendored!("genesis_bundles_v3.json");
+    /// The statements of `genesis_bundles_v3.json`, split as Verify splits them.
     pub(crate) const POOL: [&str; 8] = [
-        vendored!("pool_v2_0.json"),
-        vendored!("pool_v2_1.json"),
-        vendored!("pool_v2_2.json"),
-        vendored!("pool_v2_3.json"),
-        vendored!("pool_v2_4.json"),
-        vendored!("pool_v2_5.json"),
-        vendored!("pool_v2_6.json"),
-        vendored!("pool_v2_7.json"),
+        vendored!("pool_v3_0.json"),
+        vendored!("pool_v3_1.json"),
+        vendored!("pool_v3_2.json"),
+        vendored!("pool_v3_3.json"),
+        vendored!("pool_v3_4.json"),
+        vendored!("pool_v3_5.json"),
+        vendored!("pool_v3_6.json"),
+        vendored!("pool_v3_7.json"),
     ];
-    /// `genesis_reseat_v1.json` (its own pool inside).
-    pub(crate) const RESEAT: &str = vendored!("genesis_reseat_v1.json");
+    /// `genesis_reseat_v2.json` (its own pool inside; v1 retired with
+    /// bundles v2).
+    pub(crate) const RESEAT: &str = vendored!("genesis_reseat_v2.json");
 
-    /// Each vendored file and its SHA-256 at Verify's `v23.3.0` tag
-    /// (ffd7af1, `src/ciris-verify-core/tests/vectors/edition2/genesis/`).
+    /// Each vendored file and its SHA-256 at CIRISVerify 23.3.1
+    /// (Verify tag 23.3.1, b0933ba; byte-identical to CIRISVerify#350 head fad948e,
+    /// `src/ciris-verify-core/tests/vectors/edition2/genesis/`).
     pub(crate) fn pinned() -> [(&'static str, &'static str, &'static str); 10] {
         [
             (
-                "genesis_bundles_v2.json",
+                "genesis_bundles_v3.json",
                 V2,
-                "395819725ad28899fcff8ee75f238d09a319d5a0a8d3e242f91d7f973fa52153",
+                "187dcf6005eae5e4f6fdd8b82e644538d256c122076acf8e2f22267001c5abc1",
             ),
             (
-                "genesis_reseat_v1.json",
+                "genesis_reseat_v2.json",
                 RESEAT,
-                "11cd3aba1af28cd9cf9d1d2328b529b1aed1efd80b552b0283cd6ed7e6abc0e2",
+                "a3c93adfde2dd98710530f2377cbc30bb6f4092c06eb652f0c4c3035ca4ada3a",
             ),
             (
-                "pool_v2_0.json",
+                "pool_v3_0.json",
                 POOL[0],
-                "58fe47afd852e4c5a7015b96a112bd54ea6e58a483d55e49996250fa73a08a87",
+                "113226738b72eb60e8d745738775ff2c8ffea54189466916d84756fda467bbe5",
             ),
             (
-                "pool_v2_1.json",
+                "pool_v3_1.json",
                 POOL[1],
-                "4146bc7ec18c6fecc7112b231d139693a34f7e7c1faa8382fa89ecf82ddc3f21",
+                "8fd3e83382610546dce426061b475abc17ea904c56ccd998c3eb65d8bcedaf9f",
             ),
             (
-                "pool_v2_2.json",
+                "pool_v3_2.json",
                 POOL[2],
-                "52cb089f6321480f5ea6a54c10ae4730009aa9666b50b53e38bb00fbd9b3280f",
+                "e12bc129ebd1c69600e1ca3268a458eb7a0a36e4c4ff3703369d16f52a344a58",
             ),
             (
-                "pool_v2_3.json",
+                "pool_v3_3.json",
                 POOL[3],
-                "20a3846db5e01901b0acc87ab3f5d3079d4b67a60e204655157d242c1fdbb04a",
+                "c3984f4c2e34e89bbf64e71222a15c754227ca4aa45ecd1a77bcb6ca1b1e2a31",
             ),
             (
-                "pool_v2_4.json",
+                "pool_v3_4.json",
                 POOL[4],
-                "b705cb9caaa7f2cabfae3cc1c606dd956accf0d3a37633ba57de5f7d7c30b9dd",
+                "641f9326bae29b47d93e8381a17cb6b890386792dd88fc6f6e0f56e2c40d1564",
             ),
             (
-                "pool_v2_5.json",
+                "pool_v3_5.json",
                 POOL[5],
-                "9a98fd0301e554fe4659ae2d96cda6998472297da4a336a500f42d4af02acddf",
+                "7f1dcac2cdd6d280caaf5a0cd29b3769f78f04883871582f3d5c618bec913c7e",
             ),
             (
-                "pool_v2_6.json",
+                "pool_v3_6.json",
                 POOL[6],
-                "98e299f74ed60e899b24ef8c7b3a4bfffa080b556afc77b8017da9aaa0944ac2",
+                "45fc4810efee67ec79dd3213d470a4529a9079f6711a4a0c583205da53755ba6",
             ),
             (
-                "pool_v2_7.json",
+                "pool_v3_7.json",
                 POOL[7],
-                "635adb0daa6402b951ac8766c9c6423680e130c1a9949aaa9b0f05b35a560a08",
+                "fa80688ad634523e5c0b98f82449a3d59ed834dcb0b24114ec0cdbf46123208a",
             ),
         ]
     }
 
-    /// `genesis_bundles_v2.json` with its pool merged in under `pool`.
+    /// `genesis_bundles_v3.json` with its pool merged in under `pool`.
     pub(crate) fn v2() -> &'static J {
         static F: OnceLock<J> = OnceLock::new();
         F.get_or_init(|| {
@@ -193,7 +202,7 @@ pub(crate) mod vectors {
         })
     }
 
-    /// `genesis_reseat_v1.json`.
+    /// `genesis_reseat_v2.json`.
     pub(crate) fn reseat() -> &'static J {
         static F: OnceLock<J> = OnceLock::new();
         F.get_or_init(|| serde_json::from_str(RESEAT).unwrap())
@@ -441,14 +450,14 @@ fn check_case(f: &J, c: &J, roots: &TrustAnchorStore) -> GenesisInForce {
     in_force
 }
 
-/// I2300: the vendored files are Verify 23.3.0's, byte for byte.
+/// I2300: the vendored files are Verify 23.3.1's, byte for byte.
 #[test]
-fn i2300_the_genesis_vectors_are_verify_23_3_0s() {
+fn i2300_the_genesis_vectors_are_verify_23_3_1s() {
     for (name, body, sha) in vectors::pinned() {
         assert_eq!(sha_hex(body.as_bytes()), sha, "I2300: {name}");
     }
     assert!(
-        vectors::v2()["cases"].as_array().unwrap().len() >= 105,
+        vectors::v2()["cases"].as_array().unwrap().len() >= 116,
         "I2300: the case list"
     );
 }
@@ -476,7 +485,7 @@ fn i2301_every_v2_case_reads_through_persists_lineage() {
         replayed += 1;
     }
     assert_eq!(skipped, vec!["later_prev_not_valid"], "I2301: the one skip");
-    assert!(replayed >= 104, "I2301: {replayed} cases");
+    assert!(replayed >= 115, "I2301: {replayed} cases");
 }
 
 /// I2302: on the fork cases, the genesis in force reports Verify's forks,
@@ -613,13 +622,14 @@ fn i2303_persists_genesis_tokens_are_verifys() {
 
 /// I2304: a seat re-seated at a new key keeps its identity-ref and its
 /// standing, at the new key; a binding the placed key did not sign is
-/// `genesis_bundle_row_invalid` (`row_signer`).
+/// `genesis_bundle_row_invalid` (`row_signer`); one naming the new key as its
+/// identity is `row_invalid` (v3, `reseat_binding_names_new_key`).
 #[test]
 fn i2304_a_reseated_seat_keeps_its_identity_ref_at_the_new_key() {
     let f = vectors::reseat();
     let roots = mock_roots(f);
     let cases = f["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 4, "I2304: the case list");
+    assert_eq!(cases.len(), 5, "I2304: the case list");
     for c in cases {
         check_case(f, c, &roots);
     }

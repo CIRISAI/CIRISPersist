@@ -2903,7 +2903,9 @@ pub mod test_support {
             &id,
             &a,
             &b,
-            &serde_json::json!({ "id": id, "dimension": "scores:medical:v1" }),
+            // v62.0.0 (E0 fix 2) — a registered family; `scores:medical:v1` is
+            // open vocabulary, which the edition-2 door refuses.
+            &serde_json::json!({ "id": id, "dimension": "truth_grounding:medical:v1" }),
         );
         row.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
         seal_row_in_place(&a, &mut row);

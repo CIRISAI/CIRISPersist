@@ -77,9 +77,40 @@ fn row_type_served(attestation_type: &str) -> bool {
 /// rule. `requester` is the identity the transport authenticated, never a
 /// claim the statement makes; `None` is an anonymous read.
 ///
+/// v62.0.0 (T1-fix3; CC 2.7.5, "missing, and what is copied") — a statement
+/// its own rule ([`servable_by_own_rule`]) withholds is still served where a
+/// row naming it carries its audience to it
+/// ([`super::group_serve::carried_by_a_naming_row`]): "A row carries its
+/// audience to the rows it names when it is concluded, sits in the same
+/// room, and its signer is already in the named row's audience." So an
+/// eviction's cited proof (CC 2.6.1.7 way (d), rc21 7f94be1) travels with
+/// it, and an invitation's cited roster head reaches its invitee.
+///
 /// # Errors
 /// Directory reads.
 pub async fn servable_to<F>(
+    dir: &F,
+    statement: &[u8],
+    requester: Option<&str>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if servable_by_own_rule(dir, statement, requester).await? {
+        return Ok(true);
+    }
+    Box::pin(super::group_serve::carried_by_a_naming_row(
+        dir, statement, requester,
+    ))
+    .await
+}
+
+/// **The statement's own serve rule**, before any row naming it carries
+/// its audience to it (the body [`servable_to`] had before T1-fix3).
+///
+/// # Errors
+/// Directory reads.
+pub async fn servable_by_own_rule<F>(
     dir: &F,
     statement: &[u8],
     requester: Option<&str>,
@@ -189,10 +220,31 @@ where
 {
     let scanned = dir.edition2_statements_since(cursor, limit).await?;
     let next = scanned.last().map(|s| s.cursor);
-    let mut statements = Vec::with_capacity(scanned.len());
+    let mut statements: Vec<ServedStatement> = Vec::with_capacity(scanned.len());
     for s in scanned {
         if servable_to(dir, &s.bytes, requester).await? {
-            statements.push(s);
+            // v62.0.0 (T2-fix4; CC 2.7.5, rc21 7f94be1) — the rows an
+            // eviction cites (its voices' key records and bindings) are its
+            // ancestors and TRAVEL with it: served just before it, at its
+            // position, so the page's resume point is unchanged, each one
+            // gated by `servable_to` (T1-fix3's copy rule).
+            for ancestor in super::typed::travelling_ancestors(dir, &s.bytes).await? {
+                // Within the row's audience (CC 2.7.5): the ONE serve rule
+                // decides each ancestor (T1's carry admits a cited row to
+                // whoever the concluded eviction is served to).
+                if !servable_to(dir, &ancestor, requester).await? {
+                    continue;
+                }
+                if !statements.iter().any(|x| x.bytes == ancestor) {
+                    statements.push(ServedStatement {
+                        cursor: s.cursor,
+                        bytes: ancestor,
+                    });
+                }
+            }
+            if !statements.iter().any(|x| x.bytes == s.bytes) {
+                statements.push(s);
+            }
         }
     }
     Ok(ServedPage { statements, next })

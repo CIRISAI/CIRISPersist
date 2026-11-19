@@ -3773,7 +3773,8 @@ mod tests {
         let backend = test_backend();
         let oversize = serde_json::json!({
             "d": "x".repeat(MAX_ATTESTATION_ENVELOPE_BYTES),
-            "dimension": "test:oversize:v1",
+            // v62.0.0 (E0 fix 2) — registered (`test:` is open vocabulary).
+            "dimension": "truth_grounding:oversize:v1",
         });
 
         // Federation put: refused before signature/directory work.

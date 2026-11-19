@@ -352,3 +352,171 @@ where
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+//  The copy rule: a row carries its audience to the rows it names
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The `refs` roles a row names another row under (CC 2.6.1.3), as
+/// `ceg_row_names` stores them.
+pub const NAMING_ROLES: &[&str] = &[
+    "also:cites",
+    "also:ack",
+    "head",
+    "further_heads",
+    "target",
+    "prev",
+    "answers",
+    "trusted_through",
+];
+
+/// A statement's CWT `iss`.
+fn statement_iss(statement: &[u8]) -> Option<String> {
+    let (protected, _) = statement_parts(statement)?;
+    protected
+        .get_int(15)?
+        .get_int(1)?
+        .as_text()
+        .map(str::to_owned)
+}
+
+/// **The room a statement sits in**: its scope and the scope's target, as
+/// this node reads it. A group voice's room is its group (`family` /
+/// `community` and the group key); a row with an attestation row, its
+/// `cohort_scope` and cohort target; any other statement, its payload's
+/// `cohort_scope` (absent: `federation`) and cohort target. A `self` room is
+/// its author's self (the target is the signer, `iss`). `None` for bytes
+/// that do not read.
+///
+/// # Errors
+/// Directory reads.
+pub async fn room_of<F>(
+    dir: &F,
+    statement: &[u8],
+) -> Result<Option<(String, Option<String>)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some((protected, payload)) = statement_parts(statement) else {
+        return Ok(None);
+    };
+    let text = |label: i64| protected.get_int(label).and_then(Value::as_text);
+    let (Some(row_type), Some(family)) = (text(-70001), text(-70002)) else {
+        return Ok(None);
+    };
+    let claims = protected.get_int(15);
+    let sub = claims.and_then(|c| c.get_int(2)).and_then(Value::as_text);
+    let iss = claims.and_then(|c| c.get_int(1)).and_then(Value::as_text);
+    if let (Some(plane), Some(sub)) = (group_plane_of(row_type, family, &payload), sub) {
+        let read = match plane {
+            GroupPlane::Roster => roster_view(sub, &payload).map(|v| (v.kind, v.group)),
+            GroupPlane::Widening | GroupPlane::Removal => {
+                membership_of(plane, sub, &payload).map(|(v, _)| (v.kind, v.group))
+            }
+        };
+        return Ok(read
+            .ok()
+            .map(|(kind, group)| (kind.as_str().to_owned(), Some(group))));
+    }
+    let Some(rid) = super::names::RowId::of_statement(statement) else {
+        return Ok(None);
+    };
+    let (scope, target) = match dir.get_attestation(&rid.hex()).await? {
+        Some(row) => {
+            let target =
+                crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)
+                    .unwrap_or(None)
+                    .map(str::to_owned);
+            (row.cohort_scope, target)
+        }
+        None => {
+            let scope = payload
+                .get_text("cohort_scope")
+                .and_then(Value::as_text)
+                .unwrap_or(cs::FEDERATION)
+                .to_owned();
+            let target = crate::federation::admission::envelope_cohort_target(&json_of(&payload))
+                .unwrap_or(None)
+                .map(str::to_owned);
+            (scope, target)
+        }
+    };
+    let target = if scope == cs::SELF {
+        iss.map(str::to_owned)
+    } else {
+        target
+    };
+    Ok(Some((scope, target)))
+}
+
+/// v62.0.0 (T1-fix3; CC 2.7.5, "missing, and what is copied") — **does a
+/// row naming this statement carry its audience to it, for `requester`?**
+/// CC: "A row carries its audience to the rows it names when it is
+/// concluded, sits in the same room, and its signer is already in the named
+/// row's audience." For each held row `C` that names this statement's row
+/// (under any [`NAMING_ROLES`] role, from `ceg_row_names`):
+///
+/// - `C` is concluded: no fold hold is recorded for it (`fold_held`);
+/// - `C` sits in the same room ([`room_of`]);
+/// - `C`'s signer is in this statement's audience by its own rule
+///   (`serve::servable_by_own_rule` with the signer as the party);
+/// - and `C` is served to `requester` by its own rule.
+///
+/// One hop: a row carried to `requester` does not in turn carry. Anonymous
+/// reads are never carried (a carry only reaches a targeted room's
+/// audience; a commons row is served to anyone already).
+///
+/// # Errors
+/// Directory reads.
+pub async fn carried_by_a_naming_row<F>(
+    dir: &F,
+    statement: &[u8],
+    requester: Option<&str>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(peer) = requester else {
+        return Ok(false);
+    };
+    let Some(named) = super::names::RowId::of_statement(statement) else {
+        return Ok(false);
+    };
+    let Some(room) = room_of(dir, statement).await? else {
+        return Ok(false);
+    };
+    let mut seen: BTreeSet<super::names::RowId> = BTreeSet::new();
+    for role in NAMING_ROLES {
+        for citer in dir.edition2_rows_naming(&named, role).await? {
+            if !seen.insert(citer) {
+                continue;
+            }
+            if dir.fold_held(&citer).await?.is_some() {
+                continue;
+            }
+            let voices = dir.edition2_voices(&citer).await?;
+            let Some(st) = voices.first() else {
+                continue;
+            };
+            if room_of(dir, st).await?.as_ref() != Some(&room) {
+                continue;
+            }
+            let Some(signer) = statement_iss(st) else {
+                continue;
+            };
+            if !Box::pin(super::serve::servable_by_own_rule(
+                dir,
+                statement,
+                Some(&signer),
+            ))
+            .await?
+            {
+                continue;
+            }
+            if Box::pin(super::serve::servable_by_own_rule(dir, st, Some(peer))).await? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}

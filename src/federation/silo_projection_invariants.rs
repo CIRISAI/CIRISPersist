@@ -734,6 +734,8 @@ mod run {
         let t = tag("i960s");
         let node = format!("{t}-node");
         bodies::register_node(&b, &node).await;
+        // v62.0.0 (K1) — the node key is held under its edition-2 id.
+        let node = crate::federation::hard_case::test_support::node_key_id_of(&node);
         b.set_node_key_id(&node);
         bodies::i960_hard_case(&b, &node, &t).await;
         // RED: one column of one live row moved.
@@ -758,6 +760,8 @@ mod run {
         let t = tag("i960so");
         let node = format!("{t}-node");
         bodies::register_node(&b, &node).await;
+        // v62.0.0 (K1) — the node key is held under its edition-2 id.
+        let node = crate::federation::hard_case::test_support::node_key_id_of(&node);
         b.set_node_key_id(&node);
         bodies::i960_hard_case(&b, &node, &t).await;
         // RED: a copy of a live row under ids no row produces, planted below
@@ -818,6 +822,8 @@ mod run {
         bodies::i962_refused_without_a_node_key(&b, &t).await;
         let node = format!("{t}-node");
         bodies::register_node(&b, &node).await;
+        // v62.0.0 (K1) — the node key is held under its edition-2 id.
+        let node = crate::federation::hard_case::test_support::node_key_id_of(&node);
         b.set_node_key_id(&node);
         bodies::i962_succeeds_with_the_node_key(&b, &node, &t).await;
     }
@@ -859,6 +865,8 @@ mod run {
         .await;
         let node = format!("{t}-node");
         bodies::register_node(&b, &node).await;
+        // v62.0.0 (K1) — the node key is held under its edition-2 id.
+        let node = crate::federation::hard_case::test_support::node_key_id_of(&node);
         b.set_node_key_id(&node);
         bodies::i963_the_rehome(
             &b,
@@ -916,6 +924,8 @@ mod run {
         let t = tag("i960p");
         let node = format!("{t}-node");
         bodies::register_node(&b, &node).await;
+        // v62.0.0 (K1) — the node key is held under its edition-2 id.
+        let node = crate::federation::hard_case::test_support::node_key_id_of(&node);
         b.set_node_key_id(&node);
         bodies::i960_hard_case(&b, &node, &t).await;
         b.test_execute(
@@ -971,6 +981,8 @@ mod run {
         bodies::i962_refused_without_a_node_key(&b, &t).await;
         let node = format!("{t}-node");
         bodies::register_node(&b, &node).await;
+        // v62.0.0 (K1) — the node key is held under its edition-2 id.
+        let node = crate::federation::hard_case::test_support::node_key_id_of(&node);
         b.set_node_key_id(&node);
         bodies::i962_succeeds_with_the_node_key(&b, &node, &t).await;
         eprintln!("i962_postgres: RAN");
@@ -1014,6 +1026,8 @@ mod run {
         .await;
         let node = format!("{t}-node");
         bodies::register_node(&b, &node).await;
+        // v62.0.0 (K1) — the node key is held under its edition-2 id.
+        let node = crate::federation::hard_case::test_support::node_key_id_of(&node);
         b.set_node_key_id(&node);
         bodies::i963_the_rehome(
             &b,

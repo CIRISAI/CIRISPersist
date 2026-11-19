@@ -1353,8 +1353,18 @@ pub(crate) mod test_support {
 
     /// v57.0.0 (CIRISPersist#988 item 2) — register `key_id` as a held `node`
     /// key and declare it this backend's node key: the attester every
-    /// `hard_case:{kind}:v1` row needs.
-    pub(crate) async fn declare_node<B>(b: &B, key_id: &str)
+    /// `hard_case:{kind}:v1` row needs. Returns the key id declared.
+    ///
+    /// v62.0.0 (K1, triage round 2, `node_key_not_held`) — under the fixture
+    /// switch the key is registered as an edition-2 `key:record` whose id is
+    /// `fixture_switch::kid(key_id)` ([`register_hybrid_key_as`]), so THAT id
+    /// is declared: declaring the seed text named a key `federation_keys`
+    /// does not hold, and every hard_case attester read refused
+    /// `node_key_not_held`. A caller comparing the attester reads the
+    /// returned id.
+    ///
+    /// [`register_hybrid_key_as`]: crate::federation::tier_ingest::test_support::register_hybrid_key_as
+    pub(crate) async fn declare_node<B>(b: &B, key_id: &str) -> String
     where
         B: crate::federation::FederationDirectory + DeclaresNode,
     {
@@ -1365,7 +1375,20 @@ pub(crate) mod test_support {
             crate::federation::types::identity_type::NODE,
         )
         .await;
-        b.declare_node_key_for_test(key_id);
+        let declared = node_key_id_of(key_id);
+        b.declare_node_key_for_test(&declared);
+        declared
+    }
+
+    /// The id a node key registered from `seed` is held under: its
+    /// identity-ref under the fixture switch, the seed itself in the
+    /// earlier form.
+    pub(crate) fn node_key_id_of(seed: &str) -> String {
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            crate::federation::edition2::fixture_switch::kid(seed)
+        } else {
+            seed.to_owned()
+        }
     }
 }
 

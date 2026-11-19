@@ -2137,7 +2137,10 @@ impl LocalAttestationInput {
 /// [`crate::federation::admission::check_row_column_binding`] over the row as
 /// it will be stored, so a caller that skips the re-stamp is REFUSED rather
 /// than silently minting a row no peer will take.
-#[derive(Debug, Clone)]
+///
+/// v61.4.2 — serde: a reseal crosses the directory capsule inside
+/// `TierPromotionCustody::ActorSigned` (`DirectoryOp::EnterMesh`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationReseal {
     /// The envelope as it will be STORED and SERVED — the mirror already
     /// re-stamped for the new placement, and the exact bytes

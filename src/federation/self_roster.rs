@@ -1268,7 +1268,30 @@ where
     }
     let rows = answer_rows(dir, identity).await?;
     let mut with_answers = Vec::with_capacity(held.len());
-    for (p, c) in held {
+    for (mut p, mut c) in held {
+        // T2's I3187: an edition-2 proposal's proposer is chosen among the
+        // voices by keys on the roster at its named heads; with none, it is
+        // not decided (held, concluding nothing).
+        let e2_row = match &c {
+            Carried::Edition2Occurrence { row_id, .. }
+            | Carried::Edition2Eviction { row_id, .. } => Some(*row_id),
+            Carried::Occurrence(_) | Carried::Withdraws { .. } => None,
+        };
+        if let (Some(heads), Some(row_id)) = (head_of(&c), e2_row) {
+            if let Ok((at_heads, _)) = roster_reading(dir, identity, &heads).await {
+                match super::edition2::occurrence::proposer_on_roster(
+                    dir, &row_id, identity, &at_heads,
+                )
+                .await?
+                {
+                    Some(k) => {
+                        p.proposer.clone_from(&k);
+                        c = with_proposer(c, k);
+                    }
+                    None => continue,
+                }
+            }
+        }
         let mut a = answers_for(dir, identity, &p, &rows).await?;
         // v62.0.0 (wave O1, S1) — an edition-2 bind's further author
         // statements (roster keys signing as the self over the same payload)
@@ -1591,8 +1614,15 @@ where
             "gate_edition2: not an edition-2 proposal".into(),
         ));
     };
+    let row_id = *row_id;
     let id = row_id.hex();
     let heads = head_of(&carried).unwrap_or_default();
+    // Every named head is a read of this proposal (T2's I3186): when one
+    // lands, G0's re-fold re-runs it (declared here as well as by the
+    // roster fold, so the Ok(false) wait always carries it).
+    for h in &heads {
+        super::edition2::fold::reads(super::edition2::fold::Dep::Row(*h));
+    }
     let now = roster_clock();
     // A settled landing or voiding is final for this reader (a re-fold that
     // re-runs a concluded row's door must not re-read it against its own
@@ -1640,7 +1670,7 @@ where
     // CC 2.7.8: a stale sibling is VOID for this reader — held (its
     // statements kept), concluding nothing, under a fold reason; never a
     // door refusal. Settled so it is not re-planned.
-    if let Some(detail) = void_for_reader(dir, &identity, row_id, &heads, &reach).await? {
+    if let Some(detail) = void_for_reader(dir, &identity, &row_id, &heads, &reach).await? {
         tracing::debug!(%detail, "self-roster row void for this reader");
         super::edition2::fold::note(REASON_ROSTER_HEAD_SUPERSEDED);
         dir.note_edition2_roster_proposal(&id, &identity, now)
@@ -1653,6 +1683,17 @@ where
         record_landed(dir, &id, &identity, LandingPath::Quorum, now).await?;
         return Ok(true);
     }
+    // T2's I3187: the proposer is chosen among the voices by keys ON the
+    // roster at the named heads; a voice off it is kept and concludes
+    // nothing, never a refusal. No such voice yet: the proposal waits.
+    let Some(proposer) =
+        super::edition2::occurrence::proposer_on_roster(dir, &row_id, &identity, &roster).await?
+    else {
+        dir.note_edition2_roster_proposal(&id, &identity, now)
+            .await?;
+        return Ok(false);
+    };
+    let carried = with_proposer(carried, proposer);
     let policy = policy()?;
     let plan = plan(dir, &identity, Some((&carried, &id)), now, &policy).await?;
     let decision = plan
@@ -1688,6 +1729,16 @@ where
     dir.note_edition2_roster_proposal(&id, &identity, now)
         .await?;
     Ok(false)
+}
+
+/// `c` with this proposer (an edition-2 proposal; others unchanged).
+fn with_proposer(mut c: Carried, k: String) -> Carried {
+    if let Carried::Edition2Occurrence { proposer, .. }
+    | Carried::Edition2Eviction { proposer, .. } = &mut c
+    {
+        *proposer = k;
+    }
+    c
 }
 
 /// Record an edition-2 row's landing: this node's receipt, noted (first

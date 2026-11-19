@@ -1088,12 +1088,13 @@ mod ingest_gate_proof {
         ]
     }
 
-    /// v62.0.0 — a registered family (`capacity:{factor}`): the edition-2
-    /// door refuses an unregistered dimension.
+    /// v62.0.0 — a registered, unreserved family with its version segment
+    /// (`truth_grounding:{subject}`): the edition-2 door refuses an
+    /// unregistered dimension, and `capacity:` is reserved no-self-emit.
     fn header(id: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id,
-            "dimension": "capacity:integrity",
+            "dimension": "truth_grounding:fixture:v1",
             "score": 1.0,
             "confidence": 0.9,
         })

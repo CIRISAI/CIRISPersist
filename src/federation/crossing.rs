@@ -383,7 +383,9 @@ pub enum ContentRef {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Who signs a tier crossing. See the module doc, "Custody".
-#[derive(Debug, Clone)]
+///
+/// v61.4.2 — serde: the custody crosses the directory capsule (`DirectoryOp::EnterMesh`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TierPromotionCustody {
     /// The actor's own hybrid signature over `JCS(envelope)`. Becomes the
     /// base scrub. `reseal.attestation_envelope` must canonicalize to the
@@ -402,7 +404,10 @@ pub enum TierPromotionCustody {
 
 /// v62.0.0 (v62 P8) — the custody of an edition-2 row's crossing: the row's
 /// own statement, offered back, and the instant the crossing happens.
-#[derive(Debug, Clone)]
+///
+/// v61.4.2 — serde: crosses the directory capsule inside
+/// [`TierPromotionCustody::Statement`] (`DirectoryOp::EnterMesh`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatementCustody {
     /// The row's carried statement (`ceg_statement`), as held.
     pub statement: Vec<u8>,

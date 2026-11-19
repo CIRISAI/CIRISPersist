@@ -10,8 +10,8 @@
 //!
 //! - **the occurrence key's own statement** (`iss` = `sub` =
 //!   `occurrence_key_id`, signed by that very key, role
-//!   [`OCCURRENCE_KEY_ROLE`]): proof of possession, REQUIRED, as a rotation
-//!   record carries its new key's voice. It is held when it arrives and
+//!   [`OCCURRENCE_KEY_ROLE`], stated by [`PersistCells`]): proof of
+//!   possession, REQUIRED, as a rotation record carries its new key's voice. It is held when it arrives and
 //!   lands nothing by itself.
 //! - **the author's statement** (`iss` = `author` = `identity_key_id`): a
 //!   live roster key of the identity, its genesis key or an admitted
@@ -48,7 +48,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::family::{
-    FamilyModel, FamilyRule, RoleParty, RuleAnswer, SelectContext,
+    FamilyModel, FamilyRule, RoleParty, RuleAnswer, SelectContext, VendoredFamilyModel,
 };
 use ciris_verify_core::edition2::{identity_ref, Digest32};
 
@@ -66,11 +66,16 @@ use crate::federation::{malformed_row, Error, FederationDirectory};
 /// The family id (header -70002) of an occurrence row.
 pub const OCCURRENCE_FAMILY: &str = "identity:occurrence";
 
-/// The role the occurrence key's own statement fills: the CWT `sub`
-/// (CC 3.3.6, the rc21 second voice). CC's vendored family model (rc20)
-/// names no second signer for `identity:occurrence`; [`WithOccurrenceRole`]
-/// adds this one. TODO(verify-rc21): drop the overlay when Verify vendors it.
-pub const OCCURRENCE_KEY_ROLE: &str = "occurrence_key";
+/// The role the occurrence key's own statement fills (CC 3.3.6, CC 3.3.6.4,
+/// the rc21 second voice): CC names it `occurrence`, its party the member
+/// [`OCCURRENCE_KEY_MEMBER`] (CIRISConstitution rc21 90d537b, after the
+/// `v1.0-rc21-wire` tag). Stated by [`PersistCells`] until CIRISVerify
+/// vendors it.
+pub const OCCURRENCE_KEY_ROLE: &str = "occurrence";
+
+/// The payload member naming the occurrence key, the party of
+/// [`OCCURRENCE_KEY_ROLE`]: the occurrence key signs as itself.
+pub const OCCURRENCE_KEY_MEMBER: &str = "occurrence_key_id";
 
 /// The plane name this door's refusals carry.
 pub const PLANE: &str = "identity_occurrence";
@@ -99,31 +104,57 @@ fn payload_invalid(message: impl Into<String>) -> Error {
 //  The family model: the occurrence key's own voice
 // ─────────────────────────────────────────────────────────────────────────
 
-/// A family model that answers as the inner one, and adds the role
-/// [`OCCURRENCE_KEY_ROLE`] (party: the CWT `sub`) to `identity:occurrence`
-/// (the rc21 reading; CC 3.3.6). The edition-2 door reads every row
-/// statement through `WithOccurrenceRole(&VendoredFamilyModel)`.
-pub struct WithOccurrenceRole<'a>(
-    /// The model answered first (CC's vendored one at the door).
-    pub &'a dyn FamilyModel,
-);
+/// v62.0.0 (R1b; CIRISVerify 23.3.1) — **persist's own family cells**, read
+/// BEFORE CC's vendored model: the door reads every row statement through
+/// `WithVendored(&PersistCells)` (Verify's `edition2::family::WithVendored`:
+/// a family this model does not register falls through to
+/// `VendoredFamilyModel`).
+///
+/// One cell, `identity:occurrence`'s `second_signers`:
+/// `[{role: occurrence, member: occurrence_key_id}]` (CC 3.3.6, CC 3.3.6.4;
+/// CIRISConstitution rc21 90d537b, "An occurrence's proof of possession has a
+/// role in the family model"). The occurrence key's own statement over its
+/// occurrence row (`iss` = the payload's `occurrence_key_id`) is its proof of
+/// possession; the vendored model at `v1.0-rc21-wire` (e6fd7c6) names no second
+/// signer, so without this cell that statement is `iss_not_in_role`. The
+/// authorship and every other member of the rule are CC's vendored answer for
+/// the row, unchanged.
+///
+/// **DROP AT 23.3.2** (the CIRISVerify release that vendors CC past
+/// 90d537b): delete this model and read `VendoredFamilyModel` at the door. It
+/// replaces the earlier `WithOccurrenceRole` overlay (role `occurrence_key`,
+/// party the CWT `sub`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PersistCells;
 
-fn with_role(family_id: &str, mut rule: FamilyRule) -> FamilyRule {
-    if family_id == OCCURRENCE_FAMILY && !rule.roles.iter().any(|(r, _)| r == OCCURRENCE_KEY_ROLE) {
-        rule.roles
-            .push((OCCURRENCE_KEY_ROLE.to_owned(), RoleParty::Sub));
+/// CC's vendored rule for `identity:occurrence`, with the occurrence key's
+/// own voice ([`PersistCells`]).
+fn with_occurrence_voice(mut rule: FamilyRule) -> FamilyRule {
+    if !rule.roles.iter().any(|(r, _)| r == OCCURRENCE_KEY_ROLE) {
+        rule.roles.push((
+            OCCURRENCE_KEY_ROLE.to_owned(),
+            RoleParty::Member(OCCURRENCE_KEY_MEMBER.to_owned()),
+        ));
     }
     rule
 }
 
-impl FamilyModel for WithOccurrenceRole<'_> {
+impl FamilyModel for PersistCells {
     fn rule(&self, family_id: &str) -> Option<FamilyRule> {
-        self.0.rule(family_id).map(|r| with_role(family_id, r))
+        if family_id != OCCURRENCE_FAMILY {
+            return None;
+        }
+        VendoredFamilyModel
+            .rule(family_id)
+            .map(with_occurrence_voice)
     }
 
     fn rule_for(&self, family_id: &str, leaf: Option<&str>, ctx: &SelectContext) -> RuleAnswer {
-        match self.0.rule_for(family_id, leaf, ctx) {
-            RuleAnswer::Rule(r) => RuleAnswer::Rule(with_role(family_id, r)),
+        if family_id != OCCURRENCE_FAMILY {
+            return RuleAnswer::Unregistered;
+        }
+        match VendoredFamilyModel.rule_for(family_id, leaf, ctx) {
+            RuleAnswer::Rule(r) => RuleAnswer::Rule(with_occurrence_voice(r)),
             other => other,
         }
     }
@@ -1155,6 +1186,41 @@ fn lowest_voice_as<'a>(voices: &'a [Vec<u8>], iss: &str) -> Option<&'a Vec<u8>> 
         .filter_map(|v| statement_id_of(v).map(|id| (id, v)))
         .min_by_key(|(id, _)| *id)
         .map(|(_, v)| v)
+}
+
+/// v62.0.0 (O1 fix 3; T2's I3187) — **the proposer among the roster's
+/// voices**: the key of the held voice of `row_id` signed as `iss` by a key
+/// ON `roster` (the roster at the heads the row names) with the lowest
+/// statement id. A voice by a key off that roster is kept and concludes
+/// nothing: it is never the proposer (statement ids are random, so the
+/// unfiltered lowest could be a stray voice that refuses the proposal for
+/// good). `None` when no voice is by a roster key.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn proposer_on_roster<F>(
+    dir: &F,
+    row_id: &RowId,
+    iss: &str,
+    roster: &BTreeSet<String>,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(dir
+        .edition2_voices(row_id)
+        .await?
+        .iter()
+        .filter(|v| statement_iss(v).as_deref() == Some(iss))
+        .filter_map(|v| {
+            let key = identity_ref(&statement_kid(v)?);
+            if !roster.contains(&key) {
+                return None;
+            }
+            statement_id_of(v).map(|id| (id, key))
+        })
+        .min_by_key(|(id, _)| *id)
+        .map(|(_, k)| k))
 }
 
 /// The held statements of the row `row_id`, with its family and payload:

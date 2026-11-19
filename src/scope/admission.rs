@@ -459,6 +459,7 @@ mod revocation_honesty_tests {
             &rev,
             None,
             &[],
+            &[],
             u64::try_from(revoked.timestamp_millis()).expect("ms"),
         )
         .await;

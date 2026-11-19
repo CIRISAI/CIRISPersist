@@ -110,6 +110,7 @@ async fn revocation_voice(
 ) -> Vec<u8> {
     let ms = |t: chrono::DateTime<chrono::Utc>| u64::try_from(t.timestamp_millis()).unwrap();
     let h = head(d, &rev.identity_key_id).await;
+    let cites = eviction_cites_at(d, &rev.identity_key_id, &h).await;
     let payload = map(vec![
         ("asserted_at", Value::Uint(asserted_at)),
         ("identity_key_id", Value::Text(rev.identity_key_id.clone())),
@@ -119,10 +120,7 @@ async fn revocation_voice(
         ),
         ("revoked_at", Value::Uint(ms(rev.revoked_at))),
         ("effective_at", Value::Uint(ms(rev.effective_at))),
-        (
-            "refs",
-            map(vec![("head", ciris_verify_core::edition2::row_ref(&h.0))]),
-        ),
+        ("refs", revocation_refs(&h, &cites)),
     ]);
     sign_row_statement(
         &super::fixture_switch::signing_key(seed),
@@ -134,6 +132,39 @@ async fn revocation_voice(
         vec![],
     )
     .unwrap()
+}
+
+/// rc21 7f94be1 (T2-fix4) — what an eviction cites (`refs.also.cites`): the
+/// latest `key:record` of every key on the roster at `head`, and each
+/// non-genesis key's binding under the identity (`typed::eviction_cites`).
+/// Every roster key may voice it, so every voice states the same payload.
+async fn eviction_cites_at(
+    d: &dyn FederationDirectory,
+    identity: &str,
+    head: &RowId,
+) -> Vec<RowId> {
+    let keys: Vec<String> = sr::roster_at_head(d, identity, head)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    super::typed::eviction_cites(d, identity, &keys)
+        .await
+        .unwrap()
+}
+
+/// An eviction's `refs`: `head`, and `also.cites` as a set.
+fn revocation_refs(head: &RowId, cites: &[RowId]) -> Value {
+    let mut set: Vec<Value> = cites
+        .iter()
+        .map(|r| ciris_verify_core::edition2::row_ref(&r.0))
+        .collect();
+    set.sort_by_key(ciris_verify_core::cde::encode);
+    set.dedup();
+    map(vec![
+        ("head", ciris_verify_core::edition2::row_ref(&head.0)),
+        ("also", map(vec![("cites", Value::Array(set))])),
+    ])
 }
 
 async fn put(d: &dyn FederationDirectory, st: &[u8]) -> Result<StatementOutcome, Error> {
@@ -967,6 +998,7 @@ pub(crate) async fn fork_body(d: &dyn FederationDirectory) {
         witness_set: Vec::new(),
         persist_row_hash: String::new(),
     };
+    let cites_a = eviction_cites_at(d, &gk, &g2).await;
     let ev = |seed: &str| {
         let ms = |t: chrono::DateTime<chrono::Utc>| u64::try_from(t.timestamp_millis()).unwrap();
         sign_row_statement(
@@ -984,10 +1016,7 @@ pub(crate) async fn fork_body(d: &dyn FederationDirectory) {
                 ),
                 ("revoked_at", Value::Uint(ms(rev.revoked_at))),
                 ("effective_at", Value::Uint(ms(rev.effective_at))),
-                (
-                    "refs",
-                    map(vec![("head", ciris_verify_core::edition2::row_ref(&g2.0))]),
-                ),
+                ("refs", revocation_refs(&g2, &cites_a)),
             ]),
             vec![],
         )

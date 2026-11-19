@@ -1239,6 +1239,83 @@ pub(crate) async fn refold_never_strands_body(d: &dyn FederationDirectory) {
     assert_eq!(r.steps, 0, "I3567: a row is never its own fold dependent");
 }
 
+/// I3568 (fix2): a row held first on A, then on B, concludes when B
+/// arrives. Every hold re-records the reason and REPLACES the reads, so the
+/// index follows what the row waits on now.
+pub(crate) async fn held_on_a_then_b_body(d: &dyn FederationDirectory) {
+    let signer = "g0-ab-s";
+    let _ = e2::put_key(d, signer, &[identity_type::USER]).await;
+    let a = crate::federation::genesis::ordinary_scores_row(
+        &uuid::Uuid::new_v4().to_string(),
+        &e2::kid(signer),
+    );
+    let st = e2::statement_of(&a, signer);
+    let keys = super::ingest::held_keys_for(d, &st).await.unwrap();
+    let admitted = e2::try_admit(&st, &keys).expect("I3568: the signer's key is held");
+    d.put_edition2_statement(&admitted)
+        .await
+        .expect("I3568: the voice is held");
+    let row = admitted.row_id;
+    let (dep_a, dep_b) = (Dep::key("g0-ab-input-a"), Dep::key("g0-ab-input-b"));
+
+    // Held on A, then (a later attempt) on B.
+    fold::record_pending(
+        d,
+        row,
+        &admitted.family,
+        "federation",
+        Some((reason::LINK_UNHELD.to_owned(), "waits on A".to_owned())),
+        [dep_a.read_key()].into_iter().collect(),
+    )
+    .await
+    .unwrap();
+    fold::record_pending(
+        d,
+        row,
+        &admitted.family,
+        "federation",
+        None,
+        [dep_b.read_key()].into_iter().collect(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fold::why_held(d, &row).await.unwrap().map(|h| h.reason),
+        Some(reason::COUNT_SHORT.to_owned()),
+        "I3568: the reason is the latest hold's, not the stale first"
+    );
+    assert!(
+        d.fold_dependents(&[dep_a.read_key()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "I3568: A is no longer a dependency"
+    );
+    assert_eq!(
+        d.fold_dependents(&[dep_b.read_key()]).await.unwrap(),
+        vec![row],
+        "I3568: B is"
+    );
+
+    // B arrives: the re-fold re-runs the row's door, which concludes it.
+    let report = fold::refold_touched(d, [dep_b.read_key()].into_iter().collect())
+        .await
+        .unwrap();
+    assert!(
+        report.concluded.contains(&row),
+        "I3568: B's arrival concludes the row: {report:?}"
+    );
+    assert!(
+        d.get_attestation(&row.hex()).await.unwrap().is_some(),
+        "I3568: its typed row is in its table"
+    );
+    assert_eq!(
+        fold::why_held(d, &row).await.unwrap(),
+        None,
+        "I3568: no reason"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite() -> crate::store::sqlite::SqliteBackend {
     use crate::store::Backend as _;
@@ -1421,4 +1498,10 @@ both!(
     i3567_a_waiting_refold_never_strands_sqlite,
     i3567_a_waiting_refold_never_strands_postgres,
     refold_never_strands_body
+);
+
+both!(
+    i3568_held_on_a_then_b_concludes_on_b_sqlite,
+    i3568_held_on_a_then_b_concludes_on_b_postgres,
+    held_on_a_then_b_body
 );

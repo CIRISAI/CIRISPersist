@@ -10,6 +10,7 @@
 //! |---|---|
 //! | `edition2/row_statements_v3.json` (**Verify 23.3.0**, slice C3; v1 retired) | `src/ciris-verify-core/tests/vectors/edition2/` |
 //! | `edition2/key_of_iss_v1.json` (**Verify 23.3.0**, 24 cases) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/key_of_iss_v2.json` (**Verify 23.3.1**, tag b0933ba, 31 cases; R1, R1d) | `src/ciris-verify-core/tests/vectors/edition2/` |
 //! | `accord_halt/accord_halt_v2.json` (**Verify 23.3.0**; v1 retired) | `src/ciris-verify-core/tests/vectors/accord_halt/` |
 //! | `composite/mldsa65_ed25519_draft_kats.json` | `src/ciris-crypto/tests/vectors/composite/` |
 //! | `accord_lineage/accord_recovery_refusals_v1.json` | `src/ciris-verify-core/tests/vectors/accord_lineage/` |
@@ -45,6 +46,14 @@ const PINNED: &[(&str, &[u8], &str)] = &[
         "edition2/key_of_iss_v1.json",
         include_bytes!("../../tests/vectors/verify_v23/edition2/key_of_iss_v1.json"),
         "bd584d9b31b7271dc86c05a29eec75044b5fe74aae8dd586701a227f09001333",
+    ),
+    // v62.0.0 (R1, R1d) — CIRISVerify 23.3.1 (tag v23.3.1, b0933ba): the
+    // rc21 key check's known answers (step 8's four ways, the strict end
+    // rule, location_proof authored by its subject).
+    (
+        "edition2/key_of_iss_v2.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/key_of_iss_v2.json"),
+        "197be52f10ef880ae0632484158631166541cd4cc15ded6567f88b251d15c42d",
     ),
     (
         "accord_halt/accord_halt_v2.json",
@@ -136,6 +145,9 @@ fn i2360_verify_23_3_vectors_carry_their_case_counts() {
     }
     let key_of = vector("edition2/key_of_iss_v1.json");
     assert_eq!(len_of(&key_of, "cases"), 24, "I2360: key_of_iss_v1");
+    // v62.0.0 (R1) — Verify 23.3.1's v2 file (I4020 replays it).
+    let key_of_v2 = vector("edition2/key_of_iss_v2.json");
+    assert_eq!(len_of(&key_of_v2, "cases"), 31, "I2360: key_of_iss_v2");
     let halt = vector("accord_halt/accord_halt_v2.json");
     for (key, n) in [("invocations", 21), ("lifecycles", 22), ("latch", 13)] {
         assert_eq!(len_of(&halt, key), n, "I2360: accord_halt_v2 `{key}`");

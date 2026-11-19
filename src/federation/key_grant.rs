@@ -1988,7 +1988,7 @@ async fn emit_planned<B, F, Fut>(
 ) -> Result<Option<KeyGrantEmission>, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
-    F: FnMut(EmitAttestationInput) -> Fut,
+    F: FnMut(KeyGrantRow, u64) -> Fut,
     Fut: std::future::Future<Output = Result<String, Error>>,
 {
     // v61.4.0 — the plan and every put share one task's roster reads
@@ -2009,7 +2009,7 @@ async fn emit_planned_body<B, F, Fut>(
 ) -> Result<Option<KeyGrantEmission>, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
-    F: FnMut(EmitAttestationInput) -> Fut,
+    F: FnMut(KeyGrantRow, u64) -> Fut,
     Fut: std::future::Future<Output = Result<String, Error>>,
 {
     let Some((plan, fold)) = Box::pin(plan_with_fold(backend, signer, axis)).await? else {
@@ -2022,13 +2022,19 @@ where
     // against the fold the plan was judged by.
     let at = fold.as_ref().map(|f| f.at());
     let body = async {
+        // v62.0.0 (v62 P8 triage 2) — each row is stated in its family's
+        // payload (`edition2::typed::key_grant_payload`: `wrapped_dek` a
+        // bstr, `community` / `minter` / `owner` members, the fixed6 score),
+        // never the earlier envelope read generically (`emit_input` →
+        // `payload_from_envelope`, which the door refuses: `wrapped_dek is
+        // not bstr`).
+        let at_ms = u64::try_from(
+            at.unwrap_or_else(crate::host::clock::now)
+                .timestamp_millis(),
+        )
+        .unwrap_or(0);
         for row in &plan.rows {
-            let mut input = row.emit_input()?;
-            if let Some(at) = at {
-                input.attestation_envelope.asserted_at =
-                    Some(crate::federation::admission::render_signed_instant(at));
-            }
-            match emission_outcome(Box::pin(emit_one(input)).await)? {
+            match emission_outcome(Box::pin(emit_one(row.clone(), at_ms)).await)? {
                 Some(id) => ids.push(id),
                 None => skipped = true,
             }
@@ -2068,12 +2074,60 @@ where
     B: BlobStorage + FederationDirectory + Sync,
 {
     let me = signer.federation_id().await;
-    emit_planned(backend, &me, axis, |input| async move {
-        crate::federation::attestation_emit::emit_with_local_signer(backend, signer, input)
-            .await
-            .map(|e| e.attestation_id)
+    emit_planned(backend, &me, axis, |row, at_ms| async move {
+        state_key_grant_row(backend, signer, &row, at_ms).await
     })
     .await
+}
+
+/// v62.0.0 (v62 P8 triage 2) — **one key-grant row, stated**: its
+/// `key_grant:{axis}` payload (`edition2::typed::key_grant_payload`, the
+/// family's own members) about the recipient (`sub`), signed by `signer`'s
+/// composite key (`edition2::produce::sign_row`) and admitted through the
+/// statement door (`put_statement`, federation tier, `Authored`), which runs
+/// T2's typed key-grant door. Returns the row id (hex).
+///
+/// # Errors
+/// `composite_signing_unavailable`; the payload's and the door's refusals
+/// (`CommunityHasNoModerator` passes through for `emission_outcome`).
+pub async fn state_key_grant_row<B>(
+    backend: &B,
+    signer: &crate::signing::LocalSigner,
+    row: &KeyGrantRow,
+    asserted_at_ms: u64,
+) -> Result<String, Error>
+where
+    B: FederationDirectory + ?Sized,
+{
+    use crate::federation::edition2::ingest::StatementOutcome as O;
+    let producer = "key_grant";
+    let iss = signer.federation_id().await;
+    let payload = crate::federation::edition2::typed::key_grant_payload(&iss, row, asserted_at_ms)?;
+    let statement = crate::federation::edition2::produce::sign_row(
+        signer,
+        &row.wrap.recipient_key_id,
+        crate::federation::types::attestation_type::SCORES,
+        &ciris_verify_core::namespace_match::family_id(
+            crate::federation::edition2::typed::KEY_GRANT_PREFIX,
+        ),
+        &payload,
+    )
+    .await
+    .map_err(|e| crate::federation::edition2::emit::produce_error(producer, e))?;
+    let outcome = crate::federation::edition2::ingest::put_statement_with_origin(
+        backend,
+        &statement,
+        None,
+        crate::federation::types::attestation_tier::FEDERATION,
+        crate::federation::replication::admission::WriteOrigin::Authored,
+    )
+    .await?;
+    Ok(match outcome {
+        O::Row { row_id, .. }
+        | O::Voice { row_id, .. }
+        | O::KeyPlane { row_id, .. }
+        | O::Pending { row_id, .. } => row_id.hex(),
+    })
 }
 
 /// §14 (V146) — **every dirty axis `signer` owes, emitted** ([`dirty_axes`]
@@ -2291,7 +2345,7 @@ pub async fn emit_key_grant_axis_with<B, F, Fut>(
 ) -> Result<Option<KeyGrantEmission>, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
-    F: FnMut(EmitAttestationInput) -> Fut,
+    F: FnMut(KeyGrantRow, u64) -> Fut,
     Fut: std::future::Future<Output = Result<String, Error>>,
 {
     emit_planned(backend, signer_key_id, axis, emit_one).await

@@ -15,6 +15,9 @@
 //!   the founder is served it, a stranger is not. And there is no blanket
 //!   "about the requester" rule: a moderation row at the family's scope naming
 //!   a non-member subject is not served to that subject.
+//! - **I3013** the copy rule (CC 2.7.5): an invitation citing its family's
+//!   roster head carries the head to the invitee (the head's own rule
+//!   withholds it); not to a stranger, never to an anonymous read.
 //! - **I3010** a statement-only row is served by the `cohort_scope` its
 //!   payload states (CC: `admission:unit` like any scores row): `self` to
 //!   its author only (not another key, not anonymous), `federation` to
@@ -367,6 +370,78 @@ pub(crate) async fn invitee_body(d: &dyn FederationDirectory) {
     );
 }
 
+/// I3013 — the copy rule (CC 2.7.5): a row carries its audience to the rows
+/// it names. An invitation that cites the family's roster head
+/// (`refs.also.cites`) is concluded, sits in the family's room, and its
+/// signer (the founder) is in the head's audience: so the head, which its own
+/// rule withholds from the invitee (not a member, not listed), is served to
+/// the invitee with the invitation, and still not to a stranger.
+pub(crate) async fn carried_body(d: &dyn FederationDirectory) {
+    use super::fixture_switch as e2;
+    use crate::federation::membership_acceptance::test_support::proposal_row;
+    let founder = e2::put_key(d, "t1c-founder", &["user"]).await;
+    let joiner = e2::put_key(d, "t1c-joiner", &["user"]).await;
+    let stranger = e2::put_key(d, "t1c-stranger", &["user"]).await;
+    let kf = e2::signing_key("t1c-founder");
+    let g = key(232);
+    let gid = iref(&g);
+    let record = GroupRecord::Family(Family {
+        family_key_id: gid.clone(),
+        family_name: "citing".into(),
+        members: vec![FamilyMember {
+            key_id: founder.clone(),
+            joined_at: at(1_000),
+            role: Some("founder".into()),
+        }],
+        founded_at: at(1_000),
+        consensus_protocol: "founder_only".into(),
+        consensus_protocol_entrenched: false,
+        dissolved_at: None,
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
+        persist_row_hash: String::new(),
+    });
+    let p = roster_payload(&record, 1, None, 2_000).unwrap();
+    let head_st = sign(&kf, &gid, GROUP_ROSTER_PREFIX, &p);
+    let StatementOutcome::Row { row_id: head, .. } = put(d, &head_st).await else {
+        panic!("I3013 founded");
+    };
+    let head_st = &head_st;
+    let served = |k: String| async move { servable_to(d, head_st, Some(&k)).await.unwrap() };
+    assert!(
+        !served(joiner.clone()).await,
+        "I3013 before: the head's own rule withholds it from the invitee"
+    );
+
+    // The invitation, citing the head it stands on.
+    let mut literal = e2::with_earlier_form(|| {
+        proposal_row("t1c-founder", "family", &gid, &joiner, None, at(6_000))
+    });
+    if let Some(o) = literal.attestation_envelope.as_object_mut() {
+        o.insert(
+            "refs".to_owned(),
+            serde_json::json!({ "also": { "cites": [[2, [-16, head.hex()]]] } }),
+        );
+    }
+    let invitation = e2::row_of(&literal, "t1c-founder");
+    e2::put_signed(d, &invitation)
+        .await
+        .unwrap_or_else(|e| panic!("I3013 the citing invitation is held: {e:?}"));
+    assert!(
+        served(joiner.clone()).await,
+        "I3013 the cited head travels with the invitation to the invitee"
+    );
+    assert!(served(founder.clone()).await, "I3013 a member, as before");
+    assert!(
+        !served(stranger.clone()).await,
+        "I3013 not to a stranger: the invitation is not served to it"
+    );
+    assert!(
+        !servable_to(d, head_st, None).await.unwrap(),
+        "I3013 never to an anonymous read"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn i3011_invitee_served_sqlite() {
@@ -390,4 +465,29 @@ async fn i3011_invitee_served_postgres() {
         .unwrap();
     b.run_migrations().await.unwrap();
     Box::pin(invitee_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3013_cited_ancestor_carried_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(carried_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3013_cited_ancestor_carried_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(carried_body(&b)).await;
 }

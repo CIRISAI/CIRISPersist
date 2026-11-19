@@ -29043,7 +29043,13 @@ mod accord_tests {
         // the ids the rows were stored under (`e2::rid`).
         let mut ids: Vec<String> = Vec::new();
         for i in 0..5 {
-            let mut row = ts::federation_row(&format!("tie668-sq-{i}"), &author, "tie:score:v1");
+            // v62.0.0 (E0 fix 2) — a registered family (`tie:score:v1` is
+            // open vocabulary, refused at the edition-2 door).
+            let mut row = ts::federation_row(
+                &format!("tie668-sq-{i}"),
+                &author,
+                "truth_grounding:tie_score:v1",
+            );
             crate::federation::tier_ingest::test_support::seal_row_in_place(&author, &mut row);
             let row = e2_row(row);
             ids.push(e2::rid(&row));
@@ -30074,21 +30080,43 @@ mod tests {
         attested: &str,
         scrub_key_id: &str,
     ) -> Attestation {
+        // v62.0.0 (E0 fix 2) — NOW-RELATIVE (today 00:00 UTC minus 30 days):
+        // a row signed by a node / agent key lapses with that key's record
+        // (CC 2.4.1.1, at most 365 days), so a fixed calendar date would stop
+        // verifying within a year of it. Every row this helper builds shares
+        // the instant, as the fixed `2026-05-01` did; tests that order rows
+        // set `asserted_at` themselves.
+        let at = {
+            let today = chrono::Utc::now()
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight")
+                .and_utc();
+            today - chrono::Duration::days(30)
+        };
         let mut row = Attestation {
             attestation_id: id.into(),
             attesting_key_id: attesting.into(),
             attested_key_id: attested.into(),
             attestation_type: crate::federation::types::attestation_type::SCORES.into(),
             weight: Some(1.0),
-            asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            asserted_at: at,
             expires_at: None,
             // v2.4.0 admission gate (CIRISPersist#102 Ask 3) — `scores`
             // attestations need a versioned mechanism-descriptive
             // dimension. Test rows use a generic identity-binding
             // shape that passes the four-test gate.
+            // v62.0.0 (E0 fix 2) — a REGISTERED dimension under the switch
+            // (the edition-2 door refuses the open-vocabulary
+            // `identity_binding:v1`); a test held in the earlier form keeps
+            // its own (as `backend_suite::fix_attestation` does).
             attestation_envelope: serde_json::json!({
                 "id": id,
-                "dimension": "identity_binding:v1",
+                "dimension": if e2::emit_edition2() {
+                    "evidence:safety_battery:capture:a:b:v1"
+                } else {
+                    "identity_binding:v1"
+                },
                 "score": 1.0,
                 "confidence": 0.9,
             }),
@@ -30096,7 +30124,7 @@ mod tests {
             scrub_signature_classical: "c2ln".into(),
             scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
-            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            scrub_timestamp: at,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             subject_key_ids: Vec::new(),
@@ -37554,7 +37582,8 @@ mod tests {
         let mut a = signed_attestation_fixture(attester, attester, attester, SCORES);
         a.attestation_id = id.into();
         a.weight = Some(weight);
-        crate::federation::tier_ingest::test_support::reseal(&mut a);
+        // v62.0.0 (E0 fix 2) — no seal here: the row is not built yet (no
+        // dimension), and `e2_row` seals the finished row below.
         a.asserted_at = scores_base_ts() + chrono::Duration::seconds(secs);
         a.attestation_envelope = serde_json::json!({
             "dimension": dimension, "score": score, "confidence": weight,
@@ -37591,7 +37620,7 @@ mod tests {
         let mut a = signed_attestation_fixture(attester, attester, attester, ty);
         a.attestation_id = id.into();
         a.asserted_at = scores_base_ts() + chrono::Duration::seconds(secs);
-        crate::federation::tier_ingest::test_support::reseal(&mut a);
+        // v62.0.0 (E0 fix 2) — no seal of the unbuilt row; `e2_row` seals it.
         a.attestation_envelope = serde_json::json!({
             "references_attestation_id": references, "reason": "t",
         });

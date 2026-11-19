@@ -39357,7 +39357,15 @@ mod tests {
     async fn pg_blob_bootstrap_host(backend: &PostgresBackend, host_key_id: &str) {
         pg_put_key_rec(
             backend,
-            &fix_section_i_key(host_key_id, host_key_id, chrono::Utc::now(), false),
+            // v62.0.0 (E2-fix2): live 30 days back, so a backdated holding
+            // claim (the TTL arms sign past CUSTODY_LIVE_SECS) falls inside
+            // the key's own window; an agent key, so now-relative.
+            &fix_section_i_key(
+                host_key_id,
+                host_key_id,
+                chrono::Utc::now() - chrono::Duration::days(30),
+                false,
+            ),
         )
         .await;
         // v9.3.0 (#247) — put_blob_signing's holds_bytes scrub_key_id +
@@ -39423,20 +39431,78 @@ mod tests {
     // that envelope is keyed on the SHA. It used to be `"deadbeef"` — four
     // bytes, in a column that holds a 32-byte digest, which is how a whole
     // release of blob tests could pass without the cross-check existing.
+    /// v62.0.0 (E2-fix2) — **a holder's claim on a blob, in the form the
+    /// test runs under** (the sqlite twin is `BlobClaim`): the holder's
+    /// edition-2 custody `here` statement, offered to `put_blob_edition2`, or
+    /// the earlier `PutBlobAttestation` in a HELD test. The earlier door
+    /// writes the claim under the caller's text id, which under edition 2 is
+    /// a seed no key row is stored under (the holding-claim FK refusal).
+    struct PgBlobClaim {
+        holder: String,
+        sha256: [u8; 32],
+        size: u64,
+        at: chrono::DateTime<chrono::Utc>,
+        earlier: crate::federation::PutBlobAttestation,
+    }
+
+    impl PgBlobClaim {
+        /// The custody `here` statement this claim is.
+        fn statement(&self) -> Vec<u8> {
+            e2::custody_statement(
+                &self.holder,
+                &self.sha256,
+                Some(self.size),
+                crate::federation::types::cohort_scope::FEDERATION,
+                None,
+                e2::ms(self.at),
+            )
+        }
+
+        /// The id the claim's row is stored under: its row id under edition
+        /// 2, the earlier attestation id in a HELD test.
+        fn id(&self) -> String {
+            if e2::emit_edition2() {
+                e2::rid(&e2::row_of_statement(
+                    &self.statement(),
+                    crate::federation::types::attestation_tier::FEDERATION,
+                ))
+            } else {
+                self.earlier.attestation_id.clone()
+            }
+        }
+    }
+
+    /// `put_blob` in the form the test runs under ([`PgBlobClaim`]).
+    async fn pg_put_blob_any(
+        backend: &PostgresBackend,
+        sha256: &[u8; 32],
+        body: crate::federation::BlobBody,
+        media_type: Option<&str>,
+        claim: PgBlobClaim,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        if e2::emit_edition2() {
+            backend
+                .put_blob_edition2(sha256, body, media_type, &claim.statement())
+                .await
+        } else {
+            backend
+                .put_blob(sha256, body, media_type, claim.earlier)
+                .await
+        }
+    }
+
     fn pg_blob_attestation(
         sha256: &[u8; 32],
         attesting_key_id: &str,
         scrub_key_id: &str,
         size: u64,
-    ) -> crate::federation::PutBlobAttestation {
-        let now = chrono::Utc::now();
-        crate::federation::blobs::sealed_put_blob_attestation(
+    ) -> PgBlobClaim {
+        pg_blob_attestation_at(
             sha256,
             attesting_key_id,
             scrub_key_id,
-            &uuid::Uuid::new_v4().to_string(),
-            now,
-            now,
+            chrono::Utc::now(),
             size,
         )
     }
@@ -39455,15 +39521,15 @@ mod tests {
         pg_blob_bootstrap_host(&backend, &host).await;
         let bytes = pg_blob_payload("inline");
         let sha = pg_sha256_of(&bytes);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                Some("application/octet-stream"),
-                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .expect("put inline");
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            Some("application/octet-stream"),
+            pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .expect("put inline");
         let got = backend.get_blob(&sha).await.expect("get").expect("present");
         assert_eq!(got, BlobBody::Inline(bytes));
     }
@@ -39534,15 +39600,15 @@ mod tests {
             size_bytes: 99_999_999,
             media_type: Some("video/mp4".into()),
         };
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::External(ext.clone()),
-                Some("video/mp4"),
-                pg_blob_attestation(&sha, &host, &host, ext.size_bytes),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::External(ext.clone()),
+            Some("video/mp4"),
+            pg_blob_attestation(&sha, &host, &host, ext.size_bytes),
+        )
+        .await
+        .unwrap();
         let got = backend.get_blob(&sha).await.unwrap().unwrap();
         assert_eq!(got, BlobBody::External(ext));
     }
@@ -39556,21 +39622,21 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        use crate::federation::{BlobBody, BlobError};
         let host = format!("blob-host-mm-{}", uuid_like());
         pg_blob_bootstrap_host(&backend, &host).await;
         let bytes = pg_blob_payload("mismatch");
         let mut wrong = pg_sha256_of(&bytes);
         wrong[0] ^= 0xff;
-        let err = backend
-            .put_blob(
-                &wrong,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&wrong, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .expect_err("must reject");
+        let err = pg_put_blob_any(
+            &backend,
+            &wrong,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&wrong, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .expect_err("must reject");
         assert!(matches!(err, BlobError::HashMismatch { .. }));
         assert_eq!(err.kind(), "blob_hash_mismatch");
     }
@@ -39584,20 +39650,20 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        use crate::federation::{BlobBody, BlobError};
         let host = format!("blob-host-cap-{}", uuid_like());
         pg_blob_bootstrap_host(&backend, &host).await;
         let bytes = vec![0u8; 2 * 1024 * 1024];
         let sha = pg_sha256_of(&bytes);
-        let err = backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .expect_err("must reject");
+        let err = pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .expect_err("must reject");
         match err {
             BlobError::InlineSizeExceeded { size, cap } => {
                 assert_eq!(size, 2 * 1024 * 1024);
@@ -39622,15 +39688,15 @@ mod tests {
         let bytes = pg_blob_payload("has");
         let sha = pg_sha256_of(&bytes);
         assert!(!backend.has_blob(&sha).await.unwrap());
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         assert!(backend.has_blob(&sha).await.unwrap());
     }
 
@@ -39650,27 +39716,27 @@ mod tests {
         pg_blob_bootstrap_host(&backend, &host_b).await;
         let bytes = pg_blob_payload("two-writers");
         let sha = pg_sha256_of(&bytes);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host_a, &host_a, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host_b, &host_b, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host_a, &host_a, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host_b, &host_b, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         let mut holders = backend.list_holders(&sha).await.unwrap();
         holders.sort();
-        let mut expected = vec![host_a, host_b];
+        let mut expected = vec![pg_id(&host_a), pg_id(&host_b)];
         expected.sort();
         assert_eq!(holders, expected);
     }
@@ -39689,26 +39755,26 @@ mod tests {
         pg_blob_bootstrap_host(&backend, &host).await;
         let bytes = pg_blob_payload("idem");
         let sha = pg_sha256_of(&bytes);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         let holders = backend.list_holders(&sha).await.unwrap();
-        assert_eq!(holders, vec![host]);
+        assert_eq!(holders, vec![pg_id(&host)]);
     }
 
     #[tokio::test]
@@ -39727,28 +39793,28 @@ mod tests {
         pg_blob_bootstrap_host(&backend, &host_b).await;
         let bytes = pg_blob_payload("conflict");
         let sha = pg_sha256_of(&bytes);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host_a, &host_a, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::External(ExternalRef {
-                    uri: "s3://mirror/key".into(),
-                    size_bytes: bytes.len() as u64,
-                    media_type: None,
-                }),
-                None,
-                pg_blob_attestation(&sha, &host_b, &host_b, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host_a, &host_a, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::External(ExternalRef {
+                uri: "s3://mirror/key".into(),
+                size_bytes: bytes.len() as u64,
+                media_type: None,
+            }),
+            None,
+            pg_blob_attestation(&sha, &host_b, &host_b, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         let got = backend.get_blob(&sha).await.unwrap().unwrap();
         match got {
             BlobBody::Inline(b) => assert_eq!(b, bytes),
@@ -39756,7 +39822,7 @@ mod tests {
         }
         let mut holders = backend.list_holders(&sha).await.unwrap();
         holders.sort();
-        let mut expected = vec![host_a, host_b];
+        let mut expected = vec![pg_id(&host_a), pg_id(&host_b)];
         expected.sort();
         assert_eq!(holders, expected);
     }
@@ -42869,8 +42935,8 @@ mod tests {
         scrub_key_id: &str,
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
         size: u64,
-    ) -> crate::federation::PutBlobAttestation {
-        crate::federation::blobs::sealed_put_blob_attestation(
+    ) -> PgBlobClaim {
+        let earlier = crate::federation::blobs::sealed_put_blob_attestation(
             sha256,
             attesting_key_id,
             scrub_key_id,
@@ -42880,7 +42946,14 @@ mod tests {
             scrub_timestamp,
             scrub_timestamp,
             size,
-        )
+        );
+        PgBlobClaim {
+            holder: attesting_key_id.to_owned(),
+            sha256: *sha256,
+            size,
+            at: scrub_timestamp,
+            earlier,
+        }
     }
 
     // ── v3.5.2 (CIRISPersist#130) — list_local_holders PG parity ─
@@ -42902,22 +42975,22 @@ mod tests {
         let backdated = chrono::Utc::now()
             - chrono::Duration::seconds(crate::federation::custody_ack::CUSTODY_LIVE_SECS)
             - chrono::Duration::hours(1);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation_at(&sha, &host, &host, backdated, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation_at(&sha, &host, &host, backdated, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         // v3.6.4 (#130 reopen): BOTH methods report the holder when
         // the blob is locally held — TTL bypass on local-truth applies
         // to list_holders as well as list_local_holders.
         let federation_holders = backend.list_holders(&sha).await.unwrap();
-        assert_eq!(federation_holders, vec![host.clone()]);
+        assert_eq!(federation_holders, vec![pg_id(&host)]);
         let local_holders = backend.list_local_holders(&sha).await.unwrap();
-        assert_eq!(local_holders, vec![host]);
+        assert_eq!(local_holders, vec![pg_id(&host)]);
     }
 
     #[tokio::test]
@@ -42954,19 +43027,19 @@ mod tests {
         let backdated = chrono::Utc::now()
             - chrono::Duration::seconds(crate::federation::custody_ack::CUSTODY_LIVE_SECS)
             - chrono::Duration::hours(1);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation_at(&sha, &host, &host, backdated, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation_at(&sha, &host, &host, backdated, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         let holders = backend.list_holders(&sha).await.unwrap();
         assert_eq!(
             holders,
-            vec![host.clone()],
+            vec![pg_id(&host)],
             "locally-held blob reports holder regardless of attestation age, got {holders:?}"
         );
     }
@@ -42986,17 +43059,17 @@ mod tests {
         let bytes = pg_blob_payload("ttl-fresh");
         let sha = pg_sha256_of(&bytes);
         let fresh = chrono::Utc::now() - chrono::Duration::hours(1);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation_at(&sha, &host, &host, fresh, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation_at(&sha, &host, &host, fresh, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         let holders = backend.list_holders(&sha).await.unwrap();
-        assert_eq!(holders, vec![host]);
+        assert_eq!(holders, vec![pg_id(&host)]);
     }
 
     #[tokio::test]
@@ -43020,15 +43093,20 @@ mod tests {
             chrono::Utc::now() - chrono::Duration::hours(1),
             bytes.len() as u64,
         );
-        let holds_bytes_attestation_id = holds_bytes_attestation.attestation_id.clone();
-        backend
-            .put_blob(&sha, BlobBody::Inline(bytes), None, holds_bytes_attestation)
-            .await
-            .unwrap();
+        let holds_bytes_attestation_id = holds_bytes_attestation.id();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes),
+            None,
+            holds_bytes_attestation,
+        )
+        .await
+        .unwrap();
         // Present before withdraws.
         assert_eq!(
             backend.list_holders(&sha).await.unwrap(),
-            vec![host.clone()]
+            vec![pg_id(&host)]
         );
 
         // host emits the WITHDRAWS referencing the holds_bytes row.
@@ -43101,26 +43179,17 @@ mod tests {
             use sha2::{Digest, Sha256};
             Sha256::digest(&schema_bytes).into()
         };
-        use crate::federation::BlobStorage;
-        let now = chrono::Utc::now();
-        let put_att = crate::federation::blobs::sealed_put_blob_attestation(
+        let put_att =
+            pg_blob_attestation(&schema_sha, &steward, &steward, schema_bytes.len() as u64);
+        pg_put_blob_any(
+            &backend,
             &schema_sha,
-            &steward,
-            &steward,
-            &uuid::Uuid::new_v4().to_string(),
-            now,
-            now,
-            schema_bytes.len() as u64,
-        );
-        backend
-            .put_blob(
-                &schema_sha,
-                crate::federation::BlobBody::Inline(schema_bytes),
-                Some("application/schema+json"),
-                put_att,
-            )
-            .await
-            .unwrap();
+            crate::federation::BlobBody::Inline(schema_bytes),
+            Some("application/schema+json"),
+            put_att,
+        )
+        .await
+        .unwrap();
         let mut axis_index = std::collections::HashMap::new();
         axis_index.insert("rights_asymmetry".into(), schema_sha);
         let resolver = std::sync::Arc::new(crate::federation::BlobBackedSchemaResolver::new(
@@ -43193,26 +43262,17 @@ mod tests {
             use sha2::{Digest, Sha256};
             Sha256::digest(&schema_bytes).into()
         };
-        use crate::federation::BlobStorage;
-        let now = chrono::Utc::now();
-        let put_att = crate::federation::blobs::sealed_put_blob_attestation(
+        let put_att =
+            pg_blob_attestation(&schema_sha, &steward, &steward, schema_bytes.len() as u64);
+        pg_put_blob_any(
+            &backend,
             &schema_sha,
-            &steward,
-            &steward,
-            &uuid::Uuid::new_v4().to_string(),
-            now,
-            now,
-            schema_bytes.len() as u64,
-        );
-        backend
-            .put_blob(
-                &schema_sha,
-                crate::federation::BlobBody::Inline(schema_bytes),
-                Some("application/schema+json"),
-                put_att,
-            )
-            .await
-            .unwrap();
+            crate::federation::BlobBody::Inline(schema_bytes),
+            Some("application/schema+json"),
+            put_att,
+        )
+        .await
+        .unwrap();
         let mut axis_index = std::collections::HashMap::new();
         axis_index.insert("rights_asymmetry".into(), schema_sha);
         let resolver = std::sync::Arc::new(crate::federation::BlobBackedSchemaResolver::new(
@@ -44761,27 +44821,27 @@ mod tests {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
-        use crate::federation::{BlobBody, BlobError, BlobStorage};
+        use crate::federation::{BlobBody, BlobError};
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
         let host = format!("trust-gate-host-{}", uuid_like());
         pg_blob_bootstrap_host(&backend, &host).await;
-        backend.set_admission_gate(Some(pg_gate(&[(&host, 0.1)], 0.5)));
+        backend.set_admission_gate(Some(pg_gate(&[(&pg_id(&host), 0.1)], 0.5)));
         let huge = vec![0u8; crate::federation::DEFAULT_INLINE_BYTES_CAP + 1];
         let sha = pg_sha256_of(&huge);
-        let err = backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(huge.clone()),
-                None,
-                pg_blob_attestation(&sha, &host, &host, huge.len() as u64),
-            )
-            .await
-            .expect_err("trust beats size");
+        let err = pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(huge.clone()),
+            None,
+            pg_blob_attestation(&sha, &host, &host, huge.len() as u64),
+        )
+        .await
+        .expect_err("trust beats size");
         // Clear gate so we don't poison subsequent tests on shared DB.
         backend.set_admission_gate(None);
         match err {
-            BlobError::TrustBelowThreshold { key_id, .. } => assert_eq!(key_id, host),
+            BlobError::TrustBelowThreshold { key_id, .. } => assert_eq!(key_id, pg_id(&host)),
             other => panic!("expected TrustBelowThreshold, got {other:?}"),
         }
     }
@@ -44801,15 +44861,15 @@ mod tests {
         pg_blob_bootstrap_host(&backend, &host).await;
         let bytes = pg_blob_payload("access");
         let sha = pg_sha256_of(&bytes);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         let _ = backend.get_blob(&sha).await.unwrap();
         let _ = backend.get_blob(&sha).await.unwrap();
         // has_blob also bumps.
@@ -44847,15 +44907,15 @@ mod tests {
         // slice bytes). Unique SHA still derives from these bytes.
         let bytes = b"abcdefghij".to_vec();
         let sha = pg_sha256_of(&bytes);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         // (a) mid-range.
         assert_eq!(
             backend.get_blob_range(&sha, 2, 5).await.unwrap().unwrap(),
@@ -44888,15 +44948,15 @@ mod tests {
         pg_blob_bootstrap_host(&backend, &host).await;
         let bytes = b"abcdefghij".to_vec(); // size 10
         let sha = pg_sha256_of(&bytes);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         match backend.get_blob_range(&sha, 10, 20).await.unwrap_err() {
             BlobError::RangeNotSatisfiable { range_start, size } => {
                 assert_eq!(range_start, 10);
@@ -44921,15 +44981,15 @@ mod tests {
         pg_blob_bootstrap_host(&backend, &host).await;
         let bytes = pg_blob_payload("range-inv");
         let sha = pg_sha256_of(&bytes);
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::Inline(bytes.clone()),
+            None,
+            pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         // (e) start > end → InvalidArgument (caught before DB).
         assert!(matches!(
             backend.get_blob_range(&sha, 5, 2).await.unwrap_err(),
@@ -44970,15 +45030,15 @@ mod tests {
             size_bytes: 1000,
             media_type: Some("video/mp4".into()),
         };
-        backend
-            .put_blob(
-                &sha,
-                BlobBody::External(ext.clone()),
-                Some("video/mp4"),
-                pg_blob_attestation(&sha, &host, &host, ext.size_bytes),
-            )
-            .await
-            .unwrap();
+        pg_put_blob_any(
+            &backend,
+            &sha,
+            BlobBody::External(ext.clone()),
+            Some("video/mp4"),
+            pg_blob_attestation(&sha, &host, &host, ext.size_bytes),
+        )
+        .await
+        .unwrap();
         // request [100..=99999] — end clamps to size-1 = 999.
         match backend
             .get_blob_range(&sha, 100, 99_999)
@@ -45936,16 +45996,15 @@ mod tests {
         for i in 0..3 {
             let bytes = vec![(i + 1) as u8; 256];
             let sha = pg_sha256_of(&bytes);
-            use crate::federation::BlobStorage;
-            backend
-                .put_blob(
-                    &sha,
-                    BlobBody::Inline(bytes.clone()),
-                    None,
-                    pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
-                )
-                .await
-                .unwrap();
+            pg_put_blob_any(
+                &backend,
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
+            )
+            .await
+            .unwrap();
             shas.push(sha);
         }
         // Compose an Engine view over this backend so we can drive

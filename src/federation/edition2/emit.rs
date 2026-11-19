@@ -317,6 +317,11 @@ pub fn payload_from_envelope(
             m.push((text("author"), text(a)));
         }
     }
+    // v62.0.0 (T2-fix2) — a typed plane's earlier member names are stated
+    // as P1's payload list keys them (`typed::project_envelope`'s inverse):
+    // a custody report's `family_id`, a takedown notice's `claimant` /
+    // `content_holders`.
+    super::typed::unproject_payload(family, &mut m);
     Ok(sorted_map(m))
 }
 

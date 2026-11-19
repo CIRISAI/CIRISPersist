@@ -169,6 +169,83 @@ where
         .await
 }
 
+/// v62.0.0 (P10; CC 2.7.11, RFC 9942) — sqlite: **merge the receipts a
+/// later copy of a held statement carries** into the held bytes, in the
+/// caller's write transaction ([`super::receipts::merged`]: the union, never
+/// a replacement; the statement id and row id are unchanged, both outside
+/// the unprotected header). A merge that changes the bytes re-stamps the
+/// statement at THIS node's next admission position, so a peer that paged
+/// past it is served it again WITH the receipts. Returns whether it merged.
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn merge_receipts_sqlite(
+    tx: &rusqlite::Connection,
+    statement_id: &[u8; 32],
+    offered: &[u8],
+) -> Result<bool, rusqlite::Error> {
+    use rusqlite::OptionalExtension as _;
+    if super::receipts::receipts_of(offered).is_empty() {
+        return Ok(false);
+    }
+    let held: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT bytes FROM ceg_statements WHERE statement_id = ?1",
+            rusqlite::params![&statement_id[..]],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(merged) = held.and_then(|h| super::receipts::merged(&h, offered)) else {
+        return Ok(false);
+    };
+    let admitted = next_admitted_us_sqlite(tx)?;
+    let n = tx.execute(
+        "UPDATE ceg_statements SET bytes = ?1, admitted_us = ?2 WHERE statement_id = ?3",
+        rusqlite::params![merged, admitted, &statement_id[..]],
+    )?;
+    Ok(n == 1)
+}
+
+/// v62.0.0 (P10) — postgres: [`merge_receipts_sqlite`], in the caller's
+/// transaction.
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn merge_receipts_postgres<C>(
+    client: &C,
+    statement_id: &[u8; 32],
+    offered: &[u8],
+) -> Result<bool, tokio_postgres::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    if super::receipts::receipts_of(offered).is_empty() {
+        return Ok(false);
+    }
+    let held: Option<Vec<u8>> = client
+        .query_opt(
+            "SELECT bytes FROM cirislens.ceg_statements WHERE statement_id = $1 FOR UPDATE",
+            &[&&statement_id[..]],
+        )
+        .await?
+        .map(|r| r.try_get::<_, Vec<u8>>(0))
+        .transpose()?;
+    let Some(merged) = held.and_then(|h| super::receipts::merged(&h, offered)) else {
+        return Ok(false);
+    };
+    let admitted = next_admitted_us_postgres(client).await?;
+    let n = client
+        .execute(
+            "UPDATE cirislens.ceg_statements SET bytes = $1, admitted_us = $2 WHERE \
+             statement_id = $3",
+            &[&merged, &admitted, &&statement_id[..]],
+        )
+        .await?;
+    Ok(n == 1)
+}
+
 /// sqlite: store an admitted row's statement and its names, idempotently, in
 /// the caller's transaction. Returns whether the statement was new.
 ///
@@ -182,6 +259,10 @@ pub fn put_row_sqlite(
     let at = asserted_at_column(row)?;
     let be = |e: rusqlite::Error| crate::federation::Error::Backend(format!("ceg_statements: {e}"));
     let admitted = next_admitted_us_sqlite(tx).map_err(be)?;
+    // v62.0.0 (P10 fix1; CC 2.7.11) — the bytes held: an item of the
+    // unprotected `receipts` parameter that is no receipt is ignored, never a
+    // fault (`receipts::held_bytes`).
+    let held = super::receipts::held_bytes(&row.bytes);
     let n = tx
         .execute(
             "INSERT OR IGNORE INTO ceg_statements (statement_id, row_id, typ, row_type, family, \
@@ -198,11 +279,15 @@ pub fn put_row_sqlite(
                 row.sub,
                 row.author,
                 at,
-                row.bytes,
+                held,
                 admitted,
             ],
         )
         .map_err(be)?;
+    // v62.0.0 (P10) — a held statement takes a later copy's receipts.
+    if n == 0 {
+        merge_receipts_sqlite(tx, &row.statement_id, &row.bytes).map_err(be)?;
+    }
     for name in &row.names {
         tx.execute(
             "INSERT OR IGNORE INTO ceg_row_names (row_id, named_row_id, role) VALUES (?1, ?2, ?3)",
@@ -285,6 +370,10 @@ where
         crate::federation::Error::Backend(format!("ceg_statements: {e}"))
     };
     let admitted = next_admitted_us_postgres(client).await.map_err(be)?;
+    // v62.0.0 (P10 fix1; CC 2.7.11) — the bytes held: an item of the
+    // unprotected `receipts` parameter that is no receipt is ignored, never a
+    // fault (`receipts::held_bytes`).
+    let held = super::receipts::held_bytes(&row.bytes);
     let n = client
         .execute(
             "INSERT INTO cirislens.ceg_statements (statement_id, row_id, typ, row_type, family, \
@@ -301,12 +390,18 @@ where
                 &row.sub,
                 &row.author,
                 &at,
-                &row.bytes,
+                &held,
                 &admitted,
             ],
         )
         .await
         .map_err(be)?;
+    // v62.0.0 (P10) — a held statement takes a later copy's receipts.
+    if n == 0 {
+        merge_receipts_postgres(client, &row.statement_id, &row.bytes)
+            .await
+            .map_err(be)?;
+    }
     for name in &row.names {
         client
             .execute(
@@ -449,6 +544,10 @@ pub fn put_object_sqlite(
 ) -> Result<bool, crate::federation::Error> {
     let be = |e: rusqlite::Error| crate::federation::Error::Backend(format!("ceg_statements: {e}"));
     let admitted = next_admitted_us_sqlite(conn).map_err(be)?;
+    // v62.0.0 (P10 fix1; CC 2.7.11) — the bytes held: an item of the
+    // unprotected `receipts` parameter that is no receipt is ignored, never a
+    // fault (`receipts::held_bytes`).
+    let held = super::receipts::held_bytes(&o.bytes);
     let n = conn
         .execute(
             "INSERT OR IGNORE INTO ceg_statements (statement_id, row_id, typ, kid, iss, bytes, \
@@ -459,11 +558,15 @@ pub fn put_object_sqlite(
                 o.typ,
                 &o.kid[..],
                 o.iss,
-                o.bytes,
+                held,
                 admitted,
             ],
         )
         .map_err(be)?;
+    // v62.0.0 (P10) — a held object voice takes a later copy's receipts.
+    if n == 0 {
+        merge_receipts_sqlite(conn, &o.statement_id, &o.bytes).map_err(be)?;
+    }
     Ok(n == 1)
 }
 
@@ -503,6 +606,10 @@ where
         crate::federation::Error::Backend(format!("ceg_statements: {e}"))
     };
     let admitted = next_admitted_us_postgres(client).await.map_err(be)?;
+    // v62.0.0 (P10 fix1; CC 2.7.11) — the bytes held: an item of the
+    // unprotected `receipts` parameter that is no receipt is ignored, never a
+    // fault (`receipts::held_bytes`).
+    let held = super::receipts::held_bytes(&o.bytes);
     let n = client
         .execute(
             "INSERT INTO cirislens.ceg_statements (statement_id, row_id, typ, kid, iss, bytes, \
@@ -514,12 +621,18 @@ where
                 &o.typ,
                 &&o.kid[..],
                 &o.iss,
-                &o.bytes,
+                &held,
                 &admitted,
             ],
         )
         .await
         .map_err(be)?;
+    // v62.0.0 (P10) — a held object voice takes a later copy's receipts.
+    if n == 0 {
+        merge_receipts_postgres(client, &o.statement_id, &o.bytes)
+            .await
+            .map_err(be)?;
+    }
     Ok(n == 1)
 }
 
@@ -693,6 +806,15 @@ where
             // its first voice.
             let held = match dir.get_attestation(id_hex).await? {
                 Some(row) => super::emit::carried_statement(&row),
+                None => None,
+            };
+            // v62.0.0 (P10) — the held voice of that statement, which
+            // carries the receipts merged since the row was mapped.
+            let held = match held {
+                Some(st) => match super::receipts::statement_id_of(&st) {
+                    Some(sid) => dir.edition2_statement(&sid).await?.or(Some(st)),
+                    None => Some(st),
+                },
                 None => None,
             };
             let held = match held {

@@ -58,17 +58,51 @@ pub(crate) mod bodies {
     /// own voice, role `occurrence_key`) or as the identity (an approval: the
     /// identity's genesis key, or a live roster key through its seat). The row's
     /// `sub` is the occurrence key and its `author` the identity.
-    pub(crate) fn occ_voice(signer: &str, iss: &str, identity: &str, occurrence: &str) -> Vec<u8> {
-        occ_voice_at(signer, iss, identity, occurrence, ms_now())
+    pub(crate) async fn occ_voice(
+        d: &dyn FederationDirectory,
+        signer: &str,
+        iss: &str,
+        identity: &str,
+        occurrence: &str,
+    ) -> Vec<u8> {
+        occ_voice_at(d, signer, iss, identity, occurrence, ms_now()).await
     }
 
-    /// [`occ_voice`] asserted at `at` (the proposer's signed instant).
-    pub(crate) fn occ_voice_at(
+    /// The identity's current roster head (`refs.head`, required on every
+    /// roster row, CC 3.3.6.4; O1 fix 3).
+    pub(crate) async fn roster_head(
+        d: &dyn FederationDirectory,
+        identity: &str,
+    ) -> crate::federation::edition2::names::RowId {
+        crate::federation::edition2::occurrence::current_roster_head(d, &e2::kid(identity))
+            .await
+            .expect("the roster head reads")
+            .unwrap_or_else(|| panic!("no roster head for {identity}: its key record is held"))
+    }
+
+    /// [`occ_voice`] asserted at `at` (the proposer's signed instant), on
+    /// the identity's CURRENT roster head. A further voice of a held
+    /// proposal names the same head while nothing lands between them.
+    pub(crate) async fn occ_voice_at(
+        d: &dyn FederationDirectory,
         signer: &str,
         iss: &str,
         identity: &str,
         occurrence: &str,
         at: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<u8> {
+        let head = roster_head(d, identity).await;
+        occ_voice_on(signer, iss, identity, occurrence, at, &head)
+    }
+
+    /// [`occ_voice_at`] on the named `head`.
+    pub(crate) fn occ_voice_on(
+        signer: &str,
+        iss: &str,
+        identity: &str,
+        occurrence: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        head: &crate::federation::edition2::names::RowId,
     ) -> Vec<u8> {
         use ciris_verify_core::cde::{self, Value};
         let t = |s: &str| Value::Text(s.to_owned());
@@ -80,6 +114,13 @@ pub(crate) mod bodies {
             (
                 t("device_class"),
                 t(crate::federation::types::device_class::PHONE),
+            ),
+            (
+                t("refs"),
+                Value::Map(vec![(
+                    t("head"),
+                    ciris_verify_core::edition2::row_ref(&head.0),
+                )]),
             ),
         ];
         m.sort_by_key(|(k, _)| cde::encode(k));
@@ -115,16 +156,21 @@ pub(crate) mod bodies {
         approvers: &[&str],
         at: chrono::DateTime<chrono::Utc>,
     ) -> StatementOutcome {
-        let own = e2::put_statement(d, &occ_voice_at(device, device, identity, device, at))
-            .await
-            .expect("the occurrence key's own voice is kept");
+        // One bind, one head: every voice names the head it was built on.
+        let head = roster_head(d, identity).await;
+        let own = e2::put_statement(
+            d,
+            &occ_voice_on(device, device, identity, device, at, &head),
+        )
+        .await
+        .expect("the occurrence key's own voice is kept");
         assert!(
             matches!(own, StatementOutcome::Voice { .. }),
             "the own voice alone lands nothing: {own:?}"
         );
         let mut last = own;
         for a in approvers {
-            last = e2::put_statement(d, &occ_voice_at(a, identity, identity, device, at))
+            last = e2::put_statement(d, &occ_voice_on(a, identity, identity, device, at, &head))
                 .await
                 .unwrap_or_else(|e| panic!("{a}'s approval of {device} under {identity}: {e}"));
         }
@@ -147,7 +193,7 @@ pub(crate) mod bodies {
             bind_at(d, f, d2, &[d1], at).await,
             StatementOutcome::Voice { .. }
         ));
-        let landed = e2::put_statement(d, &occ_voice_at(f, f, f, d2, at))
+        let landed = e2::put_statement(d, &occ_voice_at(d, f, f, f, d2, at).await)
             .await
             .expect("the fixture's quorum approval");
         assert!(
@@ -185,7 +231,7 @@ pub(crate) mod bodies {
             witness_set: Vec::new(),
             persist_row_hash: String::new(),
         };
-        e2::occurrence_revocation_voice(d, signer, true, &rev, None, &[], e2::ms(at)).await
+        e2::occurrence_revocation_voice(d, signer, true, &rev, None, &[], &[], e2::ms(at)).await
     }
 
     /// The proposal id of a roster change: its row id (O1 S1).
@@ -314,7 +360,7 @@ pub(crate) mod bodies {
             "I1131: the kept voice is not an effect"
         );
         // f's assent: the SAME payload (the same instant), signed as the self.
-        let assent = e2::put_statement(d, &occ_voice_at(&f, &f, &f, &d2, at))
+        let assent = e2::put_statement(d, &occ_voice_at(d, &f, &f, &f, &d2, at).await)
             .await
             .expect("I1131: f's approval");
         assert!(
@@ -406,14 +452,14 @@ pub(crate) mod bodies {
         let t3 = ms_now();
         assert!(!landed(&bind_at(d, &f, &d3, &[&f], t3).await));
         assert!(landed(
-            &put_st(d, &occ_voice_at(&d1, &f, &f, &d3, t3)).await
+            &put_st(d, &occ_voice_at(d, &d1, &f, &f, &d3, t3).await).await
         ));
         assert!(active_e2(d, &f, &d3).await);
         // d2 proposes d4 (1 of 4); d1 assents (2 of 4: no majority yet).
         let t4 = ms_now();
         assert!(!landed(&bind_at(d, &f, &d4, &[&d2], t4).await));
         assert!(!landed(
-            &put_st(d, &occ_voice_at(&d1, &f, &f, &d4, t4)).await
+            &put_st(d, &occ_voice_at(d, &d1, &f, &f, &d4, t4).await).await
         ));
         assert!(!active_e2(d, &f, &d4).await, "I1134: 2 of 4 is no majority");
         // d1 is evicted by quorum: f proposes, d2 and d3 assent (3 of 4).
@@ -440,17 +486,20 @@ pub(crate) mod bodies {
         let t5 = ms_now();
         assert!(!landed(&bind_at(d, &f, &d5, &[&f], t5).await));
         assert!(
-            landed(&put_st(d, &occ_voice_at(&d2, &f, &f, &d5, t5)).await),
+            landed(&put_st(d, &occ_voice_at(d, &d2, &f, &f, &d5, t5).await).await),
             "I1134: 2 of the live 3 lands; the quorum was counted over a roster that kept d1"
         );
         assert!(active_e2(d, &f, &d5).await);
-        // {f, d2, d3, d5}: d4 needs 3 — d2, then d3 and d5.
+        // {f, d2, d3, d5}: d4 needs 3 — d2, then d3 and d5. d2's first
+        // proposal stood on the head d1's eviction succeeded, so it is VOID
+        // here (CC 2.7.8); d2 proposes d4 again on the current head.
+        assert!(!landed(&bind_at(d, &f, &d4, &[&d2], t4).await));
         assert!(!landed(
-            &put_st(d, &occ_voice_at(&d3, &f, &f, &d4, t4)).await
+            &put_st(d, &occ_voice_at(d, &d3, &f, &f, &d4, t4).await).await
         ));
         assert!(!active_e2(d, &f, &d4).await, "I1134: 2 of 4 is no majority");
         assert!(landed(
-            &put_st(d, &occ_voice_at(&d5, &f, &f, &d4, t4)).await
+            &put_st(d, &occ_voice_at(d, &d5, &f, &f, &d4, t4).await).await
         ));
         assert!(active_e2(d, &f, &d4).await, "I1134: live assents land it");
     }
@@ -772,14 +821,14 @@ pub(crate) mod bodies {
         }
         let me = e2::kid(&f);
         assert!(
-            landed(&put_st(d, &occ_voice(&f, &f, &f, &f)).await),
+            landed(&put_st(d, &occ_voice(d, &f, &f, &f, &f).await).await),
             "the transport self-occurrence"
         );
         assert!(landed(&bind(d, &f, &d1, &[&f]).await), "one key");
         let t2 = ms_now();
         assert!(!landed(&bind_at(d, &f, &d2, &[&f], t2).await));
         assert!(landed(
-            &put_st(d, &occ_voice_at(&d1, &f, &f, &d2, t2)).await
+            &put_st(d, &occ_voice_at(d, &d1, &f, &f, &d2, t2).await).await
         ));
 
         let te = ms_now();
@@ -810,19 +859,19 @@ pub(crate) mod bodies {
         // The evicted genesis key no longer signs for the self (not pinned to
         // a token: CC 2.7).
         let t3 = ms_now();
-        put_st(d, &occ_voice_at(&d3, &d3, &f, &d3, t3)).await;
+        put_st(d, &occ_voice_at(d, &d3, &d3, &f, &d3, t3).await).await;
         assert!(
-            e2::put_statement(d, &occ_voice_at(&f, &f, &f, &d3, t3))
+            e2::put_statement(d, &occ_voice_at(d, &f, &f, &f, &d3, t3).await)
                 .await
                 .is_err(),
             "I1141: an evicted genesis key signs for the self"
         );
         // {d1, d2}: d1's addition needs d2.
         assert!(!landed(
-            &put_st(d, &occ_voice_at(&d1, &f, &f, &d3, t3)).await
+            &put_st(d, &occ_voice_at(d, &d1, &f, &f, &d3, t3).await).await
         ));
         assert!(landed(
-            &put_st(d, &occ_voice_at(&d2, &f, &f, &d3, t3)).await
+            &put_st(d, &occ_voice_at(d, &d2, &f, &f, &d3, t3).await).await
         ));
         assert!(
             active_e2(d, &f, &d3).await,
@@ -839,7 +888,9 @@ pub(crate) mod bodies {
         for k in [&g, &e1] {
             e2::put_key(d, k, &[it::USER]).await;
         }
-        assert!(landed(&put_st(d, &occ_voice(&g, &g, &g, &g)).await));
+        assert!(landed(
+            &put_st(d, &occ_voice(d, &g, &g, &g, &g).await).await
+        ));
         assert!(landed(&bind(d, &g, &e1, &[&g]).await), "one key");
         assert!(
             landed(&put_st(d, &evict_voice_at(d, &g, &g, &g, ms_now()).await).await),
@@ -889,7 +940,7 @@ pub(crate) mod bodies {
         let t2 = ms_now();
         assert!(!landed(&bind_at(d, &f, &d2, &[&f], t2).await));
         assert!(landed(
-            &put_st(d, &occ_voice_at(&d1, &f, &f, &d2, t2)).await
+            &put_st(d, &occ_voice_at(d, &d1, &f, &f, &d2, t2).await).await
         ));
         put_binding(d, &f, &node)
             .await
@@ -1113,11 +1164,11 @@ pub(crate) mod bodies {
         ));
         test_table::set(Some(table_with_self_window_below_floor()));
         let at = ms_now();
-        e2::put_statement(d, &occ_voice_at(&d2, &d2, &f, &d2, at))
+        e2::put_statement(d, &occ_voice_at(d, &d2, &d2, &f, &d2, at).await)
             .await
             .expect("I1307: the occurrence key's own voice is kept");
         policy_refused(
-            e2::put_statement(d, &occ_voice_at(&d1, &f, &f, &d2, at))
+            e2::put_statement(d, &occ_voice_at(d, &d1, &f, &f, &d2, at).await)
                 .await
                 .map(|_| ()),
             "I1307: two keys, outside the corridor",
@@ -1136,7 +1187,7 @@ pub(crate) mod bodies {
         );
         policy_refused(sr::standing(d, &me).await.map(|_| ()), "I1307: standing");
         test_table::set(None);
-        let held = e2::put_statement(d, &occ_voice_at(&d1, &f, &f, &d2, at))
+        let held = e2::put_statement(d, &occ_voice_at(d, &d1, &f, &f, &d2, at).await)
             .await
             .expect("I1307: two keys, the vendored table");
         assert!(
@@ -1209,20 +1260,20 @@ pub(crate) mod bodies {
 
         // I1710 — `a`, in order.
         let t2 = ms_now();
-        let s = put_a(occ_voice_at(&d2, &d2, &f, &d2, t2));
+        let s = put_a(occ_voice_at(a, &d2, &d2, &f, &d2, t2).await);
         put_st(a, &s).await;
-        let s = put_a(occ_voice_at(&f, &f, &f, &d2, t2));
+        let s = put_a(occ_voice_at(a, &f, &f, &f, &d2, t2).await);
         assert!(
             landed(&put_st(a, &s).await),
             "I1710: at one key d2's add lands at once"
         );
         pause().await;
         let t3 = ms_now();
-        let own_d3 = put_a(occ_voice_at(&d3, &d3, &f, &d3, t3));
+        let own_d3 = put_a(occ_voice_at(a, &d3, &d3, &f, &d3, t3).await);
         put_st(a, &own_d3).await;
-        let f_d3 = put_a(occ_voice_at(&f, &f, &f, &d3, t3));
+        let f_d3 = put_a(occ_voice_at(a, &f, &f, &f, &d3, t3).await);
         assert!(!landed(&put_st(a, &f_d3).await), "I1710: f adds d3: held");
-        let s = put_a(occ_voice_at(&d2, &f, &f, &d3, t3));
+        let s = put_a(occ_voice_at(a, &d2, &f, &f, &d3, t3).await);
         assert!(landed(&put_st(a, &s).await), "I1710: d3 landed by quorum");
         pause().await;
         let te = ms_now();

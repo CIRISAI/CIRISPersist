@@ -59,8 +59,8 @@ pub(crate) mod bodies {
     where
         B: FederationDirectory + DeclaresNode,
     {
-        let node = format!("i1606-node-{s}");
-        declare_node(b, &node).await;
+        // v62.0.0 (K1) — the attester is the id the node key is held under.
+        let node = declare_node(b, &format!("i1606-node-{s}")).await;
 
         let own = event(&format!("i1606-mine-{s}"));
         b.record_hard_case(own.clone())

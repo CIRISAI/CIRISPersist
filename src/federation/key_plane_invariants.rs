@@ -126,7 +126,7 @@ pub(crate) mod bodies {
         // A stranger's voice: refused or held, never projected.
         let r = e2::put_statement(
             b,
-            &e2::occurrence_revocation_voice(b, &stranger, false, &rev, None, &[], at).await,
+            &e2::occurrence_revocation_voice(b, &stranger, false, &rev, None, &[], &[], at).await,
         )
         .await;
         assert!(
@@ -139,7 +139,7 @@ pub(crate) mod bodies {
             .unwrap()
             .is_empty());
         // The identity's own voice.
-        let voice = e2::occurrence_revocation_voice(b, &id, true, &rev, None, &[], at).await;
+        let voice = e2::occurrence_revocation_voice(b, &id, true, &rev, None, &[], &[], at).await;
         let out = e2::put_statement(b, &voice)
             .await
             .expect("I979b: the identity revokes its occurrence");

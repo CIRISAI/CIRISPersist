@@ -73,7 +73,9 @@ const NOT_BUILT: &[(&str, &str, &str, &str, NotYet)] = &[
 #[cfg(test)]
 mod tests {
     use super::{NotYet, NOT_BUILT};
-    use crate::federation::namespace::registry::{VENDORED_CC_VERSION, VENDORED_SOURCE_SHA256};
+    use crate::federation::namespace::registry::{
+        VENDORED_CC_TAG, VENDORED_CC_VERSION, VENDORED_SOURCE_SHA256,
+    };
     use sha2::{Digest, Sha256};
     use std::path::{Path, PathBuf};
 
@@ -120,8 +122,10 @@ mod tests {
         // v61.3.0 (CIRISPersist#1252) — every CC file is vendored at rc18; the
         // table's rows were re-read there (none of them is built). v62.0.0:
         // re-read at rc20; the Goal row's anchor moved with its text (a group,
-        // not only a community, declares a Goal by its own vote).
-        assert_eq!(VENDORED_CC_VERSION, "1.0-rc20", "the table is read at rc20");
+        // not only a community, declares a Goal by its own vote). v62.0.0
+        // (R1c): re-read at rc21-wire (e6fd7c60); every anchor is still in its
+        // part's text (read-checked with `git show v1.0-rc21-wire:`).
+        assert_eq!(VENDORED_CC_VERSION, "1.0-rc21", "the table is read at rc21");
         let tsv = std::fs::read_to_string(root().join("evidence/cc_impl.tsv")).expect("cc_impl");
         let claims: Vec<&str> = tsv
             .lines()
@@ -184,12 +188,12 @@ mod tests {
     }
 
     /// **I1499 (CC side)** — every anchor is the tag's text: with a
-    /// CIRISConstitution checkout carrying `v<VENDORED_CC_VERSION>`, its part 3
+    /// CIRISConstitution checkout carrying [`VENDORED_CC_TAG`], its part 3
     /// hashes to [`VENDORED_SOURCE_SHA256`] and every anchor is in its
     /// section's part. Skips, saying so, without the checkout or the tag.
     #[test]
     fn i1499_every_anchor_is_the_tags_text_when_cc_is_present() {
-        let tag = format!("v{VENDORED_CC_VERSION}");
+        let tag = VENDORED_CC_TAG;
         let Some(repo) = cc_repo() else {
             eprintln!(
                 "I1499: no CIRISConstitution checkout (CIRIS_CC_REPO or a sibling) — SKIPPED"

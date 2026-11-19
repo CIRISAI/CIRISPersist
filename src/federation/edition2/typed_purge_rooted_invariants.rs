@@ -108,8 +108,8 @@ async fn victim<D: FederationDirectory + ?Sized>(a: &D) -> PurgeSelection {
 /// statements for the root (and any founder B lacks), A's
 /// founding `group:roster` voices and the root's charter self-edge, each
 /// through B's replicated statement door; then B's OWN `trust:accepts:v1`
-/// edge to that root, naming B's held head (`attach_head_for`), signed by
-/// B's node key (its E0 seed, `B_NODE`).
+/// edge to that root (W1's `put_acceptance`, naming B's held head), signed
+/// by B's node key (its E0 seed, `B_NODE`).
 async fn receive_root<D: FederationDirectory + ?Sized>(a: &D, b: &D, r: &RootedTrustRoot) {
     super::fixture_genesis::install_v2(b)
         .await
@@ -142,25 +142,12 @@ async fn receive_root<D: FederationDirectory + ?Sized>(a: &D, b: &D, r: &RootedT
                 .expect("B admits A's root rows");
         }
     }
-    let head =
-        crate::federation::canonical_community::attach_head_for(b, &r.root, chrono::Utc::now())
-            .await
-            .unwrap();
-    let mut env = serde_json::json!({
-        "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-        "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
-    });
-    if let Some(h) = head {
-        env["attached_head_digest"] = serde_json::Value::String(h);
-    }
-    let mut edge = crate::federation::tier_ingest::test_support::bare_attestation(
-        "ignored-as-an-id",
-        B_NODE,
-        &r.root,
-        &env,
-    );
-    edge.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.to_owned();
-    e2::put_statement(b, &e2::statement_of(&edge, B_NODE))
+    // B's OWN acceptance edge, through W1's helper: its
+    // `attached_head_digest` is the held head's row hash as bytes, stated
+    // after the root's rows. (T2-fix2: the hand-built JSON edge named the
+    // head as text from `attach_head_for`, so B never read the root as
+    // rooted.)
+    super::fixture_trust_root::put_acceptance(b, r, &e2::signing_key(B_NODE), &e2::kid(B_NODE))
         .await
         .expect("B's own acceptance edge");
     assert!(

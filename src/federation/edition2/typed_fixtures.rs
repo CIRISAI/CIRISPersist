@@ -78,12 +78,16 @@ fn ms(at: chrono::DateTime<chrono::Utc>) -> u64 {
 /// and tips (`occurrence::current_roster_heads`, O1 v8: the latest LANDED
 /// roster row(s), else the genesis key's `key:record` row); a test of an older or unheld head
 /// passes it. `further_heads` names the further tips the row merges
-/// (`refs.further_heads`; empty for none). The occurrence is the row's `sub`; the struct's key ids are
+/// (`refs.further_heads`; empty for none). `voices` are ALL the keys that
+/// will voice the eviction (seeds or kids; empty: every key on the roster
+/// at the named heads, plus this signer): it cites
+/// each one's `key:record` and binding (`typed::eviction_cites`, CC rc21). The occurrence is the row's `sub`; the struct's key ids are
 /// seeds or E0 kids.
 ///
 /// # Panics
 /// An instant before 1970, or a current head that cannot be read (a
 /// fixture).
+#[allow(clippy::too_many_arguments)] // a fixture mirroring the payload members
 pub async fn occurrence_revocation_voice<D: crate::federation::FederationDirectory + ?Sized>(
     dir: &D,
     seed: &str,
@@ -91,6 +95,7 @@ pub async fn occurrence_revocation_voice<D: crate::federation::FederationDirecto
     rev: &IdentityOccurrenceRevocation,
     head: Option<&RowId>,
     further_heads: &[RowId],
+    voices: &[&str],
     asserted_at_ms: u64,
 ) -> Vec<u8> {
     let identity = kid_or_keep(&rev.identity_key_id);
@@ -129,8 +134,41 @@ pub async fn occurrence_revocation_voice<D: crate::federation::FederationDirecto
             )
         });
     let author = (!user).then_some(identity.as_str());
-    let p = occurrence_revocation_payload(&r, author, None, &head, &further_heads, asserted_at_ms)
-        .expect("typed_fixtures: occurrence revocation payload");
+    // v62.0.0 (T2-fix4; CC rc21 7f94be1) — the eviction cites every voice's
+    // key:record and binding. `voices` names the keys that will voice it
+    // (seeds or kids). Empty: every key on the roster at the named heads,
+    // plus this signer, so every roster key's voice states the SAME payload
+    // (one row) and each is cited.
+    let voice_keys: Vec<String> = if voices.is_empty() {
+        let mut heads = vec![head];
+        heads.extend(further_heads.iter().copied());
+        let mut keys: Vec<String> =
+            crate::federation::self_roster::roster_at_heads(dir, &identity, &heads)
+                .await
+                .expect("typed_fixtures: the roster at the named heads")
+                .into_iter()
+                .collect();
+        let me = kid_or_keep(seed);
+        if !keys.contains(&me) {
+            keys.push(me);
+        }
+        keys
+    } else {
+        voices.iter().map(|v| kid_or_keep(v)).collect()
+    };
+    let cites = super::typed::eviction_cites(dir, &identity, &voice_keys)
+        .await
+        .expect("typed_fixtures: the voices' key:records and bindings are held");
+    let p = occurrence_revocation_payload(
+        &r,
+        author,
+        None,
+        &head,
+        &further_heads,
+        &cites,
+        asserted_at_ms,
+    )
+    .expect("typed_fixtures: occurrence revocation payload");
     typed_statement(
         seed,
         as_identity.then_some(identity.as_str()),

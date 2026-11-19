@@ -145,6 +145,54 @@ pub fn typed_plane_of(row_type: &str, family: &str) -> Option<TypedPlane> {
         .map(|(_, plane)| *plane)
 }
 
+/// v62.0.0 (T2-fix3) — **the selector keys a typed family's authorship cell
+/// reads, from the statement's bytes alone**, for an admit that supplies
+/// none (`door::door_context`; a key already `Some` is kept):
+///
+/// - `takedown_notice:{basis}`: `group` from the payload's `cohort_scope`
+///   when it names a group scope; a notice at no group has no deciding seats
+///   (`seats = 0`), so the affiliation arm reads false, not unknown.
+/// - `identity:occurrence_revocation` (`identity=user => counted ;
+///   authored`): a statement with no `author` is the user self's counted
+///   row, `identity = {user}`; one with an `author` is authored (`identity
+///   = {}`). The put door supplied the identity's TRUE types
+///   ([`family_context`]) when the row was first admitted, and a counted row
+///   carries no author by CC 2.6.1.3, so a re-admission of held bytes reaches
+///   the verdict it was admitted under.
+pub fn fill_context_from_bytes(
+    bytes: &[u8],
+    ctx: &mut ciris_verify_core::edition2::family::SelectContext,
+) {
+    use ciris_verify_core::edition2::family::select::Group;
+    let Some((protected, payload)) = super::liveness::statement_parts(bytes) else {
+        return;
+    };
+    let Some(family) = protected.get_int(-70002).and_then(Value::as_text) else {
+        return;
+    };
+    if family == namespace_match::family_id(TAKEDOWN_PREFIX) {
+        if ctx.group.is_none() {
+            ctx.group = match text_of(&payload, "cohort_scope") {
+                Some(cs::FAMILY) => Some(Group::Family),
+                Some(cs::COMMUNITY) => Some(Group::Community),
+                Some(cs::AFFILIATIONS) => Some(Group::Affiliations),
+                _ => None,
+            };
+        }
+        if ctx.seats.is_none() && ctx.group.is_none() {
+            ctx.seats = Some(0);
+        }
+    } else if family == namespace_match::family_id(OCCURRENCE_REVOCATION_PREFIX)
+        && ctx.identity.is_none()
+    {
+        ctx.identity = Some(if payload.get_text("author").is_some() {
+            Vec::new()
+        } else {
+            vec![crate::federation::types::identity_type::USER.to_owned()]
+        });
+    }
+}
+
 /// v62.0.0 (T2-fix1; CC 3.1.3) — **the selector context a typed family's
 /// authorship cell reads**, which Verify's door cannot know from the bytes
 /// alone (`SelectContext` keys left `None` read unknown, and an undecided
@@ -428,6 +476,62 @@ pub fn project_envelope(row: &AdmittedRow, o: &mut serde_json::Map<String, serde
         }
         TypedPlane::DeliveryReceipt => put_digest_hex(row, o, "chunk_root"),
         TypedPlane::OccurrenceRevocation | TypedPlane::Cosign | TypedPlane::Revocation => {}
+    }
+}
+
+/// v62.0.0 (T2-fix2) — **the envelope projection's inverse**, for a producer
+/// stating a typed plane's row from its earlier-form envelope
+/// (`emit::payload_from_envelope`): the earlier member names become the
+/// edition-2 names P1's payload list keys ([`project_envelope`] is the
+/// other direction), so the statement keeps that list. Applied to the
+/// payload map before it is sorted; a row of another family is untouched.
+///
+/// - `key_grant`: nothing here. Its producer states the row through
+///   [`key_grant_payload`] (`key_grant::state_key_grant_row`, P8-fix2).
+/// - `custody`: `family_key_id` → `family_id`.
+/// - `takedown_notice`: `claimant_key_id` → `claimant`,
+///   `content_holder_key_ids` → `content_holders` (a set: sorted, unique);
+///   `subject_kind` is dropped (the family's own constant, restated by the
+///   projection).
+pub fn unproject_payload(family_id: &str, m: &mut Vec<(Value, Value)>) {
+    let Some(plane) = PLANES
+        .iter()
+        .find(|(prefix, _)| namespace_match::family_id(prefix) == family_id)
+        .map(|(_, plane)| *plane)
+    else {
+        return;
+    };
+    let renames: &[(&str, &str)] = match plane {
+        TypedPlane::Custody => &[("family_key_id", "family_id")],
+        TypedPlane::Takedown => &[
+            ("claimant_key_id", "claimant"),
+            ("content_holder_key_ids", "content_holders"),
+        ],
+        // A key grant is stated from its row by its own producer
+        // (`key_grant::state_key_grant_row` → [`key_grant_payload`], P8), never
+        // from the earlier envelope.
+        TypedPlane::KeyGrant
+        | TypedPlane::OccurrenceRevocation
+        | TypedPlane::Cosign
+        | TypedPlane::Revocation
+        | TypedPlane::DeliveryReceipt => &[],
+    };
+    if plane == TypedPlane::Takedown {
+        m.retain(|(k, _)| k.as_text() != Some("subject_kind"));
+    }
+    for (k, v) in m.iter_mut() {
+        if let Some((_, to)) = k
+            .as_text()
+            .and_then(|name| renames.iter().find(|(from, _)| *from == name))
+        {
+            *k = text(to);
+        }
+        if let (TypedPlane::Takedown, Some("content_holders")) = (plane, k.as_text()) {
+            if let Value::Array(a) = v {
+                a.sort_by_key(cde::encode);
+                a.dedup();
+            }
+        }
     }
 }
 
@@ -768,6 +872,173 @@ where
     })
 }
 
+/// v62.0.0 (T2-fix4; CC rc21 7f94be1) — the `refs` role an
+/// `identity:occurrence_revocation` cites its voices' keys under.
+pub const CITES_ROLE: &str = "also:cites";
+
+/// v62.0.0 (T2-fix4; CC rc21 7f94be1, CC 2.7.5) — **an eviction cites its
+/// evicting keys.** Under `refs.also.cites` it names the `key:record` of
+/// each of its voices and, for a voice whose key is not the identity's own,
+/// that key's `identity:occurrence` binding under the identity. The cited
+/// rows are its ancestors: they travel with it (`serve::statements_served_to`).
+///
+/// - no cite at all: Invalid (`edition2_payload_invalid`), a check of the
+///   bytes;
+/// - a cited row this node does not hold: the row WAITS (a fold hold,
+///   `link_unheld`, re-folded when the row arrives);
+/// - every cite held, but none is this voice's `key:record` (its kid), or
+///   (for a non-genesis key) none is its binding under the identity:
+///   Invalid.
+///
+/// # Errors
+/// As above; directory reads.
+async fn check_eviction_cites<F>(dir: &F, row: &AdmittedRow, identity: &str) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let cites: Vec<RowId> = row
+        .names
+        .iter()
+        .filter(|n| n.role == CITES_ROLE)
+        .map(|n| n.row)
+        .collect();
+    if cites.is_empty() {
+        return Err(invalid(format!(
+            "{OCCURRENCE_REVOCATION_PREFIX}: an eviction cites, under refs.also.cites, the \
+             key:record of each of its voices and that key's occurrence binding (CC rc21)"
+        )));
+    }
+    let voice_key = ciris_verify_core::edition2::identity_ref(&row.kid);
+    let mut held = Vec::with_capacity(cites.len());
+    for c in &cites {
+        super::fold::reads(super::fold::Dep::Row(*c));
+        let voices = dir.edition2_voices(c).await?;
+        let Some(first) = voices.into_iter().next() else {
+            return Err(super::fold::hold(
+                super::fold::reason::LINK_UNHELD,
+                Error::WithdrawsTargetUnheld {
+                    attestation_id: row.row_id.hex(),
+                    target_attestation_id: c.hex(),
+                },
+            ));
+        };
+        held.push(first);
+    }
+    let mut record_cited = false;
+    let mut bind_cited = false;
+    for st in &held {
+        let Some((protected, payload)) = super::liveness::statement_parts(st) else {
+            continue;
+        };
+        let family = protected.get_int(-70002).and_then(Value::as_text);
+        if family == Some(ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY)
+            && super::liveness::recorded_kid(st) == Some(row.kid)
+        {
+            record_cited = true;
+        }
+        if family == Some(super::occurrence::OCCURRENCE_FAMILY)
+            && text_of(&payload, "identity_key_id") == Some(identity)
+            && text_of(&payload, "occurrence_key_id") == Some(voice_key.as_str())
+        {
+            bind_cited = true;
+        }
+    }
+    if !record_cited {
+        return Err(invalid(format!(
+            "{OCCURRENCE_REVOCATION_PREFIX}: the voice's key:record ({voice_key}) is not cited \
+             under refs.also.cites"
+        )));
+    }
+    if voice_key != identity && !bind_cited {
+        return Err(invalid(format!(
+            "{OCCURRENCE_REVOCATION_PREFIX}: the voice's occurrence binding ({identity} -> \
+             {voice_key}) is not cited under refs.also.cites"
+        )));
+    }
+    Ok(())
+}
+
+/// v62.0.0 (T2-fix4; CC 2.7.5, rc21 7f94be1) — **the rows that travel with
+/// a statement**: for an `identity:occurrence_revocation`, every held
+/// statement of each row it cites (`refs.also.cites`: its voices' key
+/// records and bindings). Empty for any other statement. The serve listing
+/// serves them with it (`serve::statements_served_to`).
+///
+/// # Errors
+/// Directory reads.
+pub async fn travelling_ancestors<F>(dir: &F, statement: &[u8]) -> Result<Vec<Vec<u8>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some((protected, payload)) = super::liveness::statement_parts(statement) else {
+        return Ok(Vec::new());
+    };
+    if protected.get_int(-70002).and_then(Value::as_text)
+        != Some(namespace_match::family_id(OCCURRENCE_REVOCATION_PREFIX).as_str())
+    {
+        return Ok(Vec::new());
+    }
+    let Ok(names) = super::names::names_of(&payload) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for n in names.iter().filter(|n| n.role == CITES_ROLE) {
+        out.extend(dir.edition2_voices(&n.row).await?);
+    }
+    Ok(out)
+}
+
+/// v62.0.0 (T2-fix4) — **the cites an eviction by `voice_keys` states**:
+/// for each key, its latest held `key:record` row and, when the key is not
+/// the identity's own, its latest held `identity:occurrence` binding under
+/// `identity`. For producers and fixtures; the door checks them
+/// ([`check_eviction_cites`]).
+///
+/// # Errors
+/// A key with no held `key:record`, or a non-genesis key with no held
+/// binding (the retryable unknown signer, naming it); directory reads.
+pub async fn eviction_cites<F>(
+    dir: &F,
+    identity: &str,
+    voice_keys: &[String],
+) -> Result<Vec<RowId>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let latest = |sts: Vec<Vec<u8>>, keep: &dyn Fn(&Value) -> bool| {
+        sts.into_iter()
+            .filter_map(|st| {
+                let (_, p) = super::liveness::statement_parts(&st)?;
+                if !keep(&p) {
+                    return None;
+                }
+                let at = p.get_text("asserted_at").and_then(Value::as_u64)?;
+                Some((at, RowId::of_statement(&st)?))
+            })
+            .max()
+            .map(|(_, r)| r)
+    };
+    let mut out = Vec::new();
+    for k in voice_keys {
+        let records = dir
+            .edition2_statements_about(ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY, k)
+            .await?;
+        let record = latest(records, &|_| true).ok_or_else(|| Error::unknown_signer(k, PLANE))?;
+        out.push(record);
+        if k != identity {
+            let binds = dir
+                .edition2_statements_about(super::occurrence::OCCURRENCE_FAMILY, k)
+                .await?;
+            let bind = latest(binds, &|p| text_of(p, "identity_key_id") == Some(identity))
+                .ok_or_else(|| Error::unknown_signer(k, PLANE))?;
+            out.push(bind);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// **`identity:occurrence_revocation`** (v62.0.0, wave T2 + O1's S1b): every
 /// voice is signed AS the identity (refused otherwise, not kept), so the
 /// door's key-of-issuer check has already admitted only a key of the
@@ -803,6 +1074,10 @@ where
             row.iss
         )));
     }
+    // v62.0.0 (T2-fix4; CC rc21 7f94be1) — the eviction cites its voices'
+    // keys (their records and bindings): Invalid without them, waiting on a
+    // cited row not held.
+    check_eviction_cites(dir, row, &identity).await?;
     let single_signer = is_single_signer_identity(dir, &identity).await?;
     // Stored FIRST: the self-roster's gate counts the held voices.
     let new = dir.put_edition2_statement(row).await?;
@@ -900,17 +1175,25 @@ where
     })
 }
 
-/// A row named by `refs` must be held (its statement in `ceg_statements`),
-/// else the retryable ordering gap.
+/// A row named by `refs` must be held (its statement in `ceg_statements`);
+/// until it is, the naming row waits (a fold hold, `link_unheld`).
 async fn require_held<F>(dir: &F, row: &AdmittedRow, target: &RowId) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (T2-fix2; CC 2.7.3) — the named row is a fold read: a row
+    // naming one this node does not hold WAITS (held, kept, `Pending`) and is
+    // re-folded when it arrives, as a composer's unheld target does
+    // (`ingest::check_composer_target`). Never a refusal.
+    super::fold::reads(super::fold::Dep::Row(*target));
     if dir.edition2_voices(target).await?.is_empty() {
-        return Err(Error::WithdrawsTargetUnheld {
-            attestation_id: row.row_id.hex(),
-            target_attestation_id: target.hex(),
-        });
+        return Err(super::fold::hold(
+            super::fold::reason::LINK_UNHELD,
+            Error::WithdrawsTargetUnheld {
+                attestation_id: row.row_id.hex(),
+                target_attestation_id: target.hex(),
+            },
+        ));
     }
     Ok(())
 }
@@ -1027,7 +1310,7 @@ where
 
 /// The live (not retired) acceptance edges a query names, and the granters
 /// of the retired ones.
-async fn acceptance_edges<F>(
+pub(crate) async fn acceptance_edges<F>(
     dir: &F,
     query: crate::federation::attestation_query::AttestationQuery,
 ) -> Result<(Vec<crate::federation::types::Attestation>, BTreeSet<String>), Error>
@@ -1192,19 +1475,25 @@ pub const SELF_ROSTER_FURTHER_HEADS_ROLE: &str = "further_heads";
 
 /// `refs` of a self-roster row: `head`, and `further_heads` (a set of
 /// row-refs, sorted by encoding, unique) when it merges tips.
-fn self_roster_refs(head: &RowId, further_heads: &[RowId]) -> Value {
-    let mut refs = vec![(
-        SELF_ROSTER_HEAD_ROLE,
-        ciris_verify_core::edition2::row_ref(&head.0),
-    )];
-    if !further_heads.is_empty() {
-        let mut set: Vec<Value> = further_heads
+fn self_roster_refs(head: &RowId, further_heads: &[RowId], cites: &[RowId]) -> Value {
+    let set = |rows: &[RowId]| {
+        let mut set: Vec<Value> = rows
             .iter()
             .map(|r| ciris_verify_core::edition2::row_ref(&r.0))
             .collect();
         set.sort_by_key(cde::encode);
         set.dedup();
-        refs.push((SELF_ROSTER_FURTHER_HEADS_ROLE, Value::Array(set)));
+        Value::Array(set)
+    };
+    let mut refs = vec![(
+        SELF_ROSTER_HEAD_ROLE,
+        ciris_verify_core::edition2::row_ref(&head.0),
+    )];
+    if !further_heads.is_empty() {
+        refs.push((SELF_ROSTER_FURTHER_HEADS_ROLE, set(further_heads)));
+    }
+    if !cites.is_empty() {
+        refs.push(("also", det_map(vec![("cites", set(cites))])));
     }
     det_map(refs)
 }
@@ -1217,7 +1506,10 @@ fn refs_naming(role: &str, row: &RowId) -> Value {
 /// v62.0.0 (wave T2; CC 3.3.6.4, CC27 item 2) — **the payload of an
 /// `identity:occurrence_revocation` row**: `author` is the identity for an
 /// authored row (a node's or agent's), `None` for a user self's counted row
-/// (CC 3.1.3); every voice states the same payload, naming the
+/// (CC 3.1.3); `cites` (rc21 7f94be1, REQUIRED by the door) are the
+/// `key:record` of each voice and that key's occurrence binding when it has
+/// one (`refs.also.cites`; [`eviction_cites`] computes them); every voice
+/// states the same payload, naming the
 /// self-roster head it is counted over (`refs.head`, REQUIRED by CC's
 /// ruling): the identity's last landed bind or eviction, or the genesis
 /// key's own `key:record` row before any. The proposal's thresholds are
@@ -1235,6 +1527,7 @@ pub fn occurrence_revocation_payload(
     reason_code: Option<u64>,
     head: &RowId,
     further_heads: &[RowId],
+    cites: &[RowId],
     asserted_at_ms: u64,
 ) -> Result<Value, Error> {
     let mut m = vec![
@@ -1243,7 +1536,7 @@ pub fn occurrence_revocation_payload(
         ("occurrence_key_id", text(&revocation.occurrence_key_id)),
         ("revoked_at", ms_of(revocation.revoked_at)?),
         ("effective_at", ms_of(revocation.effective_at)?),
-        ("refs", self_roster_refs(head, further_heads)),
+        ("refs", self_roster_refs(head, further_heads, cites)),
     ];
     // CC 3.1.3 (`identity=user => counted ; authored`): a user self's
     // revocation is counted and carries no `author`; a node's or agent's is

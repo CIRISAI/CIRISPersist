@@ -615,14 +615,24 @@ getrandom = { version = "0.2", optional = true }
 # four crates on one tag. 23.3.0 adds `KeyDirectory::key_of` (the key-of-issuer
 # check, `kid_not_of_iss`), the edition-2 accord halt reader (`HaltReading`)
 # and the rc20 v1.0 (d4bd2a6) vendored family model with the derived `act`.
+# v62.0.0 (R1) — CIRISVerify v23.3.1 (tag b0933ba; read at CIRISVerify#350 head fad948e), all four
+# crates still on one tag. A patch: CC v1.0-rc21-wire (e6fd7c6) re-vendored
+# (location_proof authored by its subject, `AUTHOR_IS_SUBJECT`; the family
+# model's affiliation and officer-appointment arms), step 8's four ways
+# (`KeyDirectory::key_of_at`, `KeyRecordDirectory::{insert_occurrence,
+# insert_occurrence_revocation, hold_bundle_in_force, await_bundle_in_force}`,
+# `MissingKey::{Voice, Bundle}`), step 4's strict end rule
+# (`Invalid::ValidUntilNotAfterAssertedAt`), the seat binding as the seat's
+# own `identity:occurrence` (`edition2::check_identity_occurrence`), and CDE
+# tag-4 decimals (`cde::from_json`).
 # The NODE profile: verify-core `std` + `pqc` (the pure verifiers, plus the
 # std-tier accord custody verifiers persist's admission calls), keyring slim
 # (no `fs`: in-memory software signers from caller seeds). `host` (above)
 # turns on verify-core `host` and the keyring's file-backed defaults.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.0", version = "23", default-features = false, features = ["software", "pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.0", version = "23", default-features = false, features = ["std", "pqc"] }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.1", version = "23", default-features = false, features = ["software", "pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.1", version = "23", default-features = false, features = ["std", "pqc"] }
 # The `ciris:node` host ABI (`host-abi` feature). No `getrandom-backend` here.
-ciris-host-abi    = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.0", version = "23", optional = true }
+ciris-host-abi    = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.1", version = "23", optional = true }
 # v62.0.0 (slice C, the kernel adapter) — persist's decisions answer through
 # `ciris-kernel`: no_std, zero dependencies, its rules the Constitution's
 # (CC 2.7). `src/kernel/` is the adapter (persist's verified rows as the
@@ -633,7 +643,7 @@ ciris-kernel = { git = "https://github.com/CIRISAI/CIRISKernel", tag = "kernel-v
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.0", version = "23", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.1", version = "23", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -937,7 +947,7 @@ tokio-stream = "0.1"
 # targets only (no node module is built for them), and they never match
 # `wasm32-unknown-unknown` (I1852 vets them by name).
 [target.'cfg(target_os = "ios")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.0", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "ios"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.1", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "ios"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No iOS openssl in any configuration now.
 
@@ -945,7 +955,7 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.0
 # v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
 # before the iOS entry (~line 628) for the rationale.
 rusqlite = { version = "0.41", features = ["backup", "bundled", "serde_json", "functions"], optional = true }
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.0", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "android"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.1", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "android"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No Android openssl in any configuration now,
 # retiring the flakiest part of the mobile wheel matrix.
@@ -963,7 +973,7 @@ required-features = ["test-anchor"]
 # own root (structurally inert against the pinned real Yubico root). Same
 # git tag as the [workspace] pins — one graph version, feature-unified in
 # test builds, absent from `--edges normal`.
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.0", version = "23", default-features = false, features = [
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.3.1", version = "23", default-features = false, features = [
     "test-support",
 ] }
 # v62.0.0 (slice D) — the lib's tokio is the node's (`rt, sync, macros, time`);

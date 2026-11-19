@@ -1760,6 +1760,9 @@ pub(crate) mod test_support {
             pub(crate) asserted_at_ms: u64,
             pub(crate) valid_until_ms: Option<u64>,
             pub(crate) extra: Vec<(&'static str, Value)>,
+            /// `refs.head` (required, CC 3.3.6.4): the roster row the bind
+            /// stands on. [`Bind::headed`] states the identity's current one.
+            pub(crate) head: Option<crate::federation::edition2::names::RowId>,
         }
 
         impl Bind {
@@ -1780,7 +1783,38 @@ pub(crate) mod test_support {
                     asserted_at_ms,
                     valid_until_ms: None,
                     extra: Vec::new(),
+                    head: None,
                 }
+            }
+
+            /// v62 (O1 fix 3) — state `refs.head` = the identity's current
+            /// roster head (`occurrence::current_roster_head`), unless one is
+            /// stated already. Call it when the bind is built: every voice of
+            /// one bind names the same head.
+            ///
+            /// # Panics
+            /// The identity's key record is not held.
+            pub(crate) async fn headed(mut self, dir: &dyn FederationDirectory) -> Self {
+                if self.head.is_none() {
+                    self.head = crate::federation::edition2::occurrence::current_roster_head(
+                        dir,
+                        &e2::kid(&self.identity),
+                    )
+                    .await
+                    .expect("e2bind: the roster head reads")
+                    .or_else(|| panic!("e2bind: no roster head for {}", self.identity));
+                }
+                self
+            }
+
+            /// State this `refs.head` (a sync builder's form of [`Bind::headed`]).
+            #[must_use]
+            pub(crate) fn on_head(
+                mut self,
+                head: Option<crate::federation::edition2::names::RowId>,
+            ) -> Self {
+                self.head = head;
+                self
             }
 
             /// One more payload member.
@@ -1811,6 +1845,12 @@ pub(crate) mod test_support {
                 }
                 for (k, v) in &self.extra {
                     m.push((*k, v.clone()));
+                }
+                if let Some(h) = &self.head {
+                    m.push((
+                        "refs",
+                        map(vec![("head", ciris_verify_core::edition2::row_ref(&h.0))]),
+                    ));
                 }
                 map(m)
             }
@@ -1886,6 +1926,7 @@ pub(crate) mod test_support {
         /// # Panics
         /// A voice is refused.
         pub(crate) async fn put_bind(dir: &dyn FederationDirectory, b: &Bind) -> StatementOutcome {
+            let b = b.clone().headed(dir).await;
             put_voices(dir, &b.voices()).await
         }
 
@@ -1995,6 +2036,7 @@ pub(crate) mod test_support {
                 },
                 None,
                 &[],
+                &[],
                 revoked_at_ms,
             )
             .await
@@ -2067,7 +2109,10 @@ pub(crate) mod test_support {
 
         // I3310 — the phone's own statement alone binds nothing.
         let (td1, d1) = transport_tag(0x10);
-        let b1 = Bind::new(&alice, &alice, &phone, PHONE, t(60)).with("transport_destination", td1);
+        let b1 = Bind::new(&alice, &alice, &phone, PHONE, t(60))
+            .headed(dir)
+            .await
+            .with("transport_destination", td1);
         let (own1, auth1) = (b1.own_voice(), b1.author_voice());
         let out = put(dir, &own1).await.expect("I3310: the own voice");
         assert!(
@@ -2097,6 +2142,8 @@ pub(crate) mod test_support {
 
         // I3314 — an author statement with no occurrence-key voice held.
         let b_laptop = Bind::new(&alice, &alice, &laptop, LAPTOP, t(60))
+            .headed(dir)
+            .await
             .with("transport_destination", transport_tag(0x60).0);
         let e = put(dir, &b_laptop.author_voice())
             .await
@@ -2114,6 +2161,8 @@ pub(crate) mod test_support {
 
         // I3315 — mallory authoring a bind of alice's identity.
         let b_m = Bind::new(&mallory, &alice, &phone, PHONE, t(60))
+            .headed(dir)
+            .await
             .with("transport_destination", transport_tag(0x61).0);
         let e = put(dir, &b_m.author_voice())
             .await
@@ -2157,7 +2206,10 @@ pub(crate) mod test_support {
 
         // I3316 — rotation: the phone, acting for alice, signs a newer bind.
         let (td2, d2) = transport_tag(0x20);
-        let b2 = Bind::new(&alice, &alice, &phone, PHONE, t(50)).with("transport_destination", td2);
+        let b2 = Bind::new(&alice, &alice, &phone, PHONE, t(50))
+            .headed(dir)
+            .await
+            .with("transport_destination", td2);
         let auth2 = b2.voice(&phone, &alice);
         put(dir, &b2.own_voice()).await.expect("I3316: own voice");
         let out = put(dir, &auth2)
@@ -2189,8 +2241,10 @@ pub(crate) mod test_support {
         // I3318 — a same-instant fork displaces nothing (fail-closed, never
         // last-writer-wins).
         let (td_fork, d_fork) = transport_tag(0x2F);
-        let fork =
-            Bind::new(&alice, &alice, &phone, PHONE, t(50)).with("transport_destination", td_fork);
+        let fork = Bind::new(&alice, &alice, &phone, PHONE, t(50))
+            .headed(dir)
+            .await
+            .with("transport_destination", td_fork);
         let out = put_bind(dir, &fork).await;
         assert!(
             matches!(out, StatementOutcome::Row { .. }),
@@ -2283,7 +2337,10 @@ pub(crate) mod test_support {
         );
         // ...while a NEWER bind re-establishes the route.
         let (td3, d3) = transport_tag(0x30);
-        let b3 = Bind::new(&alice, &alice, &phone, PHONE, t(30)).with("transport_destination", td3);
+        let b3 = Bind::new(&alice, &alice, &phone, PHONE, t(30))
+            .headed(dir)
+            .await
+            .with("transport_destination", td3);
         let v3 = b3.voices();
         let out = put_voices(dir, &v3).await;
         assert!(is_row(&out, true), "I3320: {out:?}");
@@ -2311,6 +2368,8 @@ pub(crate) mod test_support {
 
         // I3322 — a member outside the family's payload refuses by name.
         let bad = Bind::new(&alice, &alice, &phone, PHONE, t(10))
+            .headed(dir)
+            .await
             .with("transport_destination", transport_tag(0x70).0)
             .with("binding_provenance", Value::Text("ROOTED".into()));
         let e = put(dir, &bad.own_voice())
@@ -2364,6 +2423,8 @@ pub(crate) mod test_support {
 
         let (td, _) = transport([0x01; 32], [0x02; 32]);
         let b = Bind::new(&alice, &alice, &phone, PHONE, t(60))
+            .headed(dir)
+            .await
             .with("transport_destination", td)
             .with(
                 "encryption_pubkeys",
@@ -2528,8 +2589,10 @@ pub(crate) mod test_support {
 
         // (1) The route is materialized from the landed bind.
         let (td1, d1) = transport_tag(0x10);
-        let b1 =
-            Bind::new(&identity, &identity, &occ, PHONE, t(60)).with("transport_destination", td1);
+        let b1 = Bind::new(&identity, &identity, &occ, PHONE, t(60))
+            .headed(dir)
+            .await
+            .with("transport_destination", td1);
         let v1 = b1.voices();
         assert!(
             is_row(&put_voices(dir, &v1).await, true),
@@ -2566,8 +2629,10 @@ pub(crate) mod test_support {
         // (2) A newer bind supersedes in lockstep; an older one replayed
         // displaces nothing.
         let (td2, d2) = transport_tag(0x20);
-        let b2 =
-            Bind::new(&identity, &identity, &occ, PHONE, t(50)).with("transport_destination", td2);
+        let b2 = Bind::new(&identity, &identity, &occ, PHONE, t(50))
+            .headed(dir)
+            .await
+            .with("transport_destination", td2);
         assert!(is_row(&put_bind(dir, &b2).await, true), "I3325 (2)");
         let rows = routes(dir, &occ).await;
         assert_eq!(
@@ -2608,8 +2673,10 @@ pub(crate) mod test_support {
 
         // (4) A NEWER bind revives the route.
         let (td3, d3) = transport_tag(0x30);
-        let b3 =
-            Bind::new(&identity, &identity, &occ, PHONE, t(30)).with("transport_destination", td3);
+        let b3 = Bind::new(&identity, &identity, &occ, PHONE, t(30))
+            .headed(dir)
+            .await
+            .with("transport_destination", td3);
         assert!(is_row(&put_bind(dir, &b3).await, true), "I3325 (4)");
         let rows = routes(dir, &occ).await;
         assert_eq!(rows.len(), 1, "I3325 (4) a newer bind revives the route");
@@ -2624,6 +2691,8 @@ pub(crate) mod test_support {
         e2::put_key(dir, &agent_key, &["agent"]).await;
         for class in [AGENT, LAPTOP] {
             let under_person = Bind::new(&owner, &owner, &agent_key, class, t(25))
+                .headed(dir)
+                .await
                 .with("transport_destination", transport_tag(0x41).0);
             let e = put(dir, &under_person.own_voice())
                 .await
@@ -2640,6 +2709,8 @@ pub(crate) mod test_support {
         );
         e2::put_agent_owner_binding(dir, &owner, &agent, t(40)).await;
         let b_agent = Bind::new(&owner, &agent, &agent_key, AGENT, t(20))
+            .headed(dir)
+            .await
             .with("transport_destination", transport_tag(0x40).0);
         assert!(
             is_row(&put_bind(dir, &b_agent).await, true),
@@ -2664,6 +2735,8 @@ pub(crate) mod test_support {
             e2::put_key(dir, k, &["user"]).await;
         }
         let live = Bind::new(&live_id, &live_id, &live_occ, PHONE, t(10))
+            .headed(dir)
+            .await
             .until(now + 3_600_000)
             .with("transport_destination", transport_tag(0x50).0);
         assert!(is_row(&put_bind(dir, &live).await, true), "I3327 live bind");
@@ -2674,6 +2747,8 @@ pub(crate) mod test_support {
         );
         // ...and a bind whose `valid_until` has passed projects none.
         let expired = Bind::new(&exp_id, &exp_id, &exp_occ, PHONE, t(120))
+            .headed(dir)
+            .await
             .until(t(60))
             .with("transport_destination", transport_tag(0x51).0);
         put_bind(dir, &expired).await;
@@ -2778,8 +2853,15 @@ pub(crate) mod test_support {
         let enc_x = [0x57u8; 32];
         let enc_m = vec![0x58u8; XWING_ML_KEM_768_LEN];
         let (td, _) = transport(link, ted);
+        // A node self's binds land without a roster count (no sibling rule
+        // reads them), so one head for all of them is enough.
+        let relay_head =
+            crate::federation::edition2::occurrence::current_roster_head(dir, &e2::kid(&relay))
+                .await
+                .expect("the relay's roster head reads");
         let node_bind = |asserted_at_ms: u64| {
             Bind::new(&relay, &relay, &relay, SERVER, asserted_at_ms)
+                .on_head(relay_head)
                 .with("transport_destination", td.clone())
         };
 

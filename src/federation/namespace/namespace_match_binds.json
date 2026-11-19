@@ -1,9 +1,9 @@
 {
  "_meta": {
-  "cc_commit": "d4bd2a6b0583b8bc57c06a89f265557d357a3191",
+  "cc_commit": "e6fd7c6071ced5d0dcdd7f578e7fa9625e5bf16c",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
-  "vectors_sha256": "1312c45ada371caa7217417c5ebbcb81abbb8dcf7c45dff832f3dfa9ae02c00b"
+  "vectors_sha256": "46a274d010a37c16c81ef02718b21cbd31d67ba823fbade85317fabad127f7ca"
  },
  "binds": [
   {
@@ -379,6 +379,44 @@
    "dimension": "activity_tier:SAMPLE:v1",
    "family": "activity_tier:{period}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "admission:unit:v1",
+   "family": "admission:unit",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "admission:unit:V1",
+   "family": "admission:unit",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "admission:unit:v1:v2",
+   "family": "admission:unit",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "admission:unit:v1beta",
+   "family": "admission:unit",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Admission:unit:v1",
+   "family": "admission:unit",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "admission:unit",
+   "family": "admission:unit",
+   "refusal": "missing_version_segment"
   },
   {
    "binds": {
@@ -5667,42 +5705,42 @@
   },
   {
    "binds": {
-    "authority_id": "id1",
+    "authority_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "version": "v1"
    },
-   "dimension": "licensure:id1:v1",
+   "dimension": "licensure:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1",
    "family": "licensure:{authority_id}",
    "refusal": null
   },
   {
    "binds": {},
-   "dimension": "licensure:id1:V1",
+   "dimension": "licensure:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:V1",
    "family": "licensure:{authority_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "licensure:id1:v1:v2",
+   "dimension": "licensure:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1:v2",
    "family": "licensure:{authority_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "licensure:id1:v1beta",
+   "dimension": "licensure:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1beta",
    "family": "licensure:{authority_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "Licensure:id1:v1",
+   "dimension": "Licensure:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1",
    "family": "licensure:{authority_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {
-    "authority_id": "id1"
+    "authority_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    },
-   "dimension": "licensure:id1",
+   "dimension": "licensure:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
    "family": "licensure:{authority_id}",
    "refusal": "missing_version_segment"
   },
@@ -6214,42 +6252,42 @@
   },
   {
    "binds": {
-    "community_key_id": "id1",
+    "community_key_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "version": "v1"
    },
-   "dimension": "moderation_track_record:id1:v1",
+   "dimension": "moderation_track_record:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1",
    "family": "moderation_track_record:{community_key_id}",
    "refusal": null
   },
   {
    "binds": {},
-   "dimension": "moderation_track_record:id1:V1",
+   "dimension": "moderation_track_record:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:V1",
    "family": "moderation_track_record:{community_key_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "moderation_track_record:id1:v1:v2",
+   "dimension": "moderation_track_record:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1:v2",
    "family": "moderation_track_record:{community_key_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "moderation_track_record:id1:v1beta",
+   "dimension": "moderation_track_record:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1beta",
    "family": "moderation_track_record:{community_key_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "Moderation_track_record:id1:v1",
+   "dimension": "Moderation_track_record:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1",
    "family": "moderation_track_record:{community_key_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {
-    "community_key_id": "id1"
+    "community_key_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    },
-   "dimension": "moderation_track_record:id1",
+   "dimension": "moderation_track_record:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
    "family": "moderation_track_record:{community_key_id}",
    "refusal": "missing_version_segment"
   },
@@ -9155,6 +9193,50 @@
    "dimension": "witness_diversity:id1",
    "family": "witness_diversity:{contribution_id}",
    "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {},
+   "dimension": "licensure:urn:ietf:params:oauth:ckt:sha-256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1",
+   "family": null,
+   "refusal": null
+  },
+  {
+   "binds": {
+    "authority_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   },
+   "dimension": "licensure:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1",
+   "family": "licensure:{authority_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "authority_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"
+   },
+   "dimension": "licensure:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB:v1",
+   "family": "licensure:{authority_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "moderation_track_record:urn:ietf:params:oauth:ckt:sha-256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1",
+   "family": null,
+   "refusal": null
+  },
+  {
+   "binds": {
+    "community_key_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   },
+   "dimension": "moderation_track_record:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:v1",
+   "family": "moderation_track_record:{community_key_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "community_key_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"
+   },
+   "dimension": "moderation_track_record:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB:v1",
+   "family": "moderation_track_record:{community_key_id}",
+   "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {

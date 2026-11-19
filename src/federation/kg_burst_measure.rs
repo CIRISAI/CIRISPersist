@@ -129,23 +129,44 @@ mod measure {
         // v62.0.0 (E3b) — `emit_with_local_signer` (cut B: `emit_statement`)
         // split into sign (`produce_row`: the edition-2 statement) and put
         // (`admit_produced`: the statement door).
-        let out = emit_key_grant_axis_with(backend, &key, &axis, |input| {
+        // v62.0.0 (v62 P8 triage 2) — sign (the typed `key_grant:{axis}`
+        // payload through `sign_row`) and put (the statement door), timed apart.
+        let out = emit_key_grant_axis_with(backend, &key, &axis, |row, at_ms| {
             let (sign, put, signer) = (sign.clone(), put.clone(), signer.clone());
             async move {
                 let t0 = Instant::now();
-                let produced =
-                    crate::federation::attestation_emit::produce_row(backend, &signer, input, None)
-                        .await?;
+                let iss = signer.federation_id().await;
+                let payload =
+                    crate::federation::edition2::typed::key_grant_payload(&iss, &row, at_ms)?;
+                let statement = crate::federation::edition2::produce::sign_row(
+                    &signer,
+                    &row.wrap.recipient_key_id,
+                    crate::federation::types::attestation_type::SCORES,
+                    &ciris_verify_core::namespace_match::family_id(
+                        crate::federation::edition2::typed::KEY_GRANT_PREFIX,
+                    ),
+                    &payload,
+                )
+                .await
+                .map_err(|e| crate::federation::edition2::emit::produce_error("key_grant", e))?;
                 sign.set(sign.get() + t0.elapsed());
                 let t1 = Instant::now();
-                let e = crate::federation::attestation_emit::admit_produced(
+                let out = crate::federation::edition2::ingest::put_statement_with_origin(
                     backend,
-                    &produced,
-                    &produced.statement,
+                    &statement,
+                    None,
+                    crate::federation::types::attestation_tier::FEDERATION,
+                    crate::federation::replication::admission::WriteOrigin::Authored,
                 )
                 .await?;
                 put.set(put.get() + t1.elapsed());
-                Ok(e.attestation_id)
+                use crate::federation::edition2::ingest::StatementOutcome as O;
+                Ok(match out {
+                    O::Row { row_id, .. }
+                    | O::Voice { row_id, .. }
+                    | O::KeyPlane { row_id, .. }
+                    | O::Pending { row_id, .. } => row_id.hex(),
+                })
             }
         })
         .await

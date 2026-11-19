@@ -330,6 +330,7 @@ fn i3146_an_occurrence_revocation_reads_back() {
         Some(3),
         &super::names::RowId([3; 32]),
         &[],
+        &[],
         3_000,
     )
     .unwrap();
@@ -378,7 +379,9 @@ fn i3147_a_revocation_names_its_head_and_further_heads() {
         persist_row_hash: String::new(),
     };
     let (head, f1, f2) = (RowId([1; 32]), RowId([2; 32]), RowId([3; 32]));
-    let p = occurrence_revocation_payload(&rev, None, None, &head, &[f2, f1, f2], 2_000).unwrap();
+    let c1 = RowId([4; 32]);
+    let p = occurrence_revocation_payload(&rev, None, None, &head, &[f2, f1, f2], &[c1, c1], 2_000)
+        .unwrap();
     let names = names_of(&p).expect("I3147 the refs read");
     let role = |r: &str| -> Vec<RowId> {
         names
@@ -391,7 +394,12 @@ fn i3147_a_revocation_names_its_head_and_further_heads() {
     let mut further = role("further_heads");
     further.sort();
     assert_eq!(further, vec![f1, f2], "I3147 refs.further_heads, a set");
-    let plain = occurrence_revocation_payload(&rev, None, None, &head, &[], 2_000).unwrap();
+    assert_eq!(
+        role("also:cites"),
+        vec![c1],
+        "I3147 refs.also.cites (rc21 7f94be1), a set"
+    );
+    let plain = occurrence_revocation_payload(&rev, None, None, &head, &[], &[], 2_000).unwrap();
     assert!(
         names_of(&plain)
             .unwrap()

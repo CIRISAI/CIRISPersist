@@ -1394,6 +1394,37 @@ where
     }
 }
 
+/// fix2 (triage round 2) — **record a door's `Pending`**, on EVERY hold:
+/// the reason is the attempt's own mark when a gate set one, else
+/// [`reason::COUNT_SHORT`]; the reads REPLACE the row's earlier ones with
+/// this attempt's (plus the row's own), so the dependency index follows what
+/// the row waits on NOW. Before fix2 only the first hold was recorded: a row
+/// first held on A and later on B never re-folded when B arrived, and its
+/// reason stayed A's.
+///
+/// # Errors
+/// Storage failures.
+pub(crate) async fn record_pending<F>(
+    dir: &F,
+    row_id: RowId,
+    family: &str,
+    tier: &str,
+    mark: Option<(String, String)>,
+    mut reads: BTreeSet<String>,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    reads.insert(Dep::Row(row_id).read_key());
+    let held = mark.unwrap_or_else(|| {
+        (
+            reason::COUNT_SHORT.to_owned(),
+            "the row's voices are short of its count".to_owned(),
+        )
+    });
+    record(dir, row_id, family, tier, Some(held), reads).await
+}
+
 /// v4 — **is this held statement held BACK** (its row concludes nothing)?
 /// The key plane's reader (`ingest::held_keys_for_kid`) skips such a
 /// statement, so a held `key:revocation` or `key:record` is not read as

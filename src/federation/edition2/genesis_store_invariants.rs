@@ -1,6 +1,6 @@
 //! **I2310–I2320**: the genesis door, the genesis in force, canonical
 //! standing under ruling C and the accord's halt roster, on sqlite and
-//! postgres, over CIRISVerify 23.3.0's vectors
+//! postgres, over CIRISVerify 23.3.1's vectors (bundles v3, reseat v2)
 //! (`tests/vectors/verify_v23/genesis/`, pinned by I2300).
 //!
 //! - I2310: a fresh node is pre-genesis. Nothing is in force, no key is
@@ -195,8 +195,9 @@ fn recite(v: &Value, old: &Digest32, new: &Digest32) -> Value {
 }
 
 /// `first_valid`'s offer with its first seat's binding lacking `member`.
-/// Where the vendored binding already lacks it (Verify 23.3.0's vectors
-/// predate CC 3.3.6's occurrence members), the vector is the case as is.
+/// Where the vendored binding already lacks it, the vector is the case as
+/// is. (Verify 23.3.0's v2 vectors predated CC 3.3.6's occurrence members;
+/// 23.3.1's v3 bindings carry all three, so the binding is re-signed.)
 /// Otherwise the binding is re-signed by its seat without the member and
 /// the bundle re-cited and re-signed by every holder.
 fn first_valid_binding_without(f: &J, member: &str) -> Vec<Vec<u8>> {
@@ -271,8 +272,8 @@ pub(crate) async fn body_named_rows(d: &dyn FederationDirectory) {
         malformed_row::EDITION2_PAYLOAD_INVALID,
         "I2322: the binding's own refusal: {e:?}"
     );
-    // The first missing member is named; at Verify 23.3.0's vectors all three
-    // occurrence members are missing, after the re-vendor only `device_class`.
+    // The first missing member is named; at Verify 23.3.1's v3 vectors only
+    // `device_class` is missing (re-signed without it).
     assert!(message(&e).contains("identity:occurrence"), "I2322: {e:?}");
     assert_eq!(held_voices(d).await, 0, "I2322: no voice stored");
     for s in &offer {

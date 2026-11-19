@@ -951,7 +951,7 @@ pub async fn put_admitted_row<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    use super::fold::{plane, reason, Arrival, Dep};
+    use super::fold::{plane, Arrival};
     // v62.0.0 (wave G0 v4) — the row is folded under its ORIGINAL arrival:
     // a later voice, or a re-fold, of a row first held through the
     // replicated door runs the replicated door's gates (T1), at the tier it
@@ -995,27 +995,23 @@ where
         // waits for; its declared reads only ever conclude it (monotone).
         super::fold::enforce_final_plane(plane_name, admitted, att.held.as_ref(), &att.reads);
         let out = match (out, att.held) {
-            (Ok(o), _) => {
+            (Ok(o), mark) => {
                 match &o {
-                    // A plane that answered `Pending` without marking (T1's
-                    // count, O1's, W1's): the count is short.
+                    // A plane that answered `Pending` (T1's count, O1's,
+                    // W1's). fix2 — recorded on EVERY hold, not only the
+                    // first: the reason is this attempt's (its mark, else the
+                    // count), and the reads are this attempt's, so a row
+                    // held first on A and then on B re-folds when B arrives.
                     StatementOutcome::Pending { row_id, .. } => {
-                        if dir.fold_held(row_id).await?.is_none() {
-                            let mut reads = att.reads.clone();
-                            reads.insert(Dep::Row(*row_id).read_key());
-                            super::fold::record(
-                                dir,
-                                *row_id,
-                                &admitted.family,
-                                &tier,
-                                Some((
-                                    reason::COUNT_SHORT.to_owned(),
-                                    "the row's voices are short of its count".to_owned(),
-                                )),
-                                reads,
-                            )
-                            .await?;
-                        }
+                        super::fold::record_pending(
+                            dir,
+                            *row_id,
+                            &admitted.family,
+                            &tier,
+                            mark,
+                            att.reads.clone(),
+                        )
+                        .await?;
                     }
                     // Concluded on a plane other than the attestation tail
                     // (which records its own, with its inner reads): the

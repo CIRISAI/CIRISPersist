@@ -81,8 +81,11 @@ classifiers = [
 # v23.1.3 (`<24`) in lockstep with the Rust pins: the minor that ships
 # `PqcSigner::sign_with_context` and the earlier-form verifiers persist calls
 # (23.1.2 carried the same code mis-versioned and was never published).
+# v62.0.0 (CIRISVerify v23.3.1 re-pin, R1) — floor moves to v23.3.1 (`<24`) in
+# lockstep with the seven Rust pins: v62 needs 23.3.1's behaviour (what it
+# brings is listed in FSD/v62_wip/parallel/R1.md and the Cargo.toml comment).
 dependencies = [
-    "ciris-verify>=23.1.3,<24",
+    "ciris-verify>=23.3.1,<24",
 ]
 dynamic = ["version"]
 

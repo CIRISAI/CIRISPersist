@@ -918,6 +918,13 @@ pub(crate) fn sample_dimension(family: &str) -> Option<String> {
                 _ => "USD".to_owned(),
             },
             Class::Value | Class::Hex => match seg.pattern.as_ref().map(Regex::as_str) {
+                // v62.0.0 (R1c; CC v1.0-rc21-wire) — the reference's
+                // `SAMPLE_THUMBPRINT`: a key-bearing placeholder's pattern
+                // names `{42}`, and its sample is a key's bare thumbprint
+                // (43 `A`s, zero trailing bits). Checked before the numeric
+                // arm, as the reference orders it: the thumbprint pattern
+                // also contains `0-9` without `a-f`.
+                Some(p) if p.contains("{42}") => "A".repeat(43),
                 Some(p) if p.contains("0-9") && !p.contains("a-f") => "42".to_owned(),
                 Some(p) if p.contains("{64}") => "abcdef0123456789".repeat(4),
                 _ if seg.class == Class::Hex => "ab12".to_owned(),

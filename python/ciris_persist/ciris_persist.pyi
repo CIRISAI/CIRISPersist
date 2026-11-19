@@ -2668,6 +2668,26 @@ class Engine:
             ValueError: a malformed id.
         """
 
+    def admission_unit_runnable(self, row_id: str) -> str:
+        """v62.0.0 (CC 2.7.11) — the receipt leg of running admitted code.
+        ``row_id`` is the ``admission:unit`` row's id, 64 hex. The unit may
+        run, as far as its receipt goes, when a SCITT receipt (RFC 9942,
+        the statement's unprotected ``receipts`` parameter, label 394) held
+        on a voice of the row verifies and comes from a Transparency Service
+        this host trusts (a live ``trust:accepts`` edge of the host owner, at
+        ``self`` scope, whose ``trust_classes`` lists ``transparency``, names
+        it; its ``service_key`` is a CEG identity-ref or a COSE_Key). Returns JSON
+        ``{"row_id", "runnable", "answer", "token", "detail", "service",
+        "statement_id"}``: ``answer`` is ``runnable``, ``waiting`` (token
+        ``admission_receipt_missing``, detail ``none``, ``unverifiable`` or
+        ``untrusted_service``) or ``not_held`` (token ``admission_none``,
+        detail ``no_row``). The lease, standing, withdrawal and halt are the
+        host's other legs.
+
+        Raises:
+            ValueError: a malformed id.
+        """
+
     def edition2_held_rows(self, after: str | None = None, limit: int = 1000) -> str:
         """v62.0.0 (CC 2.7.3) — the held edition-2 rows that conclude nothing,
         in row-id order after ``after`` (64 hex; None from the first), at

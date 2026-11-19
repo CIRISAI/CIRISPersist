@@ -76,6 +76,9 @@ pub mod payloads;
 pub mod produce;
 pub mod projection;
 pub mod recovery_signer;
+// v62.0.0 (P10; CC rc21 2.7.11) — SCITT receipts (RFC 9942, label 394) held
+// with their statements; the receipt leg of running admitted code.
+pub mod receipts;
 pub mod serve;
 pub mod standing;
 pub mod store;
@@ -189,6 +192,10 @@ mod erasure_producer_invariants;
 // `valid_until_not_after_asserted_at`, on sqlite and postgres.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod window_invariants;
+// v62.0.0 (P10; CC rc21 2.7.11) — I4040–I4057: receipts outside the row id,
+// merged and served, and the receipt leg, on sqlite and postgres.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod receipts_invariants;
 
 pub use ciris_verify_core::edition2::Digest32;
 

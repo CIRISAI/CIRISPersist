@@ -120,6 +120,55 @@ pub fn bound_key_param(dimension: &str) -> Option<(&'static str, String)> {
     m.binds.get(*bind).map(|v| (family, v.clone()))
 }
 
+/// A key segment the probe below writes into a key position: 43 `A`s, zero
+/// trailing bits (CC's own `SAMPLE_THUMBPRINT`, `tools/cc_namespace_match.py`
+/// at v1.0-rc21-wire).
+const SAMPLE_KEY_SEGMENT: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// v62.0.0 (R1c; CC v1.0-rc21-wire e6fd7c60, CC 3.1 "A shape beyond the
+/// class") — **is the key position's own pattern the ONLY grammar fault
+/// the matcher finds in `dimension`?**
+///
+/// From rc21-wire the registry pins each [`KEY_BEARING_FAMILIES`] placeholder
+/// to a bare thumbprint (`segments[].pattern`
+/// `^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$`), so the one matcher answers
+/// `namespace_dimension_case_malformed` for an earlier-form key id there
+/// (`licensure:acme:v1`). Whether such an id is refused is this module's
+/// switch ([`check_dimension_key_segments`]: refused once the earlier-form
+/// doors are shut, still a key id until then), not the case rule's. This
+/// answers `true` when the dimension resolves to a key-bearing family, its
+/// key parameter is not a key segment, and the same dimension with a key
+/// segment written in that position earns no case or vocabulary refusal:
+/// every other segment stands on its own grammar.
+#[must_use]
+pub fn only_the_key_pattern_refuses(dimension: &str) -> bool {
+    use super::matcher::{match_family, Refusal};
+    let Some((_, param)) = bound_key_param(dimension) else {
+        return false;
+    };
+    if is_key_segment(&param) || param.contains(':') {
+        return false;
+    }
+    let mut replaced = false;
+    let probe: Vec<&str> = dimension
+        .split(':')
+        .enumerate()
+        .map(|(i, p)| {
+            if i > 0 && !replaced && p == param {
+                replaced = true;
+                SAMPLE_KEY_SEGMENT
+            } else {
+                p
+            }
+        })
+        .collect();
+    replaced
+        && !matches!(
+            match_family(&probe.join(":")).refusal,
+            Some(Refusal::CaseMalformed | Refusal::VocabValueUnregistered)
+        )
+}
+
 /// **The key-segment gate** (pure; every door). In a key-bearing position, a
 /// segment that is not a key segment is refused as [`Error::MalformedRow`]
 /// with [`malformed_row::ENVELOPE_MEMBER_INVALID`]:

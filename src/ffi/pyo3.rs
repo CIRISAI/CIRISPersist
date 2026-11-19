@@ -6729,6 +6729,59 @@ impl PyEngine {
         })
     }
 
+    /// v62.0.0 (P10; CC rc21 2.7.11) — **the receipt leg of running admitted
+    /// code**: FFI mirror of
+    /// [`Engine::admission_unit_runnable`](crate::engine::Engine::admission_unit_runnable).
+    /// `row_id` is the `admission:unit` row's id, 64 hex. Returns JSON
+    /// `{"row_id", "runnable": bool, "answer": "runnable"|"waiting"|"not_held",
+    /// "token": null|"admission_receipt_missing"|"admission_none", "detail":
+    /// null|"none"|"unverifiable"|"untrusted_service"|"no_row", "service":
+    /// str|null, "statement_id": hex|null}`. Raises `ValueError` for a
+    /// malformed id.
+    fn admission_unit_runnable(&self, py: Python<'_>, row_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use crate::federation::edition2::receipts::AdmissionReceipt;
+            let id =
+                crate::federation::edition2::names::RowId(parse_digest32_hex("row_id", row_id)?);
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let answer = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::receipts::admission_unit_runnable(
+                        dir.as_ref(),
+                        &id,
+                        crate::host::clock::now(),
+                    )
+                    .await
+                    .map_err(federation_err_to_py)
+                })
+            })?;
+            let (kind, service, statement_id) = match &answer {
+                AdmissionReceipt::Runnable {
+                    service,
+                    statement_id,
+                } => (
+                    "runnable",
+                    Some(service.clone()),
+                    Some(hex::encode(statement_id)),
+                ),
+                AdmissionReceipt::Waiting(_) => ("waiting", None, None),
+                AdmissionReceipt::NotHeld => ("not_held", None, None),
+            };
+            Ok(serde_json::json!({
+                "row_id": id.hex(),
+                "runnable": answer.is_runnable(),
+                "answer": kind,
+                "token": answer.token(),
+                "detail": answer.detail(),
+                "service": service,
+                "statement_id": statement_id,
+            })
+            .to_string())
+        })
+    }
+
     /// v62.0.0 (wave G0) — the held edition-2 rows that conclude nothing,
     /// in row-id order after `after` (64 hex, or `None` from the first), at
     /// most `limit` (clamped to 1000): FFI mirror of

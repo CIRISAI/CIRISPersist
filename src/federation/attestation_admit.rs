@@ -1499,8 +1499,22 @@ where
     // every backend runs at this same point. All three DID enforce the rule
     // before (sqlite + postgres by FK, memory by emulation); what none of
     // them could express is the keyless-family exception.
-    crate::federation::admission::check_attested_subject_admission(dir, &row.attested_key_id)
-        .await?;
+    // v62.0.0 (P10 fix1; CC 2.7.11, CC 4.4.3.34) — a `trust:accepts` edge
+    // whose `service_key` is a third-party Transparency Service's COSE_Key
+    // names that key's own bare RFC 9679 thumbprint: the edge itself is the
+    // subject's record (no `key:record` exists for a service outside CEG).
+    // Only when NO key:record (nor earlier key row) holds the thumbprint's
+    // identity-ref: a CEG key's thumbprint, revoked or retired included,
+    // takes the normal rule below. A read failure is not a skip: the normal
+    // rule runs (and meets the same directory).
+    let self_certified = matches!(
+        crate::federation::edition2::receipts::is_self_certified_service_edge(dir, &row).await,
+        Ok(true)
+    );
+    if !self_certified {
+        crate::federation::admission::check_attested_subject_admission(dir, &row.attested_key_id)
+            .await?;
+    }
 
     // ── AV-76 TIER 5 — the row as it will be stored ─────────────
     // D1: `check_withdraws_admission` above STAMPS

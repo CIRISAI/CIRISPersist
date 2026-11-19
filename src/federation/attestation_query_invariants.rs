@@ -169,19 +169,19 @@ pub(crate) mod bodies {
         // One live row per (subject, leaf): a second needs a `supersedes`.
         // A about A: three config:a* leaves (two tied), two config:b*
         // leaves (one tied with an A→B row), other:x.
-        rows.push(put_scores(d, &a, &a, "evidence:i900x:a:c:p:v1", -60).await);
-        rows.push(put_scores(d, &a, &a, "evidence:i900x:a2:c:p:v1", -50).await);
-        rows.push(put_scores(d, &a, &a, "evidence:i900x:a3:c:p:v1", -50).await);
-        rows.push(put_scores(d, &a, &a, "evidence:i900x:b:c:p:v1", -40).await);
-        rows.push(put_scores(d, &a, &a, "evidence:i900x:b2:c:p:v1", -30).await);
+        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:a:c:v1", -60).await);
+        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:a2:c:v1", -50).await);
+        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:a3:c:v1", -50).await);
+        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:b:c:v1", -40).await);
+        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:b2:c:v1", -30).await);
         rows.push(put_scores(d, &a, &a, "evidence:other:x:c:p:v1", -20).await);
         // A about B and C, one tied with A's config:b2.
-        rows.push(put_scores(d, &a, &b, "evidence:i900x:a:c:p:v1", -30).await);
-        rows.push(put_scores(d, &a, &b, "evidence:i900x:ab:c:p:v1", -10).await);
-        rows.push(put_scores(d, &a, &c, "evidence:i900x:a:c:p:v1", -25).await);
+        rows.push(put_scores(d, &a, &b, "evidence:safety_battery:capture:a:c:v1", -30).await);
+        rows.push(put_scores(d, &a, &b, "evidence:safety_battery:capture:ab:c:v1", -10).await);
+        rows.push(put_scores(d, &a, &c, "evidence:safety_battery:capture:a:c:v1", -25).await);
         // B about A.
-        rows.push(put_scores(d, &b, &a, "evidence:i900x:c:c:p:v1", -45).await);
-        rows.push(put_scores(d, &b, &a, "evidence:i900x:c2:c:p:v1", -5).await);
+        rows.push(put_scores(d, &b, &a, "evidence:safety_battery:capture:c:c:v1", -45).await);
+        rows.push(put_scores(d, &b, &a, "evidence:safety_battery:capture:c2:c:v1", -5).await);
         // I913 — scoped rows: two communities, one species-wide row. A
         // community row lands only when the community's roster is held here
         // and names its writer (AV-45, `check_write_cohort_scope_for`; an
@@ -270,9 +270,9 @@ pub(crate) mod bodies {
         );
         // C noise.
         for (leaf, m) in [
-            ("evidence:i900x:a:c:p:v1", -55),
-            ("evidence:i900x:a2:c:p:v1", -35),
-            ("evidence:i900x:a3:c:p:v1", -15),
+            ("evidence:safety_battery:capture:a:c:v1", -55),
+            ("evidence:safety_battery:capture:a2:c:v1", -35),
+            ("evidence:safety_battery:capture:a3:c:v1", -15),
         ] {
             rows.push(put_scores(d, &c, &c, leaf, m).await);
         }
@@ -296,7 +296,7 @@ pub(crate) mod bodies {
                 weight: None,
                 expires_at: None,
                 attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    serde_json::json!({ "dimension": "evidence:i900x:a:c:p:v1" }),
+                    serde_json::json!({ "dimension": "evidence:safety_battery:capture:a:c:v1" }),
                 )
                 .unwrap(),
                 subject_key_ids: vec![],
@@ -321,7 +321,7 @@ pub(crate) mod bodies {
             by: a.clone(),
             to: a.clone(),
             kind: attestation_type::SCORES.into(),
-            dimension: Some("evidence:i900x:a:c:p:v1".into()),
+            dimension: Some("evidence:safety_battery:capture:a:c:v1".into()),
             at: local[0].asserted_at,
             local: true,
             scope: crate::federation::types::cohort_scope::SELF.to_owned(),
@@ -369,22 +369,27 @@ pub(crate) mod bodies {
             ));
             out.push((
                 "by A, prefix config:",
-                o(AttestationQuery::by(a, lim).dimension_prefix("evidence:i900x:")),
+                o(AttestationQuery::by(a, lim)
+                    .dimension_prefix("evidence:safety_battery:capture:")),
                 expect(
                     corpus,
-                    |r| fed(r) && r.by == a && dim(r, "evidence:i900x:"),
+                    |r| fed(r) && r.by == a && dim(r, "evidence:safety_battery:capture:"),
                     oldest,
                 ),
             ));
             out.push((
                 "by A, exact config:a:v1",
-                o(AttestationQuery::by(a, lim).dimension("evidence:i900x:a:c:p:v1")),
+                o(
+                    AttestationQuery::by(a, lim)
+                        .dimension("evidence:safety_battery:capture:a:c:v1"),
+                ),
                 expect(
                     corpus,
                     |r| {
                         fed(r)
                             && r.by == a
-                            && r.dimension.as_deref() == Some("evidence:i900x:a:c:p:v1")
+                            && r.dimension.as_deref()
+                                == Some("evidence:safety_battery:capture:a:c:v1")
                     },
                     oldest,
                 ),
@@ -407,26 +412,29 @@ pub(crate) mod bodies {
                 "by A, withdraws+scores excluding config:a:v1",
                 o(AttestationQuery::by(a, lim)
                     .types(&[attestation_type::SCORES, attestation_type::WITHDRAWS])
-                    .excluding_dimensions(&["evidence:i900x:a:c:p:v1"])),
+                    .excluding_dimensions(&["evidence:safety_battery:capture:a:c:v1"])),
                 expect(
                     corpus,
                     |r| {
                         fed(r)
                             && r.by == a
-                            && r.dimension.as_deref() != Some("evidence:i900x:a:c:p:v1")
+                            && r.dimension.as_deref()
+                                != Some("evidence:safety_battery:capture:a:c:v1")
                     },
                     oldest,
                 ),
             ));
             out.push((
                 "by A excluding config:a:v1 (no type)",
-                o(AttestationQuery::by(a, lim).excluding_dimensions(&["evidence:i900x:a:c:p:v1"])),
+                o(AttestationQuery::by(a, lim)
+                    .excluding_dimensions(&["evidence:safety_battery:capture:a:c:v1"])),
                 expect(
                     corpus,
                     |r| {
                         fed(r)
                             && r.by == a
-                            && r.dimension.as_deref() != Some("evidence:i900x:a:c:p:v1")
+                            && r.dimension.as_deref()
+                                != Some("evidence:safety_battery:capture:a:c:v1")
                     },
                     oldest,
                 ),
@@ -435,10 +443,15 @@ pub(crate) mod bodies {
                 "to B by A prefix config:a",
                 o(AttestationQuery::to(b, lim)
                     .authored_by(a)
-                    .dimension_prefix("evidence:i900x:a")),
+                    .dimension_prefix("evidence:safety_battery:capture:a")),
                 expect(
                     corpus,
-                    |r| fed(r) && r.to == b && r.by == a && dim(r, "evidence:i900x:a"),
+                    |r| {
+                        fed(r)
+                            && r.to == b
+                            && r.by == a
+                            && dim(r, "evidence:safety_battery:capture:a")
+                    },
                     oldest,
                 ),
             ));
@@ -463,8 +476,10 @@ pub(crate) mod bodies {
             // I913 — DimensionFilter::AnyOf: exact dimensions OR'd.
             out.push((
                 "by A, any of config:a:v1 / config:b2:v1",
-                o(AttestationQuery::by(a, lim)
-                    .dimension_any_of(&["evidence:i900x:a:c:p:v1", "evidence:i900x:b2:c:p:v1"])),
+                o(AttestationQuery::by(a, lim).dimension_any_of(&[
+                    "evidence:safety_battery:capture:a:c:v1",
+                    "evidence:safety_battery:capture:b2:c:v1",
+                ])),
                 expect(
                     corpus,
                     |r| {
@@ -472,7 +487,10 @@ pub(crate) mod bodies {
                             && r.by == a
                             && matches!(
                                 r.dimension.as_deref(),
-                                Some("evidence:i900x:a:c:p:v1" | "evidence:i900x:b2:c:p:v1")
+                                Some(
+                                    "evidence:safety_battery:capture:a:c:v1"
+                                        | "evidence:safety_battery:capture:b2:c:v1"
+                                )
                             )
                     },
                     oldest,
@@ -481,9 +499,9 @@ pub(crate) mod bodies {
             out.push((
                 "to B, any of config:a:v1 / config:ab:v1 / absent",
                 o(AttestationQuery::to(b, lim).dimension_any_of(&[
-                    "evidence:i900x:a:c:p:v1",
-                    "evidence:i900x:ab:c:p:v1",
-                    "evidence:i900x:none:c:p:v1",
+                    "evidence:safety_battery:capture:a:c:v1",
+                    "evidence:safety_battery:capture:ab:c:v1",
+                    "evidence:safety_battery:capture:none:c:v1",
                 ])),
                 expect(
                     corpus,
@@ -492,7 +510,10 @@ pub(crate) mod bodies {
                             && r.to == b
                             && matches!(
                                 r.dimension.as_deref(),
-                                Some("evidence:i900x:a:c:p:v1" | "evidence:i900x:ab:c:p:v1")
+                                Some(
+                                    "evidence:safety_battery:capture:a:c:v1"
+                                        | "evidence:safety_battery:capture:ab:c:v1"
+                                )
                             )
                     },
                     oldest,
@@ -792,8 +813,22 @@ pub(crate) mod bodies {
         // A row RECEIVED now but SIGNED at -40 (inside the view) enters it; a
         // row received now and signed at -25 (after t) does not — even though
         // both landed after the first read.
-        let inside = put_scores(d, &a, &corpus.b, "evidence:i900x:i906in:c:p:v1", -40).await;
-        let outside = put_scores(d, &a, &corpus.b, "evidence:i900x:i906out:c:p:v1", -25).await;
+        let inside = put_scores(
+            d,
+            &a,
+            &corpus.b,
+            "evidence:safety_battery:capture:i906in:c:v1",
+            -40,
+        )
+        .await;
+        let outside = put_scores(
+            d,
+            &a,
+            &corpus.b,
+            "evidence:safety_battery:capture:i906out:c:v1",
+            -25,
+        )
+        .await;
         let after = d.query_attestations(&q).await.served().unwrap().rows;
         let ids: Vec<&str> = after.iter().map(|r| r.attestation_id.as_str()).collect();
         assert!(

@@ -578,7 +578,52 @@ fn typed_value(v: &serde_json::Value, member: &str, ty: Ty) -> Value {
     }
 }
 
+/// v62.0.0 (E0 fix 2) — **the earlier-form row in its edition-2 shape**,
+/// before anything is read from it:
+/// - a TYPE-keyed row (an `attestation_type` outside the five row types,
+///   e.g. `age_self_declared:band:adult`) with no dimension is a `scores`
+///   row whose dimension is that type: edition 2 has no type-keyed shape
+///   (the row type is one of five, CC 2.6.1);
+/// - a dimension Verify's matcher refuses ONLY for its missing trailing
+///   version segment (`capacity:integrity`, `cert_validity:probe`) carries
+///   `:v1` when that resolves to a registered family (the rc21 R3 rule).
+///   Any other refusal, and open vocabulary, are left for the door to
+///   refuse.
+fn edition2_shape(a: &Attestation) -> std::borrow::Cow<'_, Attestation> {
+    let mut out = std::borrow::Cow::Borrowed(a);
+    let has_dimension = a.attestation_envelope.get("dimension").is_some();
+    if !has_dimension && !attestation_type::ALL.contains(&a.attestation_type.as_str()) {
+        let row = out.to_mut();
+        let ty = std::mem::replace(
+            &mut row.attestation_type,
+            attestation_type::SCORES.to_owned(),
+        );
+        if let Some(o) = row.attestation_envelope.as_object_mut() {
+            o.insert("dimension".to_owned(), serde_json::Value::String(ty));
+        }
+    }
+    let dim = out
+        .attestation_envelope
+        .get("dimension")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if let Some(d) = dim {
+        if matches!(namespace_match::resolve(&d), Err(r) if r.token == "missing_version_segment") {
+            let versioned = format!("{d}:v1");
+            if matches!(
+                namespace_match::resolve(&versioned),
+                Ok(namespace_match::Resolved::Family { .. })
+            ) {
+                out.to_mut().attestation_envelope["dimension"] =
+                    serde_json::Value::String(versioned);
+            }
+        }
+    }
+    out
+}
+
 fn try_family_of(row: &Attestation) -> Result<String, String> {
+    let row = &*edition2_shape(row);
     let env = &row.attestation_envelope;
     if let Some(d) = env.get("dimension").and_then(serde_json::Value::as_str) {
         return match namespace_match::resolve(d) {
@@ -848,6 +893,7 @@ pub fn try_statement_of(a: &Attestation, seed: &str) -> Result<Vec<u8>, String> 
 /// A payload member the codec cannot carry; a signing failure.
 #[must_use]
 pub fn statement_of_family(a: &Attestation, seed: &str, family: &str) -> Vec<u8> {
+    let a = &*edition2_shape(a);
     let key = signing_key(seed);
     let iref = identity_ref(&thumbprint(key.public_key()));
     let payload = payload_of(a, family, &iref);
@@ -949,7 +995,22 @@ fn tier_of(a: &Attestation) -> &str {
 /// # Errors
 /// The door's refusals.
 pub fn try_row_of(a: &Attestation, seed: &str) -> Result<Attestation, Error> {
-    try_row_of_statement(&statement_of(a, seed), tier_of(a))
+    try_row_of_statement(&try_statement_of_door(a, seed)?, tier_of(a))
+}
+
+/// [`try_statement_of`] with a row that names no family (a dimension
+/// Verify's matcher refuses or does not register) as the door's refusal:
+/// `federation_malformed_row` / `edition2_statement_invalid`, its message
+/// naming the matcher's token. Never a panic, so a witness that expects
+/// the refusal reads it as an `Err`.
+fn try_statement_of_door(a: &Attestation, seed: &str) -> Result<Vec<u8>, Error> {
+    try_statement_of(a, seed).map_err(|why| {
+        Error::malformed_row(
+            super::door::PLANE,
+            super::token::STATEMENT_INVALID,
+            format!("the statement door refuses the row: {why}"),
+        )
+    })
 }
 
 /// [`try_row_of`], panicking on a refusal.
@@ -1400,6 +1461,7 @@ pub async fn put_key_for_signer<D: FederationDirectory + ?Sized>(
 /// As [`statement_of_family`].
 #[must_use]
 pub fn statement_of_with_key(a: &Attestation, key: &CompositeSigningKey, family: &str) -> Vec<u8> {
+    let a = &*edition2_shape(a);
     let iref = identity_ref(&thumbprint(key.public_key()));
     let payload = payload_of(a, family, &iref);
     let st = sign_row_statement(
@@ -1851,7 +1913,7 @@ pub async fn try_put_row<D: FederationDirectory + ?Sized>(
     a: &Attestation,
     seed: &str,
 ) -> Result<Attestation, Error> {
-    let st = statement_of(a, seed);
+    let st = try_statement_of_door(a, seed)?;
     check_default_window(&st);
     super::ingest::put_statement(dir, &st, None, tier_of(a)).await?;
     try_row_of_statement(&st, tier_of(a))

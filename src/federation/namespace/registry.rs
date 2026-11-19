@@ -38,14 +38,23 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc20";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc21";
+
+/// v62.0.0 (R1c) — the CIRISConstitution TAG the vendored files were copied
+/// from. Through rc20 the tag was `v<VENDORED_CC_VERSION>`; rc21's cut is
+/// tagged `v1.0-rc21-wire` (the manifest's `_meta.cc_version` still reads
+/// `1.0-rc21`), so the tag witnesses (I1302, I1499) and
+/// `scripts/check_vendored_cc.sh` name the tag by this const, never by
+/// formatting the version. A witness that formatted `v1.0-rc21` would find
+/// no such tag and SKIP: a check that could not fail.
+pub const VENDORED_CC_TAG: &str = "v1.0-rc21-wire";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "c6631c9cd71a7f1094ea538b3b0ae643656ca118da9032492b6592b8858d2545";
+    "5ca71c32a4573063d9a904a14adc7ae0d5f05866bd7ec34b034b2e6fce884f60";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 186;
+pub const VENDORED_N_FAMILIES: usize = 187;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -55,33 +64,34 @@ pub const VENDORED_N_FAMILIES: usize = 186;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc20; see [`VENDORED_CC_COMMIT`] for the tag), together with
+/// (CC 1.0-rc21; see [`VENDORED_CC_COMMIT`] for the tag), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "4ad83caa00b33a4b7097f8fa655ced9d47cf56de6cb258b604a7744cb2abcca0";
+    "1f81a1b1ab6f29b645d292f70d8d15810b475fbde5d6444ffe33b4ee68845bd2";
 
 /// The CIRISConstitution commit every vendored CC manifest was copied from: the
-/// commit the `v1.0-rc20` tag names (`d4bd2a6b`, tag object `e9761fb9`), copied
-/// from the tag with `git show v1.0-rc20:manifests/<file>`, never a branch tip
-/// (CIRISPersist#753; v62.0.0, from rc18 `646df978`; v61.3.0,
-/// CIRISPersist#1252, from rc15 `ace6b74`). The
+/// commit the `v1.0-rc21-wire` tag names (`e6fd7c60`, [`VENDORED_CC_TAG`]),
+/// copied from the tag with `git show v1.0-rc21-wire:manifests/<file>`, never
+/// a branch tip (v62.0.0 R1c, from rc20 `d4bd2a6b`, so persist's matcher reads
+/// the registry CIRISVerify 23.3.1 vendors; CIRISPersist#753; v62.0.0, from
+/// rc18 `646df978`; v61.3.0, CIRISPersist#1252, from rc15 `ace6b74`). The
 /// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`], and the
-/// files in [`super::cc_manifests`]), and `scripts/check_vendored_cc.sh v1.0-rc20`
-/// byte-compares all of them against the tag before a persist release that
-/// names rc20 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "d4bd2a6b0583b8bc57c06a89f265557d357a3191";
+/// files in [`super::cc_manifests`]), and
+/// `scripts/check_vendored_cc.sh v1.0-rc21-wire` byte-compares all of them
+/// against the tag before a persist release that names rc21 is tagged.
+pub const VENDORED_CC_COMMIT: &str = "e6fd7c6071ced5d0dcdd7f578e7fa9625e5bf16c";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "5c8bcf87732b37f9e653e0e45190ae599d6f86f077b5ca02bd6c7a7039806002";
+    "c6a478d65b8d7040311f989941b7d747de756abf4718ce3bdf7f459bfce41f49";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =
-    "1312c45ada371caa7217417c5ebbcb81abbb8dcf7c45dff832f3dfa9ae02c00b";
+    "46a274d010a37c16c81ef02718b21cbd31d67ba823fbade85317fabad127f7ca";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -1140,6 +1150,12 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "detection:{detector}",
     "location_proof:{version}",
     "trust:blessing",
+    // rc21 (CIRISConstitution v1.0-rc21-wire @ e6fd7c60; v62.0.0 R1c) — one
+    // family added, none retired: the kernel admission unit (CC 3.1.3,
+    // CC 2.7.11; reserved, `substrate-self-report`). Two rows gain a segment
+    // `pattern` (a key's bare thumbprint: `licensure:{authority_id}`,
+    // `moderation_track_record:{community_key_id}`); two descriptions move.
+    "admission:unit",
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,

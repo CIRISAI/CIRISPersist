@@ -83,7 +83,10 @@
 //!   other row hands on nothing; a named record not held is waited on;
 //! - a rotation whose predecessor statement is not held at all WAITS on the
 //!   predecessor key here (a door receives a row's voices one at a time,
-//!   CC 2.6.1.8; I2101), where Verify's directory answers `No`;
+//!   CC 2.6.1.8; I2101), where Verify 23.3.0's directory answered `No` (the
+//!   v1 file's answer). Verify 23.3.1 (CC rc21) waits too, naming the
+//!   missing voice (`MissingKey::Voice`): the verdict now agrees, the link
+//!   named differs;
 //! - a rotation whose predecessor statement waits names the link I2101
 //!   names (the predecessor key when its record is held, else the record
 //!   `target` names), where Verify names the key that statement waits on.
@@ -931,12 +934,14 @@ pub enum KeyOf {
 }
 
 impl KeyOf {
-    /// **The one mapping onto CIRISVerify 23.3.0's `KeyDirectory::key_of`
+    /// **The one mapping onto CIRISVerify's `KeyDirectory::key_of`
     /// answer** (v62.0.0, slice C3). A key or a record maps to Verify's
     /// `MissingKey::Kid` / `MissingKey::Record`. [`ChainMissing::Bundle`]
-    /// (no genesis bundle in force held) has no Verify counterpart: it maps
-    /// to `MissingKey::Kid(kid)`, the signing key the bundle would seat, so
-    /// the reading stays retryable.
+    /// (no genesis bundle in force held) maps to `MissingKey::Kid(kid)`, the
+    /// signing key the bundle would seat, so the reading stays retryable.
+    /// R1 (Verify 23.3.1): Verify now has `MissingKey::Bundle(object_id)`,
+    /// but persist's seat arm does not know the object id of a bundle it
+    /// does not hold ([`BundleSeats`]), so the mapping is unchanged.
     #[must_use]
     pub fn to_verify(&self, kid: &Digest32) -> VerifyKeyOf {
         match self {

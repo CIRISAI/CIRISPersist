@@ -33,7 +33,8 @@ use std::sync::Arc;
 /// A signed federation-tier row of `attestation_type` by the key of seed
 /// `author`, carrying `extra` in its envelope: the earlier-shaped fixture,
 /// signed as an edition-2 statement (`row_of`), so its id is computed. The
-/// dimension is a registered family (`capacity:{factor}`).
+/// dimension is a registered, unreserved family (`truth_grounding:{subject}`;
+/// `capacity:` is reserved no-self-emit and these rows are self-attested).
 fn sealed(id: &str, author: &str, ty: &str, extra: serde_json::Value) -> Attestation {
     // v62.0.0 — an edition-2 row id is computed from the row, so two
     // fixtures of one author and envelope are one row unless they differ:
@@ -44,7 +45,7 @@ fn sealed(id: &str, author: &str, ty: &str, extra: serde_json::Value) -> Attesta
         .with_timezone(&chrono::Utc)
         + chrono::Duration::milliseconds(TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let mut envelope = serde_json::json!({
-        "dimension": "capacity:integrity",
+        "dimension": "truth_grounding:fixture:v1",
         "score": 1.0,
         "confidence": 0.9,
     });
