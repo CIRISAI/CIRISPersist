@@ -5,6 +5,10 @@
 # Used by cargo_guard.sh to learn the real (anonymous) peak of a build, since
 # memory.peak counts reclaimable page cache too.
 set -u
+# Close cargo_guard's slot-lock fd (9) if it was inherited: this sampler can
+# outlive the guarded build, and holding fd 9 kept slot 0 locked after the
+# build ended (orphaned ~1 h, 2026-11-18).
+exec 9>&-
 cg="$1"; out="$2"; iv="${3:-2}"
 pa=0; pf=0; pc=0; t0=$(date +%s)
 while [ -d "$cg" ]; do

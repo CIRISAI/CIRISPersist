@@ -105,14 +105,15 @@ if command -v systemd-run >/dev/null 2>&1 \
     esac
     unit="cargo-guard-$$-$(date +%s)"
     # 5. The scope exists only once systemd-run starts it; a detached helper
-    # waits for it and samples until it vanishes.
+    # waits for it and samples until it vanishes. `9>&-`: the helper must not
+    # inherit the slot lock, or it holds the slot after the build ends.
     (
         cg="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/$unit.scope"
         for _ in $(seq 1 50); do [ -d "$cg" ] && break; sleep 0.2; done
         [ -d "$cg" ] || exit 0
         mkdir -p "$(dirname "$stats")"
         exec "$here/cgroup_mem_sampler.sh" "$cg" "$stats" 2
-    ) </dev/null >/dev/null 2>&1 &
+    ) </dev/null >/dev/null 2>&1 9>&- &
     disown 2>/dev/null || true
     # 3. memory.oom.group is set from INSIDE the scope, before the command
     # starts, so there is no window in which a fast allocator can be killed
