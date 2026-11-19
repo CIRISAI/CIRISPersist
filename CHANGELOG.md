@@ -5,6 +5,42 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.4.2] - 2026-11-19
+
+An agent's voice or video call could not join. The directory capsule proxy (`OpsDirectory`) answered `Unsupported` for 35 `FederationDirectory` methods, so persist's folds and doors failed, or read "nothing there", at the first one they touched on an agent install. Call joins refused 503 (`directory ops proxy: method list_community_membership_widenings_for has no DirectoryOp`, then `list_group_versions has no DirectoryOp`). This release routes every one of them across the capsule. The proxy has no `Unsupported` stub of its own left.
+
+### Fixed
+
+- **The capsule proxy routes every `FederationDirectory` method it stubbed** (`src/ffi/directory_capsule.rs`). v61.4.0 (#1244 round 2) routed the family membership pair and left the rest as `Unsupported` stubs on the I1162 allowlist. Each method now has a `DirectoryOp` variant (the method's name in CamelCase), a dispatch arm that calls the host's method inside persist's `.so`, and a proxy body that answers through `run_op`. The methods:
+  - room membership reads: `list_community_membership_{widenings,revocations}_for` (Edge's call join reads a room's active roster through these);
+  - group-plane writes: `add_community_member`, `add_family_member`, `put_{community,family}_membership_{widening,revocation}`, `supersede_group_row`;
+  - group reads: `list_group_versions`, `communities_containing`, `list_communities_for_member`, `lookup_keys_for_identity`;
+  - attestation reads: `attestations_binding_content`, `attestations_binding_content_with_placements`, `list_attestations_by_dimension_citing`, `attestation_type_census`, and `list_live_consent_grants_by`. That last one inherited a trait default answering `Unsupported`, so Edge's capability gate (which calls it with `.unwrap_or_default()`) read "no grants" through the capsule;
+  - local tier and crossing: `attestation_insert_local`, `attestation_upsert_local`, `enter_mesh`;
+  - hybrid completion: `attach_key_pqc_signature`, `attach_attestation_pqc_signature`, `list_hybrid_pending_keys`, `list_hybrid_pending_attestations`;
+  - consent: `set_consent_role`;
+  - location proofs: `list_location_proofs_for`, `withdraw_location_proof`;
+  - accord: `put_accord_proposal`, `get_accord_proposal`, `put_accord_participation`, `list_accord_participations`, `put_accord_decision`, `set_active_halt`, `clear_active_halt`;
+  - blobs: `dag_manifests_of_chunk`.
+- Every routed method's allowlist row is removed, and so is the `PRE_1162` reason. What stays allowlisted are inherited trait defaults only: the node-local cosign ledgers, the retired group-framed reads, and the purge, migration and v31 doors.
+- `TierPromotionCustody`, `AttestationReseal` and `HybridPendingRow` derive `Serialize`/`Deserialize` so they can cross the capsule (additive).
+- **ABI stays 13.** All new variants are APPENDED to `DirectoryOp` and `DirectoryOpResult`, and no existing variant moves (growth under the #682 rule, as in v61.4.0). The structural digests are re-pinned. New result variants: `CommunityMembershipRevocations`, `CommunityMembershipWidenings`, `Communities`, `AttestationId`, `AttestationTypeCounts`, `ChunkManifests`, `MeshCrossing`, `AccordProposal`, `AccordParticipations`, `GroupVersions`, `LocationProofs`, `GroupRowVersion`, `HybridPendingRows`.
+
+### Adoption notes (CIRISEdge, CIRISServer)
+
+- `OpsDirectory` is compiled into the consumer. A persist `.so` from this release loads under an Edge built against 61.4.1, because the ABI number does not move, but the refusals only clear once Edge and Server re-pin to 61.4.2 and link the new proxy. No call shapes change.
+- A consumer that matches `DirectoryOp` or `DirectoryOpResult` exhaustively needs arms for the variants above.
+
+### Tested
+
+- I1762 extended to 25 rows (sqlite and postgres, over the fault-injecting directory): both community planes carry the host's injected failure by name through the vtable and the proxy, and with no fault the proxy agrees with the direct call, never `Unsupported`.
+- I1808 (new, sqlite and postgres): a keyless room (alice founder, bob member), one widening adding carol and one revocation removing bob. The vtable and the proxy each return the direct backend's rows for both planes, and the fold over the proxy's three reads (`active_roster_at`) is `{alice, carol}`, the shape Edge's call join reads.
+- I1890 (new, sqlite and postgres): one row per swept method (34). The vtable and the proxy both carry the host's injected failure by name. With no fault, a read through the proxy equals the direct call, and a write never answers `Unsupported` or "has no DirectoryOp".
+- I1891 (new, sqlite and postgres): `add_community_member` and `put_community_membership_revocation` through the proxy land exactly as direct writes, and `list_group_versions`, `list_communities_for_member` and `lookup_keys_for_identity` through the proxy equal the direct reads, non-empty.
+- I1892 (new, sqlite and postgres): an accord halt set and cleared through the proxy is seen by the direct `get_active_halt`.
+- I1893 (new, from disk): none of the 60 trait methods CIRISEdge v45.1.6 calls from production code is allowlisted `Unsupported`, and every pinned name is a trait method, so a rename cannot empty the check. I1162 still requires every remaining `Unsupported` answer to carry an allowlist row and a reason.
+- CIRISServer's end-to-end call witness on the agent boot path (fold home, two members, Server 0.5.250 built against this tree): both members now join the call, and none of the six nodes' logs contains "has no DirectoryOp". This witnesses the join only. The call's media path is not part of this fix.
+
 ## [61.4.1] - 2026-11-14
 
 A member seated late in a room of three or more could read an earlier message as `seal_mismatch`, permanently (CIRISPersist#1271). This release binds a room message to its author's minter, and heals on read a binding that is already wrong.
