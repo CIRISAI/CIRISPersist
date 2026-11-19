@@ -543,14 +543,24 @@ where
             .and_then(serde_json::Value::as_str),
     )
     .then_some(iss.as_str());
-    let mut payload = payload_from_envelope(
-        &envelope,
-        &family,
-        asserted_at_ms,
-        author,
-        &["references_attestation_id"],
-    )
-    .map_err(|e| produce_error(producer, e))?;
+    // v62.0.0 (E12, round 3) — a composer's payload is the common members
+    // and `refs` only (`payloads::check_composer`). The earlier envelope's
+    // composer bookkeeping (`withdraws_attestation_envelope`: `kind`,
+    // `references_attestation_type`) restated what the header already says
+    // (the row type, and the target's family it carries); stated as members,
+    // the door refused every edition-2 withdraws this producer signed.
+    let drop_members: &[&str] = if composer {
+        &[
+            "references_attestation_id",
+            "references_attestation_type",
+            "kind",
+        ]
+    } else {
+        &["references_attestation_id"]
+    };
+    let mut payload =
+        payload_from_envelope(&envelope, &family, asserted_at_ms, author, drop_members)
+            .map_err(|e| produce_error(producer, e))?;
     if let Some((digest, _)) = &target {
         payload = with_member(payload, "refs", refs_target(digest))
             .map_err(|e| produce_error(producer, e))?;

@@ -813,6 +813,10 @@ mod engine_bodies {
         let (fam_a, fam_b) = (format!("em-fam-a-{run}"), format!("em-fam-b-{run}"));
         ra::family(ba as &dyn FederationDirectory, &fam_a, &[&l.alice]).await;
         ra::family(ba as &dyn FederationDirectory, &fam_b, &[&l.alice]).await;
+        // v62.0.0 (round 3) — the groups are T1 rosters keyed by identity-refs:
+        // every later read and write names them by kid.
+        let kid = crate::federation::edition2::fixture_switch::kid_or_keep;
+        let (comm_b, fam_a, fam_b) = (kid(&comm_b), kid(&fam_a), kid(&fam_b));
         let c = e
             .put_blob_scoped(COMMUNITY, Some(&l.comm), b"room A bytes", None, None)
             .await
@@ -841,9 +845,12 @@ mod engine_bodies {
                     .await
                     .unwrap_or_else(|e| panic!("I512 {what} target {named:?}: {e}"));
                 let row = stored(ba, &id).await;
+                // v62.0.0 (T2) — the projected custody envelope names a family by
+                // `family_id` (T2-fix2), a room by `community_id`.
                 assert_eq!(
                     row.attestation_envelope
                         .get(member)
+                        .or_else(|| row.attestation_envelope.get("family_id"))
                         .and_then(|v| v.as_str()),
                     Some(own.as_str()),
                     "I512 {what} target {named:?}: the envelope names the row's {member}"

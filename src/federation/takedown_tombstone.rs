@@ -723,7 +723,8 @@ pub async fn takedown_authority(
     // fold (no-ops outside an attempt): the binding rows, the signer (the
     // last edge of any chain to it names it), each holder (the first edge
     // names it) and each bound community's seats. (G0 v4: no `family:`
-    // read keys; a chain's MIDDLE edge is a known gap, GC2.md.)
+    // read keys.) A chain's MIDDLE edges are declared by the chain walk
+    // itself, which reads every granter it visits (E12 round 3, I3430).
     {
         use super::edition2::fold::{reads, Dep};
         reads(content_dep(content_sha256));

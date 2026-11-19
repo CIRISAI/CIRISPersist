@@ -113,20 +113,6 @@ async fn apply_counting(
     (outcome, reads)
 }
 
-/// How many times the write door itself reads a fresh row's own id while it
-/// stores it (a backend's own business: sqlite and postgres differ).
-async fn write_door_reads(dir: &dyn FederationDirectory, row: Attestation) -> usize {
-    let id = row.attestation_id.clone();
-    let _ = read_probe::take();
-    dir.put_attestation(SignedAttestation { attestation: row })
-        .await
-        .expect("I1340 baseline put");
-    read_probe::take()
-        .iter()
-        .filter(|r| r.is(crate::observe::Door::GetAttestation.label(), &id))
-        .count()
-}
-
 async fn i1340(dir: Arc<dyn FederationDirectory>, tag: &str) {
     let author = format!("i1340-author-{tag}");
     let _ = e2::put_key(
@@ -137,8 +123,18 @@ async fn i1340(dir: Arc<dyn FederationDirectory>, tag: &str) {
         &[crate::federation::types::identity_type::USER],
     )
     .await;
-    // The plan's one read on top of the write door's own.
-    let planned = 1 + write_door_reads(&*dir, scores(&author, serde_json::json!({}))).await;
+    // v62.0.0 (round 3) — the baseline is a fresh non-composer row through
+    // the SAME apply path: an edition-2 row reads its own id on the statement
+    // door too (`put_statement` asks whether the row is held, to tell a
+    // further voice from a new row), so "the plan's one read on top of
+    // `put_attestation`'s" no longer adds up. The property is unchanged: only
+    // a composer carrying a target adds a read-back.
+    let (outcome, planned) = apply_counting(&*dir, scores(&author, serde_json::json!({}))).await;
+    assert_eq!(
+        outcome,
+        ReplicatedAttestationOutcome::Inserted,
+        "{tag} I1340 baseline"
+    );
 
     // A fresh non-composer row: no read-back.
     let (outcome, reads) = apply_counting(&*dir, scores(&author, serde_json::json!({}))).await;

@@ -211,7 +211,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.2	CLM-canonical-founders-accord	CIRISPersist	src/federation/membership_acceptance.rs#node_seated_without_acceptance	ciris-persist@61.4.2	8492056bcf0525d99ae6cc0b7d513a524c73b9a344bf175fc75acb276f286d8f
 3.2	CLM-attach-unlabelled	CIRISPersist	src/federation/trust_root.rs#direction_denied_ids	ciris-persist@61.4.2	4950159750da59aa6e407499a19f723dd50b5cd80e78da941c7d34bde7406100
 3.2	CLM-attach-unlabelled	CIRISPersist	src/federation/trust_root.rs#names_no_trust_job	ciris-persist@61.4.2	0b9119fbc72eceb904bd62a9e3e2c04550ad8417adcaf9ca93c61ae4581c35f4
-4.1.1	CLM-anti-pattern-delegation	CIRISPersist	src/federation/admission.rs#scoped_delegation_reach_at	ciris-persist@61.4.2	f1153dd1cb62264c871a01766adf3f9fff44dcf6e026f72e0cda4e042c30d700
+4.1.1	CLM-anti-pattern-delegation	CIRISPersist	src/federation/admission.rs#scoped_delegation_reach_at	ciris-persist@61.4.2	587a63b4bddd7d5b51079c2bcd406e4ec099c3a923e6605db65e3b2b871992e5
 4.1.1	CLM-self-edge-not-cycle	CIRISPersist	src/federation/admission.rs#is_trust_plane_edge	ciris-persist@61.4.2	61ba78c9299db96dbdb136a82054d57f98bf6fc18019b2707093e34b62116f01
 4.4.3.12	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#check_community_record	ciris-persist@61.4.2	7cc423b3c04f0baa8cb8b001eb801e508114f0d29ecb7d418935e011ddd58dbf
 4.4.3.12	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#declared_cohort	ciris-persist@61.4.2	43979a178e9f67fe68d8f3fe9fdb6163e8daa1a73c45f259f2f607af987b61c1
@@ -365,7 +365,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 4.5.3	CLM-erasure-subject-route	CIRISPersist	src/federation/hard_case.rs#trace_erasure_event	ciris-persist@61.4.2	71e1977a52f97d4429938438cffe19e5bd539ba3b8c4ba2079dbf8cbe084322f
 4.5.5	CLM-reconsideration-subject-standing	CIRISPersist	src/federation/admission.rs#check_reconsideration_admission	ciris-persist@61.4.2	a17dabebd51823354e9a54e833f2ab5a15e7bd0bc542f7fa6e07fc2f719f5d6f
 4.5.5	CLM-reconsideration-subject-standing	CIRISPersist	src/federation/admission.rs#reconsideration_target_subjects	ciris-persist@61.4.2	d588fe78938738dcbaf4bce2c28a4a1804ebe231a4f5d51e53ab921473888468
-4.5.5	CLM-reconsideration-subject-standing	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_authority	ciris-persist@61.4.2	198e8f9c928a9405fb2117bf20d63144f8ccb48f83a3047d080c8bffd3b64b5e
+4.5.5	CLM-reconsideration-subject-standing	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_authority	ciris-persist@61.4.2	4f21c33f3f7ccc4d2bb1ca866376824da569edc626e6829ac18ed16a75e276d6
 3.1.7	CLM-polarity-admission	CIRISPersist	src/federation/admission.rs#check_score_within_declared_polarity	ciris-persist@61.4.2	e899cbc4b59f1876caa79bc376d22e8882647920ea61d8ba36a6b634ea0ba6ee
 3.1.7	CLM-polarity-admission	CIRISPersist	src/federation/namespace/registry.rs#family_polarity_class	ciris-persist@61.4.2	251094681b6d0a97f61362bbbebce063db8ad64f2d98d1f423c1da7636fc9137
 3.1.7	CLM-polarity-admission	CIRISPersist	src/federation/namespace/registry.rs#PolarityClass::admits	ciris-persist@61.4.2	c0a8aa16da9ddfdb8598a9022312c5da2af35f1c4649036662fe89060689c3c1

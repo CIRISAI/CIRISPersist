@@ -1292,7 +1292,21 @@ pub async fn put_trust_statement<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let out = Box::pin(put_attestation_row(dir, row, tier)).await?;
+    // W1-fix2 (CC 2.6.1.9; W1.api.md v1.6) — a trust edge is a counted row
+    // like any attestation: its store goes through the ONE shared voice path
+    // (`voices::put_counted_row`). The row is projected from its author's
+    // voice, and a second signer's voice (a `trust:confers:v1` grant's
+    // `delegate: sub`) joins its count; it is never mapped as a row of its
+    // own (which made the subject's voice a self-loop `delegates_to` the
+    // charter gate refused). Short of its signers the row is held
+    // (`count_short`); a held row's further voice is a `Voice`.
+    let out = Box::pin(super::voices::put_counted_row(
+        dir,
+        row,
+        tier,
+        crate::federation::replication::admission::WriteOrigin::Wire,
+    ))
+    .await?;
     let edge = if COMPOSER_ROW_TYPES.contains(&row.row_type.as_str()) {
         match single(&row.names, TARGET_ROLE) {
             Some(t) => dir.get_attestation(&t.hex()).await?,

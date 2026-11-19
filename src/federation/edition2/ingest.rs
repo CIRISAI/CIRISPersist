@@ -1038,9 +1038,11 @@ where
                     // (which records its own, with its inner reads): the
                     // conclusion and what it read, so a later input change
                     // can un-conclude it.
+                    // W1-fix2 — the trust plane's rows store through
+                    // `voices::put_counted_row` too, which records its own.
                     StatementOutcome::Row { row_id, .. }
                     | StatementOutcome::KeyPlane { row_id, .. }
-                        if plane_name != plane::ATTESTATION =>
+                        if plane_name != plane::ATTESTATION && plane_name != plane::TRUST =>
                     {
                         super::fold::record(
                             dir,

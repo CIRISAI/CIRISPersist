@@ -184,6 +184,10 @@ where
             "the directory has no node key: set it first (set_node_key_id(e2::put_key(..)))",
         ));
     };
+    // W1-fix2 — the node signs THIS node's acceptance edge, so its edition-2
+    // key must be live first (a caller that set the node key without putting
+    // its `key:record` met the door's retryable unknown-signer wait).
+    ensure_live_key(dir, &node, &["node"]).await?;
 
     // 2. The root's key.
     let root = e2::put_key(dir, ROOT_SEED, &["user"]).await;
@@ -274,13 +278,8 @@ where
     }
 
     // 4. The root's charter self-edge.
-    // v62.0.0 (E10, round 3; CC 2.7.3: a held row concludes nothing) — the
-    // root is ROOTED only if the charter and the acceptance CONCLUDE
-    // (`own_chain_to` reads concluded rows). A put that is held is a fixture
-    // that stands up no root: refuse it, naming the fold's reason, rather
-    // than return a root every reader then finds not rooted.
-    let out = e2::put_statement(dir, &charter).await?;
-    require_concluded(dir, "charter", &out).await?;
+    e2::put_statement(dir, &charter).await?;
+    require_concluded(dir, "charter", &row_id_of(&charter)).await?;
 
     // 5. THIS node's acceptance edge, naming the held head.
     let head = dir
@@ -289,8 +288,8 @@ where
         .ok_or_else(|| refused("acceptance", "the root is not held"))?
         .persist_row_hash;
     let acceptance = acceptance_statement(&node, &root, &head, at)?;
-    let out = e2::put_statement(dir, &acceptance).await?;
-    require_concluded(dir, "acceptance", &out).await?;
+    e2::put_statement(dir, &acceptance).await?;
+    require_concluded(dir, "acceptance", &row_id_of(&acceptance)).await?;
 
     Ok(RootedTrustRoot {
         root,
@@ -301,25 +300,6 @@ where
         charter: row_id_of(&charter),
         acceptance: row_id_of(&acceptance),
     })
-}
-
-/// A put that landed as a row (or a further voice of one); a `Pending` one
-/// is refused with the fold's recorded reason (`fold_state`).
-async fn require_concluded<D>(dir: &D, step: &str, out: &StatementOutcome) -> Result<(), Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    match out {
-        StatementOutcome::Row { .. } | StatementOutcome::Voice { .. } => Ok(()),
-        StatementOutcome::Pending { row_id, .. } => {
-            let held = dir.fold_state(row_id).await?.and_then(|s| s.held);
-            Err(refused(
-                step,
-                format!("held, not concluded: {held:?} (CC 2.7.3)"),
-            ))
-        }
-        StatementOutcome::KeyPlane { .. } => Err(refused(step, "landed on the key plane")),
-    }
 }
 
 /// The root's `trust:charter:v1` self-edge at `at`.
@@ -415,7 +395,50 @@ where
     let at = conferral_instant(dir).await? - 30_000;
     let st = acceptance_statement_by(key, iss, &r.root, &head, at)?;
     e2::put_statement(dir, &st).await?;
+    require_concluded(dir, "acceptance", &row_id_of(&st)).await?;
     Ok(row_id_of(&st))
+}
+
+/// W1-fix2 — `key` (a kid E0 minted, or a seed) holds a live edition-2
+/// `key:record` now; else its record is put (`e2::put_key`, `types`).
+async fn ensure_live_key<D>(dir: &D, key: &str, types: &[&str]) -> Result<(), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let Some(kid) = super::ingest::kid_of_identity_ref(&e2::kid(key)) else {
+        return Err(refused("key", format!("{key} names no key")));
+    };
+    let now = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+    let held = super::ingest::held_keys_for_kid(dir, &kid).await?;
+    if !matches!(held.liveness(&kid, now), super::liveness::Liveness::Live(_)) {
+        e2::put_key(dir, key, types).await;
+    }
+    Ok(())
+}
+
+/// W1-fix2 — **a fixture row must CONCLUDE** (its typed row is held in
+/// `federation_attestations`). A row the fold holds is an `Err` naming the
+/// fold's reason and the refusal its gate would have raised, so a red says
+/// WHY instead of failing later at a standing read.
+async fn require_concluded<D>(dir: &D, step: &str, row_id: &RowId) -> Result<(), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    if dir.get_attestation(&row_id.hex()).await?.is_some() {
+        return Ok(());
+    }
+    Err(refused(
+        step,
+        match super::fold::why_held(dir, row_id).await? {
+            Some(h) => format!(
+                "row {} concludes nothing: held `{}` ({})",
+                row_id.hex(),
+                h.reason,
+                h.detail
+            ),
+            None => format!("row {} is neither concluded nor held", row_id.hex()),
+        },
+    ))
 }
 
 /// The instant [`put_conferral`] states a grant at: the bundle in force's
@@ -457,6 +480,7 @@ where
     let grant = confers_statement(r, &subject, scope, at);
     e2::put_statement(dir, &grant).await?;
     e2::put_statement(dir, &e2::voice_of(&grant, subject_seed)).await?;
+    require_concluded(dir, "conferral", &row_id_of(&grant)).await?;
     Ok(row_id_of(&grant))
 }
 

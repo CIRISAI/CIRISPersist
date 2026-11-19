@@ -27,11 +27,11 @@
 //!   node and the notice applies on the author's; the member cannot take the
 //!   founder's message down.
 //! - **I1747** (sqlite and postgres) — the read.
-//!   `attestations_binding_content_with_placements` returns the `scores`
-//!   rows `attestations_binding_content` returns, plus the room placement;
-//!   not a widening to `federation` scope. `attestations_binding_content`
-//!   (the bytes plane, `subject_of_content`) is unchanged: it returns no
-//!   `supersedes` row.
+//!   `attestations_binding_content_with_placements` returns the `self` row
+//!   and its room placement; a widening to `federation` scope places the
+//!   content in no room. v62: a placement is the author's restatement (a
+//!   `scores` row), so `attestations_binding_content` (the bytes plane)
+//!   returns it too and the two reads agree.
 //!
 //! v62.0.0 (JSON cut, E12) — the rooms are founded by their members'
 //! `group:roster` voices (`make_group`, T1) and every key is an edition-2
@@ -56,7 +56,6 @@ pub(crate) mod bodies {
     };
     use crate::federation::{
         Attestation, Audience, CrossingBasis, FederationDirectory, MeshCrossingOutcome,
-        SignedAttestation,
     };
 
     const NODE: &str = "c-node-1";
@@ -103,28 +102,55 @@ pub(crate) mod bodies {
     /// Write `row` on the author's node, enter it into the mesh, and place
     /// it at `audience` by the author's widening. Returns the `self` row's id
     /// and the widening.
+    ///
+    /// v62.0.0 (E12, round 3; P8) — the `self` row is the author's
+    /// statement put at the local tier through the statement door; it crosses
+    /// IN PLACE on its own statement (`TierPromotionCustody::Statement`; the
+    /// door refuses an actor reseal of an edition-2 row); and the placement is
+    /// the author's RESTATEMENT at the wider audience
+    /// (`crossing::widen_by_restatement`: a new `scores` row of the prior's
+    /// family carrying the room as `community_id`), not an earlier-form
+    /// `supersedes` row.
     async fn write_and_place(
         d: &dyn FederationDirectory,
         row: Attestation,
         audience: Audience,
     ) -> (String, Attestation) {
         let id = row.attestation_id.clone();
-        d.put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect("the author's self row");
+        let statement = e2::carried_statement(&row).expect("the author's row is a statement");
+        crate::federation::edition2::ingest::put_statement_with_origin(
+            d,
+            &statement,
+            None,
+            attestation_tier::LOCAL,
+            crate::federation::replication::admission::WriteOrigin::Authored,
+        )
+        .await
+        .expect("the author's self row");
         let local = d.get_attestation(&id).await.unwrap().unwrap();
+        let custody = crate::federation::crossing::TierPromotionCustody::of_statement(
+            &local,
+            chrono::Utc::now(),
+        )
+        .expect("an edition-2 row crosses on its statement");
         d.enter_mesh(
             &id,
             &ts::describe_own(&local, CrossingBasis::ProducerAuthority),
-            &ts::actor_reseal(&local),
+            &custody,
         )
         .await
         .expect("the crossing");
         let prior = d.get_attestation(&id).await.unwrap().unwrap();
         assert_eq!(prior.cohort_scope, cohort_scope::SELF);
-        let out = ts::widen(d, &prior, audience, &[])
-            .await
-            .expect("the placement");
+        let out = crate::federation::crossing::widen_by_restatement(
+            d,
+            &prior,
+            &ts::describe_for(&prior, audience, CrossingBasis::ProducerAuthority),
+            &ts::local_signer(&prior.attesting_key_id),
+            &[],
+        )
+        .await
+        .expect("the placement");
         let MeshCrossingOutcome::Crossed(report) = out else {
             panic!("a placement crosses: {out:?}");
         };
@@ -133,7 +159,11 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .expect("the widening is stored");
-        assert_eq!(w.attestation_type, attestation_type::SUPERSEDES);
+        assert_ne!(w.attestation_id, id, "the placement is a row of its own");
+        assert!(
+            e2::carried_statement(&w).is_some(),
+            "the placement is a statement"
+        );
         (id, w)
     }
 
@@ -145,23 +175,32 @@ pub(crate) mod bodies {
 
     /// `issuer`'s `withdraws` of `target`, born in `room` as Edge's chat
     /// composers are (`chat.rs` `RowShape::composer`: `community` scope,
-    /// federation tier, the room by `community_key_id`).
+    /// federation tier, the room named).
+    ///
+    /// v62.0.0 (E12, round 3) — an edition-2 composer: the target's family
+    /// (read off its statement), `refs.target` = `rid(target)`, and only
+    /// common members (`payloads::check_composer`): the room as
+    /// `community_id`. The earlier envelope's `kind`, `reason_code` and
+    /// `references_attestation_type` are no members of a composer.
     fn withdraws(issuer: &str, target: &Attestation, room: &str) -> Attestation {
-        let mut env = crate::federation::replication::withdraws_attestation_envelope(
-            &target.attestation_id,
-            &target.attestation_type,
-        );
-        env["dimension"] = serde_json::json!("chat:message:v1");
-        env["community_key_id"] = serde_json::json!(room);
-        env["kind"] = serde_json::json!(attestation_type::WITHDRAWS);
-        env["reason_code"] = serde_json::json!("sent_in_error");
-        let mut w = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), issuer, issuer, &env);
+        let st = e2::carried_statement(target).expect("the target is a statement");
+        let (family, _) = crate::federation::edition2::emit::family_of_statement(&st)
+            .expect("the target's statement names its family");
+        let mut env = serde_json::json!({
+            "references_attestation_id": e2::rid(target),
+            "community_id": room,
+        });
+        if let Some(d) = target.attestation_envelope.get("dimension") {
+            env["dimension"] = d.clone();
+        }
+        let mut w = ts::bare_attestation("", issuer, issuer, &env);
         w.attestation_type = attestation_type::WITHDRAWS.into();
         w.cohort_scope = cohort_scope::COMMUNITY.into();
-        w.subject_key_ids = vec![issuer.to_owned()];
         w.weight = None;
-        ts::seal_row_in_place(issuer, &mut w);
-        w
+        e2::row_of_statement(
+            &e2::statement_of_family(&w, issuer, &family),
+            attestation_tier::FEDERATION,
+        )
     }
 
     /// v62.0.0 (E12) — `row` delivered to `to`: its carried statement
@@ -185,25 +224,6 @@ pub(crate) mod bodies {
         Claimant { id: k.to_owned() }
     }
 
-    /// `identity` occurs through `node`: its laptop, on every directory.
-    async fn occurs_through(ds: &[&dyn FederationDirectory], identity: &str, node: &str) {
-        for d in ds {
-            d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: identity.to_owned(),
-                occurrence_key_id: node.to_owned(),
-                device_class: crate::federation::types::device_class::LAPTOP.into(),
-                hardware_attestation: None,
-                asserted_at: chrono::Utc::now(),
-                valid_until: None,
-                encryption_pubkeys: None,
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("occurrence {node} of {identity}: {e}"));
-        }
-    }
-
     /// **I1746** — the takedown delivered through the planes. `node_a` and
     /// `node_b` are the two directories' declared node keys.
     pub(crate) async fn i1746_a_room_moderator_takes_down_placed_content(
@@ -220,7 +240,6 @@ pub(crate) mod bodies {
                 key_as(d, n, crate::federation::types::identity_type::NODE).await;
             }
         }
-        let (node_a, node_b) = (&e2::kid(node_a), &e2::kid(node_b));
         let tag = format!("i1746-{s}");
         let other_tag = format!("i1746x-{s}");
         let mut room = String::new();
@@ -250,9 +269,11 @@ pub(crate) mod bodies {
         }
         let (founder, author, plain, deputy) = (&keys[0], &keys[1], &keys[2], &keys[3]);
         let other_founder = &other[0];
-        // A is the author's laptop; B is the founder's, a member's node.
-        occurs_through(&[a, b], author, node_a).await;
-        occurs_through(&[a, b], founder, node_b).await;
+        // A is the author's node; B is a member's node.
+        // v62.0.0 (E12, round 3) — no occurrence through the node keys: a
+        // node is never a person's occurrence (CC 3.3.6, the person/machine
+        // rule), and the takedown reads none (every notice is signed by the
+        // identity itself).
         // The founder appoints its deputy on B; the appointment reaches A.
         let appointment = delegate(b, founder, deputy, &["takedown", "review"]).await;
 
@@ -452,7 +473,6 @@ pub(crate) mod bodies {
                 key_as(d, n, crate::federation::types::identity_type::NODE).await;
             }
         }
-        let (node_a, node_b) = (&e2::kid(node_a), &e2::kid(node_b));
         let tag = format!("i1750-{s}");
         let mut room = String::new();
         let mut keys = Vec::new();
@@ -469,8 +489,10 @@ pub(crate) mod bodies {
             .await;
         }
         let (founder, member) = (&keys[0], &keys[1]);
-        occurs_through(&[a, b], member, node_a).await;
-        occurs_through(&[a, b], founder, node_b).await;
+        // v62.0.0 (E12, round 3) — no occurrence through the node keys: a
+        // node is never a person's occurrence (CC 3.3.6, the person/machine
+        // rule), and the takedown reads none (every notice is signed by the
+        // identity itself).
 
         let sha = sha_hex(&format!("{tag}-msg"));
         let (_, placed) = write_and_place(
@@ -523,7 +545,7 @@ pub(crate) mod bodies {
         assert_eq!(e.kind(), token::UNAUTHORISED, "I1750: {e}");
     }
 
-    /// **I1747** — the read, and the bytes-plane read beside it unchanged.
+    /// **I1747** — the read, and the bytes-plane read beside it.
     pub(crate) async fn i1747_the_binding_read_with_placements(
         d: &dyn FederationDirectory,
         s: &str,
@@ -575,18 +597,26 @@ pub(crate) mod bodies {
             both,
             "I1747: the self row and its room placement"
         );
+        // v62.0.0 (E12, round 3) — a placement is the author's restatement
+        // (a `scores` row of the prior's family), not a `supersedes` row, so
+        // the bytes-plane read holds it too: the two reads agree.
         assert_eq!(
             ids(d.attestations_binding_content(&sha).await.unwrap()),
-            vec![prior_id],
-            "I1747: the bytes-plane read is unchanged: no supersedes"
+            both,
+            "I1747: the bytes-plane read holds the restated placement"
         );
         let pub_rows = ids(d
             .attestations_binding_content_with_placements(&sha_pub)
             .await
             .unwrap());
         assert!(
-            !pub_rows.contains(&widened.attestation_id),
-            "I1747: a widening to federation scope places nothing in a room: {pub_rows:?}"
+            pub_rows.contains(&widened.attestation_id),
+            "I1747: the federation restatement binds its content: {pub_rows:?}"
+        );
+        let public_binding = td::content_binding(d, &sha_pub).await.unwrap().unwrap();
+        assert!(
+            public_binding.communities.is_empty(),
+            "I1747: a widening to federation scope places nothing in a room: {public_binding:?}"
         );
         assert_eq!(
             pub_rows,

@@ -352,8 +352,8 @@ fn id_of(row: &Attestation) -> RowId {
 }
 
 fn owner_binding(owner: &str, node: &str) -> Attestation {
-    // G0-fix3 — asserted now (the shared fixture's fixed 2026-05-01 is
-    // before a node key's default window: the node's voice waited).
+    // G0-fix3/fix4 — K2's builder, dated from the key-window rule (the
+    // shared fixture's fixed 2026-05-01 was before a node key's window).
     super::fold_invariants::owner_binding(owner, node)
 }
 

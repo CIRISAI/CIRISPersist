@@ -231,8 +231,8 @@ async fn public_room_joiner(
         .expect("I3873: the founder's standing proposal");
     assert!(matches!(o, StatementOutcome::Row { .. }), "I3873: {o:?}");
     let acc = reply(&joiner, &joiner, &p, true, at + Duration::seconds(1));
-    // G0-fix3 — asserted now (the shared fixture's fixed 2026-05-01 is
-    // before a node key's default window: the node's voice waited).
+    // G0-fix3/fix4 — K2's builder, dated from the key-window rule (the
+    // shared fixture's fixed 2026-05-01 was before a node key's window).
     let binding = crate::federation::edition2::fold_invariants::owner_binding(&owner, &joiner);
     (acc, binding, owner, joiner)
 }

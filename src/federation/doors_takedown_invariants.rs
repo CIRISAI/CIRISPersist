@@ -51,7 +51,8 @@
 //!   `purge_finalize` refuses until the window has passed, then deletes.
 //! - **I791** (sqlite, postgres) — only the holder retracts a holding claim:
 //!   another key's unstamped `withdraws` of this node's holding claim
-//!   (`custody:ack:v1` `here`) is `custody_ack_withdraws_not_the_holder` at the door and the claim stands;
+//!   (`custody:ack:v1` `here`) is HELD at the door
+//!   (`custody_ack_withdraws_not_the_holder`, CC 2.7.3) and the claim stands;
 //!   the holder's own is admitted. (I791b, the `custody:ack:v1` report, runs
 //!   in `dag_link_invariants` where a node holds a custody-scoped blob.)
 //! - **I792** (memory, sqlite, postgres) — CLM-derived-rows-follow-reason's
@@ -120,6 +121,11 @@
 //!   peer's raw-pubkey `takedown_notice` Contribution is refused as retired
 //!   on the local AND the replicated door, and nothing is recorded (v60.x
 //!   applied it replicated, one release of compat).
+//!
+//! - **I3430** (sqlite, postgres; v62, CC 2.7.3) — a takedown chain's
+//!   MIDDLE edge re-folds the notice: with `d1 → d2` of `owner → d1 → d2 →
+//!   signer` missing, the notice is held and concludes nothing; when it lands
+//!   the notice concludes.
 //!
 //! v62.0.0 (JSON cut, E12) — every fixture here is edition 2: a notice is
 //! the claimant's `takedown_notice:{basis}` STATEMENT (the family's closed
@@ -852,10 +858,21 @@ pub(crate) mod bodies {
             "I772 precondition"
         );
         // v62.0.0 (E12) — the attester's `withdraws` names the binding by its
-        // computed id (`refs.target`), through the statement door.
-        ts::put_retraction(dir, producer, producer, &r_old, attestation_type::WITHDRAWS)
+        // computed id (`refs.target`, `rid(&target)`), through the statement
+        // door. Round 3: built by `e2::composer_of` (the composer's common
+        // members only; `put_retraction`'s `id` member is no member of a
+        // composer's payload).
+        let old_row = dir
+            .get_attestation(&r_old)
             .await
-            .expect("I772: the attester withdraws its binding");
+            .unwrap()
+            .expect("I772: the first binding is held");
+        e2::put_signed(
+            dir,
+            &e2::composer_of(attestation_type::WITHDRAWS, &old_row, producer),
+        )
+        .await
+        .expect("I772: the attester withdraws its binding");
         assert!(
             unauthorised(auth(old.id.clone(), sha.clone()).await),
             "I772 (1): the withdrawn binding's former subject is refused"
@@ -1176,6 +1193,82 @@ pub(crate) mod bodies {
         ts::seal_row_in_place(granter, &mut row);
         e2::put_signed(dir, &row).await.expect("the delegation");
         e2::rid(&row)
+    }
+
+    /// [`delegate`] that grants `sub_delegation` (the grantee may pass the
+    /// duty on: CC 4.5.5 (b), the §11.10 deputization gate).
+    async fn delegate_on(
+        dir: &dyn FederationDirectory,
+        granter: &str,
+        grantee: &str,
+        scope: &[&str],
+    ) -> String {
+        let mut envelope = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "scope": scope,
+            "sub_delegation": true,
+        });
+        crate::federation::admission::with_test_term(&mut envelope, chrono::Utc::now());
+        let mut row = ts::bare_attestation("", granter, grantee, &envelope);
+        row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        ts::seal_row_in_place(granter, &mut row);
+        e2::put_signed(dir, &row).await.expect("the delegation");
+        e2::rid(&row)
+    }
+
+    // ── I3430 ─────────────────────────────────────────────────────────────
+    /// v62.0.0 (E12, round 3; CC 2.7.3, CC 4.5.5 (b)) — **a takedown
+    /// chain's MIDDLE edge re-folds the notice.** A three-edge
+    /// `takedown`-scoped chain `owner → d1 → d2 → signer` from the content's
+    /// steward-bound subject: with the middle edge `d1 → d2` missing, the
+    /// signer's notice is HELD (it concludes nothing: no notice row); when the
+    /// middle edge lands, the notice re-folds and concludes (its row is held
+    /// as the door's). The middle edge touches only `d1` and `d2`, neither
+    /// the signer nor a binding subject, so the re-fold rests on the chain
+    /// walk declaring every granter it visits (`admission::scoped_delegation_reach`).
+    pub(crate) async fn i3430_a_chains_middle_edge_refolds_the_notice<D>(d: &D)
+    where
+        D: FederationDirectory + Sync,
+    {
+        let dir = d.as_dyn_directory();
+        let (owner, d1, d2, signer) = (
+            claimant(0xc1),
+            claimant(0xc2),
+            claimant(0xc3),
+            claimant(0xc4),
+        );
+        key_as(dir, &owner.id, USER).await;
+        for c in [&d1, &d2, &signer] {
+            key_as(dir, &c.id, AGENT).await;
+        }
+        let sha = sha_of("i3430");
+        establish(dir, "i3430-producer", &owner.id, &sha).await;
+        delegate_on(dir, &owner.id, &d1.id, &["takedown"]).await;
+        delegate(dir, &d2.id, &signer.id, &["takedown"]).await;
+        let t = chrono::Utc::now();
+        let st = notice_statement(
+            &signer,
+            &sha,
+            "dmca512",
+            t,
+            t + chrono::Duration::days(1),
+            &[],
+        );
+        let rid = crate::federation::edition2::names::RowId::of_statement(&st)
+            .expect("a row statement")
+            .hex();
+        e2::put_statement(dir, &st)
+            .await
+            .expect("I3430: the notice is kept (held), never refused");
+        assert!(
+            dir.get_attestation(&rid).await.unwrap().is_none(),
+            "I3430: short of its chain's middle edge, the notice concludes nothing"
+        );
+        delegate_on(dir, &d1.id, &d2.id, &["takedown"]).await;
+        assert!(
+            dir.get_attestation(&rid).await.unwrap().is_some(),
+            "I3430: the middle edge re-folds the notice, which concludes"
+        );
     }
 
     // ── I798 ──────────────────────────────────────────────────────────────
@@ -2617,7 +2710,11 @@ pub(crate) mod engine_bodies {
                         == Some(hex::encode(sha).as_str())
             })
             .expect("this node's holding claim (custody:ack:v1 here)");
-        let refused = crate::federation::blobs::emit_withdraws_attestation_helper(
+        // v62.0.0 (E12, round 3; CC 2.7.3) — whose claim the target is reads
+        // ANOTHER row, so another key's withdraws is HELD at the door
+        // (`custody_ack_withdraws_not_the_holder`, a fold reason), not
+        // refused: it is kept and concludes nothing. The claim stands.
+        crate::federation::blobs::emit_withdraws_attestation_helper(
             &claim,
             "",
             &stranger,
@@ -2625,13 +2722,7 @@ pub(crate) mod engine_bodies {
             chrono::Utc::now(),
         )
         .await
-        .expect_err("I791: another key withdraws this node's claim");
-        assert!(
-            refused
-                .to_string()
-                .contains("custody_ack_withdraws_not_the_holder"),
-            "I791: {refused}"
-        );
+        .expect("I791: another key's withdraws of this node's claim is held, not refused");
         assert!(
             l.ba.list_holders(&sha).await.unwrap().contains(&l.node_a),
             "I791: the claim stands"
@@ -2809,6 +2900,11 @@ mod run {
                 async fn i1171() {
                     let Some(d) = $fresh.await else { return };
                     b::i1171_a_v59_peers_contribution_notice_is_refused(&d).await
+                }
+                #[tokio::test]
+                async fn i3430() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i3430_a_chains_middle_edge_refolds_the_notice(&d).await
                 }
             }
         };

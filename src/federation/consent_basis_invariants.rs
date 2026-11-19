@@ -20,9 +20,8 @@ pub(crate) mod bodies {
     use crate::federation::consent_scope_invariants::bodies::{put, stance};
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::ConsentState;
-    use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{AGENT, NODE, USER};
-    use crate::federation::{Attestation, FederationDirectory, IdentityOccurrence};
+    use crate::federation::{Attestation, FederationDirectory};
 
     /// `consent:state:<state>:v1` scoped `analyze` by `author` about `target`,
     /// naming `for_key` when given.
@@ -71,6 +70,11 @@ pub(crate) mod bodies {
         (state, basis)
     }
 
+    /// Now, POSIX ms.
+    fn now_ms() -> u64 {
+        u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after the epoch")
+    }
+
     /// An instant `days` before now, as the RFC 3339 text `stance` reads.
     /// v62.0.0 — rows signed by `node`/`agent` keys are NOW-RELATIVE: under
     /// CC 2.4.1.1 such a key's rows lapse when its record ends (365 days at
@@ -89,13 +93,18 @@ pub(crate) mod bodies {
 
     /// The owner binding `owner_s` -> `node_s` with the node's own voice
     /// (`ownership:*` carries the node as its second signer).
+    /// v62.0.0 (round 3) — K2's shared helper (`put_sealed_owner_binding`:
+    /// the owner's statement, then the node's voice, landing as a Row).
     async fn put_owner_binding(d: &dyn FederationDirectory, id: &str, owner_s: &str, node_s: &str) {
-        let ob = ts::owner_binding_attestation(id, owner_s, node_s);
-        let st = e2::carried_statement(&ob).expect("an edition-2 owner binding");
-        put(d, ob).await.unwrap();
-        e2::put_statement(d, &e2::voice_of(&st, node_s))
-            .await
-            .expect("the node's voice on its owner binding");
+        crate::federation::tier_ingest::test_support::put_sealed_owner_binding(
+            d,
+            &crate::federation::tier_ingest::test_support::owner_binding_attestation(
+                id, owner_s, node_s,
+            ),
+            node_s,
+        )
+        .await
+        .expect("the owner binding lands with the node's voice");
     }
 
     fn row(principal: &str, paths: &[Path], id: &str) -> ConsentBasisRow {
@@ -219,25 +228,22 @@ pub(crate) mod bodies {
         );
         assert_granted_basis_is_live(d, &b, "I623").await;
 
-        // occurrence_of: agent G, an active occurrence of human U.
-        let (g, u_s) = (
-            e2::put_key(d, &format!("i623-g-{s}"), &[AGENT]).await,
-            format!("i623-u-{s}"),
-        );
+        // occurrence_of: device G, an active occurrence of human U. v62.0.0
+        // (CC rc21 3.3.6, `occurrence_binds_machine_to_person`): a machine key
+        // is never an occurrence of a person (an agent's human is its owner,
+        // the delegates_to path above), so the occurrence is a PERSON's
+        // device, bound through O1's door (its own voice, then U's).
+        let (g_s, u_s) = (format!("i623-g-{s}"), format!("i623-u-{s}"));
+        let g = e2::put_key(d, &g_s, &[USER]).await;
         let u = e2::put_key(d, &u_s, &[USER]).await;
-        d.put_identity_occurrence_local(IdentityOccurrence {
-            identity_key_id: u.clone(),
-            occurrence_key_id: g.clone(),
-            device_class: "agent".to_owned(),
-            hardware_attestation: None,
-            asserted_at: chrono::Utc::now(),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .unwrap();
+        crate::federation::occurrence_consent_invariants::bodies::put_bind(
+            d,
+            &u_s,
+            &g_s,
+            "phone",
+            now_ms() - 60_000,
+        )
+        .await;
         let gu = put_id(
             d,
             consent(
@@ -269,24 +275,21 @@ pub(crate) mod bodies {
     /// live grant only, never the expired row.
     pub async fn i624_the_basis_follows_the_combined_state(d: &dyn FederationDirectory, s: &str) {
         let x = e2::put_key(d, &format!("i624-x-{s}"), &[NODE]).await;
-        let occurrence = |u: &str, g: &str| IdentityOccurrence {
-            identity_key_id: u.to_owned(),
-            occurrence_key_id: g.to_owned(),
-            device_class: "agent".to_owned(),
-            hardware_attestation: None,
-            asserted_at: chrono::Utc::now(),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        };
+        // v62.0.0 — G and H are a person's DEVICES (`user` keys bound by
+        // O1's door), not agents: a machine key is never an occurrence of a
+        // person (CC rc21 3.3.6, `occurrence_binds_machine_to_person`).
 
         let (g_s, u_s) = (format!("i624-g-{s}"), format!("i624-u-{s}"));
-        let g = e2::put_key(d, &g_s, &[AGENT]).await;
+        let g = e2::put_key(d, &g_s, &[USER]).await;
         let u = e2::put_key(d, &u_s, &[USER]).await;
-        d.put_identity_occurrence_local(occurrence(&u, &g))
-            .await
-            .unwrap();
+        crate::federation::occurrence_consent_invariants::bodies::put_bind(
+            d,
+            &u_s,
+            &g_s,
+            "phone",
+            now_ms() - 60_000,
+        )
+        .await;
         put(
             d,
             consent(
@@ -323,11 +326,16 @@ pub(crate) mod bodies {
         );
 
         let (h_s, v_s) = (format!("i624-h-{s}"), format!("i624-v-{s}"));
-        let h = e2::put_key(d, &h_s, &[AGENT]).await;
+        let h = e2::put_key(d, &h_s, &[USER]).await;
         let v = e2::put_key(d, &v_s, &[USER]).await;
-        d.put_identity_occurrence_local(occurrence(&v, &h))
-            .await
-            .unwrap();
+        crate::federation::occurrence_consent_invariants::bodies::put_bind(
+            d,
+            &v_s,
+            &h_s,
+            "phone",
+            now_ms() - 60_000,
+        )
+        .await;
         put(
             d,
             consent(

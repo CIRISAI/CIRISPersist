@@ -676,10 +676,22 @@ pub(crate) async fn i3240_a_rebind_names_the_bundle_in_force(d: &dyn FederationD
     fixture_genesis::install_ceremony_v2(d, &later)
         .await
         .expect("I3240: the later bundle installs");
-    match e2::put_statement(d, &voice(Some(&c.object_id))).await {
-        Err(e) if is_payload_invalid(&e) => {}
+    // CC 2.7.3 ("a check that reads another row concludes nothing"): which
+    // bundle is in force is other rows, so a re-bind over a superseded one is
+    // HELD with its reason, never refused (G0's conversion of this door).
+    let stale = voice(Some(&c.object_id));
+    match e2::put_statement(d, &stale).await {
+        Ok(StatementOutcome::Pending { .. }) => {}
         other => panic!("I3240: a re-bind over a bundle no longer in force, got {other:?}"),
     }
+    assert_eq!(
+        crate::federation::edition2::fold::why_held(d, &row_id_of(&stale))
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(crate::federation::edition2::fold::reason::REBIND_HEAD_NOT_IN_FORCE.to_owned()),
+        "I3240: held, by name"
+    );
     let o = e2::put_statement(d, &voice(Some(&later.object_id)))
         .await
         .expect("I3240: over the bundle in force, kept");

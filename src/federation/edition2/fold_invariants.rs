@@ -341,33 +341,28 @@ fn id_of(row: &Attestation) -> RowId {
     super::voices::carried_row_id(row).expect("G0: the row carries its statement")
 }
 
-/// The owner binding of `owner` over `node` (the owner's statement),
-/// asserted a minute ago.
+/// The owner binding of `owner` over `node` (the owner's statement).
 ///
-/// fix1: built here rather than from `test_support::owner_binding_attestation`.
-/// That fixture is asserted at the FIXED instant 2026-05-01, but E0 gives a
-/// node key a default window that opens `NODE_DEFAULT_BACK_DAYS` (180) days
-/// before today. The node, the binding's second party, was therefore not
-/// live at the binding's instant, and the door waited on it
-/// (`AttesterKeyUnknown`).
+/// G0-fix4/fix5 — K2's builder (`test_support::owner_binding_attestation`),
+/// dated INSIDE the bound key's own window:
+/// `fixture_switch::key_window_start_ms(node) + OWNER_BINDING_OFFSET_DAYS`.
+/// It is never dated from the wall clock.
 pub(crate) fn owner_binding(owner: &str, node: &str) -> Attestation {
-    use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
-    let mut a = crate::federation::genesis::ordinary_scores_row(
+    crate::federation::tier_ingest::test_support::owner_binding_attestation(
         &uuid::Uuid::new_v4().to_string(),
-        &e2::kid(owner),
-    );
-    a.attestation_type = attestation_type::DELEGATES_TO.to_owned();
-    a.attested_key_id = e2::kid(node);
-    a.asserted_at = crate::host::clock::now() - chrono::Duration::minutes(1);
-    a.scrub_timestamp = a.asserted_at;
-    a.attestation_envelope = serde_json::json!({
-        "id": a.attestation_id,
-        "kind": "delegates_to",
-        "dimension": owner_binding::DIMENSION,
-        "delegation_purpose": owner_binding::PURPOSE,
-        "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
-    });
-    e2::row_of(&a, owner)
+        owner,
+        node,
+    )
+}
+
+/// G0-fix5 — an instant inside `seed`'s key window, by K2's rule:
+/// `key_window_start_ms(seed) + OWNER_BINDING_OFFSET_DAYS` days, in ms.
+pub(crate) fn in_key_window_ms(seed: &str) -> u64 {
+    const DAY_MS: u64 = 86_400_000;
+    let offset =
+        u64::try_from(crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS)
+            .expect("a positive day count");
+    e2::key_window_start_ms(seed) + offset * DAY_MS
 }
 
 /// The owner's `config:*` report about its node, as the owner's statement.
@@ -957,9 +952,10 @@ pub(crate) async fn group_steward_order_body(
     });
     let keys = [e2::signing_key(user), e2::signing_key(agent)];
     let signers: Vec<&_> = keys.iter().collect();
-    // G0-fix3 — asserted now: an AGENT key's default window opens 180 days
-    // back, so a founding at 2 000 ms found the agent not live (it waited).
-    let founded_ms = e2::ms(crate::host::clock::now() - chrono::Duration::minutes(1));
+    // G0-fix3/fix4 — a founding at 2 000 ms found the AGENT key not live
+    // (its default window opens 180 days back): it waited.
+    // fix5 — inside the AGENT key's own window (K2's rule).
+    let founded_ms = in_key_window_ms(agent);
     let founding = super::group_fixtures::roster_voices(&rec, 1, None, founded_ms, &signers);
     let row = RowId::of_statement(&founding[0]).expect("I3566: row");
     let binding = owner_binding(steward, agent);

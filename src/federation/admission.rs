@@ -4979,16 +4979,21 @@ async fn community_quorum_at_head(
     head: &super::edition2::names::RowId,
     t: chrono::DateTime<chrono::Utc>,
 ) -> Result<bool, Error> {
-    let versions = directory
-        .list_group_versions(super::cohort::Cohort::Community, &c.community_key_id)
-        .await?;
-    let at_head = versions.into_iter().find_map(|v| {
-        let snap = v.snapshot.get("community").unwrap_or(&v.snapshot).clone();
-        serde_json::from_value::<super::Community>(snap)
-            .ok()
-            .filter(|cv| cv.persist_row_hash == head.hex())
-    });
-    let Some(version) = at_head else {
+    // v62.0.0 (V1 triage round 3) — every held version of the record, read
+    // from its DECLARED cohort's chain with the live record last
+    // ([`community_versions`]). Reading `Cohort::Community` alone missed an
+    // affiliation (its versions are recorded under `affiliations`, V182), so
+    // no head ever matched and a counted act stayed short for good.
+    let Some(live) = directory.lookup_community(&c.community_key_id).await? else {
+        return Ok(false);
+    };
+    let head_hex = head.hex();
+    let Some(version) = community_versions(directory, &live)
+        .await?
+        .into_iter()
+        .map(|(v, _)| v)
+        .find(|v| v.persist_row_hash == head_hex)
+    else {
         return Ok(false);
     };
     let Ok(row_id) = <[u8; 32]>::try_from(
@@ -10952,6 +10957,13 @@ async fn scoped_delegation_reach_at(
         if policy.enforce_attenuation_and_sub_delegation && node.budget == Some(0) {
             continue;
         }
+        // v62.0.0 (E12, round 3; CC 2.7.3) — this granter's edges are read
+        // below: declare it, so a fold that walked through it re-folds when
+        // one of its edges lands or is retracted. Every edge of a chain is
+        // authored by a granter the walk visits, so the chain's MIDDLE edges
+        // are declared too (they touch neither the root nor the target).
+        // A no-op outside a fold attempt.
+        fold_reads_key(&node.key);
         // The granter's edges and its retractions of them — the only types
         // the two loops below read.
         let mut rows = Vec::new();
@@ -18870,6 +18882,21 @@ pub async fn check_no_moderator_federate_apply(
     // brings in the moderator the room lacks. Refusing it would make an
     // unmoderated room unable ever to gain one.
     if super::membership_acceptance::membership_row(row).is_some() {
+        return Ok(());
+    }
+    // v62.0.0 (W1-fix2; CC 3.2 T3, W1.api.md v1.6) — a `trust:{job}` edge (a
+    // root's charter self-edge, an acceptance, a conferral) is a trust-plane
+    // row ABOUT a root, not the community federating content at moderated
+    // capability. Gating it here made an edition-2 trust root's own charter
+    // and acceptance wait on the infrastructure carve-out
+    // (`is_authorized_infrastructure_community`), which is itself decided by
+    // that charter and acceptance: every root's edges were held
+    // `community_no_moderator`, and nothing could root. "The acceptance edge
+    // is a person's row … un-trust is one deletion" (CC 3.2 T3): it never
+    // waits on the root's moderation.
+    if row.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
+        && envelope_dimension(&row.attestation_envelope).is_some_and(|d| d.starts_with("trust:"))
+    {
         return Ok(());
     }
     // Collect every community reference the row carries (deduplicated —

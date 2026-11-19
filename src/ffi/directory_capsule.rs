@@ -11401,12 +11401,19 @@ mod tests {
             "I1891: the revocation is bob's"
         );
         let dbg = |r: Result<String, Error>| r.expect("I1891 read");
-        // Only the member read is asserted non-empty from the seed (alice is
-        // seated in the room); the other two are proxy == direct.
-        for (name, seeded, via, direct) in [
+        // Each read has a seeded non-empty answer, so proxy == direct is never
+        // two empty lists agreeing:
+        // * `list_group_versions` — the room's live record is its current
+        //   version (both backends append the `federation_communities` row);
+        // * `list_communities_for_member(alice)` — alice is seated;
+        // * `lookup_keys_for_identity(alice)` — `keyless_room_dir` makes
+        //   alice's key live, and an edition-2 key row's `identity_ref` is
+        //   its own identity-ref (I2000).
+        let current = "is_current: true".to_owned();
+        for (name, must_name, via, direct) in [
             (
                 "list_group_versions",
-                false,
+                &current,
                 rt.block_on(proxy.list_group_versions(cohort::Cohort::Community, &room))
                     .map(|v| format!("{v:?}")),
                 rt.block_on(dir.list_group_versions(cohort::Cohort::Community, &room))
@@ -11414,7 +11421,7 @@ mod tests {
             ),
             (
                 "list_communities_for_member",
-                true,
+                &room,
                 rt.block_on(proxy.list_communities_for_member(&alice))
                     .map(|v| format!("{v:?}")),
                 rt.block_on(dir.list_communities_for_member(&alice))
@@ -11422,17 +11429,19 @@ mod tests {
             ),
             (
                 "lookup_keys_for_identity",
-                false,
-                rt.block_on(proxy.lookup_keys_for_identity(&carol))
+                &alice,
+                rt.block_on(proxy.lookup_keys_for_identity(&alice))
                     .map(|v| format!("{v:?}")),
-                rt.block_on(dir.lookup_keys_for_identity(&carol))
+                rt.block_on(dir.lookup_keys_for_identity(&alice))
                     .map(|v| format!("{v:?}")),
             ),
         ] {
             let (via, direct) = (dbg(via), dbg(direct));
-            if seeded {
-                assert_ne!(direct, "[]", "I1891 {name}: the seed is not empty");
-            }
+            assert_ne!(direct, "[]", "I1891 {name}: the seed is not empty");
+            assert!(
+                direct.contains(must_name.as_str()),
+                "I1891 {name}: the seeded answer names {must_name}: {direct}"
+            );
             assert_eq!(via, direct, "I1891 {name}: proxy == direct");
         }
     }

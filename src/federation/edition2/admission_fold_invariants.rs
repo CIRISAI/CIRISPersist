@@ -311,9 +311,23 @@ pub(crate) async fn deadmission_on_the_revocation_plane_body(
             }),
         ),
     ] {
-        e2::try_put_row(d, &lit(from, to, envelope), from)
+        let confers = envelope
+            .get("dimension")
+            .and_then(serde_json::Value::as_str)
+            == Some(TRUST_CONFERS_DIMENSION);
+        let edge = e2::try_put_row(d, &lit(from, to, envelope), from)
             .await
             .unwrap_or_else(|e| panic!("I3676: the trust edge {from} -> {to}: {e:?}"));
+        // G0-fix4 — Verify's `confers` rule asks the delegate for a second
+        // voice (`delegate: sub`, CC 2.6.1.9). Without the node's voice the
+        // slash conferral was held, the revocation door's authority rule
+        // found no conferral, and the de-admission was held (I3676 red).
+        if confers {
+            let st = e2::carried_statement(&edge).expect("I3676: the conferral's statement");
+            e2::put_statement(d, &e2::voice_of(&st, to))
+                .await
+                .expect("I3676: the node's own voice on its conferral");
+        }
     }
     // A peer write is admitted before the de-admission.
     let from_peer = crate::federation::tier_ingest::test_support::bare_attestation(

@@ -820,17 +820,18 @@ pub mod two_node {
         }
     }
 
-    /// v62.0.0 (E11, round 3) — **a delivered row whose signer is no member
-    /// was not admitted**, by whichever fold gate asks about the signer first
-    /// (CC 2.7: the write-scope gate at now, or the key-grant rule's
-    /// membership fold at `asserted_at`). The rule's own verdict is pinned
-    /// apart with [`rule_reason`].
-    fn assert_not_a_member(e: &Error, what: &str) {
-        let reason = refusal_reason(e);
-        assert!(
-            reason == crate::federation::edition2::fold::reason::WRITE_SCOPE_REFUSED
-                || reason == "signer_not_active_member",
-            "{what}: a non-member signer's row is held: {e}"
+    /// v62.0.0 (E11, round 3, fix2) — **a delivered row whose signer is no
+    /// member is HELD by the write-scope gate**, the first fold gate that
+    /// asks about the signer: `plan_put_attestation` runs
+    /// `membership_acceptance::check_attestation_write_scope` (the cohort
+    /// gate, at now) BEFORE `admission::check_reserved_prefix_admission`,
+    /// which holds the key-grant rule (attestation_admit.rs). The rule's own
+    /// verdict is pinned apart with [`rule_reason`].
+    fn assert_held_by_write_scope(e: &Error, what: &str) {
+        assert_eq!(
+            refusal_reason(e),
+            crate::federation::edition2::fold::reason::WRITE_SCOPE_REFUSED,
+            "{what}: a non-member signer's row is held by the write-scope gate: {e}"
         );
     }
 
@@ -2375,8 +2376,9 @@ pub mod two_node {
             attestation: to_b.clone(),
         };
         // (1) No occurrence for A on B, no binding: the key-grant rule finds
-        // no principal; delivered, the row is held by the first fold gate
-        // that asks about the signer (CC 2.7) and concludes nothing.
+        // no principal; delivered, the row is held by the write-scope gate,
+        // the first fold gate that asks about the signer (CC 2.7), and
+        // concludes nothing.
         assert_eq!(
             rule_reason(b.backend, &to_b_signed).await,
             "signer_not_active_member",
@@ -2385,7 +2387,7 @@ pub mod two_node {
         let err = carry_key_grant(a, b, &to_b.attestation_id)
             .await
             .expect_err("{tag} I77: an unbound node is nobody's instrument");
-        assert_not_a_member(&err, &format!("{tag} I77 (1)"));
+        assert_held_by_write_scope(&err, &format!("{tag} I77 (1)"));
         // (2) alice's owner binding for A lands on B (her statement and A's
         // own voice, delivered — what the mesh already carries): admitted.
         let bound_at = chrono::Utc::now() - chrono::Duration::minutes(1);
@@ -2433,7 +2435,7 @@ pub mod two_node {
         let err = admit_replicated(b.backend, later)
             .await
             .expect_err("{tag} I77: the removed owner's instrument is refused");
-        assert_not_a_member(&err, &format!("{tag} I77 (3)"));
+        assert_held_by_write_scope(&err, &format!("{tag} I77 (3)"));
         // A fresh sqlite peer seeded like B was: A's key as a NODE, alice and
         // bob, the same roster version, bob's occurrence B as the recipient
         // (v55.0.0, #989 — the recipient rule asks that the wrap's recipient
@@ -2590,7 +2592,7 @@ pub mod two_node {
             let err = admit_replicated(&f, to_b_signed.clone())
                 .await
                 .expect_err("{tag} I77 (8): a node owned off the roster is not a member");
-            assert_not_a_member(&err, &format!("{tag} I77 (8)"));
+            assert_held_by_write_scope(&err, &format!("{tag} I77 (8)"));
         }
     }
 

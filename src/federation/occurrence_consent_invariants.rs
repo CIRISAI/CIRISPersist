@@ -19,9 +19,11 @@
 //!   the owner is still the node's principal.
 //!
 //! v62.0.0 (flip wave 2, slice E6) — I381 runs on O1's edition-2
-//! `identity:occurrence` door (two voices per bind); I382 runs the Engine's
-//! own producers (`publish_signed_content_only_occurrence`, `self_at_login`),
-//! edition 2 since cut B.
+//! `identity:occurrence` door. **I382 is deleted** (round 3): its premise is a
+//! node's ENGINE key provisioned as an occurrence of its owner (a person) and
+//! named as `self_at_login`'s `app`. CC rc21 3.3.6 (way (d)) refuses a machine
+//! key under a person (`occurrence_binds_machine_to_person`): a node's human
+//! is its owner binding, which I381 witnesses.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -112,18 +114,8 @@ pub(crate) mod bodies {
         let node = e2::put_key(d, &node_s, &[it::NODE]).await;
         // The provisioning shape: the owner binds the node (with the node's
         // own voice, `ownership:*`'s second signer).
-        let ob = crate::federation::tier_ingest::test_support::owner_binding_attestation(
-            &format!("bind-{tag}"),
-            &owner_s,
-            &node_s,
-        );
-        let ob_st = e2::carried_statement(&ob).expect("an edition-2 owner binding");
-        e2::put_signed(d, &ob)
-            .await
-            .expect("I381 the owner-binding is admitted");
-        e2::put_statement(d, &e2::voice_of(&ob_st, &node_s))
-            .await
-            .expect("I381 the node's voice on its owner binding");
+        // v62.0.0 (round 3) — K2's shared helper lands the node's voice too.
+        crate::federation::tier_ingest::test_support::put_owner_binding(d, &owner_s, &node_s).await;
         // The node's own self-occurrence: it says WHAT KIND it is; its owner
         // says WHO.
         let self_bind = |at: u64| e2::BindOptions {
@@ -226,156 +218,6 @@ pub(crate) mod bodies {
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-pub(crate) mod engine_bodies {
-    use crate::engine::{SelfAtLoginInput, SelfAtLoginOccurrence};
-    use crate::federation::epoch_minter_invariants::bodies::Pick;
-    use crate::federation::key_grant::publish_signed_content_only_occurrence;
-    use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{device_class, identity_type as it};
-    use crate::federation::{BlobStorage, EncryptionPubkeys, FederationDirectory};
-    use crate::Engine;
-
-    fn fresh_keys() -> EncryptionPubkeys {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        let (_xp, x_pub, _mp, ml_pub) =
-            crate::federation::identity_aggregate::mint_content_kem_keypair().expect("kem");
-        EncryptionPubkeys {
-            x25519_base64: B64.encode(x_pub),
-            ml_kem_768_base64: B64.encode(ml_pub),
-        }
-    }
-
-    /// **I382** — the issue's shape (CIRISEdge#768), end to end.
-    pub(crate) async fn i382_self_at_login_keeps_the_engine_occurrence<B>(
-        dsn: &str,
-        tag: &str,
-        pick: Pick<B>,
-    ) where
-        B: BlobStorage + FederationDirectory + Sync,
-    {
-        let alias_n = format!("n382-the-engine-occurrence-node-{tag}");
-        let n_signer = ts::local_signer(&alias_n);
-        let engine = Engine::with_signer_pre_genesis(n_signer.clone(), dsn)
-            .await
-            .unwrap();
-        engine
-            .register_self_federation_key(it::NODE, None, None)
-            .await
-            .expect("register the engine key");
-        let n = engine.local_derived_key_id().await.unwrap();
-        let b = pick(&engine);
-        // v62.0.0 — edition-2 keys (`kid(seed)`); each LocalSigner signs as
-        // the kid of its alias.
-        let o_alias = format!("o382-the-owner-of-the-engine-node-{tag}");
-        let o_signer = ts::local_signer(&o_alias);
-        let o =
-            crate::federation::edition2::fixture_switch::put_key(b.as_ref(), &o_alias, &[it::USER])
-                .await;
-        let agent = crate::federation::edition2::fixture_switch::put_key(
-            b.as_ref(),
-            &format!("ag382-the-agent-occurrence-key-{tag}"),
-            &[it::AGENT],
-        )
-        .await;
-
-        // provision_engine_occurrence: the owner binds N, claims it, N agrees.
-        {
-            use crate::federation::edition2::fixture_switch as e2;
-            let ob = ts::owner_binding_attestation(&format!("bind382-{tag}"), &o_alias, &n);
-            let st = e2::carried_statement(&ob).expect("an edition-2 owner binding");
-            e2::put_signed(b.as_ref(), &ob)
-                .await
-                .expect("I382 the owner-binding is admitted");
-            e2::put_statement(b.as_ref(), &e2::voice_of(&st, &alias_n))
-                .await
-                .expect("I382 the node's voice on its owner binding");
-        }
-        let kem = b.load_or_init_content_kem_identity().await.unwrap();
-        let enc = EncryptionPubkeys {
-            x25519_base64: kem.x25519_pubkey_b64,
-            ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
-        };
-        for signer in [&o_signer, &n_signer] {
-            publish_signed_content_only_occurrence(
-                b.as_ref(),
-                signer,
-                &o,
-                &n,
-                device_class::SERVER,
-                None,
-                enc.clone(),
-                None,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("I382 provision ({}): {e}", signer.derived_key_id()));
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert_eq!(
-            b.active_identities_for_occurrence(&n).await.unwrap(),
-            vec![o.clone()],
-            "I382 precondition — N's own consent resolves O"
-        );
-
-        let input = |app_keys: EncryptionPubkeys, pair: &str| SelfAtLoginInput {
-            identity_key_id: o.clone(),
-            identity_signer: Some(o_signer.clone()),
-            app: SelfAtLoginOccurrence {
-                occurrence_key_id: n.clone(),
-                identity_key_id: None,
-                occurrence_signer: None,
-                transport: None,
-                device_class: device_class::SERVER.to_owned(),
-                hardware_attestation: None,
-                encryption_pubkeys: Some(app_keys),
-                transport_destinations: vec![],
-            },
-            agent: SelfAtLoginOccurrence {
-                occurrence_key_id: agent.clone(),
-                identity_key_id: None,
-                occurrence_signer: None,
-                transport: None,
-                device_class: device_class::AGENT.to_owned(),
-                hardware_attestation: None,
-                encryption_pubkeys: Some(fresh_keys()),
-                transport_destinations: vec![],
-            },
-            bilateral_pair_id: pair.to_owned(),
-            delegation_scope: None,
-        };
-        let outcome = engine
-            .self_at_login(input(enc.clone(), &format!("p1-{tag}")))
-            .await
-            .expect("I382 self_at_login over the engine occurrence");
-        assert!(
-            b.active_identities_for_occurrence(&n)
-                .await
-                .unwrap()
-                .contains(&o),
-            "I382 the owner is still the node's principal after self_at_login"
-        );
-        assert!(
-            outcome.occurrences_published.contains(&n),
-            "I382 the ceremony published the app occurrence: {outcome:?}"
-        );
-        // v62.0.0 — O1's signed listing serves edition-2 binds (carrying
-        // their statements; O1 I3034): the pair's current row is the
-        // identity's, and the occurrence's agreement lives in the history.
-        let stored = b
-            .list_signed_identity_occurrences_for(&o)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|s| s.identity_occurrence.occurrence_key_id == n)
-            .expect("I382 the (O, N) row");
-        assert_eq!(
-            stored.attesting_key_id, o,
-            "I382 the mechanism — the current row is now the identity's; the \
-             agreement lives in the history"
-        );
-    }
-}
-
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -425,39 +267,4 @@ mod runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i382_self_at_login_sqlite() {
-        Box::pin(
-            super::engine_bodies::i382_self_at_login_keeps_the_engine_occurrence(
-                "sqlite::memory:",
-                &suffix(),
-                (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
-                    as crate::federation::epoch_minter_invariants::bodies::Pick<
-                        crate::store::sqlite::SqliteBackend,
-                    >,
-            ),
-        )
-        .await;
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    async fn i382_self_at_login_postgres() {
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            return;
-        };
-        Box::pin(
-            super::engine_bodies::i382_self_at_login_keeps_the_engine_occurrence(
-                &dsn,
-                &suffix(),
-                (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
-                    as crate::federation::epoch_minter_invariants::bodies::Pick<
-                        crate::store::postgres::PostgresBackend,
-                    >,
-            ),
-        )
-        .await;
-    }
 }
