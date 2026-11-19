@@ -54,5 +54,29 @@ mod tests {
             "9f".repeat(32)
         )])
         .expect("I1311: a canonical subject passes");
+
+        // v62.0.0 (X2 pass 2) — an edition-2 identity-ref is a canonical
+        // subject WITH its base64url segment's case; the prefix is lowercase
+        // and the segment one spelling per key.
+        let iref = crate::federation::edition2::fixture_switch::kid("i1311-subject");
+        assert!(
+            iref.bytes().any(|b| b.is_ascii_uppercase()),
+            "I1311 fixture: the segment carries uppercase, so the clause is exercised: {iref}"
+        );
+        crate::federation::validate_subject_key_ids(std::slice::from_ref(&iref))
+            .expect("I1311: an identity-ref subject passes");
+        for bad_id in [
+            iref.replacen("urn:ietf", "URN:IETF", 1),
+            format!("{iref}A"),
+            format!("{}!", &iref[..iref.len() - 1]),
+        ] {
+            let e = crate::federation::validate_subject_key_ids(std::slice::from_ref(&bad_id))
+                .unwrap_err();
+            assert_eq!(
+                reason(e, "I1311 identity-ref"),
+                malformed_row::SUBJECT_KEY_ID_MALFORMED,
+                "I1311 {bad_id:?}"
+            );
+        }
     }
 }

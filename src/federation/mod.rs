@@ -3599,6 +3599,22 @@ pub fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error>
         if sid.chars().any(char::is_whitespace) {
             return malformed("whitespace");
         }
+        // v62.0.0 (X2 pass 2; CC 2.4.1) — an edition-2 identity-ref
+        // (`urn:ietf:params:oauth:ckt:sha-256:` + a 43-char base64url key
+        // segment) is canonical with its segment's case: base64url is
+        // case-significant, so the "no uppercase" clause below does not apply
+        // to it. The prefix is lowercase and the segment one spelling per key
+        // (`namespace::key_segment::segment_of`); anything else under that
+        // prefix is malformed.
+        let prefix = namespace::key_segment::IDENTITY_REF_PREFIX;
+        if sid.len() >= prefix.len()
+            && sid.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        {
+            if namespace::key_segment::segment_of(sid).is_none() {
+                return malformed("identity-ref is not the lowercase prefix and one 43-char base64url key segment");
+            }
+            continue;
+        }
         // PR #852 review round nine — `strip_prefix` is CASE-SENSITIVE, so an
         // id whose first ten bytes are `canonical:` in ANY case must be exactly
         // the canonical form. Compared as BYTES so a multi-byte character
