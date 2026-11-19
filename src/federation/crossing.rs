@@ -366,7 +366,9 @@ pub enum ContentRef {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Who signs a tier crossing. See the module doc, "Custody".
-#[derive(Debug, Clone)]
+///
+/// v61.4.2 — serde: the custody crosses the directory capsule (`DirectoryOp::EnterMesh`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TierPromotionCustody {
     /// The actor's own hybrid signature over `JCS(envelope)`. Becomes the
     /// base scrub. `reseal.attestation_envelope` must canonicalize to the

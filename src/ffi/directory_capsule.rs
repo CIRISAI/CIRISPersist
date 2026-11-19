@@ -1391,6 +1391,263 @@ pub enum DirectoryOp {
     /// installed policy, not the default. Result rides
     /// `HardwareAttestationPolicy`. APPEND-ONLY (Growth).
     HardwareAttestationPolicy {},
+    /// v61.4.2 (the community mirror of #1244 round 2's family pair) —
+    /// [`FederationDirectory::list_community_membership_revocations_for`]:
+    /// a room's active roster is record + widenings − revocations, and
+    /// through `Unsupported` every call join on an agent install answered
+    /// 503. Result rides `CommunityMembershipRevocations`. APPEND-ONLY
+    /// (Growth).
+    ListCommunityMembershipRevocationsFor {
+        /// `community_key_id`.
+        community_key_id: String,
+    },
+    /// v61.4.2 (the community mirror of #1244 round 2's family pair) —
+    /// [`FederationDirectory::list_community_membership_widenings_for`]: the
+    /// growth half of the room's active roster. Result rides
+    /// `CommunityMembershipWidenings`. APPEND-ONLY (Growth).
+    ListCommunityMembershipWideningsFor {
+        /// `community_key_id`.
+        community_key_id: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::add_community_member`]; the proxy answered
+    /// `Unsupported`. Result rides `Bool`. APPEND-ONLY (Growth).
+    AddCommunityMember {
+        /// `community_key_id`.
+        community_key_id: String,
+        /// `member`.
+        member: types::CommunityMember,
+        /// `spec`.
+        spec: cohort::AdmitSpec,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::add_family_member`]; the proxy answered
+    /// `Unsupported`. Result rides `Bool`. APPEND-ONLY (Growth).
+    AddFamilyMember {
+        /// `family_key_id`.
+        family_key_id: String,
+        /// `member`.
+        member: types::FamilyMember,
+        /// `spec`.
+        spec: cohort::AdmitSpec,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::attach_attestation_pqc_signature`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    AttachAttestationPqcSignature {
+        /// `attestation_id`.
+        attestation_id: String,
+        /// `scrub_signature_pqc`.
+        scrub_signature_pqc: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::attach_key_pqc_signature`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    AttachKeyPqcSignature {
+        /// `key_id`.
+        key_id: String,
+        /// `pubkey_ml_dsa_65_base64`.
+        pubkey_ml_dsa_65_base64: String,
+        /// `scrub_signature_pqc`.
+        scrub_signature_pqc: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::attestation_insert_local`]; the proxy answered
+    /// `Unsupported`. Result rides `AttestationId`. APPEND-ONLY (Growth).
+    AttestationInsertLocal {
+        /// `input`.
+        input: types::LocalAttestationInput,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::attestation_type_census`]; the proxy answered
+    /// `Unsupported`. Result rides `AttestationTypeCounts`. APPEND-ONLY (Growth).
+    AttestationTypeCensus {},
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::attestation_upsert_local`]; the proxy answered
+    /// `Unsupported`. Result rides `AttestationId`. APPEND-ONLY (Growth).
+    AttestationUpsertLocal {
+        /// `input`.
+        input: types::LocalAttestationInput,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::attestations_binding_content`]; the proxy answered
+    /// `Unsupported`. Result rides `AttestationRows`. APPEND-ONLY (Growth).
+    AttestationsBindingContent {
+        /// `content_sha256`.
+        content_sha256: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::attestations_binding_content_with_placements`]; the proxy answered
+    /// `Unsupported`. Result rides `AttestationRows`. APPEND-ONLY (Growth).
+    AttestationsBindingContentWithPlacements {
+        /// `content_sha256`.
+        content_sha256: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::clear_active_halt`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    ClearActiveHalt {
+        /// `family_key_id`.
+        family_key_id: String,
+        /// `active_halt_id`.
+        active_halt_id: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::communities_containing`]; the proxy answered
+    /// `Unsupported`. Result rides `Communities`. APPEND-ONLY (Growth).
+    CommunitiesContaining {
+        /// `cell_id`.
+        cell_id: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::dag_manifests_of_chunk`]; the proxy answered
+    /// `Unsupported`. Result rides `ChunkManifests`. APPEND-ONLY (Growth).
+    DagManifestsOfChunk {
+        /// `chunk_sha256`.
+        chunk_sha256: [u8; 32],
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::enter_mesh`]; the proxy answered
+    /// `Unsupported`. Result rides `MeshCrossing`. APPEND-ONLY (Growth).
+    EnterMesh {
+        /// `attestation_id`.
+        attestation_id: String,
+        /// `ci`.
+        ci: crate::federation::ContextualIntegrity,
+        /// `custody`.
+        custody: crate::federation::TierPromotionCustody,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::get_accord_proposal`]; the proxy answered
+    /// `Unsupported`. Result rides `AccordProposal`. APPEND-ONLY (Growth).
+    GetAccordProposal {
+        /// `proposal_digest`.
+        proposal_digest: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::list_accord_participations`]; the proxy answered
+    /// `Unsupported`. Result rides `AccordParticipations`. APPEND-ONLY (Growth).
+    ListAccordParticipations {
+        /// `proposal_digest`.
+        proposal_digest: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::list_attestations_by_dimension_citing`]; the proxy answered
+    /// `Unsupported`. Result rides `AttestationRows`. APPEND-ONLY (Growth).
+    ListAttestationsByDimensionCiting {
+        /// `attesting_key_id`.
+        attesting_key_id: String,
+        /// `dimension`.
+        dimension: String,
+        /// `evidence_ref`.
+        evidence_ref: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::list_communities_for_member`]; the proxy answered
+    /// `Unsupported`. Result rides `Communities`. APPEND-ONLY (Growth).
+    ListCommunitiesForMember {
+        /// `member_identity_key_id`.
+        member_identity_key_id: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::list_group_versions`]; the proxy answered
+    /// `Unsupported`. Result rides `GroupVersions`. APPEND-ONLY (Growth).
+    ListGroupVersions {
+        /// `cohort`.
+        cohort: cohort::Cohort,
+        /// `group_key_id`.
+        group_key_id: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::list_hybrid_pending_attestations`]; the proxy answered
+    /// `Unsupported`. Result rides `HybridPendingRows`. APPEND-ONLY (Growth).
+    ListHybridPendingAttestations {
+        /// `limit`.
+        limit: i64,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::list_hybrid_pending_keys`]; the proxy answered
+    /// `Unsupported`. Result rides `HybridPendingRows`. APPEND-ONLY (Growth).
+    ListHybridPendingKeys {
+        /// `limit`.
+        limit: i64,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::list_location_proofs_for`]; the proxy answered
+    /// `Unsupported`. Result rides `LocationProofs`. APPEND-ONLY (Growth).
+    ListLocationProofsFor {
+        /// `subject_key_id`.
+        subject_key_id: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::lookup_keys_for_identity`]; the proxy answered
+    /// `Unsupported`. Result rides `KeyRecords`. APPEND-ONLY (Growth).
+    LookupKeysForIdentity {
+        /// `identity_ref`.
+        identity_ref: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_accord_decision`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    PutAccordDecision {
+        /// `decision`.
+        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_accord_participation`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    PutAccordParticipation {
+        /// `participation`.
+        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
+        /// `standing_roster`.
+        standing_roster: Vec<ciris_verify_core::threshold::ThresholdMember>,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_accord_proposal`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    PutAccordProposal {
+        /// `proposal`.
+        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
+        /// `authority_signature`.
+        authority_signature: Option<serde_json::Value>,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_community_membership_revocation`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    PutCommunityMembershipRevocation {
+        /// `revocation`.
+        revocation: SignedCommunityMembershipRevocation,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_community_membership_widening`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    PutCommunityMembershipWidening {
+        /// `widening`.
+        widening: crate::federation::SignedCommunityMembershipWidening,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_family_membership_revocation`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    PutFamilyMembershipRevocation {
+        /// `revocation`.
+        revocation: SignedFamilyMembershipRevocation,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_family_membership_widening`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    PutFamilyMembershipWidening {
+        /// `widening`.
+        widening: crate::federation::SignedFamilyMembershipWidening,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::set_active_halt`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    SetActiveHalt {
+        /// `family_key_id`.
+        family_key_id: String,
+        /// `active_halt_id`.
+        active_halt_id: String,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::set_consent_role`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    SetConsentRole {
+        /// `key_id`.
+        key_id: String,
+        /// `consent_role`.
+        consent_role: Option<String>,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::supersede_group_row`]; the proxy answered
+    /// `Unsupported`. Result rides `GroupRowVersion`. APPEND-ONLY (Growth).
+    SupersedeGroupRow {
+        /// `cohort`.
+        cohort: cohort::Cohort,
+        /// `new_snapshot`.
+        new_snapshot: serde_json::Value,
+        /// `authorization`.
+        authorization: Option<serde_json::Value>,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::withdraw_location_proof`]; the proxy answered
+    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    WithdrawLocationProof {
+        /// `proof`.
+        proof: SignedLocationProof,
+    },
+    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::list_live_consent_grants_by`]; the proxy answered
+    /// `Unsupported`. Result rides `AttestationRows`. APPEND-ONLY (Growth).
+    ListLiveConsentGrantsBy {
+        /// `node_key_id`.
+        node_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1668,6 +1925,32 @@ pub enum DirectoryOpResult {
     OptionalString(Option<String>),
     /// v61.4.0 (CIRISPersist#1244 round 2) — `hardware_attestation_policy`. APPEND-ONLY (Growth).
     HardwareAttestationPolicy(crate::federation::HardwareAttestationPolicy),
+    /// v61.4.2 — `list_community_membership_revocations_for`. APPEND-ONLY (Growth).
+    CommunityMembershipRevocations(Vec<CommunityMembershipRevocation>),
+    /// v61.4.2 — `list_community_membership_widenings_for`. APPEND-ONLY (Growth).
+    CommunityMembershipWidenings(Vec<types::CommunityMembershipWidening>),
+    /// v61.4.2 (the capsule stub sweep) — `communities_containing`, `list_communities_for_member`. APPEND-ONLY (Growth).
+    Communities(Vec<Community>),
+    /// v61.4.2 (the capsule stub sweep) — `attestation_insert_local`, `attestation_upsert_local`: the row id. APPEND-ONLY (Growth).
+    AttestationId(String),
+    /// v61.4.2 (the capsule stub sweep) — `attestation_type_census`. APPEND-ONLY (Growth).
+    AttestationTypeCounts(Vec<crate::federation::row_type::AttestationTypeCount>),
+    /// v61.4.2 (the capsule stub sweep) — `dag_manifests_of_chunk`. APPEND-ONLY (Growth).
+    ChunkManifests(Vec<[u8; 32]>),
+    /// v61.4.2 (the capsule stub sweep) — `enter_mesh`. APPEND-ONLY (Growth).
+    MeshCrossing(crate::federation::MeshCrossingOutcome),
+    /// v61.4.2 (the capsule stub sweep) — `get_accord_proposal`. APPEND-ONLY (Growth).
+    AccordProposal(Option<accord_quorum::StoredProposal>),
+    /// v61.4.2 (the capsule stub sweep) — `list_accord_participations`. APPEND-ONLY (Growth).
+    AccordParticipations(Vec<accord_quorum::StoredParticipation>),
+    /// v61.4.2 (the capsule stub sweep) — `list_group_versions`. APPEND-ONLY (Growth).
+    GroupVersions(Vec<cohort::GroupVersion>),
+    /// v61.4.2 (the capsule stub sweep) — `list_hybrid_pending_keys`, `list_hybrid_pending_attestations`. APPEND-ONLY (Growth).
+    HybridPendingRows(Vec<HybridPendingRow>),
+    /// v61.4.2 (the capsule stub sweep) — `list_location_proofs_for`. APPEND-ONLY (Growth).
+    LocationProofs(Vec<LocationProof>),
+    /// v61.4.2 (the capsule stub sweep) — `supersede_group_row`: the new version. APPEND-ONLY (Growth).
+    GroupRowVersion(u32),
 }
 
 /// v61.4.0 (CIRISPersist#1244) — the refusal a blackhole op gets from a
@@ -2111,6 +2394,283 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::FamilyMembershipWidenings(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::AddCommunityMember {
+            community_key_id,
+            member,
+            spec,
+        } => {
+            match dir
+                .add_community_member(&community_key_id, member, &spec)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::Bool(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::AddFamilyMember {
+            family_key_id,
+            member,
+            spec,
+        } => match dir.add_family_member(&family_key_id, member, &spec).await {
+            Ok(v) => DirectoryOpResult::Bool(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::AttachAttestationPqcSignature {
+            attestation_id,
+            scrub_signature_pqc,
+        } => {
+            match dir
+                .attach_attestation_pqc_signature(&attestation_id, &scrub_signature_pqc)
+                .await
+            {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::AttachKeyPqcSignature {
+            key_id,
+            pubkey_ml_dsa_65_base64,
+            scrub_signature_pqc,
+        } => {
+            match dir
+                .attach_key_pqc_signature(&key_id, &pubkey_ml_dsa_65_base64, &scrub_signature_pqc)
+                .await
+            {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::AttestationInsertLocal { input } => {
+            match dir.attestation_insert_local(input).await {
+                Ok(v) => DirectoryOpResult::AttestationId(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::AttestationTypeCensus {} => match dir.attestation_type_census().await {
+            Ok(v) => DirectoryOpResult::AttestationTypeCounts(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::AttestationUpsertLocal { input } => {
+            match dir.attestation_upsert_local(input).await {
+                Ok(v) => DirectoryOpResult::AttestationId(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::AttestationsBindingContent { content_sha256 } => {
+            match dir.attestations_binding_content(&content_sha256).await {
+                Ok(v) => DirectoryOpResult::AttestationRows(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::AttestationsBindingContentWithPlacements { content_sha256 } => {
+            match dir
+                .attestations_binding_content_with_placements(&content_sha256)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::AttestationRows(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ClearActiveHalt {
+            family_key_id,
+            active_halt_id,
+        } => match dir.clear_active_halt(&family_key_id, &active_halt_id).await {
+            Ok(()) => DirectoryOpResult::Unit,
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::CommunitiesContaining { cell_id } => {
+            match dir.communities_containing(&cell_id).await {
+                Ok(v) => DirectoryOpResult::Communities(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::DagManifestsOfChunk { chunk_sha256 } => {
+            match dir.dag_manifests_of_chunk(&chunk_sha256).await {
+                Ok(v) => DirectoryOpResult::ChunkManifests(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::EnterMesh {
+            attestation_id,
+            ci,
+            custody,
+        } => match dir.enter_mesh(&attestation_id, &ci, &custody).await {
+            Ok(v) => DirectoryOpResult::MeshCrossing(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::GetAccordProposal { proposal_digest } => {
+            match dir.get_accord_proposal(&proposal_digest).await {
+                Ok(v) => DirectoryOpResult::AccordProposal(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListAccordParticipations { proposal_digest } => {
+            match dir.list_accord_participations(&proposal_digest).await {
+                Ok(v) => DirectoryOpResult::AccordParticipations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListAttestationsByDimensionCiting {
+            attesting_key_id,
+            dimension,
+            evidence_ref,
+        } => {
+            match dir
+                .list_attestations_by_dimension_citing(&attesting_key_id, &dimension, &evidence_ref)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::AttestationRows(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListCommunitiesForMember {
+            member_identity_key_id,
+        } => {
+            match dir
+                .list_communities_for_member(&member_identity_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::Communities(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListGroupVersions {
+            cohort,
+            group_key_id,
+        } => match dir.list_group_versions(cohort, &group_key_id).await {
+            Ok(v) => DirectoryOpResult::GroupVersions(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::ListHybridPendingAttestations { limit } => {
+            match dir.list_hybrid_pending_attestations(limit).await {
+                Ok(v) => DirectoryOpResult::HybridPendingRows(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListHybridPendingKeys { limit } => {
+            match dir.list_hybrid_pending_keys(limit).await {
+                Ok(v) => DirectoryOpResult::HybridPendingRows(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListLocationProofsFor { subject_key_id } => {
+            match dir.list_location_proofs_for(&subject_key_id).await {
+                Ok(v) => DirectoryOpResult::LocationProofs(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::LookupKeysForIdentity { identity_ref } => {
+            match dir.lookup_keys_for_identity(&identity_ref).await {
+                Ok(v) => DirectoryOpResult::KeyRecords(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::PutAccordDecision { decision } => {
+            match dir.put_accord_decision(decision).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::PutAccordParticipation {
+            participation,
+            standing_roster,
+        } => {
+            match dir
+                .put_accord_participation(participation, &standing_roster)
+                .await
+            {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::PutAccordProposal {
+            proposal,
+            authority_signature,
+        } => match dir.put_accord_proposal(proposal, authority_signature).await {
+            Ok(()) => DirectoryOpResult::Unit,
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::PutCommunityMembershipRevocation { revocation } => {
+            match dir.put_community_membership_revocation(revocation).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::PutCommunityMembershipWidening { widening } => {
+            match dir.put_community_membership_widening(widening).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::PutFamilyMembershipRevocation { revocation } => {
+            match dir.put_family_membership_revocation(revocation).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::PutFamilyMembershipWidening { widening } => {
+            match dir.put_family_membership_widening(widening).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::SetActiveHalt {
+            family_key_id,
+            active_halt_id,
+        } => match dir.set_active_halt(&family_key_id, &active_halt_id).await {
+            Ok(()) => DirectoryOpResult::Unit,
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::SetConsentRole {
+            key_id,
+            consent_role,
+        } => match dir.set_consent_role(&key_id, consent_role.as_deref()).await {
+            Ok(()) => DirectoryOpResult::Unit,
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::SupersedeGroupRow {
+            cohort,
+            new_snapshot,
+            authorization,
+        } => {
+            match dir
+                .supersede_group_row(cohort, new_snapshot, authorization)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::GroupRowVersion(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::WithdrawLocationProof { proof } => {
+            match dir.withdraw_location_proof(proof).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListLiveConsentGrantsBy { node_key_id } => {
+            match dir.list_live_consent_grants_by(&node_key_id).await {
+                Ok(v) => DirectoryOpResult::AttestationRows(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListCommunityMembershipRevocationsFor { community_key_id } => {
+            match dir
+                .list_community_membership_revocations_for(&community_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::CommunityMembershipRevocations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListCommunityMembershipWideningsFor { community_key_id } => {
+            match dir
+                .list_community_membership_widenings_for(&community_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::CommunityMembershipWidenings(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -4384,42 +4944,82 @@ impl FederationDirectory for OpsDirectory {
     async fn attestation_type_census(
         &self,
     ) -> Result<Vec<crate::federation::row_type::AttestationTypeCount>, Error> {
-        Err(Error::Unsupported {
-            method: "attestation_type_census",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self.run_op(&DirectoryOp::AttestationTypeCensus {}).await? {
+            DirectoryOpResult::AttestationTypeCounts(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
 
     async fn lookup_keys_for_identity(&self, identity_ref: &str) -> Result<Vec<KeyRecord>, Error> {
-        Err(Error::Unsupported {
-            method: "lookup_keys_for_identity",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::LookupKeysForIdentity {
+                identity_ref: identity_ref.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::KeyRecords(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn set_consent_role(
         &self,
-        _key_id: &str,
-        _consent_role: Option<&str>,
+        key_id: &str,
+        consent_role: Option<&str>,
     ) -> Result<(), Error> {
-        // v13.0.0 (CIRISPersist#365) — no DirectoryOp in the capsule
-        // protocol carries consent_role mutation; not routable here.
-        Err(Error::Unsupported {
-            method: "set_consent_role",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::SetConsentRole {
+                key_id: key_id.to_string(),
+                consent_role: consent_role.map(str::to_owned),
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn attestation_upsert_local(
         &self,
         input: crate::federation::types::LocalAttestationInput,
     ) -> Result<String, Error> {
-        Err(Error::Unsupported {
-            method: "attestation_upsert_local",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::AttestationUpsertLocal { input })
+            .await?
+        {
+            DirectoryOpResult::AttestationId(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn attestation_insert_local(
         &self,
         input: crate::federation::types::LocalAttestationInput,
     ) -> Result<String, Error> {
-        Err(Error::Unsupported {
-            method: "attestation_insert_local",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::AttestationInsertLocal { input })
+            .await?
+        {
+            DirectoryOpResult::AttestationId(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     /// v59.1.2 (CIRISPersist#1162) — routed (was `Error::Unsupported`). Every
     /// `AttestationQuery` read on a capsule consumer — the owner walk,
@@ -4448,10 +5048,21 @@ impl FederationDirectory for OpsDirectory {
         dimension: &str,
         evidence_ref: &str,
     ) -> Result<Vec<Attestation>, Error> {
-        let _ = (attesting_key_id, dimension, evidence_ref);
-        Err(Error::Unsupported {
-            method: "list_attestations_by_dimension_citing",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::ListAttestationsByDimensionCiting {
+                attesting_key_id: attesting_key_id.to_string(),
+                dimension: dimension.to_string(),
+                evidence_ref: evidence_ref.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AttestationRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_attestations_referencing(
         &self,
@@ -4498,29 +5109,59 @@ impl FederationDirectory for OpsDirectory {
         &self,
         content_sha256: &str,
     ) -> Result<Vec<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "attestations_binding_content",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::AttestationsBindingContent {
+                content_sha256: content_sha256.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AttestationRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     /// v61.4.0 (CIRISPersist#1260) — unsupported, as the binding query
     /// beside it is.
     async fn attestations_binding_content_with_placements(
         &self,
-        _content_sha256: &str,
+        content_sha256: &str,
     ) -> Result<Vec<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "attestations_binding_content_with_placements",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::AttestationsBindingContentWithPlacements {
+                content_sha256: content_sha256.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AttestationRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     /// v53.1.0 (#979) — a capsule host stores no blobs through this surface;
     /// unsupported, as the binding query beside it is.
     async fn dag_manifests_of_chunk(
         &self,
-        _chunk_sha256: &[u8; 32],
+        chunk_sha256: &[u8; 32],
     ) -> Result<Vec<[u8; 32]>, Error> {
-        Err(Error::Unsupported {
-            method: "dag_manifests_of_chunk",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::DagManifestsOfChunk {
+                chunk_sha256: *chunk_sha256,
+            })
+            .await?
+        {
+            DirectoryOpResult::ChunkManifests(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     /// v31.1.0 (CIRISPersist#655) — routed (was `Error::Unsupported`). An
     /// exclusion plane a capsule host could write and never read back is the
@@ -4701,9 +5342,21 @@ impl FederationDirectory for OpsDirectory {
         member: types::FamilyMember,
         spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, Error> {
-        Err(Error::Unsupported {
-            method: "add_family_member",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::AddFamilyMember {
+                family_key_id: family_key_id.to_string(),
+                member,
+                spec: spec.clone(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Bool(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn lookup_family(&self, family_key_id: &str) -> Result<Option<Family>, Error> {
         // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
@@ -4757,43 +5410,83 @@ impl FederationDirectory for OpsDirectory {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<Community>, Error> {
-        Err(Error::Unsupported {
-            method: "list_communities_for_member",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::ListCommunitiesForMember {
+                member_identity_key_id: member_identity_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Communities(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn put_family_membership_revocation(
         &self,
         revocation: SignedFamilyMembershipRevocation,
     ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "put_family_membership_revocation",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::PutFamilyMembershipRevocation { revocation })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn put_community_membership_revocation(
         &self,
         revocation: SignedCommunityMembershipRevocation,
     ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "put_community_membership_revocation",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::PutCommunityMembershipRevocation { revocation })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn put_community_membership_widening(
         &self,
         widening: crate::federation::SignedCommunityMembershipWidening,
     ) -> Result<(), Error> {
-        let _ = widening;
-        Err(Error::Unsupported {
-            method: "put_community_membership_widening",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::PutCommunityMembershipWidening { widening })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn put_family_membership_widening(
         &self,
         widening: crate::federation::SignedFamilyMembershipWidening,
     ) -> Result<(), Error> {
-        let _ = widening;
-        Err(Error::Unsupported {
-            method: "put_family_membership_widening",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::PutFamilyMembershipWidening { widening })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_identity_occurrence_revocations_for(
         &self,
@@ -5405,22 +6098,60 @@ impl FederationDirectory for OpsDirectory {
             )),
         }
     }
+    async fn list_live_consent_grants_by(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::ListLiveConsentGrantsBy {
+                node_key_id: node_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AttestationRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
     async fn list_community_membership_revocations_for(
         &self,
         community_key_id: &str,
     ) -> Result<Vec<CommunityMembershipRevocation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_community_membership_revocations_for",
-        })
+        // v61.4.2 — the removal half of a room's active roster (Edge's call
+        // join reads record + widenings − revocations through the capsule).
+        match self
+            .run_op(&DirectoryOp::ListCommunityMembershipRevocationsFor {
+                community_key_id: community_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::CommunityMembershipRevocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_community_membership_widenings_for(
         &self,
         community_key_id: &str,
     ) -> Result<Vec<crate::federation::CommunityMembershipWidening>, Error> {
-        let _ = community_key_id;
-        Err(Error::Unsupported {
-            method: "list_community_membership_widenings_for",
-        })
+        // v61.4.2 — the growth half of a room's active roster.
+        match self
+            .run_op(&DirectoryOp::ListCommunityMembershipWideningsFor {
+                community_key_id: community_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::CommunityMembershipWidenings(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_family_membership_widenings_for(
         &self,
@@ -5444,20 +6175,48 @@ impl FederationDirectory for OpsDirectory {
         &self,
         subject_key_id: &str,
     ) -> Result<Vec<LocationProof>, Error> {
-        Err(Error::Unsupported {
-            method: "list_location_proofs_for",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::ListLocationProofsFor {
+                subject_key_id: subject_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::LocationProofs(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
 
-    async fn withdraw_location_proof(&self, _proof: SignedLocationProof) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "withdraw_location_proof",
-        })
+    async fn withdraw_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::WithdrawLocationProof { proof })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn communities_containing(&self, cell_id: &str) -> Result<Vec<Community>, Error> {
-        Err(Error::Unsupported {
-            method: "communities_containing",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::CommunitiesContaining {
+                cell_id: cell_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Communities(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn add_community_member(
         &self,
@@ -5465,9 +6224,21 @@ impl FederationDirectory for OpsDirectory {
         member: types::CommunityMember,
         spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error> {
-        Err(Error::Unsupported {
-            method: "add_community_member",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::AddCommunityMember {
+                community_key_id: community_key_id.to_string(),
+                member,
+                spec: spec.clone(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Bool(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn supersede_group_row(
         &self,
@@ -5475,18 +6246,41 @@ impl FederationDirectory for OpsDirectory {
         new_snapshot: serde_json::Value,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
-        Err(Error::Unsupported {
-            method: "supersede_group_row",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::SupersedeGroupRow {
+                cohort,
+                new_snapshot,
+                authorization,
+            })
+            .await?
+        {
+            DirectoryOpResult::GroupRowVersion(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_group_versions(
         &self,
         cohort: cohort::Cohort,
         group_key_id: &str,
     ) -> Result<Vec<cohort::GroupVersion>, Error> {
-        Err(Error::Unsupported {
-            method: "list_group_versions",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::ListGroupVersions {
+                cohort,
+                group_key_id: group_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::GroupVersions(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn attach_key_pqc_signature(
         &self,
@@ -5494,18 +6288,41 @@ impl FederationDirectory for OpsDirectory {
         pubkey_ml_dsa_65_base64: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "attach_key_pqc_signature",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::AttachKeyPqcSignature {
+                key_id: key_id.to_string(),
+                pubkey_ml_dsa_65_base64: pubkey_ml_dsa_65_base64.to_string(),
+                scrub_signature_pqc: scrub_signature_pqc.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn attach_attestation_pqc_signature(
         &self,
         attestation_id: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "attach_attestation_pqc_signature",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::AttachAttestationPqcSignature {
+                attestation_id: attestation_id.to_string(),
+                scrub_signature_pqc: scrub_signature_pqc.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error> {
         // v61.4.0 (CIRISPersist#1244 round 2, the rooting view).
@@ -5528,39 +6345,88 @@ impl FederationDirectory for OpsDirectory {
         ci: &crate::federation::ContextualIntegrity,
         custody: &crate::federation::TierPromotionCustody,
     ) -> Result<crate::federation::MeshCrossingOutcome, Error> {
-        Err(Error::Unsupported {
-            method: "enter_mesh",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::EnterMesh {
+                attestation_id: attestation_id.to_string(),
+                ci: ci.clone(),
+                custody: custody.clone(),
+            })
+            .await?
+        {
+            DirectoryOpResult::MeshCrossing(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error> {
-        Err(Error::Unsupported {
-            method: "list_hybrid_pending_keys",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::ListHybridPendingKeys { limit })
+            .await?
+        {
+            DirectoryOpResult::HybridPendingRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_hybrid_pending_attestations(
         &self,
         limit: i64,
     ) -> Result<Vec<HybridPendingRow>, Error> {
-        Err(Error::Unsupported {
-            method: "list_hybrid_pending_attestations",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::ListHybridPendingAttestations { limit })
+            .await?
+        {
+            DirectoryOpResult::HybridPendingRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn put_accord_proposal(
         &self,
         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "put_accord_proposal",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::PutAccordProposal {
+                proposal,
+                authority_signature,
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn get_accord_proposal(
         &self,
         proposal_digest: &str,
     ) -> Result<Option<accord_quorum::StoredProposal>, Error> {
-        Err(Error::Unsupported {
-            method: "get_accord_proposal",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::GetAccordProposal {
+                proposal_digest: proposal_digest.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AccordProposal(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_accord_proposals_by_anchor(
         &self,
@@ -5587,26 +6453,54 @@ impl FederationDirectory for OpsDirectory {
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
         standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
     ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "put_accord_participation",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::PutAccordParticipation {
+                participation,
+                standing_roster: standing_roster.to_vec(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_accord_participations(
         &self,
         proposal_digest: &str,
     ) -> Result<Vec<accord_quorum::StoredParticipation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_accord_participations",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::ListAccordParticipations {
+                proposal_digest: proposal_digest.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AccordParticipations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn put_accord_decision(
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
     ) -> Result<(), Error> {
-        let _ = decision;
-        Err(Error::Unsupported {
-            method: "put_accord_decision",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::PutAccordDecision { decision })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn get_accord_decision(
         &self,
@@ -5631,9 +6525,20 @@ impl FederationDirectory for OpsDirectory {
         family_key_id: &str,
         active_halt_id: &str,
     ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "set_active_halt",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::SetActiveHalt {
+                family_key_id: family_key_id.to_string(),
+                active_halt_id: active_halt_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn get_active_halt(
         &self,
@@ -5658,9 +6563,20 @@ impl FederationDirectory for OpsDirectory {
         family_key_id: &str,
         active_halt_id: &str,
     ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "clear_active_halt",
-        })
+        // v61.4.2 (the capsule stub sweep).
+        match self
+            .run_op(&DirectoryOp::ClearActiveHalt {
+                family_key_id: family_key_id.to_string(),
+                active_halt_id: active_halt_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
 }
 
@@ -6528,9 +7444,13 @@ mod tests {
         // DIRECTORY_ABI_VERSION stays 13.
         // v61.4.0 round 2 (CIRISPersist#1244) — GROWTH: the rooting reads and
         // the fail-open trust reads APPENDED (29 ops); ABI stays 13.
+        // v61.4.2 — GROWTH: `ListCommunityMembership{Revocations,Widenings}For`
+        // APPENDED (the community mirror of the family pair); ABI stays 13.
+        // v61.4.2 (the capsule stub sweep) — GROWTH: 34 ops APPENDED, one per
+        // method the proxy answered `Unsupported`; ABI stays 13.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "10f494612b504776fad61ddd55b88d70ffcdf6dd6c6ba1387d9e3db5b4ca9f8e",
+            "4ad5e3cfd5b3eaec82338c9646f56119b734ada7bce42351cefb92707f86dc24",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -6589,9 +7509,13 @@ mod tests {
         // v61.4.0 (CIRISPersist#1244) — GROWTH: `BlackholeRecords` APPENDED.
         // v61.4.0 round 2 (CIRISPersist#1244) — GROWTH: 21 result variants
         // APPENDED for the rooting and trust reads.
+        // v61.4.2 — GROWTH: `CommunityMembership{Revocations,Widenings}`
+        // APPENDED.
+        // v61.4.2 (the capsule stub sweep) — GROWTH: 11 result variants
+        // APPENDED.
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "e3041d8473605d82d0aad59d6f99920013a38968d4ca66a938a67b4053ed553c",
+            "97ac79f74400568e01e968d4b97357a0151458ec872714e8d828405ff3eed856",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -7756,16 +8680,17 @@ mod tests {
         ));
         let proxy = build_ops_directory(directory, executor).expect("abi ok");
 
-        // v61.4.0 — `get_attestation` routes now; `list_communities_for_member`
-        // is still a stub (allowlisted, its callers fail closed).
+        // v61.4.2 — the proxy has no stub of its own left (the capsule stub
+        // sweep); a node-local cosign ledger read it inherits from the trait
+        // default still answers `Unsupported` (allowlisted, COSIGN_1252).
         let err = rt
-            .block_on(proxy.list_communities_for_member("member-x"))
-            .expect_err("list_communities_for_member has no op → Unsupported");
+            .block_on(proxy.list_open_cosign_receipts())
+            .expect_err("list_open_cosign_receipts has no op → Unsupported");
         assert!(
             matches!(
                 err,
                 Error::Unsupported {
-                    method: "list_communities_for_member"
+                    method: "list_open_cosign_receipts"
                 }
             ),
             "got {err:?}"
@@ -8619,6 +9544,32 @@ mod tests {
                 },
             ),
             (
+                "list_community_membership_revocations_for",
+                DirectoryOp::ListCommunityMembershipRevocationsFor {
+                    community_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_community_membership_revocations_for("x")
+                            .await
+                            .map(|_| ())
+                    })
+                },
+            ),
+            (
+                "list_community_membership_widenings_for",
+                DirectoryOp::ListCommunityMembershipWideningsFor {
+                    community_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_community_membership_widenings_for("x")
+                            .await
+                            .map(|_| ())
+                    })
+                },
+            ),
+            (
                 "list_lineage_head_cosigns_for",
                 DirectoryOp::ListLineageHeadCosignsFor {
                     lineage_key_id: "x".into(),
@@ -8711,7 +9662,8 @@ mod tests {
                 |p| Box::pin(async move { p.key_grant_held_owner(&axis()).await.map(|_| ()) }),
             ),
         ];
-        assert_eq!(table.len(), 23, "I1762: one row per routed async read");
+        // v61.4.2: + the community membership pair (23 → 25).
+        assert_eq!(table.len(), 25, "I1762: one row per routed async read");
         // Every row runs, and the red names every op that failed, not only
         // the first (so one mutated build shows each arm's witness).
         let mut red = Vec::new();
@@ -9132,6 +10084,1049 @@ mod tests {
         );
     }
 
+    /// **I1808 — a room's membership planes cross the capsule.** Edge's
+    /// call join reads a room's active roster (record + widenings −
+    /// revocations) through the capsule; before v61.4.2 the proxy answered
+    /// `Unsupported` for both planes and every join on an agent install
+    /// answered 503. A keyless room with one widening and one revocation:
+    /// the vtable and the proxy each answer the direct backend's rows, and
+    /// the fold over the proxy's reads seats the widened member and drops
+    /// the revoked one.
+    fn exercise_i1808(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+        use crate::federation::room_roster_invariants::bodies::keyless_room_dir;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+        let at = |s: &str| -> chrono::DateTime<chrono::Utc> { s.parse().expect("rfc3339") };
+        let (t_join, t_leave) = (at("2026-03-01T00:00:00Z"), at("2026-03-02T00:00:00Z"));
+        let tg = format!("{tag}-1808");
+        let (room, alice, bob) = rt.block_on(keyless_room_dir(dir.as_ref(), &tg));
+        let carol = format!("{tg}-carol");
+        let widening = ts::sign_community_membership_widening(
+            &alice,
+            types::CommunityMembershipWidening {
+                community_key_id: room.clone(),
+                member_key_id: carol.clone(),
+                joined_at: t_join,
+                effective_at: t_join,
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        let revocation = ts::sign_community_membership_revocation(
+            &alice,
+            CommunityMembershipRevocation {
+                community_key_id: room.clone(),
+                removed_identity_key_id: bob.clone(),
+                removed_at: t_leave,
+                effective_at: t_leave,
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        );
+        rt.block_on(async {
+            ts::register_hybrid_key_as(dir.as_ref(), &carol, &carol, identity_type::USER).await;
+            let d: &dyn FederationDirectory = dir.as_ref();
+            d.put_community_membership_widening_consented(widening)
+                .await
+                .expect("I1808 widening");
+            d.put_community_membership_revocation(revocation)
+                .await
+                .expect("I1808 revocation");
+        });
+        let ws = rt
+            .block_on(dir.list_community_membership_widenings_for(&room))
+            .expect("direct widenings");
+        let rs = rt
+            .block_on(dir.list_community_membership_revocations_for(&room))
+            .expect("direct revocations");
+        assert_eq!((ws.len(), rs.len()), (1, 1), "I1808 seed");
+
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ListCommunityMembershipWideningsFor {
+                community_key_id: room.clone(),
+            },
+        ) {
+            DirectoryOpResult::CommunityMembershipWidenings(v) => {
+                assert_eq!(v, ws, "I1808 vtable widenings")
+            }
+            other => panic!("I1808 widenings: {other:?}"),
+        }
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ListCommunityMembershipRevocationsFor {
+                community_key_id: room.clone(),
+            },
+        ) {
+            DirectoryOpResult::CommunityMembershipRevocations(v) => {
+                assert_eq!(v, rs, "I1808 vtable revocations")
+            }
+            other => panic!("I1808 revocations: {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+
+        let proxy = proxy_1244(rt, dir.clone());
+        let pw = rt
+            .block_on(proxy.list_community_membership_widenings_for(&room))
+            .expect("I1808: the proxy routes widenings");
+        assert_eq!(pw, ws, "I1808 proxy widenings");
+        let pr = rt
+            .block_on(proxy.list_community_membership_revocations_for(&room))
+            .expect("I1808: the proxy routes revocations");
+        assert_eq!(pr, rs, "I1808 proxy revocations");
+        // The fold Edge's join makes — record + widenings − revocations —
+        // over the PROXY's three reads: carol is in, bob is out.
+        let rec = rt
+            .block_on(proxy.lookup_community(&room))
+            .expect("I1808: the proxy routes the record")
+            .expect("I1808: the room is held");
+        let mut got: Vec<String> =
+            crate::federation::active_roster_at(&rec.members, &pw, &pr, chrono::Utc::now())
+                .into_iter()
+                .map(|m| m.key_id)
+                .collect();
+        got.sort();
+        let mut want = vec![alice, carol];
+        want.sort();
+        assert_eq!(got, want, "I1808 proxy fold: carol in, bob out");
+    }
+
+    // ── v61.4.2 (the capsule stub sweep) — every proxy stub routes ─────────
+
+    type ProxyCallDbg = fn(
+        Arc<dyn FederationDirectory>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send>>;
+
+    const KEY_1890: &str = "i1890-authority-key-000000000000000000";
+
+    fn at_1890() -> chrono::DateTime<chrono::Utc> {
+        "2026-03-01T00:00:00Z".parse().expect("rfc3339")
+    }
+
+    fn member_1890() -> types::CommunityMember {
+        types::CommunityMember {
+            key_id: "y".into(),
+            joined_at: at_1890(),
+            role: None,
+        }
+    }
+
+    fn family_member_1890() -> types::FamilyMember {
+        types::FamilyMember {
+            key_id: "y".into(),
+            joined_at: at_1890(),
+            role: None,
+        }
+    }
+
+    fn spec_1890() -> cohort::AdmitSpec {
+        cohort::AdmitSpec {
+            authority_key_id: KEY_1890.into(),
+            scrub_signature_classical: "sig".into(),
+            scrub_signature_pqc: None,
+            cosignatures: Vec::new(),
+        }
+    }
+
+    fn local_1890() -> types::LocalAttestationInput {
+        crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+            "att-1890",
+            KEY_1890,
+            "y",
+            Vec::new(),
+            "self",
+            at_1890(),
+            serde_json::json!({}),
+        )
+    }
+
+    fn ci_1890() -> crate::federation::ContextualIntegrity {
+        use crate::federation::crossing as c;
+        c::ContextualIntegrity {
+            sender: KEY_1890.into(),
+            data_subject: c::DataSubject::Nobody,
+            recipient_see: c::Audience::SelfOnly,
+            recipient_revoke: c::RevocationAuthority::ProducerOnly,
+            recipient_receive: c::DeliveryMode::BestEffort,
+            information_type: crate::federation::namespace::AttestationFamily::Scores,
+            transmission_principle: c::CrossingBasis::ProducerAuthority,
+            temporal_lifecycle: c::Lifecycle {
+                asserted_at: at_1890(),
+                expires_at: None,
+            },
+            content: c::ContentRef::Sha256Hex {
+                hash: "00".repeat(32),
+            },
+        }
+    }
+
+    fn custody_1890() -> crate::federation::TierPromotionCustody {
+        crate::federation::TierPromotionCustody::NodeCoScrub(types::ScrubSig {
+            scrub_key_id: KEY_1890.into(),
+            scrub_signature_classical: "sig".into(),
+            scrub_signature_pqc: None,
+            cosigned_at: Some("2026-03-01T00:00:00Z".into()),
+        })
+    }
+
+    fn proposal_1890() -> ciris_verify_core::accord_live_quorum::AccordProposal {
+        ciris_verify_core::accord_live_quorum::AccordProposal {
+            family_key_id: "x".into(),
+            action: ciris_verify_core::accord_live_quorum::AccordAction::Fire,
+            nonce: "n-1890".into(),
+            window_until: "2031-01-01T00:00:00Z".into(),
+            prior_family_digest: "prior".into(),
+            payload_sha256: "payload".into(),
+        }
+    }
+
+    fn decision_1890() -> ciris_verify_core::accord_live_quorum::AccordDecision {
+        ciris_verify_core::accord_live_quorum::AccordDecision {
+            proposal: proposal_1890(),
+            live_set: Vec::new(),
+            yes: 0,
+            no: 0,
+            abstain: 0,
+            authorized: false,
+        }
+    }
+
+    fn participation_1890() -> ciris_verify_core::accord_live_quorum::AccordParticipation {
+        ciris_verify_core::accord_live_quorum::AccordParticipation {
+            family_key_id: "x".into(),
+            proposal_digest: proposal_1890().digest(),
+            member_id: KEY_1890.into(),
+            vote: ciris_verify_core::accord_live_quorum::Vote::Yes,
+            window_until: "2031-01-01T00:00:00Z".into(),
+            signed_at: "2026-03-01T00:00:00Z".into(),
+            signature: ciris_verify_core::threshold::ThresholdSignature {
+                member_id: KEY_1890.into(),
+                ed25519_signature_base64: "sig".into(),
+                mldsa65_signature_base64: None,
+            },
+        }
+    }
+
+    fn community_revocation_1890() -> SignedCommunityMembershipRevocation {
+        crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+            KEY_1890,
+            CommunityMembershipRevocation {
+                community_key_id: "x".into(),
+                removed_identity_key_id: "y".into(),
+                removed_at: at_1890(),
+                effective_at: at_1890(),
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        )
+    }
+
+    fn community_widening_1890() -> crate::federation::SignedCommunityMembershipWidening {
+        crate::federation::tier_ingest::test_support::sign_community_membership_widening(
+            KEY_1890,
+            types::CommunityMembershipWidening {
+                community_key_id: "x".into(),
+                member_key_id: "y".into(),
+                joined_at: at_1890(),
+                effective_at: at_1890(),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        )
+    }
+
+    fn family_revocation_1890() -> SignedFamilyMembershipRevocation {
+        crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+            KEY_1890,
+            FamilyMembershipRevocation {
+                family_key_id: "x".into(),
+                removed_identity_key_id: "y".into(),
+                removed_at: at_1890(),
+                effective_at: at_1890(),
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        )
+    }
+
+    fn family_widening_1890() -> crate::federation::SignedFamilyMembershipWidening {
+        crate::federation::tier_ingest::test_support::sign_family_membership_widening(
+            KEY_1890,
+            types::FamilyMembershipWidening {
+                family_key_id: "x".into(),
+                member_key_id: "y".into(),
+                joined_at: at_1890(),
+                effective_at: at_1890(),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        )
+    }
+
+    fn location_proof_1890() -> SignedLocationProof {
+        crate::federation::tier_ingest::test_support::sign_location_proof(
+            KEY_1890,
+            LocationProof {
+                subject_key_id: KEY_1890.into(),
+                cell_id: "x".into(),
+                cell_resolution: 7,
+                asserted_at: at_1890(),
+                valid_until: None,
+                attestation_evidence: None,
+                withdrawn_at: None,
+                persist_row_hash: String::new(),
+            },
+        )
+    }
+
+    /// **I1890 — every method the proxy stubbed reaches the HOST.** The
+    /// capsule stub sweep: before v61.4.2 the proxy answered `Unsupported`
+    /// for 33 `FederationDirectory` methods and inherited an `Unsupported`
+    /// default for `list_live_consent_grants_by`, and persist's own folds
+    /// running over the proxy (Edge's call join, after the community pair)
+    /// failed on the next one (`list_group_versions`). One row per routed
+    /// method, over a directory double that fails exactly one method:
+    ///
+    /// * the vtable and the proxy each carry the injected failure by name
+    ///   (an op that answered empty, or called another method, would not —
+    ///   `add_*_member` are trait defaults, so the leaf they read first is
+    ///   the one failed);
+    /// * with no fault, a READ answers through the proxy exactly what the
+    ///   direct call answers (`Debug`-equal, or the host's own failure); a
+    ///   WRITE is never `Unsupported` (its effect is I1891's and I1892's).
+    fn exercise_i1890(rt: &Arc<tokio::runtime::Runtime>, inner: Arc<dyn FederationDirectory>) {
+        let table: Vec<(&'static str, &'static str, bool, DirectoryOp, ProxyCallDbg)> = vec![
+            (
+                "add_community_member",
+                "lookup_community",
+                true,
+                DirectoryOp::AddCommunityMember {
+                    community_key_id: "x".into(),
+                    member: member_1890(),
+                    spec: spec_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.add_community_member("x", member_1890(), &spec_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "add_family_member",
+                "lookup_family",
+                true,
+                DirectoryOp::AddFamilyMember {
+                    family_key_id: "x".into(),
+                    member: family_member_1890(),
+                    spec: spec_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.add_family_member("x", family_member_1890(), &spec_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "attach_attestation_pqc_signature",
+                "attach_attestation_pqc_signature",
+                true,
+                DirectoryOp::AttachAttestationPqcSignature {
+                    attestation_id: "x".into(),
+                    scrub_signature_pqc: "y".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.attach_attestation_pqc_signature("x", "y")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "attach_key_pqc_signature",
+                "attach_key_pqc_signature",
+                true,
+                DirectoryOp::AttachKeyPqcSignature {
+                    key_id: "x".into(),
+                    pubkey_ml_dsa_65_base64: "y".into(),
+                    scrub_signature_pqc: "z".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.attach_key_pqc_signature("x", "y", "z")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "attestation_insert_local",
+                "attestation_insert_local",
+                true,
+                DirectoryOp::AttestationInsertLocal {
+                    input: local_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.attestation_insert_local(local_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "attestation_type_census",
+                "attestation_type_census",
+                false,
+                DirectoryOp::AttestationTypeCensus {},
+                |p| {
+                    Box::pin(
+                        async move { p.attestation_type_census().await.map(|v| format!("{v:?}")) },
+                    )
+                },
+            ),
+            (
+                "attestation_upsert_local",
+                "attestation_upsert_local",
+                true,
+                DirectoryOp::AttestationUpsertLocal {
+                    input: local_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.attestation_upsert_local(local_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "attestations_binding_content",
+                "attestations_binding_content",
+                false,
+                DirectoryOp::AttestationsBindingContent {
+                    content_sha256: "00".repeat(32),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.attestations_binding_content(&"00".repeat(32))
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "attestations_binding_content_with_placements",
+                "attestations_binding_content_with_placements",
+                false,
+                DirectoryOp::AttestationsBindingContentWithPlacements {
+                    content_sha256: "00".repeat(32),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.attestations_binding_content_with_placements(&"00".repeat(32))
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "clear_active_halt",
+                "clear_active_halt",
+                true,
+                DirectoryOp::ClearActiveHalt {
+                    family_key_id: "x".into(),
+                    active_halt_id: "y".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.clear_active_halt("x", "y")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "communities_containing",
+                "communities_containing",
+                false,
+                DirectoryOp::CommunitiesContaining {
+                    cell_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.communities_containing("x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "dag_manifests_of_chunk",
+                "dag_manifests_of_chunk",
+                false,
+                DirectoryOp::DagManifestsOfChunk {
+                    chunk_sha256: [7u8; 32],
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.dag_manifests_of_chunk(&[7u8; 32])
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "enter_mesh",
+                "enter_mesh",
+                true,
+                DirectoryOp::EnterMesh {
+                    attestation_id: "x".into(),
+                    ci: ci_1890(),
+                    custody: custody_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.enter_mesh("x", &ci_1890(), &custody_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "get_accord_proposal",
+                "get_accord_proposal",
+                false,
+                DirectoryOp::GetAccordProposal {
+                    proposal_digest: "x".into(),
+                },
+                |p| {
+                    Box::pin(
+                        async move { p.get_accord_proposal("x").await.map(|v| format!("{v:?}")) },
+                    )
+                },
+            ),
+            (
+                "list_accord_participations",
+                "list_accord_participations",
+                false,
+                DirectoryOp::ListAccordParticipations {
+                    proposal_digest: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_accord_participations("x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "list_attestations_by_dimension_citing",
+                "list_attestations_by_dimension_citing",
+                false,
+                DirectoryOp::ListAttestationsByDimensionCiting {
+                    attesting_key_id: "x".into(),
+                    dimension: "y".into(),
+                    evidence_ref: "z".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_attestations_by_dimension_citing("x", "y", "z")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "list_communities_for_member",
+                "list_communities_for_member",
+                false,
+                DirectoryOp::ListCommunitiesForMember {
+                    member_identity_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_communities_for_member("x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "list_group_versions",
+                "list_group_versions",
+                false,
+                DirectoryOp::ListGroupVersions {
+                    cohort: cohort::Cohort::Community,
+                    group_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_group_versions(cohort::Cohort::Community, "x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "list_hybrid_pending_attestations",
+                "list_hybrid_pending_attestations",
+                false,
+                DirectoryOp::ListHybridPendingAttestations { limit: 10 },
+                |p| {
+                    Box::pin(async move {
+                        p.list_hybrid_pending_attestations(10)
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "list_hybrid_pending_keys",
+                "list_hybrid_pending_keys",
+                false,
+                DirectoryOp::ListHybridPendingKeys { limit: 10 },
+                |p| {
+                    Box::pin(async move {
+                        p.list_hybrid_pending_keys(10)
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "list_location_proofs_for",
+                "list_location_proofs_for",
+                false,
+                DirectoryOp::ListLocationProofsFor {
+                    subject_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_location_proofs_for("x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "lookup_keys_for_identity",
+                "lookup_keys_for_identity",
+                false,
+                DirectoryOp::LookupKeysForIdentity {
+                    identity_ref: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.lookup_keys_for_identity("x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "put_accord_decision",
+                "put_accord_decision",
+                true,
+                DirectoryOp::PutAccordDecision {
+                    decision: decision_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.put_accord_decision(decision_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "put_accord_participation",
+                "put_accord_participation",
+                true,
+                DirectoryOp::PutAccordParticipation {
+                    participation: participation_1890(),
+                    standing_roster: Vec::new(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.put_accord_participation(participation_1890(), &[])
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "put_accord_proposal",
+                "put_accord_proposal",
+                true,
+                DirectoryOp::PutAccordProposal {
+                    proposal: proposal_1890(),
+                    authority_signature: None,
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.put_accord_proposal(proposal_1890(), None)
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "put_community_membership_revocation",
+                "put_community_membership_revocation",
+                true,
+                DirectoryOp::PutCommunityMembershipRevocation {
+                    revocation: community_revocation_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.put_community_membership_revocation(community_revocation_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "put_community_membership_widening",
+                "put_community_membership_widening",
+                true,
+                DirectoryOp::PutCommunityMembershipWidening {
+                    widening: community_widening_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.put_community_membership_widening(community_widening_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "put_family_membership_revocation",
+                "put_family_membership_revocation",
+                true,
+                DirectoryOp::PutFamilyMembershipRevocation {
+                    revocation: family_revocation_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.put_family_membership_revocation(family_revocation_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "put_family_membership_widening",
+                "put_family_membership_widening",
+                true,
+                DirectoryOp::PutFamilyMembershipWidening {
+                    widening: family_widening_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.put_family_membership_widening(family_widening_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "set_active_halt",
+                "set_active_halt",
+                true,
+                DirectoryOp::SetActiveHalt {
+                    family_key_id: "x".into(),
+                    active_halt_id: "y".into(),
+                },
+                |p| {
+                    Box::pin(
+                        async move { p.set_active_halt("x", "y").await.map(|v| format!("{v:?}")) },
+                    )
+                },
+            ),
+            (
+                "set_consent_role",
+                "set_consent_role",
+                true,
+                DirectoryOp::SetConsentRole {
+                    key_id: "x".into(),
+                    consent_role: Some("y".into()),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.set_consent_role("x", Some("y"))
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "supersede_group_row",
+                "supersede_group_row",
+                true,
+                DirectoryOp::SupersedeGroupRow {
+                    cohort: cohort::Cohort::Community,
+                    new_snapshot: serde_json::json!({}),
+                    authorization: None,
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.supersede_group_row(
+                            cohort::Cohort::Community,
+                            serde_json::json!({}),
+                            None,
+                        )
+                        .await
+                        .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "withdraw_location_proof",
+                "withdraw_location_proof",
+                true,
+                DirectoryOp::WithdrawLocationProof {
+                    proof: location_proof_1890(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.withdraw_location_proof(location_proof_1890())
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "list_live_consent_grants_by",
+                "list_live_consent_grants_by",
+                false,
+                DirectoryOp::ListLiveConsentGrantsBy {
+                    node_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_live_consent_grants_by("x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+        ];
+        assert_eq!(table.len(), 34, "I1890: one row per routed method");
+        let mut red = Vec::new();
+        for (method, fault, write, op, call) in table {
+            let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let want = format!("injected backend failure: {fault}");
+                let faulty: Arc<dyn FederationDirectory> = Arc::new(
+                    crate::federation::directory_double::FaultInjectingDirectory::new(
+                        inner.clone(),
+                    )
+                    .erroring(fault),
+                );
+                let directory = build_persist_directory(faulty.clone());
+                match run_op(rt, &directory, &op) {
+                    DirectoryOpResult::Err(e) => {
+                        assert!(e.contains(&want), "I1890 {method} vtable: {e}")
+                    }
+                    other => panic!("I1890 {method}: the vtable answered {other:?}"),
+                }
+                // SAFETY: single-drop, matched vtable.
+                unsafe { (directory.vtable.drop)(directory.data) };
+                let proxy = proxy_1244(rt, faulty);
+                match rt.block_on(call(proxy as Arc<dyn FederationDirectory>)) {
+                    Err(Error::Backend(e)) => {
+                        assert!(e.contains(&want), "I1890 {method} proxy: {e}")
+                    }
+                    other => panic!("I1890 {method}: the proxy answered {other:?}"),
+                }
+                let clean = proxy_1244(rt, inner.clone());
+                let via = rt.block_on(call(clean));
+                if let Err(Error::Unsupported { .. }) = via {
+                    panic!("I1890 {method}: the proxy still answers Unsupported");
+                }
+                if let Err(Error::Backend(m)) = &via {
+                    assert!(
+                        !m.contains("has no DirectoryOp"),
+                        "I1890 {method}: no op carries it: {m}"
+                    );
+                }
+                if !write {
+                    match (via, rt.block_on(call(inner.clone()))) {
+                        (Ok(p), Ok(d)) => assert_eq!(p, d, "I1890 {method}: proxy == direct"),
+                        (Err(Error::Backend(p)), Err(d)) => {
+                            assert_eq!(p, d.to_string(), "I1890 {method}: the host's own failure")
+                        }
+                        (p, d) => panic!("I1890 {method}: proxy {p:?} vs direct {d:?}"),
+                    }
+                }
+            }));
+            if row.is_err() {
+                red.push(method);
+            }
+        }
+        assert!(
+            red.is_empty(),
+            "I1890: these methods did not reach the host: {red:?}"
+        );
+    }
+
+    /// **I1891 — group-plane writes through the capsule land as direct ones
+    /// would.** A keyless room (alice founds, bob seated); THROUGH THE PROXY
+    /// carol is added (`add_community_member`, after her consent) and bob
+    /// is revoked (`put_community_membership_revocation`). The direct
+    /// backend then holds both rows, and every group read — the two planes,
+    /// `list_group_versions`, `list_communities_for_member`,
+    /// `lookup_keys_for_identity` — answers the same through the proxy as
+    /// directly, non-empty.
+    fn exercise_i1891(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        use crate::federation::room_roster_invariants::bodies::keyless_room_dir;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{cohort_scope, identity_type};
+        let tg = format!("{tag}-1891");
+        let (room, alice, bob) = rt.block_on(keyless_room_dir(dir.as_ref(), &tg));
+        let carol = format!("{tg}-carol");
+        let joined = at_1890();
+        let seat = types::CommunityMember {
+            key_id: carol.clone(),
+            joined_at: joined,
+            role: None,
+        };
+        let spec = ts::widening_admit_spec(&alice, &room, &seat);
+        let revocation = ts::sign_community_membership_revocation(
+            &alice,
+            CommunityMembershipRevocation {
+                community_key_id: room.clone(),
+                removed_identity_key_id: bob.clone(),
+                removed_at: joined + chrono::Duration::days(1),
+                effective_at: joined + chrono::Duration::days(1),
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        );
+        let proxy = proxy_1244(rt, dir.clone());
+        rt.block_on(async {
+            let d: &dyn FederationDirectory = dir.as_ref();
+            ts::register_hybrid_key_as(d, &carol, &carol, identity_type::USER).await;
+            crate::federation::membership_acceptance::test_support::consent(
+                d,
+                cohort_scope::COMMUNITY,
+                &room,
+                &alice,
+                &carol,
+                None,
+                joined,
+            )
+            .await
+            .expect("I1891 consent");
+            assert!(
+                proxy
+                    .add_community_member(&room, seat, &spec)
+                    .await
+                    .expect("I1891: add_community_member routes"),
+                "I1891: carol is a genuine add"
+            );
+            proxy
+                .put_community_membership_revocation(revocation)
+                .await
+                .expect("I1891: put_community_membership_revocation routes");
+        });
+        let ws = rt
+            .block_on(dir.list_community_membership_widenings_for(&room))
+            .expect("direct widenings");
+        let rs = rt
+            .block_on(dir.list_community_membership_revocations_for(&room))
+            .expect("direct revocations");
+        assert_eq!(
+            (ws.len(), rs.len()),
+            (1, 1),
+            "I1891: both rows landed directly"
+        );
+        assert_eq!(ws[0].member_key_id, carol, "I1891: the widening is carol's");
+        assert_eq!(
+            rs[0].removed_identity_key_id, bob,
+            "I1891: the revocation is bob's"
+        );
+        let dbg = |r: Result<String, Error>| r.expect("I1891 read");
+        for (name, via, direct) in [
+            (
+                "list_group_versions",
+                rt.block_on(proxy.list_group_versions(cohort::Cohort::Community, &room))
+                    .map(|v| format!("{v:?}")),
+                rt.block_on(dir.list_group_versions(cohort::Cohort::Community, &room))
+                    .map(|v| format!("{v:?}")),
+            ),
+            (
+                "list_communities_for_member",
+                rt.block_on(proxy.list_communities_for_member(&alice))
+                    .map(|v| format!("{v:?}")),
+                rt.block_on(dir.list_communities_for_member(&alice))
+                    .map(|v| format!("{v:?}")),
+            ),
+            (
+                "lookup_keys_for_identity",
+                rt.block_on(proxy.lookup_keys_for_identity(&carol))
+                    .map(|v| format!("{v:?}")),
+                rt.block_on(dir.lookup_keys_for_identity(&carol))
+                    .map(|v| format!("{v:?}")),
+            ),
+        ] {
+            let (via, direct) = (dbg(via), dbg(direct));
+            assert_ne!(direct, "[]", "I1891 {name}: the seed is not empty");
+            assert_eq!(via, direct, "I1891 {name}: proxy == direct");
+        }
+    }
+
+    /// **I1892 — an accord halt set and cleared THROUGH the capsule is the
+    /// direct backend's halt.** Before v61.4.2 both writes answered
+    /// `Unsupported` on the proxy.
+    fn exercise_i1892(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        let fam = format!("{tag}-1892-family");
+        let proxy = proxy_1244(rt, dir.clone());
+        rt.block_on(proxy.set_active_halt(&fam, "halt-1892"))
+            .expect("I1892: set_active_halt routes");
+        let set = rt.block_on(dir.get_active_halt(&fam)).expect("direct");
+        assert_eq!(
+            set.as_ref().map(|h| h.active_halt_id.as_str()),
+            Some("halt-1892"),
+            "I1892: the direct backend holds the halt"
+        );
+        rt.block_on(proxy.clear_active_halt(&fam, "halt-1892"))
+            .expect("I1892: clear_active_halt routes");
+        assert!(
+            rt.block_on(dir.get_active_halt(&fam))
+                .expect("direct")
+                .is_none(),
+            "I1892: the direct backend's halt is lifted"
+        );
+    }
+
     both_backends_1244!(
         i1762_every_round2_read_reaches_the_host_sqlite,
         i1762_every_round2_read_reaches_the_host_pg,
@@ -9174,6 +11169,29 @@ mod tests {
         i1772_cosign_aliases_cross_the_capsule_sqlite,
         i1772_cosign_aliases_cross_the_capsule_pg,
         |rt, b, tag| exercise_i1772(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1808_room_membership_planes_cross_the_capsule_sqlite,
+        i1808_room_membership_planes_cross_the_capsule_pg,
+        |rt, b, tag| exercise_i1808(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1890_every_stubbed_method_reaches_the_host_sqlite,
+        i1890_every_stubbed_method_reaches_the_host_pg,
+        |rt, b, tag| {
+            let _ = tag;
+            exercise_i1890(&rt, b)
+        }
+    );
+    both_backends_1244!(
+        i1891_group_writes_through_the_capsule_land_sqlite,
+        i1891_group_writes_through_the_capsule_land_pg,
+        |rt, b, tag| exercise_i1891(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1892_a_halt_set_through_the_capsule_is_held_sqlite,
+        i1892_a_halt_set_through_the_capsule_is_held_pg,
+        |rt, b, tag| exercise_i1892(&rt, b, &tag)
     );
 
     /// **I1766 / I1767 / I1768 — the sync config reads answer the HOST's
@@ -9760,8 +11778,6 @@ mod tests {
     /// The reasons a `FederationDirectory` method may answer `Unsupported`
     /// on the capsule proxy. A method on this list is a KNOWN gap with its
     /// reason, never a silent one.
-    const PRE_1162: &str = "pre-existing at v59.1.1: no DirectoryOp carries it; not \
-                            audited by #1162 — routing it is appending an op";
     const COSIGN_1252: &str = "v61.3.0 (#1252): a node-local cosign ledger or projection read; \
                                a proxy holds no store of its own, and every caller treats \
                                Unsupported as nothing held";
@@ -9772,68 +11788,6 @@ mod tests {
                                   capsule at ABI 12; the record replicates as its group-plane \
                                   row through ApplyReplicatedAttestation";
     const PROXY_UNSUPPORTED_ALLOWLIST: &[(&str, &str)] = &[
-        (
-            "attestation_type_census",
-            "v53.0.0 (#975): a local report door; no DirectoryOp \
-          carries it",
-        ),
-        ("lookup_keys_for_identity", PRE_1162),
-        (
-            "set_consent_role",
-            "v13.0.0 (#365): no DirectoryOp carries consent_role mutation",
-        ),
-        (
-            "attestation_upsert_local",
-            "a node-LOCAL tier write: no DirectoryOp carries the local \
-          tier (pre-existing at v59.1.1)",
-        ),
-        (
-            "attestation_insert_local",
-            "a node-LOCAL tier write: no DirectoryOp carries the local \
-          tier (pre-existing at v59.1.1)",
-        ),
-        (
-            "list_attestations_by_dimension_citing",
-            "#1162: Edge confirms no production edge path \
-          calls it; left unrouted so the patch grows the wire by one op",
-        ),
-        ("attestations_binding_content", PRE_1162),
-        (
-            "attestations_binding_content_with_placements",
-            "v61.4.0 (#1260): the takedown binding read, unproxied as \
-          attestations_binding_content is",
-        ),
-        (
-            "dag_manifests_of_chunk",
-            "v53.1.0 (#979): a capsule host stores no blobs through this \
-          surface",
-        ),
-        ("add_family_member", PRE_1162),
-        ("list_communities_for_member", PRE_1162),
-        ("put_family_membership_revocation", PRE_1162),
-        ("put_community_membership_revocation", PRE_1162),
-        ("put_community_membership_widening", PRE_1162),
-        ("put_family_membership_widening", PRE_1162),
-        ("list_community_membership_revocations_for", PRE_1162),
-        ("list_community_membership_widenings_for", PRE_1162),
-        ("list_location_proofs_for", PRE_1162),
-        ("withdraw_location_proof", PRE_1162),
-        ("communities_containing", PRE_1162),
-        ("add_community_member", PRE_1162),
-        ("supersede_group_row", PRE_1162),
-        ("list_group_versions", PRE_1162),
-        ("attach_key_pqc_signature", PRE_1162),
-        ("attach_attestation_pqc_signature", PRE_1162),
-        ("enter_mesh", PRE_1162),
-        ("list_hybrid_pending_keys", PRE_1162),
-        ("list_hybrid_pending_attestations", PRE_1162),
-        ("put_accord_proposal", PRE_1162),
-        ("get_accord_proposal", PRE_1162),
-        ("put_accord_participation", PRE_1162),
-        ("list_accord_participations", PRE_1162),
-        ("put_accord_decision", PRE_1162),
-        ("set_active_halt", PRE_1162),
-        ("clear_active_halt", PRE_1162),
         // v61 (CIRISPersist#991): the group framed kinds retired; their ops
         // left the capsule at ABI 12 and the records replicate as rows.
         ("apply_replicated_community", GROUP_ROWS_991),
@@ -9863,7 +11817,6 @@ mod tests {
         ("adopt_genesis_reanchor", INHERITED_DEFAULT),
         ("list_attestations_citing_by_dimension", INHERITED_DEFAULT),
         ("list_consent_peers_for", INHERITED_DEFAULT),
-        ("list_live_consent_grants_by", INHERITED_DEFAULT),
         ("list_live_consent_grants_for", INHERITED_DEFAULT),
         ("list_local_tier_attestations", INHERITED_DEFAULT),
         ("list_widening_candidates", INHERITED_DEFAULT),
@@ -9990,6 +11943,112 @@ mod tests {
         assert!(
             stale.is_empty(),
             "I1162 allowlisted but no longer Unsupported on the proxy (remove them): {stale:?}"
+        );
+    }
+
+    /// v61.4.2 — the `FederationDirectory` methods CIRISEdge v45.1.6 calls
+    /// from PRODUCTION code (`git grep` over `src/` at the tag: a `.method(`
+    /// call outside `#[cfg(test)] mod`, `*test*` files, comments, and the two
+    /// delegating wrappers `ffi/kept_directory.rs` and
+    /// `replication/counting_directory_930.rs`). Pinned, not read from disk:
+    /// Edge's tree is not a persist input, and a gate that reads a sibling
+    /// checkout fails toward whatever happens to be checked out. Re-derive it
+    /// on an Edge re-pin (`L1.md` has the script).
+    const EDGE_V45_1_6_PRODUCTION_CALLS: &[&str] = &[
+        "active_community_key_ids_for",
+        "active_community_members",
+        "active_family_key_ids_for",
+        "active_family_members",
+        "active_identities_for_occurrence",
+        "add_community_member",
+        "add_member",
+        "add_peer_record",
+        "apply_replicated_accord_evidence",
+        "apply_replicated_attestation",
+        "attestations_binding_content",
+        "evict_fountain_content_hard_delete",
+        "evict_fountain_content_to_tier",
+        "get_attestation",
+        "list_attestations_for",
+        "list_attestations_naming_by_dimension",
+        "list_attestations_referencing",
+        "list_attestations_since",
+        "list_attestations_since_by_prefixes",
+        "list_canonical_withdrawals",
+        "list_communities_for_member_active",
+        "list_composers_referencing_any",
+        "list_families_for_member_active",
+        "list_held_fountain_content",
+        "list_identity_occurrences_active",
+        "list_identity_occurrences_by_occurrence_key",
+        "list_keys_by_identity_type",
+        "list_live_consent_grants_by",
+        "list_signed_accord_quorum_evidence_since",
+        "list_signed_location_proofs_since",
+        "list_signed_transport_destinations_for",
+        "list_signed_transport_destinations_since",
+        "list_targeted_by_dimension_prefix",
+        "list_transport_destinations_for",
+        "list_wire_hashes_since",
+        "lookup_canonical_withdrawal",
+        "lookup_community",
+        "lookup_public_key",
+        "lookup_signed_record_by_content_hash",
+        "put_attestation",
+        "put_attestation_authored",
+        "put_attestation_synced",
+        "put_community",
+        "put_community_membership_revocation",
+        "put_family_membership_widening",
+        "put_identity_occurrence_local",
+        "put_public_key",
+        "put_signed_transport_destination",
+        "put_touch_claim",
+        "rebuild_signed_wire_index",
+        "record_canonical_withdrawal",
+        "record_role_withdrawal",
+        "release_shared_instance_lease",
+        "remove_peer_record",
+        "resolve_scoped_consent",
+        "revocations_for",
+        "update_peer_alias",
+        "update_peer_notes",
+        "update_peer_policy",
+        "update_peer_trust",
+    ];
+
+    /// **I1893 — no method Edge calls is allowlisted `Unsupported` on the
+    /// proxy.** I1162 proves every `Unsupported` answer is allowlisted with a
+    /// reason; this proves no such reason covers a method Edge's production
+    /// code calls (v61.4.1 allowlisted five, and an agent install's call join
+    /// answered 503). Every pinned name is a trait method, so a rename
+    /// cannot empty the check.
+    #[test]
+    fn i1893_no_method_edge_calls_is_allowlisted_unsupported() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let trait_src = crate::federation::blank_comments_and_strings(
+            &std::fs::read_to_string(root.join("src/federation/mod.rs")).expect("read source"),
+        );
+        let tr = top_level_fns(&trait_src, "pub trait FederationDirectory");
+        assert!(
+            EDGE_V45_1_6_PRODUCTION_CALLS.len() > 50,
+            "I1893 the pinned list is not empty"
+        );
+        let unknown: Vec<&&str> = EDGE_V45_1_6_PRODUCTION_CALLS
+            .iter()
+            .filter(|m| !tr.contains_key(**m))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "I1893 pinned names that are no trait method (renamed? re-derive): {unknown:?}"
+        );
+        let allowlisted: Vec<&&str> = EDGE_V45_1_6_PRODUCTION_CALLS
+            .iter()
+            .filter(|m| PROXY_UNSUPPORTED_ALLOWLIST.iter().any(|(n, _)| n == *m))
+            .collect();
+        assert!(
+            allowlisted.is_empty(),
+            "I1893 Edge calls these, and the proxy answers them Unsupported: {allowlisted:?}"
         );
     }
 }

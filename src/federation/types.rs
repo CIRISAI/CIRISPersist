@@ -2061,7 +2061,10 @@ impl LocalAttestationInput {
 /// [`crate::federation::admission::check_row_column_binding`] over the row as
 /// it will be stored, so a caller that skips the re-stamp is REFUSED rather
 /// than silently minting a row no peer will take.
-#[derive(Debug, Clone)]
+///
+/// v61.4.2 — serde: a reseal crosses the directory capsule inside
+/// `TierPromotionCustody::ActorSigned` (`DirectoryOp::EnterMesh`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationReseal {
     /// The envelope as it will be STORED and SERVED — the mirror already
     /// re-stamped for the new placement, and the exact bytes
@@ -3759,7 +3762,10 @@ pub struct SignedLocationProof {
 /// bound-signature input. `classical_sig_b64` is the base64-encoded
 /// Ed25519 signature that PQC will sign over alongside the canonical
 /// bytes per the bound-signature contract.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// v61.4.2 — serde: the rows cross the directory capsule
+/// (`DirectoryOpResult::HybridPendingRows`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HybridPendingRow {
     /// Primary key of the hybrid-pending row.
     pub id: String,
