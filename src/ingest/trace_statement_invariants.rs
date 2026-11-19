@@ -746,6 +746,14 @@ where
     }
 }
 
+/// The row id of a trace row statement signed as `iss` (its raw payload).
+/// Only the `scrub`-gated engine witnesses read it.
+#[cfg(feature = "scrub")]
+fn row_id_of_statement(statement: &[u8], iss: &str) -> [u8; 32] {
+    let payload = crate::federation::edition2::door::raw_payload(statement).expect("a payload");
+    ciris_verify_core::edition2::row_id(TRACE_ROW_TYPE, TRACE_FAMILY_ID, iss, Some(iss), &payload)
+}
+
 /// The Engine-level witnesses: `Engine::seal_trace` (the producer, the sign
 /// call included) and the sealed `self` path (option A), on two engines.
 #[cfg(feature = "scrub")]
