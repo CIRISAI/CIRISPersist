@@ -5,7 +5,7 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
-## [61.4.2] - UNRELEASED
+## [61.4.2] - 2026-11-19
 
 An agent's voice or video call could not join. The directory capsule proxy (`OpsDirectory`) answered `Unsupported` for 35 `FederationDirectory` methods, so persist's folds and doors failed, or read "nothing there", at the first one they touched on an agent install. Call joins refused 503 (`directory ops proxy: method list_community_membership_widenings_for has no DirectoryOp`, then `list_group_versions has no DirectoryOp`). This release routes every one of them across the capsule. The proxy has no `Unsupported` stub of its own left.
 
