@@ -58,6 +58,15 @@
 #
 # Exit codes: 75 slot wait exceeded · 76 memory floor never met · 77 usage ·
 # otherwise the wrapped command's own code (137 = OOM-killed in its scope).
+# 0. GRACE — 2026-11-19 (Eric): every session on the box schedules through
+#    `grace sched` (CIRISGrace). When ~/CIRISGrace is installed this script
+#    only delegates to it (same call shape: CARGO_GUARD_MAX_GB is the cap,
+#    CARGO_GUARD_WAIT_SECS the wait). The body below is the fallback for a
+#    box without CIRISGrace. While sessions migrate, grace's heavy jobs also
+#    hold this guard's slot locks, so old and new guards do not double up.
+#    `grace-sched status` shows who runs and who waits.
+export GRACE_SCHED_OWNER="${GRACE_SCHED_OWNER:-persist}"
+g="$HOME/CIRISGrace/bin/cargo_guard.sh"; [ -x "$g" ] && exec "$g" "$@"
 set -uo pipefail
 [ $# -ge 1 ] || { echo "usage: $0 <cargo|maturin|...> args..." >&2; exit 77; }
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -105,14 +114,15 @@ if command -v systemd-run >/dev/null 2>&1 \
     esac
     unit="cargo-guard-$$-$(date +%s)"
     # 5. The scope exists only once systemd-run starts it; a detached helper
-    # waits for it and samples until it vanishes.
+    # waits for it and samples until it vanishes. `9>&-`: the helper must not
+    # inherit the slot lock, or it holds the slot after the build ends.
     (
         cg="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/$unit.scope"
         for _ in $(seq 1 50); do [ -d "$cg" ] && break; sleep 0.2; done
         [ -d "$cg" ] || exit 0
         mkdir -p "$(dirname "$stats")"
         exec "$here/cgroup_mem_sampler.sh" "$cg" "$stats" 2
-    ) </dev/null >/dev/null 2>&1 &
+    ) </dev/null >/dev/null 2>&1 9>&- &
     disown 2>/dev/null || true
     # 3. memory.oom.group is set from INSIDE the scope, before the command
     # starts, so there is no window in which a fast allocator can be killed
