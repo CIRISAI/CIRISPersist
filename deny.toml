@@ -98,6 +98,22 @@ ignore = [
     # v61.0.0 — zip 7.2.0 (candle-core) `extract()` aborts on a symlink entry with a huge declared size;
     # candle only opens .npz model archives by entry (ZipArchive::new + by_name), never extract(); fixed in zip 9.
     "RUSTSEC-2026-0429",  # zip extract() symlink-size abort — candle 7.x, persist and candle never extract
+    # v61.4.2 — four zip 7.2.0 advisories published 2026-11, fixed in zip 9.x (0548 in 9.0.5).
+    # zip is transitive ONLY via candle-core 0.10.2 (pins zip 7.2.0, default-features = false:
+    # no `aes-crypto`, no legacy decoders; the lockfile's zip deps are crc32fast, indexmap,
+    # memchr and typed-path only). candle reads .npz/.pth archives with ZipArchive::new +
+    # by_name/by_index and writes them with ZipWriter; it never calls extract() or
+    # ZipStreamReader, and persist has no zip:: use in src/. Remove when candle moves past
+    # zip 9.0.5.
+    "RUSTSEC-2026-0545",  # AES entries returned without their MAC checked — aes-crypto not compiled
+    "RUSTSEC-2026-0546",  # ZipArchive::extract symlink targets escape the destination — never extracts
+    "RUSTSEC-2026-0547",  # legacy Shrink/Reduce/Implode decoders preallocate — legacy decoders not compiled
+    "RUSTSEC-2026-0548",  # ZipStreamReader local-header names vs the central directory — ZipStreamReader unused
+    # v61.4.2 — chrono unmaintained (published 2026-11-18): a notice, no vulnerability, and no
+    # safe upgrade exists. A direct dependency of persist, and transitive via rusqlite,
+    # postgres-types and ciris-verify-core. CIRISVerify ignores the same ID on the same
+    # rationale. Drop with the chrono migration.
+    "RUSTSEC-2026-0543",
     "RUSTSEC-2026-0371",  # zbus_names unmaintained — ciris-keyring → secret-service
     "RUSTSEC-2026-0370",  # zvariant unmaintained — same zbus stack
     "RUSTSEC-2026-0372",  # zvariant_derive unmaintained — same zbus stack
