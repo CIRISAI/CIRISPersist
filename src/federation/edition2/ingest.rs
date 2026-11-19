@@ -1002,7 +1002,14 @@ where
                     // first: the reason is this attempt's (its mark, else the
                     // count), and the reads are this attempt's, so a row
                     // held first on A and then on B re-folds when B arrives.
-                    StatementOutcome::Pending { row_id, .. } => {
+                    // fix3 — NOT on the attestation tail: `voices::put_counted_row`
+                    // already recorded this hold with its gate's reason and its
+                    // inner attempt's reads (the outer attempt is shadowed
+                    // there and saw neither). fix2's record overwrote both
+                    // with `count_short` and the outer reads.
+                    StatementOutcome::Pending { row_id, .. }
+                        if plane_name != plane::ATTESTATION =>
+                    {
                         super::fold::record_pending(
                             dir,
                             *row_id,
@@ -1012,6 +1019,20 @@ where
                             att.reads.clone(),
                         )
                         .await?;
+                    }
+                    // fix3 — a held row whose re-run now answers `Voice` (O1's
+                    // occurrence-key statement, held on the owner gate before
+                    // the owner binding landed): its statement is a kept voice
+                    // that waits on nothing the fold reads (the author's
+                    // statement, when it arrives, runs the door itself). Its
+                    // stale hold is cleared, its reads kept.
+                    StatementOutcome::Voice { row_id, .. }
+                        if was_held && plane_name != plane::ATTESTATION =>
+                    {
+                        match dir.put_fold_reason(row_id, None).await {
+                            Ok(_) | Err(Error::Unsupported { .. }) => {}
+                            Err(e) => return Err(e),
+                        }
                     }
                     // Concluded on a plane other than the attestation tail
                     // (which records its own, with its inner reads): the

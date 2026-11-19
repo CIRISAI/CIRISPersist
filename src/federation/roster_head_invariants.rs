@@ -481,9 +481,13 @@ pub(crate) mod bodies {
         keys: &[String],
         extra: serde_json::Value,
     ) -> String {
+        // v62.0.0 (E13 fix1) — the successor keys are named from the family's
+        // SEED: `fam` is an identity-ref, and a test signer never seeds from a
+        // kid (`e2::seed_of`).
+        let seed = e2::seed_of(fam);
         let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[
-            format!("{fam}-succ-a"),
-            format!("{fam}-succ-b"),
+            format!("{seed}-succ-a"),
+            format!("{seed}-succ-b"),
         ])
         .unwrap();
         let mut env = serde_json::json!({

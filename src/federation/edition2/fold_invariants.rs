@@ -350,7 +350,7 @@ fn id_of(row: &Attestation) -> RowId {
 /// before today. The node, the binding's second party, was therefore not
 /// live at the binding's instant, and the door waited on it
 /// (`AttesterKeyUnknown`).
-fn owner_binding(owner: &str, node: &str) -> Attestation {
+pub(crate) fn owner_binding(owner: &str, node: &str) -> Attestation {
     use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
     let mut a = crate::federation::genesis::ordinary_scores_row(
         &uuid::Uuid::new_v4().to_string(),
@@ -957,7 +957,10 @@ pub(crate) async fn group_steward_order_body(
     });
     let keys = [e2::signing_key(user), e2::signing_key(agent)];
     let signers: Vec<&_> = keys.iter().collect();
-    let founding = super::group_fixtures::roster_voices(&rec, 1, None, 2_000, &signers);
+    // G0-fix3 — asserted now: an AGENT key's default window opens 180 days
+    // back, so a founding at 2 000 ms found the agent not live (it waited).
+    let founded_ms = e2::ms(crate::host::clock::now() - chrono::Duration::minutes(1));
+    let founding = super::group_fixtures::roster_voices(&rec, 1, None, founded_ms, &signers);
     let row = RowId::of_statement(&founding[0]).expect("I3566: row");
     let binding = owner_binding(steward, agent);
     if reversed {
@@ -1151,14 +1154,19 @@ pub(crate) async fn rebind_order_body(d: &dyn FederationDirectory, reversed: boo
 /// I3564 (v5, FINAL plane `typed_final`): a revocation and the key record
 /// of the key it names, in either order, give the same verdict.
 pub(crate) async fn revocation_order_body(d: &dyn FederationDirectory, reversed: bool) -> Verdicts {
-    let (revoker, subject) = ("g0-rv-r", "g0-rv-s");
-    let _ = e2::put_key(d, revoker, &[identity_type::USER]).await;
+    // G0-fix3 — a key's revocation of ITSELF (T2's I3153 shape, `agent` /
+    // `compromise`): another's key with no slash conferral is refused
+    // (I3154), so the earlier fixture was refused in both orders. Its one
+    // input is the key's own record. Arriving first, the revocation WAITS at
+    // the door (retryable, nothing kept; I3156), and the replication cursor
+    // re-offers it after the record lands.
+    let subject = "g0-rv-s";
     let t = crate::host::clock::now() - chrono::Duration::minutes(1);
     let st = super::typed_fixtures::revocation_statement(
-        revoker,
         subject,
-        "key",
-        "compromised",
+        subject,
+        "agent",
+        "compromise",
         t,
         t,
         None,
@@ -1166,11 +1174,19 @@ pub(crate) async fn revocation_order_body(d: &dyn FederationDirectory, reversed:
     );
     let row = RowId::of_statement(&st).expect("I3564: row");
     if reversed {
-        let _ = e2::put_statement(d, &st).await;
+        let e = e2::put_statement(d, &st)
+            .await
+            .expect_err("I3564: before its key, the revocation waits");
+        assert_eq!(e.kind(), "federation_attester_key_unknown", "I3564: {e:?}");
         let _ = e2::put_key(d, subject, &[identity_type::USER]).await;
+        e2::put_statement(d, &st)
+            .await
+            .expect("I3564: re-offered after its key, it lands");
     } else {
         let _ = e2::put_key(d, subject, &[identity_type::USER]).await;
-        let _ = e2::put_statement(d, &st).await;
+        e2::put_statement(d, &st)
+            .await
+            .expect("I3564: after its key, it lands");
     }
     verdicts(d, &[row]).await
 }

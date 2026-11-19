@@ -2008,10 +2008,11 @@ fn roster_payload_full(
             .ok_or_else(|| invalid("charter_digest is not a 64-hex row id"))?;
         cites.push(ciris_verify_core::edition2::row_ref(&d));
     }
+    // v62.0.0 (E13 fix1) — `refs.also.cites` is a SET of row-refs even
+    // when it names one row (Verify 23.3 `check_refs`: `also` roles go
+    // through `check_row_ref_set`; a bare row-ref is `malformed:also`).
     let mut also: Vec<(&str, Value)> = Vec::new();
-    if cites.len() == 1 {
-        also.push(("cites", cites.remove(0)));
-    } else if !cites.is_empty() {
+    if !cites.is_empty() {
         cites.sort_by_key(cde::encode);
         cites.dedup();
         also.push(("cites", Value::Array(cites)));

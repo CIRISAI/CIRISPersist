@@ -357,6 +357,37 @@ pub(crate) mod bodies {
         p
     }
 
+    /// v62.0.0 (E13 fix1; CC 2.7 rc21 X14, CC 4.4.3.17) — **a joiner whose
+    /// signature counts**: a public room joiner's acceptance of a STANDING
+    /// proposal concludes only from a key with a live federation-scope owner
+    /// binding (`public_room::joiner_owner_bound`). So the joiner is a NODE
+    /// key `joiner` owned by the person `owner`: the owner's binding, dated
+    /// now-relative, and the node's own voice over it (the binding lands at
+    /// its second voice). Returns the joiner's identity-ref.
+    pub(crate) async fn bound_joiner(
+        d: &dyn FederationDirectory,
+        joiner: &str,
+        owner: &str,
+    ) -> String {
+        use crate::federation::types::identity_type::{NODE, USER};
+        let owner = e2::put_key(d, owner, &[USER]).await;
+        let joiner = e2::put_key(d, joiner, &[NODE]).await;
+        let mut row =
+            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner, &joiner);
+        row.asserted_at = ms(Utc::now() - Duration::minutes(5));
+        row.scrub_timestamp = row.asserted_at;
+        ts::seal_row_in_place(&owner, &mut row);
+        e2::put_signed(d, &row)
+            .await
+            .expect("the owner's voice over the joiner's binding");
+        let st = e2::carried_statement(&row).expect("the binding carries its statement");
+        landed(
+            e2::put_statement(d, &e2::voice_of(&st, &joiner)).await,
+            "the joiner's voice over its owner binding",
+        );
+        joiner
+    }
+
     /// The founder's standing proposal into `cid`, and `joiner`'s acceptance.
     async fn accept_standing(
         d: &dyn FederationDirectory,
@@ -385,14 +416,10 @@ pub(crate) mod bodies {
             format!("i1502-pub-{s}"),
             format!("i1502-closed-{s}"),
         );
-        reg(d, &[&founder, &joiner, &late, &cid, &closed]).await;
-        let (founder, joiner, late, cid, closed) = (
-            id_of(&founder),
-            id_of(&joiner),
-            id_of(&late),
-            id_of(&cid),
-            id_of(&closed),
-        );
+        reg(d, &[&founder, &late, &cid, &closed]).await;
+        let joiner = bound_joiner(d, &joiner, &format!("i1502-o-{s}")).await;
+        let (founder, late, cid, closed) =
+            (id_of(&founder), id_of(&late), id_of(&cid), id_of(&closed));
         found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
             .await
             .unwrap();
@@ -583,14 +610,9 @@ pub(crate) mod bodies {
             format!("i1503-j-{s}"),
             format!("i1503-pub-{s}"),
         );
-        reg(d, &[&f1, &f2, &f3, &joiner, &cid]).await;
-        let (f1, f2, f3, joiner, cid) = (
-            id_of(&f1),
-            id_of(&f2),
-            id_of(&f3),
-            id_of(&joiner),
-            id_of(&cid),
-        );
+        reg(d, &[&f1, &f2, &f3, &cid]).await;
+        let joiner = bound_joiner(d, &joiner, &format!("i1503-o-{s}")).await;
+        let (f1, f2, f3, cid) = (id_of(&f1), id_of(&f2), id_of(&f3), id_of(&cid));
         found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&f1, &f2, &f3], &[])
             .await
             .unwrap();
@@ -706,14 +728,12 @@ pub(crate) mod two_node {
             format!("i1504-priv-{s}"),
         );
         for n in [a, b] {
-            reg(n, &[&founder, &joiner, &cid, &private]).await;
+            reg(n, &[&founder, &cid, &private]).await;
         }
-        let (founder, joiner, cid, private) = (
-            id_of(&founder),
-            id_of(&joiner),
-            id_of(&cid),
-            id_of(&private),
-        );
+        // v62.0.0 (E13 fix1; X14) — the joiner is an owner-bound NODE key;
+        // its binding reaches B with A's statements (a commons row).
+        let joiner = super::bodies::bound_joiner(a, &joiner, &format!("i1504-o-{s}")).await;
+        let (founder, cid, private) = (id_of(&founder), id_of(&cid), id_of(&private));
         found_public_room(a, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
             .await
             .unwrap();

@@ -46,7 +46,7 @@ pub mod fixture_occurrence;
 pub mod fixture_switch;
 pub mod fold;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-mod fold_invariants;
+pub(crate) mod fold_invariants;
 // v62.0.0 (wave GC3; CC 2.7.3) — witnesses of GC3's fold conversions.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod gc3_fold_invariants;

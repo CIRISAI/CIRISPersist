@@ -231,11 +231,9 @@ async fn public_room_joiner(
         .expect("I3873: the founder's standing proposal");
     assert!(matches!(o, StatementOutcome::Row { .. }), "I3873: {o:?}");
     let acc = reply(&joiner, &joiner, &p, true, at + Duration::seconds(1));
-    let binding = crate::federation::tier_ingest::test_support::owner_binding_attestation(
-        &uuid::Uuid::new_v4().to_string(),
-        &owner,
-        &joiner,
-    );
+    // G0-fix3 — asserted now (the shared fixture's fixed 2026-05-01 is
+    // before a node key's default window: the node's voice waited).
+    let binding = crate::federation::edition2::fold_invariants::owner_binding(&owner, &joiner);
     (acc, binding, owner, joiner)
 }
 

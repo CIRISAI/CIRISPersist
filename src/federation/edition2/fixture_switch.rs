@@ -701,7 +701,15 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
     let o = env
         .as_object_mut()
         .expect("fixture_switch: the envelope is a JSON object");
-    o.remove(STATEMENT_MEMBER);
+    // v62.0.0 (E13 fix1) — a RE-SEAL of a mapped row (its envelope carries
+    // the statement it was sealed from) re-derives the statement from the
+    // MUTATED struct (E0.api v1.2): the row's `subject_key_ids` column wins
+    // over the projection the earlier seal left in the envelope. Else a
+    // fixture that clears the subjects and reseals (a standing proposal)
+    // still signs the old subjects.
+    if o.remove(STATEMENT_MEMBER).is_some() {
+        o.remove("subject_key_ids");
+    }
     o.remove("row");
     // The row's columns are the signed instants (as `stamp_signed_instants`
     // stamps them on the earlier form).
@@ -1162,6 +1170,24 @@ fn note_window(seed: &str, window: Option<(u64, u64)>) {
             w.remove(&k);
         }
     }
+}
+
+/// v62.0.0 (K2, red round 3) — **where `seed`'s key record starts**, POSIX ms:
+/// the start of the default node / agent window [`put_key`] noted for it, or,
+/// when none is noted (the key is not put yet, or was put with explicit
+/// options), the start a DEFAULT node record gets ([`NODE_DEFAULT_BACK_DAYS`]
+/// before today 00:00 UTC). A fixture that signs a row a node key must voice
+/// dates it from here plus a fixed offset, so the row sits at a fixed place
+/// inside the key's own window rather than at a calendar date the window
+/// moves past. There is no pinned fixture clock: the default window is itself
+/// derived from the day the suite runs, and this reads that one derivation.
+#[must_use]
+pub fn key_window_start_ms(seed: &str) -> u64 {
+    default_windows()
+        .lock()
+        .expect("window map")
+        .get(&kid(seed))
+        .map_or_else(|| default_asserted_at(&["node"]), |(from, _)| *from)
 }
 
 /// The default window a node / agent key gets with no options.
@@ -1902,6 +1928,60 @@ pub async fn put_signed<D: FederationDirectory + ?Sized>(
     });
     check_default_window(&st);
     super::ingest::put_statement(dir, &st, None, tier_of(row)).await
+}
+
+/// v62.0.0 (K2, red round 3; CC 3.2 *The first binding (MUST)*, C557; CC 2.7.5
+/// "a seat is two consents"; CC 2.7.3: a row short of a voice is HELD, never
+/// refused) — **an owner binding, landed the way the door counts it.** The
+/// `ownership:{relation}:{target_kind}:{version}` family names the bound key
+/// as its second signer (`second_signers: bound_node`, member `sub`, CC 3.2 /
+/// CC 3.4.5, the vendored `family_authorship.json`), and
+/// `admission::check_owner_binding_counted` counts the owner's voice AND the
+/// bound key's voice before the typed row lands. So:
+///
+/// 1. the owner's statement the row carries goes through the statement door
+///    ([`put_signed`]): it is kept and the row is held (`Pending`, reason
+///    `count_short`) until the bound key speaks;
+/// 2. the bound key's own voice over the SAME payload ([`voice_of`] by
+///    `node_seed`) goes through the same door ([`put_statement`]) and lands
+///    the row.
+///
+/// Returns the second statement's outcome: `Row` when the binding lands;
+/// `Voice` when it was already held; `Pending` while another counted voice
+/// is still short (an affiliation's quorum, CC 3.2 ruling (a)).
+///
+/// The owner's statement is NEVER put through `put_attestation`: that entry
+/// runs the counted gate outside a fold attempt, so a binding short of the
+/// node's voice is refused there `owner_binding_counted_short` (the 23 reds
+/// this helper retires), not held.
+///
+/// Both statements are judged against their signers' default windows
+/// ([`check_default_window`]): a default node key's record starts
+/// [`NODE_DEFAULT_BACK_DAYS`] before today, so a binding dated before that (a
+/// fixed calendar date) panics here, naming the fix, instead of waiting
+/// `AttesterKeyUnknown` at the node's voice.
+///
+/// # Errors
+/// The door's and the gates' refusals of either statement.
+///
+/// # Panics
+/// A row that carries no statement (the earlier form: put it through
+/// `put_attestation`); a statement outside its signer's default window.
+pub async fn land_owner_binding<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    binding: &Attestation,
+    node_seed: &str,
+) -> Result<StatementOutcome, Error> {
+    let st = carried_statement(binding).unwrap_or_else(|| {
+        panic!(
+            "fixture_switch: land_owner_binding: binding {} carries no statement",
+            binding.attestation_id
+        )
+    });
+    let voice = voice_of(&st, node_seed);
+    check_default_window(&voice);
+    put_signed(dir, binding).await?;
+    put_statement(dir, &voice).await
 }
 
 /// [`statement_of`] put through the store; the row as mapped.

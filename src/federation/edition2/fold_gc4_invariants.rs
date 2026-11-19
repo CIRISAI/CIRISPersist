@@ -128,11 +128,9 @@ fn pending(o: &StatementOutcome) -> bool {
 
 /// The owner binding of `owner` over `node` (the owner's statement).
 fn owner_binding(owner: &str, node: &str) -> Attestation {
-    crate::federation::tier_ingest::test_support::owner_binding_attestation(
-        &uuid::Uuid::new_v4().to_string(),
-        owner,
-        node,
-    )
+    // G0-fix3 — asserted now (the shared fixture's fixed 2026-05-01 is
+    // before a node key's default window: the node's voice waited).
+    super::fold_invariants::owner_binding(owner, node)
 }
 
 /// The node's own capture grant naming the node, its owner and its agent.

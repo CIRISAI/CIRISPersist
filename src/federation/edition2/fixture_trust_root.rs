@@ -274,7 +274,13 @@ where
     }
 
     // 4. The root's charter self-edge.
-    e2::put_statement(dir, &charter).await?;
+    // v62.0.0 (E10, round 3; CC 2.7.3: a held row concludes nothing) — the
+    // root is ROOTED only if the charter and the acceptance CONCLUDE
+    // (`own_chain_to` reads concluded rows). A put that is held is a fixture
+    // that stands up no root: refuse it, naming the fold's reason, rather
+    // than return a root every reader then finds not rooted.
+    let out = e2::put_statement(dir, &charter).await?;
+    require_concluded(dir, "charter", &out).await?;
 
     // 5. THIS node's acceptance edge, naming the held head.
     let head = dir
@@ -283,7 +289,8 @@ where
         .ok_or_else(|| refused("acceptance", "the root is not held"))?
         .persist_row_hash;
     let acceptance = acceptance_statement(&node, &root, &head, at)?;
-    e2::put_statement(dir, &acceptance).await?;
+    let out = e2::put_statement(dir, &acceptance).await?;
+    require_concluded(dir, "acceptance", &out).await?;
 
     Ok(RootedTrustRoot {
         root,
@@ -294,6 +301,25 @@ where
         charter: row_id_of(&charter),
         acceptance: row_id_of(&acceptance),
     })
+}
+
+/// A put that landed as a row (or a further voice of one); a `Pending` one
+/// is refused with the fold's recorded reason (`fold_state`).
+async fn require_concluded<D>(dir: &D, step: &str, out: &StatementOutcome) -> Result<(), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    match out {
+        StatementOutcome::Row { .. } | StatementOutcome::Voice { .. } => Ok(()),
+        StatementOutcome::Pending { row_id, .. } => {
+            let held = dir.fold_state(row_id).await?.and_then(|s| s.held);
+            Err(refused(
+                step,
+                format!("held, not concluded: {held:?} (CC 2.7.3)"),
+            ))
+        }
+        StatementOutcome::KeyPlane { .. } => Err(refused(step, "landed on the key plane")),
+    }
 }
 
 /// The root's `trust:charter:v1` self-edge at `at`.

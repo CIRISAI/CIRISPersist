@@ -9,15 +9,18 @@
 //!   admitted; as another identity it is refused.
 //! - A missing link waits (retryable): the predecessor's statement (naming
 //!   the predecessor), or the named record (naming the record).
-//! - A rotation without the new key's own statement makes it no key of the
-//!   identity.
+//! - A rotation without the new key's own statement is not yet a key of the
+//!   identity: it WAITS on that voice (v62.0.0 R1 round 3; CC 2.6.1.9,
+//!   CIRISVerify 23.3.1 `MissingKey::Voice`), and stands once it arrives.
 //! - A predecessor record that does not cover the rotation's instant hands
 //!   on nothing.
 //! - Two rotations of one predecessor record, neither naming the other,
 //!   hand on nothing; a "rival" whose named record does not cover its
 //!   instant is no rival and blocks nothing.
 //! - A `key:record` about a key that only ANOTHER key signed never makes it
-//!   a key of the signer's identity.
+//!   a key of the signer's identity: naming no predecessor it attaches
+//!   nothing (`kid_not_of_iss`); naming the signer's own record it is a
+//!   rotation short of the new key's voice, and waits on it.
 //! - A key the accord's genesis bundle in force seats for a holder is that
 //!   holder's (a recovery has no rotation record); with no bundle held it
 //!   waits; seated for one holder, it is not another's.
@@ -223,22 +226,30 @@ fn i2101_a_missing_rotation_link_waits() {
     assert_eq!(verdict(&held, &row_as(&n2, &iref(&g2), 5_000)), "valid");
 }
 
+/// v62.0.0 (R1 round 3; CC 2.6.1.9, CIRISVerify 23.3.1
+/// `rotation_lacks_possession`) — the predecessor's voice over a sound
+/// rotation, the new key's own statement not held: the rotation WAITS on
+/// that voice (never refused, never valid), and stands once it arrives.
 #[test]
-fn i2101_a_rotation_without_the_new_keys_statement_hands_on_nothing() {
-    let (g, n, g_rec, _by_n, by_g) = rotated();
+fn i2101_a_rotation_without_the_new_keys_statement_waits_on_it() {
+    let (g, n, g_rec, by_n, by_g) = rotated();
+    let row = rid(&by_g).0;
     let mut held = HeldKeys::new();
     held.insert_record(g_rec);
     held.insert_record(by_g);
     assert_eq!(
         held.key_of(&kid(&n), &kid(&g)),
-        KeyOf::No,
-        "I2101 no own statement"
+        KeyOf::Waiting(vec![ChainMissing::Voice { kid: kid(&n), row }]),
+        "I2101 no own statement: waits on it"
     );
-    assert_ne!(
+    assert_eq!(
         verdict(&held, &row_as(&n, &iref(&g), 5_000)),
-        "valid",
+        "waiting",
         "I2101"
     );
+    held.insert_record(by_n);
+    assert_eq!(held.key_of(&kid(&n), &kid(&g)), KeyOf::Yes, "I2101");
+    assert_eq!(verdict(&held, &row_as(&n, &iref(&g), 5_000)), "valid");
 }
 
 #[test]
@@ -343,19 +354,34 @@ fn i2101_a_record_signed_by_another_key_attaches_nothing() {
     // C signs a record of A's key under C's identity; A never signs it.
     let c_rec = key_record(&c, &["user"], 0, None);
     let mut held = holding(&[&c]);
+    // Naming no predecessor, it attaches nothing.
     held.insert_record(record_under(&c, &a, &iref(&c), 1_000, None));
-    held.insert_record(record_under(&c, &a, &iref(&c), 1_000, Some(&rid(&c_rec))));
     assert_eq!(held.key_of(&kid(&a), &kid(&c)), KeyOf::No, "I2101");
     let v = verdict(&held, &row_as(&a, &iref(&c), 5_000));
     assert!(
         is_reason(&v, malformed_row::KID_NOT_OF_ISS),
         "I2101 never C's key: {v}"
     );
+    // v62.0.0 (R1 round 3; CC 2.6.1.9): naming C's own record, it is a
+    // rotation C → A short of A's voice. It waits on that voice, and is
+    // still never C's key while A has not signed it.
+    let named = record_under(&c, &a, &iref(&c), 1_000, Some(&rid(&c_rec)));
+    let row = rid(&named).0;
+    held.insert_record(named);
+    assert_eq!(
+        held.key_of(&kid(&a), &kid(&c)),
+        KeyOf::Waiting(vec![ChainMissing::Voice { kid: kid(&a), row }]),
+        "I2101 waits on A's own voice"
+    );
+    assert_eq!(verdict(&held, &row_as(&a, &iref(&c), 5_000)), "waiting");
     // With A's own genesis record held, A signs as itself, and still not C.
     held.insert_record(key_record(&a, &["user"], 0, None));
     assert_eq!(verdict(&held, &row_as(&a, &iref(&a), 5_000)), "valid");
-    let v = verdict(&held, &row_as(&a, &iref(&c), 5_000));
-    assert!(is_reason(&v, malformed_row::KID_NOT_OF_ISS), "I2101 {v}");
+    assert_ne!(
+        verdict(&held, &row_as(&a, &iref(&c), 5_000)),
+        "valid",
+        "I2101 never C's key"
+    );
 }
 
 #[test]

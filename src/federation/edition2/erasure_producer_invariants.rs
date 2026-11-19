@@ -163,6 +163,9 @@ async fn postgres() -> Option<crate::store::postgres::PostgresBackend> {
 #[tokio::test(flavor = "multi_thread")]
 async fn i3546_erasure_withdraws_sqlite() {
     let (a, b) = (sqlite().await, sqlite().await);
+    // G0-fix3 — the conferral walk starts at this node's identity.
+    a.set_node_key_id(super::fixture_switch::kid("p4-node"));
+    b.set_node_key_id(super::fixture_switch::kid("p4-node"));
     Box::pin(body(&a, &b)).await;
 }
 
@@ -173,6 +176,9 @@ async fn i3546_erasure_withdraws_postgres() {
         eprintln!("i3546 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
         return;
     };
+    // G0-fix3 — the conferral walk starts at this node's identity.
+    a.set_node_key_id(super::fixture_switch::kid("p4-node"));
+    b.set_node_key_id(super::fixture_switch::kid("p4-node"));
     Box::pin(body(&a, &b)).await;
     eprintln!("i3546 postgres: RAN");
 }

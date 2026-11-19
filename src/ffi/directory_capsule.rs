@@ -1671,6 +1671,16 @@ pub enum DirectoryOp {
         /// `node_key_id`.
         node_key_id: String,
     },
+    /// v62.0.0 (round 3, L1) — [`FederationDirectory::list_settled_edition2_roster_proposals`]:
+    /// the edition-2 twin of `ListSettledSelfRosterProposals` (#1244 round 2,
+    /// the rooting view). A producer names the latest landed roster row as
+    /// its `refs.head` from it (`current_roster_heads`), and through the
+    /// inherited `Unsupported` it read "nothing landed". Result rides
+    /// `SelfRosterReceipts`. APPEND-ONLY (Growth).
+    ListSettledEdition2RosterProposals {
+        /// `identity_key_id`.
+        identity_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -2495,6 +2505,7 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         | DirectoryOp::SupersedeGroupRow { .. }
         | DirectoryOp::WithdrawLocationProof { .. }
         | DirectoryOp::ListLiveConsentGrantsBy { .. }
+        | DirectoryOp::ListSettledEdition2RosterProposals { .. }
         | DirectoryOp::ListLineageHeadCosignsFor { .. }
         | DirectoryOp::LookupSignedCommunity { .. }
         | DirectoryOp::LookupCanonicalWithdrawal { .. }
@@ -3191,6 +3202,15 @@ pub async fn dispatch_directory_op(
         DirectoryOp::ListLiveConsentGrantsBy { node_key_id } => {
             match dir.list_live_consent_grants_by(&node_key_id).await {
                 Ok(v) => DirectoryOpResult::AttestationRows(v),
+                Err(e) => op_err(&e),
+            }
+        }
+        DirectoryOp::ListSettledEdition2RosterProposals { identity_key_id } => {
+            match dir
+                .list_settled_edition2_roster_proposals(&identity_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SelfRosterReceipts(v),
                 Err(e) => op_err(&e),
             }
         }
@@ -6748,6 +6768,25 @@ impl FederationDirectory for OpsDirectory {
             )),
         }
     }
+    async fn list_settled_edition2_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, Error> {
+        // v62.0.0 (round 3, L1) — the edition-2 rooting view, as
+        // `list_settled_self_roster_proposals`.
+        match self
+            .run_op(&DirectoryOp::ListSettledEdition2RosterProposals {
+                identity_key_id: identity_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::SelfRosterReceipts(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
     async fn list_community_membership_revocations_for(
         &self,
         community_key_id: &str,
@@ -7753,9 +7792,11 @@ mod tests {
         // v61.4.2 (the capsule stub sweep, merged forward) — GROWTH: 30 ops
         // APPENDED, one per method the proxy answered `Unsupported`; ABI
         // stays 14.
+        // v62.0.0 (round 3, L1) — GROWTH: `ListSettledEdition2RosterProposals`
+        // APPENDED (the edition-2 rooting view); ABI stays 14.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "de02860c506d16256e8a8b49e31ec51847803c1e90dd676937c41f0eadf5edc8",
+            "c79800d108a1f7fea17690482e41f0c0a127d3f94368793b1dc91be00fd357c9",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -10422,7 +10463,9 @@ mod tests {
         let (t_join, t_leave) = (at("2026-03-01T00:00:00Z"), at("2026-03-02T00:00:00Z"));
         let tg = format!("{tag}-1808");
         let (room, alice, bob) = rt.block_on(keyless_room_dir(dir.as_ref(), &tg));
-        let carol = format!("{tg}-carol");
+        // v62 (round 3) — the name leads: a test signer seeds from the first
+        // 32 bytes, and pg's tag is 32 hex.
+        let carol = format!("carol-{tg}");
         let widening = ts::sign_community_membership_widening(
             &alice,
             types::CommunityMembershipWidening {
@@ -11188,8 +11231,23 @@ mod tests {
                     })
                 },
             ),
+            (
+                "list_settled_edition2_roster_proposals",
+                "list_settled_edition2_roster_proposals",
+                false,
+                DirectoryOp::ListSettledEdition2RosterProposals {
+                    identity_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_settled_edition2_roster_proposals("x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
         ];
-        assert_eq!(table.len(), 30, "I1890: one row per routed method");
+        assert_eq!(table.len(), 31, "I1890: one row per routed method");
         let mut red = Vec::new();
         for (method, fault, write, op, call) in table {
             let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -11266,12 +11324,21 @@ mod tests {
         dir: Arc<dyn FederationDirectory>,
         tag: &str,
     ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::membership_acceptance::test_support::{
+            acceptance_row, proposal_row,
+        };
         use crate::federation::room_roster_invariants::bodies::keyless_room_dir;
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{cohort_scope, identity_type};
         let tg = format!("{tag}-1891");
         let (room, alice, bob) = rt.block_on(keyless_room_dir(dir.as_ref(), &tg));
-        let carol = format!("{tg}-carol");
+        // v62 (round 3) — carol is an edition-2 key named by her identity-ref,
+        // as the room's members are: the growth gate reads her replies by that
+        // id (`replies_of`), so a seed-named key with JSON-door consent left
+        // the acceptance unresolved. Her seed leads with her name: a test
+        // signer seeds from the first 32 bytes, and pg's tag is 32 hex.
+        let carol = e2::kid(&format!("carol-{tg}"));
         let joined = at_1890();
         let seat = types::CommunityMember {
             key_id: carol.clone(),
@@ -11294,18 +11361,17 @@ mod tests {
         let proxy = proxy_1244(rt, dir.clone());
         rt.block_on(async {
             let d: &dyn FederationDirectory = dir.as_ref();
-            ts::register_hybrid_key_as(d, &carol, &carol, identity_type::USER).await;
-            crate::federation::membership_acceptance::test_support::consent(
-                d,
-                cohort_scope::COMMUNITY,
-                &room,
-                &alice,
-                &carol,
-                None,
-                joined,
-            )
-            .await
-            .expect("I1891 consent");
+            e2::put_key(d, &carol, &[identity_type::USER]).await;
+            // Carol's consent, as the room-roster witnesses write it: the
+            // founder's proposal and her acceptance, each a statement.
+            let proposal =
+                proposal_row(&alice, cohort_scope::COMMUNITY, &room, &carol, None, joined);
+            e2::put_signed(d, &proposal)
+                .await
+                .expect("I1891: the proposal lands");
+            e2::put_signed(d, &acceptance_row(&carol, &proposal, joined))
+                .await
+                .expect("I1891: the acceptance lands");
             assert!(
                 proxy
                     .add_community_member(&room, seat, &spec)
@@ -11335,9 +11401,12 @@ mod tests {
             "I1891: the revocation is bob's"
         );
         let dbg = |r: Result<String, Error>| r.expect("I1891 read");
-        for (name, via, direct) in [
+        // Only the member read is asserted non-empty from the seed (alice is
+        // seated in the room); the other two are proxy == direct.
+        for (name, seeded, via, direct) in [
             (
                 "list_group_versions",
+                false,
                 rt.block_on(proxy.list_group_versions(cohort::Cohort::Community, &room))
                     .map(|v| format!("{v:?}")),
                 rt.block_on(dir.list_group_versions(cohort::Cohort::Community, &room))
@@ -11345,6 +11414,7 @@ mod tests {
             ),
             (
                 "list_communities_for_member",
+                true,
                 rt.block_on(proxy.list_communities_for_member(&alice))
                     .map(|v| format!("{v:?}")),
                 rt.block_on(dir.list_communities_for_member(&alice))
@@ -11352,6 +11422,7 @@ mod tests {
             ),
             (
                 "lookup_keys_for_identity",
+                false,
                 rt.block_on(proxy.lookup_keys_for_identity(&carol))
                     .map(|v| format!("{v:?}")),
                 rt.block_on(dir.lookup_keys_for_identity(&carol))
@@ -11359,7 +11430,9 @@ mod tests {
             ),
         ] {
             let (via, direct) = (dbg(via), dbg(direct));
-            assert_ne!(direct, "[]", "I1891 {name}: the seed is not empty");
+            if seeded {
+                assert_ne!(direct, "[]", "I1891 {name}: the seed is not empty");
+            }
             assert_eq!(via, direct, "I1891 {name}: proxy == direct");
         }
     }

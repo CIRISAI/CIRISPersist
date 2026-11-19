@@ -2726,9 +2726,48 @@ pub mod test_support {
         );
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         seal_row_in_place(owner, &mut row);
-        dir.put_attestation(crate::federation::SignedAttestation { attestation: row })
+        put_sealed_owner_binding(dir, &row, node)
             .await
             .expect("put owner-binding");
+    }
+
+    /// v62.0.0 (K2, red round 3; CC 3.2 *The first binding*, C557; CC 2.7.5)
+    /// — **put a sealed owner binding so it LANDS.** Under the switch: the
+    /// owner's statement, then `node`'s own voice over it
+    /// ([`land_owner_binding`](crate::federation::edition2::fixture_switch::land_owner_binding)),
+    /// and the binding must land (`Row`). In the earlier form: the row through
+    /// `put_attestation` (its co-scrub is the node's cosignature).
+    ///
+    /// `node` is the bound key's SEED (the label it was registered under).
+    ///
+    /// # Errors
+    /// The doors' refusals.
+    ///
+    /// # Panics
+    /// Under the switch, a binding the node's voice does not land (`Pending`:
+    /// another counted voice is short; call `land_owner_binding` to read it).
+    pub async fn put_sealed_owner_binding(
+        dir: &dyn crate::federation::FederationDirectory,
+        binding: &crate::federation::Attestation,
+        node: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        if e2::emit_edition2() {
+            let out = e2::land_owner_binding(dir, binding, node).await?;
+            assert!(
+                matches!(
+                    out,
+                    crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+                ),
+                "put_sealed_owner_binding: the node's voice lands the binding, got {out:?}"
+            );
+            return Ok(());
+        }
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: binding.clone(),
+        })
+        .await
+        .map(|_| ())
     }
 
     /// v38.6.0 (#773) — a live custody claim `delegates_to(steward → subject)`.
@@ -3013,11 +3052,10 @@ pub mod test_support {
             );
             binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
             seal_row_in_place(&owner, &mut binding);
-            dir.put_attestation(crate::federation::SignedAttestation {
-                attestation: binding,
-            })
-            .await
-            .unwrap_or_else(|e| panic!("({suffix}) put owner-binding: {e}"));
+            // v62.0.0 (K2 R3) — the owner's statement and the node's voice.
+            put_sealed_owner_binding(dir, &binding, node)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) put owner-binding: {e}"));
         }
 
         // (1) Conferred AND claimed ⇒ MeshServer. This is the rung that had no
@@ -3341,11 +3379,12 @@ pub mod test_support {
         );
         binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         seal_row_in_place(&owner, &mut binding);
-        dir.put_attestation(crate::federation::SignedAttestation {
-            attestation: binding,
-        })
-        .await
-        .unwrap_or_else(|e| panic!("({suffix}) put owner-binding: {e}"));
+        // v62.0.0 (K2 R3) — the owner's statement and the node's voice; a
+        // composer names the binding by the id this node stores it under.
+        put_sealed_owner_binding(dir, &binding, &node)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) put owner-binding: {e}"));
+        let binding_id = crate::federation::edition2::fixture_switch::rid(&binding);
 
         // (1) BOTH directions resolve through the one fold (#764).
         assert_eq!(
@@ -4986,12 +5025,23 @@ pub mod test_support {
         seal_row(granter, a)
     }
 
+    /// v62.0.0 (K2, red round 3) — how many days after the bound key's record
+    /// start ([`key_window_start_ms`](crate::federation::edition2::fixture_switch::key_window_start_ms))
+    /// [`owner_binding_attestation`] dates its binding under the switch. A
+    /// default node / agent window runs 365 days from its start
+    /// (`NODE_DEFAULT_BACK_DAYS` = 180 of them before today), so 150 days in
+    /// is inside it and 30 days before the day the suite runs.
+    pub const OWNER_BINDING_OFFSET_DAYS: i64 = 150;
+
     /// #371 — build a LIVE **owner-binding** `delegates_to(owner → node)`
     /// (the CC 1.13.3.3 / CC 3.2 ownership dimension `owner_of` keys on),
     /// federation-tier
     /// hybrid-signed by `owner`'s deterministic keys so
     /// `verify_federation_tier_ingest` admits it. Register `owner` as a
-    /// `user`-role key ([`register_identity_key`]) first.
+    /// `user`-role key ([`register_identity_key`]) first. v62.0.0 (K2 R3):
+    /// under the switch it is dated [`OWNER_BINDING_OFFSET_DAYS`] into the
+    /// node key's own window (the node's voice carries the same instant); land
+    /// it with the node's voice through [`put_sealed_owner_binding`].
     pub fn owner_binding_attestation(
         id: &str,
         owner: &str,
@@ -5008,7 +5058,28 @@ pub mod test_support {
             "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
         });
         let (och, classical, pqc) = sign_envelope(owner, &envelope);
-        let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        // v62.0.0 (K2, red round 3; CC 2.4.1.1) — under the switch the
+        // binding is dated INSIDE THE BOUND KEY'S OWN WINDOW: its record's
+        // start ([`key_window_start_ms`](crate::federation::edition2::fixture_switch::key_window_start_ms))
+        // plus [`OWNER_BINDING_OFFSET_DAYS`]. The node's voice is a second
+        // statement over the same payload, so it carries this instant; the
+        // fixed 2026-05-01 fell before a default node record's start (180
+        // days before today) from 2026-10-28 on, and every node voice over a
+        // builder binding waited `AttesterKeyUnknown`. A witness that needs
+        // another instant sets it and re-seals, as before. The earlier form
+        // keeps its fixed date.
+        let ts: chrono::DateTime<chrono::Utc> =
+            if crate::federation::edition2::fixture_switch::emit_edition2() {
+                let from_ms =
+                    crate::federation::edition2::fixture_switch::key_window_start_ms(node);
+                let at_ms = i64::try_from(from_ms).expect("a key window start fits i64")
+                    + OWNER_BINDING_OFFSET_DAYS * 86_400_000;
+                chrono::TimeZone::timestamp_millis_opt(&chrono::Utc, at_ms)
+                    .single()
+                    .expect("an instant inside the key's window")
+            } else {
+                "2026-05-01T00:00:00Z".parse().unwrap()
+            };
         seal_row(
             owner,
             crate::federation::Attestation {

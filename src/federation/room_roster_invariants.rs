@@ -260,9 +260,14 @@ pub mod bodies {
         tag: &str,
         protocol: &str,
     ) -> (String, String, String) {
-        let room = format!("{tag}-room");
-        let alice = format!("{tag}-alice");
-        let bob = format!("{tag}-bob");
+        // v62 (round 3, L1) — the role LEADS the seed. A test signer seeds
+        // from a key name's first 32 bytes (`seed_for`), and a caller's tag is
+        // often a 32-hex uuid: `{tag}-alice` and `{tag}-bob` were then ONE
+        // keypair, so the roster named one member twice and `group:roster`
+        // refused it (`members` is not [* roster-member]).
+        let room = format!("room-{tag}");
+        let alice = format!("alice-{tag}");
+        let bob = format!("bob-{tag}");
         for k in [&alice, &bob] {
             e2::put_key(d, k, &[identity_type::USER]).await;
         }

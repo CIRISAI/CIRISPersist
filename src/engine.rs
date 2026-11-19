@@ -6788,7 +6788,16 @@ impl Engine {
             crate::federation::Error::Backend(format!("publish_self_occurrence: node key: {e}"))
         })?;
         let local_id = local.federation_id().await;
-        if local_id != me {
+        // v62.0.0 (E11, round 3) — since cut B `local_derived_key_id` IS the
+        // LocalSigner's identity-ref on a composite engine, so `local_id != me`
+        // alone can never fire. The node's identity is the COMPOSED signer:
+        // the LocalSigner must hold its classical key.
+        let composed = self.signer.public_key().await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "publish_self_occurrence: the composed signer's public key: {e}"
+            ))
+        })?;
+        if local_id != me || composed.as_slice() != local.ed25519_public_key_bytes().as_slice() {
             return Err(crate::federation::Error::InvalidArgument(format!(
                 "publish_self_occurrence: the LocalSigner ({local_id}) is not this node's identity \
                  ({me}); a node publishes only its own occurrence (BLOB_REPLICATION.md §20.3)",

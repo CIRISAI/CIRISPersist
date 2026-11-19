@@ -247,13 +247,27 @@ pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
             }),
         ),
     ] {
-        e2::try_put_row(
+        let confers = envelope
+            .get("dimension")
+            .and_then(serde_json::Value::as_str)
+            == Some(TRUST_CONFERS_DIMENSION);
+        let edge = e2::try_put_row(
             d,
             &lit(from, to, attestation_type::DELEGATES_TO, envelope),
             from,
         )
         .await
         .unwrap_or_else(|e| panic!("I3081: the trust edge {from} -> {to} is admitted: {e:?}"));
+        // G0-fix3 — Verify's `confers` rule asks the delegate for a second
+        // voice (`delegate: sub`, CC 2.6.1.9; W1b's `put_conferral`). Without
+        // it the conferral is held, so the detector's detection:* row was
+        // held `reserved_prefix_emitter_mismatch` too (I3081 red).
+        if confers {
+            let st = e2::carried_statement(&edge).expect("I3081: the conferral's statement");
+            e2::put_statement(d, &e2::voice_of(&st, to))
+                .await
+                .expect("I3081: the detector's own voice on its conferral");
+        }
     }
     let detection = lit(
         det,

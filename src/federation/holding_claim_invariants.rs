@@ -469,7 +469,15 @@ pub(crate) mod dyn_bodies {
     ) {
         let (founder, _) = key(d, "i713f", tag).await;
         let (stranger, _) = key(d, "i713s", tag).await;
-        let (joiner, _) = key(d, "i713j", tag).await;
+        // v62.0.0 (E13 fix1; CC 2.7 rc21 X14) — a joiner's acceptance of a
+        // STANDING proposal counts only from a key with a live
+        // federation-scope owner binding: an owner-bound NODE joiner.
+        let joiner = crate::federation::open_admission_invariants::bodies::bound_joiner(
+            d,
+            &format!("i713j-{tag}"),
+            &format!("i713o-{tag}"),
+        )
+        .await;
         let id = e2::kid(&format!("i713-pub-{tag}"));
         put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await

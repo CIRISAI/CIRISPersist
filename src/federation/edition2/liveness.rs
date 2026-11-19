@@ -87,6 +87,10 @@
 //!   v1 file's answer). Verify 23.3.1 (CC rc21) waits too, naming the
 //!   missing voice (`MissingKey::Voice`): the verdict now agrees, the link
 //!   named differs;
+//! - a rotation whose NEW key's own statement is not held, the
+//!   predecessor's voice over a sound rotation being held, waits on that
+//!   voice ([`ChainMissing::Voice`]; R1 round 3, CC 2.6.1.9), as Verify
+//!   23.3.1 does (`rotation_lacks_possession`); v1 says `kid_not_of_iss`;
 //! - a rotation whose predecessor statement waits names the link I2101
 //!   names (the predecessor key when its record is held, else the record
 //!   `target` names), where Verify names the key that statement waits on.
@@ -463,11 +467,18 @@ impl HeldKeys {
         let rows = self.record_voices(kid, statements, depth);
         let mut missing: Vec<ChainMissing> = Vec::new();
         for (row_id, voices) in &rows {
-            // (1) the key's own statement, under `iss`.
+            // (1) the key's own statement, under `iss`. v62.0.0 (R1 round 3;
+            // CC 2.6.1.9, CIRISVerify 23.3.1): when it is not held but the
+            // predecessor's voice over a sound rotation is, the row waits on
+            // the new key's voice (proof of possession); it is never refused
+            // for a voice not yet held ([`Self::possession_missing`]).
             let Some(own) = voices
                 .iter()
                 .find(|v| v.row.kid == *kid && v.row.iss == iss_ref)
             else {
+                if let Some(m) = self.possession_missing(kid, &iss_ref, row_id, voices, depth) {
+                    missing.push(m);
+                }
                 continue;
             };
             // (2) it names the predecessor's record.
@@ -554,6 +565,65 @@ impl HeldKeys {
             missing.dedup();
             KeyOf::Waiting(missing)
         }
+    }
+
+    /// v62.0.0 (R1 round 3; CC 2.6.1.9, CC 2.4.1.1; CIRISVerify 23.3.1's
+    /// `KeyRecordDirectory`, `key_of_iss_v2.json` `rotation_lacks_possession`)
+    /// — **a rotation of `kid` whose own statement is not held.** The row
+    /// `row_id` (a record of `kid`) carries a predecessor's voice under `iss`
+    /// naming the predecessor's record by `refs.target`:
+    ///
+    /// - that record held as the predecessor's own, under `iss`, covering the
+    ///   rotation's instant: the row waits on `kid`'s own statement over it
+    ///   ([`ChainMissing::Voice`]), since a row gains voices without changing
+    ///   its id, and a voice not held is waited on, never refused;
+    /// - that record not held at all: it waits on the record
+    ///   ([`ChainMissing::Record`]);
+    /// - otherwise (held as something else, of another issuer, or not
+    ///   covering the instant): `None`, the row hands on nothing.
+    ///
+    /// No voice of a predecessor under `iss` (a record of `kid` that only an
+    /// unrelated key signed, naming no target) is `None` as before: the
+    /// record attaches nothing.
+    fn possession_missing(
+        &self,
+        kid: &Digest32,
+        iss_ref: &str,
+        row_id: &Digest32,
+        voices: &[Voice],
+        depth: usize,
+    ) -> Option<ChainMissing> {
+        for pred in voices
+            .iter()
+            .filter(|v| v.row.kid != *kid && v.row.iss == iss_ref)
+        {
+            let Some(target) = names_of(&pred.row.payload)
+                .ok()
+                .and_then(|n| single(&n, "target"))
+                .map(|r| r.0)
+            else {
+                continue;
+            };
+            let p = pred.row.kid;
+            let window = self.records.get(&p).and_then(|sts| {
+                self.record_voices(&p, sts, depth + 1)
+                    .get(&target)
+                    .and_then(|vs| vs.iter().find(|v| v.row.kid == p && v.row.iss == iss_ref))
+                    .map(|v| (v.record.asserted_at, v.record.valid_until))
+            });
+            match window {
+                Some(w) if covers(w, pred.row.asserted_at) => {
+                    return Some(ChainMissing::Voice {
+                        kid: *kid,
+                        row: *row_id,
+                    });
+                }
+                Some(_) => {}
+                None if !self.holds_row(&target) => return Some(ChainMissing::Record(target)),
+                None => {}
+            }
+        }
+        None
     }
 
     /// Does a valid record of the genesis key `iss` name the role
@@ -855,7 +925,7 @@ struct Voice {
 }
 
 /// What a key-chain link waits on ([`KeyOf::Waiting`]). Verify's
-/// `MissingKey` carries the first two ([`KeyOf::to_verify`]).
+/// `MissingKey` carries `Kid`, `Record` and `Voice` ([`KeyOf::to_verify`]).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChainMissing {
     /// A key, by its thumbprint: its statement over the rotation, or its
@@ -866,6 +936,15 @@ pub enum ChainMissing {
     /// The accord's genesis bundle in force, which seats holders' keys:
     /// none held. Persist's own; Verify's bundle reader answers seats.
     Bundle,
+    /// v62.0.0 (R1 round 3; CC 2.6.1.9) — a voice of a held rotation row
+    /// that is not held: `kid`'s own statement over `row` (proof of
+    /// possession). Verify 23.3.1's `MissingKey::Voice`.
+    Voice {
+        /// The key whose statement is missing.
+        kid: Digest32,
+        /// The row it would be over.
+        row: Digest32,
+    },
 }
 
 /// The keys the accord's genesis bundle in force seats, by holder
@@ -953,6 +1032,9 @@ impl KeyOf {
                         ChainMissing::Kid(k) => MissingKey::Kid(*k),
                         ChainMissing::Record(r) => MissingKey::Record(*r),
                         ChainMissing::Bundle => MissingKey::Kid(*kid),
+                        ChainMissing::Voice { kid: k, row } => {
+                            MissingKey::Voice { kid: *k, row: *row }
+                        }
                     })
                     .collect(),
             ),

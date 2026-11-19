@@ -410,6 +410,16 @@ pub(crate) mod bodies {
         chrono::Utc::now()
     }
 
+    /// A `moderation_track_record:{community_key_id}:v1` dimension about the
+    /// rooted trust root (an edition-2 dimension names a key by its bare
+    /// thumbprint, CC rc21; `e2::kid_thumb`).
+    pub(crate) fn mtr_dimension() -> String {
+        format!(
+            "moderation_track_record:{}:v1",
+            e2::kid_thumb(crate::federation::edition2::fixture_trust_root::ROOT_SEED)
+        )
+    }
+
     /// A distinct millisecond for each fixture row (an edition-2 row id is
     /// computed from its payload, so two calls with the same content would
     /// name one row): this node's clock, truncated to ms, moved back one ms
@@ -1008,8 +1018,8 @@ pub(crate) mod bodies {
             }
             assert_eq!(
                 body["retryable"].as_bool(),
-                Some(got == why::ROOT_NOT_HELD),
-                "I650 {what}: retryable is the gap alone: {body}"
+                Some(why::is_retryable(&got)),
+                "I650 {what}: retryable as the core list says: {body}"
             );
             assert_eq!(e.kind(), "purge_unauthorised", "I650 the kind IS the token");
             assert_nothing_written(d, &notice).await;
@@ -2101,11 +2111,12 @@ pub(crate) mod bodies {
         let dir = d.as_dyn_directory();
         let t = now();
         let mut ids = Vec::new();
+        let mtr = mtr_dimension();
         for dimension in [
             "revocation:peer:fraud:v1",
             "key:revocation:v1",
             "moderation:spam:v1",
-            "moderation_track_record:ciris-canonical:v1",
+            mtr.as_str(),
             "slashing:upheld:v1",
         ] {
             let id = put_local_dimension(d, HARNESS, dimension).await;
@@ -2309,13 +2320,26 @@ pub(crate) mod bodies {
             .hex()
     }
 
-    /// `batch_bytes` with its first event carrying `statement` (standard
-    /// base64), P7's batch member.
+    /// `batch_bytes` with its first event in P7's ROW FORM (P7.md final,
+    /// "The calls"): the inline `trace` is replaced by `statement` and
+    /// `trace_blob` (standard base64). The blob is the trace's content bytes
+    /// as sent ([`trace_content_bytes`], RFC 8785 JCS less the signature
+    /// members), the bytes the statement must bind.
     fn with_statement(batch_bytes: &[u8], statement: &[u8]) -> Vec<u8> {
         use base64::Engine as _;
+        let b64 = |x: &[u8]| base64::engine::general_purpose::STANDARD.encode(x);
         let mut b: serde_json::Value = serde_json::from_slice(batch_bytes).expect("a batch");
-        b["events"][0]["statement"] =
-            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(statement));
+        let event = b["events"][0]
+            .as_object_mut()
+            .expect("the batch's first event is an object");
+        let trace = event
+            .remove("trace")
+            .expect("the batch's first event carries its trace");
+        event.insert("statement".to_owned(), serde_json::json!(b64(statement)));
+        event.insert(
+            "trace_blob".to_owned(),
+            serde_json::json!(b64(&trace_content_bytes(&trace))),
+        );
         b.to_string().into_bytes()
     }
 
@@ -2629,9 +2653,11 @@ pub(crate) mod bodies {
             AGENT,
         );
         let bytes = v28_signed_batch(&signed, &st, "generic");
-        // Pure: the parsed trace keeps both members, typed, and serializes
-        // back to the wire profile.
-        let env = BatchEnvelope::from_json(&bytes).expect("I1031: a v2.8.0 trace parses");
+        // Pure: the parsed trace (the inline batch; the row form carries it
+        // as the blob) keeps both members, typed, and serializes back to the
+        // wire profile.
+        let env = BatchEnvelope::from_json(&v28_batch(&signed, "generic"))
+            .expect("I1031: a v2.8.0 trace parses");
         let BatchEvent::CompleteTrace { trace, .. } = &env.events[0];
         let profile = trace.deployment_profile.as_ref().expect("profile");
         assert_eq!(profile.run_kind.as_deref(), Some("qa"), "I1031");
@@ -2691,7 +2717,8 @@ pub(crate) mod bodies {
             t["deployment_profile"]["pipeline_metadata"] = metadata.clone();
             let (signed, st) = sign_v28(t, AGENT);
             let bytes = v28_signed_batch(&signed, &st, "generic");
-            let env = BatchEnvelope::from_json(&bytes).expect("I1364: parses");
+            let env =
+                BatchEnvelope::from_json(&v28_batch(&signed, "generic")).expect("I1364: parses");
             let BatchEvent::CompleteTrace { trace, .. } = &env.events[0];
             let profile = trace.deployment_profile.as_ref().expect("profile");
             assert_eq!(
@@ -2979,8 +3006,7 @@ pub(crate) mod bodies {
         let t = now();
         // A quorum-cosigned bundle that no origin door would have produced:
         // it names an accountability record this receiver holds.
-        let held =
-            put_local_dimension(d, HARNESS, "moderation_track_record:ciris-canonical:v1").await;
+        let held = put_local_dimension(d, HARNESS, &mtr_dimension()).await;
         let plain = put_score(d, SCORER, AGENT, &[]).await.attestation_id;
         let mut ids = vec![
             format!("attestation:{held}"),
@@ -3212,24 +3238,13 @@ pub(crate) mod bodies {
         plain: &D,
     ) {
         // (a) the attestation door, federation tier.
+        // v62.0.0 (E10, P7 final: the manifest form is the only form) — the
+        // trace row names its content by digest; an inline `trace` is
+        // unencodable (floats) and refused. The mock run is the manifest's
+        // signed `run_kind`.
         let r = root(canonical).await;
         let dir = canonical.as_dyn_directory();
-        let mut row = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
-            ts::bare_attestation(
-                &uuid::Uuid::new_v4().to_string(),
-                AGENT,
-                AGENT,
-                &serde_json::json!({
-                    "dimension": crate::ingest::TRACE_ATTESTATION_DIMENSION,
-                    "trace_id": "trace-i659-att",
-                    "trace": trace_json("trace-i659-att", AGENT, "gpt-real", Some(sp::RUN_KIND_MOCK)),
-                }),
-            )
-        });
-        row.attestation_type = attestation_type::SCORES.to_owned();
-        row.asserted_at = distinct_instant();
-        row.scrub_timestamp = row.asserted_at;
-        // v62.0.0 (E10) — the row as AGENT's edition-2 statement.
+        let row = manifest_row("e10", "trace-i659-att", Some(sp::RUN_KIND_MOCK));
         let e = e2::try_put_row(dir, &row, AGENT)
             .await
             .expect_err("a federation-tier mock trace is refused");
@@ -3248,26 +3263,14 @@ pub(crate) mod bodies {
             sp::refuse_mock_trace_attestation(&local).is_ok(),
             "the local tier keeps QA traces"
         );
-        // Keyed on the signed `run_kind`, never on a model-name heuristic: a
-        // production run on the mock model's id, and a trace that predates
+        // Keyed on the signed `run_kind`, never on a model-name heuristic (the
+        // row names no model): a production run, and a trace that predates
         // `run_kind`, pass.
-        for (what, trace) in [
-            (
-                "run_kind production",
-                trace_json(
-                    "trace-i659-att",
-                    AGENT,
-                    sp::MOCK_LLM_MODEL,
-                    Some("production"),
-                ),
-            ),
-            (
-                "no run_kind",
-                trace_json("trace-i659-att", AGENT, sp::MOCK_LLM_MODEL, None),
-            ),
+        for (what, run_kind) in [
+            ("run_kind production", Some("production")),
+            ("no run_kind", None),
         ] {
-            let mut other = row.clone();
-            other.attestation_envelope["trace"] = trace;
+            let other = manifest_row("e10", "trace-i659-att", run_kind);
             assert!(
                 sp::refuse_mock_trace_attestation(&other).is_ok(),
                 "I659(a): {what} passes"
@@ -3619,11 +3622,7 @@ pub(crate) mod bodies {
         let r = root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
-        let (track_st, track) = fed_statement(
-            HARNESS,
-            BYSTANDER,
-            "moderation_track_record:ciris-canonical:v1",
-        );
+        let (track_st, track) = fed_statement(HARNESS, BYSTANDER, &mtr_dimension());
         let (plain_st, plain) = fed_statement(SCORER, AGENT, "chat:message:v1");
         // A bundle naming ids this node does not hold yet.
         let mut ids: Vec<String> = [&track, &plain]
@@ -4093,10 +4092,16 @@ pub(crate) mod bodies {
         inline.subject_key_ids = vec![k(AGENT)];
         inline.asserted_at = distinct_instant();
         inline.scrub_timestamp = inline.asserted_at;
+        // v62.0.0 (P7 final, CC ruling: the manifest form is the only form) —
+        // an inline trace row is refused by its payload, whatever its
+        // run_kind: the trace family's payload requires `manifest`.
         let e = e2::try_put_row(dir, &inline, AGENT)
             .await
-            .expect_err("I698: a non-string inline run_kind is refused");
-        assert_eq!(e.kind(), "federation_trace_dimension_invalid", "I698: {e}");
+            .expect_err("I698: an inline trace row is refused");
+        assert!(
+            e.to_string().contains("`manifest` is required"),
+            "I698: the inline form is gone: {e}"
+        );
     }
 
     // ── I820 ──────────────────────────────────────────────────────────────
@@ -4106,11 +4111,7 @@ pub(crate) mod bodies {
         let t = now();
         // A refused-today accountability row (inadmissible) and a refused-
         // today plain row (admissible).
-        let (parent_st, parent) = fed_statement(
-            HARNESS,
-            BYSTANDER,
-            "moderation_track_record:ciris-canonical:v1",
-        );
+        let (parent_st, parent) = fed_statement(HARNESS, BYSTANDER, &mtr_dimension());
         e2::put_statement(dir, &parent_st)
             .await
             .expect("the accountability row admits");
