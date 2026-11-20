@@ -92,6 +92,10 @@ pub(crate) mod bodies {
         node: &str,
         node_seed: &str,
     ) {
+        // v62.0.0 (E2-fix5; P1-fix10) — the bound key's edition-2 record before
+        // its voice (else the voice waits `AttesterKeyUnknown`, an ordering
+        // gap); a key the test already registered is left as it is.
+        crate::federation::key_grant_invariants::two_node::key_live(d, node_seed).await;
         let row = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner, node);
         // v62.0.0 (E2-fix3; K2.api) — the owner's statement, then the bound
         // node's voice, through K2's shared helper (no hand-rolled voice).

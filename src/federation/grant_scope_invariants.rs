@@ -148,7 +148,10 @@ pub mod bodies {
         // One signing step, after the end is set (edition 2).
         let r = e2::row_of(&lit, seed);
         let id = r.attestation_id.clone();
-        crate::federation::edition2::fixture_switch::put_signed(d, &r)
+        // v62 (E3b-fix4; CC 2.6.1.9, E0.api v1.15): an own-act delegation waits
+        // for the delegate's voice; `land_delegation` puts the author's row, then
+        // that voice (a door refusal stays an Err).
+        e2::land_delegation(d, &r)
             .await
             .unwrap_or_else(|e| panic!("delegates_to({granter} → {grantee}, {scope}): {e}"));
         id
@@ -201,9 +204,10 @@ pub mod bodies {
         );
         // Edition 2: the row id is node-computed.
         let id = r.attestation_id.clone();
-        d.put_attestation(SignedAttestation { attestation: r })
-            .await
-            .map(|_| id)
+        // v62 (E3b-fix4; CC 2.6.1.9, E0.api v1.15): an own-act delegation waits
+        // for the delegate's voice; `land_delegation` puts the author's row, then
+        // that voice (a door refusal stays an Err).
+        e2::land_delegation(d, &r).await.map(|_| id)
     }
 
     /// The granter withdraws the edge `target` by name.
@@ -1076,7 +1080,7 @@ mod run {
     #[cfg(feature = "sqlite")]
     mod sqlite_key_grant {
         use super::super::key_grant_arms::*;
-        use crate::federation::key_grant_invariants::two_node::{introduce, node};
+        use crate::federation::key_grant_invariants::two_node::{introduce_as, node, node_as};
         use crate::store::sqlite::SqliteBackend;
         use crate::store::Backend as _;
 
@@ -1110,9 +1114,24 @@ mod run {
         #[tokio::test(flavor = "multi_thread")]
         async fn i591c() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node(&ba, "i591c-a").await;
-            let b = node(&bb, "i591c-b").await;
-            introduce(&[&a, &b], &["i591c-a", "i591c-b"]).await;
+            let a = node_as(
+                &ba,
+                "i591c-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i591c-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            introduce_as(
+                &[&a, &b],
+                &["i591c-a", "i591c-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i591c_epoch_axis(&a, "i591c-a", &b, "sqlite").await;
         }
     }
@@ -1120,7 +1139,7 @@ mod run {
     #[cfg(feature = "postgres")]
     mod postgres_key_grant {
         use super::super::key_grant_arms::*;
-        use crate::federation::key_grant_invariants::two_node::{introduce, node};
+        use crate::federation::key_grant_invariants::two_node::{introduce_as, node, node_as};
         use crate::store::postgres::PostgresBackend;
         use crate::store::Backend as _;
 
@@ -1157,9 +1176,24 @@ mod run {
             let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
                 return;
             };
-            let a = node(&ba, "i591c-a").await;
-            let b = node(&bb, "i591c-b").await;
-            introduce(&[&a, &b], &["i591c-a", "i591c-b"]).await;
+            let a = node_as(
+                &ba,
+                "i591c-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i591c-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            introduce_as(
+                &[&a, &b],
+                &["i591c-a", "i591c-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i591c_epoch_axis(&a, "i591c-a", &b, "postgres").await;
         }
     }

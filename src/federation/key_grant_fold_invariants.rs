@@ -51,7 +51,7 @@ use crate::federation::key_grant::{
     EmissionFold, KeyGrantAxis, KeyGrantRow,
 };
 use crate::federation::key_grant_invariants::two_node::{
-    community_removal_voices, encryption_member, node, node_as, owner_binding_voices,
+    community_removal_voices, encryption_member, key_live, node, node_as, owner_binding_voices,
     sign_row_unstored_at, Node,
 };
 use crate::federation::tier_ingest::test_support as ts;
@@ -95,7 +95,8 @@ where
 
 /// v62.0.0 (E3b) — **the minter node is `owner`'s**, by the owner relation:
 /// `owner`'s owner binding for the node (her `delegates_to` statement,
-/// re-dated a minute back so the node-typed key's own record covers it,
+/// dated at the node key's held record start plus a fixed offset
+/// ([`node_record_anchor`]), inside that record, which is made live first;
 /// then the node's own voice: `owner_of` requires it), and the node's OWN
 /// self-occurrence (author = identity = occurrence = the node; one
 /// statement), `server` class, carrying the node's content-KEM keys so a
@@ -110,7 +111,18 @@ where
         n.key,
         "fixture: the node's key is its alias's identity-ref"
     );
-    let bound_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    // v62.0.0 (E11-fix3) — the node key's own edition-2 record FIRST
+    // (P1-fix10's `key_live`; a key already registered is left as it is),
+    // and the binding dated FROM THAT RECORD: its held `valid_from` plus a
+    // fixed offset, so the node's voice sits inside its own record by
+    // construction, whenever the record was put. An engine-registered node
+    // key (`register_self_federation_key`, I1807) starts its record at its
+    // registration instant; a binding re-dated a minute back from the wall
+    // clock put the node's voice before the record began ("signer … is not
+    // a registered federation key on this node yet"). A caller that backdates
+    // rows dates them from the same anchor ([`node_record_anchor`]).
+    key_live(n.backend.as_dyn_directory(), node_seed).await;
+    let bound_at = node_record_anchor(n).await;
     for v in owner_binding_voices(owner, node_seed, bound_at) {
         e2::put_statement(n.backend, &v)
             .await
@@ -133,6 +145,30 @@ where
         Ok(StatementOutcome::Row { .. }) => {}
         other => panic!("{node_seed}'s own self-occurrence: {other:?}"),
     }
+}
+
+/// v62.0.0 (E11-fix3) — the offset past the node key's record start at
+/// which [`own_node`] dates the owner binding.
+pub(crate) const NODE_BINDING_OFFSET_MS: i64 = 1;
+
+/// v62.0.0 (E11-fix3) — **the instant a node's owner binding is dated at**:
+/// the node key's held record's `valid_from` (read back through
+/// `lookup_public_key`, as P7-fix8 anchors its rows) plus
+/// [`NODE_BINDING_OFFSET_MS`]. Inside the record by construction.
+///
+/// # Panics
+/// The node's key is not held.
+pub(crate) async fn node_record_anchor<B>(n: &Node<'_, B>) -> chrono::DateTime<chrono::Utc>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let held = n
+        .backend
+        .lookup_public_key(&n.key)
+        .await
+        .expect("lookup_public_key")
+        .unwrap_or_else(|| panic!("the node key {} is held", n.key));
+    held.valid_from + chrono::Duration::milliseconds(NODE_BINDING_OFFSET_MS)
 }
 
 /// v62.0.0 (E3b) — **found the community `comm`** (a seed, its key live) as

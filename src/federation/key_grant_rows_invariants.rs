@@ -526,7 +526,7 @@ pub(crate) mod two_nodes {
     #[cfg(feature = "sqlite")]
     mod sqlite {
         use super::*;
-        use crate::federation::key_grant_invariants::two_node::{introduce, node, node_as};
+        use crate::federation::key_grant_invariants::two_node::{introduce_as, node_as};
         use crate::store::sqlite::SqliteBackend;
         use crate::store::Backend as _;
 
@@ -539,20 +539,30 @@ pub(crate) mod two_nodes {
         #[tokio::test]
         async fn i743_sqlite() {
             let (ba, bb, bc, bo) = (fresh().await, fresh().await, fresh().await, fresh().await);
-            let a = node(&ba, "i743-a").await;
-            let b = node(&bb, "i743-b").await;
-            let c = node(&bc, "i743-c").await;
+            let a = node_as(&ba, "i743-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i743-b", crate::federation::types::identity_type::NODE).await;
+            let c = node_as(&bc, "i743-c", crate::federation::types::identity_type::NODE).await;
             let o = node_as(&bo, "i743-o", crate::federation::types::identity_type::NODE).await;
-            introduce(&[&a, &b, &c, &o], &["i743-a", "i743-b", "i743-c", "i743-o"]).await;
+            introduce_as(
+                &[&a, &b, &c, &o],
+                &["i743-a", "i743-b", "i743-c", "i743-o"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             i743_delivery_through_the_planes(&a, &b, &c, &o, "sqlite").await;
         }
 
         #[tokio::test]
         async fn i744_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node(&ba, "i744-a").await;
-            let b = node(&bb, "i744-b").await;
-            introduce(&[&a, &b], &["i744-a", "i744-b"]).await;
+            let a = node_as(&ba, "i744-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i744-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i744-a", "i744-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             i744_reemission_is_idempotent_and_rechecks(&a, &b, "sqlite").await;
         }
     }
@@ -560,7 +570,7 @@ pub(crate) mod two_nodes {
     #[cfg(feature = "postgres")]
     mod postgres {
         use super::*;
-        use crate::federation::key_grant_invariants::two_node::{introduce, node, node_as};
+        use crate::federation::key_grant_invariants::two_node::{introduce_as, node_as};
         use crate::store::postgres::PostgresBackend;
         use crate::store::Backend as _;
 
@@ -579,11 +589,16 @@ pub(crate) mod two_nodes {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node(&ba, "i743-a").await;
-            let b = node(&bb, "i743-b").await;
-            let c = node(&bc, "i743-c").await;
+            let a = node_as(&ba, "i743-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i743-b", crate::federation::types::identity_type::NODE).await;
+            let c = node_as(&bc, "i743-c", crate::federation::types::identity_type::NODE).await;
             let o = node_as(&bo, "i743-o", crate::federation::types::identity_type::NODE).await;
-            introduce(&[&a, &b, &c, &o], &["i743-a", "i743-b", "i743-c", "i743-o"]).await;
+            introduce_as(
+                &[&a, &b, &c, &o],
+                &["i743-a", "i743-b", "i743-c", "i743-o"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             i743_delivery_through_the_planes(&a, &b, &c, &o, "postgres").await;
         }
 
@@ -593,9 +608,14 @@ pub(crate) mod two_nodes {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node(&ba, "i744-a").await;
-            let b = node(&bb, "i744-b").await;
-            introduce(&[&a, &b], &["i744-a", "i744-b"]).await;
+            let a = node_as(&ba, "i744-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i744-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i744-a", "i744-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             i744_reemission_is_idempotent_and_rechecks(&a, &b, "postgres").await;
         }
     }

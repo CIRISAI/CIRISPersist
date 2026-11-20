@@ -542,6 +542,23 @@ pub struct TransitKexPair {
     pub ml_kem_768: Box<[u8; TRANSIT_KEX_ML_KEM_768_LEN]>,
 }
 
+impl TransitKexPair {
+    /// v62.0.0 (ceremony gap 3, item 3; CC 3.3.6.2) — **the pair an X-Wing
+    /// transit key carries**: X-Wing is `pk_M ‖ pk_X`, so its ML-KEM-768
+    /// encapsulation key is bytes `0..1184` and its X25519 key bytes
+    /// `1184..1216`. An edition-2 seat or bound node publishes only the
+    /// X-Wing form (`transit_xwing_pubkey`); this is the same key, read as
+    /// the two-member pair a hop key consumer takes.
+    #[must_use]
+    pub fn from_xwing(key: &XWingPublicKey) -> Self {
+        let mut x25519 = [0u8; TRANSIT_KEX_X25519_LEN];
+        x25519.copy_from_slice(key.x25519());
+        let mut ml_kem_768 = Box::new([0u8; TRANSIT_KEX_ML_KEM_768_LEN]);
+        ml_kem_768.copy_from_slice(key.ml_kem_768());
+        Self { x25519, ml_kem_768 }
+    }
+}
+
 /// v59.0.0 (CIRISPersist#1106, CIRISEdge) — why a transit pair fails
 /// [`check_transit_kex_pair`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1044,6 +1061,16 @@ impl SignedTransportDestination {
 /// 3. the transit x25519 or ML-KEM-768 bytes equal to ANY of them ⇒ `None`;
 ///    otherwise `Some(pair)`.
 ///
+/// v62.0.0 (ceremony gap 3, item 3) — **the X-Wing form.** For a seat of the
+/// genesis bundle in force the pair is its X-Wing transit key, the bundle
+/// binding's or the latest counted re-bind's
+/// ([`seat_transit_key`](crate::federation::edition2::transport_rebind::seat_transit_key)),
+/// split by [`TransitKexPair::from_xwing`]; steps 1–3 do not run (Verify's
+/// reader separates a binding's X-Wing members). A node that is not a seat
+/// and carries no earlier-form pair answers its edition-2 bind's X-Wing key
+/// ([`bind_transit_xwing_for`](crate::federation::edition2::occurrence::bind_transit_xwing_for)),
+/// which applies the cross-row rule itself.
+///
 /// [`list_identity_occurrences_by_occurrence_key`]: crate::federation::FederationDirectory::list_identity_occurrences_by_occurrence_key
 ///
 /// # Errors
@@ -1054,6 +1081,18 @@ pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?S
     dir: &D,
     occurrence_key_id: &str,
 ) -> Result<Option<TransitKexPair>, crate::federation::Error> {
+    // v62.0.0 (ceremony gap 3, item 3; CC 3.3.6.2 "A seat's transit key") —
+    // a seat of the genesis bundle in force: its pair is its X-Wing transit
+    // key, the bundle binding's or the latest counted re-bind's, as
+    // [`transit_xwing_pubkey_for`] reads it. A binding the seat publishes
+    // itself is not read.
+    let in_force = crate::federation::edition2::genesis::genesis_in_force(dir).await?;
+    if let Some(seat) = in_force.seat(occurrence_key_id) {
+        let key =
+            crate::federation::edition2::transport_rebind::seat_transit_key(dir, &in_force, seat)
+                .await?;
+        return Ok(XWingPublicKey::from_bytes(&key).map(|k| TransitKexPair::from_xwing(&k)));
+    }
     let bindings = dir
         .list_signed_transport_destinations_for(occurrence_key_id)
         .await?;
@@ -1073,7 +1112,13 @@ pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?S
         }
     }
     let Some(pair) = pair else {
-        return Ok(None);
+        // v62.0.0 (ceremony gap 3, item 3) — no earlier-form pair: the
+        // edition-2 bind's X-Wing transit key, for a node that is not a seat.
+        return Ok(
+            super::edition2::occurrence::bind_transit_xwing_for(dir, occurrence_key_id)
+                .await?
+                .map(|k| TransitKexPair::from_xwing(&k)),
+        );
     };
 
     let others = other_keys_of(dir, occurrence_key_id, &live).await?;

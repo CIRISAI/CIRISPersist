@@ -721,13 +721,11 @@ pub(crate) mod bodies {
         row.cohort_scope = scope.to_owned();
         ts::seal_row_in_place(owner, &mut row);
         let id = row.attestation_id.clone();
-        let statement = e2::carried_statement(&row).expect("I1575 fixture: an edition-2 row");
-        crate::federation::edition2::fixture_switch::put_signed(d, &row)
+        // v62 (E3b-fix4, K2.api): the shared landing (owner's statement, then
+        // the node's voice, C557; asserts Row).
+        ts::put_sealed_owner_binding(d, &row, node)
             .await
             .unwrap_or_else(|e| panic!("I1575 fixture: {owner} binds {node} at {scope}: {e}"));
-        e2::put_statement(d, &e2::voice_of(&statement, node))
-            .await
-            .unwrap_or_else(|e| panic!("I1575 fixture: {node}'s voice on its binding: {e}"));
         id
     }
 

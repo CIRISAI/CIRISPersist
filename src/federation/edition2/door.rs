@@ -553,6 +553,256 @@ pub fn names_an_affiliation_on_the_bond(bytes: &[u8]) -> bool {
             .any(|f| payload.get_text(f).and_then(Value::as_text).is_some())
 }
 
+/// v62.0.0 (K2-fix6; CC 2.6.1.9) — who fills a second-signer role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecondSignerParty {
+    /// This identity-ref: the CWT `sub`, or one a payload member names.
+    Key(String),
+    /// The owner of this key, when it is a MACHINE key (`node` / `agent`):
+    /// the owner the live owner binding of the key names (`owner_of_sub`,
+    /// CC 4.4.3.19, authorship_text.tsv:44). For a person's key the role does
+    /// not apply. Resolved by the gate
+    /// (`admission::check_second_signers_voiced`), which holds the directory.
+    OwnerOf(String),
+}
+
+/// v62.0.0 (K2-fix4, K2-fix6; CC 2.7.3, CC 2.6.1.9) — one second-signer role
+/// of a row, and the parties that may fill it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondSignerRole {
+    /// The role's name in the family model (`bound_node`, `delegate`,
+    /// `delegate_owner`, `custodian`, ...).
+    pub role: String,
+    /// The parties that fill it; any one of them voicing fills the role. A
+    /// role naming a payload member that is absent has none: it cannot be
+    /// filled, and the row waits.
+    pub parties: Vec<SecondSignerParty>,
+}
+
+/// v62.0.0 (K2-fix4, K2-fix6; CC 2.6.1.9 (P2:1147): "The second consent of a
+/// scoped delegates_to is a second statement over the same payload, signed
+/// by the delegate, the row's sub. A scoped delegation seats only with that
+/// statement."; CC 2.7.3) — **the second-signer roles of this row
+/// statement, read UNDER THE ACT SELECTOR** as Verify's reader reads them
+/// (`family::select::second_signers` over the vendored entries, with the
+/// row's leaf and the door's context: `act` from the bytes, the typed keys).
+///
+/// - **act = own** (the payload carries `author`): the entries whose `when`
+///   holds. `self:delegates_to` gives `delegate` = `sub`
+///   (authorship_text.tsv:43) and `delegate_owner` = `owner_of_sub`
+///   (authorship_text.tsv:44, [`SecondSignerParty::OwnerOf`]: Verify's model
+///   drops it as unresolvable from the row; persist resolves it from the live
+///   owner binding).
+/// - **act = group** (no `author`: a counted row, an affiliation's counted
+///   appointment, count_text.tsv:40 / authorship_text.tsv:56): no role. Its
+///   own count decides it, and an appointee's consent is a separate
+///   `membership:acceptance` row.
+/// - a `subject` family, a family the model leaves undecided, a cell whose
+///   `when` is unknown: no role. A `gap` / `target` member is not resolved.
+/// - A family only persist's own cells register (`occurrence::PersistCells`)
+///   reads those cells' roles.
+#[must_use]
+pub fn second_signer_roles(bytes: &[u8]) -> Vec<SecondSignerRole> {
+    use ciris_verify_core::edition2::family::{
+        select::{second_signers, Signers},
+        vendored_family, FamilyModel as _, RoleParty, RuleAnswer, AUTHOR_IS_SUBJECT,
+    };
+    let Some((protected, payload)) = statement_parts(bytes) else {
+        return Vec::new();
+    };
+    let Some(family) = protected.get_int(-70002).and_then(Value::as_text) else {
+        return Vec::new();
+    };
+    let sub = protected
+        .get_int(15)
+        .and_then(|c| c.get_int(2))
+        .and_then(Value::as_text)
+        .map(str::to_owned);
+    let leaf = payload
+        .get_text("dimension")
+        .and_then(Value::as_text)
+        .and_then(|d| {
+            let prefix = ciris_verify_core::namespace_match::prefix_of_family_id(family)?;
+            ciris_verify_core::namespace_match::bind_leaf(prefix, d)
+                .ok()
+                .map(|b| b.leaf)
+        });
+    let ctx = door_context(bytes, SelectContext::default());
+    // CC's carve-out: a group act (a counted row) has no second signer.
+    if ctx.act != Some(Act::Own) {
+        return Vec::new();
+    }
+    let model = WithVendored(&super::occurrence::PersistCells);
+    let RuleAnswer::Rule(rule) = model.rule_for(family, leaf.as_deref(), &ctx) else {
+        return Vec::new();
+    };
+    if !rule.authored
+        || rule
+            .roles
+            .iter()
+            .any(|(r, p)| r == AUTHOR_IS_SUBJECT && *p == RoleParty::Sub)
+    {
+        return Vec::new();
+    }
+    // (role, member): the vendored entries under the selector, else (a
+    // family only persist's cells register) the cells' roles.
+    let entries: Vec<(String, String)> = match vendored_family(family) {
+        Some(f) => match second_signers(&f.second_signers, leaf.as_deref(), &ctx) {
+            Signers::Roles(rs) => rs
+                .into_iter()
+                .map(|e| (e.role.clone(), e.member.clone()))
+                .collect(),
+            Signers::Unknown => Vec::new(),
+        },
+        None => rule
+            .roles
+            .iter()
+            .map(|(r, p)| {
+                let m = match p {
+                    RoleParty::Sub => "sub".to_owned(),
+                    RoleParty::Member(m) => m.clone(),
+                };
+                (r.clone(), m)
+            })
+            .collect(),
+    };
+    let named = |m: &str| -> Vec<SecondSignerParty> {
+        match payload.get_text(m) {
+            Some(Value::Text(t)) => vec![SecondSignerParty::Key(t.clone())],
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(Value::as_text)
+                .map(|t| SecondSignerParty::Key(t.to_owned()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    entries
+        .into_iter()
+        .filter_map(|(role, member)| {
+            let parties = match member.as_str() {
+                "sub" => sub
+                    .clone()
+                    .map(SecondSignerParty::Key)
+                    .into_iter()
+                    .collect(),
+                "owner_of_sub" => sub
+                    .clone()
+                    .map(SecondSignerParty::OwnerOf)
+                    .into_iter()
+                    .collect(),
+                // Not resolvable by the row's statement and not asked of
+                // persist by CC: never required here.
+                "gap" | "target" => return None,
+                m => named(m),
+            };
+            Some(SecondSignerRole { role, parties })
+        })
+        .collect()
+}
+
+/// v62.0.0 (K2-fix6; CC 2.6.1.9, authorship_text.tsv:43–44, CC 4.4.3.19)
+/// — **THE answer to "who must voice this row"**: [`second_signer_roles`]
+/// with every party RESOLVED to an identity-ref. It is the one source of
+/// truth: the gate (`admission::check_second_signers_voiced`) counts against
+/// it, and a producer or fixture voices exactly these roles.
+///
+/// - `Key(k)` stays `k`.
+/// - `OwnerOf(sub)` (`delegate_owner = owner_of_sub`, REQUIRED for a
+///   machine-key sub by CC :44): for a `node` / `agent` sub, the owner of
+///   its LIVE owner binding: an agent's from its edition-2 agent owner
+///   binding at the row's `asserted_at` (`admission::agent_owner_of`, the
+///   owner P8's delegate-voice listing names too), else `admission::owner_of`. No owner,
+///   or an ambiguous one, leaves the role with NO party: reported
+///   unfillable, and the row holds. A person's sub has no owner role, so the
+///   role is not listed.
+///
+/// Declares the fold read `key:<sub>`, so a held row re-folds when an owner
+/// binding about its sub lands or is withdrawn (a no-op outside a fold
+/// attempt).
+///
+/// # Errors
+/// Directory reads.
+pub async fn resolved_second_signer_roles<F>(
+    dir: &F,
+    bytes: &[u8],
+) -> Result<Vec<SecondSignerRole>, Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    let asserted_at_ms = statement_parts(bytes)
+        .and_then(|(_, p)| p.get_text("asserted_at").and_then(Value::as_u64))
+        .unwrap_or(u64::MAX);
+    let mut out = Vec::new();
+    for r in second_signer_roles(bytes) {
+        let mut parties = Vec::new();
+        let mut applies = r.parties.is_empty();
+        for p in r.parties {
+            match p {
+                SecondSignerParty::Key(k) => {
+                    applies = true;
+                    parties.push(SecondSignerParty::Key(k));
+                }
+                SecondSignerParty::OwnerOf(sub) => {
+                    if !super::occurrence::is_machine_key(dir, &sub).await? {
+                        continue;
+                    }
+                    applies = true;
+                    super::fold::reads(super::fold::Dep::key(&sub));
+                    // K2-fix7 — the same owner P8's delegate-voice listing
+                    // names (one answer): an AGENT's owner from its
+                    // edition-2 agent owner binding at the row's instant
+                    // (`agent_owner_of`), else (a node, or an agent bound the
+                    // node way) the live owner binding (`owner_of`).
+                    let owner = match agent_owner(dir, &sub, asserted_at_ms).await {
+                        Ok(Some(o)) => Ok(Some(o)),
+                        Ok(None) => crate::federation::admission::owner_of(dir, &sub).await,
+                        Err(e) => Err(e),
+                    };
+                    match owner {
+                        Ok(Some(owner)) => parties.push(SecondSignerParty::Key(owner)),
+                        Ok(None) | Err(Error::AmbiguousNodeOwner { .. }) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        if applies {
+            // v62.0.0 (P8-fix5) — every party it names is a fold read: the
+            // held row re-folds when a row by or about that key lands (its
+            // voice), and `ceg_fold_reads` indexes the row under each key it
+            // waits for, so `second_signer_voice::held_rows_for` finds it by
+            // the awaited key, never by a scan of the held set.
+            for p in &parties {
+                if let SecondSignerParty::Key(k) = p {
+                    super::fold::reads(super::fold::Dep::key(k));
+                }
+            }
+            out.push(SecondSignerRole {
+                role: r.role,
+                parties,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// K2-fix7 — `admission::agent_owner_of` for an `agent` key, else `None`.
+async fn agent_owner<F>(dir: &F, key: &str, at_ms: u64) -> Result<Option<String>, Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    use crate::federation::types::identity_type;
+    let is_agent = dir
+        .lookup_public_key(key)
+        .await?
+        .is_some_and(|k| identity_type::set_contains(&k.identity_type, identity_type::AGENT));
+    if !is_agent {
+        return Ok(None);
+    }
+    crate::federation::admission::agent_owner_of(dir, key, at_ms).await
+}
+
 /// The family of a `delegates_to` that is not an owner binding or another
 /// purpose-specific family (RULINGS, *delegates_to families*).
 pub const SELF_DELEGATES_TO_FAMILY_PREFIX: &str = "self:delegates_to";

@@ -1691,6 +1691,59 @@ pub enum DirectoryOp {
         /// The proposal's row id, hex.
         row_id_hex: String,
     },
+    /// v62.0.0 (v62 P8-fix5; CC 2.6.1.9, 2.7.3, 4.4.3.19) —
+    /// [`FederationDirectory::held_rows_for`]: the held rows waiting for
+    /// `key`'s voice, in any second-signer role (only `role`, when named).
+    /// Result rides `HeldRows`. APPEND-ONLY (Growth).
+    HeldRowsFor {
+        /// The awaited key (identity-ref).
+        key: String,
+        /// Only this role, when named.
+        role: Option<String>,
+        /// The held row id to page after.
+        after: Option<[u8; 32]>,
+        /// At most this many.
+        limit: u32,
+    },
+    /// v62.0.0 (v62 P8-fix5) — [`FederationDirectory::voice_status`]: the
+    /// state of a row a voice concerns. Result rides `VoiceOutcome`.
+    /// APPEND-ONLY (Growth).
+    VoiceStatus {
+        /// The row id.
+        row_id: [u8; 32],
+    },
+    /// v62.0.0 (v62 P8-fix5) — [`FederationDirectory::submit_voice`]: a
+    /// second signer's voice through the statement door, run inside
+    /// persist's `.so`; the row's resulting state. Result rides
+    /// `VoiceOutcome`. APPEND-ONLY (Growth).
+    SubmitVoice {
+        /// The voice statement's bytes.
+        statement: Vec<u8>,
+    },
+    /// v62.0.0 (ceremony gap 4; CC 2.6.1.11, CC 5.3.4) — **the genesis
+    /// bundle/2 import door**,
+    /// [`crate::federation::edition2::genesis::put_genesis_bundle`], run
+    /// inside persist's `.so` over persist's own directory, so every gate
+    /// runs on the host's store: one statement list (bundle voices and the
+    /// rows they name, each as received) read by CIRISVerify's bundle reader,
+    /// and `anchor` for a first bundle not already held (`None` roots nothing
+    /// new). An earlier-form object is refused `earlier_form_object` by the
+    /// door itself. Result rides `GenesisAdmission`. APPEND-ONLY (Growth).
+    PutGenesisBundle {
+        /// The bundle voices and the rows they name, each as received.
+        statements: Vec<Vec<u8>>,
+        /// The anchor for a first bundle not already held.
+        anchor: Option<GenesisAnchor>,
+    },
+    /// v62.0.0 (ceremony gap 2; CC 3.3.6.2, CC 3.4.7) —
+    /// [`crate::federation::edition2::transport_rebind::rebind_held_for`]: the
+    /// counted re-bind live for a seat of the genesis bundle in force (a
+    /// pre-roll gate's question). Result rides `RebindHeld`. APPEND-ONLY
+    /// (Growth).
+    RebindHeldFor {
+        /// The seat's identity-ref.
+        seat_identity_ref: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -2017,6 +2070,17 @@ pub enum DirectoryOpResult {
     LocationProofs(Vec<LocationProof>),
     /// v61.4.2 (the capsule stub sweep) — `supersede_group_row`: the new version. APPEND-ONLY (Growth).
     GroupRowVersion(u32),
+    /// v62.0.0 (v62 P8-fix5) — `held_rows_for`. APPEND-ONLY (Growth).
+    HeldRows(Vec<crate::federation::edition2::second_signer_voice::HeldRow>),
+    /// v62.0.0 (v62 P8-fix5) — `voice_status` / `submit_voice`. APPEND-ONLY
+    /// (Growth).
+    VoiceOutcome(crate::federation::edition2::second_signer_voice::VoiceOutcome),
+    /// v62.0.0 (ceremony gap 4) — what `PutGenesisBundle` did. APPEND-ONLY
+    /// (Growth).
+    GenesisAdmission(Edition2GenesisAdmission),
+    /// v62.0.0 (ceremony gap 2) — `edition2::transport_rebind::rebind_held_for`.
+    /// APPEND-ONLY (Growth).
+    RebindHeld(Option<Edition2HeldRebind>),
 }
 
 /// v62.0.0 (CC 2.7) — a failed op's error as it crosses the capsule: what
@@ -2323,6 +2387,105 @@ impl From<&crate::federation::edition2::genesis::GenesisPlacement> for Edition2B
     }
 }
 
+/// v62.0.0 (ceremony gap 4) — the wire mirror of
+/// [`crate::federation::edition2::genesis::Anchor`] (CC 5.3.4): the reader's
+/// anchor for a first bundle, never a member of the wire bundle itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GenesisAnchor {
+    /// The first bundle's holders' composite-key thumbprints.
+    Thumbprints(Vec<[u8; 32]>),
+    /// The object id of one first bundle; any other first bundle is void.
+    ObjectId([u8; 32]),
+}
+
+impl From<GenesisAnchor> for crate::federation::edition2::genesis::Anchor {
+    fn from(a: GenesisAnchor) -> Self {
+        match a {
+            GenesisAnchor::Thumbprints(t) => Self::Thumbprints(t.into_iter().collect()),
+            GenesisAnchor::ObjectId(o) => Self::ObjectId(o),
+        }
+    }
+}
+
+/// v62.0.0 (ceremony gap 4) — the wire mirror of
+/// [`crate::federation::edition2::genesis::NotPlaced`]: an offered bundle the
+/// door did not place (nothing of it stored).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edition2NotPlaced {
+    /// The object id.
+    pub object_id: [u8; 32],
+    /// Verify's token, or `genesis_bundle_waiting`.
+    pub token: String,
+    /// Verify's reason or detail; for a waiting bundle, what it waits on.
+    pub detail: Option<String>,
+    /// It waits on a named row or its predecessor: retryable.
+    pub waiting: bool,
+}
+
+/// v62.0.0 (ceremony gap 4) — the wire mirror of
+/// [`crate::federation::edition2::genesis::GenesisAdmission`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edition2GenesisAdmission {
+    /// Each offered bundle placed, in lineage order.
+    pub placed: Vec<Edition2BundleInForce>,
+    /// Each offered bundle not placed.
+    pub not_placed: Vec<Edition2NotPlaced>,
+    /// Offered statements (by index) that are neither a bundle voice nor a
+    /// row.
+    pub unreadable: Vec<u64>,
+    /// The tips in force after the store ([`crate::federation::edition2::genesis::GenesisInForce::tips`]):
+    /// empty on a fork of the genesis.
+    pub tips: Vec<Edition2BundleInForce>,
+}
+
+impl From<&crate::federation::edition2::genesis::GenesisAdmission> for Edition2GenesisAdmission {
+    fn from(a: &crate::federation::edition2::genesis::GenesisAdmission) -> Self {
+        Self {
+            placed: a.placed.iter().map(Edition2BundleInForce::from).collect(),
+            not_placed: a
+                .not_placed
+                .iter()
+                .map(|n| Edition2NotPlaced {
+                    object_id: n.object_id,
+                    token: n.token.to_owned(),
+                    detail: n.detail.clone(),
+                    waiting: n.waiting,
+                })
+                .collect(),
+            unreadable: a.unreadable.iter().map(|i| *i as u64).collect(),
+            tips: a
+                .in_force
+                .tips()
+                .into_iter()
+                .map(Edition2BundleInForce::from)
+                .collect(),
+        }
+    }
+}
+
+/// v62.0.0 (ceremony gap 2) — the wire mirror of
+/// [`crate::federation::edition2::transport_rebind::HeldRebind`]: the counted
+/// re-bind live for a seat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edition2HeldRebind {
+    /// The re-bind row's id.
+    pub row_id: [u8; 32],
+    /// The X-Wing transit key it makes live (1216 bytes).
+    pub transit_xwing_pubkey: Vec<u8>,
+    /// The bundle it is counted over (`refs.head`).
+    pub head: [u8; 32],
+}
+
+impl From<&crate::federation::edition2::transport_rebind::HeldRebind> for Edition2HeldRebind {
+    fn from(r: &crate::federation::edition2::transport_rebind::HeldRebind) -> Self {
+        Self {
+            row_id: r.row_id.0,
+            transit_xwing_pubkey: r.transit_xwing_pubkey.to_vec(),
+            head: r.head.0,
+        }
+    }
+}
+
 /// v62.0.0 (JSON-cut slice D) — an [`Error`] flattened for the capsule WITH
 /// its stable reading: `"{kind}: {plane}: {reason}: {message}"` for a
 /// [`Error::MalformedRow`] (the prefix is Python's
@@ -2537,7 +2700,17 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         DirectoryOp::PutEdition2Statement { .. }
         | DirectoryOp::ApplyReplicatedStatement { .. }
         | DirectoryOp::Edition2StatementsSince { .. }
-        | DirectoryOp::BundlesInForce { .. } => None,
+        | DirectoryOp::BundlesInForce { .. }
+        // v62.0.0 (v62 P8-fix5) — edition-2 reads and the edition-2 door
+        // (`SubmitVoice` puts through `put_statement`, which refuses an
+        // earlier-form object itself): no earlier-form object.
+        | DirectoryOp::HeldRowsFor { .. }
+        | DirectoryOp::VoiceStatus { .. }
+        | DirectoryOp::SubmitVoice { .. }
+        // v62.0.0 (ceremony gap 4) — the genesis import door.
+        | DirectoryOp::PutGenesisBundle { .. }
+        // v62.0.0 (ceremony gap 2) — the seat re-bind read.
+        | DirectoryOp::RebindHeldFor { .. } => None,
         // TODO(json-cut): detection events are MESH (RULINGS "Planes"), but
         // no edition-2 detection door exists yet and the Rust door
         // (`derived::put_edge_detection_event`) is not wired to the
@@ -3231,6 +3404,31 @@ pub async fn dispatch_directory_op(
                 Err(e) => op_err(&e),
             }
         }
+        DirectoryOp::HeldRowsFor {
+            key,
+            role,
+            after,
+            limit,
+        } => {
+            let after = after.map(crate::federation::edition2::names::RowId);
+            match Box::pin(dir.held_rows_for(&key, role.as_deref(), after.as_ref(), limit)).await {
+                Ok(v) => DirectoryOpResult::HeldRows(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::VoiceStatus { row_id } => {
+            let row_id = crate::federation::edition2::names::RowId(row_id);
+            match Box::pin(dir.voice_status(&row_id)).await {
+                Ok(v) => DirectoryOpResult::VoiceOutcome(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::SubmitVoice { statement } => {
+            match Box::pin(dir.submit_voice(&statement)).await {
+                Ok(v) => DirectoryOpResult::VoiceOutcome(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
         DirectoryOp::ListCommunityMembershipRevocationsFor { community_key_id } => {
             match dir
                 .list_community_membership_revocations_for(&community_key_id)
@@ -3910,6 +4108,32 @@ pub async fn dispatch_directory_op(
                 Ok(v) => DirectoryOpResult::BundlesInForce(
                     v.iter().map(Edition2BundleInForce::from).collect(),
                 ),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::PutGenesisBundle { statements, anchor } => {
+            let anchor = anchor.map(crate::federation::edition2::genesis::Anchor::from);
+            match Box::pin(crate::federation::edition2::genesis::put_genesis_bundle(
+                dir,
+                &statements,
+                anchor.as_ref(),
+            ))
+            .await
+            {
+                Ok(a) => DirectoryOpResult::GenesisAdmission((&a).into()),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::RebindHeldFor { seat_identity_ref } => {
+            match Box::pin(
+                crate::federation::edition2::transport_rebind::rebind_held_for(
+                    dir,
+                    &seat_identity_ref,
+                ),
+            )
+            .await
+            {
+                Ok(r) => DirectoryOpResult::RebindHeld(r.as_ref().map(Edition2HeldRebind::from)),
                 Err(e) => op_err_typed(&e),
             }
         }
@@ -6306,6 +6530,75 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    /// v62.0.0 (v62 P8-fix5) — the held rows waiting for a key's voice,
+    /// proxied: the default reads the fold store (`fold_dependents`,
+    /// `fold_state`, `edition2_voices`), which answers EMPTY through the
+    /// proxy and would read "nothing waits for you" (the #1244 fail-open
+    /// class), so the whole read crosses.
+    async fn held_rows_for(
+        &self,
+        key: &str,
+        role: Option<&str>,
+        after: Option<&crate::federation::edition2::names::RowId>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::edition2::second_signer_voice::HeldRow>, Error> {
+        match self
+            .run_op(&DirectoryOp::HeldRowsFor {
+                key: key.to_owned(),
+                role: role.map(str::to_owned),
+                after: after.map(|r| r.0),
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::HeldRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v62.0.0 (v62 P8-fix5) — a row's voice state, proxied (the default's
+    /// fold read answers empty through the proxy: every row would read
+    /// `Waiting` with no reason).
+    async fn voice_status(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<crate::federation::edition2::second_signer_voice::VoiceOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::VoiceStatus { row_id: row_id.0 })
+            .await?
+        {
+            DirectoryOpResult::VoiceOutcome(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v62.0.0 (v62 P8-fix5) — a second signer's voice, put through the
+    /// statement door inside persist's `.so` and answered with the row's
+    /// state in one crossing.
+    async fn submit_voice(
+        &self,
+        statement: &[u8],
+    ) -> Result<crate::federation::edition2::second_signer_voice::VoiceOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::SubmitVoice {
+                statement: statement.to_vec(),
+            })
+            .await?
+        {
+            DirectoryOpResult::VoiceOutcome(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     /// v62.0.0 (JSON-cut slice D) — the edition-2 serve listing, proxied.
     /// The trait default answers EMPTY, which a serving consumer would read
     /// as "nothing held" (the #1244 fail-open class), so the read crosses.
@@ -7838,9 +8131,23 @@ mod tests {
         // APPENDED (the edition-2 rooting view); ABI stays 14.
         // v62.0.0 (round 3, O1 fix 5) — GROWTH: `Edition2RosterProposal`
         // APPENDED (one receipt of that view); ABI stays 14.
+        // v62.0.0 (v62 P8-fix4 + P8-fix5, one pass) — GROWTH: `HeldRowsFor`,
+        // `VoiceStatus`, `SubmitVoice` APPENDED (fix4's unshipped
+        // `HeldDelegationsFor` became `HeldRowsFor` before any release); ABI
+        // stays 14.
+        // v62.0.0 (ceremony gap 4) — GROWTH: `PutGenesisBundle` APPENDED (the
+        // genesis import door); ABI stays 14.
+        // v62.0.0 (ceremony gap 2, C3) — GROWTH: `RebindHeldFor` APPENDED;
+        // ABI stays 14.
+        // v62.0.0 (L1-fix3) — re-pinned over the merged order: P8-fix5's
+        // three, then C1's `PutGenesisBundle`, then C3's `RebindHeldFor`.
+        // GROWTH; ABI stays 14.
+        // v62.0.0 (X2 pass 4c) — re-pinned over the integrated order: L1's
+        // `ListSettledEdition2RosterProposals`, O1 fix 5's
+        // `Edition2RosterProposal`, then the five above. GROWTH; ABI stays 14.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "649ef35268ab910e86125fcafa756d4dce9e5fea5d9d5d3ec1661fafa8f6d145",
+            "d36caa2e9fbb6ec3fcc19e60d725e8438947652770c0d56a927fae8e1e52ddc1",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -7909,9 +8216,16 @@ mod tests {
         // `TypedErr`; ABI stays 14.
         // v61.4.2 (the capsule stub sweep, merged forward) — GROWTH: 10
         // result variants APPENDED.
+        // v62.0.0 (v62 P8-fix5) — GROWTH: `HeldRows`, `VoiceOutcome`
+        // APPENDED (fix4's unshipped `HeldDelegations` became `HeldRows`).
+        // v62.0.0 (ceremony gap 4) — GROWTH: `GenesisAdmission` APPENDED;
+        // ABI stays 14.
+        // v62.0.0 (ceremony gap 2, C3) — GROWTH: `RebindHeld` APPENDED.
+        // v62.0.0 (L1-fix3) — re-pinned over the merged order: `HeldRows`,
+        // `VoiceOutcome`, `GenesisAdmission`, `RebindHeld`. GROWTH.
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "a3aaa920ff107902fb4279790f1f933ee9832e03a2422733150f1d57ef826873",
+            "f958b2043be6204758ee464c3a334b3c1937f62507bfb15361be4024ce7da0e7",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -11366,8 +11680,45 @@ mod tests {
                     })
                 },
             ),
+            // v62.0.0 (L1-fix3; P8-fix5, CC 2.6.1.9) — the second-signer voice
+            // reads. Both are trait DEFAULTS composing reads, so the double
+            // fails the leaf each one reads first.
+            (
+                "held_rows_for",
+                "fold_dependents",
+                false,
+                DirectoryOp::HeldRowsFor {
+                    key: "x".into(),
+                    role: None,
+                    after: None,
+                    limit: 10,
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.held_rows_for("x", None, None, 10)
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "voice_status",
+                "get_attestation",
+                false,
+                DirectoryOp::VoiceStatus { row_id: [9u8; 32] },
+                |p| {
+                    Box::pin(async move {
+                        p.voice_status(&crate::federation::edition2::names::RowId([9u8; 32]))
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
         ];
-        assert_eq!(table.len(), 32, "I1890: one row per routed method");
+        // v62.0.0 (L1-fix3) — + `held_rows_for`, `voice_status`; with O1 fix 5's
+        // `edition2_roster_proposal` the table is 34 rows (`submit_voice` is
+        // I1894's: its first act is a parse, no leaf to fail).
+        assert_eq!(table.len(), 34, "I1890: one row per routed method");
         let mut red = Vec::new();
         for (method, fault, write, op, call) in table {
             let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -11566,6 +11917,80 @@ mod tests {
         }
     }
 
+    /// **I1894 — a second signer's voice submitted THROUGH the capsule lands
+    /// on the host** (`submit_voice`, P8-fix5, CC 2.6.1.9). Its first act is
+    /// the statement door's parse, so I1890's fault leg has no leaf to fail;
+    /// this witness drives it end to end instead:
+    ///
+    /// * a statement submitted through the proxy lands in the HOST's store
+    ///   (the key it records is live there), and the proxy's `VoiceOutcome`
+    ///   is the direct `voice_status` of that row;
+    /// * `voice_status` of that row is proxy == direct;
+    /// * a malformed statement is the host's own refusal, never
+    ///   `Unsupported` or "has no DirectoryOp".
+    fn exercise_i1894(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::names::RowId;
+        use crate::federation::edition2::second_signer_voice::VoiceOutcome;
+        let seed = format!("voice-{tag}-1894");
+        let statement = e2::key_record(&seed, &["user"]);
+        let proxy = proxy_1244(rt, dir.clone());
+        let via = rt
+            .block_on(proxy.submit_voice(&statement))
+            .expect("I1894: submit_voice routes");
+        assert!(
+            rt.block_on(dir.lookup_public_key(&e2::kid(&seed)))
+                .expect("direct lookup")
+                .is_some(),
+            "I1894: the statement landed in the host's store"
+        );
+        let hex_id = match &via {
+            VoiceOutcome::Seated { row_id } | VoiceOutcome::Waiting { row_id, .. } => {
+                row_id.clone()
+            }
+        };
+        let row_id = RowId(
+            <[u8; 32]>::try_from(hex::decode(&hex_id).expect("I1894: a hex row id"))
+                .expect("I1894: a 32-byte row id"),
+        );
+        let direct = rt
+            .block_on(dir.voice_status(&row_id))
+            .expect("direct voice_status");
+        assert_eq!(via, direct, "I1894: the proxy's outcome is the host's");
+        assert_eq!(
+            rt.block_on(proxy.voice_status(&row_id))
+                .expect("I1894: voice_status routes"),
+            direct,
+            "I1894: voice_status proxy == direct"
+        );
+        let refused = rt
+            .block_on(proxy.submit_voice(b"not a statement"))
+            .expect_err("I1894: a malformed voice is refused");
+        assert!(
+            !matches!(refused, Error::Unsupported { .. })
+                && !refused.to_string().contains("has no DirectoryOp"),
+            "I1894: the host refused it, not the proxy: {refused}"
+        );
+        let direct_refusal = rt
+            .block_on(dir.submit_voice(b"not a statement"))
+            .expect_err("direct refusal");
+        // ABI 14: a host `Backend` crosses as `Backend` carrying the host's
+        // text; any other failure as `Relayed`, whose text is the host's.
+        let crossed = match &refused {
+            Error::Backend(m) => m.clone(),
+            other => other.to_string(),
+        };
+        assert_eq!(
+            crossed,
+            direct_refusal.to_string(),
+            "I1894: the host's own refusal"
+        );
+    }
+
     /// **I1892 — an accord halt set and cleared THROUGH the capsule is the
     /// direct backend's halt.** Before v61.4.2 both writes answered
     /// `Unsupported` on the proxy.
@@ -11659,6 +12084,11 @@ mod tests {
         i1892_a_halt_set_through_the_capsule_is_held_sqlite,
         i1892_a_halt_set_through_the_capsule_is_held_pg,
         |rt, b, tag| exercise_i1892(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1894_a_voice_submitted_through_the_capsule_lands_sqlite,
+        i1894_a_voice_submitted_through_the_capsule_lands_pg,
+        |rt, b, tag| exercise_i1894(&rt, b, &tag)
     );
 
     /// **I1766 / I1767 / I1768 — the sync config reads answer the HOST's
@@ -12699,6 +13129,16 @@ mod proxy_gate {
             "`edition2::genesis::bundles_in_force` is a free fold over the held genesis \
              lineage, not a trait method",
         ),
+        (
+            "PutGenesisBundle",
+            "`edition2::genesis::put_genesis_bundle` is a free door persist runs over its own \
+             directory (Verify's reader, then one transaction); no trait method to proxy",
+        ),
+        (
+            "RebindHeldFor",
+            "`edition2::transport_rebind::rebind_held_for` is a free read over the held \
+             genesis lineage and re-bind voices, not a trait method",
+        ),
     ];
 
     /// The body of the first `{ … }` block opening at or after `at`.
@@ -13216,6 +13656,11 @@ mod edition2_ops {
         (
             "ApplyReplicatedStatement",
             "the replicated edition-2 door; the same form check runs inside put_statement",
+        ),
+        (
+            "PutGenesisBundle",
+            "the edition-2 genesis door itself; it refuses an earlier-form object (a bundle/1 \
+             JSON) by its own form check",
         ),
         (
             "PutEdgeDetectionEvent",

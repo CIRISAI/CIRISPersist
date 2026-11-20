@@ -16232,6 +16232,12 @@ fn scope_blob_symbol_from_pg_row(
 /// v45.0.0 (CIRISPersist#871, FSD §5) — what the placement gate asks: the
 /// cohort this node holds a blob under, from the blob row the write NAMED.
 impl crate::federation::renditions::HeldBlobScope for PostgresBackend {
+    // v62.0.0 (T2-fix7) — this node's own claims are told apart by its node
+    // key (the key its holding claims are signed by).
+    fn own_holder_key_id(&self) -> Option<String> {
+        crate::federation::FederationDirectory::node_key_id(self)
+    }
+
     async fn held_blob_cohort_scope(
         &self,
         sha256: &[u8; 32],
@@ -18121,6 +18127,11 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     ))
                 })?;
         }
+        // v62.0.0 (T2-fix8) — the eviction window's test seam (I3193).
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::EVICT_AFTER_RETRACT)
+            .await;
         let mut client = self
             .get_client()
             .await
@@ -18167,6 +18178,19 @@ impl crate::federation::BlobStorage for PostgresBackend {
         tx.commit().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("evict epoch commit: {e}"))
         })?;
+        // v62.0.0 (T2-fix7; E8-fix2's residual) — see the SQLite twin: the
+        // bytes left, so every row that read this node's holding of them
+        // re-folds (an own claim admitted in the window is taken out).
+        for sha_hex in &sha_hexes {
+            let Ok(sha) = <[u8; 32]>::try_from(hex::decode(sha_hex).unwrap_or_default()) else {
+                continue;
+            };
+            crate::federation::holding_claim::refold_on_blob(self, &sha)
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("evict epoch re-fold: {e}"))
+                })?;
+        }
         Ok(n)
     }
 

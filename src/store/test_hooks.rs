@@ -81,6 +81,13 @@ pub(crate) const BYTES_AFTER_TOMBSTONE_PRECHECK: &str = "bytes_after_tombstone_p
 #[allow(dead_code)]
 pub(crate) const BYTES_INSIDE_THE_WRITE: &str = "bytes_inside_the_write";
 
+/// v62.0.0 (T2-fix8; E8-fix2's residual) — the community epoch eviction
+/// pauses here, after it retracted this node's own holding claims and before
+/// its delete transaction: a witness admits a NEW own claim in that window,
+/// then resumes the eviction (I3193).
+#[allow(dead_code)]
+pub(crate) const EVICT_AFTER_RETRACT: &str = "evict_after_retract";
+
 /// The longest a paused door waits for its witness.
 pub(crate) const PAUSE_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -233,5 +240,27 @@ impl ArmBytesPause for crate::store::sqlite::SqliteBackend {
 impl ArmBytesPause for crate::store::postgres::PostgresBackend {
     fn arm_bytes_pause(&self) -> std::sync::Arc<Pause> {
         self.test_hooks().arm_pause(BYTES_AFTER_TOMBSTONE_PRECHECK)
+    }
+}
+
+/// v62.0.0 (T2-fix8) — arm the pause at [`EVICT_AFTER_RETRACT`] on whichever
+/// backend a generic witness body runs over.
+#[allow(dead_code)]
+pub(crate) trait ArmEvictPause {
+    /// Arm the one-shot pause and return its handle.
+    fn arm_evict_pause(&self) -> std::sync::Arc<Pause>;
+}
+
+#[cfg(feature = "sqlite")]
+impl ArmEvictPause for crate::store::sqlite::SqliteBackend {
+    fn arm_evict_pause(&self) -> std::sync::Arc<Pause> {
+        self.test_hooks().arm_pause(EVICT_AFTER_RETRACT)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl ArmEvictPause for crate::store::postgres::PostgresBackend {
+    fn arm_evict_pause(&self) -> std::sync::Arc<Pause> {
+        self.test_hooks().arm_pause(EVICT_AFTER_RETRACT)
     }
 }

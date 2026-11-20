@@ -173,6 +173,15 @@ pub trait HeldBlobScope {
         &self,
         sha256: &[u8; 32],
     ) -> impl std::future::Future<Output = Result<Option<super::holding_claim::ClaimScope>, Error>> + Send;
+
+    /// v62.0.0 (T2-fix7; E8's residual, BLOB_ENCRYPTION_AT_REST §11.5) —
+    /// THIS node's own key id, the holder of its own holding claims: a `here`
+    /// claim this node signs about bytes it does not hold waits
+    /// (`blob_not_held`). `None` (the default; memory and test doubles): no
+    /// own claim is told apart.
+    fn own_holder_key_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The `derived_from` digest a row's struct names, when it names one.

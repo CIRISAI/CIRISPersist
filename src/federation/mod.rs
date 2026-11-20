@@ -686,6 +686,11 @@ pub struct ConsentSweepReport {
     /// `skipped` "not a member".
     #[serde(default)]
     pub awaiting_roster: u64,
+    /// v62.0.0 (v62 P8-fix5) — crossings whose restatement is HELD for its
+    /// second signers' voices (`MeshCrossingOutcome::Held`). Like
+    /// `awaiting_actor` these wait; they are not errors.
+    #[serde(default)]
+    pub awaiting_voices: u64,
     /// Rows on which a crossing returned an error (logged via
     /// `tracing::warn!`).
     pub skipped: u64,
@@ -3937,6 +3942,55 @@ pub trait FederationDirectory: Send + Sync {
     ) -> Result<Option<edition2::fold::HeldReason>, Error> {
         let _ = row_id;
         Ok(None)
+    }
+
+    /// v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3, CC 4.4.3.19) — **the
+    /// held rows waiting for `key`'s voice**, in any role K2's resolver
+    /// (`edition2::door::resolved_second_signer_roles`) lists `key` a party
+    /// of (only `role`, when named), after `after`, at most `limit`, each
+    /// with the author's statement. Looked up by the awaited key through the
+    /// fold's recorded reads, never a scan. A default over this directory's
+    /// own reads ([`edition2::second_signer_voice::held_rows_for`]); the
+    /// directory capsule's proxy routes it as one op (`HeldRowsFor`).
+    async fn held_rows_for(
+        &self,
+        key: &str,
+        role: Option<&str>,
+        after: Option<&edition2::names::RowId>,
+        limit: u32,
+    ) -> Result<Vec<edition2::second_signer_voice::HeldRow>, Error> {
+        edition2::second_signer_voice::held_rows_for(
+            self.as_dyn_directory(),
+            key,
+            role,
+            after,
+            limit,
+        )
+        .await
+    }
+
+    /// v62.0.0 (v62 P8-fix5) — **the state of a row a voice concerns**:
+    /// `Seated`, or `Waiting` with its held reason. A default over this
+    /// directory's own reads ([`edition2::second_signer_voice::row_status`]);
+    /// the proxy routes it as one op (`VoiceStatus`), since the fold reads it
+    /// takes answer empty through the proxy.
+    async fn voice_status(
+        &self,
+        row_id: &edition2::names::RowId,
+    ) -> Result<edition2::second_signer_voice::VoiceOutcome, Error> {
+        edition2::second_signer_voice::row_status(self.as_dyn_directory(), row_id).await
+    }
+
+    /// v62.0.0 (v62 P8-fix5) — **put a second signer's voice** (a statement
+    /// signed anywhere, e.g. an assembled `voice_draft`) through the
+    /// statement door and answer the row's resulting state. A default over
+    /// this directory ([`edition2::second_signer_voice::submit_voice`]); the
+    /// proxy routes it as one op (`SubmitVoice`).
+    async fn submit_voice(
+        &self,
+        statement: &[u8],
+    ) -> Result<edition2::second_signer_voice::VoiceOutcome, Error> {
+        edition2::second_signer_voice::submit_voice(self.as_dyn_directory(), statement).await
     }
 
     /// v62.0.0 (wave G0) — the held reasons in row-id order after `after`,

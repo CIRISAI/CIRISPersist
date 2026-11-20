@@ -51,6 +51,12 @@
 //!   unchanged). The
 //!   counted re-seat keeps the seat canonical under its identity-ref, at the
 //!   new key.
+//! - I2323 (ceremony gap 4): the genesis import door crosses the capsule
+//!   (`PutGenesisBundle`): a bundle every anchored holder signed is placed; one
+//!   holder short is `genesis_bundle_count_unmet` and stores nothing; two
+//!   first bundles are a fork of the genesis (no tip, `common` null, no
+//!   canonical seat); an object-id anchor voids any other genesis
+//!   (`genesis_bundle_not_anchored`).
 
 use ciris_verify_core::cde::{self, Value};
 use ciris_verify_core::edition2::accord_halt::HaltRoster;
@@ -776,4 +782,206 @@ async fn i2322_postgres() {
         return;
     };
     Box::pin(body_named_rows(&d)).await;
+}
+
+/// One op through the capsule's wire: the op and its result each cross as
+/// serialized bytes (the C-ABI's encoding), dispatched by persist over `d`.
+async fn through_capsule(
+    d: &dyn FederationDirectory,
+    op: crate::ffi::directory_capsule::DirectoryOp,
+) -> crate::ffi::directory_capsule::DirectoryOpResult {
+    use crate::ffi::directory_capsule::{dispatch_directory_op, DirectoryOp, DirectoryOpResult};
+    let op: DirectoryOp = serde_json::from_slice(&serde_json::to_vec(&op).unwrap()).unwrap();
+    let r = dispatch_directory_op(d, op).await;
+    serde_json::from_slice::<DirectoryOpResult>(&serde_json::to_vec(&r).unwrap())
+        .unwrap()
+        .into_flattened()
+}
+
+/// A vector case's anchor on the wire.
+fn wire_anchor(c: &J) -> Option<crate::ffi::directory_capsule::GenesisAnchor> {
+    use crate::ffi::directory_capsule::GenesisAnchor;
+    anchor(c).map(|a| match a {
+        Anchor::Thumbprints(t) => GenesisAnchor::Thumbprints(t.into_iter().collect()),
+        Anchor::ObjectId(o) => GenesisAnchor::ObjectId(o),
+    })
+}
+
+/// `PutGenesisBundle` with a vector case's offer and anchor.
+async fn import_case(
+    d: &dyn FederationDirectory,
+    f: &J,
+    id: &str,
+) -> crate::ffi::directory_capsule::DirectoryOpResult {
+    let c = case(f, id);
+    through_capsule(
+        d,
+        crate::ffi::directory_capsule::DirectoryOp::PutGenesisBundle {
+            statements: offered(f, c),
+            anchor: wire_anchor(c),
+        },
+    )
+    .await
+}
+
+/// **I2323 (ceremony gap 4): the genesis import door crosses the capsule**
+/// (`PutGenesisBundle`, the op a Python or capsule host imports a genesis
+/// through), on four fresh stores:
+/// - `accepted`: a first bundle every anchored holder signed is placed; its
+///   tip is in force (and `BundlesInForce` answers it);
+/// - `missing`: the same bundle one holder short is refused
+///   `genesis_bundle_count_unmet`, and nothing is stored;
+/// - `forked`: two first bundles under one thumbprint anchor are both placed,
+///   and are a fork of the genesis: no tip is in force, the tips share
+///   nothing (`common` null), no seat is canonical;
+/// - `voided`: under an object-id anchor only that genesis roots; the other
+///   is not placed, `genesis_bundle_not_anchored`.
+///
+/// A bundle/1 JSON at the op is `earlier_form_object`.
+pub(crate) async fn body_capsule(
+    accepted: &dyn FederationDirectory,
+    missing: &dyn FederationDirectory,
+    forked: &dyn FederationDirectory,
+    voided: &dyn FederationDirectory,
+) {
+    use crate::ffi::directory_capsule::{DirectoryOp, DirectoryOpResult};
+    register_roots();
+    let f = vectors::v2();
+
+    // accepted
+    let first = case(f, "first_valid");
+    match import_case(accepted, f, "first_valid").await {
+        DirectoryOpResult::GenesisAdmission(a) => {
+            assert_eq!(a.placed.len(), 1, "I2323 accepted");
+            assert_eq!(a.placed[0].object_id, oid(first), "I2323 accepted");
+            assert!(a.not_placed.is_empty(), "I2323 accepted");
+            assert_eq!(a.tips.len(), 1, "I2323 accepted: in force");
+            assert_eq!(a.tips[0].object_id, oid(first), "I2323 accepted");
+        }
+        other => panic!("I2323 accepted: {other:?}"),
+    }
+    match through_capsule(accepted, DirectoryOp::BundlesInForce {}).await {
+        DirectoryOpResult::BundlesInForce(v) => {
+            assert_eq!(v.len(), 1, "I2323 accepted: BundlesInForce");
+            assert_eq!(v[0].object_id, oid(first), "I2323 accepted");
+        }
+        other => panic!("I2323 accepted: {other:?}"),
+    }
+    match through_capsule(
+        accepted,
+        DirectoryOp::PutGenesisBundle {
+            statements: vec![br#"{"version":4,"family_key_id":"humanity-accord"}"#.to_vec()],
+            anchor: None,
+        },
+    )
+    .await
+    {
+        DirectoryOpResult::Err(e) => assert!(
+            e.contains("earlier_form_object"),
+            "I2323: a bundle/1 JSON at the op: {e}"
+        ),
+        other => panic!("I2323 earlier form: {other:?}"),
+    }
+
+    // missing
+    match import_case(missing, f, "missing_holder_signature").await {
+        DirectoryOpResult::Err(e) => assert!(
+            e.contains(malformed_row::GENESIS_BUNDLE_COUNT_UNMET),
+            "I2323 missing: {e}"
+        ),
+        other => panic!("I2323 missing: {other:?}"),
+    }
+    assert_eq!(
+        held_voices(missing).await,
+        0,
+        "I2323 missing: nothing stored"
+    );
+    assert!(
+        !genesis_in_force(missing).await.unwrap().is_held(),
+        "I2323 missing: pre-genesis"
+    );
+
+    // forked
+    let fork = case(f, "fork_of_the_genesis");
+    assert!(
+        fork["forks"]["common"].is_null(),
+        "I2323 forked: Verify's vector says the tips share nothing"
+    );
+    match import_case(forked, f, "fork_of_the_genesis").await {
+        DirectoryOpResult::GenesisAdmission(a) => {
+            assert_eq!(a.placed.len(), 2, "I2323 forked: both first bundles placed");
+            assert!(a.tips.is_empty(), "I2323 forked: no tip is in force");
+        }
+        other => panic!("I2323 forked: {other:?}"),
+    }
+    let g = genesis_in_force(forked).await.unwrap();
+    assert!(g.common.is_none(), "I2323 forked: common null");
+    assert!(g.head.is_none(), "I2323 forked: no head");
+    assert!(
+        g.forks
+            .iter()
+            .any(|k| matches!(k, super::genesis::Fork::Genesis { bundles } if bundles.len() == 2)),
+        "I2323 forked: a fork of the genesis: {:?}",
+        g.forks
+    );
+    for p in &g.valid {
+        for s in &p.seats {
+            assert!(
+                !canonical(forked, &s.identity_ref).await,
+                "I2323 forked: no seat is canonical on a fork of the genesis"
+            );
+        }
+    }
+    match through_capsule(forked, DirectoryOp::BundlesInForce {}).await {
+        DirectoryOpResult::BundlesInForce(v) => {
+            assert!(v.is_empty(), "I2323 forked: BundlesInForce is empty");
+        }
+        other => panic!("I2323 forked: {other:?}"),
+    }
+
+    // voided
+    let void = case(f, "object_id_anchor_voids_the_other");
+    let anchored = hex32(void["anchor"]["object_id"].as_str().unwrap());
+    match import_case(voided, f, "object_id_anchor_voids_the_other").await {
+        DirectoryOpResult::GenesisAdmission(a) => {
+            assert_eq!(a.placed.len(), 1, "I2323 voided: only the anchored genesis");
+            assert_eq!(a.placed[0].object_id, anchored, "I2323 voided");
+            assert_eq!(a.not_placed.len(), 1, "I2323 voided: the other");
+            assert_ne!(a.not_placed[0].object_id, anchored, "I2323 voided");
+            assert_eq!(
+                a.not_placed[0].token,
+                malformed_row::GENESIS_BUNDLE_NOT_ANCHORED,
+                "I2323 voided"
+            );
+            assert_eq!(a.tips.len(), 1, "I2323 voided: one genesis in force");
+            assert_eq!(a.tips[0].object_id, anchored, "I2323 voided");
+        }
+        other => panic!("I2323 voided: {other:?}"),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2323_genesis_import_crosses_the_capsule_sqlite() {
+    let (a, b, c, d) = (
+        sqlite().await,
+        sqlite().await,
+        sqlite().await,
+        sqlite().await,
+    );
+    Box::pin(body_capsule(&a, &b, &c, &d)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2323_genesis_import_crosses_the_capsule_postgres() {
+    let (Some(a), Some(b), Some(c), Some(d)) = (
+        postgres().await,
+        postgres().await,
+        postgres().await,
+        postgres().await,
+    ) else {
+        return;
+    };
+    Box::pin(body_capsule(&a, &b, &c, &d)).await;
 }

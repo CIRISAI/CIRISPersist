@@ -1013,8 +1013,12 @@ where
                     // inner attempt's reads (the outer attempt is shadowed
                     // there and saw neither). fix2's record overwrote both
                     // with `count_short` and the outer reads.
+                    // G0-fix8 — nor on the trust plane: since W1-fix2 its rows
+                    // store through `voices::put_counted_row` too, which records
+                    // its own hold (reason + inner reads); this would overwrite
+                    // them with `count_short` and the outer reads.
                     StatementOutcome::Pending { row_id, .. }
-                        if plane_name != plane::ATTESTATION && !concluded_final =>
+                        if !records_itself(plane_name) && !concluded_final =>
                     {
                         super::fold::record_pending(
                             dir,
@@ -1033,7 +1037,7 @@ where
                     // statement, when it arrives, runs the door itself). Its
                     // stale hold is cleared, its reads kept.
                     StatementOutcome::Voice { row_id, .. }
-                        if was_held && plane_name != plane::ATTESTATION =>
+                        if was_held && !records_itself(plane_name) =>
                     {
                         match dir.put_fold_reason(row_id, None).await {
                             Ok(_) | Err(Error::Unsupported { .. }) => {}
@@ -1048,7 +1052,7 @@ where
                     // `voices::put_counted_row` too, which records its own.
                     StatementOutcome::Row { row_id, .. }
                     | StatementOutcome::KeyPlane { row_id, .. }
-                        if plane_name != plane::ATTESTATION && plane_name != plane::TRUST =>
+                        if !records_itself(plane_name) =>
                     {
                         super::fold::record(
                             dir,
@@ -1112,6 +1116,14 @@ where
         Ok(out)
     })
     .await
+}
+
+/// G0-fix8 — the planes whose door is `voices::put_counted_row`, which
+/// records its own fold state (reason and inner reads): the attestation tail
+/// and, since W1-fix2, the trust plane. `put_admitted_row`'s bookkeeping
+/// never writes over them.
+fn records_itself(plane_name: &str) -> bool {
+    plane_name == super::fold::plane::ATTESTATION || plane_name == super::fold::plane::TRUST
 }
 
 /// The key a key-plane statement is about: a record's own key, a

@@ -142,6 +142,14 @@ where
     };
     let rid = rid.hex();
     let Some(row) = dir.get_attestation(&rid).await? else {
+        // v62.0.0 (K2-fix6; CC 2.6.1.9, CC 2.7.3) — an authored row whose
+        // family names second signers and that has no typed row is HELD for
+        // a second signer's voice: kept, not served. The second signer gets
+        // the payload from the producer's draft, never from the serve feed;
+        // once the row lands its voices follow the row.
+        if !super::door::second_signer_roles(statement).is_empty() {
+            return Ok(false);
+        }
         // v62.0.0 (wave T1) — no attestation row: judged from the statement.
         if dir
             .purge_tombstoned("attestation", &rid)

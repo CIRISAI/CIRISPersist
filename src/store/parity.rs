@@ -960,6 +960,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // binding is counted (owner, bound key, affiliation quorum); at the
     // edition-2 door it waits (`Pending`).
     ("check_owner_binding_counted", Class::Gate),
+    // v62.0.0 (K2-fix4, I3545) — the generic second-signer hold.
+    ("check_second_signers_voiced", Class::Gate),
     // v62.0.0 (wave V1b, CC 4.4.3.12) — an affiliation's counted officer
     // appointment; at the edition-2 door it waits (`Pending`).
     ("check_officer_appointment_counted", Class::Gate),
@@ -1537,6 +1539,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // holding-claim retractions, through the shared withdraws helper; a
     // refused one aborts the eviction (I18).
     ("retract_own_claims", Class::Delegates),
+    // v62.0.0 (T2-fix7) — the bytes plane's touch after the bytes land or
+    // leave (an epoch eviction, the edition-2 blob door): re-folds the rows
+    // that read this node's holding of the blob. It refuses nothing about the
+    // caller; it fails only on the substrate's own terms (a fold read/write).
+    ("refold_on_blob", Class::Plumbing),
     // v55.0.0 (CIRISPersist#989) — sqlite: the holding claim's INSERT inside
     // the caller's transaction. Storage, as `insert_holding_claim_tx`.
     ("sqlite_insert_holding_claim", Class::Plumbing),

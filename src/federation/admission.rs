@@ -3614,9 +3614,11 @@ pub async fn check_promotion_admission(
     // is cosigned under its protocol; the roster is directory state that can
     // have changed since the local write.
     check_owner_binding_affiliation_admission(directory, row).await?;
-    // v62.0.0 (wave V1b) — an edition-2 owner binding is counted: the
-    // owner's, the bound key's and (naming one) the affiliation's voices.
+    // v62.0.0 (wave V1b) — an edition-2 owner binding naming an affiliation
+    // is counted over its quorum. v62.0.0 (K2-fix4) — every family's second
+    // signers (the bound key's voice among them) are the generic gate's.
     check_owner_binding_counted(directory, row).await?;
+    check_second_signers_voiced(directory, row).await?;
     // v62.0.0 (wave V1b, CC 4.4.3.12) — a counted officer appointment waits
     // for the affiliation's quorum at the head it names.
     check_officer_appointment_counted(directory, row).await?;
@@ -14423,10 +14425,12 @@ pub const OWNER_BINDING_COUNTED_SHORT: &str = "owner_binding_counted_short";
 /// carries and the one the door is offering now):
 ///
 /// 1. the owner's own statement (the payload's `author`, one person: the
-///    steward);
+///    steward) — the row's carried voice;
 /// 2. the bound key's own statement (the `ownership:*` family's
 ///    `bound_node` role: RULINGS "with the node's own statement as the
-///    second voice");
+///    second voice") — v62.0.0 (K2-fix4) counted by the generic
+///    [`check_second_signers_voiced`], which reads the role from the family
+///    model;
 /// 3. where the binding names an affiliation (`community_id` or an alias,
 ///    [`envelope_cohort_target`]; not a node's group-audience re-signing,
 ///    `binding_is_group_audience`): the affiliation members' voices counted
@@ -14463,22 +14467,17 @@ pub async fn check_owner_binding_counted(
     {
         return Ok(());
     }
-    let voices = super::edition2::voices::row_voice_issuers(directory, row).await?;
+    // v62.0.0 (K2-fix4, I3545) — the owner's own statement is the row's
+    // carried voice, and the bound key's voice is the `ownership:*` family's
+    // `bound_node` second signer: both are the generic gate's
+    // ([`check_second_signers_voiced`]). This gate keeps the leg only it can
+    // count: the affiliation's quorum at the head the binding names.
     let owner = row
         .attestation_envelope
         .get("author")
         .and_then(serde_json::Value::as_str)
         .unwrap_or(row.attesting_key_id.as_str());
     let mut short: Vec<String> = Vec::new();
-    if !voices.contains(owner) {
-        short.push(format!("the owner {owner}'s own statement"));
-    }
-    if !voices.contains(&row.attested_key_id) {
-        short.push(format!(
-            "the bound key {}'s own statement",
-            row.attested_key_id
-        ));
-    }
     if !binding_is_group_audience(row) {
         if let Some(named) = envelope_cohort_target(&row.attestation_envelope)? {
             let refuse = |reason: &'static str, detail: String| {
@@ -14527,6 +14526,106 @@ pub async fn check_owner_binding_counted(
         "{OWNER_BINDING_COUNTED_SHORT}: owner-binding {} over {} waits for {} (CC 3.2, C557)",
         row.attestation_id,
         row.attested_key_id,
+        short.join("; ")
+    )))
+}
+
+/// v62.0.0 (K2-fix4, I3545; CC 2.7.3 as the lead ruled it; CC 2.7.5 "a seat
+/// is two consents"; CC 2.6.1.9) — **an authored row whose family names a
+/// second signer is held until every named role has voiced.** The roles are
+/// the family model's, read from the row's own statement
+/// ([`door::second_signer_roles`](super::edition2::door::second_signer_roles):
+/// Verify's vendored `family_authorship.json` through
+/// `WithVendored(&PersistCells)`, with the row's leaf), never a per-family
+/// list here. A role is filled when one of its parties is among the row's
+/// voices ([`row_voice_issuers`](super::edition2::voices::row_voice_issuers):
+/// the held ones, the carried one, the one the door is offering now).
+///
+/// v62.0.0 (K2-fix6, CC ruled A: CC 2.6.1.9 P2:1147) — the roles are read
+/// under the act selector (own act: `self:delegates_to`'s `delegate` and,
+/// for a MACHINE sub, `delegate_owner`, the owner its live owner binding
+/// names; group act: none). The author's own statement is required too, so a
+/// row projected from a second signer's voice alone never lands. A short row
+/// is KEPT (its voice stays in `ceg_statements`), concludes nothing, writes
+/// no typed row, and is not served (`edition2::serve`).
+///
+/// Short of a role: the shortfall is noted
+/// ([`note_short`](super::edition2::voices::note_short), core reason
+/// `count_short`), so at the statement door the voice is kept and the row is
+/// `Pending`, re-folded when the missing voice arrives; outside a fold
+/// attempt (`put_attestation` of a carried statement) the refusal stands. A
+/// no-op for a row that carries no statement (the earlier form) and for a
+/// row whose family names no second signer.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] prefixed `count_short` (core `fold::reason`
+/// spelling); directory reads.
+pub async fn check_second_signers_voiced(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(st) = row
+        .attestation_envelope
+        .get(super::edition2::ingest::STATEMENT_MEMBER)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|h| hex::decode(h).ok())
+    else {
+        return Ok(());
+    };
+    // v62.0.0 (K2-fix6) — the ONE answer to who must voice this row, every
+    // party resolved (`owner_of_sub` from the live owner binding).
+    let roles = super::edition2::door::resolved_second_signer_roles(directory, &st).await?;
+    if roles.is_empty() {
+        return Ok(());
+    }
+    let voices = super::edition2::voices::row_voice_issuers(directory, row).await?;
+    let mut short: Vec<String> = Vec::new();
+    // The author's own statement first: a row projected from a second
+    // signer's voice alone (its author's not held here) waits for its
+    // author, never lands on the second signer.
+    if let Some(author) = row
+        .attestation_envelope
+        .get("author")
+        .and_then(serde_json::Value::as_str)
+    {
+        if !voices.contains(author) {
+            short.push(format!("the author {author}'s own statement"));
+        }
+    }
+    for r in &roles {
+        use super::edition2::door::SecondSignerParty;
+        let keys: Vec<&str> = r
+            .parties
+            .iter()
+            .filter_map(|p| match p {
+                SecondSignerParty::Key(k) => Some(k.as_str()),
+                SecondSignerParty::OwnerOf(_) => None,
+            })
+            .collect();
+        if keys.iter().any(|k| voices.contains(*k)) {
+            continue;
+        }
+        short.push(if keys.is_empty() {
+            format!(
+                "the {} voice (no party can fill it: an unowned machine sub, or a member the \
+                 row does not name)",
+                r.role
+            )
+        } else {
+            format!("the {} voice of {}", r.role, keys.join(" or "))
+        });
+    }
+    if short.is_empty() {
+        return Ok(());
+    }
+    let family = super::edition2::emit::family_of_statement(&st)
+        .map(|(f, _)| f)
+        .unwrap_or_default();
+    super::edition2::voices::note_short();
+    Err(Error::InvalidArgument(format!(
+        "{}: row {} of {family} waits for {} (CC 2.7.3, CC 2.7.5)",
+        super::edition2::fold::reason::COUNT_SHORT,
+        row.attestation_id,
         short.join("; ")
     )))
 }
@@ -27231,11 +27330,71 @@ pub(crate) mod steward_liveness_test_support {
     /// statement under its TARGET's family (a target this node does not
     /// hold, or none, falls back to `self:delegates_to` and the door judges
     /// it); any other literal as its signer's statement.
+    /// v62 (E4 round 3, fix3; CC 2.6.1.9, K2-fix6) — an OWN-act
+    /// `self:delegates_to` waits for the delegate's voice (and, for a
+    /// machine-key delegate, its owner's): such a row lands through E0's
+    /// `land_delegation` (K2's `land_with_voices`), which also exempts a
+    /// group-act appointment. An owner-binding lands through K2's
+    /// `land_owner_binding` (the bound key's voice; fix4). `None` for any
+    /// other row. The returned row is the sealed one, under its row id.
+    async fn land_if_delegation(
+        dir: &dyn FederationDirectory,
+        row: &Attestation,
+    ) -> Result<Option<Attestation>, Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        let owner_binding = row
+            .attestation_envelope
+            .get("delegation_purpose")
+            .and_then(serde_json::Value::as_str)
+            == Some(crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE);
+        if row.attestation_type != attestation_type::DELEGATES_TO {
+            return Ok(None);
+        }
+        if !owner_binding
+            && e2::family_of(row) != crate::federation::edition2::emit::DELEGATES_TO_FAMILY
+        {
+            return Ok(None);
+        }
+        let sealed = if e2::carried_statement(row).is_some() {
+            row.clone()
+        } else {
+            e2::try_row_of(row, &row.attesting_key_id)?
+        };
+        if owner_binding {
+            // v62 (fix4; K2, C557): an owner binding counts the bound key's
+            // voice too.
+            e2::land_owner_binding(dir, &sealed, &row.attested_key_id).await?;
+        } else {
+            e2::land_delegation(dir, &sealed).await?;
+        }
+        Ok(Some(sealed))
+    }
+
+    /// v62 (E4 round 3, fix4; CC 4.4.3.19) — a machine-key delegate's OWNER
+    /// is a required voice on a delegation to it, so a node or agent
+    /// delegate seats only once its owner is bound. `owner_seed` binds
+    /// `node_seed` (K2's builder and helper, the node's voice included).
+    pub(crate) async fn bind_machine_owner(
+        dir: &dyn FederationDirectory,
+        owner_seed: &str,
+        node_seed: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        let binding =
+            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner_seed, node_seed);
+        ts::put_sealed_owner_binding(dir, &binding, node_seed)
+            .await
+            .unwrap_or_else(|e| panic!("the owner binding of {node_seed} lands: {e}"));
+    }
+
     pub(crate) async fn store(
         dir: &dyn FederationDirectory,
         row: &Attestation,
     ) -> Result<(), Error> {
         use crate::federation::edition2::fixture_switch as e2;
+        if land_if_delegation(dir, row).await?.is_some() {
+            return Ok(());
+        }
         if e2::carried_statement(row).is_some() {
             return e2::put_signed(dir, row).await.map(|_| ());
         }
@@ -27278,6 +27437,9 @@ pub(crate) mod steward_liveness_test_support {
         } else {
             row.tier.as_str()
         };
+        if let Some(sealed) = land_if_delegation(dir, row).await? {
+            return Ok(sealed);
+        }
         if let Some(st) = e2::carried_statement(row) {
             e2::put_signed(dir, row).await?;
             return e2::try_row_of_statement(&st, tier);
@@ -27290,15 +27452,7 @@ pub(crate) mod steward_liveness_test_support {
         ]
         .contains(&row.attestation_type.as_str());
         if !composer {
-            let stored = e2::try_put_row(dir, row, &seed).await?;
-            // v62 (E4 round 3; K2-fix4, CC 2.7.3): a `delegates_to` waits for
-            // the delegate's voice (the family's second signer, `sub`).
-            if row.attestation_type == attestation_type::DELEGATES_TO {
-                if let Some(st) = e2::carried_statement(&stored) {
-                    e2::put_statement(dir, &e2::voice_of(&st, &row.attested_key_id)).await?;
-                }
-            }
-            return Ok(stored);
+            return e2::try_put_row(dir, row, &seed).await;
         }
         let target = match row
             .attestation_envelope
@@ -27361,13 +27515,42 @@ pub(crate) mod steward_liveness_test_support {
         use crate::federation::edition2::fixture_switch as e2;
         let granter = e2::kid(&format!("sb-granter-{suffix}"));
         let node = e2::kid(&format!("sb-node-{suffix}"));
+        // v62 (E4 round 3, fix4; CC 4.4.3.19): the nodes' owner. Its binding
+        // is itself a steward anchor, so the edge's legs below ask whether the
+        // GRANTER is an anchor, not whether the anchor set is empty.
+        let owner_s = format!("sb-owner-{suffix}");
+        let owner = e2::kid(&owner_s);
 
         register(dir, &granter, &[identity_type::USER]).await;
         register(dir, &node, &[identity_type::NODE]).await;
+        register(dir, &owner, &[identity_type::USER]).await;
+        for n in ["sb-node2", "sb-node3"] {
+            register(
+                dir,
+                &e2::kid(&format!("{n}-{suffix}")),
+                &[identity_type::NODE],
+            )
+            .await;
+        }
 
         // A node with no incoming edge is not steward-bound (clauses 1/2 never
         // fire for a node key).
         assert_biconditional(dir, &node, false, "no edges").await;
+
+        // ── no owner bound: the delegation is HELD (CC 4.4.3.19) ──────────
+        let held_edge = delegates_to(
+            &granter,
+            &node,
+            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+            &[&node],
+        );
+        store_row(dir, &held_edge)
+            .await
+            .expect("the delegation is kept, held for the owner's voice");
+        assert_biconditional(dir, &node, false, "delegation held: no owner bound").await;
+        bind_machine_owner(dir, &owner_s, &format!("sb-node-{suffix}")).await;
+        bind_machine_owner(dir, &owner_s, &format!("sb-node2-{suffix}")).await;
+        bind_machine_owner(dir, &owner_s, &format!("sb-node3-{suffix}")).await;
 
         // ── the live delegation ──────────────────────────────────────────
         // rc3-conformant: the binding NAMES the key it is about in
@@ -27382,9 +27565,11 @@ pub(crate) mod steward_liveness_test_support {
         );
         let edge = store_row(dir, &edge).await.expect("delegates_to admitted");
         assert_biconditional(dir, &node, true, "live edge").await;
-        assert_eq!(
-            steward_bindings_of(dir, &node).await.expect("anchors"),
-            vec![granter.clone()],
+        assert!(
+            steward_bindings_of(dir, &node)
+                .await
+                .expect("anchors")
+                .contains(&granter),
             "the live edge's granter is the node's steward anchor"
         );
 
@@ -27410,12 +27595,14 @@ pub(crate) mod steward_liveness_test_support {
         );
 
         // THE DEFECT (#584): the edge is dead, so nothing it conferred survives.
-        assert_biconditional(dir, &node, false, "subject-revoked edge").await;
+        // v62 (fix4): the owner's binding still anchors the node; the dead
+        // edge's granter does not.
+        assert_biconditional(dir, &node, true, "subject-revoked edge (owner stays)").await;
         assert!(
-            steward_bindings_of(dir, &node)
+            !steward_bindings_of(dir, &node)
                 .await
                 .expect("anchors")
-                .is_empty(),
+                .contains(&granter),
             "a delegates_to retracted by an admitted withdraws its granter never issued must NOT \
              confer stewardship — CIRISPersist#584, the second site of the fold CIRISPersist#578 \
              repaired in live_owner_binding_granters"
@@ -27437,18 +27624,22 @@ pub(crate) mod steward_liveness_test_support {
         // "subsumed". (It is not subsumed — the two clauses read different
         // rows.)
         let node2 = e2::kid(&format!("sb-node2-{suffix}"));
-        register(dir, &node2, &[identity_type::NODE]).await;
         let edge2 = delegates_to(&granter, &node2, &[ds::INFRA_SERVE], &[]);
         store(dir, &edge2).await.expect("second edge admitted");
         assert_biconditional(dir, &node2, true, "second live edge").await;
         store(dir, &bare_edge_retraction(&granter, &node2))
             .await
             .expect("the granter's own edge-retraction lands");
-        assert_biconditional(dir, &node2, false, "granter-retracted edge").await;
+        assert!(
+            !steward_bindings_of(dir, &node2)
+                .await
+                .expect("anchors")
+                .contains(&granter),
+            "granter-retracted edge: the granter is no anchor (the owner stays)"
+        );
 
         // ── an unrelated withdraws does not kill a live edge ─────────────
         let node3 = e2::kid(&format!("sb-node3-{suffix}"));
-        register(dir, &node3, &[identity_type::NODE]).await;
         let edge3 = delegates_to(&granter, &node3, &[ds::INFRA_SERVE], &[&node3]);
         store(dir, &edge3).await.expect("third edge admitted");
         // v62 (E4, wave 4): an edition-2 composer whose target is not held
@@ -27457,9 +27648,11 @@ pub(crate) mod steward_liveness_test_support {
         let decoy = withdraws_of(&node3, &node3, &"ab".repeat(32));
         let _ = store(dir, &decoy).await;
         assert_biconditional(dir, &node3, true, "unrelated withdraws").await;
-        assert_eq!(
-            steward_bindings_of(dir, &node3).await.expect("anchors"),
-            vec![granter.clone()],
+        assert!(
+            steward_bindings_of(dir, &node3)
+                .await
+                .expect("anchors")
+                .contains(&granter),
             "a withdraws that references some OTHER attestation must not fold this edge away"
         );
 
@@ -27504,6 +27697,11 @@ pub(crate) mod steward_liveness_test_support {
             &[&agent],
         );
         store(dir, &custody).await.expect("custody edge admitted");
+        // v62 (fix4; CC 4.4.3.19): the conferral was held for the agent's
+        // owner's voice; with the custodian bound it is re-offered and seats.
+        store(dir, &conferral)
+            .await
+            .expect("the conferral seats once the agent's owner is bound");
         assert_biconditional(dir, &agent, true, "custody + conferral").await;
         assert_eq!(
             steward_bindings_of(dir, &agent).await.expect("anchors"),
@@ -28834,6 +29032,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
 /// does not collide with a prior one.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod ungated_doors_test_support {
+    use super::steward_liveness_test_support::bind_machine_owner;
     use super::*;
     use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
     use crate::federation::{Attestation, FederationDirectory};
@@ -29210,9 +29409,34 @@ pub(crate) mod ungated_doors_test_support {
         edge.attestation_envelope = serde_json::json!({
             "scope": DELEGATION_SCOPE_CONSENT_REVOCATION,
         });
-        let edge = e2::try_put_row(dir, &edge, &granter)
+        // v62 (E4 round 3, fix4; CC 4.4.3.19): the recipient is an AGENT, a
+        // machine key, so its OWNER is a required voice on the delegation.
+        // Negative leg: with no owner bound the edge is held and confers
+        // nothing. Then the owner is bound and the edge seats.
+        let edge = e2::try_row_of(&edge, &granter).expect("the delegation edge seals");
+        let (out, _unvoiced) = e2::land_delegation(dir, &edge)
             .await
-            .expect("the delegation edge lands");
+            .expect("the delegation is kept");
+        assert!(
+            matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+            ),
+            "no owner bound: the delegation to an agent waits for its owner's voice: {out:?}"
+        );
+        assert!(
+            !live_delegation_granters(dir, &recipient, DelegationEdgeFilter::AnyDelegation)
+                .await
+                .expect("granters")
+                .contains(&granter),
+            "a held delegation confers nothing"
+        );
+        let owner_s = format!("aw-owner-{suffix}");
+        register(dir, &e2::kid(&owner_s), identity_type::USER).await;
+        bind_machine_owner(dir, &owner_s, &format!("aw-recipient-{suffix}")).await;
+        e2::land_delegation(dir, &edge)
+            .await
+            .expect("the delegation edge lands once the agent's owner is bound");
 
         // A foreign `withdraws` of the held edge: kept or refused, it must
         // not sever.

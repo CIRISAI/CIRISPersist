@@ -538,6 +538,28 @@ where
     // held.
     let want = match backend.held_claim_scope(&sha).await {
         Ok(Some(w)) => w,
+        // v62.0.0 (T2-fix7; E8-fix2's residual, BLOB_ENCRYPTION_AT_REST
+        // §11.5 / I28) — THIS node's own `here` claim about bytes it does not
+        // hold (an eviction committed between the announce and the claim, or
+        // the bytes are gone) WAITS, `blob_not_held`, reading the blob
+        // (above): it concludes when the bytes land, and a claim that
+        // concluded before an eviction is re-folded by the eviction's touch
+        // (`refold_on_blob`) and taken out. Another holder's claim about
+        // bytes this node does not hold is not judged here.
+        Ok(None)
+            if ack.state == CustodyState::Here
+                && backend.own_holder_key_id().as_deref()
+                    == Some(row.attesting_key_id.as_str()) =>
+        {
+            return Err(super::edition2::fold::hold(
+                super::edition2::fold::reason::BLOB_NOT_HELD,
+                Error::InvalidArgument(format!(
+                    "blob_not_held: this node's own holding claim says `here` about {}, which it \
+                     does not hold (BLOB_ENCRYPTION_AT_REST §11.5: a claim names bytes held)",
+                    ack.blob_sha256_hex
+                )),
+            ));
+        }
         Ok(None) => return Ok(()),
         Err(Error::InvalidArgument(m)) if m.contains(HOLDING_CLAIM_SCOPE_UNRESOLVED) => {
             return Ok(())

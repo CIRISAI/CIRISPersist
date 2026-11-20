@@ -740,6 +740,31 @@ impl Engine {
         crate::federation::edition2::genesis::genesis_in_force(dir.as_ref()).await
     }
 
+    /// v62.0.0 (ceremony gap 2; CC 3.3.6.2, CC 3.4.7) — **the counted
+    /// re-bind live for a seat**, the edition-2 answer to a pre-roll gate:
+    /// the re-bind whose `transit_xwing_pubkey` is the seat's live key, or
+    /// `None` (no bundle held, not a seat of the bundle in force, no re-bind
+    /// counted, or every counted one left behind by a re-seat). See
+    /// [`rebind_held_for`](crate::federation::edition2::transport_rebind::rebind_held_for).
+    ///
+    /// # Errors
+    /// Directory read failures.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rebind_held_for(
+        &self,
+        seat_identity_ref: &str,
+    ) -> Result<
+        Option<crate::federation::edition2::transport_rebind::HeldRebind>,
+        crate::federation::Error,
+    > {
+        let dir = self.federation_directory();
+        crate::federation::edition2::transport_rebind::rebind_held_for(
+            dir.as_ref(),
+            seat_identity_ref,
+        )
+        .await
+    }
+
     /// Variant accepting raw signer Arcs — matches the issue's
     /// `Engine::with_signer_arcs(classical, pqc, dsn)` shape from
     /// CIRISPersist#43.
@@ -4274,6 +4299,11 @@ impl Engine {
                 report.awaiting_actor += 1;
                 false
             }
+            // v62.0.0 (v62 P8-fix5) — held for its second signers: not yet.
+            Ok(MeshCrossingOutcome::Held { .. }) => {
+                report.awaiting_voices += 1;
+                false
+            }
             Err(e) => {
                 tracing::warn!(attestation_id = %row.attestation_id, error = %e,
                     "promote_consented_backlog: enter_mesh failed; skipping");
@@ -4341,6 +4371,8 @@ impl Engine {
             Ok(MeshCrossingOutcome::AlreadyWidened { .. })
             | Ok(MeshCrossingOutcome::AlreadyInMesh { .. }) => {}
             Ok(MeshCrossingOutcome::AwaitingActor { .. }) => report.awaiting_actor += 1,
+            // v62.0.0 (v62 P8-fix5) — held for its second signers: not yet.
+            Ok(MeshCrossingOutcome::Held { .. }) => report.awaiting_voices += 1,
             // v47.0.0 (CIRISPersist#797) — the room's roster has not arrived:
             // wait for it, and do not log "not a member" for a room this node
             // simply has not received yet.
@@ -4850,6 +4882,217 @@ impl Engine {
             crate::federation::admission::DelegationTermBounds::default(),
         )
         .await
+    }
+
+    /// v62.0.0 (v62 P8-fix4/fix5; CC 2.6.1.9, CC 2.7.3) —
+    /// [`Self::grant_delegation`] with the row's STATE: `Seated` when it
+    /// landed, `Waiting` (HTTP 424 on a host surface; reason `count_short`)
+    /// while it is held for its second signers (the delegate, and for a
+    /// machine delegate its owner). A held delegation is not an error: each
+    /// second signer finds it with [`Self::held_rows_for`] and voices it with
+    /// [`Self::voice_held_row`] (or signs [`Self::voice_draft`] and submits it
+    /// through [`Self::submit_voice`]).
+    ///
+    /// # Errors
+    /// As [`Self::grant_delegation`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn grant_delegation_outcome(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        delegate_key_id: &str,
+        scopes: Vec<String>,
+        sub_delegation: bool,
+        delegation_purpose: Option<&str>,
+        term: crate::federation::admission::DelegationTermBounds,
+    ) -> Result<
+        crate::federation::edition2::second_signer_voice::VoiceOutcome,
+        crate::federation::Error,
+    > {
+        let id = self
+            .grant_delegation(
+                signer,
+                delegate_key_id,
+                scopes,
+                sub_delegation,
+                delegation_purpose,
+                term,
+            )
+            .await?;
+        self.voice_status(&id).await
+    }
+
+    /// v62.0.0 (v62 P8-fix4/fix5) — [`Self::steward_bind`] with the row's
+    /// state ([`Self::grant_delegation_outcome`]): for an agent, `Waiting`
+    /// until the agent and the agent's owner have voiced it.
+    ///
+    /// # Errors
+    /// As [`Self::steward_bind`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn steward_bind_outcome(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        node_or_agent_key_id: &str,
+        infra_scopes: Vec<String>,
+        delegation_purpose: Option<&str>,
+    ) -> Result<
+        crate::federation::edition2::second_signer_voice::VoiceOutcome,
+        crate::federation::Error,
+    > {
+        let id = self
+            .steward_bind(
+                signer,
+                node_or_agent_key_id,
+                infra_scopes,
+                delegation_purpose,
+            )
+            .await?;
+        self.voice_status(&id).await
+    }
+
+    /// The row id (64 hex) a voice surface names, as a [`RowId`].
+    ///
+    /// [`RowId`]: crate::federation::edition2::names::RowId
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn voice_row_id(
+        row_id_hex: &str,
+    ) -> Result<crate::federation::edition2::names::RowId, crate::federation::Error> {
+        crate::federation::edition2::store::id_of_hex(row_id_hex)
+            .map(crate::federation::edition2::names::RowId)
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "second-signer voice: {row_id_hex:?} is not an edition-2 row id (64 lowercase hex)"
+                ))
+            })
+    }
+
+    /// v62.0.0 (v62 P8-fix5) — **the state of a row a voice concerns**:
+    /// `Seated`, or `Waiting` with its held reason
+    /// ([`crate::federation::FederationDirectory::voice_status`]).
+    ///
+    /// # Errors
+    /// A row id that is not 64 hex; directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn voice_status(
+        &self,
+        row_id_hex: &str,
+    ) -> Result<
+        crate::federation::edition2::second_signer_voice::VoiceOutcome,
+        crate::federation::Error,
+    > {
+        let rid = Self::voice_row_id(row_id_hex)?;
+        self.federation_directory().voice_status(&rid).await
+    }
+
+    /// v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3, CC 4.4.3.19) — **the
+    /// held rows waiting for `key`'s voice** (this engine's own key when
+    /// `None`), in every second-signer role K2's resolver lists it a party of
+    /// (only `role`, when named): a delegation's `delegate` or
+    /// `delegate_owner`, an owner binding's `bound_node`, a retirement's
+    /// `custodian`, a trust conferral's `delegate`, .... Each entry is
+    /// `(row, role, statement)` with the author and held reason. Looked up by
+    /// the awaited key, never a scan. Page with `after` = the last row id
+    /// read.
+    ///
+    /// # Errors
+    /// A row id that is not 64 hex; no own key; directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn held_rows_for(
+        &self,
+        key: Option<&str>,
+        role: Option<&str>,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<
+        Vec<crate::federation::edition2::second_signer_voice::HeldRow>,
+        crate::federation::Error,
+    > {
+        let key = match key {
+            Some(v) => v.to_owned(),
+            None => self.local_derived_key_id().await.map_err(|e| {
+                crate::federation::Error::Backend(format!("held_rows_for: own key: {e}"))
+            })?,
+        };
+        let after = after.map(Self::voice_row_id).transpose()?;
+        self.federation_directory()
+            .held_rows_for(&key, role, after.as_ref(), limit)
+            .await
+    }
+
+    /// v62.0.0 (v62 P8-fix5; CC 2.6.1.9) — **voice a held row**: `signer`
+    /// (this engine's composite signer when `None`) signs its own statement
+    /// over the author's payload and puts it through the statement door; the
+    /// row's resulting state. Whether the voice fills a role is the door's.
+    ///
+    /// # Errors
+    /// `composite_signing_unavailable`; no statement of the row held; the
+    /// door's refusals.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn voice_held_row(
+        &self,
+        row_id_hex: &str,
+        signer: Option<&crate::signing::LocalSigner>,
+    ) -> Result<
+        crate::federation::edition2::second_signer_voice::VoiceOutcome,
+        crate::federation::Error,
+    > {
+        let rid = Self::voice_row_id(row_id_hex)?;
+        let signer = match signer {
+            Some(s) => s,
+            None => self.composite_signer("voice_held_row")?,
+        };
+        crate::federation::edition2::second_signer_voice::voice_held_row(
+            &*self.federation_directory(),
+            signer,
+            &rid,
+        )
+        .await
+    }
+
+    /// v62.0.0 (v62 P8-fix5) — **a held row's voice, drafted** for a hardware
+    /// or remote signer whose identity-ref is `signer_iss` (the
+    /// `self_at_login` draft shape): sign `sig_structure`, then submit
+    /// `Draft::assemble(signature)` with [`Self::submit_voice`]. A host with
+    /// only a [`crate::federation::edition2::second_signer_voice::HeldRow`] drafts from its `statement` with
+    /// [`crate::federation::edition2::second_signer_voice::voice_draft`].
+    ///
+    /// # Errors
+    /// No statement of the row held; `signer_iss` not an identity-ref.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn voice_draft(
+        &self,
+        row_id_hex: &str,
+        signer_iss: &str,
+    ) -> Result<crate::federation::edition2::emit::Draft, crate::federation::Error> {
+        let rid = Self::voice_row_id(row_id_hex)?;
+        let st = crate::federation::edition2::second_signer_voice::held_statement(
+            &*self.federation_directory(),
+            &rid,
+        )
+        .await?
+        .ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "voice_draft: no statement of row {row_id_hex} is held"
+            ))
+        })?;
+        crate::federation::edition2::second_signer_voice::voice_draft(&st, signer_iss)
+    }
+
+    /// v62.0.0 (v62 P8-fix5) — **submit a second signer's voice signed
+    /// elsewhere** (an assembled [`Self::voice_draft`]) through the statement
+    /// door; the row's resulting state
+    /// ([`crate::federation::FederationDirectory::submit_voice`]).
+    ///
+    /// # Errors
+    /// The door's refusals.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn submit_voice(
+        &self,
+        statement: &[u8],
+    ) -> Result<
+        crate::federation::edition2::second_signer_voice::VoiceOutcome,
+        crate::federation::Error,
+    > {
+        self.federation_directory().submit_voice(statement).await
     }
 
     /// v16.0.0 (CIRISPersist#433, CC 3.4.12) — the **adult-incapacity

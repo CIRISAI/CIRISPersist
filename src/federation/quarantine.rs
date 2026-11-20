@@ -1502,7 +1502,9 @@ pub(crate) mod test_support {
             (&deputy_mod, DELEGATION_SCOPE_MODERATE),
             (&deputy_slash, DELEGATION_SCOPE_SLASH),
         ] {
-            e2::put_signed(
+            // v62 (E3b-fix4; CC 2.6.1.9, E0.api v1.15): the own-act
+            // delegation lands with the delegate's voice.
+            e2::land_delegation(
                 dir,
                 &delegation_row(&founder, &e2::kid(deputy), &[scope], Utc::now()),
             )

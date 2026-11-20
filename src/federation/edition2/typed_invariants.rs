@@ -80,6 +80,12 @@
 //!   reaps the bytes that call stored: a refused claim leaves no bytes.
 //! - **I3181** the reap is conditional (one transaction): a blob a `here`
 //!   claim names is kept; unclaimed local bytes are reaped.
+//! - **I3192** this node's own `here` claim about bytes it does not hold
+//!   waits (`blob_not_held`) and concludes when the bytes land; another
+//!   holder's claim is not judged by this node's holding.
+//! - **I3193** the eviction window: an own claim admitted between the
+//!   eviction's retraction and its commit is taken out by the eviction's
+//!   re-fold (held `blob_not_held`).
 //! - **I3172** a `trust:accepts:v1` edge projects into the v1.3 trust plane
 //!   (`lookup_trust`): `trusted_by` = its granter, `Direct`, `valid_until`
 //!   as `expires_at`, and `trust_type` DERIVED `temporary`.
@@ -1070,6 +1076,171 @@ async fn key_grant_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) {
     );
 }
 
+/// I3192 (T2-fix7; E8-fix2's residual, BLOB_ENCRYPTION_AT_REST §11.5) —
+/// THIS node's own `here` claim about bytes it does not hold WAITS
+/// (`Pending`, kept, held `blob_not_held`, no attestation row); when the
+/// bytes land (the edition-2 blob door, whose store touches the blob) it
+/// concludes. Another holder's claim about bytes this node does not hold is
+/// not judged by this node's holding (it lands).
+async fn own_claim_body<B>(d: &B, node: &K)
+where
+    B: FederationDirectory + BlobStorage + crate::federation::blob_admit::BlobWriteStore + Sync,
+{
+    use sha2::Digest as _;
+    let other = key(251);
+    register(d, &[node, &other]).await;
+    let (ni, oi) = (iref(node), iref(&other));
+    let bytes = b"t2 own claim, bytes not held yet".to_vec();
+    let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+    let size = bytes.len() as u64;
+    let claim = |k: &K, kid: &str, at: u64| {
+        sign(
+            k,
+            kid,
+            CUSTODY_PREFIX,
+            &custody_payload(
+                kid,
+                &sha,
+                CustodyState::Here,
+                Some(size),
+                "federation",
+                None,
+                at,
+            )
+            .unwrap(),
+        )
+    };
+    let t = now_ms() - 10_000;
+    let early = claim(node, &ni, t);
+    let out = put(d, &early)
+        .await
+        .expect("I3192 an own claim about bytes not held is never refused");
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I3192 it waits for the bytes: {out:?}"
+    );
+    assert!(kept(d, &early).await, "I3192 kept while it waits");
+    assert!(
+        d.get_attestation(&rid(&early).hex())
+            .await
+            .unwrap()
+            .is_none(),
+        "I3192 no claim row while the bytes are not held"
+    );
+    let why = super::fold::why_held(d, &rid(&early))
+        .await
+        .unwrap()
+        .map(|h| h.reason);
+    assert_eq!(
+        why.as_deref(),
+        Some(super::fold::reason::BLOB_NOT_HELD),
+        "I3192 the reason"
+    );
+    // Another holder's claim about the same (unheld) bytes: not this node's
+    // holding to judge.
+    let theirs = claim(&other, &oi, t);
+    assert!(
+        matches!(put(d, &theirs).await.unwrap(), StatementOutcome::Row { .. }),
+        "I3192 another holder's claim lands"
+    );
+    // The bytes land (with a later claim): the early claim concludes.
+    d.put_blob_edition2(
+        &sha,
+        crate::federation::BlobBody::Inline(bytes.clone()),
+        None,
+        &claim(node, &ni, t + 1_000),
+    )
+    .await
+    .expect("I3192 the bytes land");
+    assert!(
+        d.get_attestation(&rid(&early).hex())
+            .await
+            .unwrap()
+            .is_some(),
+        "I3192 the waiting claim concluded when its bytes landed"
+    );
+}
+
+/// I3193 (T2-fix8; E8-fix2's residual) — the eviction window: the community
+/// epoch eviction retracts this node's own claims, then (paused there) a NEW
+/// own `here` claim is admitted while the bytes are still held, then the
+/// eviction commits. Its post-commit touch (`refold_on_blob`) re-folds the
+/// claim: it is taken out (no attestation row) and held `blob_not_held`, so
+/// no claim names bytes this node no longer holds.
+async fn eviction_window_body<B>(d: &B)
+where
+    B: FederationDirectory
+        + BlobStorage
+        + Sync
+        + crate::store::test_hooks::ArmEvictPause
+        + crate::federation::canonical_community_invariants::bodies::SetNodeKey,
+{
+    use crate::federation::community_dek::lifecycle_support as ls;
+    use crate::federation::community_dek::orchestrate::{
+        encrypt_and_cascade_community, sweep_rotated_epochs,
+    };
+    use crate::federation::holding_claim::{emit_holding_claim, HoldingClaimOutcome};
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let comm = format!("t2-win-comm-{run}");
+    let alice = format!("t2-win-alice-{run}");
+    let alice_occ = format!("t2-win-alice-occ-{run}");
+    let node = format!("t2-win-node-{run}");
+    let signer = ls::seed_community_with_node(d, &comm, &[(&alice, &alice_occ)], &node).await;
+    let comm = ls::id_of(&comm);
+    d.set_node_key(signer.federation_id().await);
+    let minter = signer.derived_key_id();
+    let sealed =
+        encrypt_and_cascade_community(d, &comm, b"t2 eviction window", None, Some(&minter))
+            .await
+            .expect("I3193 the sealed bytes");
+    let sha = sealed.at_rest_sha256;
+    d.community_dek_bump_epoch(&comm, &minter).await.unwrap();
+    d.community_dek_set_retain_past_epochs(&comm, &minter, Some(0))
+        .await
+        .unwrap();
+    let pause = d.arm_evict_pause();
+    let sweep = sweep_rotated_epochs(d, &comm, &signer, crate::host::clock::now());
+    let window = async {
+        tokio::time::timeout(crate::store::test_hooks::PAUSE_CEILING, pause.reached())
+            .await
+            .expect("I3193 the eviction reaches its window");
+        let out = emit_holding_claim(d, &signer, &sha, crate::host::clock::now()).await;
+        pause.resume();
+        out
+    };
+    let (report, claimed) = tokio::join!(sweep, window);
+    let report = report.expect("I3193 the sweep");
+    assert_eq!(
+        report.evicted_objects, 1,
+        "I3193 the old epoch's object is evicted"
+    );
+    let claimed = claimed.expect("I3193 the claim in the window (bytes still held)");
+    let HoldingClaimOutcome::Emitted { attestation_id, .. } = claimed else {
+        panic!("I3193 precondition: this node claims the held bytes: {claimed:?}");
+    };
+    assert!(
+        d.blob_head(&sha).await.unwrap().is_none(),
+        "I3193 the bytes are gone"
+    );
+    assert!(
+        d.get_attestation(&attestation_id).await.unwrap().is_none(),
+        "I3193 the claim admitted in the window is taken out by the eviction's re-fold"
+    );
+    let id: [u8; 32] = hex::decode(&attestation_id)
+        .expect("a row id")
+        .try_into()
+        .expect("32 bytes");
+    let why = super::fold::why_held(d, &RowId(id))
+        .await
+        .unwrap()
+        .map(|h| h.reason);
+    assert_eq!(
+        why.as_deref(),
+        Some(super::fold::reason::BLOB_NOT_HELD),
+        "I3193 held, the bytes not held"
+    );
+}
+
 async fn blob_body<B>(d: &B)
 where
     B: FederationDirectory + BlobStorage + crate::federation::blob_admit::BlobWriteStore + Sync,
@@ -1687,6 +1858,41 @@ async fn i3157_i3159_i3165_i3166_custody_cosign_postgres() {
         return;
     };
     Box::pin(custody_cosign_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3192_own_claim_waits_for_its_bytes_sqlite() {
+    let b = sqlite().await;
+    let node = key(250);
+    b.set_node_key_id(iref(&node));
+    Box::pin(own_claim_body(&b, &node)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3192_own_claim_waits_for_its_bytes_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    let node = key(250);
+    b.set_node_key_id(iref(&node));
+    Box::pin(own_claim_body(&b, &node)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3193_eviction_window_sqlite() {
+    Box::pin(eviction_window_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3193_eviction_window_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(eviction_window_body(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]

@@ -165,6 +165,7 @@ Engine	apply_replicated_attestation	deontic
 Engine	apply_replicated_key_grant	deontic
 Engine	apply_replicated_key_record	deontic
 Engine	apply_replicated_statement	deontic	
+Engine	held_rows_for	empirical	
 Engine	put_edition2_statement	deontic	
 Engine	attestation_insert_local	empirical	
 Engine	attestation_insert_local_many	empirical	
@@ -193,7 +194,14 @@ Engine	blackhole_upsert	deontic
 Engine	blob_storage_capsule	structural	
 Engine	body_sha256	pragmatic	
 Engine	bundles_in_force_json	deontic	
+# v62.0.0 (ceremony gap 4) — `put_genesis_bundle` is DEONTIC: it roots the
+# node's trust (the accord's roster, the canonical seats). A wrong entry
+# grants or withholds constitutional authority.
+Engine	put_genesis_bundle	deontic	
 Engine	amendment_standings_json	deontic	
+# v62.0.0 (ceremony gap 2) — the pre-roll gate's re-bind read is DEONTIC like
+# bundles_in_force_json: a wrong answer makes a key live a seat's holders never counted.
+Engine	rebind_held_for_json	deontic	
 Engine	build_corpus_want_v1	deontic	
 Engine	build_storage_budget_v1	deontic	
 Engine	cache_budget_bytes	epistemic	
@@ -635,6 +643,7 @@ Engine	store_plaintext_local	deontic
 Engine	stream_chunks_json	testimonial	log_commitment
 Engine	stream_consistency_proof	testimonial	log_commitment
 Engine	stream_inclusion_proof	testimonial	log_commitment
+Engine	submit_voice	deontic	
 Engine	subscribe	structural	
 Engine	subscription_count	structural	
 Engine	substrate_owner	structural	
@@ -704,6 +713,9 @@ Engine	verify_signed_revocation	deontic
 Engine	verify_skill_import_manifest_b64	deontic	
 Engine	verify_storage_budget_v1	deontic	
 Engine	verify_trace	epistemic	
+Engine	voice_draft	procedural	
+Engine	voice_held_row	deontic	
+Engine	voice_status	epistemic	
 Engine	wa_cert_get	empirical	
 Engine	wa_cert_get_by_kid	empirical	
 Engine	wa_cert_get_by_oauth	empirical	

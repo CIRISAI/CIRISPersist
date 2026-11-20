@@ -61,8 +61,8 @@ use super::super::{Error, FederationDirectory};
 use serde::{Deserialize, Serialize};
 
 /// v31.0.0 (CIRISPersist#648) — WHICH leg of the constitutional seed a fault is
-/// about. Three legs, in the order [`seed_family_and_canonical`](super::seed_family_and_canonical)
-/// establishes them, because a later leg cannot be judged before an earlier one
+/// about. Three legs, in the order the retired bundle/1 seed
+/// (`seed_family_and_canonical`) established them, because a later leg cannot be judged before an earlier one
 /// holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,7 +94,7 @@ pub enum GenesisLeg {
     /// CIRISPersist#973 — the baked `ciris-canonical` COMMUNITY birth record:
     /// the roster the root's lineage starts from. Seeded after the delegation
     /// plane through the signed `put_community` door, and only once a ceremony
-    /// has baked the asset ([`super::canonical_community_asset`]); until then
+    /// has baked the asset (the retired `canonical_community_asset`); until then
     /// this leg is not evaluated at all.
     ///
     /// Reported, and excluded from [`require_constitutional_root`] for the
@@ -377,7 +377,7 @@ pub enum GenesisPosture {
     /// Both the SEED and the READ path now compare the stored row to the baked
     /// artifact WHOLE. The seed restores the compiled-in bytes when only the
     /// unsigned material around a byte-identical signed envelope has been
-    /// altered; [`verify_delegation_plane_seeded`](super::verify_delegation_plane_seeded)
+    /// altered; `verify_delegation_plane_seeded` (bundle/1, retired)
     /// — which is what every LIVE query answers from, since
     /// [`genesis_posture`](super::posture::genesis_posture) never calls the
     /// seed — reports divergence when it has not been. Asking only on the seed

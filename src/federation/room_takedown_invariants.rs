@@ -277,7 +277,16 @@ pub(crate) mod bodies {
         // The founder appoints its deputy on B; the appointment reaches A.
         let appointment = delegate(b, founder, deputy, &["takedown", "review"]).await;
 
-        deliver(a, &b.get_attestation(&appointment).await.unwrap().unwrap()).await;
+        // E12-fix2 — an own-act delegation lands with its delegate's voice
+        // (CC 2.6.1.9): on A as on B, through E0's `land_delegation`.
+        let appointed = b.get_attestation(&appointment).await.unwrap().unwrap();
+        e2::land_delegation(a, &appointed)
+            .await
+            .expect("I1746: the appointment lands on A with the deputy's voice");
+        assert!(
+            a.get_attestation(&appointment).await.unwrap().is_some(),
+            "I1746: the appointment is held on A"
+        );
 
         // The author writes a message, a file and a second message, and
         // places each in the room, on A.

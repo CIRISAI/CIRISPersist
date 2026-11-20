@@ -41,7 +41,7 @@
 //! - Otherwise the voice is kept. The row is `Row` once its distinct holder
 //!   voices reach the count ([`required_count`]), `Pending` before.
 //!
-//! # The read ([`seat_transit_key`])
+//! # The read ([`seat_transit_key`], [`rebind_held_for`])
 //!
 //! The seat's binding was seeded by the earliest bundle of the unbroken run
 //! (back from the newest Valid bundle) that seats it with its current
@@ -234,17 +234,26 @@ fn seeding_run<'a>(in_force: &'a GenesisInForce, seat: &PlacedSeat) -> Vec<&'a G
     run
 }
 
-/// **The live transit key of a seat of the bundle in force**: the latest
-/// re-bind counted over a bundle of the seeding run, else the binding's key
-/// (module doc).
-///
-/// # Errors
-/// Directory read failures.
-pub async fn seat_transit_key<F>(
+/// A counted re-bind of a seat's transit key that applies now
+/// ([`rebind_held_for`], [`seat_transit_key`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldRebind {
+    /// The re-bind row's id (node-computed).
+    pub row_id: RowId,
+    /// The transit key it carries (`transit_xwing_pubkey`, 1216 bytes).
+    pub transit_xwing_pubkey: [u8; XWING_PUBKEY_LEN],
+    /// The bundle it is counted over (`refs.head`): a bundle of the seat's
+    /// seeding run.
+    pub head: RowId,
+}
+
+/// The latest re-bind about `seat` counted over a bundle of its seeding run
+/// (by `asserted_at`, then row id), or `None`.
+async fn latest_counted_rebind<F>(
     dir: &F,
     in_force: &GenesisInForce,
     seat: &PlacedSeat,
-) -> Result<[u8; XWING_PUBKEY_LEN], Error>
+) -> Result<Option<HeldRebind>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -258,7 +267,7 @@ where
             rows.entry(id).or_default().push(st);
         }
     }
-    let mut best: Option<(u64, RowId, [u8; XWING_PUBKEY_LEN])> = None;
+    let mut best: Option<(u64, HeldRebind)> = None;
     for (id, voices) in rows {
         let Some((_, payload)) = voices.first().and_then(|v| statement_parts(v.as_slice())) else {
             continue;
@@ -280,10 +289,63 @@ where
         };
         if best
             .as_ref()
-            .is_none_or(|(b_at, b_id, _)| (at, id) > (*b_at, *b_id))
+            .is_none_or(|(b_at, b)| (at, id) > (*b_at, b.row_id))
         {
-            best = Some((at, id, key));
+            best = Some((
+                at,
+                HeldRebind {
+                    row_id: id,
+                    transit_xwing_pubkey: key,
+                    head,
+                },
+            ));
         }
     }
-    Ok(best.map_or(seat.transit_xwing_pubkey, |(_, _, k)| k))
+    Ok(best.map(|(_, r)| r))
+}
+
+/// **The live transit key of a seat of the bundle in force**: the latest
+/// re-bind counted over a bundle of the seeding run, else the binding's key
+/// (module doc).
+///
+/// # Errors
+/// Directory read failures.
+pub async fn seat_transit_key<F>(
+    dir: &F,
+    in_force: &GenesisInForce,
+    seat: &PlacedSeat,
+) -> Result<[u8; XWING_PUBKEY_LEN], Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(latest_counted_rebind(dir, in_force, seat)
+        .await?
+        .map_or(seat.transit_xwing_pubkey, |r| r.transit_xwing_pubkey))
+}
+
+/// v62.0.0 (ceremony gap 2; CC 3.3.6.2, CC 3.4.7) — **is a counted re-bind
+/// held for this seat, and live?** The edition-2 answer to Server's
+/// pre-roll gate: for `seat_identity_ref`, a seat of the genesis bundle in
+/// force, the re-bind whose key is live now (the latest counted over a
+/// bundle of the seat's seeding run, as [`seat_transit_key`] reads it).
+///
+/// `None` when no genesis bundle is held, when `seat_identity_ref` is not a
+/// seat of the bundle in force, when no re-bind about it reaches its count,
+/// or when every counted re-bind is over a bundle a later re-seat has left
+/// behind (the seat's key is then its binding's, and no re-bind is live).
+///
+/// # Errors
+/// Directory read failures.
+pub async fn rebind_held_for<F>(
+    dir: &F,
+    seat_identity_ref: &str,
+) -> Result<Option<HeldRebind>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let in_force = genesis_in_force(dir).await?;
+    let Some(seat) = in_force.seat(seat_identity_ref) else {
+        return Ok(None);
+    };
+    latest_counted_rebind(dir, &in_force, seat).await
 }

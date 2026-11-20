@@ -5561,6 +5561,8 @@ impl PyEngine {
             dict.set_item("awaiting_actor", report.awaiting_actor)?;
             // v47.0.0 (CIRISPersist#797) — waiting on a roster, not skipped.
             dict.set_item("awaiting_roster", report.awaiting_roster)?;
+            // v62.0.0 (v62 P8-fix5) — held for second signers, not skipped.
+            dict.set_item("awaiting_voices", report.awaiting_voices)?;
             dict.set_item("skipped", report.skipped)?;
             // v50.0.0 (CIRISPersist#924) — grant-covered rows the grammar refuses.
             dict.set_item(
@@ -6602,6 +6604,133 @@ impl PyEngine {
                 })
                 .collect();
             Ok(serde_json::Value::Array(out).to_string())
+        })
+    }
+
+    /// v62.0.0 (ceremony gap 4; CC 2.6.1.11, CC 5.3.4) — **the genesis
+    /// bundle/2 import door**, the Python twin of
+    /// [`Engine::put_genesis_bundle`](crate::engine::Engine::put_genesis_bundle)
+    /// ([`put_genesis_bundle`](crate::federation::edition2::genesis::put_genesis_bundle)).
+    ///
+    /// `statements_hex` is one list of hex-encoded statements, each as
+    /// received: the bundle voices (`ceg-genesis-bundle/2`, one or more
+    /// objects; a lineage may travel whole) and the rows they name. Rows
+    /// already held need not be sent. `anchor` roots a first bundle not
+    /// already held: `{"thumbprints": [hex, ...]}` (the first bundle's
+    /// holders' key thumbprints) or `{"object_id": hex}` (that one first
+    /// bundle; any other is void), as a dict or its JSON text. `None` roots
+    /// nothing new. The import is one transaction: all or nothing.
+    ///
+    /// Returns JSON `{"placed": [bundle, ...], "not_placed": [{"object_id":
+    /// hex, "token": str, "detail": str|null, "waiting": bool}, ...],
+    /// "unreadable": [index, ...], "tips": [bundle, ...]}`, each bundle in
+    /// `bundles_in_force_json`'s shape; `tips` is the genesis in force after
+    /// the store (empty on a fork of the genesis). A refusal raises
+    /// `ValueError`: `federation_malformed_row: edition2: <token>`
+    /// (`earlier_form_object` for a bundle/1 JSON, `genesis_bundle_malformed`,
+    /// `genesis_bundle_count_unmet`, `genesis_bundle_not_anchored`, a named
+    /// row's own token, ...), or the retryable
+    /// `federation_attester_key_unknown` for a bundle waiting on a named row
+    /// or its predecessor.
+    #[pyo3(signature = (statements_hex, anchor = None))]
+    fn put_genesis_bundle(
+        &self,
+        py: Python<'_>,
+        statements_hex: Vec<String>,
+        anchor: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let statements: Vec<Vec<u8>> = statements_hex
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    hex::decode(h).map_err(|e| {
+                        PyValueError::new_err(format!("statements_hex[{i}]: not hex: {e}"))
+                    })
+                })
+                .collect::<PyResult<_>>()?;
+            let anchor = match anchor {
+                None => None,
+                Some(a) => Some(genesis_anchor_of(py, &a)?),
+            };
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let admission = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::genesis::put_genesis_bundle(
+                        dir.as_ref(),
+                        &statements,
+                        anchor.as_ref(),
+                    )
+                    .await
+                    .map_err(federation_err_to_py)
+                })
+            })?;
+            Ok(serde_json::json!({
+                "placed": admission.placed.iter().map(genesis_placement_json).collect::<Vec<_>>(),
+                "not_placed": admission
+                    .not_placed
+                    .iter()
+                    .map(|n| serde_json::json!({
+                        "object_id": hex::encode(n.object_id),
+                        "token": n.token,
+                        "detail": n.detail,
+                        "waiting": n.waiting,
+                    }))
+                    .collect::<Vec<_>>(),
+                "unreadable": admission.unreadable,
+                "tips": admission
+                    .in_force
+                    .tips()
+                    .into_iter()
+                    .map(genesis_placement_json)
+                    .collect::<Vec<_>>(),
+            })
+            .to_string())
+        })
+    }
+
+    /// v62.0.0 (ceremony gap 2; CC 3.3.6.2, CC 3.4.7) — **the counted re-bind
+    /// live for a seat**, the edition-2 answer to a pre-roll gate: FFI mirror
+    /// of [`rebind_held_for`](crate::federation::edition2::transport_rebind::rebind_held_for).
+    ///
+    /// Returns JSON: `null` when no genesis bundle is held, when
+    /// `seat_identity_ref` is not a seat of the bundle in force, when no
+    /// re-bind about it reaches its count (a strict majority of the holders
+    /// of the bundle it names), or when every counted re-bind is over a
+    /// bundle a later re-seat left behind. Otherwise `{"row_id": hex,
+    /// "transit_xwing_pubkey_base64": str, "head": hex}`: the re-bind row,
+    /// the X-Wing key it makes live (1216 bytes, standard base64), and the
+    /// bundle it is counted over. Directory read failures raise as the other
+    /// federation reads.
+    fn rebind_held_for_json(&self, py: Python<'_>, seat_identity_ref: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let seat = seat_identity_ref.to_owned();
+            let held = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::transport_rebind::rebind_held_for(
+                        dir.as_ref(),
+                        &seat,
+                    )
+                    .await
+                    .map_err(federation_err_to_py)
+                })
+            })?;
+            Ok(held
+                .map_or(serde_json::Value::Null, |r| {
+                    serde_json::json!({
+                        "row_id": r.row_id.hex(),
+                        "transit_xwing_pubkey_base64": B64.encode(r.transit_xwing_pubkey),
+                        "head": r.head.hex(),
+                    })
+                })
+                .to_string())
         })
     }
 
@@ -8239,6 +8368,152 @@ impl PyEngine {
                     engine
                         .steward_bind(&local_signer, &key, infra_scopes, purpose.as_deref())
                         .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3) — **the state of a row a
+    /// second signer's voice concerns** as JSON: `{"status":
+    /// "seated"|"waiting", "row_id", "reason", "detail", "http_status":
+    /// 200|424}`. A row `grant_delegation` / `steward_bind` (or any authored
+    /// row with second signers) returned is `waiting` (424, not an error)
+    /// until every second signer has voiced it.
+    fn voice_status(&self, py: Python<'_>, row_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.engine_backend();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let id = row_id.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .voice_status(&id)
+                        .await
+                        .map(|o| o.to_json().to_string())
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3, CC 4.4.3.19) — **the held
+    /// rows waiting for a key's voice**, in every second-signer role the
+    /// gate's resolver lists it a party of, as a JSON array: each `{row_id,
+    /// family, row_type, author, sub, role, parties, reason, detail,
+    /// statement (hex)}`. `key_id` defaults to this engine's own key; `role`
+    /// narrows to one role; page with `after` = the last `row_id` read.
+    #[pyo3(signature = (key_id = None, role = None, after = None, limit = 1000))]
+    fn held_rows_for(
+        &self,
+        py: Python<'_>,
+        key_id: Option<&str>,
+        role: Option<&str>,
+        after: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.engine_backend();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let (key, role, after) = (
+                key_id.map(str::to_owned),
+                role.map(str::to_owned),
+                after.map(str::to_owned),
+            );
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .held_rows_for(key.as_deref(), role.as_deref(), after.as_deref(), limit)
+                        .await
+                        .map(|v| {
+                            serde_json::Value::Array(v.iter().map(|h| h.to_json()).collect())
+                                .to_string()
+                        })
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v62.0.0 (v62 P8-fix5; CC 2.6.1.9) — **voice a held row** with this
+    /// engine's composite key: its own statement over the author's payload,
+    /// through the statement door. Returns the row's state as `voice_status`
+    /// does.
+    fn voice_held_row(&self, py: Python<'_>, row_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.engine_backend();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let id = row_id.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .voice_held_row(&id, None)
+                        .await
+                        .map(|o| o.to_json().to_string())
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v62.0.0 (v62 P8-fix5) — **a held row's voice, drafted** for a hardware
+    /// or remote second signer (`signer_iss`, its identity-ref): JSON
+    /// `{protected, payload, sig_structure}` (hex). Sign `sig_structure` with
+    /// the signer's composite key, assemble the `COSE_Sign1`, and submit it
+    /// with `submit_voice`.
+    fn voice_draft(&self, py: Python<'_>, row_id: &str, signer_iss: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.engine_backend();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let (id, iss) = (row_id.to_owned(), signer_iss.to_owned());
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .voice_draft(&id, &iss)
+                        .await
+                        .map(|d| d.to_json().to_string())
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v62.0.0 (v62 P8-fix5) — **submit a second signer's voice signed
+    /// elsewhere** (`statement_hex`: the assembled `COSE_Sign1`, lowercase
+    /// hex) through the statement door. Returns the row's state as
+    /// `voice_status` does.
+    fn submit_voice(&self, py: Python<'_>, statement_hex: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let statement = hex::decode(statement_hex)
+            .map_err(|e| PyValueError::new_err(format!("statement_hex: {e}")))?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.engine_backend();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .submit_voice(&statement)
+                        .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -33394,6 +33669,66 @@ fn erasure_err_to_py(e: crate::store::Error) -> PyErr {
 /// v62.0.0 (JSON-cut slice D) — a 32-byte id the caller passes as 64 hex
 /// (an offered row id, a pinned genesis object id). `what` names the
 /// argument in the `ValueError`.
+/// v62.0.0 (ceremony gap 4) — one genesis placement in
+/// `bundles_in_force_json`'s shape.
+fn genesis_placement_json(
+    t: &crate::federation::edition2::genesis::GenesisPlacement,
+) -> serde_json::Value {
+    serde_json::json!({
+        "object_id": hex::encode(t.object_id),
+        "version": t.version,
+        "prev": t.prev.as_ref().map(hex::encode),
+        "asserted_at": t.asserted_at,
+        "family_key_id": t.family_key_id,
+        "holders": t.holders.iter().map(|h| h.identity_ref.as_str()).collect::<Vec<_>>(),
+        "serve_nodes": t.seats.iter().map(|x| x.identity_ref.as_str()).collect::<Vec<_>>(),
+        "counted": t.counted,
+    })
+}
+
+/// v62.0.0 (ceremony gap 4) — the reader's anchor from Python: a dict, or
+/// its JSON text, of exactly one of `{"thumbprints": [hex, ...]}` and
+/// `{"object_id": hex}` (CC 5.3.4).
+fn genesis_anchor_of(
+    py: Python<'_>,
+    anchor: &Bound<'_, PyAny>,
+) -> PyResult<crate::federation::edition2::genesis::Anchor> {
+    use crate::federation::edition2::genesis::Anchor;
+    let text: String = match anchor.extract::<String>() {
+        Ok(s) => s,
+        Err(_) => PyModule::import(py, "json")?
+            .call_method1("dumps", (anchor,))?
+            .extract()?,
+    };
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| PyValueError::new_err(format!("anchor: not JSON: {e}")))?;
+    let shape = || {
+        PyValueError::new_err(
+            "anchor is {\"thumbprints\": [hex, ...]} or {\"object_id\": hex}, exactly one",
+        )
+    };
+    let m = v.as_object().ok_or_else(shape)?;
+    if m.len() != 1 {
+        return Err(shape());
+    }
+    if let Some(t) = m.get("thumbprints") {
+        let list = t.as_array().ok_or_else(shape)?;
+        let kids = list
+            .iter()
+            .map(|x| {
+                let h = x.as_str().ok_or_else(shape)?;
+                parse_digest32_hex("anchor.thumbprints", h)
+            })
+            .collect::<PyResult<std::collections::BTreeSet<_>>>()?;
+        return Ok(Anchor::Thumbprints(kids));
+    }
+    if let Some(o) = m.get("object_id") {
+        let h = o.as_str().ok_or_else(shape)?;
+        return Ok(Anchor::ObjectId(parse_digest32_hex("anchor.object_id", h)?));
+    }
+    Err(shape())
+}
+
 fn parse_digest32_hex(what: &str, s: &str) -> PyResult<crate::federation::edition2::Digest32> {
     let bytes = hex::decode(s)
         .map_err(|e| PyValueError::new_err(format!("{what}: 64 hex characters expected: {e}")))?;

@@ -712,6 +712,48 @@ class Engine:
         Two entries are a fork: a reader takes only what both name.
         """
 
+    def put_genesis_bundle(
+        self,
+        statements_hex: list[str],
+        anchor: dict[str, Any] | str | None = None,
+    ) -> str:
+        """v62.0.0 (CC 2.6.1.11, CC 5.3.4) — the genesis bundle/2 import door:
+        one list of hex statements (the ``ceg-genesis-bundle/2`` voices, one
+        or more objects, and the rows they name), read by CIRISVerify's bundle
+        reader. ``anchor`` roots a first bundle not already held:
+        ``{"thumbprints": [hex, ...]}`` or ``{"object_id": hex}`` (a dict or
+        its JSON text); ``None`` roots nothing new. All or nothing.
+
+        Returns JSON ``{"placed": [bundle, ...], "not_placed": [{"object_id":
+        hex, "token": str, "detail": str | null, "waiting": bool}, ...],
+        "unreadable": [int, ...], "tips": [bundle, ...]}``, each bundle in
+        :meth:`bundles_in_force_json`'s shape; ``tips`` is empty on a fork of
+        the genesis.
+
+        Raises:
+            ValueError: ``federation_malformed_row: edition2: <token>``
+                (``earlier_form_object``, ``genesis_bundle_malformed``,
+                ``genesis_bundle_count_unmet``, ``genesis_bundle_not_anchored``,
+                a named row's own token, ...); the retryable
+                ``federation_attester_key_unknown`` for a bundle waiting on a
+                named row or its predecessor; a malformed ``anchor`` or a
+                statement that is not hex.
+        """
+
+    def rebind_held_for_json(self, seat_identity_ref: str) -> str:
+        """v62.0.0 (CC 3.3.6.2, CC 3.4.7) — the counted re-bind live for a
+        seat, the edition-2 answer to a pre-roll gate.
+
+        Returns JSON: ``null`` when no genesis bundle is held, when
+        ``seat_identity_ref`` is not a seat of the bundle in force, when no
+        re-bind about it reaches its count (a strict majority of the holders
+        of the bundle it names), or when every counted re-bind is over a
+        bundle a later re-seat left behind. Otherwise ``{"row_id": hex,
+        "transit_xwing_pubkey_base64": str, "head": hex}``: the re-bind row,
+        the X-Wing key it makes live (1216 bytes, standard base64), and the
+        bundle it is counted over.
+        """
+
     def put_edition2_statement(self, statement: bytes, offered_row_id: str | None = None) -> str:
         """v62.0.0 (CC 2.6.1, 2.6.1.12) — the edition-2 statement door, local
         or replicated: one ``COSE_Sign1`` (tag 18) statement as received.
@@ -1696,6 +1738,21 @@ class Engine:
 
     def sign_stream_sth_json(self, stream_id: str, chunk_shas_hex: list[str], tree_size: int) -> str:
         """(derived) deontic — v52.0.0 (CIRISPersist#950) — mint this node's Signed Tree Head over a chunk-DAG file's stream under the engine's local signer. chunk_shas_hex are t..."""
+
+    def held_rows_for(self, key_id: str | None = None, role: str | None = None, after: str | None = None, limit: int = 1000) -> str:
+        """(derived) empirical — v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3, CC 4.4.3.19) — the held rows waiting for a key's voice, in every second-signer role the gate's resolver..."""
+
+    def submit_voice(self, statement_hex: str) -> str:
+        """(derived) deontic — v62.0.0 (v62 P8-fix5) — submit a second signer's voice signed elsewhere (statement_hex: the assembled COSE_Sign1, lowercase hex) through the statem..."""
+
+    def voice_draft(self, row_id: str, signer_iss: str) -> str:
+        """(derived) procedural — v62.0.0 (v62 P8-fix5) — a held row's voice, drafted for a hardware or remote second signer (signer_iss, its identity-ref): JSON {protected, payload..."""
+
+    def voice_held_row(self, row_id: str) -> str:
+        """(derived) deontic — v62.0.0 (v62 P8-fix5; CC 2.6.1.9) — voice a held row with this engine's composite key: its own statement over the author's payload, through the sta..."""
+
+    def voice_status(self, row_id: str) -> str:
+        """(derived) epistemic — v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3) — the state of a row a second signer's voice concerns as JSON: {"status": "seated"|"waiting", "row_id",..."""
 
     def steward_bind(self, node_or_agent_key_id: str, infra_scopes: list[str], delegation_purpose: str | None = None) -> str:
         """(derived) deontic — v9.3.0 (#249, CC 4.4.3.4.3) — steward-bind a node/agent occurrence by granting it infra:-only scopes (passes the node-agency gate on a node-role ke..."""

@@ -161,6 +161,9 @@ pub mod two_node {
         key: &str,
         key_seed: &str,
     ) {
+        // v62.0.0 (P1-fix10) — the bound key's own record FIRST: its voice
+        // over the binding is checked against it.
+        key_live(d, key_seed).await;
         // v62.0.0 (P1-fix5) — ONE voice path and one dating rule: K2's
         // `put_sealed_owner_binding` (the owner's statement through the
         // statement door, then the bound key's voice by `key_seed`; it asserts
@@ -170,6 +173,43 @@ pub mod two_node {
         ts::put_sealed_owner_binding(d, &row, key_seed)
             .await
             .unwrap_or_else(|e| panic!("{owner} owns {key}: {e}"));
+    }
+
+    /// v62.0.0 (P1-fix10) — **make the bound key live before anything it
+    /// voices**: under the switch, when `dir` holds no record for
+    /// `kid(key_seed)`, put its default `node` `key:record` (window from
+    /// [`NODE_DEFAULT_BACK_DAYS`](crate::federation::edition2::fixture_switch::NODE_DEFAULT_BACK_DAYS)
+    /// before today, so a binding dated now sits inside it). A key the test
+    /// already registered (any role, any window) is left as it is. Without
+    /// this the node's voice met `AttesterKeyUnknown` ("an ordering gap"):
+    /// 197 reds in pass 4b. The earlier form needs no record here.
+    ///
+    /// # Panics
+    /// (P1-fix11) The key is held, but not as a `node` / `agent` key.
+    pub async fn key_live(d: &dyn crate::federation::FederationDirectory, key_seed: &str) {
+        use crate::federation::types::identity_type::{set_contains, AGENT, NODE};
+        if !e2::emit_edition2() {
+            return;
+        }
+        let seed = e2::seed_of(key_seed);
+        let k = e2::kid(&seed);
+        let held = d
+            .lookup_public_key(&k)
+            .await
+            .unwrap_or_else(|e| panic!("{k}'s record: {e}"));
+        let Some(rec) = held else {
+            e2::put_key(d, &seed, &["node"]).await;
+            return;
+        };
+        // v62.0.0 (P1-fix11; CC 2.7, CC rc21 3.3.6) — an owner binding binds
+        // a MACHINE key: onto a `user` key it is held, never landed (a silent
+        // `Pending` the caller then misreads). Named here instead.
+        assert!(
+            set_contains(&rec.identity_type, NODE) || set_contains(&rec.identity_type, AGENT),
+            "owner binding onto {k} ({seed}): the key is held as `{}`, not a node or agent key; \
+             register it as NODE (introduce_as(.., NODE) / node_as(.., NODE)) before owning it",
+            rec.identity_type
+        );
     }
 
     /// v62.0.0 (P1-fix4; CC rc21 3.3.6) — **THE shared fixture for "a
@@ -191,6 +231,9 @@ pub mod two_node {
         device_class: &str,
         kem: Option<EncryptionPubkeys>,
     ) {
+        // v62.0.0 (P1-fix10) — the node's record before its self-occurrence
+        // and its owner binding.
+        key_live(d, node_seed).await;
         d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
             identity_key_id: node.to_owned(),
             occurrence_key_id: node.to_owned(),
@@ -3440,18 +3483,28 @@ mod tests {
         #[tokio::test]
         async fn i60_forged_set_refused_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node(&ba, "i60-a").await;
-            let b = node(&bb, "i60-b").await;
-            introduce(&[&a, &b], &["i60-a", "i60-b"]).await;
+            let a = node_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i60-a", "i60-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i60_forged_set_refused(&a, &b, "sqlite").await;
         }
 
         #[tokio::test]
         async fn i60b_delayed_set_survives_a_later_occurrence_revocation_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node(&ba, "i60b-a").await;
-            let b = node(&bb, "i60b-b").await;
-            introduce(&[&a, &b], &["i60b-a", "i60b-b"]).await;
+            let a = node_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i60b-a", "i60b-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i60b_delayed_set_survives_a_later_occurrence_revocation(&a, &b, "sqlite")
                 .await;
         }
@@ -3476,46 +3529,71 @@ mod tests {
         #[tokio::test]
         async fn i71_rotation_keys_on_effective_at_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node(&ba, "i71-a").await;
-            let b = node(&bb, "i71-b").await;
-            introduce(&[&a, &b], &["i71-a", "i71-b"]).await;
+            let a = node_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i71-a", "i71-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i71_rotation_keys_on_effective_at(&a, &b, "sqlite").await;
         }
 
         #[tokio::test]
         async fn i61_end_to_end_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node(&ba, "i61-a").await;
-            let b = node(&bb, "i61-b").await;
-            introduce(&[&a, &b], &["i61-a", "i61-b"]).await;
+            let a = node_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i61-a", "i61-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i61_end_to_end(&a, &b, "sqlite").await;
         }
 
         #[tokio::test]
         async fn i62_union_order_independent_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node(&ba, "i62-a").await;
-            let b = node(&bb, "i62-b").await;
-            introduce(&[&a, &b], &["i62-a", "i62-b"]).await;
+            let a = node_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i62-a", "i62-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i62_union_order_independent(&a, &b, "sqlite").await;
         }
 
         #[tokio::test]
         async fn i63_rotation_on_admitted_removal_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node(&ba, "i63-a").await;
-            let b = node(&bb, "i63-b").await;
-            introduce(&[&a, &b], &["i63-a", "i63-b"]).await;
+            let a = node_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i63-a", "i63-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i63_rotation_on_admitted_removal(&a, &b, "sqlite").await;
         }
 
         #[tokio::test]
         async fn i64_two_minters_same_epoch_sqlite() {
             let (ba, bb, bc) = (fresh().await, fresh().await, fresh().await);
-            let a = node(&ba, "i64-a").await;
-            let b = node(&bb, "i64-b").await;
-            let c = node(&bc, "i64-c").await;
-            introduce(&[&a, &b, &c], &["i64-a", "i64-b", "i64-c"]).await;
+            let a = node_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
+            let c = node_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b, &c],
+                &["i64-a", "i64-b", "i64-c"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i64_two_minters_same_epoch(&a, &b, &c, "sqlite").await;
         }
 
@@ -4803,9 +4881,14 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node(&ba, "i61-a").await;
-            let b = node(&bb, "i61-b").await;
-            introduce(&[&a, &b], &["i61-a", "i61-b"]).await;
+            let a = node_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i61-a", "i61-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i61_end_to_end(&a, &b, "postgres").await;
         }
 
@@ -4825,9 +4908,14 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node(&ba, "i60-a").await;
-            let b = node(&bb, "i60-b").await;
-            introduce(&[&a, &b], &["i60-a", "i60-b"]).await;
+            let a = node_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i60-a", "i60-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i60_forged_set_refused(&a, &b, "postgres").await;
         }
 
@@ -4837,9 +4925,14 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node(&ba, "i60b-a").await;
-            let b = node(&bb, "i60b-b").await;
-            introduce(&[&a, &b], &["i60b-a", "i60b-b"]).await;
+            let a = node_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i60b-a", "i60b-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i60b_delayed_set_survives_a_later_occurrence_revocation(&a, &b, "postgres")
                 .await;
         }
@@ -4870,9 +4963,14 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node(&ba, "i71-a").await;
-            let b = node(&bb, "i71-b").await;
-            introduce(&[&a, &b], &["i71-a", "i71-b"]).await;
+            let a = node_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i71-a", "i71-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i71_rotation_keys_on_effective_at(&a, &b, "postgres").await;
         }
 
@@ -4882,9 +4980,14 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node(&ba, "i62-a").await;
-            let b = node(&bb, "i62-b").await;
-            introduce(&[&a, &b], &["i62-a", "i62-b"]).await;
+            let a = node_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i62-a", "i62-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i62_union_order_independent(&a, &b, "postgres").await;
         }
 
@@ -4894,9 +4997,14 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node(&ba, "i63-a").await;
-            let b = node(&bb, "i63-b").await;
-            introduce(&[&a, &b], &["i63-a", "i63-b"]).await;
+            let a = node_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b],
+                &["i63-a", "i63-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i63_rotation_on_admitted_removal(&a, &b, "postgres").await;
         }
 
@@ -4907,10 +5015,15 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node(&ba, "i64-a").await;
-            let b = node(&bb, "i64-b").await;
-            let c = node(&bc, "i64-c").await;
-            introduce(&[&a, &b, &c], &["i64-a", "i64-b", "i64-c"]).await;
+            let a = node_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
+            let b = node_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
+            let c = node_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
+            introduce_as(
+                &[&a, &b, &c],
+                &["i64-a", "i64-b", "i64-c"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
             exercise_i64_two_minters_same_epoch(&a, &b, &c, "postgres").await;
         }
 

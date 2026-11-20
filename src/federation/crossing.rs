@@ -541,6 +541,22 @@ pub enum MeshCrossingOutcome {
         /// `now − asserted_at`, so the CC 2.6.7 window is observable.
         age_ms: i64,
     },
+    /// v62.0.0 (v62 P8-fix5; E7's finding) — the widening restatement was
+    /// admitted but is HELD by the statement door (`Pending`): its family
+    /// names second signers who have not voiced it yet (K2's gate), or
+    /// another fold condition is unmet. Nothing crossed yet; it is not an
+    /// error. The second signers find it with `held_rows_for` and voice it;
+    /// `voice_status` reads when it seats.
+    Held {
+        /// The restatement's row id (hex).
+        attestation_id: String,
+        /// The prior the restatement widens.
+        prior_attestation_id: String,
+        /// The held reason token (`count_short` while a voice is missing).
+        reason: String,
+        /// The held detail, as the gate words it.
+        detail: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1829,7 +1845,7 @@ where
             prior_attestation_id: prior.attestation_id.clone(),
         });
     }
-    super::edition2::ingest::put_statement_with_origin(
+    let outcome = super::edition2::ingest::put_statement_with_origin(
         dir,
         &statement,
         None,
@@ -1837,6 +1853,17 @@ where
         super::replication::admission::WriteOrigin::Authored,
     )
     .await?;
+    // v62.0.0 (v62 P8-fix5; E7's finding) — a HELD restatement did not
+    // cross: report it held, never `Crossed`.
+    if let super::edition2::ingest::StatementOutcome::Pending { row_id, .. } = outcome {
+        let held = super::edition2::fold::why_held(dir, &row_id).await?;
+        return Ok(MeshCrossingOutcome::Held {
+            attestation_id: row_id.hex(),
+            prior_attestation_id: prior.attestation_id.clone(),
+            reason: held.as_ref().map(|h| h.reason.clone()).unwrap_or_default(),
+            detail: held.map(|h| h.detail).unwrap_or_default(),
+        });
+    }
     Ok(MeshCrossingOutcome::Crossed(report(
         &signed,
         Custody::ActorSigned,

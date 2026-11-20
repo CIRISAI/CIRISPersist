@@ -74,8 +74,10 @@ pub mod bodies {
     ) -> Result<String, Error> {
         let row = raw_edge(granter, recipient, envelope);
         let id = row.attestation_id.clone();
-        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
-            .await?;
+        // v62 (E3b-fix4; CC 2.6.1.9, E0.api v1.15): an own-act delegation waits
+        // for the delegate's voice; `land_delegation` puts the author's row, then
+        // that voice (a door refusal stays an Err).
+        crate::federation::edition2::fixture_switch::land_delegation(d, &row).await?;
         Ok(id)
     }
 

@@ -79,6 +79,12 @@ pub mod recovery_signer;
 // v62.0.0 (P10; CC rc21 2.7.11) — SCITT receipts (RFC 9942, label 394) held
 // with their statements; the receipt leg of running admitted code.
 pub mod receipts;
+// v62.0.0 (v62 P8-fix5; CC 2.6.1.9, 2.7.3, 4.4.3.19) — a second signer's
+// voice over a held row, in any role K2's resolver names: list (by the
+// awaited key), draft, voice, submit, outcome.
+pub mod second_signer_voice;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod second_signer_voice_invariants;
 pub mod serve;
 pub mod standing;
 pub mod store;
@@ -141,6 +147,9 @@ mod payloads_invariants;
 mod produce_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod wait_invariants;
+// v62.0.0 (K2-fix4) — I2845–I2846: the generic second-signer hold (CC 2.7.3).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod second_signer_invariants;
 // v62.0.0 (wave P1c) — I2914: the door's pure gates precede its first
 // directory read (AV-76), on sqlite and postgres.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -159,6 +168,10 @@ mod hard_case_producer_invariants;
 mod crossing_producer_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod projection_invariants;
+// v62.0.0 (ceremony gap 2, C3) — I2368–I2372: the edition-2 re-bind read,
+// its capsule op and the X-Wing transit pair, on sqlite and postgres.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod rebind_held_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod recovery_signer_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]

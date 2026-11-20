@@ -491,16 +491,10 @@ pub(crate) mod bodies {
         );
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         let row = ts::seal_row(owner, row);
-        e2::put_signed(dir, &row)
+        // E12-fix2 — the one owner-binding path (K2's `land_owner_binding`).
+        e2::land_owner_binding(dir, &row, node)
             .await
-            .expect("the owner's binding of its node");
-        let voice = e2::voice_of(
-            &e2::carried_statement(&row).expect("the binding carries its statement"),
-            node,
-        );
-        e2::put_statement(dir, &voice)
-            .await
-            .expect("the node's voice on its owner binding");
+            .expect("the owner's binding of its node, with the node's voice");
     }
 
     // ── I1517 (#1160) ─────────────────────────────────────────────────────
@@ -652,7 +646,9 @@ pub(crate) mod bodies {
         let (room, elsewhere) = ("i1523-room", "i1523-elsewhere");
         group_of(dir, room, &[&founder.id, &author.id], None).await;
         community_of(dir, elsewhere, &other.id).await;
-        key_as(dir, &deputy.id, AGENT).await;
+        // E12-fix2: a person deputy (a machine delegate's edge would wait on
+        // its owner's voice; the duty walk is what this witnesses).
+        key_as(dir, &deputy.id, USER).await;
         delegate(dir, &founder.id, &deputy.id, &["takedown"]).await;
 
         let shas: Vec<String> = ["founder", "delegate"].map(sha_of).to_vec();
@@ -1169,6 +1165,20 @@ pub(crate) mod bodies {
         .unwrap()
     }
 
+    /// v62.0.0 (E12-fix2; CC 2.6.1.9, the CC ruling on own-act delegations) —
+    /// an own-act `delegates_to` waits for its delegate's voice (and a machine
+    /// delegate's owner's): E0's `land_delegation` puts the granter's
+    /// statement, then those voices. The edge must be LIVE here, so a
+    /// `Pending` outcome fails the fixture (a machine delegate with no bound
+    /// owner would leave it held).
+    async fn land(dir: &dyn FederationDirectory, row: &crate::federation::types::Attestation) {
+        let (out, _unvoiced) = e2::land_delegation(dir, row).await.expect("the delegation");
+        assert!(
+            !matches!(out, StatementOutcome::Pending { .. }),
+            "the delegation lands with its voices: {out:?}"
+        );
+    }
+
     /// A `delegates_to(granter → grantee)` bearing `scope`, really signed.
     ///
     /// v62.0.0 (JSON cut, E12) — the granter's `self:delegates_to` statement
@@ -1191,7 +1201,7 @@ pub(crate) mod bodies {
         let mut row = ts::bare_attestation("", granter, grantee, &envelope);
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         ts::seal_row_in_place(granter, &mut row);
-        e2::put_signed(dir, &row).await.expect("the delegation");
+        land(dir, &row).await;
         e2::rid(&row)
     }
 
@@ -1212,7 +1222,7 @@ pub(crate) mod bodies {
         let mut row = ts::bare_attestation("", granter, grantee, &envelope);
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         ts::seal_row_in_place(granter, &mut row);
-        e2::put_signed(dir, &row).await.expect("the delegation");
+        land(dir, &row).await;
         e2::rid(&row)
     }
 
@@ -1239,7 +1249,7 @@ pub(crate) mod bodies {
         );
         key_as(dir, &owner.id, USER).await;
         for c in [&d1, &d2, &signer] {
-            key_as(dir, &c.id, AGENT).await;
+            key_as(dir, &c.id, USER).await;
         }
         let sha = sha_of("i3430");
         establish(dir, "i3430-producer", &owner.id, &sha).await;
@@ -1291,10 +1301,10 @@ pub(crate) mod bodies {
         );
         for (c, kind) in [
             (&owner, USER),
-            (&delegate_ok, AGENT),
-            (&delegate_cr, AGENT),
+            (&delegate_ok, USER),
+            (&delegate_cr, USER),
             (&machine, AGENT),
-            (&machine_delegate, AGENT),
+            (&machine_delegate, USER),
             (&nobody, AGENT),
         ] {
             key_as(dir, &c.id, kind).await;

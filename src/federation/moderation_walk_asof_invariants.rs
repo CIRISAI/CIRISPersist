@@ -102,9 +102,18 @@ pub mod bodies {
 
     /// Store `row` and return it AS STORED (the instants the walk will read).
     async fn put(dir: &dyn FederationDirectory, row: &Attestation, what: &str) -> Attestation {
-        store(dir, row)
-            .await
-            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        if row.attestation_type == attestation_type::DELEGATES_TO {
+            // v62 (E3b-fix4; CC 2.6.1.9, E0.api v1.15): an own-act delegation waits
+            // for the delegate's voice; `land_delegation` puts the author's row, then
+            // that voice (a door refusal stays an Err).
+            fx::land_delegation(dir, row)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+        } else {
+            store(dir, row)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+        }
         dir.get_attestation(&row.attestation_id)
             .await
             .expect("read back")

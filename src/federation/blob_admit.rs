@@ -216,40 +216,32 @@ pub(crate) fn stream_claim_verdict(
 
 /// The held stream rows an append may not land on.
 fn refuse_held_stream(batch: &PlannedChunkBatch, held: &HeldStream) -> Result<(), BlobError> {
-    use super::edition2::fold::reason;
     let stream_id = batch.stream_id.as_str();
-    // v62.0.0 (wave GC7; CC 2.7.2/2.7.3) — "a stream belongs to its first
-    // append" reads the held stream row: each refusal is a fold condition.
+    // v62.0.0 (T2-fix8; lead's GC7 ruling, T2-fix7.md §2) — NOT a fold hold.
+    // No production path ever clears this blocker (an abandoned stream, the
+    // first append's cohort / owner, a held slot, a moved epoch), so no held
+    // bytes could ever be released: this arm is a terminal REFUSAL, and v62
+    // keeps no held chunk store. (These doors also run outside any fold
+    // attempt, where a mark was inert.) Same-author `seq_held` equivocation
+    // ("both kept, neither concludes") is a post-v62 CC policy question.
     if held.abandoned {
-        return Err(held_on(
-            reason::STREAM_ABANDONED,
-            stream_id,
-            blobs::stream_abandoned_refusal(stream_id),
-        ));
+        return Err(blobs::stream_abandoned_refusal(stream_id));
     }
     if held.cohort_scope != batch.cohort_scope
         || held.community_key_id != batch.claim.community_key_id
     {
-        return Err(held_on(
-            reason::STREAM_ELSEWHERE,
+        return Err(blobs::stream_elsewhere_refusal(
             stream_id,
-            blobs::stream_elsewhere_refusal(
-                stream_id,
-                &held.cohort_scope,
-                held.community_key_id.as_deref(),
-                &batch.cohort_scope,
-                batch.claim.community_key_id.as_deref(),
-            ),
+            &held.cohort_scope,
+            held.community_key_id.as_deref(),
+            &batch.cohort_scope,
+            batch.claim.community_key_id.as_deref(),
         ));
     }
     match (&held.owner_key_id, &batch.claim.owner_key_id) {
         (None, _) => Ok(()),
         (Some(owner), Some(mine)) if owner == mine => Ok(()),
-        _ => Err(held_on(
-            reason::STREAM_FOREIGN,
-            stream_id,
-            foreign_stream(batch, held),
-        )),
+        _ => Err(foreign_stream(batch, held)),
     }
 }
 
@@ -272,42 +264,34 @@ fn item_answer(
     got: ItemAppended,
 ) -> Result<[u8; 32], BlobError> {
     use super::edition2::fold::reason;
-    // v62.0.0 (wave GC7; CC 2.7.3) — every arm but the epoch cap (a
-    // resource limit) read another row at the slot: held under a fold
-    // attempt.
+    // v62.0.0 (T2-fix8; lead's GC7 ruling, T2-fix7.md §2) — NOT a fold hold.
+    // No production path ever clears this blocker (an abandoned stream, the
+    // first append's cohort / owner, a held slot, a moved epoch), so no held
+    // bytes could ever be released: this arm is a terminal REFUSAL, and v62
+    // keeps no held chunk store. (These doors also run outside any fold
+    // attempt, where a mark was inert.) Same-author `seq_held` equivocation
+    // ("both kept, neither concludes") is a post-v62 CC policy question.
+    // The epoch cap is a resource limit. Only the tombstone arm keeps its
+    // mark (GC2's reversal item; a purge order, not a slot conflict).
     Err(match got {
         ItemAppended::Ok => return Ok(sha),
-        ItemAppended::SeqConflict => held_on(
-            reason::STREAM_SEQ_HELD,
-            batch_stream,
-            BlobError::InvalidArgument(format!("stream {batch_stream} seq {seq} already exists")),
-        ),
+        ItemAppended::SeqConflict => {
+            BlobError::InvalidArgument(format!("stream {batch_stream} seq {seq} already exists"))
+        }
         ItemAppended::CapReached => blobs::epoch_cap_refusal(batch_stream, epoch),
         ItemAppended::EpochMoved => {
             let b = binding.expect("EpochMoved only arises with a binding");
-            held_on(
-                reason::STREAM_EPOCH_MOVED,
-                &b.community_key_id,
-                BlobError::EpochNotCurrent {
-                    community_key_id: b.community_key_id.clone(),
-                    epoch: b.epoch,
-                },
-            )
+            BlobError::EpochNotCurrent {
+                community_key_id: b.community_key_id.clone(),
+                epoch: b.epoch,
+            }
         }
-        ItemAppended::StreamCounterMoved => held_on(
-            reason::STREAM_EPOCH_MOVED,
+        ItemAppended::StreamCounterMoved => blobs::stream_counter_moved_refusal(
             batch_stream,
-            blobs::stream_counter_moved_refusal(
-                batch_stream,
-                epoch,
-                claim.stream_key.map_or(0, |k| k.counter),
-            ),
+            epoch,
+            claim.stream_key.map_or(0, |k| k.counter),
         ),
-        ItemAppended::StreamEpochClosed => held_on(
-            reason::STREAM_EPOCH_MOVED,
-            batch_stream,
-            blobs::stream_epoch_closed_refusal(batch_stream, epoch),
-        ),
+        ItemAppended::StreamEpochClosed => blobs::stream_epoch_closed_refusal(batch_stream, epoch),
         ItemAppended::Purged(notice_id) => held_on(
             reason::BLOB_PURGED,
             &hex::encode(sha),
@@ -1240,6 +1224,12 @@ pub(crate) async fn put_blob_edition2_planned<D: BlobWriteStore>(
     if dir.blob_head(sha256).await?.is_none() {
         dir.store_planned_blob(planned).await?;
     }
+    // v62.0.0 (T2-fix7) — the bytes landed: the bytes plane's touch, so a
+    // row that waited on this node's holding of them (an own `here` claim
+    // held `blob_not_held`, a claim at the wrong scope) re-folds now.
+    super::holding_claim::refold_on_blob(dir, sha256)
+        .await
+        .map_err(|e| BlobError::Backend(format!("put_blob re-fold: {e}")))?;
     Ok(())
 }
 
@@ -1540,47 +1530,36 @@ pub(crate) async fn seal_stream_planned<D: BlobWriteStore>(
             binding: binding.clone(),
         })
         .await?;
-    // v62.0.0 (wave GC7; CC 2.7.3) — the bytes checks above are refusals;
-    // what the transaction found reads other rows (the stream's chunks, its
-    // abandonment, the community epoch): held under a fold attempt.
-    use super::edition2::fold::reason;
+    // v62.0.0 (T2-fix8; lead's GC7 ruling) — this node's OWN seal of its
+    // own stream (LOCAL: the producer re-seals). Every arm is a refusal, not
+    // a fold hold: the seal runs outside any fold attempt, and no blocker
+    // here is released by another row's arrival.
     match written {
         SealWrite::Sealed => Ok(()),
-        SealWrite::Abandoned => Err(held_on(
-            reason::STREAM_ABANDONED,
-            stream_id,
-            blobs::stream_abandoned_refusal(stream_id),
-        )),
+        SealWrite::Abandoned => Err(blobs::stream_abandoned_refusal(stream_id)),
         // §12.3 — the manifest describes a stream that no longer exists:
         // refused, never truncated.
-        SealWrite::StreamMoved(count) => Err(held_on(
-            reason::STREAM_SEQ_HELD,
-            stream_id,
-            BlobError::InvalidArgument(format!(
-                "seal_stream_with_scope: stream {stream_id} has {count} chunk(s) but the \
-                 manifest was built over {expected_count}; the stream moved under the seal — \
-                 list it again (BLOB_ENCRYPTION_AT_REST.md §12.3)"
-            )),
-        )),
+        SealWrite::StreamMoved(count) => Err(BlobError::InvalidArgument(format!(
+            "seal_stream_with_scope: stream {stream_id} has {count} chunk(s) but the manifest \
+             was built over {expected_count}; the stream moved under the seal — list it again \
+             (BLOB_ENCRYPTION_AT_REST.md §12.3)"
+        ))),
         SealWrite::EpochMoved => {
             let b = binding.expect("EpochMoved only arises with a binding");
-            Err(held_on(
-                reason::STREAM_EPOCH_MOVED,
-                &b.community_key_id,
-                BlobError::EpochNotCurrent {
-                    community_key_id: b.community_key_id.clone(),
-                    epoch: b.epoch,
-                },
-            ))
+            Err(BlobError::EpochNotCurrent {
+                community_key_id: b.community_key_id.clone(),
+                epoch: b.epoch,
+            })
         }
     }
 }
 
-/// **I3916** (wave GC7; CC 2.7.3): the chunk savepoint's answers that read
-/// another row at the slot (a held seq, a moved epoch / counter, a closed
-/// epoch, a tombstone) mark a running fold attempt held with their reason
-/// and declare the stream; the epoch CAP (a resource limit) is a refusal
-/// and marks nothing; outside an attempt every one is the refusal it was.
+/// **I3916** (wave GC7; T2-fix8 per the lead's GC7 ruling): the chunk
+/// savepoint's slot answers (a held seq, a moved epoch / counter, a closed
+/// epoch) are terminal REFUSALS that mark nothing, even inside a fold
+/// attempt (no held chunk store; no blocker clears); the tombstone answer
+/// keeps its `blob_purged` mark; the epoch CAP (a resource limit) marks
+/// nothing; outside an attempt every one is the refusal it was.
 #[cfg(test)]
 mod gc7_fold_marks {
     use super::*;
@@ -1608,18 +1587,17 @@ mod gc7_fold_marks {
 
     #[tokio::test]
     async fn i3916_chunk_slot_answers_hold_and_the_cap_refuses() {
-        assert_eq!(
-            marked(ItemAppended::SeqConflict).await.as_deref(),
-            Some(reason::STREAM_SEQ_HELD)
-        );
-        assert_eq!(
-            marked(ItemAppended::StreamCounterMoved).await.as_deref(),
-            Some(reason::STREAM_EPOCH_MOVED)
-        );
-        assert_eq!(
-            marked(ItemAppended::StreamEpochClosed).await.as_deref(),
-            Some(reason::STREAM_EPOCH_MOVED)
-        );
+        for got in [
+            ItemAppended::SeqConflict,
+            ItemAppended::StreamCounterMoved,
+            ItemAppended::StreamEpochClosed,
+        ] {
+            assert_eq!(
+                marked(got).await,
+                None,
+                "I3916: a slot conflict is a terminal refusal, never a hold (GC7 ruling)"
+            );
+        }
         assert_eq!(
             marked(ItemAppended::Purged("n1".into())).await.as_deref(),
             Some(reason::BLOB_PURGED)

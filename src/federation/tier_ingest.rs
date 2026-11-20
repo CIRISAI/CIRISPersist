@@ -1197,7 +1197,51 @@ pub mod test_support {
         for (i, b) in key_id.bytes().take(32).enumerate() {
             seed[i] = b;
         }
+        guard_seed_collision(&seed, key_id);
         seed
+    }
+
+    /// v62.0.0 (E0 fix 7) — the seed of each name this process derived a
+    /// key from → the first name seen with it.
+    fn seed_names() -> &'static std::sync::Mutex<std::collections::HashMap<[u8; 32], String>> {
+        static NAMES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<[u8; 32], String>>,
+        > = std::sync::OnceLock::new();
+        NAMES.get_or_init(Default::default)
+    }
+
+    /// v62.0.0 (E0 fix 7) — **the 32-byte trap, made loud.** A test key seeds
+    /// from the FIRST 32 BYTES of its name, so two DIFFERENT names sharing
+    /// those bytes (`{uuid}-owner` / `{uuid}-node-1`: a 32-char tag in front)
+    /// are ONE key, and the failure surfaced far away as a refusal no one
+    /// could read (L1's I1891, E0's owner == node, E7's detector == root). The
+    /// derivation is unchanged (pinned keys and vectors depend on it). This
+    /// panics instead, naming both names.
+    ///
+    /// Exempt: one name EXTENDING the other (`fp_key_id`'s `<base>-<fp>`, a
+    /// witness of the truncation itself). Those deliberately name one key.
+    ///
+    /// # Panics
+    /// Two different names, neither a prefix of the other, with one seed.
+    pub(crate) fn guard_seed_collision(seed: &[u8; 32], name: &str) {
+        let mut names = seed_names().lock().expect("seed-name map");
+        match names.get(seed) {
+            None => {
+                names.insert(*seed, name.to_owned());
+            }
+            Some(seen)
+                if seen == name || seen.starts_with(name) || name.starts_with(seen.as_str()) => {}
+            Some(seen) => {
+                let seen = seen.clone();
+                drop(names);
+                panic!(
+                    "test key seed collision: {seen:?} and {name:?} share their first 32 bytes, \
+                     so they are ONE key (a test key seeds from the first 32 bytes of its name). \
+                     Put the role FIRST and the tag after it (`owner-{{tag}}`, not \
+                     `{{tag}}-owner`)."
+                );
+            }
+        }
     }
 
     /// The Ed25519 signer for `key_id` (deterministic).
@@ -3589,32 +3633,55 @@ pub mod test_support {
             crate::federation::SignedAttestation { attestation: b }
         };
 
-        // (1) ANNOUNCED — the minor's federation-scope owner-binding refuses,
-        // by its own typed reason, and nothing is stored.
-        // v62.0.0 (E0 fix 4) — an owner binding lands counted (owner + node,
-        // K2's `put_sealed_owner_binding`); the refusal is the minor gate's.
-        let err = put_sealed_owner_binding(
-            dir,
-            &binding(&minor, &node_a, cohort_scope::FEDERATION).attestation,
-            &node_a,
-        )
-        .await
-        .expect_err("a minor's owner-binding at cohort_scope federation must refuse");
-        assert!(
+        // (1) ANNOUNCED — the minor's federation-scope owner-binding is HELD.
+        // v62.0.0 (K2-fix8; CC 2.7.3, CC27-rulings X10: the minor-band leg
+        // reads OTHER rows, the owner's age witnesses, so it concludes
+        // nothing rather than refusing; GC1's
+        // `minor_owner_binding_at_federation`) — both voices are kept (the
+        // owner's and the node's), the row is `Pending` with that reason, no
+        // typed row is written and nobody owns the node.
+        let announced = binding(&minor, &node_a, cohort_scope::FEDERATION).attestation;
+        let held = if crate::federation::edition2::fixture_switch::emit_edition2() {
+            let out = crate::federation::edition2::fixture_switch::land_owner_binding(
+                dir, &announced, &node_a,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) the announced binding is kept: {e}"));
+            let crate::federation::edition2::ingest::StatementOutcome::Pending { row_id, .. } = out
+            else {
+                panic!("({suffix}) CC 5.4.6: a minor's announce never lands, got {out:?}");
+            };
+            let why = crate::federation::edition2::fold::why_held(dir, &row_id)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) read the hold: {e}"))
+                .unwrap_or_else(|| panic!("({suffix}) the announced binding is held"));
+            assert_eq!(
+                why.reason,
+                crate::federation::edition2::fold::reason::gc1::MINOR_OWNER_BINDING_AT_FEDERATION,
+                "({suffix}) CC 5.4.6: held as the announce of a minor: {why:?}"
+            );
+            true
+        } else {
+            let err = put_sealed_owner_binding(dir, &announced, &node_a)
+                .await
+                .expect_err("a minor's owner-binding at cohort_scope federation must refuse");
             matches!(
                 err,
                 crate::federation::Error::WriteScopeRefused(
                     crate::scope::ScopeRefusalReason::MinorOwnerBindingAtFederation
                 )
-            ),
-            "({suffix}) CC 5.4.6: refused as the announce of a minor, got {err:?}"
+            )
+        };
+        assert!(
+            held,
+            "({suffix}) CC 5.4.6: a minor's announced owner-binding never lands"
         );
         assert!(
             crate::federation::admission::owner_of(dir, &id_of(&node_a))
                 .await
                 .unwrap()
                 .is_none(),
-            "({suffix}) the refused binding left nothing behind"
+            "({suffix}) the held binding owns nothing"
         );
 
         // (2) The DERIVED plane — the same binding at `self` lands, and the
@@ -4148,27 +4215,89 @@ pub mod test_support {
     /// `expires_at` is stamped BEFORE the seal (it is bound in both directions
     /// since #598, so setting the column afterwards is the divergence the gate
     /// refuses).
+    ///
+    /// v62.0.0 (E0 fix 6) — under the switch the delegation must SEAT: the
+    /// author's statement and every second-signer voice its model names
+    /// (`fixture_switch::land_delegation`, K2's role reader). A delegation
+    /// left held PANICS, naming the unvoiced role (e.g. a machine delegate
+    /// with no bound owner: bind the owner first). A test that wants the held
+    /// state calls [`put_delegates_to_held`].
+    ///
+    /// # Panics
+    /// Under the switch, a delegation that does not land as a row.
     pub(crate) async fn put_delegates_to<D: crate::federation::FederationDirectory + ?Sized>(
         dir: &D,
         granter: &str,
         grantee: &str,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<String, crate::federation::Error> {
-        let id = uuid::Uuid::new_v4().to_string();
-        // v62.0.0 (E0) — under the switch the row is named by the id this
-        // node computes: no self-echo of a minted uuid (an edition-2 name is a
-        // row id), the statement put through the one entry, and the STORED
-        // id returned.
+        use crate::federation::edition2::ingest::StatementOutcome;
         if crate::federation::edition2::fixture_switch::emit_edition2() {
-            let envelope = serde_json::json!({ "id": id, "scope": ["act_on_behalf"] });
-            let mut row = bare_attestation(&id, granter, grantee, &envelope);
-            row.attestation_type =
-                crate::federation::types::attestation_type::DELEGATES_TO.to_owned();
-            row.expires_at = expires_at;
-            seal_row_in_place(granter, &mut row);
-            crate::federation::edition2::fixture_switch::put_signed(dir, &row).await?;
-            return Ok(crate::federation::edition2::fixture_switch::rid(&row));
+            let (id, out, missing) =
+                put_delegates_to_held(dir, granter, grantee, expires_at).await?;
+            if !matches!(out, StatementOutcome::Row { .. }) {
+                let roles: Vec<String> = missing
+                    .iter()
+                    .map(|m| format!("`{}`: {}", m.role, m.why))
+                    .collect();
+                panic!(
+                    "put_delegates_to({granter} -> {grantee}): the delegation is HELD ({out:?}), \
+                     not seated; unvoiced second-signer roles: [{}]. Stand up the missing \
+                     party (bind the owner first for a machine delegate), or call \
+                     put_delegates_to_held to witness the hold.",
+                    roles.join("; ")
+                );
+            }
+            return Ok(id);
         }
+        put_delegates_to_earlier(dir, granter, grantee, expires_at).await
+    }
+
+    /// v62.0.0 (E0 fix 6) — [`put_delegates_to`] that does NOT judge: the
+    /// stored id, the last statement's outcome (`Row`, or `Pending` while a
+    /// role is unvoiced) and the roles no fixture key could voice. For the
+    /// witnesses of the hold itself. Under the switch only.
+    ///
+    /// # Errors
+    /// The doors' refusals.
+    pub(crate) async fn put_delegates_to_held<
+        D: crate::federation::FederationDirectory + ?Sized,
+    >(
+        dir: &D,
+        granter: &str,
+        grantee: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<
+        (
+            String,
+            crate::federation::edition2::ingest::StatementOutcome,
+            Vec<crate::federation::edition2::fixture_switch::UnvoicedRole>,
+        ),
+        crate::federation::Error,
+    > {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({ "id": id, "scope": ["act_on_behalf"] });
+        let mut row = bare_attestation(&id, granter, grantee, &envelope);
+        row.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.to_owned();
+        row.expires_at = expires_at;
+        seal_row_in_place(granter, &mut row);
+        let (out, missing) =
+            crate::federation::edition2::fixture_switch::land_delegation(dir, &row).await?;
+        Ok((
+            crate::federation::edition2::fixture_switch::rid(&row),
+            out,
+            missing,
+        ))
+    }
+
+    async fn put_delegates_to_earlier<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        granter: &str,
+        grantee: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<String, crate::federation::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        // The earlier form (a test held there): the row under its minted id.
         let envelope = serde_json::json!({
             "references_attestation_id": id,
             "scope": ["act_on_behalf"],

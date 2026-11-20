@@ -1346,6 +1346,11 @@ where
     // binding is counted: the owner's, the bound key's and (naming one) the
     // affiliation's voices; short, the door keeps the voice (`Pending`).
     crate::federation::admission::check_owner_binding_counted(dir, &row).await?;
+    // v62.0.0 (K2-fix4, I3545; CC 2.7.3 / CC 2.7.5) — an authored row whose
+    // family's model names second signers waits (`Pending`, `count_short`)
+    // until every named role has voiced: the bound key on an owner binding,
+    // the delegate on a delegation, ... (the model's roles, not a list).
+    crate::federation::admission::check_second_signers_voiced(dir, &row).await?;
     // v62.0.0 (wave V1b, CC 4.4.3.12) — an affiliation's counted officer
     // appointment waits (`Pending`) for the quorum at the head it names.
     crate::federation::admission::check_officer_appointment_counted(dir, &row).await?;

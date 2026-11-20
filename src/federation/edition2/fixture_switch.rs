@@ -2153,25 +2153,39 @@ pub async fn land_owner_binding<D: FederationDirectory + ?Sized>(
     put_statement(dir, &voice).await
 }
 
-/// v62.0.0 (E0 fix 3) — **a counted row with its further voices**: the
-/// statement `row` carries (`put_signed`; a counted row short of its
-/// voices answers `Pending`), then each of `cosigners`' voices over the same
-/// payload ([`voice_of`]), in order. The outcome of the last put.
+/// v62.0.0 (K2-fix4; CC 2.7.3 as ruled on I3545) — **an authored row landed
+/// with its second signers' voices**: the author's statement the row carries
+/// ([`put_signed`]: held, `Pending`, while a role the family's model names
+/// has not voiced; `admission::check_second_signers_voiced`), then each of
+/// `seeds`' voices over the same payload ([`voice_of`], [`put_statement`]),
+/// in order. Returns the last statement's outcome (`Row` once every role has
+/// voiced). [`land_owner_binding`] is the `ownership:*` case
+/// (`bound_node`).
 ///
 /// # Errors
-/// The door's and the gates' refusals, at the first put that refuses.
-pub async fn put_with_voices<D: FederationDirectory + ?Sized>(
+/// The door's and the gates' refusals of any statement.
+///
+/// # Panics
+/// A row that carries no statement; a statement outside its signer's
+/// default window.
+pub async fn land_with_voices<D: FederationDirectory + ?Sized>(
     dir: &D,
     row: &Attestation,
-    cosigners: &[&str],
+    seeds: &[&str],
 ) -> Result<StatementOutcome, Error> {
-    let mut out = put_signed(dir, row).await?;
-    if cosigners.is_empty() {
-        return Ok(out);
+    let st = carried_statement(row).unwrap_or_else(|| {
+        panic!(
+            "fixture_switch: land_with_voices: row {} carries no statement",
+            row.attestation_id
+        )
+    });
+    let voices: Vec<Vec<u8>> = seeds.iter().map(|s| voice_of(&st, s)).collect();
+    for v in &voices {
+        check_default_window(v);
     }
-    let st = carried_statement(row).expect("put_signed checked it carries one");
-    for c in cosigners {
-        out = super::ingest::put_statement(dir, &voice_of(&st, c), None, tier_of(row)).await?;
+    let mut out = put_signed(dir, row).await?;
+    for v in &voices {
+        out = put_statement(dir, v).await?;
     }
     Ok(out)
 }
@@ -2180,10 +2194,10 @@ pub async fn put_with_voices<D: FederationDirectory + ?Sized>(
 /// `admission::check_owner_binding_counted`): the owner's statement, then
 /// the bound key's own (`row.attested_key_id`, the `bound_node` voice).
 /// An affiliation-naming binding also needs its members' voices: put those
-/// with [`put_with_voices`].
+/// with [`land_with_voices`].
 ///
 /// # Errors
-/// As [`put_with_voices`].
+/// As [`land_owner_binding`].
 pub async fn put_owner_binding_row<D: FederationDirectory + ?Sized>(
     dir: &D,
     row: &Attestation,
@@ -2191,6 +2205,127 @@ pub async fn put_owner_binding_row<D: FederationDirectory + ?Sized>(
     // One owner-binding path: K2's `land_owner_binding` (no second voicing).
     let node = row.attested_key_id.clone();
     land_owner_binding(dir, row, &node).await
+}
+
+/// v62.0.0 (E0 fix 3; one path since E0 fix 6) — a counted row with its
+/// further voices: exactly K2-fix4's [`land_with_voices`] (kept as a name the
+/// E lanes already call).
+///
+/// # Errors
+/// As [`land_with_voices`].
+pub async fn put_with_voices<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    row: &Attestation,
+    cosigners: &[&str],
+) -> Result<StatementOutcome, Error> {
+    land_with_voices(dir, row, cosigners).await
+}
+
+/// v62.0.0 (E0 fix 6) — a second-signer role the resolved model names that
+/// no fixture key can voice, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnvoicedRole {
+    /// The role's name in the family model (`delegate`, `delegate_owner`, ...).
+    pub role: String,
+    /// Why no voice was found (and what to do).
+    pub why: String,
+}
+
+/// v62.0.0 (E0 fix 6; CC 2.6.1.9 / 2.7.3 / 2.7.5) — **who must voice a row
+/// besides its author**, read from K2's resolved role reader
+/// ([`super::door::resolved_second_signer_roles`]: the exact list the gate
+/// counts against; `delegate_owner` already resolved to the machine sub's
+/// live owner, `[]` when it has none; no `delegate_owner` for a person sub;
+/// nothing for a group act). For each role: none needed when the author is
+/// one of its parties; else the first party this module can sign as (a minted
+/// kid, mapped back to its seed, or a registered foreign key). Returns the
+/// SEEDS to voice, in role order, and the roles no fixture key can fill.
+///
+/// # Errors
+/// The reader's directory reads.
+///
+/// # Panics
+/// A row that carries no statement.
+pub async fn second_signer_voices<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    row: &Attestation,
+) -> Result<(Vec<String>, Vec<UnvoicedRole>), Error> {
+    use super::door::SecondSignerParty;
+    let st = carried_statement(row).unwrap_or_else(|| {
+        panic!(
+            "fixture_switch: second_signer_voices: row {} carries no statement",
+            row.attestation_id
+        )
+    });
+    let author = row.attesting_key_id.clone();
+    let mut voices: Vec<String> = Vec::new();
+    let mut missing: Vec<UnvoicedRole> = Vec::new();
+    for r in super::door::resolved_second_signer_roles(dir, &st).await? {
+        let keys: Vec<String> = r
+            .parties
+            .iter()
+            .filter_map(|p| match p {
+                SecondSignerParty::Key(k) => Some(k.clone()),
+                // The resolved reader names Keys only; an unresolved owner
+                // is no party this fixture can voice.
+                SecondSignerParty::OwnerOf(_) => None,
+            })
+            .collect();
+        if keys.contains(&author) {
+            continue;
+        }
+        let signable = |k: &String| is_identity_ref(k) && (seed_of(k) != *k || is_foreign_kid(k));
+        match keys.iter().find(|k| signable(k)) {
+            Some(k) => {
+                let seed = if is_foreign_kid(k) {
+                    k.clone()
+                } else {
+                    seed_of(k)
+                };
+                if !voices.contains(&seed) {
+                    voices.push(seed);
+                }
+            }
+            None if keys.is_empty() && r.role == "delegate_owner" => missing.push(UnvoicedRole {
+                role: r.role.clone(),
+                why: format!(
+                    "the machine delegate {} has no bound owner: bind the owner first \
+                     (`tier_ingest::test_support::put_owner_binding`)",
+                    row.attested_key_id
+                ),
+            }),
+            None if keys.is_empty() => missing.push(UnvoicedRole {
+                role: r.role.clone(),
+                why: "the resolved model names no party for this role".to_owned(),
+            }),
+            None => missing.push(UnvoicedRole {
+                role: r.role.clone(),
+                why: format!(
+                    "no party {keys:?} is a key this fixture can sign as (register it with put_key)"
+                ),
+            }),
+        }
+    }
+    Ok((voices, missing))
+}
+
+/// v62.0.0 (E0 fix 6) — **a delegation landed with the voices its resolved
+/// model names**: the author's statement (the gate requires it), then each
+/// [`second_signer_voices`] seed's voice, through [`land_with_voices`]. A
+/// row with no second signer (a group act) is the author's statement alone.
+/// Returns the last outcome and the roles left unvoiced (the row is then
+/// `Pending`). It does not judge: `tier_ingest::test_support::put_delegates_to`
+/// panics unless the row seats; `put_delegates_to_held` returns the hold.
+///
+/// # Errors
+/// As [`land_with_voices`]; the reader's directory reads.
+pub async fn land_delegation<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    row: &Attestation,
+) -> Result<(StatementOutcome, Vec<UnvoicedRole>), Error> {
+    let (voices, missing) = second_signer_voices(dir, row).await?;
+    let refs: Vec<&str> = voices.iter().map(String::as_str).collect();
+    Ok((land_with_voices(dir, row, &refs).await?, missing))
 }
 
 /// [`statement_of`] put through the store; the row as mapped.
@@ -2760,6 +2895,35 @@ mod tests {
             Some(500_000),
             "I2552: the envelope's own weight"
         );
+    }
+
+    /// **I2555 (the 32-byte seed trap is loud)**: two DIFFERENT names
+    /// sharing their first 32 bytes, neither extending the other, panic at
+    /// the shared seed helper, naming both and the fix; a name extending
+    /// another (one key, deliberately: `fp_key_id`) is exempt; a name seen
+    /// again is fine.
+    #[test]
+    fn i2555_a_seed_collision_panics_naming_both() {
+        use crate::federation::tier_ingest::test_support::seed_for;
+        let tag = "i2555tag0123456789abcdef01234567"; // 32 bytes
+        assert_eq!(tag.len(), 32);
+        let owner = format!("{tag}-owner");
+        let node = format!("{tag}-node-1");
+        let _ = seed_for(&owner);
+        let _ = seed_for(&owner); // the same name again
+        let _ = seed_for(&format!("{owner}-extended")); // extends: exempt
+        let msg = std::panic::catch_unwind(|| seed_for(&node))
+            .expect_err("I2555: two names, one key, is refused")
+            .downcast::<String>()
+            .map(|b| *b)
+            .unwrap_or_default();
+        assert!(
+            msg.contains(&owner) && msg.contains(&node) && msg.contains("role FIRST"),
+            "I2555: names both and the fix: {msg}"
+        );
+        // Role first: distinct seeds, no collision.
+        let _ = seed_for(&format!("owner-{tag}"));
+        let _ = seed_for(&format!("node-1-{tag}"));
     }
 
     /// **I2554 (round 3: a fixture's own names and members)**: a composer
