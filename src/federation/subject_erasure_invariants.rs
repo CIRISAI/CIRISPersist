@@ -87,10 +87,11 @@ pub(crate) mod bodies {
             severity: crate::derived::DetectionSeverity::Warning,
             cohort_cell: serde_json::json!({"agent_role": "x"}),
             conformity_variant: crate::derived::ConformityVariant::Numeric,
-            // v62.0.0 (P8-fix12) — an integral score: a non-integral body real is a
-            // tag-4 decimal, which Verify 23.3.1's `ceg-value` refuses (admitted
-            // from 23.3.2, pass 4e). P8's I3535 keeps the tag-4 witness.
-            conformity_payload: serde_json::json!({"score": 1}),
+            // v62.0.0 (P8-fix17, pass 4e) — a FRACTIONAL score, as production
+            // detections carry: a non-integral body real is a tag-4 decimal
+            // (`0.25` → `4([-2, 25])`), which Verify 23.3.2's `ceg-value` admits
+            // (23.3.1 refused it, so P8-fix12 had rounded this to 1).
+            conformity_payload: serde_json::json!({"score": 0.25}),
             lens_core_version: "1.0.0".into(),
             ratchet_calibration_version: 3,
             canonical_bytes: format!("{{\"trace\":\"{trace}\"}}").into_bytes(),

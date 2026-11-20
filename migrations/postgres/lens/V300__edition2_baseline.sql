@@ -2007,7 +2007,7 @@ CREATE TABLE cirisnode.credits_ledger (
     domain text NOT NULL,
     language text NOT NULL,
     subject text NOT NULL,
-    balance double precision DEFAULT 0 NOT NULL,
+    balance numeric DEFAULT 0 NOT NULL,
     last_update_contribution text,
     last_updated_at timestamp with time zone DEFAULT now() NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -2020,13 +2020,13 @@ CREATE TABLE cirisnode.expertise_ledger (
     contributor_id text NOT NULL,
     domain text NOT NULL,
     language text NOT NULL,
-    expertise double precision DEFAULT 0 NOT NULL,
+    expertise numeric DEFAULT 0 NOT NULL,
     is_active boolean DEFAULT false NOT NULL,
     last_updated_at timestamp with time zone DEFAULT now() NOT NULL,
     last_update_contribution text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     attestation_id text,
-    CONSTRAINT expertise_ledger_expertise_check CHECK (((expertise >= (0)::double precision) AND (expertise <= (1)::double precision)))
+    CONSTRAINT expertise_ledger_expertise_check CHECK (((expertise >= (0)::numeric) AND (expertise <= (1)::numeric)))
 );
 
 COMMENT ON TABLE cirisnode.expertise_ledger IS 'v0.7.0 — derived Expertise balances per (contributor, cell). Routing-eligibility lookup uses the partial index for the WHERE is_active path.';
@@ -3041,7 +3041,7 @@ CREATE INDEX expertise_cell ON cirisnode.expertise_ledger USING btree (domain, l
 
 CREATE INDEX expertise_contributor ON cirisnode.expertise_ledger USING btree (contributor_id);
 
-CREATE INDEX expertise_routable ON cirisnode.expertise_ledger USING btree (domain, language, is_active) WHERE ((expertise > (0)::double precision) AND (is_active = true));
+CREATE INDEX expertise_routable ON cirisnode.expertise_ledger USING btree (domain, language, is_active) WHERE ((expertise > (0)::numeric) AND (is_active = true));
 
 CREATE INDEX federation_delivery_attestations_peer ON cirisnode.federation_delivery_attestations USING btree (peer_key_id);
 

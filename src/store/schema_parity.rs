@@ -125,6 +125,20 @@ pub(crate) const DIALECT_ENCODINGS: &[Encoding] = &[
     },
 ];
 
+/// v62.0.0 (P1-fix8; CC 2.6.1.5, the lead's ruling) — **the exact-decimal
+/// columns**: postgres `numeric`, sqlite canonical decimal `TEXT`. Not a
+/// general `real`/`text` licence: only these columns. Both backends bind the
+/// SAME canonical decimal `String`
+/// ([`crate::federation::ledger_projection::decimal`]) and read the same text
+/// back (`::text` on postgres), so no value is admitted by one and refused
+/// by the other, and nothing is rounded through a float. Bidirectional like
+/// [`PG_NARROWED_ID_COLUMNS`]: an entry whose pair is no longer
+/// `numeric`/`TEXT` fails until it is deleted.
+pub(crate) const EXACT_DECIMAL_COLUMNS: &[(&str, &str)] = &[
+    ("cirisnode.credits_ledger", "balance"),
+    ("cirisnode.expertise_ledger", "expertise"),
+];
+
 /// **Postgres columns typed `UUID` whose sqlite twin is unvalidated `TEXT`.**
 ///
 /// This is a *pinned inventory of a known divergence class*, not a licence.
@@ -292,7 +306,8 @@ pub(crate) const WRITE_COLUMN_DIVERGENCES: &[WriteColumnDivergence] = &[
 mod tests {
     use super::{
         Encoding, NullabilityDivergence, WriteColumnDivergence, DIALECT_ENCODINGS,
-        NULLABILITY_DIVERGENCES, PG_NARROWED_ID_COLUMNS, WRITE_COLUMN_DIVERGENCES,
+        EXACT_DECIMAL_COLUMNS, NULLABILITY_DIVERGENCES, PG_NARROWED_ID_COLUMNS,
+        WRITE_COLUMN_DIVERGENCES,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -922,6 +937,7 @@ mod tests {
         let pinned: BTreeSet<(&str, &str)> = PG_NARROWED_ID_COLUMNS.iter().copied().collect();
         let mut failures = Vec::new();
         let mut seen_pins: BTreeSet<(&str, &str)> = BTreeSet::new();
+        let mut seen_exact: BTreeSet<(&str, &str)> = BTreeSet::new();
 
         for (t, pcols) in &pg {
             let Some(twin) = sqlite_twin(t, &sq) else {
@@ -956,6 +972,18 @@ mod tests {
                 if let Some(k) = pin {
                     seen_pins.insert(k);
                 }
+                // v62.0.0 (P1-fix8) — an exact-decimal column: postgres
+                // `numeric`, sqlite `TEXT`, named, never by class.
+                let exact = EXACT_DECIMAL_COLUMNS
+                    .iter()
+                    .find(|(et, ec)| *et == t.as_str() && ec == c)
+                    .copied();
+                if let Some(k) = exact {
+                    if pcol.ty.trim().eq_ignore_ascii_case("numeric") && ks == "text" {
+                        seen_exact.insert(k);
+                        continue;
+                    }
+                }
                 if kp == ks || sanctioned.contains(&(kp.as_str(), ks.as_str())) {
                     continue;
                 }
@@ -969,6 +997,15 @@ mod tests {
         }
         // The pin is a partition, not a floor: a stale entry licenses nothing
         // and must go.
+        for k in EXACT_DECIMAL_COLUMNS {
+            if !seen_exact.contains(k) {
+                failures.push(format!(
+                    "{}.{} is pinned in EXACT_DECIMAL_COLUMNS but is no longer a postgres \
+                     `numeric` / sqlite `TEXT` pair — restore it or delete the pin.",
+                    k.0, k.1
+                ));
+            }
+        }
         for k in pinned.difference(&seen_pins) {
             failures.push(format!(
                 "{}.{} is pinned in PG_NARROWED_ID_COLUMNS but is no longer a postgres-UUID / \

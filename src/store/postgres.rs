@@ -23860,7 +23860,7 @@ where
                     &format!(
                         "INSERT INTO {table} (contributor_id, domain, language, subject, balance, \
                         last_update_contribution, last_updated_at, created_at, attestation_id) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)"
+                     VALUES ($1, $2, $3, $4, ($5::text)::numeric, $6, $7, $7, $8)"
                     ),
                     &[
                         &x.contributor_id,
@@ -23881,7 +23881,7 @@ where
                     &format!(
                     "INSERT INTO {table} (contributor_id, domain, language, expertise, is_active, \
                         last_updated_at, last_update_contribution, created_at, attestation_id) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8)"
+                     VALUES ($1, $2, $3, ($4::text)::numeric, $5, $6, $7, $6, $8)"
                 ),
                     &[
                         &x.contributor_id,
@@ -31691,7 +31691,7 @@ mod tests {
                 "deployment_trust_mode": "federated_peer"
             }),
             conformity_variant: ConformityVariant::Numeric,
-            conformity_payload: serde_json::json!({"score": 4}),
+            conformity_payload: serde_json::json!({"score": 3.7}),
             lens_core_version: "0.1.0".into(),
             ratchet_calibration_version: 1,
             canonical_bytes: b"{\"detection_id\":\"x\"}".to_vec(),

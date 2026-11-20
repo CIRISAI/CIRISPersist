@@ -15,36 +15,33 @@
 //! - **signature**: `mldsaSig || ed25519Sig` — `SIGNATURE_LEN = MLDSA65_SIG_LEN + 64`
 //!   and `CompositePublicKey::verify`, which splits at `MLDSA65_SIG_LEN`.
 //!
-//! A byte string of any other length yields `None`, never a guessed slice. When
-//! Verify ships named half accessors (asked for 23.3.2), the key helpers
-//! become one-line delegates and nothing else in persist changes.
+//! A byte string of any other length yields `None`, never a guessed slice.
+//!
+//! v62.0.0 (R1-v2332) — ciris-crypto v23.3.2 ships the named half accessors
+//! `CompositePublicKey::{ed25519_half, mldsa65_half}`, so the KEY helpers
+//! are one-line delegates to them; the signature split (a bare byte string,
+//! no type of its own) still reads the layout constants. The helpers keep
+//! their `Option` signatures so no caller changes.
 
-use ciris_crypto::composite::{
-    CompositePublicKey, MLDSA65_PK_LEN, MLDSA65_SIG_LEN, PUBLIC_KEY_LEN, SIGNATURE_LEN,
-};
+use ciris_crypto::composite::{CompositePublicKey, MLDSA65_SIG_LEN, SIGNATURE_LEN};
 
 /// The Ed25519 half of a composite public key (32 bytes).
 #[must_use]
 pub fn ed25519_public(key: &CompositePublicKey) -> Option<[u8; 32]> {
-    let (_mldsa, ed25519) = key_halves(key)?;
-    <[u8; 32]>::try_from(ed25519).ok()
+    <[u8; 32]>::try_from(&key.ed25519_half()[..]).ok()
 }
 
 /// The ML-DSA-65 half of a composite public key (`MLDSA65_PK_LEN` bytes).
 #[must_use]
 pub fn mldsa65_public(key: &CompositePublicKey) -> Option<&[u8]> {
-    key_halves(key).map(|(mldsa, _)| mldsa)
+    Some(&key.mldsa65_half()[..])
 }
 
 /// A composite public key's two halves, `(ML-DSA-65, Ed25519)`, in the
 /// composite's order.
 #[must_use]
 pub fn key_halves(key: &CompositePublicKey) -> Option<(&[u8], &[u8])> {
-    let bytes: &[u8] = key.as_bytes();
-    if bytes.len() != PUBLIC_KEY_LEN {
-        return None;
-    }
-    Some(bytes.split_at(MLDSA65_PK_LEN))
+    Some((&key.mldsa65_half()[..], &key.ed25519_half()[..]))
 }
 
 /// A composite signature's two halves, `(ML-DSA-65, Ed25519)`, in the
@@ -60,7 +57,7 @@ pub fn signature_halves(sig: &[u8]) -> Option<(&[u8], &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ciris_crypto::composite::CompositeSigningKey;
+    use ciris_crypto::composite::{CompositeSigningKey, MLDSA65_PK_LEN};
 
     /// I2423 (v62.0.0, C5-fix3) — **the shared split reads Verify's layout**,
     /// checked against independent derivations, never against itself:

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::family::SelectContext;
-use ciris_verify_core::edition2::{cose_key, sign_row_statement};
+use ciris_verify_core::edition2::{cose_key, sign_row_statement, MissingKey};
 
 use super::door::admit_row;
 use super::door_invariants::fixture::*;
@@ -357,10 +357,21 @@ fn i2101_a_record_signed_by_another_key_attaches_nothing() {
     // Naming no predecessor, it attaches nothing.
     held.insert_record(record_under(&c, &a, &iref(&c), 1_000, None));
     assert_eq!(held.key_of(&kid(&a), &kid(&c)), KeyOf::No, "I2101");
-    let v = verdict(&held, &row_as(&a, &iref(&c), 5_000));
+    // v62.0.0 (R1-v2332; CC 2.4.1.1, CIRISVerify 23.3.2) — nor does it make
+    // A live: a record held only in another key's voice waits on A's own
+    // voice before any key-of-issuer question is asked.
+    let waits_on = match held.liveness(&kid(&a), 5_000) {
+        Liveness::Waiting(m) => m,
+        other => panic!("I2101 A is not live, it waits: {other:?}"),
+    };
     assert!(
-        is_reason(&v, malformed_row::KID_NOT_OF_ISS),
-        "I2101 never C's key: {v}"
+        matches!(waits_on.as_slice(), [MissingKey::Voice { kid: k, .. }] if *k == kid(&a)),
+        "I2101 A's own voice: {waits_on:?}"
+    );
+    assert_eq!(
+        verdict(&held, &row_as(&a, &iref(&c), 5_000)),
+        "waiting",
+        "I2101 never C's key, and not live"
     );
     // v62.0.0 (R1 round 3; CC 2.6.1.9): naming C's own record, it is a
     // rotation C → A short of A's voice. It waits on that voice, and is

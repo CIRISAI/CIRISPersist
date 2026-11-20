@@ -8,9 +8,9 @@
 //!
 //! | file | Verify path at the tag |
 //! |---|---|
-//! | `edition2/row_statements_v3.json` (**Verify 23.3.0**, slice C3; v1 retired) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/row_statements_v4.json` (**Verify 23.3.2**, R1-v2332; v3 retired) | `src/ciris-verify-core/tests/vectors/edition2/` |
 //! | `edition2/key_of_iss_v1.json` (**Verify 23.3.0**, 24 cases) | `src/ciris-verify-core/tests/vectors/edition2/` |
-//! | `edition2/key_of_iss_v2.json` (**Verify 23.3.1**, tag b0933ba, 31 cases; R1, R1d) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/key_of_iss_v3.json` (**Verify 23.3.2**, 32 cases; R1-v2332; v2 retired) | `src/ciris-verify-core/tests/vectors/edition2/` |
 //! | `accord_halt/accord_halt_v2.json` (**Verify 23.3.0**; v1 retired) | `src/ciris-verify-core/tests/vectors/accord_halt/` |
 //! | `composite/mldsa65_ed25519_draft_kats.json` | `src/ciris-crypto/tests/vectors/composite/` |
 //! | `accord_lineage/accord_recovery_refusals_v1.json` | `src/ciris-verify-core/tests/vectors/accord_lineage/` |
@@ -29,7 +29,7 @@
 //!   counts they have at Verify tag 23.3.0 (ffd7af1).
 //!
 //! To re-pin from a later tag: copy the file, update its digest here, and
-//! say why in the CHANGELOG. `edition2/row_statements_v3.json` and
+//! say why in the CHANGELOG. `edition2/row_statements_v4.json` and
 //! `edition2/key_of_iss_v1.json` are the files persist's door replays
 //! (`edition2::verify_vectors_replay`, I1901, I2365–I2367);
 //! `accord_halt/accord_halt_v2.json` the halt door's
@@ -38,22 +38,23 @@
 /// `(path under tests/vectors/verify_v23/, bytes, pinned SHA-256)`.
 const PINNED: &[(&str, &[u8], &str)] = &[
     (
-        "edition2/row_statements_v3.json",
-        include_bytes!("../../tests/vectors/verify_v23/edition2/row_statements_v3.json"),
-        "0c072516dea1d89132567e0f343ca47a2183df79697651685aa557d739cdf920",
+        "edition2/row_statements_v4.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/row_statements_v4.json"),
+        "ec83f2d8dc4080c62bc5482d7eaa99f778d374c8f126df884ee416cf67cb0b93",
     ),
     (
         "edition2/key_of_iss_v1.json",
         include_bytes!("../../tests/vectors/verify_v23/edition2/key_of_iss_v1.json"),
         "bd584d9b31b7271dc86c05a29eec75044b5fe74aae8dd586701a227f09001333",
     ),
-    // v62.0.0 (R1, R1d) — CIRISVerify 23.3.1 (tag v23.3.1, b0933ba): the
-    // rc21 key check's known answers (step 8's four ways, the strict end
-    // rule, location_proof authored by its subject).
+    // v62.0.0 (R1-v2332) — CIRISVerify 23.3.2: the rc21 key check's known
+    // answers (step 8's four ways, the strict end rule, location_proof
+    // authored by its subject), the possession voice signed as the
+    // occurrence key (CC rc21 90d537b). v2 (23.3.1) is retired.
     (
-        "edition2/key_of_iss_v2.json",
-        include_bytes!("../../tests/vectors/verify_v23/edition2/key_of_iss_v2.json"),
-        "197be52f10ef880ae0632484158631166541cd4cc15ded6567f88b251d15c42d",
+        "edition2/key_of_iss_v3.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/key_of_iss_v3.json"),
+        "371eebcb647e802d522bf44fd979d7faa338d87c42a6af0377e5ab4aaab3a8f9",
     ),
     (
         "accord_halt/accord_halt_v2.json",
@@ -129,25 +130,25 @@ fn i1850_verify_v23_vectors_are_pinned_by_sha256() {
 /// Verify tag 23.3.0 (a re-copy from another tag is red here as well as on its digest).
 #[test]
 fn i2360_verify_23_3_vectors_carry_their_case_counts() {
-    let rows = vector("edition2/row_statements_v3.json");
+    let rows = vector("edition2/row_statements_v4.json");
     for (key, n) in [
-        ("valid", 4),
-        ("refusals", 42),
+        ("valid", 5),
+        ("refusals", 50),
         ("family", 9),
         ("family_vendored", 33),
         ("family_vendored_groups", 4),
-        ("key_directory", 4),
+        ("key_directory", 6),
         ("key_records", 17),
         ("objects", 6),
         ("references", 11),
     ] {
-        assert_eq!(len_of(&rows, key), n, "I2360: row_statements_v3 `{key}`");
+        assert_eq!(len_of(&rows, key), n, "I2360: row_statements_v4 `{key}`");
     }
     let key_of = vector("edition2/key_of_iss_v1.json");
     assert_eq!(len_of(&key_of, "cases"), 24, "I2360: key_of_iss_v1");
-    // v62.0.0 (R1) — Verify 23.3.1's v2 file (I4020 replays it).
-    let key_of_v2 = vector("edition2/key_of_iss_v2.json");
-    assert_eq!(len_of(&key_of_v2, "cases"), 31, "I2360: key_of_iss_v2");
+    // v62.0.0 (R1-v2332) — Verify 23.3.2's v3 file (I4020 replays it).
+    let key_of_v3 = vector("edition2/key_of_iss_v3.json");
+    assert_eq!(len_of(&key_of_v3, "cases"), 32, "I2360: key_of_iss_v3");
     let halt = vector("accord_halt/accord_halt_v2.json");
     for (key, n) in [("invocations", 21), ("lifecycles", 22), ("latch", 13)] {
         assert_eq!(len_of(&halt, key), n, "I2360: accord_halt_v2 `{key}`");

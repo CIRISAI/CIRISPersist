@@ -149,6 +149,9 @@ pub fn invalid_label(i: &Invalid) -> String {
         // v62.0.0 (R1; CIRISVerify 23.3.1, CC 2.6.1.8 step 4) — Verify's own
         // token for a span that covers no instant.
         Invalid::ValidUntilNotAfterAssertedAt => "valid_until_not_after_asserted_at".into(),
+        // v62.0.0 (R1-v2332; CIRISVerify 23.3.2, CC rc21 cddl 87–91) — a
+        // body number outside CBOR's integer range.
+        Invalid::BodyNumberUnrepresentable => "body_number_unrepresentable".into(),
         other => format!("{other:?}"),
     }
 }
@@ -419,6 +422,17 @@ pub fn admit_row(
                 crate::federation::malformed_row::VALID_UNTIL_NOT_AFTER_ASSERTED_AT,
                 "valid_until is not after asserted_at: the window [asserted_at, \
                  valid_until) covers no instant (CC 2.6.1.8 step 4)",
+            ));
+        }
+        // v62.0.0 (R1-v2332; CIRISVerify 23.3.2) — Verify's reader refuses a
+        // body number outside CBOR's integer range itself; the pure gate
+        // (`payloads::check_body_numbers`) refuses it first at this door, by
+        // the same token. A caller reaching Verify's verdict without the pure
+        // gate gets persist's token, not `edition2_statement_invalid`.
+        FamilyVerdict::Invalid(Invalid::BodyNumberUnrepresentable) => {
+            return Err(refuse(
+                crate::federation::malformed_row::BODY_NUMBER_UNREPRESENTABLE,
+                "a body number outside CBOR's integer range (CC 2.6.1.4)",
             ));
         }
         FamilyVerdict::Invalid(i) => {

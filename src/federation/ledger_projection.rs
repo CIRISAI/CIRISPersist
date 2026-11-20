@@ -32,6 +32,9 @@
 use super::types::attestation_type;
 use super::Attestation;
 
+pub mod decimal;
+pub use decimal::Decimal;
+
 /// The `credits:` family stem (CC 3.1.9.6). A leaf is
 /// `credits:{domain}:{language}:{subject}:v1`.
 pub const CREDITS_PREFIX: &str = "credits:";
@@ -61,8 +64,9 @@ pub struct CreditsProjection {
     pub language: String,
     /// `{subject}`.
     pub subject: String,
-    /// The balance.
-    pub balance: f64,
+    /// v62.0.0 (P1-fix8) — the balance, EXACT, as its canonical decimal
+    /// text ([`decimal`]): the row's own number, never an `f64`.
+    pub balance: String,
     /// The `source_contribution` member.
     pub source_contribution: Option<String>,
 }
@@ -76,8 +80,9 @@ pub struct ExpertiseProjection {
     pub domain: String,
     /// `{language}`.
     pub language: String,
-    /// Expertise in `[0, 1]`.
-    pub expertise: f64,
+    /// v62.0.0 (P1-fix8) — expertise in `[0, 1]`, EXACT, as its canonical
+    /// decimal text ([`decimal`]).
+    pub expertise: String,
     /// The active-tier flag.
     pub is_active: bool,
     /// The `source_contribution` member.
@@ -144,6 +149,15 @@ impl LedgerProjection {
     }
 }
 
+/// v62.0.0 (P1-fix7, P1-fix8) — is the EXACT decimal `n` (its source text,
+/// under `arbitrary_precision`) within `[0, 1]`? Read through the one
+/// body-number reader ([`Decimal::of_number`]). A value it cannot state
+/// exactly is not in range.
+#[must_use]
+pub fn decimal_in_unit(n: &serde_json::Number) -> bool {
+    Decimal::of_number(n).is_some_and(|d| d.in_unit())
+}
+
 /// `(domain, language, subject?)` of a ledger dimension, or `None` for a
 /// dimension that is not a ledger leaf: `credits:{domain}:{language}:{subject}:v1`
 /// or `expertise:{domain}:{language}:v1` (CC 3.1.7's trailing version
@@ -197,10 +211,9 @@ pub fn project_ledger_row(
     };
     let body = match ledger {
         Ledger::Credits => {
-            let balance = env.get(BALANCE_MEMBER)?.as_f64()?;
-            if !balance.is_finite() {
-                return None;
-            }
+            // v62.0.0 (P1-fix8) — the EXACT decimal, canonical text; a
+            // number the body-number reader cannot state is not projected.
+            let balance = Decimal::of_number(env.get(BALANCE_MEMBER)?.as_number()?)?.canonical();
             LedgerBody::Credits(CreditsProjection {
                 contributor_id: row.attested_key_id.clone(),
                 domain,
@@ -211,10 +224,14 @@ pub fn project_ledger_row(
             })
         }
         Ledger::Expertise => {
-            let expertise = env.get(EXPERTISE_MEMBER)?.as_f64()?;
-            if !(0.0..=1.0).contains(&expertise) {
+            // v62.0.0 (P1-fix7) — the range is judged on the EXACT decimal (a
+            // body number, `edition2::payloads::body_number`), never on its
+            // f64: `1.00000000000000001` is over 1 though its f64 is 1.0.
+            let exact = Decimal::of_number(env.get(EXPERTISE_MEMBER)?.as_number()?)?;
+            if !exact.in_unit() {
                 return None;
             }
+            let expertise = exact.canonical();
             let is_active = env.get(IS_ACTIVE_MEMBER)?.as_bool()?;
             LedgerBody::Expertise(ExpertiseProjection {
                 contributor_id: row.attested_key_id.clone(),
@@ -317,6 +334,23 @@ mod tests {
         );
         let p = project_ledger_row(&credits, Some("node")).expect("projects");
         assert_eq!(p.ledger(), Ledger::Credits);
+        // v62.0.0 (P1-fix8, I4004) — the balance is the row's EXACT number.
+        for (token, canon) in [
+            ("12.5", "12.5"),
+            ("0.12345678901234567890", "0.1234567890123456789"),
+            ("-3.50", "-3.5"),
+            ("2.0", "2"),
+        ] {
+            let r = row(
+                "credits:health:en:arc:v1",
+                "node",
+                serde_json::json!({"balance": serde_json::from_str::<serde_json::Value>(token).unwrap()}),
+            );
+            match project_ledger_row(&r, Some("node")).map(|p| p.body) {
+                Some(LedgerBody::Credits(c)) => assert_eq!(c.balance, canon, "I4004: {token}"),
+                other => panic!("I4004: {token} projects a balance: {other:?}"),
+            }
+        }
         assert_eq!(
             p.key(),
             ("contrib".into(), "health".into(), "en".into(), "arc".into())
@@ -353,6 +387,27 @@ mod tests {
             serde_json::json!({"expertise": 1.5, "is_active": true}),
         );
         assert!(project_ledger_row(&over, Some("node")).is_none());
+        // v62.0.0 (P1-fix7, I4004) — the range is the EXACT decimal's.
+        let n = |t: &str| -> serde_json::Value { serde_json::from_str(t).unwrap() };
+        for (text, admitted) in [
+            ("1", true),
+            ("1.0", true),
+            ("0", true),
+            ("0.30000000000000004", true),
+            ("1.00000000000000001", false),
+            ("-0.0000000000000001", false),
+        ] {
+            let r = row(
+                "expertise:health:en:v1",
+                "node",
+                serde_json::json!({"expertise": n(text), "is_active": true}),
+            );
+            assert_eq!(
+                project_ledger_row(&r, Some("node")).is_some(),
+                admitted,
+                "I4004: expertise {text} is judged exactly"
+            );
+        }
         let no_flag = row(
             "expertise:health:en:v1",
             "node",
@@ -374,7 +429,7 @@ mod tests {
                 domain: "d".into(),
                 language: "l".into(),
                 subject: "s".into(),
-                balance: 1.0,
+                balance: "1".into(),
                 source_contribution: None,
             }),
             attestation_id: id.into(),

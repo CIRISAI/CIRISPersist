@@ -18,5 +18,7 @@
 # SipHasher13 over name, version and text). Still unshipped: no node ran it.
 # dialect	version	name	checksum
 # v62.0.0 (P8-fix14): re-pinned over V300's appended restatement_key column (plain TEXT, written beside the row) and its index (both dialects; V300 is unshipped).
-sqlite	300	edition2_baseline	15633899536491953851
-postgres	300	edition2_baseline	15801953822701352571
+# v62.0.0 (P1-fix8): re-pinned for the exact ledger columns (numeric / canonical
+# decimal TEXT); V300 is still unshipped. Recomputed on the 4e-prep merged tree (1be745c6 + 4d.3 + P1-fix6/7/8).
+sqlite	300	edition2_baseline	3123189220795043183
+postgres	300	edition2_baseline	17856288883111543973

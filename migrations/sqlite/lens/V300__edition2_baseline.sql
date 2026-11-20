@@ -1847,7 +1847,7 @@ CREATE TABLE cirisnode_credits_ledger (
     domain                        TEXT NOT NULL,
     language                      TEXT NOT NULL,
     subject                       TEXT NOT NULL,
-    balance                       REAL NOT NULL DEFAULT 0,
+    balance                       TEXT NOT NULL DEFAULT '0',
     last_update_contribution      TEXT,
     last_updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     created_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
@@ -1859,8 +1859,8 @@ CREATE TABLE cirisnode_expertise_ledger (
     contributor_id                TEXT NOT NULL,
     domain                        TEXT NOT NULL,
     language                      TEXT NOT NULL,
-    expertise                     REAL NOT NULL DEFAULT 0
-        CHECK (expertise >= 0 AND expertise <= 1),
+    expertise                     TEXT NOT NULL DEFAULT '0'
+        CHECK (expertise IN ('0', '1') OR (expertise GLOB '0.*[1-9]' AND substr(expertise, 3) NOT GLOB '*[^0-9]*')),
     is_active                     INTEGER NOT NULL DEFAULT 0,
     last_updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     last_update_contribution      TEXT,
@@ -2604,7 +2604,7 @@ CREATE INDEX credits_cell        ON cirisnode_credits_ledger (domain, language);
 CREATE INDEX expertise_contributor ON cirisnode_expertise_ledger (contributor_id);
 CREATE INDEX expertise_cell        ON cirisnode_expertise_ledger (domain, language);
 CREATE INDEX expertise_routable    ON cirisnode_expertise_ledger (domain, language, is_active)
-    WHERE expertise > 0 AND is_active = 1;
+    WHERE expertise <> '0' AND is_active = 1;
 CREATE INDEX idx_scheduled_takedowns_pending
     ON cirisnode_scheduled_takedown_actions (scheduled_eviction_at)
     WHERE status = 'pending';

@@ -387,7 +387,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/federation/takedown_tombstone.rs#check_takedown_notice_row_admission	ciris-persist@61.4.2	b725b4eb7753aa38d99dee810b5c5071638e47aab4f370d40013f921ec7ea234
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_terms	ciris-persist@61.4.2	72445dfb40f4d94f9e86c58d0cfd6b796f13eff023e8bce7d8dbd18dd7d24215
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/cirisnode/rows.rs#plan_takedown_notice_row	ciris-persist@61.4.2	279734963c54d4b1915662c34cd6406f192a38820e448ef878e2f1c34f083b3e
-2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/ledger_projection.rs#project_ledger_row	ciris-persist@61.4.2	db16afc065967b1f182c47d2dd6f25eac9b0a1663950e84e29ea6f380e25e6f3
+2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/ledger_projection.rs#project_ledger_row	ciris-persist@61.4.2	0d61a666eb85d937e15732ed289e39d4115b70e314ed1cbd6bfaff519405ff5e
 2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/goal_projection.rs#fold_goal	ciris-persist@61.4.2	0e2ae819b2b1e281f1aff672ccfbe9a0d6a2c428832f9b3e21bf5fc6875634eb
 # v60.0.0 (S6v, CC v1.0-rc9 at the tag) — the CC governance policy table is a runtime
 # manifest; a two-path door reads its policy from it and runs the corridor at admission.
@@ -452,7 +452,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 # genesis bundle/2 and canonical standing (CC 5.3.4), key liveness (CC 3.1.3).
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/ingest.rs#put_statement	ciris-persist@61.4.2	a138f5bb93953b04783e0264169ea915ce4f5c3c4cb23d161aedf59c995bcbae
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/ingest.rs#apply_replicated_statement	ciris-persist@61.4.2	5be30bef6b94de51ebfe8408b3d90d7dbccb8e6f83d2c20001d06ea9a7b4e94f
-2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#admit_row	ciris-persist@61.4.2	2552dc8629184a7c391a8678962638537cf260ade20e270fd624ce063d2e1c3b
+2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#admit_row	ciris-persist@61.4.2	bf3b9e6cfccaf52afc8e5bd82df83428dbac842adea6a3a3436410907991b125
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#require_statement_form	ciris-persist@61.4.2	b34305537779c912398120e5f502e1c822cbb5ec5270fae7b41c918057ae109e
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#refuse_edition_one	ciris-persist@61.4.2	4a0b8b96d042831e6d4dd9cc78862c5d9d585d3c59d25c6ee877080c4bcebd04
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#refuse_earlier_form	ciris-persist@61.4.2	664f52340225294dcc3ec81e455fc1b40a86d3cd82d4078fe55543bf8046c71b

@@ -84,8 +84,11 @@ classifiers = [
 # v62.0.0 (CIRISVerify v23.3.1 re-pin, R1) — floor moves to v23.3.1 (`<24`) in
 # lockstep with the seven Rust pins: v62 needs 23.3.1's behaviour (what it
 # brings is listed in FSD/v62_wip/parallel/R1.md and the Cargo.toml comment).
+# v62.0.0 (CIRISVerify v23.3.2 re-pin, R1-v2332) — floor moves to v23.3.2
+# (`<24`) in lockstep with the Rust pins: the body-decimal ceg-value, the
+# own-voice key record and the possession voice's iss.
 dependencies = [
-    "ciris-verify>=23.3.1,<24",
+    "ciris-verify>=23.3.2,<24",
 ]
 dynamic = ["version"]
 

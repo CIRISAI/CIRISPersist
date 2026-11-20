@@ -149,21 +149,20 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         let mut stmt = guard
             .prepare(
                 "SELECT contributor_id, expertise FROM cirisnode_expertise_ledger \
-                 WHERE domain = ?1 AND language = ?2 \
-                   AND expertise > 0 AND is_active = 1 \
-                 ORDER BY expertise DESC",
+                 WHERE domain = ?1 AND language = ?2 AND is_active = 1",
             )
             .map_err(|e| map_sqlite_error(e, "routable_contributors prepare"))?;
         let rows = stmt
             .query_map(params![domain, language], |row| {
-                Ok(RoutableContributor {
-                    contributor_id: row.get::<_, String>(0)?,
-                    expertise: row.get::<_, f64>(1)?,
-                })
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|e| map_sqlite_error(e, "routable_contributors query"))?;
-        let out: Result<Vec<_>, _> = rows.collect();
-        out.map_err(|e| map_sqlite_error(e, "routable_contributors collect"))
+        let rows: Vec<(String, String)> = rows
+            .collect::<Result<_, _>>()
+            .map_err(|e| map_sqlite_error(e, "routable_contributors collect"))?;
+        // v62.0.0 (P1-fix8) — `TEXT` cannot order a decimal: the above-zero
+        // filter and the ranking are the exact rule both backends share.
+        super::service::rank_routable(rows)
     }
 
     async fn read_vote_weight(
@@ -175,46 +174,33 @@ impl NodeCoreService for SqliteNodeCoreBackend {
     ) -> Result<Option<VoteWeight>, Error> {
         let (credits, expertise_row) = {
             let guard = self.conn.lock();
-            let credits: Option<f64> = guard
+            let credits: Option<String> = guard
                 .query_row(
                     "SELECT balance FROM cirisnode_credits_ledger \
                      WHERE contributor_id = ?1 AND domain = ?2 \
                        AND language = ?3 AND subject = ?4",
                     params![contributor_id, domain, language, subject],
-                    |row| row.get::<_, f64>(0),
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()
                 .map_err(|e| map_sqlite_error(e, "read_vote_weight credits"))?;
-            let expertise_row: Option<(f64, bool)> = guard
+            let expertise_row: Option<(String, bool)> = guard
                 .query_row(
                     "SELECT expertise, is_active FROM cirisnode_expertise_ledger \
                      WHERE contributor_id = ?1 AND domain = ?2 AND language = ?3",
                     params![contributor_id, domain, language],
-                    |row| Ok((row.get::<_, f64>(0)?, row.get::<_, bool>(1)?)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
                 )
                 .optional()
                 .map_err(|e| map_sqlite_error(e, "read_vote_weight expertise"))?;
             (credits, expertise_row)
         };
-        let credits = credits.unwrap_or(0.0);
-        let (expertise, is_active) = expertise_row.unwrap_or((0.0, false));
-        if credits == 0.0 && expertise == 0.0 && !is_active {
-            return Ok(None);
-        }
-        // SCHEMA.md §5.2: expertise_multiplier = 1 + 4*expertise ([1, 5]);
-        // active_tier_multiplier = 1.5 if active else 0.5.
-        let expertise_multiplier = 1.0 + 4.0 * expertise;
-        let active_tier_multiplier = if is_active { 1.5 } else { 0.5 };
-        Ok(Some(VoteWeight {
-            contributor_id: contributor_id.to_owned(),
-            domain: domain.to_owned(),
-            language: language.to_owned(),
-            subject: subject.to_owned(),
+        // v62.0.0 (P1-fix8) — SCHEMA.md §5.2, exactly (the shared rule).
+        super::service::vote_weight_of(
+            (contributor_id, domain, language, subject),
             credits,
-            expertise_multiplier,
-            active_tier_multiplier,
-            weight: credits * expertise_multiplier * active_tier_multiplier,
-        }))
+            expertise_row,
+        )
     }
 
     async fn get_credits_ledger(
@@ -240,7 +226,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
-                            row.get::<_, f64>(4)?,
+                            row.get::<_, String>(4)?,
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, String>(6)?,
                             row.get::<_, String>(7)?,
@@ -257,7 +243,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 domain: d,
                 language: l,
                 subject: s,
-                balance,
+                // v62.0.0 (P1-fix8) — the exact decimal, canonical text.
+                balance: super::service::stored_decimal("balance", &balance)?.canonical(),
                 last_update_contribution: src,
                 last_updated_at: parse_datetime(&upd)?,
                 created_at: parse_datetime(&created)?,
@@ -287,7 +274,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
-                            row.get::<_, f64>(3)?,
+                            row.get::<_, String>(3)?,
                             row.get::<_, bool>(4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, Option<String>>(6)?,
@@ -304,7 +291,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 contributor_id: c,
                 domain: d,
                 language: l,
-                expertise,
+                expertise: super::service::stored_decimal("expertise", &expertise)?.canonical(),
                 is_active,
                 last_updated_at: parse_datetime(&upd)?,
                 last_update_contribution: src,

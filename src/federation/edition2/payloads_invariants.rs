@@ -104,9 +104,11 @@
 //! - **I3995** (CC ruling, free-form body numbers) — `body_number`: an
 //!   integral value is a plain integer (`2.0` → 2, `1e2` → 100), a
 //!   non-integral one tag 4 normalised (`0.5` → 4([-1,5]), `1.25` →
-//!   4([-2,125])), from the exact decimal text; a mantissa outside i64 and
-//!   an integral value outside the CBOR range are refused
-//!   `body_number_unrepresentable`.
+//!   4([-2,125])), from the exact decimal text; a mantissa or an integral
+//!   value outside the CBOR integer range (Verify 23.3.2's limit; P1-fix8
+//!   widened the mantissa from i64) is refused
+//!   `body_number_unrepresentable`, and the decoder reads every mantissa in
+//!   that range back exactly.
 //! - **I3996** — the reader refuses a non-normalised tag 4 (4([-1,50]),
 //!   4([0,3])) with `edition2_payload_invalid`, anywhere in a payload, at the
 //!   door's schema step.
@@ -131,6 +133,12 @@
 //!   (`chat:*`, an unmapped family whose `refs` roles are open; only the
 //!   `also` roles are closed), and at the door (sqlite, postgres) such a
 //!   statement passes the pure gates and reaches the directory.
+//! - **I4003** (P1-fix6; the lead's ruling) — a ledger's `balance` /
+//!   `expertise` are body numbers: the encoder states a non-integral one as
+//!   the normalised tag-4 decimal and an integral one as an integer (never
+//!   fixed6, never refused); the mapping reads it back exactly. The
+//!   store-backed round trip is `ledger_projection_invariants` I1166 / I1169
+//!   (12.5, 7.25, 3.5 projected, sqlite and postgres).
 //! - **I2919** (wave P1d) — the list is enforced AT THE DOOR: for each mapped
 //!   family, a statement whose payload breaks its list (an unknown member, a
 //!   missing required one, a wrong type, a closed leaf) is refused
@@ -2491,8 +2499,43 @@ fn i3995_body_numbers_are_exact_decimals() {
     ] {
         assert_eq!(body_number(&num(text)).unwrap(), want, "I3995 {text}");
     }
+    // v62.0.0 (P1-fix8, aligned with Verify 23.3.2 per R1-v2332) — a
+    // mantissa anywhere in the CBOR integer range states, past i64 included,
+    // and the decoder reads it back as the same text.
+    let tag4_raw = |e: i64, m: Value| {
+        Value::Tag(
+            4,
+            Box::new(Value::Array(vec![Value::Nint(e.unsigned_abs() - 1), m])),
+        )
+    };
+    for (text, want) in [
+        // i64::MAX + 1: past i64, inside CBOR's range.
+        (
+            "92233720368547758.08",
+            tag4_raw(-2, Value::Uint(9_223_372_036_854_775_808)),
+        ),
+        // -2^64, the bottom of the CBOR integer range.
+        (
+            "-184467440737095516.16",
+            tag4_raw(-2, Value::Nint(u64::MAX)),
+        ),
+        (
+            "0.12345678901234567891",
+            tag4_raw(-20, Value::Uint(12_345_678_901_234_567_891)),
+        ),
+    ] {
+        let got = body_number(&num(text)).unwrap();
+        assert_eq!(got, want, "I3995 {text}");
+        assert_eq!(
+            super::payloads::json_number_of_decimal(&got).map(|n| n.to_string()),
+            Some(text.to_owned()),
+            "I3995 {text} decodes exactly"
+        );
+    }
     for text in [
-        "92233720368547758.08",
+        // 2^64: one past the top of the CBOR integer range.
+        "184467440737095516.16",
+        "-184467440737095516.17",
         "1e40",
         "-1e40",
         "0.123456789012345678901",
@@ -2791,4 +2834,61 @@ fn i4002_a_chat_reply_and_reaction_name_their_message() {
         ("refs", refs(vec![("target", ref2(&[0xa9; 32]))])),
     ]);
     check_by_id(&chat, "withdraws", &withdraws).expect("I4002 the author withdraws a reaction");
+}
+
+/// I4003: a ledger balance is a body number, exact both ways.
+#[test]
+fn i4003_a_ledger_balance_is_an_exact_body_number() {
+    use super::emit::payload_from_envelope;
+    use super::payloads::is_body_member;
+    use ciris_verify_core::namespace_match::family_id;
+    let credits = family_id("credits:{domain}:{language}:{subject}");
+    let expertise = family_id("expertise:{domain}:{language}");
+    assert!(is_body_member(&credits, "balance"), "I4003 balance");
+    assert!(is_body_member(&expertise, "expertise"), "I4003 expertise");
+    let n = |t: &str| -> serde_json::Value { serde_json::from_str(t).unwrap() };
+    for (text, want, back) in [
+        ("12.5", tag4(-1, 125), "12.5"),
+        ("7.25", tag4(-2, 725), "7.25"),
+        ("3", Value::Uint(3), "3"),
+        ("2.0", Value::Uint(2), "2"),
+    ] {
+        let env = serde_json::json!({
+            "dimension": "credits:code:en:rust:v1",
+            "score": n("0.5"),
+            "balance": n(text),
+        });
+        let p = payload_from_envelope(&env, &credits, 7, None, &[])
+            .unwrap_or_else(|e| panic!("I4003 {text}: the producer states it: {e:?}"));
+        assert_eq!(
+            p.get_text("balance"),
+            Some(&want),
+            "I4003 {text} on the wire"
+        );
+        assert_eq!(
+            p.get_text("score"),
+            Some(&Value::Uint(500_000)),
+            "I4003 score stays fixed6"
+        );
+        let a = super::ingest::attestation_of(&admitted(&credits, p), "federation").unwrap();
+        assert_eq!(
+            a.attestation_envelope["balance"].to_string(),
+            back,
+            "I4003 {text} reads back exactly"
+        );
+    }
+    // An expertise in [0, 1], a decimal.
+    let env = serde_json::json!({ "dimension": "expertise:code:en:v1", "expertise": n("0.75") });
+    let p = payload_from_envelope(&env, &expertise, 7, None, &[]).unwrap();
+    assert_eq!(
+        p.get_text("expertise"),
+        Some(&tag4(-2, 75)),
+        "I4003 expertise"
+    );
+    // Outside the ledger members a real is still refused.
+    let env = serde_json::json!({ "dimension": "credits:code:en:rust:v1", "ratio": n("0.5") });
+    assert!(
+        payload_from_envelope(&env, &credits, 7, None, &[]).is_err(),
+        "I4003 refused"
+    );
 }

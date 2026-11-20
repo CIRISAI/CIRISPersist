@@ -559,7 +559,7 @@ pub(crate) mod engine_bodies {
                 domain: "health".into(),
                 language: "en".into(),
                 subject: "arc_question".into(),
-                new_balance: 6.5,
+                new_balance: "6.5".into(),
                 source_contribution: nid.clone(),
             })
             .await
@@ -578,7 +578,36 @@ pub(crate) mod engine_bodies {
         }
         .unwrap()
         .expect("I1170: the ledger holds the balance");
-        assert_eq!((ledger.balance, ledger.attestation_id), (6.5, Some(bid)));
+        assert_eq!(
+            (ledger.balance, ledger.attestation_id),
+            ("6.5".to_owned(), Some(bid))
+        );
+        // v62.0.0 (P1-fix8, I4008) — the vote weight from the projection,
+        // exact decimal arithmetic on both backends: 6.5 × 1 × 0.5.
+        let w = match e.node_core_service() {
+            #[cfg(feature = "postgres")]
+            crate::engine::NodeCoreDispatch::Postgres(b) => {
+                b.read_vote_weight(&alice.id, "health", "en", "arc_question")
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            crate::engine::NodeCoreDispatch::Sqlite(b) => {
+                b.read_vote_weight(&alice.id, "health", "en", "arc_question")
+                    .await
+            }
+        }
+        .unwrap()
+        .expect("I4008: a balance weighs");
+        assert_eq!(
+            (
+                w.credits.as_str(),
+                w.expertise_multiplier.as_str(),
+                w.active_tier_multiplier.as_str(),
+                w.weight.as_str()
+            ),
+            ("6.5", "1", "0.5", "3.25"),
+            "I4008: exact"
+        );
         e.check_silo_projection(crate::federation::silo_projection::SiloProjection::CreditsLedger)
             .await
             .expect("I1170: the ledger is its rebuild");
@@ -806,7 +835,7 @@ pub(crate) mod engine_bodies {
                 contributor_id: alice.to_owned(),
                 domain: "health".into(),
                 language: "en".into(),
-                new_expertise: 0.25,
+                new_expertise: "0.25".into(),
                 new_active_tier: true,
                 source_contribution: aid.to_owned(),
             })
@@ -825,7 +854,30 @@ pub(crate) mod engine_bodies {
         }
         .unwrap()
         .expect("I1170: the expertise ledger holds it");
-        assert_eq!((ledger.expertise, ledger.attestation_id), (0.25, Some(xid)));
+        assert_eq!(
+            (ledger.expertise, ledger.attestation_id),
+            ("0.25".to_owned(), Some(xid))
+        );
+        // v62.0.0 (P1-fix8, I4008) — routing reads the exact decimal.
+        let routable = match e.node_core_service() {
+            #[cfg(feature = "postgres")]
+            crate::engine::NodeCoreDispatch::Postgres(b) => {
+                b.routable_contributors("health", "en").await
+            }
+            #[cfg(feature = "sqlite")]
+            crate::engine::NodeCoreDispatch::Sqlite(b) => {
+                b.routable_contributors("health", "en").await
+            }
+        }
+        .unwrap();
+        assert_eq!(
+            routable,
+            vec![crate::cirisnode::RoutableContributor {
+                contributor_id: alice.to_owned(),
+                expertise: "0.25".into(),
+            }],
+            "I4008: routable, exactly"
+        );
     }
 
     /// I1170 (rehome) — a pre-V203 balance is moved by the Engine's rehome.
@@ -909,7 +961,7 @@ mod run {
         let sq = e.sqlite_backend().expect("sqlite").clone();
         let sql = format!(
             "INSERT INTO cirisnode_expertise_ledger (contributor_id, domain, language, \
-             expertise, is_active) VALUES ('{}', 'health', 'en', 0.5, 1)",
+             expertise, is_active) VALUES ('{}', 'health', 'en', '0.5', 1)",
             e.local_derived_key_id().await.unwrap()
         );
         super::engine_bodies::i1170_the_rehome_moves_a_legacy_balance(&e, async move {

@@ -296,10 +296,12 @@ pub fn json_of(v: &Value) -> serde_json::Value {
         ),
         Value::Bool(b) => J::Bool(*b),
         Value::Null => J::Null,
-        // v62.0.0 (wave P1e; lead's ruling) — a normalised tag-4 decimal (a
-        // free-form body's non-integral number) reads back as its EXACT JSON
-        // number (`payloads::json_number_of_decimal`); any other tag keeps
-        // the tagged form.
+        // v62.0.0 (wave P1e; lead's ruling; P1-fix6) — a normalised tag-4
+        // decimal (a body number: a ledger balance, a free-form body's real)
+        // reads back as its EXACT JSON number
+        // (`payloads::json_number_of_decimal`), so the earlier readers (the
+        // ledger projection's `as_f64`) see a number; any other tag keeps the
+        // tagged form.
         Value::Tag(4, _) if super::payloads::json_number_of_decimal(v).is_some() => {
             super::payloads::json_number_of_decimal(v).map_or(J::Null, J::Number)
         }

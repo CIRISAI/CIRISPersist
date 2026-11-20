@@ -339,6 +339,42 @@ fn envelope(
     EnvelopeCore::from_value(members).map_err(Error::from)
 }
 
+/// v62.0.0 (P1-fix8) — [`envelope`] with the `score` given as an exact JSON
+/// number (a six-place decimal), not an `f64`.
+fn envelope_with_score(
+    mut members: serde_json::Value,
+    dimension: &str,
+    score: serde_json::Number,
+) -> Result<EnvelopeCore, Error> {
+    members["dimension"] = serde_json::json!(dimension);
+    members["score"] = serde_json::Value::Number(score);
+    members["confidence"] = serde_json::json!(1.0);
+    EnvelopeCore::from_value(members).map_err(Error::from)
+}
+
+/// v62.0.0 (P1-fix8; CC 2.6.1.5) — a ledger input as its exact decimal: the
+/// canonical decimal text only (`crate::federation::ledger_projection::decimal`).
+fn exact_member(
+    field: &str,
+    text: &str,
+) -> Result<crate::federation::ledger_projection::Decimal, Error> {
+    use crate::federation::ledger_projection::Decimal;
+    // Canonical, AND statable on the wire: a tag-4 mantissa is a CBOR
+    // integer (`-2^64 ..= 2^64 - 1`, as Verify 23.3.2), so a balance with
+    // more significant digits is refused here, not at the encoder.
+    Decimal::parse_canonical(text)
+        .filter(|d| Decimal::of_number(&d.json_number()).as_ref() == Some(d))
+        .ok_or_else(|| {
+            let hint = Decimal::parse(text)
+                .map(|d| format!(" (canonical: {})", d.canonical()))
+                .unwrap_or_default();
+            Error::InvalidArgument(format!(
+                "{field} {text:?} is not a canonical decimal{hint}: an integer as plain digits, \
+                 else [-]I.F with no trailing zero, its digits within the wire's CBOR-integer mantissa"
+            ))
+        })
+}
+
 fn input(env: EnvelopeCore) -> EmitAttestationInput {
     EmitAttestationInput::with_envelope(attestation_type::SCORES, env, cohort_scope::FEDERATION)
 }
@@ -624,12 +660,10 @@ pub async fn plan_reconsideration_ruling_row(
 ///
 /// # Errors
 ///
-/// [`Error::InvalidArgument`] for a non-finite balance or a non-vocabulary
-/// segment.
+/// [`Error::InvalidArgument`] for a balance that is not canonical decimal
+/// text (v62.0.0 P1-fix8: exact, one spelling) or a non-vocabulary segment.
 pub fn plan_credits_row(u: &CreditsUpdate) -> Result<EmitAttestationInput, Error> {
-    if !u.new_balance.is_finite() {
-        return Err(Error::InvalidArgument("new_balance is not finite".into()));
-    }
+    let balance = exact_member("new_balance", &u.new_balance)?;
     for (f, v) in [("domain", &u.domain), ("subject", &u.subject)] {
         vocab_segment(f, v)?;
     }
@@ -639,7 +673,7 @@ pub fn plan_credits_row(u: &CreditsUpdate) -> Result<EmitAttestationInput, Error
         ));
     }
     let members = serde_json::json!({
-        lp::BALANCE_MEMBER: u.new_balance,
+        lp::BALANCE_MEMBER: balance.json_number(),
         lp::SOURCE_CONTRIBUTION_MEMBER: u.source_contribution,
     });
     let dimension = format!(
@@ -660,9 +694,11 @@ pub fn plan_credits_row(u: &CreditsUpdate) -> Result<EmitAttestationInput, Error
 ///
 /// # Errors
 ///
-/// [`Error::InvalidArgument`] for an expertise outside `[0, 1]`.
+/// [`Error::InvalidArgument`] for an expertise that is not canonical
+/// decimal text or is outside `[0, 1]` (judged exactly).
 pub fn plan_expertise_row(u: &ExpertiseUpdate) -> Result<EmitAttestationInput, Error> {
-    if !(0.0..=1.0).contains(&u.new_expertise) {
+    let expertise = exact_member("new_expertise", &u.new_expertise)?;
+    if !expertise.in_unit() {
         return Err(Error::InvalidArgument(format!(
             "new_expertise must be in [0, 1] (got {})",
             u.new_expertise
@@ -675,12 +711,16 @@ pub fn plan_expertise_row(u: &ExpertiseUpdate) -> Result<EmitAttestationInput, E
         ));
     }
     let members = serde_json::json!({
-        lp::EXPERTISE_MEMBER: u.new_expertise,
+        lp::EXPERTISE_MEMBER: expertise.json_number(),
         lp::IS_ACTIVE_MEMBER: u.new_active_tier,
         lp::SOURCE_CONTRIBUTION_MEMBER: u.source_contribution,
     });
     let dimension = format!("{}{}:{}:v1", lp::EXPERTISE_PREFIX, u.domain, u.language);
-    let mut row = input(envelope(members, &dimension, u.new_expertise)?);
+    // The `score` is fixed6 (CC 2.6.1.5): the expertise rounded half away
+    // from zero to six places, EXACTLY, handed to the encoder as that
+    // six-place decimal (whose `f64` × 10⁶ rounds back to the same integer).
+    let score = expertise.round_half_away_to(6).json_number();
+    let mut row = input(envelope_with_score(members, &dimension, score)?);
     row.attested_key_id = Some(u.contributor_id.clone());
     Ok(row)
 }
@@ -1101,7 +1141,7 @@ mod tests {
             domain: "health".into(),
             language: "en".into(),
             subject: "arc_question".into(),
-            new_balance: -3.5,
+            new_balance: "-3.5".into(),
             source_contribution: "c1".into(),
         })
         .unwrap();
@@ -1120,7 +1160,7 @@ mod tests {
             contributor_id: "alice".into(),
             domain: "health".into(),
             language: "en".into(),
-            new_expertise: 0.25,
+            new_expertise: "0.25".into(),
             new_active_tier: true,
             source_contribution: "c1".into(),
         })
@@ -1137,7 +1177,7 @@ mod tests {
                 domain: "health".into(),
                 language: lang.into(),
                 subject: "arc_question".into(),
-                new_balance: 1.0,
+                new_balance: "1".into(),
                 source_contribution: "c1".into(),
             });
             assert!(c.is_err(), "credits {who:?}/{lang:?}");
@@ -1145,24 +1185,84 @@ mod tests {
                 contributor_id: who.into(),
                 domain: "health".into(),
                 language: lang.into(),
-                new_expertise: 0.5,
+                new_expertise: "0.5".into(),
                 new_active_tier: true,
                 source_contribution: "c1".into(),
             });
             assert!(x.is_err(), "expertise {who:?}/{lang:?}");
         }
         assert!(plan_expertise_row(&ExpertiseUpdate {
-            new_expertise: 1.5,
+            new_expertise: "1.5".into(),
             ..ExpertiseUpdate {
                 contributor_id: "a".into(),
                 domain: "d".into(),
                 language: "en".into(),
-                new_expertise: 0.0,
+                new_expertise: "0".into(),
                 new_active_tier: false,
                 source_contribution: "c".into(),
             }
         })
         .is_err());
+        // v62.0.0 (P1-fix8, I4004) — exact: one spelling, the range judged on
+        // the decimal, and the fixed6 score rounded exactly.
+        let ex = |e: &str| {
+            plan_expertise_row(&ExpertiseUpdate {
+                contributor_id: "a".into(),
+                domain: "d".into(),
+                language: "en".into(),
+                new_expertise: e.into(),
+                new_active_tier: false,
+                source_contribution: "c".into(),
+            })
+        };
+        for bad in [
+            "1.00000000000000001",
+            "-0.0000000000000001",
+            "0.50",
+            "1.0",
+            "5e-1",
+            "x",
+        ] {
+            assert!(ex(bad).is_err(), "I4004: expertise {bad:?} is refused");
+        }
+        let v = ex("0.12345678901234567890".trim_end_matches('0'))
+            .unwrap()
+            .attestation_envelope
+            .to_value();
+        assert_eq!(v["expertise"].to_string(), "0.1234567890123456789", "I4004");
+        assert_eq!(v["score"].to_string(), "0.123457", "I4004: fixed6, exact");
+        let cr = |b: &str| {
+            plan_credits_row(&CreditsUpdate {
+                contributor_id: "a".into(),
+                domain: "d".into(),
+                language: "en".into(),
+                subject: "s".into(),
+                new_balance: b.into(),
+                source_contribution: "c".into(),
+            })
+        };
+        for bad in [
+            "1.50",
+            "-0",
+            "1e2",
+            "2.0",
+            "",
+            "NaN",
+            "0.123456789012345678901",
+        ] {
+            assert!(cr(bad).is_err(), "I4004: balance {bad:?} is refused");
+        }
+        // 20 significant digits: a mantissa past i64, inside CBOR's range.
+        let v = cr("-0.12345678901234567891")
+            .unwrap()
+            .attestation_envelope
+            .to_value();
+        assert_eq!(v["balance"].to_string(), "-0.12345678901234567891", "I4004");
+        let v = cr("0.30000000000000004")
+            .unwrap()
+            .attestation_envelope
+            .to_value();
+        assert_eq!(v["balance"].to_string(), "0.30000000000000004", "I4004");
     }
 
     /// I1168 (unit) — the retired objects are refused BY NAME: a

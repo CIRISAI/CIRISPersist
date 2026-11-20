@@ -407,6 +407,28 @@ impl HeldKeys {
         let Some(statements) = self.records.get(kid) else {
             return Err(Liveness::NotHeld);
         };
+        // v62.0.0 (R1-v2332; CC 2.4.1.1, CIRISVerify 23.3.2 `resolve`) — each
+        // key's own holder signs its record, and no third party makes a key
+        // live: a record of `kid` held only in other keys' voices waits on
+        // `kid`'s own voice over it (`MissingKey::Voice`), never on the
+        // other signer's key, and never reads live.
+        if !statements
+            .iter()
+            .any(|st| super::ingest::statement_kid(st) == Some(*kid))
+        {
+            return Err(
+                match statements
+                    .first()
+                    .and_then(|st| super::names::RowId::of_statement(st.as_slice()))
+                {
+                    Some(row) => Liveness::Waiting(vec![MissingKey::Voice {
+                        kid: *kid,
+                        row: row.0,
+                    }]),
+                    None => Liveness::Invalid,
+                },
+            );
+        }
         let mut valid: Vec<ValidRecord> = Vec::new();
         let mut waiting: Vec<MissingKey> = Vec::new();
         for st in statements {
@@ -443,6 +465,13 @@ impl HeldKeys {
                 Verdict::Invalid(_) => {}
             }
         }
+        // R1-v2332 — only a record row carrying `kid`'s own voice counts.
+        let own_rows: Vec<Digest32> = valid
+            .iter()
+            .filter(|v| v.signer == *kid)
+            .map(|v| v.row_id)
+            .collect();
+        valid.retain(|v| own_rows.contains(&v.row_id));
         if valid.is_empty() {
             return Err(if waiting.is_empty() {
                 Liveness::Invalid

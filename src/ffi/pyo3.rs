@@ -21470,7 +21470,8 @@ impl PyEngine {
     }
 
     /// v60.0.0 — Set a credits balance: `update_json` is a
-    /// [`CreditsUpdate`](crate::cirisnode::CreditsUpdate). Emits this node's
+    /// [`CreditsUpdate`](crate::cirisnode::CreditsUpdate), `new_balance` an exact
+    /// canonical decimal STRING (v62 P1-fix8; not a JSON number). Emits this node's
     /// `credits:{domain}:{language}:{subject}` row, projected into the
     /// credits ledger. Returns the row's id.
     #[cfg(feature = "cirisnode")]
@@ -21489,7 +21490,8 @@ impl PyEngine {
     }
 
     /// v60.0.0 — Set an expertise balance: `update_json` is an
-    /// [`ExpertiseUpdate`](crate::cirisnode::ExpertiseUpdate). Emits this
+    /// [`ExpertiseUpdate`](crate::cirisnode::ExpertiseUpdate), `new_expertise`
+    /// an exact canonical decimal STRING in [0, 1] (v62 P1-fix8). Emits this
     /// node's `expertise:{domain}:{language}` row. Returns the row's id.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_update_expertise_ledger(
@@ -21599,7 +21601,8 @@ impl PyEngine {
 
     /// v0.7.0 — List active routable contributors for `(domain,
     /// language)` (the expertise projection). JSON array of
-    /// `RoutableContributor`.
+    /// `RoutableContributor`, `expertise` an exact decimal string (v62 P1-fix8),
+    /// ranked exactly.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_routable_contributors(
         &self,
@@ -21615,7 +21618,8 @@ impl PyEngine {
     }
 
     /// v0.7.0 — `Credits × expertise_multiplier × active_tier_multiplier`
-    /// per SCHEMA.md §5.2, from the projections. JSON `VoteWeight` or None.
+    /// per SCHEMA.md §5.2, from the projections. JSON `VoteWeight` or None;
+    /// v62 P1-fix8: every number an exact decimal string, computed exactly.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_read_vote_weight(
         &self,
@@ -21698,7 +21702,7 @@ impl PyEngine {
     }
 
     /// v0.7.0 — Point-lookup one credits-ledger row (the projection). JSON
-    /// `CreditsLedgerEntry` or None.
+    /// `CreditsLedgerEntry` or None; `balance` an exact decimal string (v62 P1-fix8).
     #[cfg(feature = "cirisnode")]
     fn cirisnode_get_credits_ledger(
         &self,
@@ -21722,7 +21726,7 @@ impl PyEngine {
     }
 
     /// v0.7.0 — Point-lookup one expertise-ledger row (the projection). JSON
-    /// `ExpertiseLedgerEntry` or None.
+    /// `ExpertiseLedgerEntry` or None; `expertise` an exact decimal string (v62 P1-fix8).
     #[cfg(feature = "cirisnode")]
     fn cirisnode_get_expertise_ledger(
         &self,

@@ -147,6 +147,30 @@ pub(crate) const DELIVERY_ADDED_COLUMNS: &[&str] = &["signature_composite"];
 pub(crate) const DELIVERY_ADDED_PG_CONSTRAINTS: &[&str] =
     &["federation_delivery_attestations_signature_composite_check"];
 
+/// v62.0.0 (P1-fix8; CC 2.6.1.5, the lead's ruling) — **the ledger facts
+/// edition 2 makes exact.** Edition 1 stored a credits `balance` and an
+/// `expertise` as floats; the baseline stores them as postgres `numeric` and
+/// sqlite canonical decimal `TEXT` (with the expertise range check and the
+/// routable index's predicate restated for that form). V300 is unshipped, so
+/// the baseline's own DDL says it; I1950 sets exactly these catalog facts
+/// aside on both sides and [`exact_ledger_fact`]'s callers check the
+/// baseline's form of each.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) fn exact_ledger_fact(line: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        // sqlite: the two tables' DDL, and the routable index.
+        "object\ttable\tcirisnode_credits_ledger\t",
+        "object\ttable\tcirisnode_expertise_ledger\t",
+        "object\tindex\texpertise_routable\t",
+        // postgres: the two columns, the range check, the routable index.
+        "col\tcirisnode.credits_ledger\t5\tbalance\t",
+        "col\tcirisnode.expertise_ledger\t4\texpertise\t",
+        "con\tcirisnode.expertise_ledger\texpertise_ledger_expertise_check\t",
+        "idx\tCREATE INDEX expertise_routable ON cirisnode.expertise_ledger ",
+    ];
+    PREFIXES.iter().any(|p| line.starts_with(p))
+}
+
 /// The signer FKs edition 1 had and edition 2 keeps (I1950 checks them
 /// present): an edition-2 signer is projected into `federation_keys`.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
@@ -570,8 +594,34 @@ mod tests {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        let got = catalog::sqlite(&b.conn_handle().lock());
-        let want = fixture("sqlite");
+        let all = catalog::sqlite(&b.conn_handle().lock());
+        // v62.0.0 (P1-fix8, I4007) — the exact ledger facts, set aside on
+        // both sides and checked in the baseline's own form.
+        let (exact, got): (Vec<String>, Vec<String>) =
+            all.into_iter().partition(|l| super::exact_ledger_fact(l));
+        let (was, want): (Vec<String>, Vec<String>) = fixture("sqlite")
+            .into_iter()
+            .partition(|l| super::exact_ledger_fact(l));
+        assert_eq!(
+            (exact.len(), was.len()),
+            (3, 3),
+            "I4007: {exact:?} / {was:?}"
+        );
+        let joined = exact.join("\n");
+        for needle in [
+            "balance                       TEXT NOT NULL DEFAULT '0'",
+            "expertise                     TEXT NOT NULL DEFAULT '0'",
+            "WHERE expertise <> '0' AND is_active = 1",
+        ] {
+            assert!(
+                joined.contains(needle),
+                "I4007 (sqlite): {needle} in {joined}"
+            );
+        }
+        assert!(
+            !joined.contains("REAL"),
+            "I4007 (sqlite): no float ledger column"
+        );
         assert!(want.len() > 500, "I1950: the fixture is edition 1's");
         assert!(got == want, "I1950 (sqlite):\n{}", diff(&want, &got));
         for t in super::EDITION_TWO_ADDITIONS {
@@ -715,6 +765,30 @@ mod tests {
         // positioned ones did.
         got.sort();
         want.sort();
+        // v62.0.0 (P1-fix8, I4007) — the exact ledger facts, set aside on
+        // both sides and checked in the baseline's own form (after the delivery
+        // attestation's filter; `partition` keeps each side's sorted order).
+        let (exact, got): (Vec<String>, Vec<String>) =
+            got.into_iter().partition(|l| super::exact_ledger_fact(l));
+        let (was, want): (Vec<String>, Vec<String>) =
+            want.into_iter().partition(|l| super::exact_ledger_fact(l));
+        assert_eq!(
+            (exact.len(), was.len()),
+            (4, 4),
+            "I4007: {exact:?} / {was:?}"
+        );
+        let joined = exact.join("\n");
+        assert!(
+            exact
+                .iter()
+                .filter(|l| l.starts_with("col\t"))
+                .all(|l| l.split('\t').nth(4) == Some("numeric")),
+            "I4007 (postgres): the ledger columns are numeric: {joined}"
+        );
+        assert!(
+            !joined.contains("double precision"),
+            "I4007 (postgres): no float: {joined}"
+        );
         assert!(want.len() > 1500, "I1950: the fixture is edition 1's");
         assert!(got == want, "I1950 (postgres):\n{}", diff(&want, &got));
         for t in super::EDITION_TWO_ADDITIONS {

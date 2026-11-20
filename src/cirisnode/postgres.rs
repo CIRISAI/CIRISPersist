@@ -110,21 +110,20 @@ impl NodeCoreService for PostgresBackend {
         let client = self.cirisnode_client().await?;
         let rows = client
             .query(
-                "SELECT contributor_id, expertise FROM cirisnode.expertise_ledger \
+                "SELECT contributor_id, expertise::text FROM cirisnode.expertise_ledger \
                  WHERE domain = $1 AND language = $2 \
-                   AND expertise > 0 AND is_active = TRUE \
-                 ORDER BY expertise DESC",
+                   AND expertise > 0 AND is_active = TRUE",
                 &[&domain, &language],
             )
             .await
             .map_err(|e| map_pg_error(e, "routable_contributors"))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| RoutableContributor {
-                contributor_id: r.get(0),
-                expertise: r.get(1),
-            })
-            .collect())
+        // v62.0.0 (P1-fix8) — ranked on the exact decimal by the one rule
+        // both backends share.
+        super::service::rank_routable(
+            rows.into_iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect(),
+        )
     }
 
     async fn read_vote_weight(
@@ -137,10 +136,9 @@ impl NodeCoreService for PostgresBackend {
         let client = self.cirisnode_client().await?;
         let row = client
             .query_one(
-                "SELECT \
-                    COALESCE(c.balance, 0)::float8 AS credits, \
-                    COALESCE(e.expertise, 0)::float8 AS expertise, \
-                    COALESCE(e.is_active, FALSE) AS is_active \
+                "SELECT c.balance::text AS credits, \
+                    e.expertise::text AS expertise, \
+                    e.is_active AS is_active \
                  FROM (SELECT 1) _ \
                  LEFT JOIN cirisnode.credits_ledger c \
                     ON c.contributor_id = $1 AND c.domain = $2 \
@@ -151,26 +149,16 @@ impl NodeCoreService for PostgresBackend {
             )
             .await
             .map_err(|e| map_pg_error(e, "read_vote_weight"))?;
-        let credits: f64 = row.get(0);
-        let expertise: f64 = row.get(1);
-        let is_active: bool = row.get(2);
-        if credits == 0.0 && expertise == 0.0 && !is_active {
-            return Ok(None);
-        }
-        // SCHEMA.md §5.2: expertise_multiplier = 1 + 4*expertise ([1, 5]);
-        // active_tier_multiplier = 1.5 if active else 0.5.
-        let expertise_multiplier = 1.0 + 4.0 * expertise;
-        let active_tier_multiplier = if is_active { 1.5 } else { 0.5 };
-        Ok(Some(VoteWeight {
-            contributor_id: contributor_id.to_owned(),
-            domain: domain.to_owned(),
-            language: language.to_owned(),
-            subject: subject.to_owned(),
+        // v62.0.0 (P1-fix8) — the exact decimals as text; the arithmetic is
+        // the shared exact rule (SCHEMA.md §5.2), never `float8`.
+        let credits: Option<String> = row.get(0);
+        let expertise: Option<String> = row.get(1);
+        let is_active: Option<bool> = row.get(2);
+        super::service::vote_weight_of(
+            (contributor_id, domain, language, subject),
             credits,
-            expertise_multiplier,
-            active_tier_multiplier,
-            weight: credits * expertise_multiplier * active_tier_multiplier,
-        }))
+            expertise.map(|e| (e, is_active.unwrap_or(false))),
+        )
     }
 
     async fn get_credits_ledger(
@@ -183,7 +171,7 @@ impl NodeCoreService for PostgresBackend {
         let client = self.cirisnode_client().await?;
         let row_opt = client
             .query_opt(
-                "SELECT contributor_id, domain, language, subject, balance, \
+                "SELECT contributor_id, domain, language, subject, balance::text, \
                         last_update_contribution, last_updated_at, created_at, attestation_id \
                  FROM cirisnode.credits_ledger \
                  WHERE contributor_id = $1 AND domain = $2 \
@@ -192,17 +180,23 @@ impl NodeCoreService for PostgresBackend {
             )
             .await
             .map_err(|e| map_pg_error(e, "get_credits_ledger"))?;
-        Ok(row_opt.map(|row| CreditsLedgerEntry {
-            contributor_id: row.get(0),
-            domain: row.get(1),
-            language: row.get(2),
-            subject: row.get(3),
-            balance: row.get(4),
-            last_update_contribution: row.get(5),
-            last_updated_at: row.get(6),
-            created_at: row.get(7),
-            attestation_id: row.get(8),
-        }))
+        // v62.0.0 (P1-fix8) — the exact decimal, as its canonical text.
+        row_opt
+            .map(|row| {
+                let balance: String = row.get(4);
+                Ok(CreditsLedgerEntry {
+                    contributor_id: row.get(0),
+                    domain: row.get(1),
+                    language: row.get(2),
+                    subject: row.get(3),
+                    balance: super::service::stored_decimal("balance", &balance)?.canonical(),
+                    last_update_contribution: row.get(5),
+                    last_updated_at: row.get(6),
+                    created_at: row.get(7),
+                    attestation_id: row.get(8),
+                })
+            })
+            .transpose()
     }
 
     async fn get_expertise_ledger(
@@ -214,7 +208,7 @@ impl NodeCoreService for PostgresBackend {
         let client = self.cirisnode_client().await?;
         let row_opt = client
             .query_opt(
-                "SELECT contributor_id, domain, language, expertise, is_active, \
+                "SELECT contributor_id, domain, language, expertise::text, is_active, \
                         last_updated_at, last_update_contribution, created_at, attestation_id \
                  FROM cirisnode.expertise_ledger \
                  WHERE contributor_id = $1 AND domain = $2 AND language = $3",
@@ -222,17 +216,23 @@ impl NodeCoreService for PostgresBackend {
             )
             .await
             .map_err(|e| map_pg_error(e, "get_expertise_ledger"))?;
-        Ok(row_opt.map(|row| ExpertiseLedgerEntry {
-            contributor_id: row.get(0),
-            domain: row.get(1),
-            language: row.get(2),
-            expertise: row.get(3),
-            is_active: row.get(4),
-            last_updated_at: row.get(5),
-            last_update_contribution: row.get(6),
-            created_at: row.get(7),
-            attestation_id: row.get(8),
-        }))
+        // v62.0.0 (P1-fix8) — the exact decimal, as its canonical text.
+        row_opt
+            .map(|row| {
+                let expertise: String = row.get(3);
+                Ok(ExpertiseLedgerEntry {
+                    contributor_id: row.get(0),
+                    domain: row.get(1),
+                    language: row.get(2),
+                    expertise: super::service::stored_decimal("expertise", &expertise)?.canonical(),
+                    is_active: row.get(4),
+                    last_updated_at: row.get(5),
+                    last_update_contribution: row.get(6),
+                    created_at: row.get(7),
+                    attestation_id: row.get(8),
+                })
+            })
+            .transpose()
     }
 
     async fn legacy_ledger_rows(&self) -> Result<Vec<LegacyLedgerRow>, Error> {
@@ -240,7 +240,7 @@ impl NodeCoreService for PostgresBackend {
         let mut out = Vec::new();
         for r in client
             .query(
-                "SELECT contributor_id, domain, language, subject, balance, \
+                "SELECT contributor_id, domain, language, subject, balance::text, \
                         COALESCE(last_update_contribution, '') \
                  FROM cirisnode.credits_ledger WHERE attestation_id IS NULL \
                  ORDER BY contributor_id, domain, language, subject",
@@ -260,7 +260,7 @@ impl NodeCoreService for PostgresBackend {
         }
         for r in client
             .query(
-                "SELECT contributor_id, domain, language, expertise, is_active, \
+                "SELECT contributor_id, domain, language, expertise::text, is_active, \
                         COALESCE(last_update_contribution, '') \
                  FROM cirisnode.expertise_ledger WHERE attestation_id IS NULL \
                  ORDER BY contributor_id, domain, language",

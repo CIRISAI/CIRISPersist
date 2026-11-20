@@ -757,8 +757,9 @@ pub fn digest_json(v: &Value) -> Option<serde_json::Value> {
 /// - A non-integral value is CBOR tag 4, `[exponent, mantissa]`, normalised:
 ///   a negative exponent and a mantissa NOT divisible by 10. `0.5` →
 ///   `4([-1, 5])`, `1.25` → `4([-2, 125])`, `-0.050` → `4([-2, -5])`.
-/// - A mantissa outside `i64`, an integral value outside the CBOR integer
-///   range (`-2^64 ..= 2^64 - 1`), or an exponent that cannot be read is
+/// - A mantissa or an integral value outside the CBOR integer range
+///   (`-2^64 ..= 2^64 - 1`; v62.0.0 R1-v2332 alignment: Verify 23.3.2's
+///   `from_json` limit, no stricter), or an exponent that cannot be read, is
 ///   refused `body_number_unrepresentable`.
 ///
 /// Fixed-scale MEMBERS (`score`, `confidence`, `weight`) are NOT this:
@@ -816,11 +817,11 @@ pub fn body_number(n: &serde_json::Number) -> Result<Value, Error> {
             .ok_or_else(|| refuse("its exponent is out of range"))?;
     }
     if digits.len() > 38 {
-        return Err(refuse("its mantissa is outside i64"));
+        return Err(refuse("its mantissa is outside the CBOR integer range"));
     }
     let magnitude: i128 = digits
         .parse()
-        .map_err(|_| refuse("its mantissa is outside i64"))?;
+        .map_err(|_| refuse("its mantissa is outside the CBOR integer range"))?;
     let signed = if negative { -magnitude } else { magnitude };
     if exponent >= 0 {
         // Integral: mantissa × 10^exponent, a plain CBOR integer.
@@ -834,12 +835,8 @@ pub fn body_number(n: &serde_json::Number) -> Result<Value, Error> {
         return int_value(v)
             .ok_or_else(|| refuse("an integral value outside the CBOR integer range"));
     }
-    let mantissa = i64::try_from(signed).map_err(|_| refuse("its mantissa is outside i64"))?;
-    let (Some(e), Some(m)) = (
-        int_value(i128::from(exponent)),
-        int_value(i128::from(mantissa)),
-    ) else {
-        return Err(refuse("its mantissa is outside i64"));
+    let (Some(e), Some(m)) = (int_value(i128::from(exponent)), int_value(signed)) else {
+        return Err(refuse("its mantissa is outside the CBOR integer range"));
     };
     Ok(Value::Tag(4, Box::new(Value::Array(vec![e, m]))))
 }
@@ -849,7 +846,16 @@ pub fn body_number(n: &serde_json::Number) -> Result<Value, Error> {
 /// decimal) instead of being refused: `(family, member)`, `*` for every
 /// family. The CDDL's `body`, and `hard_case:{kind}`'s `hard_case` body
 /// (P3). A producer whose family carries another free-form body appends it.
-pub const BODY_MEMBERS: &[(&str, &str)] = &[("*", "body"), ("hard_case:{kind}", "hard_case")];
+pub const BODY_MEMBERS: &[(&str, &str)] = &[
+    ("*", "body"),
+    ("hard_case:{kind}", "hard_case"),
+    // v62.0.0 (P1-fix6; the lead's ruling) — a ledger's free-form numbers:
+    // a credits `balance` and an `expertise` are body numbers (an integer
+    // when integral, else the normalised tag-4 decimal, exact), never fixed6
+    // (reserved for score / confidence / weight, CC 2.6.1.5).
+    ("credits:{domain}:{language}:{subject}", "balance"),
+    ("expertise:{domain}:{language}", "expertise"),
+];
 
 /// v62.0.0 (wave P1e) — is `member` a free-form body of a payload of
 /// `family_id` (the header's family id)?
@@ -874,12 +880,18 @@ pub fn json_number_of_decimal(v: &Value) -> Option<serde_json::Number> {
     let [e, m] = inner.as_array()? else {
         return None;
     };
-    let (e, m) = (e.as_i64()?, m.as_i64()?);
-    if e >= 0 || m == 0 || m % 10 == 0 {
+    // v62.0.0 (R1-v2332 alignment) — the mantissa anywhere in the CBOR
+    // integer range, as Verify 23.3.2 admits it (`Nint(k)` is `-1 - k`).
+    let e = e.as_i64()?;
+    let (negative, magnitude) = match m {
+        Value::Uint(u) => (false, u128::from(*u)),
+        Value::Nint(k) => (true, u128::from(*k) + 1),
+        _ => return None,
+    };
+    if e >= 0 || magnitude == 0 || magnitude % 10 == 0 {
         return None;
     }
-    let negative = m < 0;
-    let digits = m.unsigned_abs().to_string();
+    let digits = magnitude.to_string();
     let places = usize::try_from(e.unsigned_abs()).ok()?;
     let text = if digits.len() > places {
         let (int, frac) = digits.split_at(digits.len() - places);
@@ -911,25 +923,57 @@ fn int_value(v: i128) -> Option<Value> {
 /// # Errors
 /// `edition2_payload_invalid`, naming the decimal.
 pub fn check_body_numbers(v: &Value) -> Result<(), Error> {
-    fn walk(v: &Value) -> Result<(), String> {
+    // v62.0.0 (R1-v2332; CC rc21 cddl 87–91, CIRISVerify 23.3.2) — a bignum
+    // (tag 2 / 3) that does not fit a CBOR integer, as a member or as a
+    // decimal's mantissa, is a number a body cannot carry:
+    // `body_number_unrepresentable`, the token `body_number` refuses the
+    // same value with on the way in. A bignum that DOES fit an integer is a
+    // second encoding (Verify's reader: `malformed:ceg-value`, or a decode
+    // refusal inside a decimal).
+    fn big_bignum(v: &Value) -> bool {
+        matches!(v, Value::Tag(2 | 3, b)
+            if b.as_bytes().is_some_and(|b| b.len() > 8 && b[0] != 0))
+    }
+    fn unrepresentable(inner: &Value) -> Error {
+        Error::malformed_row(
+            PLANE,
+            malformed_row::BODY_NUMBER_UNREPRESENTABLE,
+            format!("a body number outside CBOR's integer range: {inner:?}"),
+        )
+    }
+    fn walk(v: &Value) -> Result<(), Error> {
         match v {
             Value::Tag(4, inner) => {
+                if let Some([Value::Nint(_), m]) = inner.as_array() {
+                    if big_bignum(m) {
+                        return Err(unrepresentable(inner));
+                    }
+                }
+                // Verify's `cde::decimal_is_normal` (23.3.2), read the same
+                // way: a negative exponent, and a mantissa anywhere in CBOR's
+                // integer range whose magnitude is not divisible by ten (so
+                // not zero).
                 let ok = match inner.as_array() {
-                    Some([e, m]) => match (e.as_i64(), m.as_i64()) {
-                        (Some(e), Some(m)) => e < 0 && m != 0 && m % 10 != 0,
-                        _ => false,
-                    },
+                    Some([Value::Nint(_), m]) => {
+                        let mag = match m {
+                            Value::Uint(n) => Some(u128::from(*n)),
+                            Value::Nint(n) => Some(u128::from(*n) + 1),
+                            _ => None,
+                        };
+                        mag.is_some_and(|m| m % 10 != 0)
+                    }
                     _ => false,
                 };
                 if ok {
                     Ok(())
                 } else {
-                    Err(format!(
+                    Err(refuse(format!(
                         "a decimal (tag 4) that is not normalised (a negative exponent, a \
                          mantissa not divisible by 10): {inner:?}"
-                    ))
+                    )))
                 }
             }
+            x if big_bignum(x) => Err(unrepresentable(x)),
             Value::Tag(_, inner) => walk(inner),
             Value::Array(a) => a.iter().try_for_each(walk),
             Value::Map(m) => m.iter().try_for_each(|(k, x)| {
@@ -939,7 +983,7 @@ pub fn check_body_numbers(v: &Value) -> Result<(), Error> {
             _ => Ok(()),
         }
     }
-    walk(v).map_err(refuse)
+    walk(v)
 }
 
 /// The `also` roles of `refs`, a closed registry (CC 2.6.1.3, the CDDL's

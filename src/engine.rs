@@ -14401,7 +14401,7 @@ mod tests {
             severity: crate::derived::DetectionSeverity::Warning,
             cohort_cell: serde_json::json!({"deployment_domain": "legal"}),
             conformity_variant: crate::derived::ConformityVariant::Numeric,
-            conformity_payload: serde_json::json!({"score": 3}),
+            conformity_payload: serde_json::json!({"score": 2.7}),
             lens_core_version: "lc-test".to_owned(),
             ratchet_calibration_version: 1,
             canonical_bytes: canonical.to_vec(),

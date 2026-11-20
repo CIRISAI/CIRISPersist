@@ -23,22 +23,27 @@
 //!   reader over persist's directory gives the vector's exact verdict, and
 //!   the door the matching refusal. `after_valid_until` waits on a record of
 //!   the key covering the instant (`MissingKey::CoveringRecord`, CC 2.4.1.1).
-//!   DEPARTURE (K1, triage round 3): `held_through_chain` (B's node record
-//!   with A's voice alone) waits the same way here, where Verify reads it
-//!   Valid: CC 2.4.1.1, "Each key's own holder signs its record".
+//!   K1-fix3's DEPARTURE on `held_through_chain` (B's node record with A's
+//!   voice alone; CC 2.4.1.1, "Each key's own holder signs its record") is
+//!   closed by CIRISVerify 23.3.2, which drops its reader's fallback to a
+//!   record another key signed: the file and persist agree (R1-v2332).
 //! - `objects`: the header verdicts agree, and persist's object id equals
 //!   the vector's.
 //! - `key_of_iss_v1.json` (I2366): every case through Verify's reader with
 //!   persist's directory (a raw key map, or [`HeldKeys`] holding the
 //!   vector's records in order), whose `KeyDirectory::key_of` is
-//!   [`HeldKeys::key_of`], gives the vector's verdict. Three stated
-//!   divergences, each kept by A's I2101 witnesses:
+//!   [`HeldKeys::key_of`], gives the vector's verdict. Five stated
+//!   divergences from the v1 FILE, each kept by A's I2101 witnesses:
 //!   - `rotation_without_predecessor_statement` waits on the predecessor key
 //!     here (a door receives a rotation's voices one at a time; "a missing
 //!     link waits"), where Verify's directory answers `kid_not_of_iss`;
 //!   - `rotation_genesis_not_held` and `rotation_two_hops_middle_missing`
 //!     wait in both, but persist names the record `target` names where
-//!     Verify names the predecessor key its statement waits on.
+//!     Verify names the predecessor key its statement waits on;
+//!   - `rotation_without_own_statement` and `record_by_other_key_only` (a
+//!     record held only in another key's voice) wait on the signing key's
+//!     own voice (CC 2.4.1.1; R1 round 3, R1-v2332), as Verify 23.3.2's
+//!     directory does, where the v1 file says `kid_not_of_iss`.
 //! - (I2367) the same cases at persist's door: `kid_not_of_iss` is refused
 //!   by that token, a wait is the retryable unknown-signer error.
 //!
@@ -51,17 +56,20 @@
 //! `kid_not_of_iss` for a rotation lacking a voice (`MissingKey::Voice`), so
 //! I2366's first stated divergence is persist's reading against the v1
 //! FILE, no longer against Verify's directory.
-//! - `key_of_iss_v2.json` (I4020, I4021): the rc21 key check's known answers.
+//! - `key_of_iss_v3.json` (I4020, I4021): the rc21 key check's known answers.
 //!   The cases whose directory is key records alone (the end rule of step
 //!   4, half-open coverage, rotation voices, and `location_proof` authored by
 //!   its subject) through Verify's reader over persist's [`HeldKeys`]; the
-//!   cases that need an admitted occurrence, an eviction or a bundle's seats
-//!   are listed and not replayed here (persist's occurrence and seat arms are
-//!   loaded from the store, I3020 and slice C3, not from a vector's list).
-//! - (I4022, I4023; R1 round 3) three of the four cases the Verify 23.3.1 tag
-//!   added, where persist's own door can carry them: an integer-keyed
-//!   occurrence (pure gates), a forged record of another key, and an
-//!   eviction whose signer is not held (the store door, sqlite and pg).
+//!   cases that need an admitted occurrence or an eviction are replayed at
+//!   the store door instead (I4024), and the ones holding a bundle's seats
+//!   are not replayed (persist's occurrence and seat arms are loaded from
+//!   the store, I3020 and slice C3, not from a vector's list).
+//! - (I4022, I4023, I4024; R1 round 3, R1-v2332) the occurrence and eviction
+//!   cases: an integer-keyed occurrence refused by the pure gates (I4023), a
+//!   forged record of another key leaving A a person (I4022), and EVERY
+//!   occurrence and eviction case at the store door by the file's verdict
+//!   (I4024, sqlite and pg; CIRISVerify 23.3.2's file, whose possession voice
+//!   is signed as the occurrence key, CC rc21 90d537b).
 //! - (R1 round 3) `rotation_lacks_possession` now matches: persist's
 //!   [`HeldKeys::key_of`] waits on a rotation's missing own voice
 //!   (`ChainMissing::Voice`), and v1's `rotation_without_own_statement` is
@@ -91,14 +99,15 @@ const WAITING_KID: &str = concat!("waiting", ":kid:");
 const COLON: char = ':';
 
 const FILE: &str =
-    include_str!("../../../tests/vectors/verify_v23/edition2/row_statements_v3.json");
+    include_str!("../../../tests/vectors/verify_v23/edition2/row_statements_v4.json");
 const KEY_OF_ISS: &str =
     include_str!("../../../tests/vectors/verify_v23/edition2/key_of_iss_v1.json");
-/// v62.0.0 (R1, R1d) — CIRISVerify 23.3.1's `key_of_iss_v2.json` (31 cases at
-/// the tag b0933ba;
-/// SHA-256 pinned in `verify_v23_vectors`, I1850).
-const KEY_OF_ISS_V2: &str =
-    include_str!("../../../tests/vectors/verify_v23/edition2/key_of_iss_v2.json");
+/// v62.0.0 (R1-v2332) — CIRISVerify 23.3.2's `key_of_iss_v3.json` (32 cases;
+/// a NEW file beside v2, whose possession voice is signed as the occurrence
+/// key, CC rc21 90d537b; SHA-256 pinned in `verify_v23_vectors`, I1850).
+/// v2 (23.3.1, the possession voice signed as the identity) is retired.
+const KEY_OF_ISS_V3: &str =
+    include_str!("../../../tests/vectors/verify_v23/edition2/key_of_iss_v3.json");
 
 fn key(n: u8) -> CompositeSigningKey {
     CompositeSigningKey::from_seeds(&[n; 32], &[n.wrapping_add(100); 32])
@@ -127,13 +136,34 @@ fn seeds(c: &J) -> Vec<u8> {
         .collect()
 }
 
-/// The door's answer, spelled like the vector's `expect`.
+/// The reasons persist's door refuses by VERIFY's own token: each `Invalid`
+/// with a stable `token()`, which the door maps to the malformed-row reason of
+/// the same spelling (`kid_not_of_iss`, `valid_until_not_after_asserted_at`,
+/// `body_number_unrepresentable`). Read from Verify, never restated.
+fn verify_token_reasons() -> Vec<&'static str> {
+    use ciris_verify_core::edition2::Invalid;
+    [
+        Invalid::KidNotOfIss,
+        Invalid::ValidUntilNotAfterAssertedAt,
+        Invalid::BodyNumberUnrepresentable,
+    ]
+    .iter()
+    .filter_map(Invalid::token)
+    .collect()
+}
+
+/// The door's answer, spelled like the vector's `expect`. A refusal by one of
+/// Verify's own tokens ([`verify_token_reasons`]) reads as Verify's verdict,
+/// `invalid:<token>` (v62.0.0, R1-v2332): the same refusal, named the same.
 fn label(r: &Result<super::door::AdmittedRow, Error>) -> String {
     match r {
         Ok(_) => "valid".into(),
         Err(Error::MalformedRow {
             reason, message, ..
         }) if *reason == malformed_row::EDITION2_STATEMENT_INVALID => format!("invalid:{message}"),
+        Err(Error::MalformedRow { reason, .. }) if verify_token_reasons().contains(reason) => {
+            format!("invalid:{reason}")
+        }
         Err(Error::MalformedRow { reason, .. }) => format!("refused:{reason}"),
         Err(Error::AttesterKeyUnknown {
             attesting_key_id, ..
@@ -150,7 +180,7 @@ fn file() -> J {
 fn i1901_valid_statements_pass_the_door() {
     let f = file();
     let cases = f["valid"].as_array().unwrap();
-    assert_eq!(cases.len(), 4);
+    assert_eq!(cases.len(), 5);
     for c in cases {
         let id = c["id"].as_str().unwrap();
         assert_eq!(
@@ -192,7 +222,7 @@ fn i1901_valid_statements_pass_the_door() {
 fn i1901_refusals_give_verifys_reasons() {
     let f = file();
     let cases = f["refusals"].as_array().unwrap();
-    assert_eq!(cases.len(), 42);
+    assert_eq!(cases.len(), 50);
     for c in cases {
         let id = c["id"].as_str().unwrap();
         let expect = c["expect"].as_str().unwrap();
@@ -290,7 +320,7 @@ fn i1901_key_record_end_rule_is_the_doors() {
 fn i1901_i2365_key_directory_through_persists_reading() {
     let f = file();
     let cases = f["key_directory"].as_array().unwrap();
-    assert_eq!(cases.len(), 4);
+    assert_eq!(cases.len(), 6);
     for c in cases {
         let id = c["id"].as_str().unwrap();
         let mut held = HeldKeys::new();
@@ -298,33 +328,13 @@ fn i1901_i2365_key_directory_through_persists_reading() {
             held.insert_record(hx(r)).unwrap();
         }
         let st = hx(&c["statement_hex"]);
-        // v62.0.0 (K1, triage round 3) — a DEPARTURE from Verify's vector:
-        // `held_through_chain` holds B's node record with A's voice alone.
-        // CC 2.4.1.1: "Each key's own holder signs its record of this form,
-        // so the genesis ends no key and gives no key a power over
-        // another"; persist's liveness is the kernel's key-end reading
-        // (`key_end::well_formed`: a record stating an end carries its own
-        // key's signature), so no record of B covers the statement's
-        // instant and it waits on one that does (CC 2.4.1.1: retryable).
-        // Named in the differential (`key_record_own_voice`); routed to
-        // Verify / CC (K1-fix3.md).
-        let departed;
-        let expect = if id == "held_through_chain" {
-            let (protected, payload) = super::liveness::statement_parts(&st).unwrap();
-            let kid = protected
-                .get_int(4)
-                .and_then(cde::Value::as_bytes)
-                .map(hex::encode)
-                .unwrap();
-            let at = payload
-                .get_text("asserted_at")
-                .and_then(cde::Value::as_u64)
-                .unwrap();
-            departed = format!("waiting{COLON}covering_record{COLON}{kid}{COLON}{at}");
-            departed.as_str()
-        } else {
-            c["expect"].as_str().unwrap()
-        };
+        // v62.0.0 (R1-v2332) — K1-fix3's DEPARTURE (`held_through_chain`,
+        // B's node record with A's voice alone) is gone: CIRISVerify 23.3.2
+        // drops the reader's fallback to a record another key signed (CC
+        // 2.4.1.1, "Each key's own holder signs its record") and regenerates
+        // the file (row_statements v4), so persist's kernel reading and the
+        // vector agree, and every case is compared with the file as it is.
+        let expect = c["expect"].as_str().unwrap();
         assert_eq!(
             reader_label(&verify_row_statement(&st, &held)),
             expect,
@@ -397,11 +407,11 @@ fn missing_label(missing: &[MissingKey]) -> String {
         ),
         Some(MissingKey::Record(r)) => format!("waiting{COLON}record{COLON}{}", hex::encode(r)),
         // v62.0.0 (R1; CIRISVerify 23.3.1) — the two links rc21 adds.
-        Some(MissingKey::Voice { kid, row }) => format!(
-            "waiting{COLON}voice{COLON}{}{COLON}{}",
-            hex::encode(kid),
-            hex::encode(row)
-        ),
+        // v62.0.0 (R1-v2332) — row_statements_v4's spelling: the key whose
+        // own voice is missing (the row is not named).
+        Some(MissingKey::Voice { kid, .. }) => {
+            format!("waiting{COLON}voice{COLON}{}", hex::encode(kid))
+        }
         Some(MissingKey::Bundle(b)) => format!("waiting{COLON}bundle{COLON}{}", hex::encode(b)),
         other => format!("{other:?}"),
     }
@@ -415,7 +425,9 @@ fn waiting_kid(expect: &str) -> Option<Digest32> {
         return None;
     }
     match (parts.next(), parts.next()) {
-        (Some("kid" | "covering_record"), Some(k)) => hex::decode(k).ok()?.try_into().ok(),
+        (Some("kid" | "covering_record" | "voice"), Some(k)) => {
+            hex::decode(k).ok()?.try_into().ok()
+        }
         _ => None,
     }
 }
@@ -457,26 +469,6 @@ fn own_record_target(c: &J, st: &[u8]) -> Digest32 {
         .0
 }
 
-/// The row of the held rotation record: the one held record that names a
-/// predecessor's record in `refs.target`.
-fn rotation_row(c: &J) -> super::names::RowId {
-    let named: Vec<super::names::RowId> = c["records_hex"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(hx)
-        .filter(|r| {
-            super::liveness::statement_parts(r)
-                .and_then(|(_, p)| super::names::names_of(&p).ok())
-                .and_then(|n| super::names::single(&n, "target"))
-                .is_some()
-        })
-        .map(|r| super::names::RowId::of_statement(&r).unwrap())
-        .collect();
-    assert_eq!(named.len(), 1, "one rotation record");
-    named[0]
-}
-
 /// What persist answers where it differs from Verify's `KeyRecordDirectory`
 /// (module docs): persist's verdict for the case, or `None` where they agree.
 fn key_of_divergence(c: &J) -> Option<String> {
@@ -496,15 +488,15 @@ fn key_of_divergence(c: &J) -> Option<String> {
             "waiting{COLON}record{COLON}{}",
             hex::encode(own_record_target(c, &st))
         )),
-        // v62.0.0 (R1 round 3; CC 2.6.1.9) — B's statement over B2's rotation
-        // is held, B2's own is not: the rotation waits on B2's voice over
-        // that row, as Verify 23.3.1's own directory now answers (its replay
-        // records the move; key_of_iss_v2 `rotation_lacks_possession`). The
-        // v1 file says kid_not_of_iss.
-        "rotation_without_own_statement" => Some(format!(
-            "waiting{COLON}voice{COLON}{}{COLON}{}",
-            hex::encode(super::ingest::statement_kid(&st).unwrap()),
-            rotation_row(c).hex()
+        // v62.0.0 (R1 round 3, R1-v2332; CC 2.6.1.9, CC 2.4.1.1) — a record
+        // held only in another key's voice (B's over B2's rotation; A's over
+        // a record of C) waits on the signing key's OWN voice, as Verify
+        // 23.3.2's directory answers (`resolve`: no third party makes a key
+        // live; row_statements_v4 `record_not_own_voice`). The v1 file says
+        // kid_not_of_iss.
+        "rotation_without_own_statement" | "record_by_other_key_only" => Some(format!(
+            "waiting{COLON}voice{COLON}{}",
+            hex::encode(super::ingest::statement_kid(&st).unwrap())
         )),
         _ => None,
     }
@@ -548,8 +540,8 @@ fn i2366_key_of_iss_through_persists_directory() {
         assert_eq!(got, want, "I2366 {id} (Verify: {})", c["expect"]);
     }
     assert_eq!(
-        diverged, 4,
-        "I2366: the four stated divergences are replayed"
+        diverged, 5,
+        "I2366: the five stated divergences are replayed"
     );
 }
 
@@ -577,7 +569,7 @@ fn i2367_key_of_iss_at_the_door() {
                 refused += 1;
                 assert_eq!(
                     label(&got),
-                    format!("refused:{}", malformed_row::KID_NOT_OF_ISS),
+                    format!("invalid:{}", malformed_row::KID_NOT_OF_ISS),
                     "I2367 {id}"
                 );
             }
@@ -589,58 +581,47 @@ fn i2367_key_of_iss_at_the_door() {
             _ => {}
         }
     }
-    // R1 round 3: `rotation_without_own_statement` waits here (the fourth
-    // divergence), so seven of the file's eight kid_not_of_iss cases refuse.
-    assert_eq!(refused, 7, "I2367: the kid_not_of_iss cases ran");
+    // R1 round 3 and R1-v2332: `rotation_without_own_statement` and
+    // `record_by_other_key_only` wait here (stated divergences), so six of
+    // the file's eight kid_not_of_iss cases refuse.
+    assert_eq!(refused, 6, "I2367: the kid_not_of_iss cases ran");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  v62.0.0 (R1) — CIRISVerify 23.3.1's `key_of_iss_v2.json`
+//  v62.0.0 (R1, R1-v2332) — CIRISVerify 23.3.2's `key_of_iss_v3.json`
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The `key_of_iss_v2.json` cases whose directory names an admitted
-/// occurrence, an eviction, a bundle's seats or a pending bundle: persist
-/// loads those arms from the store (the occurrence arm, I3020; the seat arm,
-/// slice C3), so they are not replayed from the vector's lists.
-const KEY_OF_ISS_V2_NOT_REPLAYED: [&str; 20] = [
-    "seated_by_bundle",
-    "seat_ended",
-    "bundle_pending",
-    "seated_key_no_record",
-    "occurrence_binds",
-    "occurrence_lacks_possession",
-    "occurrence_lacks_identity_voice",
-    "agent_under_person",
-    "agent_record_under_person",
-    "occurrence_evicted",
-    "evicted_later",
-    "eviction_by_stranger",
-    "occurrence_names_no_head",
-    "occurrence_of_other_identity",
-    "occurrence_ended",
-    "occurrence_voiced_by_stranger",
-    // R1d (Verify tag 23.3.1, b0933ba, after PR head fad948e): four cases more,
-    // each with an occurrence, an eviction or a bundle's seats. R1 round 3:
-    // `occurrence_integer_key` is replayed at the door's pure gates (I4023),
-    // `eviction_signer_not_held` and `forged_record_does_not_unperson` at the
-    // store door (I4022). `seat_shadows_bad_record` is not: Verify's seats
-    // carry their keys, while persist's seat arm names kids and reads each
-    // seat's key from its bundle-placed record, so a seat whose own record is
-    // bad has no persist analogue.
-    "eviction_signer_not_held",
-    "forged_record_does_not_unperson",
-    "seat_shadows_bad_record",
-    "occurrence_integer_key",
-];
+/// v62.0.0 (R1-v2332) — the number of cases in `key_of_iss_v3.json`
+/// (CIRISVerify 23.3.2: v2's 31, re-signed with the possession voice as the
+/// occurrence key, plus `possession_signed_as_identity`). Checked against the
+/// tag by `FSD/v62_wip/parallel/R1-v2332-finalize.py`; I1850 pins the bytes.
+const KEY_OF_ISS_V3_CASES: usize = 32;
 
-fn key_of_v2_file() -> J {
-    serde_json::from_str(KEY_OF_ISS_V2).unwrap()
+/// A case whose directory holds a bundle's seats or waits on a bundle: not
+/// replayed. Verify's seats carry their keys (`hold_bundle_in_force`);
+/// persist's seat arm names kids and reads each seat's key from its
+/// bundle-placed record ([`super::liveness::BundleSeats`]), so a vector's
+/// bare seat list has no persist analogue.
+fn needs_seats(c: &J) -> bool {
+    !c["seats"].as_array().unwrap().is_empty() || c.get("pending_bundle_hex").is_some()
 }
 
-/// A verdict's class, as `key_of_iss_v2.json` compares it: `valid`, the
+/// A case whose directory admits an occurrence or an eviction: replayed at
+/// the store door ([`i4024_case`]), where persist's occurrence arm is loaded
+/// from the store (I3020), never from a vector's list.
+fn needs_occurrence_arm(c: &J) -> bool {
+    !c["occurrences_hex"].as_array().unwrap().is_empty()
+        || !c["evictions_hex"].as_array().unwrap().is_empty()
+}
+
+fn key_of_v3_file() -> J {
+    serde_json::from_str(KEY_OF_ISS_V3).unwrap()
+}
+
+/// A verdict's class, as `key_of_iss_v3.json` compares it: `valid`, the
 /// refusal with its token, or `waiting` (persist names a missing link by its
 /// own reading, I2101, so a wait is compared as a wait).
-fn v2_class(label: &str) -> String {
+fn v3_class(label: &str) -> String {
     if label.starts_with(concat!("waiting", ":")) {
         "waiting".to_owned()
     } else {
@@ -648,21 +629,24 @@ fn v2_class(label: &str) -> String {
     }
 }
 
-/// I4020 — every case of `key_of_iss_v2.json` (CIRISVerify 23.3.1's, pinned
-/// by I1850) is either replayed (I4021) or named as not replayed.
+/// I4020 — `key_of_iss_v3.json` (CIRISVerify 23.3.2's, pinned by I1850)
+/// carries [`KEY_OF_ISS_V3_CASES`] cases; each is replayed by records alone
+/// (I4021), at the store door (I4024), or, holding a bundle's seats, not at
+/// all ([`needs_seats`]).
 #[test]
-fn i4020_key_of_iss_v2_cases_are_replayed_or_named() {
-    let f = key_of_v2_file();
-    let ids: Vec<&str> = f["cases"]
-        .as_array()
-        .unwrap()
+fn i4020_key_of_iss_v3_cases_are_replayed_or_named() {
+    let f = key_of_v3_file();
+    let cases = f["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), KEY_OF_ISS_V3_CASES, "I4020: the case list");
+    let seats = cases.iter().filter(|c| needs_seats(c)).count();
+    let store = cases
         .iter()
-        .map(|c| c["id"].as_str().unwrap())
-        .collect();
-    assert_eq!(ids.len(), 31, "I4020: the case list");
-    for id in KEY_OF_ISS_V2_NOT_REPLAYED {
-        assert!(ids.contains(&id), "I4020: {id} is a case");
-    }
+        .filter(|c| !needs_seats(c) && needs_occurrence_arm(c))
+        .count();
+    assert!(
+        seats >= 1 && store >= 1,
+        "I4020: {seats} seat, {store} store cases"
+    );
 }
 
 /// I4021 — the rc21 key check over key records alone, through Verify's
@@ -674,19 +658,12 @@ fn i4020_key_of_iss_v2_cases_are_replayed_or_named() {
 /// waits, never refuses), and `location_proof` authored by its subject alone
 /// under CC's vendored family model (`family:iss_not_in_role` otherwise).
 #[test]
-fn i4021_key_of_iss_v2_through_persists_directory() {
-    let f = key_of_v2_file();
+fn i4021_key_of_iss_v3_through_persists_directory() {
+    let f = key_of_v3_file();
     let mut replayed = 0usize;
     for c in f["cases"].as_array().unwrap() {
         let id = c["id"].as_str().unwrap();
-        if KEY_OF_ISS_V2_NOT_REPLAYED.contains(&id) {
-            assert!(
-                !c["occurrences_hex"].as_array().unwrap().is_empty()
-                    || !c["evictions_hex"].as_array().unwrap().is_empty()
-                    || !c["seats"].as_array().unwrap().is_empty()
-                    || c.get("pending_bundle_hex").is_some(),
-                "I4021 {id}: listed as not replayed, but its directory is records alone"
-            );
+        if needs_seats(c) || needs_occurrence_arm(c) {
             continue;
         }
         let mut held = HeldKeys::new();
@@ -711,9 +688,9 @@ fn i4021_key_of_iss_v2_through_persists_directory() {
             l => panic!("level {l}"),
         };
         assert_eq!(
-            v2_class(&got),
-            v2_class(expect),
-            "I4021 {id}: Verify 23.3.1 says {expect}, persist's reading {got}"
+            v3_class(&got),
+            v3_class(expect),
+            "I4021 {id}: Verify says {expect}, persist's reading {got}"
         );
         // The end rule at persist's door: refused by persist's token.
         if expect == concat!("invalid", ":valid_until_not_after_asserted_at") {
@@ -721,7 +698,7 @@ fn i4021_key_of_iss_v2_through_persists_directory() {
             assert_eq!(
                 label(&door),
                 format!(
-                    "refused{COLON}{}",
+                    "invalid{COLON}{}",
                     malformed_row::VALID_UNTIL_NOT_AFTER_ASSERTED_AT
                 ),
                 "I4021 {id} at the door"
@@ -729,10 +706,9 @@ fn i4021_key_of_iss_v2_through_persists_directory() {
         }
         replayed += 1;
     }
-    assert_eq!(
-        replayed,
-        31 - KEY_OF_ISS_V2_NOT_REPLAYED.len(),
-        "I4021: every records-only case ran"
+    assert!(
+        replayed >= 11,
+        "I4021: the records-only cases ran ({replayed})"
     );
 }
 
@@ -741,8 +717,8 @@ fn i4021_key_of_iss_v2_through_persists_directory() {
 //  replay them
 // ─────────────────────────────────────────────────────────────────────────
 
-fn key_of_v2_case(id: &str) -> J {
-    key_of_v2_file()["cases"]
+fn key_of_v3_case(id: &str) -> J {
+    key_of_v3_file()["cases"]
         .as_array()
         .unwrap()
         .iter()
@@ -755,7 +731,7 @@ fn hexes(c: &J, list: &str) -> Vec<Vec<u8>> {
     c[list].as_array().unwrap().iter().map(hx).collect()
 }
 
-/// I4023 — `occurrence_integer_key` (CIRISVerify 23.3.1 tag b0933ba): an
+/// I4023 — `occurrence_integer_key` (CIRISVerify 23.3.1 tag b0933ba and on): an
 /// `identity:occurrence` payload with an integer-keyed member. Persist's
 /// door refuses each of its statements by the family's closed payload map
 /// (`edition2_payload_invalid`, "a member key is not text"; the open tail
@@ -764,7 +740,7 @@ fn hexes(c: &J, list: &str) -> Vec<Vec<u8>> {
 /// the device's records alone, is `kid_not_of_iss`, Verify's answer.
 #[test]
 fn i4023_an_integer_keyed_occurrence_binds_nothing() {
-    let c = key_of_v2_case("occurrence_integer_key");
+    let c = key_of_v3_case("occurrence_integer_key");
     let mut held = HeldKeys::new();
     for r in hexes(&c, "records_hex") {
         held.insert_record(r).unwrap();
@@ -783,44 +759,36 @@ fn i4023_an_integer_keyed_occurrence_binds_nothing() {
     }
     let st = hx(&c["statement_hex"]);
     assert_eq!(
-        v2_class(&reader_label(&verify_row_statement(&st, &held))),
-        v2_class(c["expect"].as_str().unwrap()),
+        v3_class(&reader_label(&verify_row_statement(&st, &held))),
+        v3_class(c["expect"].as_str().unwrap()),
         "I4023: {}",
         c["expect"]
     );
 }
 
-/// I4022 — two of the tag's cases at the store door (`put_statement`), on
-/// sqlite and postgres:
+/// I4022 — `forged_record_does_not_unperson` at the store door
+/// (`put_statement`), on sqlite and postgres: S files a `key:record` of A's
+/// key saying `agent`. Whatever the door does with it, A's own key stays a
+/// person's (its projection never reads `agent`), and the agent key E
+/// signing as A is `kid_not_of_iss` over the store's own key plane
+/// (`held_keys_for`), Verify's answer. (I4024 replays every occurrence and
+/// eviction case, this one included, by the file's verdict; I4022 keeps the
+/// projection half.)
 ///
-/// - `forged_record_does_not_unperson`: S files a `key:record` of A's key
-///   saying `agent`. Whatever the door does with it, A's own key stays a
-///   person's (its projection never reads `agent`), and the agent key E
-///   signing as A is `kid_not_of_iss` over the store's own key plane
-///   (`held_keys_for`), Verify's answer.
-/// - `eviction_signer_not_held`: an eviction of D signed by a key Z whose
-///   record is not held never lands (no revocation is recorded for A), so it
-///   evicts nothing.
-///
-/// **A stated divergence** (`eviction_signer_not_held`'s occurrence): the
-/// Verify 23.3.1 vector signs the occurrence key's own voice (proof of possession)
-/// with `iss` = the IDENTITY (`oD.by(D, A)`). CC rc21 90d537b
-/// (`identity:occurrence` `second_signers [{role: occurrence, member:
-/// occurrence_key_id}]`) has that voice signed as ITSELF, `iss` = the
-/// occurrence key, and so does persist's door. CIRISVerify has ruled persist
-/// right: 23.3.2 regenerates `key_of_iss_v2.json` and adds a "possession
-/// signed as the identity is not admitted" case. So here the vector's
-/// occurrence does NOT bind (nothing in the occurrence table for the
-/// device), and the device signing as the identity is `kid_not_of_iss`
-/// where the Verify 23.3.1 file says `valid`. Re-pin at 23.3.2 and this half
-/// replays as the file says.
+/// v62.0.0 (R1-v2332) — R1-fix2's stated divergence on
+/// `eviction_signer_not_held` (the CIRISVerify v23.3.1 vector signed the possession voice
+/// as the identity) is closed: CIRISVerify 23.3.2 regenerates the file with
+/// the possession voice signed as the occurrence key (CC rc21 90d537b), and
+/// I4024 replays the case as the file says.
+/// Its two store assertions (the eviction by a key not held lands no row; no
+/// revocation is recorded for A) are kept, in I4024's leg for that case
+/// (`i4024_case`, sqlite and postgres), where the clock is pinned.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn i4022_body(d: &dyn crate::federation::FederationDirectory) {
     use super::ingest::{held_keys_for, put_statement, INGEST_TIER};
     let put = |st: Vec<u8>| async move { put_statement(d, &st, None, INGEST_TIER).await };
 
-    // forged_record_does_not_unperson
-    let c = key_of_v2_case("forged_record_does_not_unperson");
+    let c = key_of_v3_case("forged_record_does_not_unperson");
     let records = hexes(&c, "records_hex");
     assert_eq!(records.len(), 3, "I4022: recA, forged, recE");
     put(records[0].clone())
@@ -856,72 +824,148 @@ pub(crate) async fn i4022_body(d: &dyn crate::federation::FederationDirectory) {
     let st = hx(&c["statement_hex"]);
     let held = held_keys_for(d, &st).await.unwrap();
     assert_eq!(
-        v2_class(&reader_label(&verify_row_statement(&st, &held))),
-        v2_class(c["expect"].as_str().unwrap()),
+        v3_class(&reader_label(&verify_row_statement(&st, &held))),
+        v3_class(c["expect"].as_str().unwrap()),
         "I4022 forged_record_does_not_unperson"
     );
+}
 
-    // eviction_signer_not_held
-    let c = key_of_v2_case("eviction_signer_not_held");
-    for r in hexes(&c, "records_hex") {
-        // recA is held already; recD is new. Re-offering is idempotent.
-        put(r).await.expect("I4022: a held record");
-    }
-    // The stated divergence (doc above): the vector's occurrence, its
-    // possession voice signed as the identity, binds nothing at persist's
-    // door.
-    let occurrences = hexes(&c, "occurrences_hex");
-    assert_eq!(
-        occurrences.len(),
-        2,
-        "I4022: the identity's and the device's"
-    );
-    let d_ref = super::liveness::statement_parts(&occurrences[0])
-        .and_then(|(protected, _)| {
-            protected
-                .get_int(15)?
-                .get_int(2)?
-                .as_text()
-                .map(str::to_owned)
-        })
-        .expect("I4022: the occurrence's sub, the device");
-    for st in &occurrences {
-        let r = put(st.clone()).await;
-        assert!(
-            !matches!(r, Ok(super::ingest::StatementOutcome::Row { .. })),
-            "I4022: a possession voice signed as the identity lands nothing: {r:?}"
-        );
-    }
-    assert!(
-        d.list_identity_occurrences_by_occurrence_key(&d_ref)
-            .await
-            .unwrap()
-            .is_empty(),
-        "I4022: the vector's occurrence binds nothing (CC rc21 90d537b; Verify 23.3.2)"
-    );
+/// I4024 (R1-v2332) — **every occurrence and eviction case of
+/// `key_of_iss_v3.json` at the store door**, on sqlite and postgres, a fresh
+/// store per case: its records, occurrence voices and evictions are put
+/// through `put_statement` (the door's refusals and waits are the replay;
+/// a voice refused until another voice is held is re-offered, up to three
+/// passes), then the case's statement is read by Verify's reader over the
+/// store's own key plane (`held_keys_for`, whose occurrence arm is persist's,
+/// I3020). The class is the file's: valid, the refusal's token, or a wait.
+///
+/// The clock is pinned one second after the statement's instant (the
+/// vector's instants are fixed; the past-freshness bound W is read from
+/// this node's clock, CC 3.3.6.4). Needs the CIRISVerify 23.3.2 file: the
+/// v23.3.1 one signed the possession voice as the identity.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) async fn i4024_case(d: &dyn crate::federation::FederationDirectory, c: &J) {
+    use super::ingest::{held_keys_for, put_statement, INGEST_TIER};
+    let id = c["id"].as_str().unwrap();
     let st = hx(&c["statement_hex"]);
-    assert_eq!(c["expect"], "valid", "I4022: the v23.3.1 file's answer");
+    let at = super::liveness::statement_parts(&st)
+        .and_then(|(_, p)| p.get_text("asserted_at").and_then(cde::Value::as_u64))
+        .expect("I4024: the statement's instant");
+    let now = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        i64::try_from(at).expect("I4024: an instant in range") + 1_000,
+    )
+    .expect("I4024: a clock instant");
+    crate::federation::steward_purge::test_clock::set(Some(now));
+    let mut pending: Vec<Vec<u8>> = hexes(c, "records_hex");
+    pending.extend(hexes(c, "occurrences_hex"));
+    pending.extend(hexes(c, "evictions_hex"));
+    for _ in 0..3 {
+        let mut again = Vec::new();
+        for s in pending {
+            if put_statement(d, &s, None, INGEST_TIER).await.is_err() {
+                again.push(s);
+            }
+        }
+        pending = again;
+        if pending.is_empty() {
+            break;
+        }
+    }
     let held = held_keys_for(d, &st).await.unwrap();
-    assert_eq!(
-        reader_label(&verify_row_statement(&st, &held)),
-        concat!("invalid", ":kid_not_of_iss"),
-        "I4022 eviction_signer_not_held: the stated divergence (the file says valid; \
-         Verify 23.3.2 regenerates it)"
-    );
-    let evictions = hexes(&c, "evictions_hex");
-    assert_eq!(evictions.len(), 1, "I4022: one eviction");
-    let e = put(evictions[0].clone()).await;
-    assert!(
-        !matches!(e, Ok(super::ingest::StatementOutcome::Row { .. })),
-        "I4022: an eviction by a key not held lands nothing: {e:?}"
-    );
-    assert!(
-        d.list_identity_occurrence_revocations_for(&a_ref)
+    let got = reader_label(&verify_row_statement(&st, &held));
+    // I4022's store half (R1 round 3, kept): `eviction_signer_not_held`'s
+    // eviction, signed by a key Z whose record is not held, is offered once
+    // more under the pinned clock; the store facts are asserted below.
+    let unheld_eviction = if id == "eviction_signer_not_held" {
+        let evictions = hexes(c, "evictions_hex");
+        assert_eq!(evictions.len(), 1, "I4022: one eviction");
+        let landed = put_statement(d, &evictions[0], None, INGEST_TIER).await;
+        let a_ref = hexes(c, "records_hex")
+            .first()
+            .and_then(|r| super::liveness::statement_parts(r))
+            .and_then(|(protected, _)| {
+                protected
+                    .get_int(15)?
+                    .get_int(1)?
+                    .as_text()
+                    .map(str::to_owned)
+            })
+            .expect("I4022: A's iss");
+        let revocations = d
+            .list_identity_occurrence_revocations_for(&a_ref)
             .await
-            .unwrap()
-            .is_empty(),
-        "I4022: no revocation is recorded for A"
+            .unwrap();
+        Some((landed, revocations.len()))
+    } else {
+        None
+    };
+    crate::federation::steward_purge::test_clock::set(None);
+    assert_eq!(
+        v3_class(&got),
+        v3_class(c["expect"].as_str().unwrap()),
+        "I4024 {id}: Verify says {}, persist's store reads {got}",
+        c["expect"]
     );
+    // I4022 `eviction_signer_not_held`, the store stays clean: the verdict
+    // above says the eviction evicted nothing; these say it never landed.
+    if let Some((landed, revocations)) = unheld_eviction {
+        assert!(
+            !matches!(landed, Ok(super::ingest::StatementOutcome::Row { .. })),
+            "I4022: an eviction by a key not held lands nothing: {landed:?}"
+        );
+        assert_eq!(revocations, 0, "I4022: no revocation is recorded for A");
+    }
+}
+
+/// The I4024 cases: an occurrence or an eviction, and no bundle seats.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn i4024_cases() -> Vec<J> {
+    let cases: Vec<J> = key_of_v3_file()["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| !needs_seats(c) && needs_occurrence_arm(c))
+        .cloned()
+        .collect();
+    assert!(
+        cases.len() >= 15,
+        "I4024: the store cases ({})",
+        cases.len()
+    );
+    assert!(
+        cases.iter().any(|c| c["id"] == "eviction_signer_not_held"),
+        "I4022: the case whose store half I4024 carries is replayed"
+    );
+    cases
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i4024_sqlite() {
+    use crate::store::Backend as _;
+    for c in i4024_cases() {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(i4024_case(&b, &c)).await;
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i4024_postgres() {
+    use crate::store::Backend as _;
+    for c in i4024_cases() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(i4024_case(&b, &c)).await;
+    }
 }
 
 #[cfg(feature = "sqlite")]

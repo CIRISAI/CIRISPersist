@@ -84,7 +84,7 @@ pub(crate) mod bodies {
         b: &B,
         s: &Signer,
         who: &str,
-        balance: f64,
+        balance: &str,
         at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> String
     where
@@ -96,7 +96,13 @@ pub(crate) mod bodies {
             ledger_input(
                 "credits:health:en:arc_question:v1",
                 1.0,
-                serde_json::json!({lp::BALANCE_MEMBER: balance, lp::SOURCE_CONTRIBUTION_MEMBER: "c-1"}),
+                // v62.0.0 (P1-fix8) — the balance as a JSON number TOKEN
+                // (`arbitrary_precision`), never through `f64`.
+                serde_json::json!({
+                    lp::BALANCE_MEMBER: serde_json::from_str::<serde_json::Value>(balance)
+                        .expect("a balance token is a JSON number"),
+                    lp::SOURCE_CONTRIBUTION_MEMBER: "c-1",
+                }),
                 who,
                 at,
             ),
@@ -116,12 +122,45 @@ pub(crate) mod bodies {
     }
 
     /// Does the projected ledger row carry `balance` as its balance? Matched
-    /// as the balance COLUMN (sqlite renders `…|7.25|…`, postgres
-    /// `"balance":7.25,`), never as a bare substring: `"3.5"` is inside an
-    /// instant like `…:43.572…`, which made I1166 a coin flip on the clock.
+    /// as the balance COLUMN (sqlite renders the canonical decimal TEXT
+    /// `…|'7.25'|…`, postgres the `numeric` as `"balance":7.25,`; v62.0.0
+    /// P1-fix8), never as a bare substring: `"3.5"` is inside an instant like
+    /// `…:43.572…`, which made I1166 a coin flip on the clock.
     fn balance_is(row: &str, balance: &str) -> bool {
-        row.contains(&format!("|{balance}|")) || row.contains(&format!("\"balance\":{balance},"))
+        row.contains(&format!("|'{balance}'|")) || row.contains(&format!("\"balance\":{balance},"))
     }
+
+    // ── I4004 (P1-fix7, P1-fix8) ──────────────────────────────────────────
+    /// I4004 — a non-integral balance crosses the wire as a body number
+    /// (P1-fix6) and lands in the ledger EXACTLY (P1-fix8): emits the
+    /// balance TOKEN on a fresh contributor and returns the contributor's id
+    /// for the backend's read of the column as text.
+    pub(crate) async fn i4004_emit_balance<B>(b: &B, tag: &str, balance: &str) -> String
+    where
+        B: AttestationStore + DeclaresNode + Sync,
+    {
+        let node = signer(b, &format!("i4004-node-{tag}"), identity_type::NODE).await;
+        b.declare_node_key_for_test(&node.id);
+        let who = format!("i4004-who-{tag}");
+        ts::register_hybrid_key(b, &who).await;
+        credits(b, &node, &who, balance, None).await;
+        who
+    }
+
+    /// The balances I4004 round-trips, `(token, the column's canonical
+    /// text)`: a short decimal, the 0.1 + 0.2 shape (17 significant digits),
+    /// 20 significant digits no `f64` holds (the canonical text drops only
+    /// the trailing zero: the same value, its one spelling), a negative, and
+    /// (P1-fix9, Verify 23.3.2's range) tag-4 mantissas past i64: i64::MAX + 1
+    /// and -2^64, the bottom of the CBOR integer range.
+    pub(crate) const I4004_BALANCES: [(&str, &str); 6] = [
+        ("12.5", "12.5"),
+        ("0.30000000000000004", "0.30000000000000004"),
+        ("0.12345678901234567890", "0.1234567890123456789"),
+        ("-3.25", "-3.25"),
+        ("92233720368547758.08", "92233720368547758.08"),
+        ("-184467440737095516.16", "-184467440737095516.16"),
+    ];
 
     // ── I1166 ─────────────────────────────────────────────────────────────
     pub(crate) async fn i1166_the_ledgers_are_this_nodes_rows<B>(b: &B, tag: &str)
@@ -138,7 +177,7 @@ pub(crate) mod bodies {
         // a truncated instant, and the fold then orders by id (a coin flip
         // this witness must not depend on).
         let t0 = chrono::Utc::now() - chrono::Duration::minutes(10);
-        credits(b, &node, &alice, 12.5, Some(t0)).await;
+        credits(b, &node, &alice, "12.5", Some(t0)).await;
         let rows = live(b, SiloProjection::CreditsLedger).await;
         assert_eq!(rows.len(), 1, "I1166: one key, one ledger row: {rows:?}");
         assert!(balance_is(&rows[0], "12.5"), "I1166: the balance: {rows:?}");
@@ -148,7 +187,7 @@ pub(crate) mod bodies {
             b,
             &node,
             &alice,
-            7.25,
+            "7.25",
             Some(t0 + chrono::Duration::minutes(1)),
         )
         .await;
@@ -164,7 +203,7 @@ pub(crate) mod bodies {
             b,
             &node,
             &alice,
-            3.5,
+            "3.5",
             Some(chrono::Utc::now() - chrono::Duration::hours(1)),
         )
         .await;
@@ -175,7 +214,7 @@ pub(crate) mod bodies {
         );
 
         // A peer's balance about the same contributor is held, not projected.
-        let peers = credits(b, &peer, &alice, 99.5, None).await;
+        let peers = credits(b, &peer, &alice, "99.5", None).await;
         assert!(b.get_attestation(&peers).await.unwrap().is_some());
         let rows = live(b, SiloProjection::CreditsLedger).await;
         assert!(
@@ -247,7 +286,7 @@ pub(crate) mod bodies {
             e.to_string().contains("credits_ledger") && e.to_string().contains(&bob),
             "I1169: the refusal names the projection and the row: {e}"
         );
-        credits(b, &node, &bob, 3.0, None).await;
+        credits(b, &node, &bob, "3", None).await;
         check_projection_rebuild(b, SiloProjection::CreditsLedger)
             .await
             .expect("I1169: this node's row supersedes the legacy balance");
@@ -304,7 +343,7 @@ mod run {
         let sql = format!(
             "INSERT INTO cirisnode_credits_ledger (contributor_id, domain, language, subject, \
              balance, last_updated_at, created_at) VALUES ('i1169-bob-{t}', 'health', 'en', \
-             'arc_question', 2.0, '2026-01-01 00:00:00.000', '2026-01-01 00:00:00.000')"
+             'arc_question', '2', '2026-01-01 00:00:00.000', '2026-01-01 00:00:00.000')"
         );
         b::i1169_a_legacy_balance_is_red_until_rehomed(&s, &t, s.test_execute(&sql)).await;
     }
@@ -316,9 +355,52 @@ mod run {
         let t = tag();
         let sql = format!(
             "INSERT INTO cirisnode.credits_ledger (contributor_id, domain, language, subject, \
-             balance) VALUES ('i1169-bob-{t}', 'health', 'en', 'arc_question', 2.0)"
+             balance) VALUES ('i1169-bob-{t}', 'health', 'en', 'arc_question', 2)"
         );
         b::i1169_a_legacy_balance_is_red_until_rehomed(&p, &t, p.test_execute(&sql)).await;
+    }
+
+    // ── I4004 (P1-fix7, P1-fix8) — the balance round-trips exactly ────────
+    // Read back as TEXT (sqlite) and `numeric::text` (postgres): the
+    // canonical decimal, no float on the read either.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i4004_sqlite() {
+        let s = sqlite().await;
+        for (balance, text) in b::I4004_BALANCES {
+            let t = tag();
+            let who = b::i4004_emit_balance(&s, &t, balance).await;
+            let conn = s.conn_handle();
+            let got: String = conn
+                .lock()
+                .query_row(
+                    "SELECT balance FROM cirisnode_credits_ledger WHERE contributor_id = ?1",
+                    [&who],
+                    |r| r.get(0),
+                )
+                .expect("I4004: the projected balance");
+            assert_eq!(got, text, "I4004 sqlite: {balance} round-trips exactly");
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i4004_postgres() {
+        let Some(p) = postgres().await else { return };
+        for (balance, text) in b::I4004_BALANCES {
+            let t = tag();
+            let who = b::i4004_emit_balance(&p, &t, balance).await;
+            let c = p.checkout().await.unwrap();
+            let got: String = c
+                .query_one(
+                    "SELECT balance::text FROM cirisnode.credits_ledger WHERE contributor_id = $1",
+                    &[&who],
+                )
+                .await
+                .expect("I4004: the projected balance")
+                .get(0);
+            assert_eq!(got, text, "I4004 postgres: {balance} round-trips exactly");
+        }
     }
 
     // ── I1173 — V203 over an upgrading node ───────────────────────────────

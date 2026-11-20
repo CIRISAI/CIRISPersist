@@ -209,8 +209,8 @@ pub struct CreditsLedgerEntry {
     /// Per-subject Credits bucket (e.g. `"arc_question"`,
     /// `"prompt_edit"`).
     pub subject: String,
-    /// Balance — negative allowed for slashing outcomes.
-    pub balance: f64,
+    /// Balance — negative allowed for slashing outcomes. The exact decimal, as its canonical text (`crate::federation::ledger_projection::decimal`; v62.0.0 P1-fix8, CC 2.6.1.5: never a float).
+    pub balance: String,
     /// The `source_contribution` of the projected row.
     pub last_update_contribution: Option<String>,
     /// The projected row's signed instant.
@@ -231,8 +231,8 @@ pub struct ExpertiseLedgerEntry {
     pub contributor_id: String,
     pub domain: String,
     pub language: String,
-    /// Expertise in `[0, 1]`.
-    pub expertise: f64,
+    /// Expertise in `[0, 1]`. The exact decimal, as its canonical text (`crate::federation::ledger_projection::decimal`; v62.0.0 P1-fix8, CC 2.6.1.5: never a float).
+    pub expertise: String,
     /// `SCHEMA.md` §3.8 active-tier flag.
     pub is_active: bool,
     pub last_updated_at: DateTime<Utc>,
@@ -254,8 +254,9 @@ pub struct CreditsUpdate {
     pub domain: String,
     pub language: String,
     pub subject: String,
-    /// New balance after the update.
-    pub new_balance: f64,
+    /// New balance after the update. The exact decimal, as its canonical text (`crate::federation::ledger_projection::decimal`; v62.0.0 P1-fix8, CC 2.6.1.5: never a float); any other
+    /// spelling (`1.50`, `1e2`) is refused.
+    pub new_balance: String,
     /// The Contribution row whose outcome moved the balance.
     pub source_contribution: String,
 }
@@ -267,7 +268,9 @@ pub struct ExpertiseUpdate {
     pub contributor_id: String,
     pub domain: String,
     pub language: String,
-    pub new_expertise: f64,
+    /// Expertise in `[0, 1]`. The exact decimal, as its canonical text (`crate::federation::ledger_projection::decimal`; v62.0.0 P1-fix8, CC 2.6.1.5: never a float); any other spelling is
+    /// refused.
+    pub new_expertise: String,
     pub new_active_tier: bool,
     pub source_contribution: String,
 }
@@ -278,8 +281,9 @@ pub struct ExpertiseUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutableContributor {
     pub contributor_id: String,
-    /// Expertise in `[0, 1]` — used to rank candidates.
-    pub expertise: f64,
+    /// Expertise in `[0, 1]` — used to rank candidates (exactly). The
+    /// exact decimal, as its canonical text (`crate::federation::ledger_projection::decimal`; v62.0.0 P1-fix8, CC 2.6.1.5: never a float).
+    pub expertise: String,
 }
 
 /// Vote weight computed at aggregation time per `SCHEMA.md` §5.2.
@@ -289,11 +293,13 @@ pub struct VoteWeight {
     pub domain: String,
     pub language: String,
     pub subject: String,
-    pub credits: f64,
-    pub expertise_multiplier: f64,
-    pub active_tier_multiplier: f64,
+    /// v62.0.0 (P1-fix8) — every number here is an exact decimal, as its canonical text (`crate::federation::ledger_projection::decimal`; v62.0.0 P1-fix8, CC 2.6.1.5: never a float); the
+    /// arithmetic is exact decimal, no float step.
+    pub credits: String,
+    pub expertise_multiplier: String,
+    pub active_tier_multiplier: String,
     /// Final weight = credits × expertise_multiplier × active_tier_multiplier.
-    pub weight: f64,
+    pub weight: String,
 }
 
 #[cfg(test)]
@@ -337,7 +343,7 @@ mod tests {
     fn routable_contributor_round_trip() {
         let r = RoutableContributor {
             contributor_id: "abc".into(),
-            expertise: 0.75,
+            expertise: "0.75".into(),
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: RoutableContributor = serde_json::from_str(&s).unwrap();
@@ -351,7 +357,7 @@ mod tests {
             domain: "mental_health".into(),
             language: "am".into(),
             subject: "arc_question".into(),
-            balance: 12.5,
+            balance: "12.5".into(),
             last_update_contribution: Some("01HX".into()),
             last_updated_at: Utc::now(),
             created_at: Utc::now(),

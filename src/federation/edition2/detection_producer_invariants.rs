@@ -33,6 +33,16 @@
 //!   it the row is HELD (`Pending`), reason `reserved_prefix_emitter_mismatch`,
 //!   and nothing projects. A draft whose `sig_structure` is signed by
 //!   another key is refused by the door.
+//! - **I3570** (v62 P8-fix17, pass 4e) — **a fractional score lands and
+//!   reads back EXACT.** Fractional detection scores are what production
+//!   detectors emit. The conferred detector states detections scoring `0.25`
+//!   and `2.7` through the real producer (`detection_row::state_detection`);
+//!   each lands at the edition-2 door (stored under its node-computed row
+//!   id, not held), its statement spells the score as the normalised tag-4
+//!   decimal (`4([-2, 25])`, `4([-1, 27])`), and the row's envelope and the
+//!   `detection_events` projection both read the score back as the exact
+//!   JSON number (its decimal token, never a rounded float). Needs Verify
+//!   23.3.2 (23.3.1's `ceg-value` refused tag 4).
 //! - **I3537** — DELETED in v62.0.0 (P8-fix11): it witnessed that the
 //!   earlier-form door (`put_detection_event`) refused once the doors were
 //!   shut; the door itself is deleted (ruling 4).
@@ -388,6 +398,146 @@ where
             .is_err(),
         "I3523: a draft signed by another key is refused"
     );
+}
+
+/// I3570 (v62 P8-fix17, pass 4e) — **a fractional detection score lands at
+/// the edition-2 door and reads back exact**, through the real producer
+/// (`detection_row::state_detection`). The caller has set this node's
+/// identity to `e2::kid("p4-node")`.
+async fn i3570_a_fractional_score_reads_back_exact<B>(d: &B)
+where
+    B: FederationDirectory
+        + DerivedSchema
+        + crate::federation::attestation_admit::AttestationStore
+        + Sync,
+{
+    use ciris_verify_core::cde::{encode, Value};
+    Box::pin(super::standing_invariants::conferred_detector_body(d)).await;
+    let det = "p4-detector";
+    let signer = crate::federation::tier_ingest::test_support::local_signer(det);
+    // The instants come from the bundle in force, as the conferral's does
+    // (`conferred_detector_body`: the grant at tip + 90 s, inside the
+    // detector's key window); never the wall clock. The detections follow
+    // the grant.
+    let tip = super::genesis::genesis_in_force(d)
+        .await
+        .expect("I3570: the genesis in force")
+        .tips()
+        .iter()
+        .map(|t| t.asserted_at)
+        .max()
+        .expect("I3570: a bundle in force");
+    let granted_at: u64 = tip + 90_000;
+    // (the score's decimal token, its tag-4 exponent, its tag-4 mantissa)
+    let cases: [(&str, i64, i64, u64); 2] = [("0.25", -2, 25, 180_000), ("2.7", -1, 27, 240_000)];
+    for (token, exponent, mantissa, after_ms) in cases {
+        let score: serde_json::Value =
+            serde_json::from_str(token).expect("I3570: the score's token is a JSON number");
+        assert!(
+            score.is_number() && score.as_i64().is_none() && score.as_u64().is_none(),
+            "I3570: {token} is a non-integral number"
+        );
+        let mut ev = event(&e2::kid(det));
+        ev.ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            i64::try_from(granted_at + after_ms).expect("I3570: an instant"),
+        )
+        .expect("I3570: an instant");
+        ev.conformity_payload = serde_json::json!({ "score": score.clone() });
+
+        // Through the real producer, to the door.
+        let rid = crate::derived::detection_row::state_detection(d, &signer, &ev)
+            .await
+            .unwrap_or_else(|e| panic!("I3570: the detector states a {token} detection: {e:?}"));
+        // The producer returns a held row's id too: landed means STORED.
+        let Some(row) = d.get_attestation(&rid).await.expect("I3570: read the row") else {
+            let id: [u8; 32] = hex::decode(&rid)
+                .expect("I3570: a hex row id")
+                .try_into()
+                .expect("I3570: a 32-byte row id");
+            panic!(
+                "I3570: the {token} detection lands (stored under its row id); held {:?}",
+                super::fold::why_held(d, &super::names::RowId(id))
+                    .await
+                    .expect("I3570: the held reason")
+                    .map(|h| (h.reason, h.detail))
+            );
+        };
+        assert_eq!(row.attesting_key_id, e2::kid(det), "I3570: by the detector");
+
+        // The statement spells the score as the normalised tag-4 decimal.
+        let st = e2::carried_statement(&row).expect("I3570: the row carries its statement");
+        assert_eq!(
+            super::names::RowId::of_statement(&st).map(|r| r.hex()),
+            Some(rid.clone()),
+            "I3570: the row id is the statement's"
+        );
+        let (_, payload) = super::liveness::statement_parts(&st).expect("I3570: decodes");
+        let stated = payload
+            .get_text(crate::derived::detection_row::BODY_MEMBER)
+            .and_then(|b| b.get_text("conformity_payload"))
+            .and_then(|c| c.get_text("score"))
+            .expect("I3570: the body's score");
+        assert_eq!(
+            encode(stated),
+            encode(&Value::Tag(
+                4,
+                Box::new(Value::Array(vec![
+                    Value::int(exponent),
+                    Value::int(mantissa)
+                ]))
+            )),
+            "I3570: {token} is 4([{exponent}, {mantissa}])"
+        );
+
+        // The row's envelope reads the score back as the exact JSON number.
+        let enveloped = row
+            .attestation_envelope
+            .get(crate::derived::detection_row::BODY_MEMBER)
+            .and_then(|b| b.get("conformity_payload"))
+            .and_then(|c| c.get("score"))
+            .unwrap_or_else(|| panic!("I3570: the envelope's score: {}", row.attestation_envelope));
+        assert_eq!(enveloped, &score, "I3570: the envelope's score is {token}");
+        assert_eq!(
+            enveloped.to_string(),
+            token,
+            "I3570: the envelope's score token is exact"
+        );
+
+        // And so does the projection (`detection_events`).
+        let p = projected(d, &ev)
+            .await
+            .unwrap_or_else(|| panic!("I3570: the {token} detection projects"));
+        assert_eq!(
+            p.conformity_payload, ev.conformity_payload,
+            "I3570: the projected payload is the stated one"
+        );
+        assert_eq!(
+            p.conformity_payload["score"].to_string(),
+            token,
+            "I3570: the projected score token is exact"
+        );
+        assert_eq!(p.ts, ev.ts, "I3570: at the detection's instant");
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn i3570_a_fractional_score_reads_back_exact_sqlite() {
+    let a = sqlite().await;
+    a.set_node_key_id(super::fixture_switch::kid("p4-node"));
+    Box::pin(i3570_a_fractional_score_reads_back_exact(&a)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn i3570_a_fractional_score_reads_back_exact_postgres() {
+    let Some(a) = postgres().await else {
+        eprintln!("i3570 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+        return;
+    };
+    a.set_node_key_id(super::fixture_switch::kid("p4-node"));
+    Box::pin(i3570_a_fractional_score_reads_back_exact(&a)).await;
+    eprintln!("i3570 postgres: RAN");
 }
 
 #[cfg(feature = "sqlite")]

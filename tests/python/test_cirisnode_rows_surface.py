@@ -92,13 +92,16 @@ def test_the_classes_are_rows_from_python(tmp_path) -> None:
                     "domain": "health",
                     "language": "en",
                     "subject": "arc_question",
-                    "new_balance": 4.5,
+                    # v62 (P1-fix8): an exact canonical decimal STRING.
+                    "new_balance": "0.1234567890123456789",
                     "source_contribution": cid,
                 }
             )
         )
         ledger = json.loads(eng.cirisnode_get_credits_ledger(me, "health", "en", "arc_question"))
-        assert ledger["balance"] == 4.5 and ledger["attestation_id"] == bid, ledger
+        # Exact: 19 significant digits no float holds, as the same string.
+        assert ledger["balance"] == "0.1234567890123456789", ledger
+        assert ledger["attestation_id"] == bid, ledger
         assert json.loads(eng.cirisnode_check_ledger_projection("credits_ledger")) == {
             "live": 1,
             "rebuilt": 1,

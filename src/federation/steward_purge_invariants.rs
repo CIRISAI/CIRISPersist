@@ -4358,7 +4358,7 @@ pub(crate) mod bodies {
             severity: crate::derived::DetectionSeverity::Warning,
             cohort_cell: serde_json::json!({"deployment_domain": "legal"}),
             conformity_variant: crate::derived::ConformityVariant::Numeric,
-            conformity_payload: serde_json::json!({"score": 3}),
+            conformity_payload: serde_json::json!({"score": 3.1}),
             lens_core_version: "lc-1.0.0".to_owned(),
             ratchet_calibration_version: 4,
             canonical_bytes: canonical.to_vec(),

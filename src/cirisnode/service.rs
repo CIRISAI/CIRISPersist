@@ -29,6 +29,95 @@ use super::types::{
 };
 use super::Error;
 
+/// v62.0.0 (P1-fix8; CC 2.6.1.5) — a ledger decimal as stored: the
+/// canonical decimal text sqlite holds as `TEXT` and postgres returns as
+/// `numeric::text`. Anything else is a store that was written around the
+/// projection — refused, never coerced.
+///
+/// # Errors
+/// [`Error::Backend`] naming the column.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn stored_decimal(
+    column: &str,
+    text: &str,
+) -> Result<crate::federation::ledger_projection::Decimal, Error> {
+    crate::federation::ledger_projection::Decimal::parse_canonical(text).ok_or_else(|| {
+        Error::Backend(format!(
+            "{column} {text:?} is not a canonical decimal (the ledger stores exact decimals)"
+        ))
+    })
+}
+
+/// v62.0.0 (P1-fix8) — **routing order, exactly**: `(contributor_id,
+/// expertise)` of a cell's ACTIVE rows, kept where the expertise is above
+/// zero and ranked by it, greatest first, ties by contributor id. Done here,
+/// on the exact decimal, for both backends: sqlite's `TEXT` cannot order a
+/// decimal, and one rule keeps the two backends' answers equal.
+///
+/// # Errors
+/// [`stored_decimal`]'s.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn rank_routable(
+    rows: Vec<(String, String)>,
+) -> Result<Vec<RoutableContributor>, Error> {
+    let mut ranked = Vec::with_capacity(rows.len());
+    for (contributor_id, text) in rows {
+        let d = stored_decimal("expertise", &text)?;
+        if !d.is_zero() && !d.is_negative() {
+            ranked.push((d, contributor_id));
+        }
+    }
+    ranked.sort_by(|(da, ca), (db, cb)| db.cmp(da).then_with(|| ca.cmp(cb)));
+    Ok(ranked
+        .into_iter()
+        .map(|(d, contributor_id)| RoutableContributor {
+            contributor_id,
+            expertise: d.canonical(),
+        })
+        .collect())
+}
+
+/// v62.0.0 (P1-fix8) — **the vote weight from the two projections,
+/// exactly** (`SCHEMA.md` §5.2,
+/// [`crate::federation::ledger_projection::decimal::vote_weight`]): `None`
+/// when neither ledger says anything (no credits, no expertise, not active),
+/// as before. A missing ledger row is zero / inactive.
+///
+/// # Errors
+/// [`stored_decimal`]'s.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn vote_weight_of(
+    key: (&str, &str, &str, &str),
+    credits: Option<String>,
+    expertise: Option<(String, bool)>,
+) -> Result<Option<VoteWeight>, Error> {
+    use crate::federation::ledger_projection::{decimal, Decimal};
+    let credits = match credits {
+        Some(t) => stored_decimal("balance", &t)?,
+        None => Decimal::zero(),
+    };
+    let (expertise, is_active) = match expertise {
+        Some((t, a)) => (stored_decimal("expertise", &t)?, a),
+        None => (Decimal::zero(), false),
+    };
+    if credits.is_zero() && expertise.is_zero() && !is_active {
+        return Ok(None);
+    }
+    let (expertise_multiplier, active_tier_multiplier, weight) =
+        decimal::vote_weight(&credits, &expertise, is_active);
+    let (contributor_id, domain, language, subject) = key;
+    Ok(Some(VoteWeight {
+        contributor_id: contributor_id.to_owned(),
+        domain: domain.to_owned(),
+        language: language.to_owned(),
+        subject: subject.to_owned(),
+        credits: credits.canonical(),
+        expertise_multiplier: expertise_multiplier.canonical(),
+        active_tier_multiplier: active_tier_multiplier.canonical(),
+        weight: weight.canonical(),
+    }))
+}
+
 /// v60.0.0 — a pre-V203 ledger row with no backing row (`attestation_id`
 /// NULL): what the rehome re-emits as this node's `credits:` /
 /// `expertise:` row.
