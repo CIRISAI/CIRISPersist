@@ -420,6 +420,7 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 | earlier-form co-signature (not a payload member) | now |
 |---|---|
 | scrub_signature_* under the subject's key | the subject's statement |
+
 ### `transport:canonical_rebind`
 
 - **Replaces:** the transport:canonical_rebind:v1 scores row (its additional_scrubs, and the carried SignedTransportDestination under transport_destination)
