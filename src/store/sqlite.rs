@@ -70,13 +70,10 @@
 
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
-use ed25519_dalek::VerifyingKey;
 use parking_lot::Mutex;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 
-use super::backend::{Backend, InsertReport, PublicKeySample};
+use super::backend::{Backend, InsertReport};
 use super::types::{TraceEventRow, TraceLlmCallRow};
 use super::Error;
 use crate::schema::ReasoningEventType;
@@ -1398,77 +1395,6 @@ impl Backend for SqliteBackend {
             .await
             .map_err(|e| Error::Backend(format!("insert trace_llm_calls: {e}")))?;
         Ok(inserted)
-    }
-
-    async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
-        // v0.4.0 (lens#8 ASK 2) — federation_keys is the canonical
-        // pubkey directory. accord_public_keys fallback retired this
-        // release. Same shape as PostgresBackend post-cutover.
-        let key_id = key_id.to_owned();
-        let b64_opt = self
-            .read(move |conn| -> Result<Option<String>, rusqlite::Error> {
-                conn.query_row(
-                    "SELECT pubkey_ed25519_base64 FROM federation_keys \
-                     WHERE key_id = ?1 \
-                       AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP)",
-                    [&key_id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("lookup_public_key: {e}")))?;
-
-        let Some(b64) = b64_opt else {
-            return Ok(None);
-        };
-        let bytes = BASE64
-            .decode(&b64)
-            .map_err(|e| Error::Backend(format!("public_key_base64 decode: {e}")))?;
-        if bytes.len() != 32 {
-            return Err(Error::Backend(format!(
-                "public_key_base64 wrong length: got {}, expected 32",
-                bytes.len()
-            )));
-        }
-        let arr: [u8; 32] = bytes.as_slice().try_into().expect("length-checked");
-        let key = VerifyingKey::from_bytes(&arr)
-            .map_err(|e| Error::Backend(format!("public_key parse: {e}")))?;
-        Ok(Some(key))
-    }
-
-    async fn sample_public_keys(&self, limit: usize) -> Result<PublicKeySample, Error> {
-        // v0.4.0 — diagnostic queries federation_keys (canonical
-        // post-lens#8 ASK 2) so the verify-unknown-key breadcrumb
-        // sample matches what `lookup_public_key` actually queries.
-        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
-
-        let (size, sample) = self
-            .read(
-                move |conn| -> Result<(usize, Vec<String>), rusqlite::Error> {
-                    let total: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM federation_keys \
-                     WHERE valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP",
-                        [],
-                        |r| r.get(0),
-                    )?;
-                    let mut stmt = conn.prepare(
-                        "SELECT key_id FROM federation_keys \
-                     WHERE valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP \
-                     ORDER BY key_id LIMIT ?1",
-                    )?;
-                    let rows = stmt.query_map([lim], |r| r.get::<_, String>(0))?;
-                    let mut sample = Vec::new();
-                    for r in rows {
-                        sample.push(r?);
-                    }
-                    Ok((usize::try_from(total.max(0)).unwrap_or(0), sample))
-                },
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("sample_public_keys: {e}")))?;
-
-        Ok(PublicKeySample { size, sample })
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
@@ -28211,131 +28137,6 @@ mod tests {
         assert_eq!(r.conflicted, 0);
         let n = backend.insert_trace_llm_calls_batch(&[]).await.unwrap();
         assert_eq!(n, 0);
-    }
-
-    fn fixture_pubkey() -> ed25519_dalek::VerifyingKey {
-        // Deterministic 32-byte seed → SigningKey → VerifyingKey, so
-        // we don't pull `rand` into the dev-deps just for tests.
-        let seed: [u8; 32] = [7u8; 32];
-        ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key()
-    }
-
-    /// public_key lookup hits round-trip through base64 → 32-byte
-    /// VerifyingKey. Insert a known key directly into accord_public_keys
-    /// (test fixture) and look it up.
-    #[tokio::test]
-    async fn lookup_public_key_round_trip() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-
-        let verifying = fixture_pubkey();
-        let pk_b64 = BASE64.encode(verifying.to_bytes());
-
-        // Insert the row directly via the connection (the federation
-        // directory ingest path is v0.3.0 work).
-        {
-            let conn = backend.conn.clone();
-            (move || -> Result<(), rusqlite::Error> {
-                let conn = conn.lock();
-                // v0.4.0 — write directly to federation_keys (the
-                // canonical pubkey directory post-lens#8 ASK 2). The
-                // pre-v0.4.0 dual-read fallback to accord_public_keys
-                // was retired.
-                conn.execute(
-                    "INSERT INTO federation_keys (\
-                        key_id, pubkey_ed25519_base64, algorithm, \
-                        identity_type, identity_ref, valid_from, \
-                        registration_envelope, original_content_hash, \
-                        scrub_signature_classical, scrub_key_id, \
-                        scrub_timestamp, persist_row_hash, admitted_at\
-                     ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, '{}', \
-                              x'00', '', ?1, ?3, '0', ?3)",
-                    rusqlite::params!["key-test", pk_b64, "2026-04-30T00:00:00+00:00"],
-                )?;
-                Ok(())
-            })()
-            .unwrap();
-        }
-
-        // Disambiguate: both Backend and FederationDirectory traits
-        // expose `lookup_public_key` post-v0.2.0. This test exercises
-        // the legacy Backend (VerifyingKey) shape used by the trace
-        // verify path. Source-of-truth is federation_keys (v0.4.0).
-        let got = Backend::lookup_public_key(&backend, "key-test")
-            .await
-            .unwrap();
-        assert!(got.is_some());
-        assert_eq!(got.unwrap().to_bytes(), verifying.to_bytes());
-
-        // Unknown key returns None.
-        let none = Backend::lookup_public_key(&backend, "key-missing")
-            .await
-            .unwrap();
-        assert!(none.is_none());
-    }
-
-    /// v0.4.0 — Expired federation_keys rows are filtered from
-    /// lookup AND sample. Replaces the v0.1.x revoked_at filter
-    /// against accord_public_keys (retired in this release).
-    /// Federation revocations now live in federation_revocations,
-    /// a separate concern (consumers walk that graph for revocation
-    /// policy).
-    #[tokio::test]
-    async fn expired_keys_filtered() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-
-        let pk_b64 = BASE64.encode(fixture_pubkey().to_bytes());
-
-        {
-            let conn = backend.conn.clone();
-            let pk_b64 = pk_b64.clone();
-            (move || -> Result<(), rusqlite::Error> {
-                let conn = conn.lock();
-                conn.execute(
-                    "INSERT INTO federation_keys (\
-                        key_id, pubkey_ed25519_base64, algorithm, \
-                        identity_type, identity_ref, valid_from, \
-                        registration_envelope, original_content_hash, \
-                        scrub_signature_classical, scrub_key_id, \
-                        scrub_timestamp, persist_row_hash, admitted_at\
-                     ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, '{}', \
-                              x'00', '', ?1, ?3, '0', ?3)",
-                    rusqlite::params!["key-active", pk_b64, "2026-04-30T00:00:00+00:00"],
-                )?;
-                conn.execute(
-                    "INSERT INTO federation_keys (\
-                        key_id, pubkey_ed25519_base64, algorithm, \
-                        identity_type, identity_ref, valid_from, valid_until, \
-                        registration_envelope, original_content_hash, \
-                        scrub_signature_classical, scrub_key_id, \
-                        scrub_timestamp, persist_row_hash, admitted_at\
-                     ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, ?4, '{}', \
-                              x'00', '', ?1, ?3, '0', ?3)",
-                    rusqlite::params![
-                        "key-expired",
-                        pk_b64,
-                        "2026-04-29T00:00:00+00:00",
-                        "2026-04-30T00:00:00+00:00",
-                    ],
-                )?;
-                Ok(())
-            })()
-            .unwrap();
-        }
-
-        assert!(Backend::lookup_public_key(&backend, "key-active")
-            .await
-            .unwrap()
-            .is_some());
-        assert!(Backend::lookup_public_key(&backend, "key-expired")
-            .await
-            .unwrap()
-            .is_none());
-
-        let sample = backend.sample_public_keys(10).await.unwrap();
-        assert_eq!(sample.size, 1);
-        assert_eq!(sample.sample, vec!["key-active".to_owned()]);
     }
 
     // ─── FederationDirectory tests ─────────────────────────────────

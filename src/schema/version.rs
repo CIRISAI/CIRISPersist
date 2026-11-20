@@ -55,6 +55,12 @@ use serde::{Deserialize, Serialize};
 ///     JCS). The agent stamps `"3.0.0"` on its 2.9.6 hard-JCS cutover so
 ///     the signed `trace_schema_version` is the canonicalizer
 ///     discriminator (downgrade-safe — it is inside the signed bytes).
+///   - **`"3.1.0"` (v62.0.0, P7-fix9; agreed with Server + Agent)** is a
+///     JCS-epoch LABEL (major 3): every dispatch takes 3.0.0's path — the
+///     same canonical layout, the same canonicalizer, the same
+///     `from_json` checks. It names the agent's wire that carries an
+///     `LLM_CALL` component's `context_manifest` in `data`; persist stores
+///     `data` verbatim, so the member needs no arm of its own.
 ///
 /// `"2.7.legacy"` covers the pre-2.7.8.9 2-field
 /// `{components, trace_level}` canonical shape (no
@@ -69,7 +75,7 @@ use serde::{Deserialize, Serialize};
 /// because each trace contributes to exactly one canonical shape's
 /// verify path. Peers may also stamp `"2.7.legacy"` explicitly to
 /// hit the same dispatch arm via the sentinel route.
-pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0", "2.7.9", "2.7.legacy", "3.0.0"];
+pub const SUPPORTED_VERSIONS: &[&str] = &["2.7.0", "2.7.9", "2.7.legacy", "3.0.0", "3.1.0"];
 
 /// Type-checked wrapper around a schema version string.
 ///
@@ -206,7 +212,10 @@ mod tests {
         match err {
             super::super::Error::UnsupportedSchemaVersion { got, supported } => {
                 assert_eq!(got, "2.6.0");
-                assert_eq!(supported, &["2.7.0", "2.7.9", "2.7.legacy", "3.0.0"]);
+                assert_eq!(
+                    supported,
+                    &["2.7.0", "2.7.9", "2.7.legacy", "3.0.0", "3.1.0"]
+                );
             }
             _ => panic!("expected UnsupportedSchemaVersion, got {err:?}"),
         }
@@ -227,11 +236,12 @@ mod tests {
         // require an explicit migrator (FSD §3.4 / version.rs doc), not
         // best-effort parsing.
         assert!(SchemaVersion::parse("2.8.0").is_err());
-        // "3.0.0" is the JCS-cutover schema (v4.15.0/#871) and is now
-        // supported; a genuinely-future 3.x point/minor without a
-        // dispatch arm still rejects.
+        // "3.0.0" is the JCS-cutover schema (v4.15.0/#871) and "3.1.0"
+        // its label (v62.0.0, P7-fix9; I3471); a genuinely-future 3.x
+        // point/minor without a dispatch arm still rejects.
         assert!(SchemaVersion::parse("3.0.1").is_err());
-        assert!(SchemaVersion::parse("3.1.0").is_err());
+        assert!(SchemaVersion::parse("3.1.1").is_err());
+        assert!(SchemaVersion::parse("3.2.0").is_err());
     }
 
     #[test]

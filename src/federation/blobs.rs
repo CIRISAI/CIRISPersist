@@ -5176,7 +5176,7 @@ pub(crate) fn prepare_sealed_manifest_row(
 /// The producer's keys come from the directory, **not** from the
 /// pubkeys embedded in the STH's `HybridSignature` — a forged STH
 /// carrying its own keypair cannot self-certify. Uses
-/// [`HybridPolicy::Strict`](crate::verify::HybridPolicy::Strict): a
+/// `HybridPolicy::Strict` (deleted v62.0.0): a
 /// stream STH must carry both signature components (no hybrid-pending
 /// acceptance for transparency heads). Any verification failure —
 /// unknown key, bad signature, missing PQC — maps to
@@ -5230,7 +5230,7 @@ where
 ///
 /// A witness is not a new kind of principal needing a new roster. It is a
 /// registered federation key that watched this log, so `witness_id` resolves
-/// through [`verify_hybrid_via_directory`](crate::verify::verify_hybrid_via_directory)
+/// through `verify_hybrid_via_directory` (deleted v62.0.0)
 /// exactly as `producer_key_id` does: authority re-derived from THIS node's own
 /// verified state, never from keys carried on the row (the #377 rule). Each
 /// cosignature must clear all four checks, and a failure REFUSES THE WHOLE PUT

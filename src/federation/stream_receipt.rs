@@ -40,7 +40,7 @@
 //! # Crypto routing (MISSION §1.4)
 //!
 //! The subscriber signature is verified via
-//! [`crate::verify::verify_hybrid_via_directory`] against the **pinned**
+//! `crate::verify::verify_hybrid_via_directory` (deleted v62.0.0) against the **pinned**
 //! `federation_keys` key (never keys embedded in the signature) — the
 //! same discipline C1b's `verify_stream_sth_signature` uses. No rolled
 //! crypto.

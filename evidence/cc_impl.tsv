@@ -35,7 +35,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.2	CLM-nsproc-pre-rotation-commitment-trust	CIRISPersist	src/federation/trust_root.rs#check_trust_charter_admission	ciris-persist@61.4.2	21672f70ad12e59a8223b1ba2ff6cc14fc6e3b771ae27b80b4332bb642554f00
 3.2	CLM-halt-not-a-trust-leg	CIRISPersist	src/federation/trust_root.rs#trust_root_valid	ciris-persist@61.4.2	94fd3b1bc9ee2a38ce7758e3c58dc7ca14aa9b1b36ae346d1d44763bb1b19f02
 3.2	CLM-halt-not-a-trust-leg	CIRISPersist	src/federation/trust_root.rs#transit_eligibility_walk	ciris-persist@61.4.2	1b5774272618e40ba38453fb953a48de0f4046736b4f990652f471b60572aac0
-3.2	CLM-trust-not-membership	CIRISPersist	src/federation/admission.rs#check_user_target_steward_binding_admission	ciris-persist@61.4.2	31731e881159a99ec3fef6e7270ebedaa848eef649ca9892d0c8febcd6430f77
+3.2	CLM-trust-not-membership	CIRISPersist	src/federation/admission.rs#check_user_target_steward_binding_admission	ciris-persist@61.4.2	84bd19f4d870d89e56365f69da4813672429b21afa58c9b07dca5a325e796820
 3.2	CLM-nsproc-steward-bound-predicate-trust	CIRISPersist	src/federation/admission.rs#is_steward_bound	ciris-persist@61.4.2	3217545f608288d5c87f66dab040b9dc69f1afbba1cf06082d35316a42649e40
 3.2	CLM-nsproc-steward-bindings-read-fold-trust	CIRISPersist	src/engine.rs#steward_bindings_of	ciris-persist@61.4.2	7df0174b73d2b30230164aca2e1572afaec173ac61d27c4e6d99b61b19418441
 3.2	CLM-infrastructure-trust-root-admitted-under-accord-quorum	CIRISPersist	src/federation/canonical_community.rs#check_trust_root_community_admission	ciris-persist@61.4.2	40dfd85c0c41487faec1935611cc502d46a1b177757532162f1ac5a27a82b21c
@@ -211,7 +211,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.2	CLM-canonical-founders-accord	CIRISPersist	src/federation/membership_acceptance.rs#node_seated_without_acceptance	ciris-persist@61.4.2	8492056bcf0525d99ae6cc0b7d513a524c73b9a344bf175fc75acb276f286d8f
 3.2	CLM-attach-unlabelled	CIRISPersist	src/federation/trust_root.rs#direction_denied_ids	ciris-persist@61.4.2	ba648cc5986cb6c068218e1c1d644f87c09ca023a20d78738833b4ef6b8632f1
 3.2	CLM-attach-unlabelled	CIRISPersist	src/federation/trust_root.rs#names_no_trust_job	ciris-persist@61.4.2	0b9119fbc72eceb904bd62a9e3e2c04550ad8417adcaf9ca93c61ae4581c35f4
-4.1.1	CLM-anti-pattern-delegation	CIRISPersist	src/federation/admission.rs#scoped_delegation_reach_at	ciris-persist@61.4.2	587a63b4bddd7d5b51079c2bcd406e4ec099c3a923e6605db65e3b2b871992e5
+4.1.1	CLM-anti-pattern-delegation	CIRISPersist	src/federation/admission.rs#scoped_delegation_reach_at	ciris-persist@61.4.2	098a91cef4e4b242dafb9b598b6154442c1e8e836f3e87cee1b3a2b167bc997c
 4.1.1	CLM-self-edge-not-cycle	CIRISPersist	src/federation/admission.rs#is_trust_plane_edge	ciris-persist@61.4.2	61ba78c9299db96dbdb136a82054d57f98bf6fc18019b2707093e34b62116f01
 4.4.3.12	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#check_community_record	ciris-persist@61.4.2	7cc423b3c04f0baa8cb8b001eb801e508114f0d29ecb7d418935e011ddd58dbf
 4.4.3.12	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#declared_cohort	ciris-persist@61.4.2	43979a178e9f67fe68d8f3fe9fdb6163e8daa1a73c45f259f2f607af987b61c1
@@ -222,7 +222,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 2.4.1.1	CLM-accountability-record-unpurgeable	CIRISPersist	src/federation/migration.rs#accountability_record_family	ciris-persist@61.4.2	ddde28a43a1b8bfe67fd76f504633ad14ef421ab3ef0297d14074cc2ec0f79c6
 2.4.1.1	CLM-accountability-record-unpurgeable	CIRISPersist	src/federation/steward_purge.rs#retraction_admissible	ciris-persist@61.4.2	aa29f734f9d6398894cd8c4aadd7201ebff586005ef716c8c30e10f81b729570
 2.4.1.1	CLM-accountability-record-unpurgeable	CIRISPersist	src/federation/steward_purge.rs#accountability_record_of	ciris-persist@61.4.2	75f496a8ce2c1a3becd9def0be0d523d812148a80547176a3ce45de2e2a67902
-3.1.5	CLM-trace-run-kind-refusal	CIRISPersist	src/federation/steward_purge.rs#refuse_mock_trace_attestation	ciris-persist@61.4.2	71cf57b0d73c424b68b7bb57ff7419cec7903caba336887ce3b1d1b8f7b39da9
+3.1.5	CLM-trace-run-kind-refusal	CIRISPersist	src/federation/steward_purge.rs#refuse_mock_trace_attestation	ciris-persist@61.4.2	d167b44ad2c0c5f08fa6546bbf337da7ab0490b206b42119128c02aa566c7b64
 3.1.5	CLM-trace-run-kind-refusal	CIRISPersist	src/schema/trace.rs#RUN_KINDS	ciris-persist@61.4.2	c67ab2fd12c8bc5d43e80c2e9f23f72dd40bb4bdabb9a53ea52caaa13c8f012e
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#purge_rows	ciris-persist@61.4.2	5d0246589c4ea38263724f6fe3c23402658681ea22c29257998f38350789653e
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#purge_finalize	ciris-persist@61.4.2	a62d5ea24c50f0978108a70419cfb656e548a1652b1b99df273ee36fb1c3aa3f
@@ -428,9 +428,9 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 5.4.6	CLM-serve-seat-announced	CIRISPersist	src/federation/admission.rs#serve_seat_owner_announced	ciris-persist@61.4.2	43a017cc2ef4c367dd6ff125b2dc70aee675774ab9c69a1ae2443c7f6921854a
 8.11.10	CLM-canonicalization	CIRISPersist	src/federation/admission.rs#signed_instant_form_violation	ciris-persist@61.4.2	59390d119a0233437ea82824935e296f3232ebe20882f820c8ee01e517e68b8b
 
-# v61.1.0 (CIRISPersist#1233) — the verifier's hybrid-required check is always-on: the
-# caller verify doors accept only strict, and the audit plane's gate is its hybrid-signed head.
-5.3.2.8	CLM-admission-pqc	CIRISPersist	src/verify/hybrid.rs#require_strict_policy	ciris-persist@61.4.2	a12dd08a1bcae9817d256e2874fa930f907aa50894656eb23a228a06cb6b7405
+# v62.0.0 (F0-cp7) — composite only: one composite under a live edition-2 key; no
+# standalone component verify (the bound-hybrid family is deleted); the audit gate is its composite head.
+5.3.2.8	CLM-admission-pqc	CIRISPersist	src/federation/edition2/composite_verify.rs#verify_composite_via_directory	ciris-persist@61.4.2	d34466c16dda47ff762cb3e9875ec19e93db02eb77087d76756db598f35797b2
 5.3.2.8	CLM-admission-pqc	CIRISPersist	src/audit/merkle_store.rs#require_hybrid_sth	ciris-persist@61.4.2	8de67a83552c928012d44fd9aba49c246551865ca2b26ff8ea3ea1d14412a565
 # v61.3.0 (CIRISPersist#1252, CC 3.3.4) — the cosign hold: held on the sole shortfall,
 # collected as cosign:signature rows served to members only, landed through its own door

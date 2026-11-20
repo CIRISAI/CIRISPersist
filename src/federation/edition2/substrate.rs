@@ -1,13 +1,12 @@
 //! v62.0.0 (JSON-cut slice F, F0-cp6) — **the CC 6.1.3 substrate planes, and
 //! the ONE predicate that decides each.**
 //!
-//! Two planes carry a signature persist chooses the form of:
-//!
-//! - the audit chain's entries (`audit::verify::verify_entry_signature`: an
-//!   inner Ed25519 signature under `actor_id`; the plane's hybrid gate is the
-//!   signed tree head);
-//! - the calibration bundle (`Engine.put_calibration_bundle`: a bound pair
-//!   through the directory).
+//! One plane carries a signature persist chooses the form of: the audit
+//! chain's entries (`audit::verify::verify_entry_signature`: an inner Ed25519
+//! signature under `actor_id`; the plane's gate is the composite-signed tree
+//! head). The calibration bundle crosses nodes and is composite only
+//! (v62.0.0, F0-cp7: its own-form branch went with the bound-hybrid verify
+//! family; `derived::calibration_admit`).
 //!
 //! CC 6.1.3 (corrected by CC, 2026-11-19): every CC 6.1 signed object
 //! carries ONE composite signature over its own preimage; what 6.1 exempts is
@@ -33,12 +32,10 @@
 //!
 //! F0-cp6b findings (each line below):
 //!
-//! - the audit chain's entries do NOT: what is served is the composite-signed
-//!   tree head, row hashes and inclusion proofs (`federation::read`,
-//!   `AuditChainProof`); no other node verifies an entry's inner Ed25519
-//!   signature — its own form;
-//! - the calibration bundle CROSSES nodes: persist verifies a RATCHET
-//!   steward's signature through the directory — composite.
+//! - the audit chain's entries do NOT cross nodes: what is served is the
+//!   composite-signed tree head, row hashes and inclusion proofs
+//!   (`federation::read`, `AuditChainProof`); no other node verifies an
+//!   entry's inner Ed25519 signature — its own form.
 
 use crate::federation::Error;
 
@@ -47,20 +44,17 @@ use crate::federation::Error;
 pub enum SubstratePlane {
     /// An audit-chain entry (`AuditEntry`).
     AuditEntry,
-    /// A derived calibration bundle (`CalibrationBundle`).
-    CalibrationBundle,
 }
 
 impl SubstratePlane {
     /// Every plane.
-    pub const ALL: [Self; 2] = [Self::AuditEntry, Self::CalibrationBundle];
+    pub const ALL: [Self; 1] = [Self::AuditEntry];
 
     /// The plane name the refusal carries.
     #[must_use]
     pub const fn plane(self) -> &'static str {
         match self {
             Self::AuditEntry => "audit_entry",
-            Self::CalibrationBundle => "calibration_bundle",
         }
     }
 }
@@ -84,7 +78,6 @@ pub enum SubstrateForm {
 pub const fn keeps_its_own_signature(plane: SubstratePlane) -> bool {
     match plane {
         SubstratePlane::AuditEntry => true,
-        SubstratePlane::CalibrationBundle => false,
     }
 }
 

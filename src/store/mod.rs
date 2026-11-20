@@ -144,7 +144,7 @@ pub enum HostStoreProfile {
     SingleProcess,
 }
 
-pub use backend::{Backend, InsertReport, PublicKeySample};
+pub use backend::{Backend, InsertReport};
 pub use decompose::{
     decompose, dedup_key, trace_dedup_shard_key, trace_dedup_shard_key_parts, Decomposed,
     TRACE_DEDUP_SHARD_COUNT,

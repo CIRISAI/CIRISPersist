@@ -81,7 +81,7 @@
 //! check first, with a clear error, and is **not stored**
 //! (fail-secure).
 //!
-//! Verification runs in [`HybridPolicy::Strict`](crate::verify::HybridPolicy::Strict)
+//! Verification ran in `HybridPolicy::Strict` (deleted v62.0.0, F0-cp7)
 //! — both Ed25519 and ML-DSA-65 are REQUIRED. Peering is a high-stakes
 //! domain; a hybrid-pending (Ed25519-only) registration is rejected.
 //!
@@ -113,7 +113,6 @@ use super::edition2::fold::{self, Dep};
 use super::types::{algorithm, KeyRecord};
 use super::{Error, FederationDirectory};
 use crate::verify::canonical::ceg_produce_canonicalize;
-use crate::verify::{verify_hybrid, HybridPolicy, VerifyOutcome};
 
 /// v24.2.0 (CIRISPersist#565) — **WHICH policy branch refused** a replicated
 /// Key-plane apply.
@@ -1493,8 +1492,10 @@ pub fn record_is_role_gated(record: &KeyRecord) -> bool {
 /// directory is only consulted to resolve a granting-authority
 /// signer's pubkeys when `scrub_key_id != key_id`.
 ///
-/// On success returns the [`VerifyOutcome`] (always
-/// [`VerifyOutcome::HybridVerified`] under the Strict policy this gate
+/// v62.0.0 (F0-cp7): the bound-hybrid verify is deleted, so this gate
+/// refuses every earlier-form record by name (`earlier_form_object`). Before:
+/// on success it returned the `VerifyOutcome` (always `HybridVerified` under
+/// the Strict policy this gate
 /// uses); the caller then stores the row via `put_public_key`. On ANY
 /// failure returns a typed [`Error`] and the caller MUST NOT store the
 /// row.
@@ -1520,10 +1521,7 @@ pub fn record_is_role_gated(record: &KeyRecord) -> bool {
 /// the SAME function the accord co-scrub quorum core calls. Absence is a
 /// refusal; there is no legacy regime. See this module's header for the defect
 /// and why the check sits above the self-attested / granting-authority split.
-pub async fn verify_key_registration<F>(
-    directory: &F,
-    record: &KeyRecord,
-) -> Result<VerifyOutcome, Error>
+pub async fn verify_key_registration<F>(directory: &F, record: &KeyRecord) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -1789,26 +1787,21 @@ fn registration_canonical_bytes(record: &KeyRecord) -> Result<Vec<u8>, Error> {
     Ok(canonical)
 }
 
-/// Strict hybrid verify of the record's base scrub over `canonical`, against
-/// the signer's pubkeys. Peering is high-stakes; a hybrid-pending
-/// (Ed25519-only) registration is rejected. `row_age` is irrelevant under
-/// Strict.
+/// v62.0.0 (F0-cp7) — an earlier-form key registration's base scrub is the
+/// bound-hybrid pair over the record's JSON preimage. Its verify is DELETED
+/// (RULINGS: no standalone component signers), so a record reaching here is
+/// refused by name (`earlier_form_object`); a key is an edition-2
+/// `key:record` statement through the door.
 fn verify_registration_signature(
     record: &KeyRecord,
     canonical: &[u8],
     ed25519_pubkey_b64: &str,
     ml_dsa_65_pubkey_b64: Option<&str>,
-) -> Result<VerifyOutcome, Error> {
-    verify_hybrid(
-        canonical,
-        &record.scrub_signature_classical,
-        record.scrub_signature_pqc.as_deref(),
-        ed25519_pubkey_b64,
-        ml_dsa_65_pubkey_b64,
-        HybridPolicy::Strict,
-        None,
-    )
-    .map_err(|e| Error::SignatureInvalid(format!("registration hybrid-verify: {e} ({})", e.kind())))
+) -> Result<(), Error> {
+    let _ = (record, canonical, ed25519_pubkey_b64, ml_dsa_65_pubkey_b64);
+    Err(super::edition2::door::earlier_form_signature(
+        "key_registration",
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────

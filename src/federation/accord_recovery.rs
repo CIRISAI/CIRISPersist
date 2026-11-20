@@ -628,19 +628,12 @@ where
             format!("signed by {}, not the recovery key", sig.member_id),
         );
     }
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(st)
-        .map_err(|e| Error::InvalidArgument(format!("recovery canonicalize: {e}")))?;
-    crate::verify::hybrid::verify_hybrid(
-        &bytes,
-        &sig.ed25519_signature_base64,
-        sig.mldsa65_signature_base64.as_deref(),
-        &record.pubkey_ed25519_base64,
-        record.pubkey_ml_dsa_65_base64.as_deref(),
-        crate::verify::hybrid::HybridPolicy::Strict,
-        None,
-    )
-    .map_err(|e| Error::CharterInvalid {
-        detail: format!("accord_recovery_signature: {e}"),
-    })?;
-    Ok(Some(new.to_owned()))
+    // v62.0.0 (F0-cp7) — the earlier recovery's signature is the bound-hybrid
+    // pair over its JSON statement; the verify is deleted, so a recovery of
+    // that form is refused by name. An edition-2 recovery is ONE recovery
+    // voice over the genesis bundle/2 (`edition2::recovery_signer`).
+    let _ = (st, record, sig, new);
+    Err(super::edition2::door::earlier_form_signature(
+        "accord_recovery",
+    ))
 }

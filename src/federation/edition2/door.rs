@@ -957,6 +957,30 @@ pub fn earlier_form_doors_shut() -> bool {
     EARLIER_FORM_DOORS_SHUT
 }
 
+/// v62.0.0 (F0-cp7; RULINGS "composite signatures only, no standalone
+/// component signers") — **the refusal of an earlier-form, bound-hybrid
+/// signature** (an Ed25519 half plus an ML-DSA-65 half over `msg ‖
+/// ed25519_sig`, verified against a key's registered component halves). The
+/// bound-hybrid verify family (`verify_hybrid`, `verify_hybrid_via_directory`,
+/// `verify_hybrid_with_policy`) is DELETED; a door that still receives such a
+/// signature answers this, by name (`earlier_form_object`), whatever the
+/// switch says. A signature is ONE composite under a LIVE edition-2 key
+/// (`composite_verify`), or a CC 6.1 composite over its own preimage
+/// (`verify::sig19`).
+#[must_use]
+pub fn earlier_form_signature(plane: &'static str) -> Error {
+    Error::malformed_row(
+        plane,
+        token::EARLIER_FORM_OBJECT,
+        format!(
+            "an earlier-form (bound-hybrid Ed25519 + ML-DSA-65) signature at the `{plane}` \
+             door: v62 verifies ONE composite signature under a live edition-2 key and no \
+             standalone component signature (RULINGS); offer the edition-2 statement \
+             (CC 2.6.1.12)"
+        ),
+    )
+}
+
 /// **The one shared refusal every earlier-form door calls** (v62.0.0,
 /// JSON-cut slice A). `plane` names the door. It is inert until
 /// [`EARLIER_FORM_DOORS_SHUT`] is `true`; then it refuses

@@ -20,8 +20,8 @@
 //! Persist's [`crate::derived::DerivedSchema::put_calibration_bundle`]
 //! back end does **not** verify these signatures themselves — that is the
 //! [`Engine`] surface's responsibility, which calls
-//! [`crate::verify::verify_hybrid_via_directory`] under
-//! [`crate::verify::HybridPolicy::Strict`] before the backend write
+//! `crate::verify::verify_hybrid_via_directory` (deleted v62.0.0) under
+//! `crate::verify::HybridPolicy::Strict` (deleted v62.0.0) before the backend write
 //! (cf. CIRISPersist#14).
 
 use chrono::{DateTime, Utc};

@@ -90,7 +90,7 @@ impl FountainManifestV1 {
 
     /// Canonical signing bytes — [`canonical_value`](Self::canonical_value)
     /// run through `canonicalizer`. The admit gate signs/verifies over
-    /// exactly these bytes via [`crate::verify::verify_hybrid`].
+    /// exactly these bytes via `crate::verify::verify_hybrid` (deleted v62.0.0).
     pub fn canonical_bytes<C>(&self, canonicalizer: &C) -> Result<Vec<u8>, CanonError>
     where
         C: Canonicalizer + ?Sized,

@@ -35,10 +35,7 @@
 //!   columns, so it dedups exactly the same rows the V001 index did while
 //!   spreading concurrent inserts across shards.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
-use ed25519_dalek::VerifyingKey;
 use postgres_types::ToSql;
 #[cfg(not(feature = "tls"))]
 use tokio_postgres::NoTls;
@@ -7374,79 +7371,6 @@ impl Backend for PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("update_features_batch: {e}")))?;
         Ok(n)
-    }
-
-    async fn lookup_public_key(&self, key_id: &str) -> Result<Option<VerifyingKey>, Error> {
-        // v0.4.0 (lens#8 ASK 2) — federation_keys is the canonical
-        // pubkey directory. The v0.2.1 dual-read fallback to
-        // accord_public_keys was retired in this release, coordinated
-        // with lens dropping its direct INSERT into accord_public_keys
-        // the same release. The legacy table stays in the schema for
-        // historical reads via cirislens_reader (V005 read-only role)
-        // but the verify path no longer touches it.
-        //
-        // Filter: federation_keys has no direct revocation column
-        // (revocations live in federation_revocations); we accept any
-        // unexpired row. Strict consumers can layer revocation checks
-        // via FederationDirectory::revocations_for().
-        let client = self.get_client().await?;
-        let fed_row = client
-            .query_opt(
-                "SELECT pubkey_ed25519_base64 FROM cirislens.federation_keys \
-                 WHERE key_id = $1 \
-                   AND (valid_until IS NULL OR valid_until > NOW())",
-                &[&key_id],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("lookup_public_key: {e}")))?;
-        match fed_row {
-            None => Ok(None),
-            Some(row) => {
-                let b64: String = row.safe_get_with(0, Error::Backend)?;
-                decode_ed25519_b64(&b64).map(Some)
-            }
-        }
-    }
-
-    async fn sample_public_keys(
-        &self,
-        limit: usize,
-    ) -> Result<super::backend::PublicKeySample, Error> {
-        // v0.4.0 — diagnostic for the verify-unknown-key breadcrumb,
-        // updated to query federation_keys (the canonical directory
-        // post-lens#8 ASK 2). Same filter as `lookup_public_key`'s
-        // WHERE so the sample reflects exactly what the runtime
-        // lookup queries against.
-        let client = self.get_client().await?;
-        let count_row = client
-            .query_one(
-                "SELECT COUNT(*)::BIGINT FROM cirislens.federation_keys \
-                 WHERE valid_until IS NULL OR valid_until > NOW()",
-                &[],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("count_public_keys: {e}")))?;
-        let total: i64 = count_row.safe_get_with(0, Error::Backend)?;
-
-        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = client
-            .query(
-                "SELECT key_id FROM cirislens.federation_keys \
-                 WHERE valid_until IS NULL OR valid_until > NOW() \
-                 ORDER BY key_id LIMIT $1",
-                &[&lim],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("sample_public_keys: {e}")))?;
-        let sample: Vec<String> = rows
-            .iter()
-            .map(|r| r.safe_get_with(0, Error::Backend))
-            .collect::<Result<_, _>>()?;
-
-        Ok(super::backend::PublicKeySample {
-            size: total.max(0) as usize,
-            sample,
-        })
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
@@ -20805,23 +20729,6 @@ fn pg_row_to_outbound_row(
         claimed_until: row.safe_get_with("claimed_until", mk_err)?,
         claimed_by: row.safe_get_with("claimed_by", mk_err)?,
     })
-}
-
-/// v0.2.1 — Decode a base64 standard-alphabet Ed25519 public key
-/// (32 raw bytes) and parse to VerifyingKey. Shared between the
-/// federation_keys and accord_public_keys lookup paths.
-fn decode_ed25519_b64(b64: &str) -> Result<VerifyingKey, Error> {
-    let bytes = BASE64
-        .decode(b64)
-        .map_err(|e| Error::Backend(format!("public_key_base64 decode: {e}")))?;
-    if bytes.len() != 32 {
-        return Err(Error::Backend(format!(
-            "public_key_base64 wrong length: got {}, expected 32",
-            bytes.len()
-        )));
-    }
-    let arr: [u8; 32] = bytes.as_slice().try_into().expect("length-checked");
-    VerifyingKey::from_bytes(&arr).map_err(|e| Error::Backend(format!("public_key parse: {e}")))
 }
 
 /// v56.0.0 (CIRISPersist#1001) — the typed bounded read's one statement

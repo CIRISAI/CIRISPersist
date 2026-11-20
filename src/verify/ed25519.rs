@@ -405,7 +405,7 @@ where
     let mut canonical = match wire {
         "2.7.0" => canonical_payload_value(trace),
         "2.7.9" => canonical_payload_value_v279(trace),
-        "3.0.0" => canonical_payload_value_v279(trace),
+        "3.0.0" | "3.1.0" => canonical_payload_value_v279(trace),
         "2.7.legacy" => canonical_payload_value_legacy(trace),
         other => return Err(Error::UnsupportedSchemaVersion(other.to_owned())),
     };
@@ -486,6 +486,7 @@ mod tests {
             ("2.7.legacy", V1Python),
             ("1.0.0", V1Python),
             ("3.0.0", V2Jcs),
+            ("3.1.0", V2Jcs),
             ("3.5.2", V2Jcs),
             ("10.0.0", V2Jcs),
             ("garbage", V1Python),
@@ -504,7 +505,7 @@ mod tests {
     fn i699_the_diagnostic_hashes_the_verifiers_preimage() {
         use sha2::{Digest, Sha256};
         let sk = fixed_signing_key();
-        for wire in ["2.7.0", "2.7.9", "3.0.0", "2.7.legacy"] {
+        for wire in ["2.7.0", "2.7.9", "3.0.0", "3.1.0", "2.7.legacy"] {
             let mut trace = make_trace(&sk, "agent-i699");
             trace.trace_schema_version = SchemaVersion::parse(wire).unwrap();
             trace.run_kind = Some("production".into());

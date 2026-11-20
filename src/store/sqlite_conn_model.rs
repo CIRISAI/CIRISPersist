@@ -904,7 +904,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("replay_abandoned", ConnClass::Write),
     ("revocations_for_subject", ConnClass::Read),
     ("run_migrations", ConnClass::Write),
-    ("sample_public_keys", ConnClass::Read),
     ("scoring_ingest_watermark_ms", ConnClass::Read),
     ("seal_stream", ConnClass::Write),
     ("set_active_halt", ConnClass::Write),

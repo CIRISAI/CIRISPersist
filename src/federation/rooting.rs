@@ -42,7 +42,7 @@
 //! # Crypto goes through CIRISVerify
 //!
 //! Each link's scrub-signature is verified through
-//! [`crate::verify::hybrid::verify_hybrid`] — the existing hybrid
+//! `crate::verify::hybrid::verify_hybrid` (deleted v62.0.0) — the existing hybrid
 //! Ed25519 + ML-DSA-65 verify path, which delegates to
 //! `ciris_crypto`. This module never rolls its own crypto
 //! (MISSION.md §1.4 — the crypto-through-CIRISVerify invariant).

@@ -1205,38 +1205,6 @@ pub fn trust_revocation_signing_bytes_v1(
     pinned_trust_bytes("trust_revocation", &value)
 }
 
-/// v61 — verify a trust-plane signature over the v2 preimage, else the v1
-/// one. The two domains are separated by their `domain` member, so a signature
-/// verifies under at most the preimage it was made over; a v2 preimage that
-/// cannot be built (a sub-millisecond instant) leaves only v1.
-async fn verify_trust_plane_signature(
-    directory: &dyn super::FederationDirectory,
-    v2: Result<Vec<u8>, Error>,
-    v1: Vec<u8>,
-    signer: &str,
-    classical: &str,
-    pqc: Option<&str>,
-) -> Result<(), crate::verify::hybrid::VerifyError> {
-    let verify = |bytes: Vec<u8>| async move {
-        crate::verify::hybrid::verify_hybrid_via_directory(
-            directory,
-            &bytes,
-            signer,
-            classical,
-            pqc,
-            crate::verify::hybrid::HybridPolicy::Strict,
-            None,
-        )
-        .await
-    };
-    if let Ok(bytes) = v2 {
-        if verify(bytes).await.is_ok() {
-            return Ok(());
-        }
-    }
-    verify(v1).await.map(|_| ())
-}
-
 /// v38.0.0 (CIRISPersist#721) — **the trust-grant authority gate.** The
 /// granter must PROVE it is `trusted_by`: a Strict hybrid verification of
 /// the signature over [`trust_grant_signing_bytes`] against `trusted_by`'s
@@ -1249,24 +1217,12 @@ pub async fn check_trust_grant_authority(
     directory: &dyn super::FederationDirectory,
     signed: &super::SignedTrustGrant,
 ) -> Result<(), Error> {
-    verify_trust_plane_signature(
-        directory,
-        trust_grant_signing_bytes(&signed.grant),
-        trust_grant_signing_bytes_v1(&signed.grant)?,
-        &signed.grant.trusted_by,
-        &signed.signature_classical_base64,
-        signed.signature_pqc_base64.as_deref(),
-    )
-    .await
-    .map_err(|e| {
-        Error::InvalidArgument(format!(
-            "trust grant authority: granter {:?} did not prove the grant (hybrid verify \
-             against the directory-pinned keys failed: {e}). A trust edge whose granter is \
-             unproven is a rumor with a column (CIRISPersist#721)",
-            signed.grant.trusted_by
-        ))
-    })?;
-    Ok(())
+    // v62.0.0 (F0-cp7) — the trust plane's signature is the earlier
+    // bound-hybrid pair over a JSON preimage; its verify is deleted, so the
+    // grant is refused by name (`grant_trust` refuses the earlier form first;
+    // a trust blessing is a CC family pending its card).
+    let _ = (directory, signed);
+    Err(super::edition2::door::earlier_form_signature("trust_grant"))
 }
 
 /// v38.0.0 (CIRISPersist#721) — **the trust-revocation authority gate.**
@@ -1278,23 +1234,11 @@ pub async fn check_trust_revocation_authority(
     directory: &dyn super::FederationDirectory,
     signed: &super::SignedTrustRevocation,
 ) -> Result<(), Error> {
-    verify_trust_plane_signature(
-        directory,
-        trust_revocation_signing_bytes(&signed.key, &signed.revoked_by, &signed.revoked_at),
-        trust_revocation_signing_bytes_v1(&signed.key, &signed.revoked_by, &signed.revoked_at)?,
-        &signed.revoked_by,
-        &signed.signature_classical_base64,
-        signed.signature_pqc_base64.as_deref(),
-    )
-    .await
-    .map_err(|e| {
-        Error::InvalidArgument(format!(
-            "trust revocation authority: revoker {:?} did not prove the revocation (hybrid \
-             verify against the directory-pinned keys failed: {e})",
-            signed.revoked_by
-        ))
-    })?;
-    Ok(())
+    // v62.0.0 (F0-cp7) — as [`check_trust_grant_authority`]: refused by name.
+    let _ = (directory, signed);
+    Err(super::edition2::door::earlier_form_signature(
+        "trust_revocation",
+    ))
 }
 
 /// v38.0.0 (CIRISPersist#721) — **every op that writes the trust plane,
@@ -4989,12 +4933,63 @@ async fn community_quorum_at_head(
     let Some(live) = directory.lookup_community(&c.community_key_id).await? else {
         return Ok(false);
     };
-    let head_hex = head.hex();
+    // v62.0.0 (E2-fix6; CC 2.7.4, CC 3.2 T6) — `refs.head` names the roster
+    // VERSION by its edition-2 ROW ID; a typed version carries its RECORD's
+    // content hash (`compute_persist_row_hash`, as `community_admit` stamps
+    // it), so the two never compare. The named roster statement is mapped to
+    // its typed record (the group door's own mapping: `record_of_roster` over
+    // `prev_head_digest`) and the version is found by THAT hash, the one
+    // spelling of a version's identity here. The named version is an input.
+    //
+    // - no held statement whose own row id IS `head`, or one that is not a
+    //   `group:roster` statement: the act WAITS (`Ok(false)`), as before;
+    // - a named version whose earlier version is not held: WAITS
+    //   (`Ok(false)`, the structural `WithdrawsTargetUnheld`);
+    // - a held `group:roster` statement that does not map (it does not read,
+    //   or its view or record is malformed): REFUSED (`?`). Malformed is a
+    //   refusal, not absence.
+    //
+    // Every voice held under a row id is over the same `(type, family, sub,
+    // author, payload)` (`RowId::of_statement`, CC 2.6.1.3), so the statement
+    // selected by its own row id maps to the same record whichever voice it
+    // is; it is selected explicitly, never by position.
+    super::edition2::fold::reads(super::edition2::fold::Dep::Row(*head));
+    let held = directory.edition2_voices(head).await?;
+    let Some(st) = held
+        .iter()
+        .find(|st| super::edition2::names::RowId::of_statement(st) == Some(*head))
+    else {
+        return Ok(false);
+    };
+    let Some((protected, _)) = super::edition2::liveness::statement_parts(st) else {
+        return Err(Error::InvalidArgument(format!(
+            "community_quorum_at_head: the held statement {} that refs.head names does not read",
+            head.hex()
+        )));
+    };
+    if protected
+        .get_int(-70002)
+        .and_then(ciris_verify_core::cde::Value::as_text)
+        != Some(super::edition2::group::GROUP_ROSTER_PREFIX)
+    {
+        return Ok(false);
+    }
+    let view = super::edition2::group::roster_view_of_statement(st)?;
+    // An earlier version the named one follows that is not held here is
+    // ABSENCE: the act waits. The group door says so structurally
+    // (`Error::WithdrawsTargetUnheld`, its `unheld` arm, held `link_unheld`).
+    // Every other error of the lineage read is the error as raised.
+    let prev = match super::edition2::group::prev_head_digest(directory, &view, head).await {
+        Ok(prev) => prev,
+        Err(Error::WithdrawsTargetUnheld { .. }) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let named_hash = super::edition2::group::record_of_roster(&view, prev)?.persist_row_hash()?;
     let Some(version) = community_versions(directory, &live)
         .await?
         .into_iter()
         .map(|(v, _)| v)
-        .find(|v| v.persist_row_hash == head_hex)
+        .find(|v| v.persist_row_hash == named_hash)
     else {
         return Ok(false);
     };
@@ -11075,6 +11070,19 @@ async fn scoped_delegation_reach_at(
             if incoming_retracted[&r.attested_key_id].contains(&r.attestation_id) {
                 if to_target {
                     out.target_edge_retracted = true;
+                }
+                continue;
+            }
+            // v62.0.0 (K2-fix11; an appointment made to a minor is VOID) — the
+            // duty walk never counts a void duty edge
+            // (`age::duty_edge_void_for_minor`, the write gate's one
+            // predicate, over the edge's community's OPEN duty set). It declares the fold read `key:<recipient>`, so a
+            // minor row landing about the recipient re-folds every fold that
+            // walked this edge, and a read-time walk (`is_named_moderator`)
+            // sees it at once.
+            if super::age::duty_edge_void_for_minor(directory, &r).await? {
+                if to_target {
+                    out.target_edge_missing_scope = true;
                 }
                 continue;
             }
@@ -20801,6 +20809,24 @@ pub async fn check_user_target_steward_binding_admission(
     if !target_set.contains(identity_type::USER) {
         return Ok(());
     }
+    // v62.0.0 (K2-fix11; Eric's ruling: an appointment made to a minor is
+    // VOID) — a duty edge onto a person is void when a minor band is held
+    // about them and the edge does not post-date their earliest ASSURED-adult
+    // proof (`age::duty_edge_void_for_minor`: a function of the held rows,
+    // so every node converges; a backdated edge can only be void). Judged
+    // BEFORE the conferral early return, so a person proven adult later does
+    // not revive an appointment made while they were a minor: it is made
+    // again. A fold reason (GC1 `minor_appointment_void`), held at the
+    // edition-2 door.
+    if super::age::duty_edge_void_for_minor(directory, row).await? {
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::gc1::MINOR_APPOINTMENT_VOID,
+            Error::UserTargetStewardBindingForbidden {
+                target_key_id: row.attested_key_id.clone(),
+                reason: MINOR_APPOINTMENT_VOID,
+            },
+        ));
+    }
     // The target is a user. The default CC 3.2 rule admits ONLY a proven
     // minor (guardianship). An ADULT target is un-stewardable by default —
     // EXCEPT the single narrow CC 3.4.12 adult-incapacity aperture, which
@@ -20870,6 +20896,82 @@ pub async fn check_user_target_steward_binding_admission(
     }
     // Admit the minor-guardianship binding (S == attesting_key_id structural).
     Ok(())
+}
+
+/// v62.0.0 (K2-fix11; Eric's ruling: an appointment made to a minor is VOID)
+/// — the reason of [`Error::UserTargetStewardBindingForbidden`] when a duty
+/// edge onto a person is void for minority
+/// ([`super::age::duty_edge_void_for_minor`]). At the edition-2 door it is the
+/// GC1 fold reason
+/// [`minor_appointment_void`](super::edition2::fold::reason::gc1::MINOR_APPOINTMENT_VOID):
+/// held, concluding nothing (CC 2.7.3: it reads other rows), never seating on
+/// its own.
+pub const MINOR_APPOINTMENT_VOID: &str = "minor_appointment_void";
+
+/// v62.0.0 (K2-fix11; CC 4.5.4) — the duties the law names for every
+/// community: `moderate`, `takedown`, `review`, `slash` (the formal model's
+/// `DUTIES`). The duty set in force for a community is these PLUS the duties
+/// its record declares ([`duty_set_in_force`]); the set is OPEN.
+pub const CORE_DUTY_SCOPES: &[&str] = &[
+    DELEGATION_SCOPE_MODERATE,
+    DELEGATION_SCOPE_TAKEDOWN,
+    DELEGATION_SCOPE_REVIEW,
+    DELEGATION_SCOPE_SLASH,
+];
+
+/// v62.0.0 (K2-fix11; CC 4.5.4 (i): "a record MAY declare others") — the
+/// member of a community record's `policy` map that lists the further duties
+/// it declares: `policy.duties = [* tstr]` (the formal model's founding-row
+/// `duties`). Any other shape declares nothing.
+pub const COMMUNITY_DECLARED_DUTIES_MEMBER: &str = "duties";
+
+/// v62.0.0 (K2-fix11; CC 4.5.4, CC 4.5.5) — **the duty set in force for
+/// `community_id`**: [`CORE_DUTY_SCOPES`] plus every string in the held
+/// record's `policy.duties` ([`COMMUNITY_DECLARED_DUTIES_MEMBER`]). An empty
+/// or unknown community has the core four. The record is another row, so
+/// this declares the fold read `key:<community_id>`: a record version that
+/// declares a duty re-folds every row judged against the set.
+///
+/// # Errors
+/// Directory reads.
+pub async fn duty_set_in_force(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+) -> Result<std::collections::BTreeSet<String>, Error> {
+    let mut set: std::collections::BTreeSet<String> =
+        CORE_DUTY_SCOPES.iter().map(|d| (*d).to_owned()).collect();
+    if community_id.is_empty() {
+        return Ok(set);
+    }
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(community_id));
+    let Some(community) = directory.lookup_community(community_id).await? else {
+        return Ok(set);
+    };
+    if let Some(serde_json::Value::Array(declared)) = community
+        .policy_blob
+        .as_ref()
+        .and_then(|b| b.get(COMMUNITY_DECLARED_DUTIES_MEMBER))
+    {
+        set.extend(
+            declared
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned)),
+        );
+    }
+    Ok(set)
+}
+
+/// v62.0.0 (K2-fix11; CC 4.5.4) — is scope token `scope` a duty of `set`
+/// (a [`duty_set_in_force`])? The formal model's `is_duty`: the bare token
+/// `duty`, or a token whose head segment (before the first `:`) is in the
+/// set. An `infra:*` scope is never a duty (CC 4.5.4: judgment duties sit
+/// outside the `infra:*` set), whatever a record declares.
+#[must_use]
+pub fn is_duty_scope(scope: &str, set: &std::collections::BTreeSet<String>) -> bool {
+    if scope.starts_with(super::types::delegation_scope::INFRA_PREFIX) {
+        return false;
+    }
+    scope == "duty" || set.contains(scope.split(':').next().unwrap_or(scope))
 }
 
 /// v62.0.0 (wave G0; CC 2.7.3) — the steward-binding gate's refusals that
@@ -26738,6 +26840,29 @@ pub(crate) mod r2_test_support {
         subject: &str,
         scope: &str,
     ) {
+        // The rows are deterministic (today's UTC midnight, inside an agent
+        // key's default window), so re-asserting the shared charter / accept
+        // row is the same statement.
+        let now = {
+            use chrono::TimeZone as _;
+            let today = chrono::Utc::now().date_naive();
+            chrono::Utc.from_utc_datetime(&today.and_hms_opt(0, 0, 0).expect("midnight"))
+        };
+        confer_scope_from_trusted_root_at(dir, node, root, subject, scope, now).await;
+    }
+
+    /// v62.0.0 (K2-fix11) — [`confer_scope_from_trusted_root`] with the three
+    /// rows dated at `at`, for a witness that anchors its instants to a key
+    /// window instead of today's midnight. `at` must sit inside the node's
+    /// and the root's key windows.
+    pub(crate) async fn confer_scope_from_trusted_root_at(
+        dir: &dyn FederationDirectory,
+        node: &str,
+        root: &str,
+        subject: &str,
+        scope: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
         use crate::federation::trust_root::{
             test_pre_rotation_commitment, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
             TRUST_CONFERS_DIMENSION,
@@ -26757,15 +26882,9 @@ pub(crate) mod r2_test_support {
                 e2::put_key(dir, k, &[crate::federation::types::identity_type::AGENT]).await;
             }
         }
-        // The rows are deterministic (today's UTC midnight, inside an agent
-        // key's default window), so re-asserting the shared charter / accept
-        // row is the same statement — the node computes the same id, and the
-        // fixture skips a row it already holds.
-        let now = {
-            use chrono::TimeZone as _;
-            let today = chrono::Utc::now().date_naive();
-            chrono::Utc.from_utc_datetime(&today.and_hms_opt(0, 0, 0).expect("midnight"))
-        };
+        // The same instant for the same arguments is the same statement — the
+        // node computes the same id, and the fixture skips a row it already
+        // holds.
         let rows: [(&str, &str, serde_json::Value); 3] = [
             (
                 root,

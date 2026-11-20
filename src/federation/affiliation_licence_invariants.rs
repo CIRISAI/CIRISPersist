@@ -519,6 +519,167 @@ pub mod bodies {
         assert_eq!(EnvelopeKind::ALL[12], EnvelopeKind::PartnerRecord);
     }
 
+    /// **I2630** (v62.0.0, E2-fix6; CC 2.7.4, CC 3.2 T6) — **a counted act is
+    /// counted over the roster version its `refs.head` NAMES, found by that
+    /// version's ROW ID.** A typed community version carries its record's
+    /// content hash, never the roster statement's row id, so the door must
+    /// map the named statement to its record before it can find the version.
+    /// Under `majority` over three members: one member's licence HOLDS (1 of
+    /// 3), and a second member's voice SETTLES it (2 of 3 is a majority).
+    /// Kills: comparing the version's `persist_row_hash` with the head's row
+    /// id (no head ever matches, every act stays short); counting a lone
+    /// voice as a majority.
+    pub async fn i2630_a_majority_counts_at_its_named_head(d: &dyn FederationDirectory, tag: &str) {
+        let (aff, k) = affiliation(
+            d,
+            &format!("{tag}-mj"),
+            consensus_protocol::MAJORITY,
+            &["a", "b", "c"],
+            1,
+            None,
+        )
+        .await;
+        let holder = format!("{tag}-holder");
+        crate::federation::licensure_chain_invariants::bodies::reg(
+            d,
+            &holder,
+            &[identity_type::USER],
+        )
+        .await;
+        let now = base();
+        let lic = |status: &str, mins: i64| {
+            classed(licence(
+                &k[0],
+                &holder,
+                &aff,
+                status,
+                None,
+                now - Duration::minutes(mins),
+            ))
+        };
+        // 1 of 3: held (`Pending`), no typed row.
+        match crate::federation::licensure_chain_invariants::bodies::offer(d, &lic("suspended", 20))
+            .await
+        {
+            Ok((held, Some(StatementOutcome::Pending { .. }))) => assert!(
+                d.get_attestation(&held.attestation_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "[{tag}] I2630: one member of three is short of a majority: no typed row"
+            ),
+            other => panic!("[{tag}] I2630: one member of three must wait, got {other:?}"),
+        }
+        // 2 of 3: settles, and it is the affiliation's licence.
+        let settled = must_put(
+            d,
+            &cosigned(lic("issued", 10), &[&k[1]]),
+            &format!("[{tag}] I2630: two members of three"),
+        )
+        .await;
+        assert!(
+            crate::federation::admission::row_was_issued_under_authority(
+                d,
+                &settled,
+                &key_id(&aff)
+            )
+            .await
+            .unwrap(),
+            "[{tag}] I2630: the majority-cosigned licence is the affiliation's"
+        );
+        // A head that names a held row which is NOT a roster version (here the
+        // settled licence itself) counts nothing: even all three members'
+        // voices leave the act WAITING, with no typed row. Kills: reading any
+        // held statement under the head as the roster; mapping a non-roster
+        // head to a refusal or to a version.
+        use crate::federation::edition2::fixture_switch as e2;
+        let mut shape = lic("revoked", 5);
+        shape.attestation_envelope["refs"] =
+            serde_json::json!({ "head": [2, [-16, settled.attestation_id.clone()]] });
+        let counted = e2::counted_row_of(&shape, &e2::seed_of(&shape.attesting_key_id));
+        let mut out = e2::put_signed(d, &counted)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] I2630: a non-roster head waits, refused: {e}"));
+        for v in e2::voices_of(&counted, &[k[1].as_str(), k[2].as_str()]) {
+            out = e2::put_statement(d, &v)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] I2630: a voice over it, refused: {e}"));
+        }
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "[{tag}] I2630: a head naming a non-roster row waits, got {out:?}"
+        );
+        assert!(
+            d.get_attestation(&counted.attestation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "[{tag}] I2630: a non-roster head lands no typed row"
+        );
+        // A head naming roster VERSION 2 whose version 1 is not held here (a
+        // v1' of this group that never landed) is absence: the act WAITS,
+        // all three voices notwithstanding. Kills: refusing (or erroring) on
+        // a lineage this node has not received yet.
+        let roster = |name: &str| {
+            crate::federation::tier_ingest::test_support::sign_community(
+                &k[0],
+                crate::federation::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
+                    community_key_id: aff.clone(),
+                    community_name: name.into(),
+                    members: k
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| crate::federation::CommunityMember {
+                            key_id: m.clone(),
+                            joined_at: base() - Duration::days(1),
+                            role: (i == 0).then(|| "founder".to_owned()),
+                        })
+                        .collect(),
+                    founded_at: base() - Duration::days(1),
+                    consensus_protocol: consensus_protocol::MAJORITY.into(),
+                    policy_blob: Some(serde_json::json!({
+                        "cohort_scope": "affiliations",
+                        "affiliation_config": { "licence_audiences": { PUBLIC_CLASS: "federation" } },
+                    })),
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        let at_ms = e2::ms(base());
+        let v1_unheld = e2::community_voices(&roster("never landed"), 1, None, at_ms);
+        let v1_id = crate::federation::edition2::names::RowId::of_statement(&v1_unheld[0])
+            .expect("a roster statement has a row id");
+        let v2 = e2::community_voices(&roster("version two"), 2, Some(&v1_id), at_ms);
+        let v2_id = crate::federation::edition2::names::RowId::of_statement(&v2[0])
+            .expect("a roster statement has a row id");
+        // v2 itself waits on its unheld predecessor; its statements are kept.
+        let _ = e2::put_voices(d, &v2).await;
+        let mut shape = lic("probation", 3);
+        shape.attestation_envelope["refs"] = serde_json::json!({ "head": [2, [-16, v2_id.hex()]] });
+        let counted = e2::counted_row_of(&shape, &e2::seed_of(&shape.attesting_key_id));
+        let mut out = e2::put_signed(d, &counted).await.unwrap_or_else(|e| {
+            panic!("[{tag}] I2630: a head whose version 1 is not held waits, refused: {e}")
+        });
+        for v in e2::voices_of(&counted, &[k[1].as_str(), k[2].as_str()]) {
+            out = e2::put_statement(d, &v)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] I2630: a voice over it, refused: {e}"));
+        }
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "[{tag}] I2630: a head whose version 1 is not held waits, got {out:?}"
+        );
+        assert!(
+            d.get_attestation(&counted.attestation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "[{tag}] I2630: a head whose version 1 is not held lands no typed row"
+        );
+    }
+
     /// **I1214** — a licence under a quorum is a cosigned row.
     pub async fn i1214_quorum_licence_is_cosigned(d: &dyn FederationDirectory, tag: &str) {
         let (aff, k) = affiliation(
@@ -1854,6 +2015,12 @@ mod run {
         i1213_sqlite,
         i1213_postgres,
         "i1213"
+    );
+    on_both_backends!(
+        i2630_a_majority_counts_at_its_named_head,
+        i2630_sqlite,
+        i2630_postgres,
+        "i2630"
     );
     on_both_backends!(
         i1214_quorum_licence_is_cosigned,

@@ -1163,6 +1163,56 @@ def unignore(base: Path) -> int:
     return 0
 
 
+# v62.0.0 (F0-cp7; RULINGS "composite signatures only, no standalone
+# component signers") — a STANDALONE component verify in production code: the
+# bound-hybrid family, a raw Ed25519 / ML-DSA-65 verifier, or an Ed25519 key
+# built to check a signature. A composite is checked by
+# `CompositePublicKey::verify` (`composite_verify`, `sig19`) and is not matched.
+LONE_VERIFY = re.compile(
+    r"\b(?:verify_hybrid|verify_hybrid_via_directory|verify_hybrid_with_policy|"
+    r"verify_trace_hybrid|verify_ed25519_only_with_policy)\s*\("
+    r"|\b(?:HybridVerifier|Ed25519Verifier|MlDsa65Verifier|MlDsa65SoftwareVerifier)\b"
+    r"|\.verify_strict\s*\("
+    r"|\bed25519_dalek::Verifier\b"
+)
+# The deliberate standalone verifies, each with why. Nothing else may verify a
+# lone component (the media chunk trailer, CC 5.3.3.5, is Edge's).
+LONE_VERIFY_ALLOWED = {
+    "src/audit/verify.rs":
+        "an audit entry's INNER Ed25519 signature by a local actor whose actor_id IS the "
+        "Ed25519 key, over bytes no other node verifies (CC 1.13.4; the served gate is the "
+        "composite-signed head); not an edition-2 key's half",
+    "src/federation/edition2/receipts.rs":
+        "SCITT receipts (RFC 9942) under a trusted transparency service's own COSE key; not a "
+        "CIRIS identity's component",
+}
+
+
+def lone_verify_errors(tree: "Tree") -> list[str]:
+    """Every production standalone component verify outside
+    [`LONE_VERIFY_ALLOWED`] is red; an allow-list entry whose file no longer
+    holds one is red too (stale)."""
+    errors = []
+    found: set[str] = set()
+    for rel in tree.glob("src/**/*.rs"):
+        code = tree.code(rel)
+        if not code:
+            continue
+        for m in LONE_VERIFY.finditer(code):
+            if rel in LONE_VERIFY_ALLOWED:
+                found.add(rel)
+                continue
+            line = code.count("\n", 0, m.start()) + 1
+            errors.append(f"{rel}:{line}: a standalone component verify (`{m.group(0).strip()}`): "
+                          f"v62 verifies ONE composite (composite_verify / sig19); a lone "
+                          f"Ed25519 or ML-DSA-65 half, or the bound-hybrid pair, never verifies")
+    for rel in sorted(set(LONE_VERIFY_ALLOWED) - found):
+        if tree.code(rel) is not None:
+            errors.append(f"{rel}: in LONE_VERIFY_ALLOWED but holds no standalone verify; "
+                          f"remove the entry")
+    return errors
+
+
 def check(base: Path) -> tuple[list[str], dict]:
     try:
         return _check(base)
@@ -1175,6 +1225,7 @@ def check(base: Path) -> tuple[list[str], dict]:
 def _check(base: Path) -> tuple[list[str], dict]:
     errors: list[str] = cp2_errors(base)
     tree = Tree(base)
+    errors += lone_verify_errors(tree)
     inv = inventory(tree, errors)
     rows = read_rows(base, errors)
     for key in sorted(set(inv) - set(rows)):
@@ -1613,6 +1664,18 @@ def self_test() -> int:
          {"src/server/mod.rs": FIX_SERVER.replace(
              "    fountain::require_node_local_producer(&m, me)?;\n", "")},
          "post_local does not call `require_node_local_producer(`"),
+        ("a standalone component verify in production code is red (F0-cp7)",
+         {"src/federation/w.rs": "pub fn v(k: &[u8], m: &[u8], s: &[u8]) -> bool {\n    ciris_crypto::Ed25519Verifier.verify_strict(k, m, s).unwrap_or(false)\n}\n"},
+         "a standalone component verify"),
+        ("the bound-hybrid verify returning is red (F0-cp7)",
+         {"src/federation/w.rs": "pub fn v() { let _ = crate::verify::hybrid::verify_hybrid_via_directory(d, m, k, e, p, s, None); }\n"},
+         "a standalone component verify (`verify_hybrid_via_directory"),
+        ("a standalone verify in test code is not production (F0-cp7)",
+         {"src/federation/w.rs": "#[cfg(test)]\nmod tests {\n    fn v(k: &[u8], m: &[u8], s: &[u8]) { let _ = ciris_crypto::Ed25519Verifier.verify_strict(k, m, s); }\n}\n"},
+         None),
+        ("an allow-listed standalone verify passes, and a stale entry is red (F0-cp7)",
+         {"src/audit/verify.rs": "fn f() {}\n"},
+         "in LONE_VERIFY_ALLOWED but holds no standalone verify"),
         ("a door's whole test-gated module file is not production",
          {"src/federation/some_invariants.rs": "pub fn plan_family() { refuse_earlier_form(\"x\"); }\n",
           TSV: FIX_TSV.replace("federation/door_x.rs::plan_family", "federation/some_invariants.rs::plan_family")},

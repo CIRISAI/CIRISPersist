@@ -16,10 +16,6 @@ pub mod ed25519;
 pub mod hybrid;
 pub mod named_key;
 pub mod sig19;
-/// v61.1.0 (CIRISPersist#1233) — I1568: the public Rust verify API accepts
-/// only `Strict` (sqlite and postgres legs of `verify_hybrid_via_directory`).
-#[cfg(test)]
-mod strict_api_1233_invariants;
 
 pub use canonical::{
     body_sha256, canonicalize_envelope_for_signing, canonicalize_envelope_for_signing_v1_pinned,
@@ -31,10 +27,9 @@ pub use canonical_validation::{
 };
 // v62.0.0 (F0-cp6e) — `verify_trace` and `PublicKeyDirectory` are removed.
 pub use ed25519::canonical_payload_value;
-pub use hybrid::{
-    verify_hybrid, verify_hybrid_via_directory, HybridPolicy, VerifyError as HybridVerifyError,
-    VerifyOutcome,
-};
+// v62.0.0 (F0-cp7) — the bound-hybrid verify family is removed; only the
+// retired capsule op's wire types remain (`hybrid::{HybridPolicy,
+// VerifyOutcome}`), not re-exported.
 
 /// Verify-layer errors.
 #[derive(Debug, thiserror::Error)]
@@ -89,7 +84,7 @@ pub enum Error {
     /// missing-PQC-half hard cut: a malformed/wrong-length PQC signature
     /// or pubkey, a PQC sig present without its pubkey, or a
     /// cryptographic mismatch on either half. Carries the stable token
-    /// from [`crate::verify::hybrid::VerifyError::kind`].
+    /// of the earlier hybrid verify (deleted v62.0.0, F0-cp7).
     #[error("hybrid verify failed: {0}")]
     HybridVerify(String),
 }

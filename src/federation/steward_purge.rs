@@ -3904,6 +3904,37 @@ pub fn trace_run_kind(trace: &serde_json::Value) -> Option<&str> {
         })
 }
 
+/// v62.0.0 (P7-fix9; CIRISAgent#1370) — does ANY signed place of a trace JSON
+/// say `mock`: its [`trace_run_kind`] (top level or `deployment_profile`) or
+/// any `components[].data.run_kind`. Pure; fails closed (one `mock` is a mock
+/// run, whatever the other places say). Mirrors
+/// [`crate::schema::CompleteTrace::signs_mock_run`]; on a manifest (no
+/// components) it is [`trace_run_kind`] alone.
+#[must_use]
+pub fn trace_signs_mock(trace: &serde_json::Value) -> bool {
+    trace_run_kind(trace) == Some(RUN_KIND_MOCK)
+        || trace
+            .get("components")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|cs| {
+                cs.iter().any(|c| {
+                    c.get("data")
+                        .and_then(|d| d.get("run_kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(RUN_KIND_MOCK)
+                })
+            })
+}
+
+/// v62.0.0 (P7-fix9) — [`trace_signs_mock`] over a `trace:complete:v1`
+/// attestation envelope, in EITHER shape: the inline trace (top level,
+/// profile, every component's data) or the manifest's `run_kind`.
+#[must_use]
+pub fn trace_attestation_signs_mock(envelope: &serde_json::Value) -> bool {
+    envelope.get("trace").is_some_and(trace_signs_mock)
+        || envelope.get("manifest").is_some_and(trace_signs_mock)
+}
+
 /// A `trace:complete:v1` attestation envelope's `run_kind`, from EITHER
 /// shape: the inline trace's own member (`trace.run_kind`) or the oversize
 /// manifest's (`manifest.run_kind`, which the mint copies from the signed
@@ -3935,16 +3966,27 @@ pub fn refuse_mock_trace_attestation(row: &Attestation) -> Result<(), Error> {
     {
         return Ok(());
     }
-    match trace_attestation_run_kind(&row.attestation_envelope) {
-        Some(RUN_KIND_MOCK) => Err(refused(
-            TRACE_RUN_KIND_MOCK,
-            serde_json::json!({
-                "attestation_id": row.attestation_id,
-                "run_kind": RUN_KIND_MOCK,
-                "reason": "a mock run attests nothing about any agent; the federation tier \
-                           refuses it (CC 3.1.5, CIRISConstitution#166)",
-            }),
-        )),
-        _ => Ok(()),
+    // v62.0.0 (P7-fix9) — any signed `mock`, a component's included (an
+    // edition-2 row's manifest carries the EFFECTIVE kind, mock-dominant).
+    if !trace_attestation_signs_mock(&row.attestation_envelope) {
+        return Ok(());
     }
+    Err(mock_trace_refusal(&row.attestation_id))
+}
+
+/// v62.0.0 (P7-fix9) — the federation-tier mock refusal for the row
+/// `attestation_id` ([`TRACE_RUN_KIND_MOCK`]): the ONE body the manifest gate
+/// ([`refuse_mock_trace_attestation`]) and the projection-time check (the
+/// trace's signed bytes in hand, `ingest::trace_projection_of`) both return.
+#[must_use]
+pub(crate) fn mock_trace_refusal(attestation_id: &str) -> Error {
+    refused(
+        TRACE_RUN_KIND_MOCK,
+        serde_json::json!({
+            "attestation_id": attestation_id,
+            "run_kind": RUN_KIND_MOCK,
+            "reason": "a mock run attests nothing about any agent; the federation tier \
+                       refuses it (CC 3.1.5, CIRISConstitution#166)",
+        }),
+    )
 }

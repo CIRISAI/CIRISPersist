@@ -277,7 +277,7 @@ supported set is rejected with HTTP 422 and detail
 
 ```python
 import ciris_persist as cp
-print(cp.SUPPORTED_SCHEMA_VERSIONS)  # → ["2.7.0", "2.7.9", "2.7.legacy", "3.0.0"]
+print(cp.SUPPORTED_SCHEMA_VERSIONS)  # → ["2.7.0", "2.7.9", "2.7.legacy", "3.0.0", "3.1.0"]
 ```
 
 The set is `crate::schema::version::SUPPORTED_VERSIONS`. Supporting a new

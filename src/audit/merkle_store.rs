@@ -146,7 +146,7 @@ pub fn require_hybrid_sth(sth: &SignedTreeHead) -> Result<(), TransparencyError>
 ///
 /// The head must first pass [`require_hybrid_sth`]; then both halves verify
 /// over [`SignedTreeHead::signing_bytes_of`] through persist's one hybrid
-/// policy layer ([`verify_hybrid`](crate::verify::hybrid::verify_hybrid),
+/// policy layer (`verify_hybrid` (deleted v62.0.0),
 /// `Strict`), against the PINNED pubkeys passed in. The pubkeys embedded in
 /// the signature are never trusted (a forged head carrying its own keypair
 /// would otherwise self-certify): the gate asks about the signer the

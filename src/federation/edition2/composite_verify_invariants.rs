@@ -407,9 +407,71 @@ async fn calibration(d: &dyn FederationDirectory) {
         }
         other => panic!("I2891: a composite over other bytes is refused: {other:?}"),
     }
+
+    // v62.0.0 (F0-cp7) — I2893 (calibration leg): a SEPARATE Ed25519 +
+    // ML-DSA-65 pair over the same bytes, from the steward's own component
+    // seeds (the earlier bound-hybrid form, ML-DSA over `bytes ‖ ed_sig`), is
+    // never read as the composite: refused by the composite verify.
+    let pair = crate::federation::tier_ingest::test_support::threshold_sign(STEWARD, &canonical);
+    let dec =
+        |b: &str| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b).unwrap();
+    let ed_pair = dec(&pair.ed25519_signature_base64);
+    let ml_pair = dec(pair
+        .mldsa65_signature_base64
+        .as_deref()
+        .expect("a hybrid pair"));
+    match verify_calibration_bundle(d, &bundle(&ed_pair, &ml_pair)).await {
+        Err(CalibrationSignatureError::Composite(e)) => {
+            assert_eq!(
+                e.token(),
+                VERIFY_COMPOSITE_INVALID,
+                "I2893 calibration pair: {e}"
+            );
+        }
+        other => panic!("I2893: a separate Ed25519 + ML-DSA-65 pair is refused: {other:?}"),
+    }
 }
 
-/// I2877–I2881, I2885, I2887, I2891 on sqlite.
+/// v62.0.0 (F0-cp7) — **I2893: no door verifies a lone component of an
+/// edition-2 key.** The edition-2 key's projected `federation_keys` row
+/// carries its composite's halves; the earlier row-signature verify
+/// (`tier_ingest::verify_envelope_hybrid_signature`), handed a genuine
+/// separate Ed25519 + ML-DSA-65 pair from that key's own component seeds, no
+/// longer verifies it against those halves: refused by name
+/// (`earlier_form_object`). The bound-hybrid verify family is deleted
+/// (`scripts/earlier_form_doors.py`'s LONE_VERIFY scan keeps it out).
+async fn no_lone_half(d: &dyn FederationDirectory) {
+    const SIGNER: &str = "f0-cp7-pair-signer";
+    let who = e2::put_key(d, SIGNER, &["user"]).await;
+    let envelope = serde_json::json!({"dimension": "scores:f0cp7:v1", "x": 1});
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope).unwrap();
+    let pair = crate::federation::tier_ingest::test_support::threshold_sign(SIGNER, &canonical);
+    let got = crate::federation::tier_ingest::verify_envelope_hybrid_signature(
+        d,
+        &who,
+        &envelope,
+        &pair.ed25519_signature_base64,
+        pair.mldsa65_signature_base64.as_deref(),
+    )
+    .await;
+    match got {
+        Err(crate::federation::Error::MalformedRow { reason, .. }) => assert_eq!(
+            reason,
+            super::token::EARLIER_FORM_OBJECT,
+            "I2893: the pair is refused by name"
+        ),
+        other => {
+            panic!("I2893: a separate pair under an edition-2 key's halves is refused: {other:?}")
+        }
+    }
+    // The composite by the same key, through the one composite verifier,
+    // verifies (the control: the key is live).
+    verify_composite_via_directory(d, &canonical, &who, &sign(SIGNER, &canonical), now())
+        .await
+        .unwrap_or_else(|e| panic!("I2893 control: the composite verifies: {e}"));
+}
+
+/// I2877–I2881, I2885, I2887, I2891, I2893 on sqlite.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn i2877_to_i2885_sqlite() {
@@ -421,9 +483,10 @@ async fn i2877_to_i2885_sqlite() {
     Box::pin(body(&b)).await;
     Box::pin(wholeness(&b)).await;
     Box::pin(calibration(&b)).await;
+    Box::pin(no_lone_half(&b)).await;
 }
 
-/// I2877–I2881, I2885, I2887, I2891 on postgres.
+/// I2877–I2881, I2885, I2887, I2891, I2893 on postgres.
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn i2877_to_i2885_postgres() {
@@ -438,6 +501,7 @@ async fn i2877_to_i2885_postgres() {
     Box::pin(body(&b)).await;
     Box::pin(wholeness(&b)).await;
     Box::pin(calibration(&b)).await;
+    Box::pin(no_lone_half(&b)).await;
 }
 
 /// I2892 on sqlite.

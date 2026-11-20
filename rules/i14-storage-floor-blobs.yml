@@ -1,20 +1,47 @@
 # I14, blobs.rs: the trait's thin wrappers and the default
-# `put_blob_signing_at` → `put_blob_with_scope` hop forward a scope a door
-# already validated; only a `store_blob_local` call is a door here. Expected 0.
+# `put_blob_signing_at` hop forward a scope a door already validated; only a
+# `store_blob_local` call is a door here. Expected 0.
+#
+# v62.0.0 (E8-fix3) — the ONE floor site in blobs.rs: since JSON-cut slice B
+# (d5b39133) the default `put_blob_signing_at` stores a PLAINTEXT floor's bytes
+# through `store_blob_local` (and announces the claim as a statement after),
+# where it used to hop to `put_blob_with_scope`; a sealed floor only ANNOUNCES
+# (E8-fix2, `announce_held_blob`: §11.5 / I28, it never stores). The Rust twin
+# (`blob_surface_gates.rs::i14_the_storage_floor_has_no_door`) names the same
+# site by its fn. This port is narrower than the twin: the call is exempt only
+# inside `fn put_blob_signing_at` AND inside the consequence (the block directly under the `if`, never the
+# `else`) of an `if` whose condition is the floor's tier `== …CryptoTier::Plaintext`. Any other
+# `store_blob_local` in that fn (a sealed arm, an else, an unconditioned call)
+# still matches.
 id: i14-storage-floor-blobs
 language: rust
 severity: hint
 message: "a production store_blob_local call in blobs.rs"
 rule:
-  any:
-    - kind: call_expression
-      has: {field: function, regex: '(\.|::)\s*store_blob_local$'}
-      not:
-        has: {field: arguments, stopBy: end, regex: '(^|::)cohort_scope::(FEDERATION|SPECIES|BIOSPHERE)$'}
-    - kind: identifier
-      regex: '^store_blob_local$'
-      inside: {kind: token_tree, stopBy: end}
-      follows: {regex: '^(\.|::)$'}
-  not: {inside: {stopBy: end, matches: test-gated}}
+  all:
+    - any:
+        - kind: call_expression
+          has: {field: function, regex: '(\.|::)\s*store_blob_local$'}
+          not:
+            has: {field: arguments, stopBy: end, regex: '(^|::)cohort_scope::(FEDERATION|SPECIES|BIOSPHERE)$'}
+        - kind: identifier
+          regex: '^store_blob_local$'
+          inside: {kind: token_tree, stopBy: end}
+          follows: {regex: '^(\.|::)$'}
+    - not: {inside: {stopBy: end, matches: test-gated}}
+    - not:
+        inside:
+          stopBy: end
+          kind: block
+          # the consequence: an `else` block's parent is the else_clause
+          inside:
+            kind: if_expression
+            has:
+              field: condition
+              regex: '\.tier\(\)\s*==\s*(crate::federation::types::cohort_scope::)?CryptoTier::Plaintext$'
+            inside:
+              stopBy: end
+              kind: function_item
+              has: {field: name, regex: '^put_blob_signing_at$'}
 files:
   - src/federation/blobs.rs

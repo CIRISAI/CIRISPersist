@@ -40,7 +40,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::verify::canonical::canonicalize_envelope_for_signing_v1_pinned;
-use crate::verify::hybrid::{verify_hybrid_with_policy, HybridPolicy};
 
 use super::types::AuditEntry;
 use super::Error;
@@ -156,23 +155,44 @@ pub fn verify_entry_signature(entry: &AuditEntry) -> Result<(), Error> {
         return Err(Error::InvalidArgument("actor_id missing".into()));
     }
     let canonical = canonical_bytes_for_entry(entry)?;
-    // v61.1.0 (CIRISPersist#1233) — the crate-private policy-taking twin: the
-    // public `verify_hybrid` refuses every policy but `Strict`.
-    verify_hybrid_with_policy(
-        &canonical,
-        &entry.signature,
-        None, // AuditEntry has no PQC half — see the PINNED policy note
-        &entry.actor_id,
-        None, // no per-actor ML-DSA-65 pubkey exists to verify against
-        // PINNED. This is the entry's INNER signature; the plane's hybrid
-        // gate is the signed tree head (CC 5.3.1, `merkle_store`). `Strict`
-        // here would refuse every entry (both PQC args are None) and take
-        // the stored chain + Merkle corpus dark (19 reds in v37.0.0).
-        HybridPolicy::Ed25519Fallback,
-        None,
-    )
-    .map_err(|e| Error::Signature(format!("{e}")))?;
-    Ok(())
+    // v62.0.0 (F0-cp7) — the bound-hybrid verify family is deleted, and an
+    // audit entry never carried a hybrid: its signature is the INNER Ed25519
+    // signature of a local actor whose `actor_id` IS the Ed25519 pubkey, over
+    // a preimage no other node verifies (CC 1.13.4; what is served is the
+    // composite-signed tree head, the row hashes and the inclusion proofs).
+    // It is checked here directly, strict, the one deliberate classical
+    // verify left in persist (`scripts/earlier_form_doors.py`'s
+    // `LONE_VERIFY_ALLOWED`). It is not a composite's half: the actor key is
+    // not an edition-2 key.
+    verify_actor_ed25519(&canonical, &entry.signature, &entry.actor_id)
+}
+
+/// The strict Ed25519 check of an entry's inner signature (see
+/// [`verify_entry_signature`]): 64-byte signature, 32-byte key, both
+/// standard base64; `verify_strict` (no small-order `A`/`R`).
+fn verify_actor_ed25519(message: &[u8], sig_b64: &str, pubkey_b64: &str) -> Result<(), Error> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let sig = b64
+        .decode(sig_b64)
+        .map_err(|e| Error::Signature(format!("signature base64: {e}")))?;
+    let key = b64
+        .decode(pubkey_b64)
+        .map_err(|e| Error::Signature(format!("actor_id base64: {e}")))?;
+    let sig: [u8; 64] = sig
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Signature(format!("signature must be 64 bytes (got {})", sig.len())))?;
+    let key: [u8; 32] = key.as_slice().try_into().map_err(|_| {
+        Error::Signature(format!(
+            "actor_id must be a 32-byte Ed25519 key (got {})",
+            key.len()
+        ))
+    })?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&key)
+        .map_err(|e| Error::Signature(format!("actor_id key: {e}")))?;
+    key.verify_strict(message, &ed25519_dalek::Signature::from_bytes(&sig))
+        .map_err(|_| Error::Signature("ed25519 signature mismatch".to_owned()))
 }
 
 #[cfg(test)]

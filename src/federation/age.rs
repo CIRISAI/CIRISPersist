@@ -285,6 +285,101 @@ pub async fn age_band(directory: &dyn FederationDirectory, k: &str) -> Result<Ag
     Ok(AgeBand::Unknown)
 }
 
+/// v62.0.0 (K2-fix11; Eric's ruling: **an appointment made to a minor is
+/// VOID**; if the person is later proven adult it is made again, never
+/// revived) — **is the duty edge `edge` void for minority?** The ONE
+/// predicate the write gate
+/// (`admission::check_user_target_steward_binding_admission`) and the duty
+/// walk (`admission::scoped_delegation_reach_at`) both ask.
+///
+/// `edge` is a `delegates_to` carrying ANY duty scope onto `T` (its
+/// `attested_key_id`): a scope of the duty set in force for the edge's
+/// `community_id` (`admission::duty_set_in_force`: the four core duties plus
+/// any the community's record declares, CC 4.5.4; matched by
+/// `admission::is_duty_scope`). It is VOID iff:
+///
+/// 1. a MINOR-band age row about `T` is held: an assurance rung
+///    (`age_assurance:*`, not self-emitted) or a self-declaration
+///    (`age_self_declared:*`), whatever its liveness (a retraction or an
+///    expiry does not launder an appointment made during minority); AND
+/// 2. `edge`'s `asserted_at` is NOT after the earliest live ASSURED-adult row
+///    about `T` (an `age_assurance:*` rung parsing to adult; a self-declared
+///    adult never counts, the one-way ratchet), or there is none.
+///
+/// Why it converges (CC 2.7): it is a function of the held rows `{edge, T's
+/// age rows}` alone, never of arrival order or of what this node saw first.
+/// A node missing a row reads it when it lands: this declares the fold read
+/// `key:<T>`. Why a backdate does not help (CC 2.6.7): an EARLIER
+/// `asserted_at` can only make `edge` void; to seat, `edge` must post-date an
+/// adult proof the WITNESS signed. A pure guardianship (no duty scope) is
+/// never judged here. A minor row asserted after an assured-adult proof that
+/// precedes `edge` leaves `edge` seated.
+///
+/// # Errors
+/// Directory reads.
+pub async fn duty_edge_void_for_minor(
+    directory: &dyn FederationDirectory,
+    edge: &super::types::Attestation,
+) -> Result<bool, Error> {
+    use super::admission::{delegation_scope_set, duty_set_in_force, is_duty_scope};
+    if edge.attestation_type != super::types::attestation_type::DELEGATES_TO {
+        return Ok(false);
+    }
+    let scopes = delegation_scope_set(&edge.attestation_envelope);
+    // Only an `infra:*` (or empty) scope set skips the community read: no
+    // record can make an `infra:*` scope a duty.
+    if scopes
+        .iter()
+        .all(|s| s.starts_with(super::types::delegation_scope::INFRA_PREFIX))
+    {
+        return Ok(false);
+    }
+    let community_id = edge
+        .attestation_envelope
+        .get("community_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let duties = duty_set_in_force(directory, community_id).await?;
+    if !scopes.iter().any(|s| is_duty_scope(s, &duties)) {
+        return Ok(false);
+    }
+    let t = edge.attested_key_id.as_str();
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(t));
+    let now = crate::host::clock::now();
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(t, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    let mut minor = false;
+    let mut earliest_adult: Option<chrono::DateTime<chrono::Utc>> = None;
+    for r in &rows {
+        let Some(token) = super::row_type::claim_token(r) else {
+            continue;
+        };
+        if token.starts_with("age_assurance:") {
+            if r.attesting_key_id == r.attested_key_id {
+                continue;
+            }
+            match parse_age_band_token(token) {
+                Some(AgeBand::Minor) => minor = true,
+                Some(AgeBand::Adult) if r.expires_at.is_none_or(|exp| exp > now) => {
+                    earliest_adult = Some(match earliest_adult {
+                        Some(a) if a <= r.asserted_at => a,
+                        _ => r.asserted_at,
+                    });
+                }
+                _ => {}
+            }
+        } else if token.starts_with("age_self_declared:")
+            && parse_age_band_token(token) == Some(AgeBand::Minor)
+        {
+            minor = true;
+        }
+    }
+    Ok(minor && !earliest_adult.is_some_and(|a| edge.asserted_at > a))
+}
+
 /// v11.9.0 (CIRISPersist#309, CC 3.4.13 Q1) — resolve the finer
 /// [`AgeBandFine`] of key `k` from its INCOMING age attestations, the policy
 /// layer ABOVE [`age_band`]. Same witness-outranks-self one-way ratchet + the

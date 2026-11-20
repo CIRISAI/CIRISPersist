@@ -45,7 +45,6 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::custody_ack::{device_custody_of, CustodyState, CustodyVerdict};
-    use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::attestation_type as at;
     use crate::federation::types::cohort_scope as cs;
     use crate::federation::types::identity_type as it;
@@ -157,10 +156,16 @@ pub(crate) mod bodies {
         // personal laptop here, which is what these witnesses are about.
         // v62.0.0 — the owner seed derives from the device's SEED (a kid
         // never seeds a signer, E0 v1.4).
+        // v62.0.0 (T2-fix12) — as a PREFIX. A test signer seeds from the
+        // seed's FIRST 32 bytes, and the device alias is longer than that, so
+        // the earlier `{seed}-owner` SUFFIX named the device's own key: the
+        // "owner" was the device, the bind was the device's self-pair, and
+        // the device was in no owner's `self` cohort (TRIAGE4: "claim K → K",
+        // 24 reds; `custody_ack_outside_cohort`).
         let owner = crate::federation::edition2::fixture_switch::put_key(
             d,
             &format!(
-                "{}-owner",
+                "owner-{}",
                 crate::federation::edition2::fixture_switch::seed_of(&k)
             ),
             &[it::USER],
@@ -183,6 +188,7 @@ pub(crate) mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("claim {owner} → {k}: {e}"));
+        assert_ne!(owner, k, "the owner is another key than the device");
         assert!(
             matches!(
                 bound,
@@ -482,7 +488,20 @@ pub(crate) mod bodies {
         let b = device_as(d, &format!("{tag}--b"), it::USER).await;
         let outsider = device_as(d, &format!("{tag}--o"), it::USER).await;
         let community = format!("cust-comm-{tag}");
-        ts::seed_two_member_community(d, &community, &a, &b).await;
+        // v62.0.0 (E6-fix7) — the room is a T1 roster keyed by
+        // `kid(community)`, the id `custody()` places the report at. The
+        // earlier `seed_two_member_community` stored it under the bare seed,
+        // so the write path found no roster (`link_unheld`). `ra::room` takes
+        // SEEDS and stores `kid(seed)`.
+        {
+            use crate::federation::edition2::fixture_switch::seed_of;
+            crate::federation::replication_audience_invariants::bodies::room(
+                d,
+                &community,
+                &[&seed_of(&a), &seed_of(&b)],
+            )
+            .await;
+        }
         let sha = blob(tag);
         let at_room = |by: &str| {
             let by = by.to_owned();
@@ -616,7 +635,20 @@ pub(crate) mod bodies {
         let b = device_as(d, &format!("{tag}--b"), it::USER).await;
         let outsider = device_as(d, &format!("{tag}--o"), it::USER).await;
         let community = format!("cust-aud-{tag}");
-        ts::seed_two_member_community(d, &community, &a, &b).await;
+        // v62.0.0 (E6-fix7) — the room is a T1 roster keyed by
+        // `kid(community)`, the id `custody()` places the report at. The
+        // earlier `seed_two_member_community` stored it under the bare seed,
+        // so the write path found no roster (`link_unheld`). `ra::room` takes
+        // SEEDS and stores `kid(seed)`.
+        {
+            use crate::federation::edition2::fixture_switch::seed_of;
+            crate::federation::replication_audience_invariants::bodies::room(
+                d,
+                &community,
+                &[&seed_of(&a), &seed_of(&b)],
+            )
+            .await;
+        }
         let sha = blob(tag);
         custody(
             d,

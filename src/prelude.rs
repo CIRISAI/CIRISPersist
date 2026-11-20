@@ -16,25 +16,16 @@
 //! ```ignore
 //! use ciris_persist::prelude::*;
 //!
-//! async fn verify_inbound<F: FederationDirectory>(
+//! async fn verify_inbound<F: FederationDirectory + ?Sized>(
 //!     directory: &F,
-//!     envelope: &serde_json::Value,
-//!     signing_key_id: &str,
-//!     ed25519_sig_b64: &str,
-//!     ml_dsa_65_sig_b64: Option<&str>,
-//! ) -> Result<VerifyOutcome, HybridVerifyError> {
-//!     let canonical = canonicalize_envelope_for_signing(envelope)
-//!         .map_err(|e| HybridVerifyError::Crypto(format!("{e}")))?;
-//!     verify_hybrid_via_directory(
-//!         directory,
-//!         &canonical,
-//!         signing_key_id,
-//!         ed25519_sig_b64,
-//!         ml_dsa_65_sig_b64,
-//!         HybridPolicy::Strict,
-//!         None,
-//!     )
-//!     .await
+//!     message: &[u8],
+//!     identity_ref: &str,
+//!     composite_sig: &[u8],
+//!     at_ms: u64,
+//! ) -> Result<LiveSigner, CompositeVerifyError> {
+//!     // v62.0.0 — ONE composite under the signer's live edition-2 key.
+//!     verify_composite_via_directory(directory, message, identity_ref, composite_sig, at_ms)
+//!         .await
 //! }
 //! ```
 
@@ -103,10 +94,13 @@ pub use crate::signing::{LocalSigner, LocalSignerConfig, LocalSignerError};
 // v62.0.0 (F0-cp6e) — `verify_trace` and `PublicKeyDirectory` are removed:
 // a trace is verified as its edition-2 `trace:complete:v1` statement through
 // the door.
+// v62.0.0 (F0-cp7) — the bound-hybrid verify family (`verify_hybrid`,
+// `verify_hybrid_via_directory`, `HybridPolicy`, `HybridVerifyError`,
+// `VerifyOutcome`) is removed: verify ONE composite with
+// `verify_composite_via_directory` (below).
 pub use crate::verify::{
     body_sha256, canonical_payload_value, canonicalize_envelope_for_signing,
-    ceg_produce_canonicalize, verify_hybrid, verify_hybrid_via_directory, Canonicalizer,
-    HybridPolicy, HybridVerifyError, PythonJsonDumpsCanonicalizer, VerifyOutcome,
+    ceg_produce_canonicalize, Canonicalizer, PythonJsonDumpsCanonicalizer,
 };
 
 // v62.0.0 (P7-fix8; Server / lens-core's ports off the removed

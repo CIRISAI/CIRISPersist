@@ -99,7 +99,7 @@ pyo3	put_blob_chunks_json	exempt	-	node-local blob bytes under this node's own s
 pyo3	put_blob_chunks_signing_json	exempt	-	node-local blob bytes under this node's own signer; no signed object is admitted
 pyo3	put_blob	edition2	store/sqlite.rs::put_blob > store/sqlite.rs::put_blob_with_scope > federation/blob_admit.rs::put_blob_planned | store/postgres.rs::put_blob > store/postgres.rs::put_blob_with_scope > federation/blob_admit.rs::put_blob_planned	the claim is the holder's composite custody:{kind} statement through put_statement (P8; T2-fix11, CC 6.1.3)
 pyo3	put_blob_signing	exempt	-	node-local bytes or tier data under this node's own signer; no signed object is admitted
-pyo3	put_calibration_bundle	substrate	derived/calibration_admit.rs::verify_calibration_bundle	CC 6.1.3: crosses nodes, so the substrate predicate requires ONE composite over its preimage (lone/bound-hybrid refused by name)
+pyo3	put_calibration_bundle	composite	derived/calibration_admit.rs::verify_calibration_bundle	crosses nodes: ONE composite under the RATCHET steward's live edition-2 key (F0-cp7: composite only)
 pyo3	put_community_json	refuses	-	refuses in its own body, before any decode (D1)
 pyo3	put_delivery_receipt	refuses	-	refuses in its own body, before any decode (D1)
 pyo3	put_edge_detection_event	exempt	-	an adjacent signed plane (edge detection), not a CEG row; scope ruling pending (JSON_CUT_PLAN §8)

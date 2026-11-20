@@ -370,11 +370,16 @@ pub async fn check_custody_ack_admission(
         return Err(super::edition2::fold::hold(
             super::edition2::fold::reason::CUSTODY_ACK_OUTSIDE_COHORT,
             Error::InvalidArgument(format!(
-                "custody_ack_outside_cohort: device {:?} is not in the {} cohort {:?} its report \
-                 is placed at (CC 3.1.3.3: a custody report stays within the blob's own cohort)",
+                "custody_ack_outside_cohort: device {:?} is not in the {} cohort{} its report is \
+                 placed at (CC 3.1.3.3: a custody report stays within the blob's own cohort)",
                 row.attesting_key_id,
                 row.cohort_scope,
-                target.unwrap_or("")
+                // v62.0.0 (T2-fix12) — an untargeted scope (`self`) names no
+                // cohort id: say so, never print an empty one.
+                target.map_or_else(
+                    || " (no target: untargeted scope)".to_owned(),
+                    |t| format!(" {t:?}")
+                )
             )),
         ));
     }

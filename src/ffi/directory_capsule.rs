@@ -476,7 +476,7 @@ pub enum DirectoryOp {
     },
     /// The **security-critical** composite verify (CIRISPersist#320 audit /
     /// CIRISEdge#245). The free fn
-    /// [`verify_hybrid_via_directory`](crate::verify::hybrid::verify_hybrid_via_directory)`(dir,
+    /// `verify_hybrid_via_directory` (deleted v62.0.0)`(dir,
     /// …)` does MULTIPLE directory lookups + the Ed25519/ML-DSA-65 hybrid
     /// verification internally — a raw-`dyn` vtable misdispatch here would
     /// silently verify against the wrong method (accept a forged signature),

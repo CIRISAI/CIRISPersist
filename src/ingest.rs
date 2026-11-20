@@ -599,7 +599,10 @@ where
             }
             // v56.0.0 (#1089) — the signed run_kind from either place it is
             // signed (top level, or `deployment_profile.run_kind` at v2.8.0).
-            if trace.signed_run_kind() != Some(crate::federation::steward_purge::RUN_KIND_MOCK) {
+            // v62.0.0 (P7-fix9; CIRISAgent#1370) — or ANY component's signed
+            // `data.run_kind`: one signed `mock` anywhere is a mock run (fail
+            // closed; a disagreement between places is not its own refusal).
+            if !trace.signs_mock_run() {
                 continue;
             }
             let is_canonical = match canonical {
@@ -1356,7 +1359,8 @@ where
             // the inline form; a manifest without it is the legacy shape.
             // v56.0.0 (#1089) — copied from wherever the trace signs it:
             // the top level, or `deployment_profile.run_kind` (v2.8.0).
-            if let Some(kind) = trace.signed_run_kind() {
+            // v62.0.0 (P7-fix9) — the EFFECTIVE kind (mock-dominant).
+            if let Some(kind) = trace.effective_run_kind() {
                 manifest["run_kind"] = serde_json::json!(kind);
             }
             envelope = serde_json::json!({
@@ -2087,10 +2091,17 @@ pub fn check_trace_row_members(
             format!("{component_count:?} vs {}", trace.components.len()),
         ));
     }
-    if m_text("run_kind") != trace.signed_run_kind() {
+    // v62.0.0 (P7-fix9; the lead's ruling) — pinned against the EFFECTIVE
+    // kind: a row whose manifest does not say `mock` for a trace that signs a
+    // mock anywhere (an older encoder's component-only mock) is refused.
+    if m_text("run_kind") != trace.effective_run_kind() {
         return Err(mismatch(
             "manifest.run_kind",
-            format!("{:?} vs {:?}", m_text("run_kind"), trace.signed_run_kind()),
+            format!(
+                "{:?} vs {:?}",
+                m_text("run_kind"),
+                trace.effective_run_kind()
+            ),
         ));
     }
     Ok(())
@@ -2294,7 +2305,10 @@ pub fn trace_row_payload(
             Value::Uint(u64::try_from(trace.components.len()).unwrap_or(u64::MAX)),
         ),
     ];
-    if let Some(kind) = trace.signed_run_kind() {
+    // v62.0.0 (P7-fix9; the lead's ruling) — the EFFECTIVE kind: `mock` when
+    // any signed place says so, else exactly the signed one (absent stays
+    // absent), so every non-mock row's bytes are unchanged.
+    if let Some(kind) = trace.effective_run_kind() {
         manifest.push((t("run_kind"), t(kind)));
     }
     let mut payload = vec![
@@ -2570,6 +2584,7 @@ fn trace_projection_of(
     stored: &[u8],
     plaintext: &[u8],
     signer: &str,
+    federation_row: Option<&str>,
 ) -> Result<crate::store::decompose::Decomposed, crate::federation::Error> {
     let named = |e: IngestError| match e {
         IngestError::TraceRefused { kind, detail } => {
@@ -2590,6 +2605,19 @@ fn trace_projection_of(
             format!("the trace blob is no CompleteTrace: {e}"),
         )
     })?;
+    // v62.0.0 (P7-fix9; the lead's ruling, defense in depth) — with the
+    // trace's SIGNED bytes in hand, a federation-tier row whose trace signs a
+    // mock anywhere is refused `trace_run_kind_mock`, the same token as the
+    // manifest gate (`steward_purge::refuse_mock_trace_attestation`), BEFORE
+    // the member check: an older encoder's row (no `manifest.run_kind`, a
+    // component-only mock) is refused as the mock it is.
+    if let Some(attestation_id) = federation_row {
+        if trace.signs_mock_run() {
+            return Err(crate::federation::steward_purge::mock_trace_refusal(
+                attestation_id,
+            ));
+        }
+    }
     check_trace_row_members(&payload, &trace).map_err(named)?;
     trace.signature_key_id = signer.to_owned();
     crate::store::decompose::decompose(&trace).map_err(|e| {
@@ -2651,9 +2679,15 @@ where
     })?;
     fold::reads(fold::Dep::key(&fold::blob_slot(&sha)));
     match dir.open_trace_blob(&sha).await? {
-        TraceBlobOpen::Open { stored, plaintext } => {
-            trace_projection_of(&statement, &stored, &plaintext, &row.attesting_key_id).map(Some)
-        }
+        TraceBlobOpen::Open { stored, plaintext } => trace_projection_of(
+            &statement,
+            &stored,
+            &plaintext,
+            &row.attesting_key_id,
+            (row.tier == crate::federation::types::attestation_tier::FEDERATION)
+                .then_some(row.attestation_id.as_str()),
+        )
+        .map(Some),
         TraceBlobOpen::NotHeld => Err(fold::hold(
             TRACE_BLOB_NOT_HELD,
             crate::federation::Error::malformed_row(
@@ -2727,6 +2761,10 @@ mod trace_statement_invariants;
 /// door. Never in a production build; re-exported from `prelude`.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod trace_anchor;
+// v62.0.0 (P7-fix9) — I3470 / I3471: trace_schema_version 3.1.0 and the
+// LLM_CALL `context_manifest` member.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod trace_schema_310_invariants;
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {

@@ -47,7 +47,7 @@
 //! check with a clear error, and is **not stored** (fail-secure) —
 //! exactly as [`super::register::verify_key_registration`] does.
 //!
-//! Verification runs in [`HybridPolicy::Strict`](crate::verify::HybridPolicy::Strict):
+//! Verification runs in `HybridPolicy::Strict` (deleted v62.0.0):
 //! **both** Ed25519 over `JCS(envelope)` AND ML-DSA-65 over the bound
 //! `JCS(envelope) ‖ ed25519_sig` ([CC 3.1.2.1] bound-payload form,
 //! applied inside the hybrid verifier) are REQUIRED. There is no
@@ -88,7 +88,6 @@ use sha2::{Digest, Sha256};
 use super::types::attestation_tier;
 use super::{Attestation, Error, FederationDirectory};
 use crate::verify::canonical::ceg_produce_canonicalize;
-use crate::verify::{verify_hybrid, HybridPolicy};
 
 /// Verify a federation-tier [`Attestation`]'s envelope hybrid signature
 /// against the §CC 5.3.2.4.3.1 ingest gate, BEFORE any store. Generic
@@ -109,7 +108,7 @@ use crate::verify::{verify_hybrid, HybridPolicy};
 /// 2. resolve the attester's registered Ed25519 + ML-DSA-65 pubkeys via
 ///    [`FederationDirectory::lookup_public_key`] on `attesting_key_id`
 ///    (unknown attester ⇒ reject);
-/// 3. [`verify_hybrid`] under [`HybridPolicy::Strict`] — both halves
+/// 3. `verify_hybrid` (deleted v62.0.0) under `HybridPolicy::Strict` (deleted v62.0.0) — both halves
 ///    REQUIRED.
 ///
 /// On success returns `Ok(())`; the caller then stores the row. On ANY
@@ -161,8 +160,8 @@ pub(crate) fn check_content_hash(row: &Attestation, computed_hash: &str) -> Resu
 ///
 /// Same verify contract as the federation ingest gate: canonicalize the
 /// envelope, cross-check `SHA-256(canonical) == original_content_hash`,
-/// resolve the attester's REGISTERED pubkeys, [`verify_hybrid`] under
-/// [`HybridPolicy::Strict`] (both Ed25519 + ML-DSA-65 REQUIRED; PQC
+/// resolve the attester's REGISTERED pubkeys, `verify_hybrid` (deleted v62.0.0) under
+/// `HybridPolicy::Strict` (deleted v62.0.0) (both Ed25519 + ML-DSA-65 REQUIRED; PQC
 /// mandatory). ANY failure ⇒ [`Error::FederationTierUnverified`],
 /// fail-secure, row NOT stored.
 pub async fn verify_row_hybrid_signature<F>(directory: &F, row: &Attestation) -> Result<(), Error>
@@ -348,7 +347,7 @@ where
 /// yet — it verifies before building one). Canonicalizes `envelope` through
 /// the CEG produce gate, resolves `attesting_key_id`'s REGISTERED pubkeys via
 /// the directory (unknown attester ⇒ reject, fail-secure), and runs
-/// [`verify_hybrid`] under [`HybridPolicy::Strict`] (both halves REQUIRED,
+/// `verify_hybrid` (deleted v62.0.0) under `HybridPolicy::Strict` (deleted v62.0.0) (both halves REQUIRED,
 /// PQC-mandatory per CC 5.3.2.4.3.1). On success returns the hex-encoded
 /// `SHA-256(canonical)` (the row's `original_content_hash`); on a signature
 /// failure returns [`Error::FederationTierUnverified`] with an empty
@@ -401,26 +400,20 @@ where
     // of the lookup propagates as itself, as `register::verify_key_registration`'s
     // twin does: a transient storage error is not a verdict on the row, and
     // folding it into `FederationTierUnverified` made it read as terminal.
-    let attester = directory
+    let _attester = directory
         .lookup_public_key(attesting_key_id)
         .await?
         .ok_or_else(|| Error::unknown_signer(attesting_key_id, "signed_envelope"))?;
 
-    // (3) Strict hybrid verify: Ed25519 (over canonical) AND ML-DSA-65 (over
-    // the bound canonical || classical_sig) both REQUIRED. A classical-only /
-    // hybrid-pending signature is rejected — the CC 5.3.2.4.3.1 guard.
-    verify_hybrid(
-        &canonical,
-        scrub_signature_classical,
-        scrub_signature_pqc,
-        &attester.pubkey_ed25519_base64,
-        attester.pubkey_ml_dsa_65_base64.as_deref(),
-        HybridPolicy::Strict,
-        None,
-    )
-    .map_err(|e| reject(format!("hybrid-verify: {e} ({})", e.kind())))?;
-
-    Ok(computed_hash)
+    // (3) v62.0.0 (F0-cp7; RULINGS "composite signatures only, no standalone
+    // component signers") — the bound-hybrid verify (an Ed25519 half and an
+    // ML-DSA-65 half checked against the attester's registered component
+    // halves) is DELETED. A signature that is not the edition-2 door's vouch
+    // above is the earlier form: refused by name, whatever the switch says.
+    let _ = (reject, scrub_signature_classical, scrub_signature_pqc);
+    Err(super::edition2::door::earlier_form_signature(
+        "signed_envelope",
+    ))
 }
 
 /// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **the

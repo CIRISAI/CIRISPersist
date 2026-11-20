@@ -652,7 +652,7 @@ pub struct RevokeSpec {
 /// of a `self` removal that carries co-signatures
 /// (`FederationDirectory::revoke_member`): the occurrence revocation has no
 /// gate to count them, so they are refused rather than dropped unread. The
-/// [`crate::verify::hybrid::VERIFY_POLICY_VIOLATION`] style: the message is
+/// `crate::verify::hybrid::VERIFY_POLICY_VIOLATION` (deleted v62.0.0) style: the message is
 /// `{token}: {why}`.
 pub const SELF_REMOVAL_COSIGNATURES_REFUSED: &str = "self_removal_cosignatures_refused";
 

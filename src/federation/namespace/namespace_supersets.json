@@ -17380,15 +17380,15 @@
     "decimal_id": "5.3.2.8",
     "claim_id": "CLM-admission-pqc",
     "repo": "CIRISPersist",
-    "path#symbol": "src/verify/hybrid.rs#require_strict_policy",
+    "path#symbol": "src/federation/edition2/composite_verify.rs#verify_composite_via_directory",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v61.1-1233",
     "tsv_comment_before": [
      "",
-     "# v61.1.0 (CIRISPersist#1233) — the verifier's hybrid-required check is always-on: the",
-     "# caller verify doors accept only strict, and the audit plane's gate is its hybrid-signed head."
+     "# v62.0.0 (F0-cp7) — composite only: one composite under a live edition-2 key; no",
+     "# standalone component verify (the bound-hybrid family is deleted); the audit gate is its composite head."
     ],
-    "witness": "I1568 (unit, trace; sqlite, postgres): the public Rust verify_hybrid, verify_trace_hybrid and verify_hybrid_via_directory refuse every policy but Strict with VerifyError::PolicyViolation (verify_policy_violation) before decode, canonicalization or lookup; I1560, I1561 (sqlite, postgres): Engine.verify_hybrid / verify_hybrid_via_directory / verify_signed_* refuse every policy but strict with verify_policy_violation before decode, lookup or crypto; I1562 (capsule): VerifyHybridViaDirectory refuses every HybridPolicy but Strict; I1563 (wheel). Every caller-facing path asks require_strict_policy; only the two pinned classical-only planes call the crate-private twin verify_hybrid_with_policy"
+    "witness": "I2877–I2881, I2885, I2893 (sqlite, postgres): v62.0.0 (F0-cp7) — the bound-hybrid verify family (verify_hybrid, verify_hybrid_via_directory, verify_hybrid_with_policy, require_strict_policy; verify_trace_hybrid since cp5b) is deleted; ONE composite under a LIVE edition-2 key verifies (verify_composite_via_directory), a lone half is refused verify_component_signature, a separate Ed25519 + ML-DSA-65 pair over the same bytes is refused (earlier_form_object at the row door, verify_composite_invalid at calibration), and scripts/earlier_form_doors.py LONE_VERIFY keeps any standalone component verify out of production code; the audit plane's gate is its composite-signed head (I1564–I1566)"
    },
    {
     "decimal_id": "5.3.2.8",

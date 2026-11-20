@@ -1441,6 +1441,1143 @@ pub(crate) mod test_support {
             .any(|r| r.attestation_id == id)
     }
 
+    /// v62.0.0 (K2-fix11) — the shared minor/adult fixture: a `witness` key
+    /// conferred `infra:attest_assurance` from `root`, accepted by THIS node
+    /// (`node_seed`, the identity the runner gave the backend), the three
+    /// conferral rows dated at `at` (a key-window instant, never today's
+    /// midnight). Returns the witness seed.
+    async fn confer_age_witness(
+        dir: &dyn FederationDirectory,
+        node_seed: &str,
+        tag: &str,
+        at: DateTime<Utc>,
+    ) -> String {
+        let (witness, root) = (format!("{tag}-witness"), format!("{tag}-root"));
+        register_key(
+            dir,
+            &witness,
+            crate::federation::types::identity_type::WITNESS,
+        )
+        .await;
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root_at(
+            dir,
+            node_seed,
+            &root,
+            &e2::kid(&witness),
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            at,
+        )
+        .await;
+        witness
+    }
+
+    /// An age row by `by` about `about` (`age_assurance:*` by a witness, or
+    /// `age_self_declared:*` by the subject), dated `at`, through the door.
+    async fn put_age_row(
+        dir: &dyn FederationDirectory,
+        by: &str,
+        about: &str,
+        token: &str,
+        at: DateTime<Utc>,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut a = ts::bare_attestation(&id, by, about, &serde_json::json!({ "id": id }));
+        a.attestation_type = token.to_owned();
+        a.asserted_at = at;
+        a.scrub_timestamp = at;
+        ts::seal_row_in_place(by, &mut a);
+        e2::put_signed(dir, &a)
+            .await
+            .unwrap_or_else(|e| panic!("the age row {token} about {about}: {e}"));
+    }
+
+    /// The founder's duty edge `delegates_to(slash, community_id: C)` onto
+    /// `grantee`, or (`duty = false`) a pure guardianship (custody purpose,
+    /// `infra:serve`, no duty scope), dated `at`.
+    fn founder_edge(
+        founder: &str,
+        community_k: &str,
+        grantee: &str,
+        duty: bool,
+        at: DateTime<Utc>,
+    ) -> Attestation {
+        if duty {
+            return founder_scoped_edge(founder, community_k, grantee, DELEGATION_SCOPE_SLASH, at);
+        }
+        let mut envelope = serde_json::json!({
+            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "scope": [crate::federation::types::delegation_scope::INFRA_SERVE],
+        });
+        crate::federation::admission::with_test_term(&mut envelope, at);
+        let a = unsigned_row(
+            founder,
+            &e2::kid(grantee),
+            attestation_type::DELEGATES_TO,
+            envelope,
+            at,
+        );
+        e2::row_of_statement(
+            &e2::statement_of_family(&a, founder, "self:delegates_to"),
+            attestation_tier::FEDERATION,
+        )
+    }
+
+    /// `founder`'s duty edge `delegates_to(founder → grantee, scope:
+    /// [scope], community_id: community_k)` at `at`, as an edition-2 row.
+    fn founder_scoped_edge(
+        founder: &str,
+        community_k: &str,
+        grantee: &str,
+        scope: &str,
+        at: DateTime<Utc>,
+    ) -> Attestation {
+        let mut envelope = serde_json::json!({
+            "dimension": "delegation:duty:v1",
+            "scope": [scope],
+            "community_id": community_k,
+        });
+        crate::federation::admission::with_test_term(&mut envelope, at);
+        let a = unsigned_row(
+            founder,
+            &e2::kid(grantee),
+            attestation_type::DELEGATES_TO,
+            envelope,
+            at,
+        );
+        e2::row_of_statement(
+            &e2::statement_of_family(&a, founder, "self:delegates_to"),
+            attestation_tier::FEDERATION,
+        )
+    }
+
+    /// The duty the I2030 guild's record declares (CC 4.5.4: not a core
+    /// duty).
+    const DECLARED_DUTY: &str = "curate";
+
+    /// A community founded by `founder` (with `member`) at `at`, through
+    /// T1's roster voices.
+    async fn found_commons(
+        dir: &dyn FederationDirectory,
+        founder: &str,
+        member: &str,
+        community: &str,
+        at: DateTime<Utc>,
+    ) {
+        found_commons_with(dir, founder, member, community, at, None).await;
+    }
+
+    /// [`found_commons`] with the record's `policy` map (`policy_blob`).
+    async fn found_commons_with(
+        dir: &dyn FederationDirectory,
+        founder: &str,
+        member: &str,
+        community: &str,
+        at: DateTime<Utc>,
+        policy_blob: Option<serde_json::Value>,
+    ) {
+        let community_row = crate::federation::tier_ingest::test_support::sign_community(
+            founder,
+            crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: community.to_owned(),
+                community_name: format!("commons {community}"),
+                members: vec![
+                    crate::federation::types::CommunityMember {
+                        key_id: founder.to_owned(),
+                        joined_at: at,
+                        role: Some("founder".to_owned()),
+                    },
+                    crate::federation::types::CommunityMember {
+                        key_id: member.to_owned(),
+                        joined_at: at,
+                        role: Some("member".to_owned()),
+                    },
+                ],
+                founded_at: at,
+                consensus_protocol: "majority".to_owned(),
+                policy_blob,
+                persist_row_hash: String::new(),
+            },
+        );
+        e2::put_voices(
+            dir,
+            &e2::community_voices(&community_row, 1, None, e2::ms(at)),
+        )
+        .await
+        .expect("the community roster lands");
+    }
+
+    /// v62.0.0 (K2-fix11; CC rc21 4.5.4: the duty set is OPEN) — **I2030**,
+    /// on every backend. A duty the community's record declares
+    /// (`policy.duties = ["curate"]`, `admission::duty_set_in_force`) is a
+    /// duty, so an appointment to it onto a minor is void exactly like a core
+    /// one: `Pending`, `why_held == minor_appointment_void`, and
+    /// `is_named_moderator(minor, guild, curate)` is false. Controls: the
+    /// same edge onto an assured adult SEATS (the declared duty is a real
+    /// seat), and `curate` in a community that does NOT declare it is never
+    /// judged `minor_appointment_void`.
+    ///
+    /// Dates: the founder key's window start + `OWNER_BINDING_OFFSET_DAYS`
+    /// (`late`) plus minutes / hours.
+    pub(crate) async fn exercise_declared_duty(
+        engine: &crate::Engine,
+        node_seed: &str,
+        suffix: &str,
+    ) {
+        use crate::federation::admission::is_named_moderator;
+        use crate::federation::age::{age_band, AgeBand};
+        use crate::federation::edition2::fold::{reason::gc1::MINOR_APPOINTMENT_VOID, why_held};
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::edition2::names::RowId;
+        let directory = engine.federation_directory();
+        let dir: &dyn FederationDirectory = directory.as_ref();
+        let k = |n: &str| format!("q13-{n}-{suffix}");
+        let (founder, member, community) = (k("founder"), k("member"), k("commons"));
+        let (cm, ca, cn) = (k("cm"), k("ca"), k("cn"));
+        for x in [&founder, &member, &community, &cm, &ca, &cn] {
+            register_user_key(dir, x).await;
+        }
+        let base = DateTime::<Utc>::from_timestamp_millis(
+            i64::try_from(e2::key_window_start_ms(&founder)).expect("a window start fits i64"),
+        )
+        .expect("an instant");
+        let late = base
+            + chrono::Duration::days(
+                crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS,
+            );
+        let min = chrono::Duration::minutes(1);
+        let hour = chrono::Duration::hours(1);
+        let witness = confer_age_witness(dir, node_seed, &k("age"), late).await;
+        put_age_row(
+            dir,
+            &witness,
+            &founder,
+            "age_assurance:provider:adult:v1",
+            late + min,
+        )
+        .await;
+        assert_eq!(
+            age_band(dir, &e2::kid(&founder)).await.expect("band"),
+            AgeBand::Adult,
+            "({suffix}) I2030: precondition, the founder is an assured adult"
+        );
+        found_commons(dir, &founder, &member, &community, base).await;
+        let community_k = e2::kid(&community);
+        let land = |e: Attestation, by: String| async move {
+            e2::land_with_voices(dir, &e, &[by.as_str()]).await
+        };
+        let void_held = |e: Attestation| async move {
+            let why = why_held(dir, &RowId(e2::rid_digest(&e)))
+                .await
+                .expect("read the hold");
+            why.is_some_and(|w| w.reason == MINOR_APPOINTMENT_VOID)
+        };
+        let (cm, ca, cn) = (&cm, &ca, &cn);
+        let guild = k("guild");
+        register_user_key(dir, &guild).await;
+        found_commons_with(
+            dir,
+            &founder,
+            &member,
+            &guild,
+            base,
+            Some(serde_json::Value::Object(
+                std::iter::once((
+                    crate::federation::admission::COMMUNITY_DECLARED_DUTIES_MEMBER.to_owned(),
+                    serde_json::json!([DECLARED_DUTY]),
+                ))
+                .collect(),
+            )),
+        )
+        .await;
+        let guild_k = e2::kid(&guild);
+        assert!(
+            crate::federation::admission::duty_set_in_force(dir, &guild_k)
+                .await
+                .expect("the duty set")
+                .contains(DECLARED_DUTY),
+            "({suffix}) I2030: the guild's record declares `{DECLARED_DUTY}`"
+        );
+        let named_curate = |who: &str| {
+            let who = e2::kid(who);
+            let guild_k = guild_k.clone();
+            async move {
+                is_named_moderator(dir, &who, &guild_k, DECLARED_DUTY)
+                    .await
+                    .expect("is_named_moderator")
+            }
+        };
+        put_age_row(
+            dir,
+            cm,
+            cm,
+            "age_self_declared:band:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        put_age_row(
+            dir,
+            &witness,
+            ca,
+            "age_assurance:provider:adult:v1",
+            late + min * 2,
+        )
+        .await;
+        put_age_row(
+            dir,
+            cn,
+            cn,
+            "age_self_declared:band:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        let d = founder_scoped_edge(&founder, &guild_k, cm, DECLARED_DUTY, late + hour);
+        let out = land(d.clone(), cm.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2030 declared: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }) && void_held(d.clone()).await,
+            "({suffix}) I2030: a community-declared duty onto the minor is held \
+             minor_appointment_void: {out:?}"
+        );
+        assert!(
+            !named_curate(cm).await,
+            "({suffix}) I2030: no minor holds the declared duty"
+        );
+        let d = founder_scoped_edge(&founder, &guild_k, ca, DECLARED_DUTY, late + hour);
+        let out = land(d, ca.clone())
+            .await
+            .expect("I2030: the adult's declared duty");
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }) && named_curate(ca).await,
+            "({suffix}) I2030 control: the declared duty seats an assured adult: {out:?}"
+        );
+        let d = founder_scoped_edge(&founder, &community_k, cn, DECLARED_DUTY, late + hour);
+        let _ = land(d.clone(), cn.clone()).await;
+        assert!(
+            !void_held(d).await,
+            "({suffix}) I2030 control: `{DECLARED_DUTY}` is no duty where the record does \
+             not declare it, so it is never judged minor_appointment_void"
+        );
+    }
+
+    /// v62.0.0 (K2-fix11; Eric's ruling: **an appointment made to a minor is
+    /// VOID**) — **I2863–I2869**, on every backend. One predicate,
+    /// `age::duty_edge_void_for_minor`: a duty edge D onto T is void iff a
+    /// minor-band age row about T is held and D does not post-date T's
+    /// earliest ASSURED-adult row (`age_assurance:*`; a self-declared adult
+    /// never counts). Held at the door with the GC1 fold reason
+    /// `minor_appointment_void`; the duty walk never counts it.
+    ///
+    /// - **I2863** (witness 9) — a self-declared minor and an assured minor:
+    ///   D, landing AFTER the minor row, is held `minor_appointment_void`;
+    ///   `is_named_moderator` is false; the minor's marker is not admitted.
+    /// - **I2864** (witness 9, the other arrival order) — D lands first and
+    ///   SEATS (no age row yet); the minor row lands; the held row re-folds
+    ///   (`why_held(D) == minor_appointment_void`), `is_named_moderator` is
+    ///   false, and the marker is not admitted.
+    /// - **I2865** (witness 9) — D, then an assured-adult proof: still void
+    ///   (D predates every adult proof); a re-appointment D' after the proof
+    ///   SEATS.
+    /// - **I2866** (witness 9) — a BACKDATED D (dated before the adult proof,
+    ///   put after it) is void.
+    /// - **I2867** (clarification (a)) — D after a self-declared ADULT row,
+    ///   with an earlier self-declared minor row and no assurance: void.
+    /// - **I2868** (clarification (b)) — an assured-adult row before D and a
+    ///   minor row asserted AFTER D: D stays seated.
+    /// - **I2869** (witness 9) — a pure guardianship (no duty scope) from an
+    ///   assured-adult founder onto a minor still lands.
+    ///
+    /// Dates: every instant is the founder key's window start +
+    /// `OWNER_BINDING_OFFSET_DAYS` (`late`) plus minutes / hours; the witness
+    /// conferral is dated `late` (`confer_scope_from_trusted_root_at`).
+    pub(crate) async fn exercise_minor_duty(engine: &crate::Engine, node_seed: &str, suffix: &str) {
+        use crate::federation::admission::is_named_moderator;
+        use crate::federation::age::{age_band, AgeBand};
+        use crate::federation::edition2::emit::draft_from_envelope;
+        use crate::federation::edition2::fold::{reason::gc1::MINOR_APPOINTMENT_VOID, why_held};
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::edition2::names::RowId;
+        let directory = engine.federation_directory();
+        let dir: &dyn FederationDirectory = directory.as_ref();
+        let k = |n: &str| format!("q12-{n}-{suffix}");
+        let (founder, member, actor, community) =
+            (k("founder"), k("member"), k("actor"), k("commons"));
+        let people: Vec<String> = ["p1", "p2", "p3", "p4", "p5", "ward", "sm", "am"]
+            .iter()
+            .map(|n| k(n))
+            .collect();
+        for x in [&founder, &member, &actor, &community]
+            .into_iter()
+            .chain(people.iter())
+        {
+            register_user_key(dir, x).await;
+        }
+        let base = DateTime::<Utc>::from_timestamp_millis(
+            i64::try_from(e2::key_window_start_ms(&founder)).expect("a window start fits i64"),
+        )
+        .expect("an instant");
+        let late = base
+            + chrono::Duration::days(
+                crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS,
+            );
+        let min = chrono::Duration::minutes(1);
+        let hour = chrono::Duration::hours(1);
+        let witness = confer_age_witness(dir, node_seed, &k("age"), late).await;
+        put_age_row(
+            dir,
+            &witness,
+            &founder,
+            "age_assurance:provider:adult:v1",
+            late + min,
+        )
+        .await;
+        assert_eq!(
+            age_band(dir, &e2::kid(&founder)).await.expect("band"),
+            AgeBand::Adult,
+            "({suffix}) precondition: the founder is an assured adult"
+        );
+        found_commons(dir, &founder, &member, &community, base).await;
+        let (actor_k, community_k) = (e2::kid(&actor), e2::kid(&community));
+        let named = |who: &str| {
+            let who = e2::kid(who);
+            let community_k = community_k.clone();
+            async move {
+                is_named_moderator(dir, &who, &community_k, DELEGATION_SCOPE_SLASH)
+                    .await
+                    .expect("is_named_moderator")
+            }
+        };
+        let land = |e: Attestation, by: String| async move {
+            e2::land_with_voices(dir, &e, &[by.as_str()]).await
+        };
+        let void_held = |e: Attestation| async move {
+            let why = why_held(dir, &RowId(e2::rid_digest(&e)))
+                .await
+                .expect("read the hold");
+            why.is_some_and(|w| w.reason == MINOR_APPOINTMENT_VOID)
+        };
+        let marker_admitted = |seed: String, delegation_id: String, at: DateTime<Utc>| {
+            let actor_k = actor_k.clone();
+            let community_k = community_k.clone();
+            async move {
+                let draft = draft_from_envelope(
+                    &e2::kid_digest(&seed),
+                    &e2::kid(&seed),
+                    &actor_k,
+                    attestation_type::SCORES,
+                    &withhold_envelope(&actor_k, &community_k, &delegation_id, "spam"),
+                    e2::ms(at),
+                    None,
+                )
+                .expect("the marker drafts");
+                let sig = e2::signing_key(&seed)
+                    .sign(&draft.sig_structure)
+                    .expect("the key signs");
+                matches!(
+                    engine
+                        .put_edition2_statement(&draft.assemble(sig), None)
+                        .await,
+                    Ok(StatementOutcome::Row { .. })
+                )
+            }
+        };
+        let edge = |grantee: &str, duty: bool, at: DateTime<Utc>| {
+            founder_edge(&founder, &community_k, grantee, duty, at)
+        };
+        let (p1, p2, p3, p4, p5, ward, sm, am) = (
+            &people[0], &people[1], &people[2], &people[3], &people[4], &people[5], &people[6],
+            &people[7],
+        );
+
+        // ── I2863: the minor row first, then D.
+        put_age_row(
+            dir,
+            sm,
+            sm,
+            "age_self_declared:band:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        put_age_row(
+            dir,
+            &witness,
+            am,
+            "age_assurance:provider:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        for (n, minor) in [(0i32, sm), (1, am)] {
+            let d = edge(minor, true, late + hour * (1 + n));
+            let out = land(d.clone(), minor.clone())
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) I2863: kept, not refused: {e}"));
+            assert!(
+                matches!(out, StatementOutcome::Pending { .. }) && void_held(d.clone()).await,
+                "({suffix}) I2863: D onto the minor {minor} is held minor_appointment_void: {out:?}"
+            );
+            assert!(!named(minor).await, "({suffix}) I2863: no minor moderator");
+            assert!(
+                !marker_admitted(
+                    minor.clone(),
+                    d.attestation_id.clone(),
+                    late + hour * (3 + n)
+                )
+                .await,
+                "({suffix}) I2863: the minor's marker is not admitted"
+            );
+        }
+
+        // ── I2864: D first (seats), then the minor row: void after re-fold.
+        let d = edge(p1, true, late + hour * 5);
+        let out = land(d.clone(), p1.clone()).await.expect("I2864: seated");
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2864: {out:?}"
+        );
+        assert!(
+            named(p1).await,
+            "({suffix}) I2864: seated while no age row is held"
+        );
+        put_age_row(
+            dir,
+            p1,
+            p1,
+            "age_self_declared:band:minor:v1",
+            late + hour * 6,
+        )
+        .await;
+        assert!(
+            void_held(d.clone()).await,
+            "({suffix}) I2864: the seated appointment re-folds to minor_appointment_void"
+        );
+        assert!(!named(p1).await, "({suffix}) I2864: unseated");
+        assert!(
+            !marker_admitted(p1.clone(), d.attestation_id.clone(), late + hour * 7).await,
+            "({suffix}) I2864: the unseated minor's marker is not admitted"
+        );
+
+        // ── I2865: D, then an assured-adult proof: still void; D' after it seats.
+        put_age_row(
+            dir,
+            p2,
+            p2,
+            "age_self_declared:band:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        let d = edge(p2, true, late + hour * 8);
+        let _ = land(d.clone(), p2.clone()).await;
+        put_age_row(
+            dir,
+            &witness,
+            p2,
+            "age_assurance:provider:adult:v1",
+            late + hour * 9,
+        )
+        .await;
+        assert!(
+            void_held(d.clone()).await && !named(p2).await,
+            "({suffix}) I2865: an appointment made during minority stays void after the \
+             adult proof"
+        );
+        let d2 = edge(p2, true, late + hour * 10);
+        let out = land(d2, p2.clone()).await.expect("I2865: re-appointed");
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }) && named(p2).await,
+            "({suffix}) I2865: the re-appointment after the adult proof seats: {out:?}"
+        );
+
+        // ── I2866: a backdated D is void.
+        put_age_row(
+            dir,
+            p3,
+            p3,
+            "age_self_declared:band:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        put_age_row(
+            dir,
+            &witness,
+            p3,
+            "age_assurance:provider:adult:v1",
+            late + hour * 11,
+        )
+        .await;
+        let d = edge(p3, true, late + hour * 10);
+        let _ = land(d.clone(), p3.clone()).await;
+        assert!(
+            void_held(d).await && !named(p3).await,
+            "({suffix}) I2866: dated before the adult proof, put after it: void"
+        );
+
+        // ── I2867: a self-declared ADULT never counts.
+        put_age_row(
+            dir,
+            p4,
+            p4,
+            "age_self_declared:band:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        put_age_row(
+            dir,
+            p4,
+            p4,
+            "age_self_declared:band:adult:v1",
+            late + hour * 12,
+        )
+        .await;
+        let d = edge(p4, true, late + hour * 13);
+        let _ = land(d.clone(), p4.clone()).await;
+        assert!(
+            void_held(d).await && !named(p4).await,
+            "({suffix}) I2867: after a self-declared adult row, with no assurance: void"
+        );
+
+        // ── I2868: an assured adult before D, a later minor row: D stays seated.
+        put_age_row(
+            dir,
+            &witness,
+            p5,
+            "age_assurance:provider:adult:v1",
+            late + min * 2,
+        )
+        .await;
+        let d = edge(p5, true, late + hour * 14);
+        let out = land(d.clone(), p5.clone()).await.expect("I2868: seated");
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2868: {out:?}"
+        );
+        put_age_row(
+            dir,
+            p5,
+            p5,
+            "age_self_declared:band:minor:v1",
+            late + hour * 15,
+        )
+        .await;
+        assert!(
+            !void_held(d).await && named(p5).await,
+            "({suffix}) I2868: a minor row asserted after D cannot unseat a properly \
+             appointed adult"
+        );
+
+        // ── I2869: a pure guardianship onto a minor still lands.
+        put_age_row(
+            dir,
+            ward,
+            ward,
+            "age_self_declared:band:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        let g = edge(ward, false, late + hour * 16);
+        let out = land(g, ward.clone())
+            .await
+            .expect("I2869: the guardianship");
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2869: guardianship without a duty scope is unchanged: {out:?}"
+        );
+    }
+
+    /// v62.0.0 (K2-fix11) — **I2860–I2862: a PERSON as a named moderator.**
+    /// CC 4.5.4 (part_4 l.1762): `is_named_moderator(K, C, duty)` is a live
+    /// `delegates_to` chain `root →* K` with `scope ⊇ {duty}`, `community_id ==
+    /// C`, the root in C's authority set: K is any key, a person's included.
+    /// The user-target rule (part_3 l.1072) governs only a CUSTODY claim
+    /// (`delegation_purpose == owner_binding` / `legitimacy_source`,
+    /// `admission::is_custody_claim_envelope`); an ordinary `delegates_to`
+    /// onto a person who can accept for itself passes it
+    /// (`check_user_target_steward_binding_admission`). The one other
+    /// condition on such an edge is CC 2.6.1.9's: it seats with the
+    /// delegate's own statement (the `delegate` role, K2-fix6); a person sub
+    /// names no `delegate_owner`.
+    ///
+    /// - **I2860** — the founder's `delegates_to(slash, community_id: C)`
+    ///   onto a person with NO age record, voiced by the person: `Row`, and
+    ///   `is_named_moderator(person, C, slash)` is true.
+    /// - **I2861** — that person's externally signed marker (the two-step
+    ///   flow): `Row`, and `resolve_quarantine` reads `Withheld`, governed by
+    ///   the person's marker.
+    /// - **I2862** — the same delegation carrying `delegation_purpose:
+    ///   owner_binding` (a CUSTODY claim) onto a person: it does not land
+    ///   (the user-target custody leg: an unproven-age target is held
+    ///   `steward_unproven`), and that person is NOT a named moderator. The
+    ///   adult arm, on every backend: onto an ASSURED adult (the witness
+    ///   fixture I2865/I2868 use), the edge is `Pending`, held
+    ///   `steward_unproven` with detail `target_is_self_sovereign`, and the
+    ///   adult is NOT a named moderator.
+    ///
+    /// Dates: the founder key's window start plus
+    /// `OWNER_BINDING_OFFSET_DAYS`, so the edges' 180-day test terms cover
+    /// today.
+    pub(crate) async fn exercise_person_moderator(
+        engine: &crate::Engine,
+        node_seed: &str,
+        suffix: &str,
+    ) {
+        use crate::federation::admission::is_named_moderator;
+        use crate::federation::edition2::emit::draft_from_envelope;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::edition2::names::RowId;
+        let directory = engine.federation_directory();
+        let dir: &dyn FederationDirectory = directory.as_ref();
+        let founder = format!("q11-founder-{suffix}");
+        let member = format!("q11-member-{suffix}");
+        let person = format!("q11-person-{suffix}");
+        let custodied = format!("q11-custodied-{suffix}");
+        let actor = format!("q11-actor-{suffix}");
+        let community = format!("q11-commons-{suffix}");
+        for k in [&founder, &member, &person, &custodied, &actor, &community] {
+            register_user_key(dir, k).await;
+        }
+        let base_ms = e2::key_window_start_ms(&founder);
+        let base = DateTime::<Utc>::from_timestamp_millis(
+            i64::try_from(base_ms).expect("a window start fits i64"),
+        )
+        .expect("an instant");
+        let offset_days = crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS;
+        let late = base + chrono::Duration::days(offset_days);
+        let late_ms = e2::ms(late);
+        let hour_ms: u64 = 3_600_000;
+        let (actor_k, community_k) = (e2::kid(&actor), e2::kid(&community));
+        let community_row = crate::federation::tier_ingest::test_support::sign_community(
+            &founder,
+            crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: community.clone(),
+                community_name: format!("commons {community}"),
+                members: vec![
+                    crate::federation::types::CommunityMember {
+                        key_id: founder.clone(),
+                        joined_at: base,
+                        role: Some("founder".to_owned()),
+                    },
+                    crate::federation::types::CommunityMember {
+                        key_id: member.clone(),
+                        joined_at: base,
+                        role: Some("member".to_owned()),
+                    },
+                ],
+                founded_at: base,
+                consensus_protocol: "majority".to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        e2::put_voices(
+            dir,
+            &e2::community_voices(&community_row, 1, None, e2::ms(base)),
+        )
+        .await
+        .expect("I2860: the community roster lands");
+
+        // The founder's duty edge onto `grantee`, naming C; `custody` adds
+        // the owner-binding purpose (a custody claim).
+        let edge = |grantee: &str, custody: bool, at: DateTime<Utc>| {
+            let mut envelope = serde_json::json!({
+                "dimension": "delegation:duty:v1",
+                "scope": [DELEGATION_SCOPE_SLASH],
+                "community_id": community_k,
+            });
+            if custody {
+                envelope["delegation_purpose"] = serde_json::json!(
+                    crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE
+                );
+            }
+            crate::federation::admission::with_test_term(&mut envelope, at);
+            let a = unsigned_row(
+                &founder,
+                &e2::kid(grantee),
+                attestation_type::DELEGATES_TO,
+                envelope,
+                at,
+            );
+            e2::row_of_statement(
+                &e2::statement_of_family(&a, &founder, "self:delegates_to"),
+                attestation_tier::FEDERATION,
+            )
+        };
+
+        // ── I2860: seated, and a named moderator.
+        let seat = edge(&person, false, late + chrono::Duration::hours(1));
+        let out = e2::land_with_voices(dir, &seat, &[person.as_str()])
+            .await
+            .expect("I2860: the edge onto a person is admitted");
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2860: the founder's delegates_to(slash) onto a person (no age \
+             record) seats with the person's voice: {out:?}"
+        );
+        assert!(
+            is_named_moderator(dir, &e2::kid(&person), &community_k, DELEGATION_SCOPE_SLASH)
+                .await
+                .expect("I2860"),
+            "({suffix}) I2860: the person is a named moderator of C for slash (CC 4.5.4)"
+        );
+
+        // ── I2861: the person's externally signed marker.
+        let draft = draft_from_envelope(
+            &e2::kid_digest(&person),
+            &e2::kid(&person),
+            &actor_k,
+            attestation_type::SCORES,
+            &withhold_envelope(&actor_k, &community_k, &seat.attestation_id, "spam"),
+            late_ms + 2 * hour_ms,
+            None,
+        )
+        .expect("I2861: the marker drafts");
+        let sig = e2::signing_key(&person)
+            .sign(&draft.sig_structure)
+            .expect("I2861: the person's own key signs");
+        let stmt = draft.assemble(sig);
+        let marker_rid = RowId::of_statement(&stmt).expect("a row statement");
+        let out = engine
+            .put_edition2_statement(&stmt, None)
+            .await
+            .expect("I2861: admitted");
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2861: a named-moderator person's marker lands: {out:?}"
+        );
+        let fold = resolve_quarantine(dir, &actor_k, Utc::now())
+            .await
+            .expect("resolve");
+        assert_eq!(
+            (fold.state, fold.marker_id.as_deref()),
+            (QuarantineState::Withheld, Some(marker_rid.hex().as_str())),
+            "({suffix}) I2861: Withheld, governed by the person's marker"
+        );
+
+        // ── I2862: the custody-claim form does not seat a moderator.
+        let custody = edge(&custodied, true, late + chrono::Duration::hours(3));
+        if let Ok(StatementOutcome::Row { .. }) =
+            e2::land_with_voices(dir, &custody, &[custodied.as_str()]).await
+        {
+            panic!(
+                "({suffix}) I2862: an owner-binding-purpose delegates_to onto a person must not \
+             land"
+            )
+        }
+        assert!(
+            !is_named_moderator(
+                dir,
+                &e2::kid(&custodied),
+                &community_k,
+                DELEGATION_SCOPE_SLASH
+            )
+            .await
+            .expect("I2862"),
+            "({suffix}) I2862: a custody claim is not a moderator appointment"
+        );
+        // ── I2862 (proven adult): the same custody-claim edge onto an ASSURED
+        // adult (the CC 3.4.12 adult-incapacity aperture is the only custody
+        // of an adult; none is attested here, so `target_is_self_sovereign`).
+        let adult = format!("q11-adult-{suffix}");
+        register_user_key(dir, &adult).await;
+        let witness = confer_age_witness(dir, node_seed, &format!("q11-age-{suffix}"), late).await;
+        put_age_row(
+            dir,
+            &witness,
+            &adult,
+            "age_assurance:provider:adult:v1",
+            late + chrono::Duration::minutes(1),
+        )
+        .await;
+        assert_eq!(
+            crate::federation::age::age_band(dir, &e2::kid(&adult))
+                .await
+                .expect("band"),
+            crate::federation::age::AgeBand::Adult,
+            "({suffix}) I2862: precondition, an assured adult"
+        );
+        let custody = edge(&adult, true, late + chrono::Duration::hours(4));
+        let out = e2::land_with_voices(dir, &custody, &[adult.as_str()])
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2862: held, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "({suffix}) I2862: an owner-binding-purpose delegates_to onto a proven adult must \
+             not land: {out:?}"
+        );
+        let held = crate::federation::edition2::fold::why_held(
+            dir,
+            &crate::federation::edition2::names::RowId(e2::rid_digest(&custody)),
+        )
+        .await
+        .expect("read the hold")
+        .unwrap_or_else(|| panic!("({suffix}) I2862: the adult custody claim is held"));
+        assert!(
+            held.reason == crate::federation::edition2::fold::reason::STEWARD_UNPROVEN
+                && held.detail.contains("target_is_self_sovereign"),
+            "({suffix}) I2862: held steward_unproven for target_is_self_sovereign (the \
+             presumption of capacity): {held:?}"
+        );
+        assert!(
+            !is_named_moderator(dir, &e2::kid(&adult), &community_k, DELEGATION_SCOPE_SLASH)
+                .await
+                .expect("I2862"),
+            "({suffix}) I2862: a custody claim onto a proven adult seats no moderator"
+        );
+    }
+
+    /// v62.0.0 (K2-fix10) — **I2855–I2857: a quarantine marker signed
+    /// OUTSIDE the engine** (the two-step path CIRISServer uses for a
+    /// hardware-custodied owner): `emit::draft_from_envelope(kid, iss, ..)`,
+    /// the draft's `sig_structure` signed by the person's own composite key
+    /// (a seeded fixture signer, never the engine's LocalSigner),
+    /// `draft.assemble(sig)`, then `Engine::put_edition2_statement`.
+    ///
+    /// The slash seat: a PERSON holds it as the founder (a root of the
+    /// community's authority set) OR as a named moderator, a person seated by
+    /// the founder's `delegates_to(slash)` (CC 4.5.4; I2860). An ordinary
+    /// delegation onto a person is not a custody claim, so the user-target
+    /// rule does not govern it (K2-fix11). The holder here is the founder;
+    /// the named-moderator person is I2860–I2861.
+    ///
+    /// - **I2855** — the person (a slash-seat holder: founder or named
+    ///   moderator) signs: admitted (`Row`);
+    ///   `resolve_quarantine` reads `Withheld`.
+    /// - **I2856** — the same flow under a NODE key: refused
+    ///   [`cells::SIGNER_KIND_REFUSED`].
+    /// - **I2857** — a person without the slash seat: HELD (`Pending`, GC1
+    ///   `delegated_scope_unauthorized`), no typed row, not admitted.
+    /// - **I2858** — an AGENT holding a seated `delegates_to(slash)` from the
+    ///   founder root signs externally: `Row`, and the fold is `Withheld`,
+    ///   governed by the agent's marker.
+    /// - **I2859** — an agent (owned) WITHOUT that delegation: held, not
+    ///   admitted.
+    ///
+    /// Every instant is the holder key's window start plus a fixed offset.
+    pub(crate) async fn exercise_external_signer_quarantine(engine: &crate::Engine, suffix: &str) {
+        use crate::federation::edition2::emit::draft_from_envelope;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::edition2::names::RowId;
+        let directory = engine.federation_directory();
+        let dir: &dyn FederationDirectory = directory.as_ref();
+        let holder = format!("q10-holder-{suffix}");
+        let member = format!("q10-member-{suffix}");
+        let outsider = format!("q10-outsider-{suffix}");
+        let actor = format!("q10-actor-{suffix}");
+        let community = format!("q10-commons-{suffix}");
+        let node = format!("q10-node-{suffix}");
+        for k in [&holder, &member, &outsider, &actor, &community] {
+            register_user_key(dir, k).await;
+        }
+        register_key(dir, &node, crate::federation::types::identity_type::NODE).await;
+        let base_ms = e2::key_window_start_ms(&holder);
+        let base = DateTime::<Utc>::from_timestamp_millis(
+            i64::try_from(base_ms).expect("a window start fits i64"),
+        )
+        .expect("an instant");
+        let hour_ms: u64 = 3_600_000;
+        let (actor_k, community_k) = (e2::kid(&actor), e2::kid(&community));
+        let community_row = crate::federation::tier_ingest::test_support::sign_community(
+            &holder,
+            crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: community.clone(),
+                community_name: format!("commons {community}"),
+                members: vec![
+                    crate::federation::types::CommunityMember {
+                        key_id: holder.clone(),
+                        joined_at: base,
+                        role: Some("founder".to_owned()),
+                    },
+                    crate::federation::types::CommunityMember {
+                        key_id: member.clone(),
+                        joined_at: base,
+                        role: Some("member".to_owned()),
+                    },
+                ],
+                founded_at: base,
+                consensus_protocol: "majority".to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        e2::put_voices(
+            dir,
+            &e2::community_voices(&community_row, 1, None, e2::ms(base)),
+        )
+        .await
+        .expect("I2855: the community roster lands");
+
+        // The two-step path: draft for `seed`'s key, sign OUTSIDE the engine.
+        let external = |seed: &str, delegation_id: &str, at_ms: u64| {
+            let draft = draft_from_envelope(
+                &e2::kid_digest(seed),
+                &e2::kid(seed),
+                &actor_k,
+                crate::federation::types::attestation_type::SCORES,
+                &withhold_envelope(&actor_k, &community_k, delegation_id, "spam"),
+                at_ms,
+                None,
+            )
+            .expect("the marker drafts");
+            let sig = e2::signing_key(seed)
+                .sign(&draft.sig_structure)
+                .expect("the person's own key signs the draft");
+            draft.assemble(sig)
+        };
+
+        // ── I2855: the slash-seat holder.
+        let stmt = external(&holder, "q10-deleg-h", base_ms + hour_ms);
+        let out = engine
+            .put_edition2_statement(&stmt, None)
+            .await
+            .expect("I2855: admitted");
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2855: an externally signed holder's marker lands: {out:?}"
+        );
+        assert_eq!(
+            resolve_quarantine(dir, &actor_k, Utc::now())
+                .await
+                .expect("resolve")
+                .state,
+            QuarantineState::Withheld,
+            "({suffix}) I2855: and withholds"
+        );
+
+        // ── I2856: the same flow under a node key.
+        let by_node = external(&node, "q10-deleg-n", base_ms + 2 * hour_ms);
+        match engine.put_edition2_statement(&by_node, None).await {
+            Err(Error::InvalidArgument(m)) if m.starts_with(cells::SIGNER_KIND_REFUSED) => {}
+            other => panic!("({suffix}) I2856: a node key's marker is refused: {other:?}"),
+        }
+
+        // ── I2857: a person without the slash seat.
+        let by_outsider = external(&outsider, "q10-deleg-o", base_ms + 3 * hour_ms);
+        let rid = RowId::of_statement(&by_outsider).expect("a row statement");
+        let out = engine
+            .put_edition2_statement(&by_outsider, None)
+            .await
+            .expect("I2857: kept, not refused");
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "({suffix}) I2857: held, not admitted: {out:?}"
+        );
+        assert!(
+            dir.get_attestation(&rid.hex())
+                .await
+                .expect("read")
+                .is_none(),
+            "({suffix}) I2857: no typed row"
+        );
+        let why = crate::federation::edition2::fold::why_held(dir, &rid)
+            .await
+            .expect("I2857: read the hold")
+            .expect("I2857: held");
+        assert_eq!(
+            why.reason,
+            crate::federation::edition2::fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
+            "({suffix}) I2857: {why:?}"
+        );
+
+        // ── I2858: an AGENT holding `delegates_to(slash)` from the founder
+        // root signs externally through the same flow. The edge is SEATED
+        // first: the holder owns the agent (its agent owner binding, the
+        // agent's own voice), and the edge lands with the delegate's voice
+        // (`delegate`); the holder's own statement fills `delegate_owner`
+        // (CC 2.6.1.9, authorship_text.tsv:43–44).
+        // The deputy's acts sit OWNER_BINDING_OFFSET_DAYS into the window, so
+        // the edge's 180-day test term (`with_test_term`) covers today too.
+        let late_ms = base_ms
+            + u64::try_from(
+                crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS,
+            )
+            .expect("a positive offset")
+                * 24
+                * hour_ms;
+        let late = base
+            + chrono::Duration::days(
+                crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS,
+            );
+        let deputy = format!("q10-deputy-{suffix}");
+        let bare_agent = format!("q10-bare-agent-{suffix}");
+        for k in [&deputy, &bare_agent] {
+            register_agent_key(dir, k).await;
+            e2::put_agent_owner_binding(dir, &holder, k, late_ms + hour_ms).await;
+        }
+        let edge = delegation_row(
+            &holder,
+            &e2::kid(&deputy),
+            &[DELEGATION_SCOPE_SLASH],
+            late + chrono::Duration::hours(2),
+        );
+        let seated = e2::land_with_voices(dir, &edge, &[deputy.as_str()])
+            .await
+            .expect("I2858: the slash edge");
+        assert!(
+            matches!(seated, StatementOutcome::Row { .. }),
+            "({suffix}) I2858: the delegates_to(slash) edge is SEATED: {seated:?}"
+        );
+        let by_deputy = external(&deputy, "q10-deleg-d", late_ms + 3 * hour_ms);
+        let deputy_rid = RowId::of_statement(&by_deputy).expect("a row statement");
+        let out = engine
+            .put_edition2_statement(&by_deputy, None)
+            .await
+            .expect("I2858: admitted");
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2858: the delegate's externally signed marker lands: {out:?}"
+        );
+        let fold = resolve_quarantine(dir, &actor_k, Utc::now())
+            .await
+            .expect("resolve");
+        assert_eq!(
+            (
+                fold.state,
+                fold.marker_id.as_deref(),
+                fold.decided_by.as_deref()
+            ),
+            (
+                QuarantineState::Withheld,
+                Some(deputy_rid.hex().as_str()),
+                Some(e2::kid(&deputy).as_str())
+            ),
+            "({suffix}) I2858: Withheld, governed by the delegate's marker"
+        );
+
+        // ── I2859: an agent WITHOUT the delegation (owned, but no slash
+        // edge): held, not admitted.
+        let by_bare = external(&bare_agent, "q10-deleg-b", late_ms + 4 * hour_ms);
+        let bare_rid = RowId::of_statement(&by_bare).expect("a row statement");
+        let out = engine
+            .put_edition2_statement(&by_bare, None)
+            .await
+            .expect("I2859: kept, not refused");
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "({suffix}) I2859: an agent with no slash edge is held: {out:?}"
+        );
+        assert!(
+            dir.get_attestation(&bare_rid.hex())
+                .await
+                .expect("read")
+                .is_none(),
+            "({suffix}) I2859: no typed row"
+        );
+        let why = crate::federation::edition2::fold::why_held(dir, &bare_rid)
+            .await
+            .expect("I2859: read the hold")
+            .expect("I2859: held");
+        assert_eq!(
+            why.reason,
+            crate::federation::edition2::fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
+            "({suffix}) I2859: {why:?}"
+        );
+    }
+
     /// v62.0.0 (K2-fix9) — **I2850–I2853: the `quarantine:{state}` cells**
     /// (`quarantine::cells`; CC rc21's family model, DROP AT 23.3.3), on every
     /// backend. Every instant is anchored to the founder's key window
@@ -2095,6 +3232,178 @@ mod cells_runners {
         Box::pin(super::test_support::exercise_quarantine_cells(
             &b,
             &suffix(),
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2855_i2857_external_signer_quarantine_sqlite() {
+        let s = suffix();
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&format!("q10-engine-{s}")),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("engine");
+        Box::pin(super::test_support::exercise_external_signer_quarantine(
+            &engine, &s,
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2855_i2857_external_signer_quarantine_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let s = suffix();
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&format!("q10-engine-{s}")),
+            &dsn,
+        )
+        .await
+        .expect("pg engine");
+        Box::pin(super::test_support::exercise_external_signer_quarantine(
+            &engine, &s,
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2860_i2862_person_moderator_sqlite() {
+        let s = suffix();
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&format!("q11-engine-{s}")),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("engine");
+        let node = format!("q11-node-{s}");
+        engine
+            .sqlite_backend()
+            .expect("sqlite")
+            .set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
+        Box::pin(super::test_support::exercise_person_moderator(
+            &engine, &node, &s,
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2860_i2862_person_moderator_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let s = suffix();
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&format!("q11-engine-{s}")),
+            &dsn,
+        )
+        .await
+        .expect("pg engine");
+        let node = format!("q11-node-{s}");
+        engine
+            .postgres_backend()
+            .expect("postgres")
+            .set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
+        Box::pin(super::test_support::exercise_person_moderator(
+            &engine, &node, &s,
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2863_i2869_minor_appointment_void_sqlite() {
+        let s = suffix();
+        let seed = format!("q12-engine-{s}");
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&seed),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("engine");
+        let node = format!("q12-node-{s}");
+        engine
+            .sqlite_backend()
+            .expect("sqlite")
+            .set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
+        Box::pin(super::test_support::exercise_minor_duty(&engine, &node, &s)).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2863_i2869_minor_appointment_void_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let s = suffix();
+        let seed = format!("q12-engine-{s}");
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&seed),
+            &dsn,
+        )
+        .await
+        .expect("pg engine");
+        let node = format!("q12-node-{s}");
+        engine
+            .postgres_backend()
+            .expect("postgres")
+            .set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
+        Box::pin(super::test_support::exercise_minor_duty(&engine, &node, &s)).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2030_declared_duty_minor_appointment_void_sqlite() {
+        let s = suffix();
+        let seed = format!("q13-engine-{s}");
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&seed),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("engine");
+        let node = format!("q13-node-{s}");
+        engine
+            .sqlite_backend()
+            .expect("sqlite")
+            .set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
+        Box::pin(super::test_support::exercise_declared_duty(
+            &engine, &node, &s,
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2030_declared_duty_minor_appointment_void_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let s = suffix();
+        let seed = format!("q13-engine-{s}");
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&seed),
+            &dsn,
+        )
+        .await
+        .expect("pg engine");
+        let node = format!("q13-node-{s}");
+        engine
+            .postgres_backend()
+            .expect("postgres")
+            .set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
+        Box::pin(super::test_support::exercise_declared_duty(
+            &engine, &node, &s,
         ))
         .await;
     }

@@ -372,10 +372,10 @@ mod tests {
         assert_eq!(h.status, "ok");
         // v0.4.3 (CIRISPersist#21) — 2.7.legacy restored under the
         // telemetry-driven sunset rule. v4.15.0 (#871) — 3.0.0 added as
-        // the JCS-cutover schema.
+        // the JCS-cutover schema. v62.0.0 (P7-fix9) — 3.1.0, its label.
         assert_eq!(
             h.schema_versions_supported,
-            vec!["2.7.0", "2.7.9", "2.7.legacy", "3.0.0"]
+            vec!["2.7.0", "2.7.9", "2.7.legacy", "3.0.0", "3.1.0"]
         );
         assert!(h.queue_capacity_remaining > 0);
     }

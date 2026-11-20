@@ -195,6 +195,12 @@ pub mod reason {
             "accord_dimension_requires_accord_holder";
         /// A reconsideration naming another community than its held target's.
         pub const RECONSIDERATION_COMMUNITY_MISMATCH: &str = "reconsideration_community_mismatch";
+        /// v62.0.0 (K2-fix11; Eric's ruling) — a duty edge onto a person,
+        /// void because a minor band is held about them and the edge does not
+        /// post-date their earliest assured-adult proof
+        /// (`age::duty_edge_void_for_minor`). Never seats on its own: the
+        /// appointment is made again after the adult proof.
+        pub const MINOR_APPOINTMENT_VOID: &str = "minor_appointment_void";
         /// GC1's tokens, in append order.
         pub const ALL: &[&str] = &[
             COHORT_STANDING_REFUSED,
@@ -220,6 +226,7 @@ pub mod reason {
             RESERVED_PREFIX_EMITTER_MISMATCH,
             ACCORD_DIMENSION_REQUIRES_ACCORD_HOLDER,
             RECONSIDERATION_COMMUNITY_MISMATCH,
+            MINOR_APPOINTMENT_VOID,
         ];
     }
     /// Wave GC2's reasons (GC2 owns this module).

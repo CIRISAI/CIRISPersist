@@ -5,6 +5,19 @@ valid:
   - |
     #[cfg(test)]
     mod t { fn a() { b.store_blob_local(x); } }
+  # E8-fix3: the plaintext arm of the default `put_blob_signing_at`.
+  - |
+    fn put_blob_signing_at(&self) { async move { if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext { self.store_blob_local(sha, body, cohort_scope); } else { self.announce_held_blob(sha, a, floor); } } }
 invalid:
   - |
     fn a() { b.store_blob_local(x); }
+  # E8-fix3 near-misses: the sealed (else) arm, an unconditioned call, the
+  # same plaintext guard in another fn, and a condition on something else.
+  - |
+    fn put_blob_signing_at(&self) { if floor.tier() == CryptoTier::Plaintext { ok(); } else { self.store_blob_local(sha, body, cohort_scope); } }
+  - |
+    fn put_blob_signing_at(&self) { self.store_blob_local(sha, body, cohort_scope); }
+  - |
+    fn other_door(&self) { if floor.tier() == CryptoTier::Plaintext { self.store_blob_local(sha, body, cohort_scope); } }
+  - |
+    fn put_blob_signing_at(&self) { if sealed == CryptoTier::Plaintext { self.store_blob_local(sha, body, cohort_scope); } }

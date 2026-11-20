@@ -451,7 +451,7 @@ pub struct CompleteTrace {
     /// v7.2.0 (CIRISPersist#225) — the producer's ML-DSA-65 half of the
     /// per-trace envelope signature: base64 (standard) ML-DSA-65
     /// signature over the SAME canonical bytes the Ed25519
-    /// [`signature`](Self::signature) covers. The [`verify_hybrid`]
+    /// [`signature`](Self::signature) covers. The `verify_hybrid` (deleted v62.0.0)
     /// primitive binds the PQC sig to the classical one (it signs
     /// `canonical || classical_sig`), so the two halves cannot be
     /// stripped or recombined.
@@ -513,6 +513,40 @@ impl CompleteTrace {
                 .as_ref()
                 .and_then(|p| p.run_kind.as_deref())
         })
+    }
+
+    /// v62.0.0 (P7-fix9; CIRISAgent#1370, CC 3.1.5) — **does ANY signed place
+    /// of this trace say `mock`?** The top level, `deployment_profile.run_kind`
+    /// ([`Self::signed_run_kind`]), or any component's `data.run_kind` (the
+    /// components' data are inside the signed bytes on every wire: the
+    /// canonical payload, and the row's blob). Fails closed: one signed `mock`
+    /// is a mock run, whatever the other places say; a disagreement is not a
+    /// refusal of its own. Reads only the trace as signed, never a projection.
+    /// Mirrored, over JSON, by `federation::steward_purge::trace_signs_mock`.
+    #[must_use]
+    pub fn signs_mock_run(&self) -> bool {
+        const MOCK: &str = "mock";
+        self.signed_run_kind() == Some(MOCK)
+            || self
+                .components
+                .iter()
+                .any(|c| c.data.get("run_kind").and_then(serde_json::Value::as_str) == Some(MOCK))
+    }
+
+    /// v62.0.0 (P7-fix9; the lead's ruling, mock-dominant) — **the trace's
+    /// EFFECTIVE run kind**, what a manifest carries: `"mock"` when ANY signed
+    /// place says so ([`Self::signs_mock_run`]), otherwise exactly
+    /// [`Self::signed_run_kind`] (`None` stays `None`). Every non-mock trace's
+    /// manifest is byte-identical to before; a component-only mock's manifest
+    /// now says `mock`, so the federation-tier gate (which reads the manifest)
+    /// refuses it wherever the row arrives.
+    #[must_use]
+    pub fn effective_run_kind(&self) -> Option<&str> {
+        if self.signs_mock_run() {
+            Some("mock")
+        } else {
+            self.signed_run_kind()
+        }
     }
 }
 

@@ -19,8 +19,8 @@
 //! (Ed25519 + ML-DSA-65) signatures. The trait does NOT verify
 //! signatures itself — that responsibility belongs to the
 //! [`Engine`] PyO3 surface, which calls
-//! [`crate::verify::verify_hybrid_via_directory`] under
-//! [`crate::verify::HybridPolicy::Strict`] before invoking the
+//! `crate::verify::verify_hybrid_via_directory` (deleted v62.0.0) under
+//! `crate::verify::HybridPolicy::Strict` (deleted v62.0.0) before invoking the
 //! backend put. (CIRISPersist#14 closure-pattern; the trait is the
 //! storage primitive, the verify call is the policy layer.)
 //!
@@ -128,7 +128,7 @@ pub trait DerivedSchema: Send + Sync {
     /// without transactional flip would race).
     ///
     /// Caller MUST have already verified the hybrid signature under
-    /// [`crate::verify::HybridPolicy::Strict`].
+    /// `crate::verify::HybridPolicy::Strict` (deleted v62.0.0).
     fn put_calibration_bundle(
         &self,
         bundle: CalibrationBundle,
